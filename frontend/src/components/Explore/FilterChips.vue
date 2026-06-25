@@ -53,6 +53,28 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
     >
       time: {{ filters.start || "*" }} to {{ filters.end || "*" }}
     </v-chip>
+    <v-chip
+      v-for="(value, key) in filters.fields"
+      :key="`field:${key}`"
+      closable
+      size="small"
+      color="primary"
+      variant="outlined"
+      @click:close="emit('remove', `field:${key}`)"
+    >
+      {{ key }}: {{ value }}
+    </v-chip>
+    <v-chip
+      v-for="(value, key) in filters.exclude"
+      :key="`exclude:${key}`"
+      closable
+      size="small"
+      color="error"
+      variant="outlined"
+      @click:close="emit('remove', `exclude:${key}`)"
+    >
+      {{ key }} != {{ value }}
+    </v-chip>
     <v-btn
       v-if="hasFilters"
       size="x-small"
@@ -73,7 +95,10 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (e: "remove", key: "q" | "source" | "tag" | "timerange"): void;
+  (
+    e: "remove",
+    key: "q" | "source" | "tag" | "timerange" | `field:${string}` | `exclude:${string}`,
+  ): void;
   (e: "clear"): void;
 }>();
 
@@ -84,7 +109,9 @@ const hasFilters = computed(
       props.filters.source ||
       props.filters.tag ||
       props.filters.start ||
-      props.filters.end
+      props.filters.end ||
+      Object.keys(props.filters.fields || {}).length > 0 ||
+      Object.keys(props.filters.exclude || {}).length > 0
     ),
 );
 </script>

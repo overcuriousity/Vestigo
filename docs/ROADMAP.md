@@ -46,7 +46,7 @@ forensic timeline explorer:
     accepting `format` and the current `FilterState`.
   - Frontend: "Export" button in the event table toolbar.
 
-### 2. Real column filtering (highest priority)
+### 2. Real column filtering ✅
 
 Add Timesketch/ELK-style filter chips/buttons per column in the event table:
 
@@ -54,11 +54,11 @@ Add Timesketch/ELK-style filter chips/buttons per column in the event table:
   filter chip for that value.
 - A filter bar shows active chips and allows removing them individually or
   clearing all.
-- The backend `/events` endpoint already supports `q`, `source`, and `tag`;
-  extend it to support additional field filters as needed (e.g. `display_name`,
-  `timestamp_desc`, arbitrary attribute keys).
-- Time-range filtering must be wired via the existing `start`/`end` query
-  parameters.
+- The backend `/events` endpoint supports `q`, `source`, `tag`, `start`, `end`,
+  plus arbitrary field equality/exclusion filters via `filters` and `exclusions`
+  JSON query params (e.g. `display_name`, `timestamp_desc`, attribute keys).
+- Event detail panel shows filter/include, exclude, and copy icons next to each
+  field and attribute.
 
 ### 3. Time visualization
 
@@ -97,9 +97,9 @@ Turn the current stub panel into a working feature:
 
 ## Implementation order
 
-1. Fix create-timeline refresh bug (quick win).
-2. Add case/timeline delete endpoints and UI.
-3. Richer Explore view: event details panel, column filters, filter chips.
+1. ✅ Real column filtering (include/exclude on fields and attributes).
+2. Fix create-timeline refresh bug (quick win).
+3. Add case/timeline delete endpoints and UI.
 4. Persisted saved views + backend endpoints.
 5. Tag/comment annotations + backend endpoints.
 6. Export CSV/JSONL + backend endpoint.

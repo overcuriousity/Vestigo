@@ -88,7 +88,8 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           @update:page="onPageChange"
           @update:limit="onLimitChange"
           @update:selected-ids="onSelectionChange"
-          @filter-source="setSourceFilter"
+          @filter-field="addFieldFilter"
+          @exclude-field="addFieldExclusion"
           @filter-tag="setTagFilter"
           @tag-selected="tagSelected"
           @export="exportEvents"
@@ -203,28 +204,63 @@ function clearQuery() {
   applyFilters();
 }
 
-function setSourceFilter(source: string) {
-  filters.value.source = source;
-  applyFilters();
-}
-
 function setTagFilter(tag: string) {
   filters.value.tag = tag;
   applyFilters();
 }
 
-function removeFilter(key: "q" | "source" | "tag" | "timerange") {
-  if (key === "timerange") {
+function addFieldFilter(payload: { key: string; value: string }) {
+  if (!filters.value.fields) {
+    filters.value.fields = {};
+  }
+  filters.value.fields[payload.key] = payload.value;
+  applyFilters();
+}
+
+function addFieldExclusion(payload: { key: string; value: string }) {
+  if (!filters.value.exclude) {
+    filters.value.exclude = {};
+  }
+  filters.value.exclude[payload.key] = payload.value;
+  applyFilters();
+}
+
+function removeFilter(
+  key:
+    | "q"
+    | "source"
+    | "tag"
+    | "timerange"
+    | `field:${string}`
+    | `exclude:${string}`,
+) {
+  if (key === "q" || key === "source" || key === "tag") {
+    filters.value[key] = undefined;
+  } else if (key === "timerange") {
     filters.value.start = undefined;
     filters.value.end = undefined;
-  } else {
-    filters.value[key] = undefined;
+  } else if (key.startsWith("field:")) {
+    const fieldKey = key.slice(6);
+    if (filters.value.fields) {
+      delete filters.value.fields[fieldKey];
+      if (Object.keys(filters.value.fields).length === 0) {
+        filters.value.fields = undefined;
+      }
+    }
+  } else if (key.startsWith("exclude:")) {
+    const fieldKey = key.slice(8);
+    if (filters.value.exclude) {
+      delete filters.value.exclude[fieldKey];
+      if (Object.keys(filters.value.exclude).length === 0) {
+        filters.value.exclude = undefined;
+      }
+    }
   }
   applyFilters();
 }
 
 function resetFilters() {
-  filters.value = { q: "", source: "", tag: "", start: "", end: "" };
+  filters.value = {};
   applyFilters();
 }
 

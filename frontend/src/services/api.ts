@@ -87,6 +87,8 @@ export interface FilterState {
   tag?: string;
   start?: string;
   end?: string;
+  fields?: Record<string, string>;
+  exclude?: Record<string, string>;
 }
 
 export interface SavedView {
@@ -221,9 +223,21 @@ export async function listEvents(
   timelineId: string,
   params: FilterState & { limit?: number; offset?: number },
 ): Promise<EventPage> {
+  const queryParams: Record<string, unknown> = { ...params };
+  if (params.fields && Object.keys(params.fields).length > 0) {
+    queryParams.filters = JSON.stringify(params.fields);
+  } else {
+    delete queryParams.fields;
+  }
+  if (params.exclude && Object.keys(params.exclude).length > 0) {
+    queryParams.exclusions = JSON.stringify(params.exclude);
+  } else {
+    delete queryParams.exclude;
+  }
+
   const response = await api.get(
     `/api/cases/${caseId}/timelines/${timelineId}/events`,
-    { params },
+    { params: queryParams },
   );
   return response.data;
 }

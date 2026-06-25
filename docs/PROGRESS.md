@@ -16,7 +16,7 @@ This document tracks implementation progress against the MVP defined in
 |---|---------|--------|-------|
 | 1 | **Ingestion (CLI-first)** | ✅ Done | Streaming CSV/JSONL parsers, `tv ingest` CLI, plus web-based drag-and-drop upload. |
 | 2 | **Storage & Vector Backend** | ✅ Done | ClickHouse `events` table with token-bloom full-text index; Qdrant collections with embedding-config-hash isolation and vector-size config-match checks. |
-| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Replaced the minimal scaffold with a Timesketch-v3-inspired shell: AppBar, navigation, Pinia store, Home/Case/Sketch views, and an Explore-style investigation view. Supports search chips, source/tag filters, time-range filters, selectable event table, saved-views UI, and export stubs. Backend endpoints for saved views, annotations, and export are still pending. |
+| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Replaced the minimal scaffold with a Timesketch-v3-inspired shell: AppBar, navigation, Pinia store, Home/Case/Sketch views, and an Explore-style investigation view. Supports search chips, source/tag filters, time-range filters, field-level include/exclude filters on event attributes, selectable event table, saved-views UI, and export stubs. Backend endpoints for saved views, annotations, and export are still pending. |
 | 4 | **Anomaly & Similarity Panel** | 🟡 UI stubbed | Frontend anomaly panel and similarity search UI added; backend endpoints (`/anomalies`, `/similar`) still need Qdrant nearest-neighbor implementation. |
 | 5 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml`, `uv` workflow, environment-based config. Missing: authentication, GPU index selection, strict offline-mode guard for model downloads. |
 
@@ -39,3 +39,5 @@ This document tracks implementation progress against the MVP defined in
 4. **Anomaly panel** — use Qdrant nearest-neighbor search to surface outliers and enable semantic similarity search.
 5. **Authentication** — basic user auth for team access.
 6. **Offline-mode enforcement** — prevent HuggingFace network calls when `allow_online=false`.
+7. **Case/timeline deletion** — `DELETE` endpoints and UI actions.
+8. **Time visualization** — histogram endpoint and chart above the event table.

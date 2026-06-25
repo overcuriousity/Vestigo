@@ -61,7 +61,9 @@ export const useAppStore = defineStore("app", () => {
         activeFilters.value.source ||
         activeFilters.value.tag ||
         activeFilters.value.start ||
-        activeFilters.value.end
+        activeFilters.value.end ||
+        Object.keys(activeFilters.value.fields || {}).length > 0 ||
+        Object.keys(activeFilters.value.exclude || {}).length > 0
       ),
   );
   const selectedEvents = computed(() =>

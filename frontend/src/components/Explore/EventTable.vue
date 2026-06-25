@@ -81,7 +81,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       <v-chip
         size="x-small"
         variant="outlined"
-        @click.stop="emit('filter-source', item.source)"
+        @click.stop="emit('filter-field', { key: 'source', value: item.source })"
       >
         {{ item.source }}
       </v-chip>
@@ -102,7 +102,8 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       <td :colspan="columns.length" class="pa-4 bg-surface-light">
         <EventDetail
           :event="item"
-          @filter-source="emit('filter-source', $event)"
+          @filter-field="emit('filter-field', $event)"
+          @exclude-field="emit('exclude-field', $event)"
         />
       </td>
     </template>
@@ -155,7 +156,8 @@ const emit = defineEmits<{
   (e: "update:page", page: number): void;
   (e: "update:limit", limit: number): void;
   (e: "update:selectedIds", ids: Set<string>): void;
-  (e: "filter-source", source: string): void;
+  (e: "filter-field", payload: { key: string; value: string }): void;
+  (e: "exclude-field", payload: { key: string; value: string }): void;
   (e: "filter-tag", tag: string): void;
   (e: "tag-selected"): void;
   (e: "export"): void;

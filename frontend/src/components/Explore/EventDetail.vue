@@ -19,22 +19,52 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
   <div>
     <v-row>
       <v-col cols="12" md="6">
-        <p class="text-caption text-disabled mb-1">Message</p>
-        <p class="text-body-2">{{ event.message }}</p>
+        <FieldRow
+          label="Message"
+          field-key="message"
+          :value="event.message"
+          @filter="emit('filter-field', $event)"
+          @exclude="emit('exclude-field', $event)"
+          @copy="copyValue"
+        />
       </v-col>
       <v-col cols="12" md="3">
-        <p class="text-caption text-disabled mb-1">Timestamp</p>
-        <p class="text-body-2">{{ event.timestamp }}</p>
-        <p class="text-caption text-disabled mt-2 mb-1">Description</p>
-        <p class="text-body-2">{{ event.timestamp_desc }}</p>
+        <FieldRow
+          label="Timestamp"
+          field-key="timestamp"
+          :value="event.timestamp"
+          @filter="emit('filter-field', $event)"
+          @exclude="emit('exclude-field', $event)"
+          @copy="copyValue"
+        />
+        <FieldRow
+          label="Description"
+          field-key="timestamp_desc"
+          :value="event.timestamp_desc"
+          class="mt-3"
+          @filter="emit('filter-field', $event)"
+          @exclude="emit('exclude-field', $event)"
+          @copy="copyValue"
+        />
       </v-col>
       <v-col cols="12" md="3">
-        <p class="text-caption text-disabled mb-1">Source</p>
-        <v-chip size="small" @click="emit('filter-source', event.source)">
-          {{ event.source }}
-        </v-chip>
-        <p class="text-caption text-disabled mt-2 mb-1">Display name</p>
-        <p class="text-body-2">{{ event.display_name }}</p>
+        <FieldRow
+          label="Source"
+          field-key="source"
+          :value="event.source"
+          @filter="emit('filter-field', $event)"
+          @exclude="emit('exclude-field', $event)"
+          @copy="copyValue"
+        />
+        <FieldRow
+          label="Display name"
+          field-key="display_name"
+          :value="event.display_name"
+          class="mt-3"
+          @filter="emit('filter-field', $event)"
+          @exclude="emit('exclude-field', $event)"
+          @copy="copyValue"
+        />
       </v-col>
     </v-row>
     <v-row v-if="Object.keys(event.attributes || {}).length > 0">
@@ -47,6 +77,32 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
                 {{ key }}
               </td>
               <td class="text-body-2">{{ value }}</td>
+              <td class="text-right" style="width: 120px">
+                <v-btn
+                  icon="mdi-filter-plus"
+                  variant="text"
+                  density="compact"
+                  size="small"
+                  title="Filter for this value"
+                  @click="emit('filter-field', { key, value })"
+                />
+                <v-btn
+                  icon="mdi-filter-minus"
+                  variant="text"
+                  density="compact"
+                  size="small"
+                  title="Exclude this value"
+                  @click="emit('exclude-field', { key, value })"
+                />
+                <v-btn
+                  icon="mdi-content-copy"
+                  variant="text"
+                  density="compact"
+                  size="small"
+                  title="Copy value"
+                  @click="copyValue(value)"
+                />
+              </td>
             </tr>
           </tbody>
         </v-table>
@@ -57,12 +113,22 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
 
 <script setup lang="ts">
 import type { EventRecord } from "@/services/api";
+import FieldRow from "@/components/Explore/FieldRow.vue";
 
 defineProps<{
   event: EventRecord;
 }>();
 
 const emit = defineEmits<{
-  (e: "filter-source", source: string): void;
+  (e: "filter-field", payload: { key: string; value: string }): void;
+  (e: "exclude-field", payload: { key: string; value: string }): void;
 }>();
+
+async function copyValue(value: string) {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    // Clipboard may be unavailable; ignore silently.
+  }
+}
 </script>
