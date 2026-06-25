@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from tracevector.core.config import get_settings
+from tracevector.core.jobs import JobStore, get_job_store
 from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.ingestion.parser import detect_format
-from tracevector.ingestion.pipeline import IngestionPipeline
+from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
 
 class CaseCreate(BaseModel):
@@ -85,6 +87,16 @@ async def list_timelines(case_id: str) -> dict[str, Any]:
     return {"timelines": [t.to_dict() for t in timelines]}
 
 
+@router.get("/{case_id}/timelines/{timeline_id}")
+async def get_timeline(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """Get a single timeline by ID."""
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    return {"timeline": timeline.to_dict()}
+
+
 @router.post("/{case_id}/timelines")
 async def create_timeline(case_id: str, payload: TimelineCreate) -> dict[str, Any]:
     """Create a new timeline within a case."""
@@ -111,7 +123,10 @@ async def upload_timeline(
     file: UploadFile = File(...),  # noqa: B008
     parser: str | None = Form(default=None),
 ) -> dict[str, Any]:
-    """Upload a timeline file and run ingestion."""
+    """Upload a timeline file and ingest events into ClickHouse.
+
+    Embeddings are *not* generated here; use the embed endpoint for that.
+    """
     store = get_store()
     await store.init_schema()
     timeline = await store.get_timeline(case_id, timeline_id)
@@ -124,7 +139,11 @@ async def upload_timeline(
         tmp_path = Path(tmp.name)
 
     try:
-        fmt = parser or detect_format(tmp_path)
+        # The frontend may send the literal string "undefined" when no parser
+        # is selected, or "auto" when the user leaves the default, so treat
+        # those as unspecified and fall back to detection.
+        fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
+        fmt = fmt or detect_format(tmp_path)
         pipeline = IngestionPipeline(
             case_id=case_id,
             timeline_id=timeline_id,
@@ -135,14 +154,83 @@ async def upload_timeline(
             case_id=case_id,
             timeline_id=timeline_id,
             event_count=result.events_inserted,
-            vector_count=result.vectors_inserted,
+            vector_count=0,
         )
         return {
             "timeline_id": timeline_id,
             "events_parsed": result.events_parsed,
             "events_inserted": result.events_inserted,
-            "vectors_inserted": result.vectors_inserted,
             "parser": fmt,
         }
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _run_embedding_job(
+    job_id: str,
+    case_id: str,
+    timeline_id: str,
+    job_store: JobStore,
+) -> None:
+    """Run the embedding pipeline and update the job store."""
+
+    def progress_callback(total: int, processed: int) -> None:
+        job_store.update(
+            job_id,
+            status="running",
+            progress={"total": total, "processed": processed},
+        )
+
+    try:
+        pipeline = EmbeddingPipeline(
+            case_id=case_id,
+            timeline_id=timeline_id,
+            batch_size=get_settings().embedding_batch_size,
+            progress_callback=progress_callback,
+        )
+        result = pipeline.run()
+
+        # Use a fresh PostgresStore inside the worker thread.
+        store = PostgresStore()
+        asyncio.run(
+            store.update_timeline_counts(
+                case_id=case_id,
+                timeline_id=timeline_id,
+                vector_count=result.vectors_inserted,
+            )
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            progress={"total": result.events_processed, "processed": result.events_processed},
+            result={"vectors_inserted": result.vectors_inserted},
+        )
+    except Exception as exc:  # noqa: BLE001
+        job_store.update(job_id, status="failed", error=str(exc))
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/embed")
+async def start_embedding(
+    case_id: str,
+    timeline_id: str,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    """Start a background job to generate embeddings for a timeline."""
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    job_store = get_job_store()
+    job = job_store.create(
+        kind="embed",
+        progress={"total": 0, "processed": 0},
+    )
+    background_tasks.add_task(
+        _run_embedding_job,
+        job.id,
+        case_id,
+        timeline_id,
+        job_store,
+    )
+    return {"job_id": job.id, "status": job.status}

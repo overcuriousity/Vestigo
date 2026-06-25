@@ -1,5 +1,6 @@
 """Tests for TraceVector streaming parsers."""
 
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -153,3 +154,28 @@ def test_event_text_for_embedding() -> None:
     assert "source=auth" in text
     assert "tags=login" in text
     assert "ip=10.0.0.1" in text
+
+
+def test_parse_timestamp_normalizes_common_formats() -> None:
+    from datetime import datetime
+
+    from tracevector.models.event import _parse_timestamp
+
+    assert _parse_timestamp("2024-01-01T00:00:00+00:00") == datetime(
+        2024, 1, 1, 0, 0, 0, tzinfo=UTC
+    )
+    assert _parse_timestamp("2024-01-01 00:00:00") == datetime(
+        2024, 1, 1, 0, 0, 0, tzinfo=UTC
+    )
+    assert _parse_timestamp("1704067200") == datetime(
+        2024, 1, 1, 0, 0, 0, tzinfo=UTC
+    )
+    assert _parse_timestamp("1704067200000") == datetime(
+        2024, 1, 1, 0, 0, tzinfo=UTC
+    )
+    assert _parse_timestamp("1764367341913908") == datetime(
+        2025, 11, 28, 22, 2, 21, 913908, tzinfo=UTC
+    )
+    assert _parse_timestamp(None) is None
+    assert _parse_timestamp("") is None
+    assert _parse_timestamp("not-a-date") is None

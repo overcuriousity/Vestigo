@@ -33,7 +33,7 @@ class _RecordTrackingIterator:
         self.index = 0
         self.record_start_index = 0
 
-    def __iter__(self) -> "_RecordTrackingIterator":
+    def __iter__(self) -> _RecordTrackingIterator:
         return self
 
     def __next__(self) -> str:

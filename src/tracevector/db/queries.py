@@ -78,7 +78,7 @@ class _ParameterizedQueryBuilder:
     def add_param(self, sql_fragment: str, value: Any) -> None:
         """Add a condition containing exactly one ':name' placeholder."""
         name = self._param_name()
-        self.conditions.append(sql_fragment.replace(":name", f":{name}"))
+        self.conditions.append(sql_fragment.replace(":name", f"{{{name}:String}}"))
         self.parameters[name] = value
 
     def add_field_filter(self, key: str, value: str) -> None:
@@ -98,7 +98,7 @@ class _ParameterizedQueryBuilder:
         # Map lookup; parameterize the key as well to stay defensive.
         key_param = self._param_name()
         self.parameters[key_param] = key
-        return f"attributes[:{key_param}]"
+        return f"attributes[{{{key_param}:String}}]"
 
     def where_clause(self) -> str:
         return " AND ".join(self.conditions)

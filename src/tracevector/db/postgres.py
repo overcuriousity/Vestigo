@@ -169,15 +169,20 @@ class PostgresStore:
         self,
         case_id: str,
         timeline_id: str,
-        event_count: int,
-        vector_count: int,
+        event_count: int | None = None,
+        vector_count: int | None = None,
     ) -> None:
-        """Update stored event/vector counts for a timeline."""
+        """Update stored event/vector counts for a timeline.
+
+        Pass ``None`` for a count that should not be changed.
+        """
         timeline = await self.get_timeline(case_id, timeline_id)
         if timeline is None:
             return
-        timeline.event_count = event_count
-        timeline.vector_count = vector_count
+        if event_count is not None:
+            timeline.event_count = event_count
+        if vector_count is not None:
+            timeline.vector_count = vector_count
         timeline.updated_at = datetime.now(UTC)
         async with self.session_factory() as session:
             session.add(timeline)

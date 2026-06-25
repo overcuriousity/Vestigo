@@ -111,7 +111,21 @@ class QdrantStore:
                 )
             )
 
-        self.client.upsert(collection_name=name, points=points, wait=True)
+        return self.upsert(name, points)
+
+    def upsert(self, collection_name: str, points: list[PointStruct]) -> int:
+        """Upsert raw points into a Qdrant collection.
+
+        Args:
+            collection_name: Target Qdrant collection.
+            points: Points to upsert.
+
+        Returns:
+            Number of points upserted.
+        """
+        if not points:
+            return 0
+        self.client.upsert(collection_name=collection_name, points=points, wait=True)
         return len(points)
 
     def count_vectors(self, case_id: str, embedding_config_hash: str) -> int:

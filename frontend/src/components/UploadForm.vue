@@ -48,11 +48,9 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         closable
         @click:close="result = null"
       >
-        Ingested {{ result.events_inserted }} events ({{
-          result.vectors_inserted
-        }}
-        vectors) using <code>{{ result.parser }}</code
-        >.
+        Ingested {{ result.events_inserted }} events using
+        <code>{{ result.parser }}</code>. Generate embeddings from the timeline
+        view when you want vector search.
       </v-alert>
     </v-card-text>
     <v-card-actions>
@@ -109,7 +107,7 @@ async function upload() {
       props.caseId,
       props.timelineId,
       file,
-      parser.value === "auto" ? undefined : parser.value,
+      parser.value,
     );
     result.value = res;
     emit("uploaded", res);

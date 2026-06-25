@@ -134,6 +134,53 @@ class ClickHouseStore:
         result = self.client.query(query)
         return result.result_rows[0][0] if result.result_rows else 0
 
+    def list_events(
+        self,
+        case_id: str,
+        timeline_id: str,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return a batch of raw event rows for a timeline ordered by event_id.
+
+        This is used by the embedding pipeline to read events that were
+        previously ingested without vectors.
+        """
+        result = self.client.query(
+            f"""
+            SELECT
+                event_id,
+                case_id,
+                timeline_id,
+                source_file,
+                byte_offset,
+                line_number,
+                content_hash,
+                parser_name,
+                parser_version,
+                ingest_time,
+                message,
+                timestamp,
+                timestamp_desc,
+                source,
+                source_long,
+                display_name,
+                tags,
+                attributes,
+                embedding_model,
+                embedding_config_hash,
+                vector_id
+            FROM {self.database}.events
+            WHERE case_id = {{case_id:String}} AND timeline_id = {{timeline_id:String}}
+            ORDER BY event_id
+            LIMIT {limit}
+            OFFSET {offset}
+            """,
+            parameters={"case_id": case_id, "timeline_id": timeline_id},
+        )
+        columns = result.column_names
+        return [dict(zip(columns, row, strict=False)) for row in result.result_rows]
+
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the ClickHouse connection."""
         try:

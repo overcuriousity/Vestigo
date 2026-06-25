@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from tracevector import __version__
-from tracevector.api.routers import cases, events
+from tracevector.api.routers import cases, events, jobs
 
 FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
@@ -37,6 +37,7 @@ def create_app() -> FastAPI:
 
     app.include_router(cases.router)
     app.include_router(events.router)
+    app.include_router(jobs.router)
 
     if FRONTEND_DIST.is_dir():
         app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
@@ -47,5 +48,16 @@ def create_app() -> FastAPI:
             if file_path.is_file():
                 return FileResponse(file_path)
             return FileResponse(FRONTEND_DIST / "index.html")
+    else:
+
+        @app.get("/", response_class=JSONResponse)
+        async def no_frontend_built() -> dict:
+            return {
+                "message": "TraceVector API is running, but the frontend has not been built.",
+                "frontend_dist": str(FRONTEND_DIST),
+                "hint": "Run 'cd frontend && npm install && npm run build', then restart tv-web.",
+                "api_docs": "/api/docs",
+                "health": "/api/health",
+            }
 
     return app

@@ -177,6 +177,7 @@ class Event:
 
     def to_clickhouse_row(self) -> dict[str, Any]:
         """Serialize to a ClickHouse-ready row dictionary."""
+        parsed_ts = _parse_timestamp(self.timestamp)
         return {
             "event_id": str(self.event_id),
             "case_id": self.case_id,
@@ -189,7 +190,7 @@ class Event:
             "parser_version": self.parser_version,
             "ingest_time": self.ingest_time,
             "message": self.message,
-            "timestamp": self.timestamp or "",
+            "timestamp": parsed_ts if parsed_ts is not None else "",
             "timestamp_desc": self.timestamp_desc or "",
             "source": self.source or "",
             "source_long": self.source_long or "",
@@ -231,6 +232,54 @@ class Event:
         data["vector_id"] = self.vector_id
         data["source_file"] = str(self.source_file)
         return data
+
+
+def _parse_timestamp(value: str | int | float | datetime | None) -> datetime | None:
+    """Parse a forensic timestamp into a timezone-aware datetime.
+
+    Accepts ISO-8601 strings, common ``YYYY-MM-DD HH:MM:SS`` forms, and
+    Unix epoch integers/strings in seconds, milliseconds, or microseconds.
+    Returns ``None`` when the value cannot be parsed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=UTC)
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # ISO-8601 (python's fromisoformat does not accept trailing Z before 3.11).
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    except ValueError:
+        pass
+
+    # Common absolute datetime formats.
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            pass
+
+    # Epoch seconds / milliseconds / microseconds as a numeric string.
+    try:
+        n = int(s)
+        length = len(s)
+        if length == 10:
+            return datetime.fromtimestamp(n, tz=UTC)
+        if length == 13:
+            return datetime.fromtimestamp(n / 1000, tz=UTC)
+        if length in (16, 17):
+            return datetime.fromtimestamp(n / 1_000_000, tz=UTC)
+    except ValueError:
+        pass
+
+    return None
 
 
 def content_hash(content: str | bytes) -> str:

@@ -1,10 +1,11 @@
 """Tests for the ingestion pipeline."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from tracevector.ingestion.pipeline import IngestionPipeline
+from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 from tracevector.models.embeddings import EmbeddingConfig, EmbeddingModel
 from tracevector.models.event import Event
 
@@ -30,6 +31,20 @@ class FakeClickHouseStore:
         if timeline_id is not None:
             events = [e for e in events if e.timeline_id == timeline_id]
         return len(events)
+
+    def list_events(
+        self,
+        case_id: str,
+        timeline_id: str,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        events = [
+            e.as_dict()
+            for e in self.events
+            if e.case_id == case_id and e.timeline_id == timeline_id
+        ]
+        return events[offset : offset + limit]
 
 
 class FakeQdrantStore:
@@ -66,12 +81,21 @@ class FakeQdrantStore:
         vectors: list[list[float]],
     ) -> int:
         name = self._name(case_id, embedding_config_hash)
-        for event, vector in zip(events, vectors, strict=False):
-            self.points[name].append({"id": event.vector_id, "vector": vector})
-        return len(events)
+        points = [
+            {"id": event.vector_id, "vector": vector}
+            for event, vector in zip(events, vectors, strict=False)
+        ]
+        return self.upsert(name, points)
+
+    def upsert(self, collection_name: str, points: list[dict[str, Any]]) -> int:
+        self.points[collection_name].extend(points)
+        return len(points)
 
     def count_vectors(self, case_id: str, embedding_config_hash: str) -> int:
         return len(self.points[self._name(case_id, embedding_config_hash)])
+
+    def collection_name(self, case_id: str, embedding_config_hash: str) -> str:
+        return self._name(case_id, embedding_config_hash)
 
     @staticmethod
     def _name(case_id: str, embedding_config_hash: str) -> str:
@@ -119,17 +143,13 @@ def sample_jsonl(tmp_path: Path) -> Path:
     return path
 
 
-def test_pipeline_ingests_events_and_vectors(sample_jsonl: Path) -> None:
-    embedding_model = FakeEmbeddingModel(vector_dimension=8)
+def test_pipeline_ingests_events_without_vectors(sample_jsonl: Path) -> None:
     clickhouse = FakeClickHouseStore()
-    qdrant = FakeQdrantStore()
 
     pipeline = IngestionPipeline(
         case_id="case1",
         timeline_id="timeline1",
-        embedding_model=embedding_model,
         clickhouse=clickhouse,
-        qdrant=qdrant,
         batch_size=2,
     )
 
@@ -139,23 +159,24 @@ def test_pipeline_ingests_events_and_vectors(sample_jsonl: Path) -> None:
     assert result.timeline_id == "timeline1"
     assert result.events_parsed == 3
     assert result.events_inserted == 3
-    assert result.vectors_inserted == 3
     assert len(clickhouse.events) == 3
     assert clickhouse.schema_initialized is True
-    assert len(qdrant.collections) == 1
-
-    # Verify embedding metadata was attached to events.
-    for event in clickhouse.events:
-        assert event.embedding_model == "fake-model"
-        assert event.embedding_config_hash == embedding_model.config_hash()
 
 
-def test_pipeline_batching(sample_jsonl: Path) -> None:
+def test_embedding_pipeline_generates_vectors(sample_jsonl: Path) -> None:
     embedding_model = FakeEmbeddingModel(vector_dimension=8)
     clickhouse = FakeClickHouseStore()
     qdrant = FakeQdrantStore()
 
-    pipeline = IngestionPipeline(
+    ingest = IngestionPipeline(
+        case_id="case1",
+        timeline_id="timeline1",
+        clickhouse=clickhouse,
+        batch_size=2,
+    )
+    ingest.run(sample_jsonl)
+
+    embed = EmbeddingPipeline(
         case_id="case1",
         timeline_id="timeline1",
         embedding_model=embedding_model,
@@ -163,9 +184,10 @@ def test_pipeline_batching(sample_jsonl: Path) -> None:
         qdrant=qdrant,
         batch_size=2,
     )
+    result = embed.run()
 
-    pipeline.run(sample_jsonl)
-
+    assert result.events_processed == 3
+    assert result.vectors_inserted == 3
     collection_name = qdrant._name("case1", embedding_model.config_hash())
     assert qdrant.count_vectors("case1", embedding_model.config_hash()) == 3
     assert len(qdrant.points[collection_name]) == 3
@@ -175,9 +197,7 @@ def test_pipeline_raises_on_missing_path(tmp_path: Path) -> None:
     pipeline = IngestionPipeline(
         case_id="case1",
         timeline_id="timeline1",
-        embedding_model=FakeEmbeddingModel(),
         clickhouse=FakeClickHouseStore(),
-        qdrant=FakeQdrantStore(),
     )
     with pytest.raises(FileNotFoundError):
         pipeline.run(tmp_path / "does-not-exist.jsonl")

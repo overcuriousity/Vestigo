@@ -114,8 +114,21 @@ export interface UploadResult {
   timeline_id: string;
   events_parsed: number;
   events_inserted: number;
-  vectors_inserted: number;
   parser: string;
+}
+
+export interface Job {
+  id: string;
+  kind: string;
+  status: "queued" | "running" | "completed" | "failed";
+  progress: {
+    total: number;
+    processed: number;
+  };
+  result: {
+    vectors_inserted: number;
+  } | null;
+  error: string | null;
 }
 
 export interface SimilarityResult {
@@ -207,7 +220,7 @@ export async function uploadTimeline(
 ): Promise<UploadResult> {
   const formData = new FormData();
   formData.append("file", file);
-  if (parser) {
+  if (parser && parser !== "auto") {
     formData.append("parser", parser);
   }
   const response = await api.post(
@@ -215,6 +228,21 @@ export async function uploadTimeline(
     formData,
     { headers: { "Content-Type": "multipart/form-data" } },
   );
+  return response.data;
+}
+
+export async function startEmbedding(
+  caseId: string,
+  timelineId: string,
+): Promise<{ job_id: string; status: string }> {
+  const response = await api.post(
+    `/api/cases/${caseId}/timelines/${timelineId}/embed`,
+  );
+  return response.data;
+}
+
+export async function getJob(jobId: string): Promise<{ job: Job }> {
+  const response = await api.get(`/api/jobs/${jobId}`);
   return response.data;
 }
 

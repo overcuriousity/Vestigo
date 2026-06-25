@@ -53,12 +53,45 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           {{ appStore.currentTimeline?.name || "Timeline" }}
         </v-toolbar-title>
         <v-spacer />
+        <v-btn
+          v-if="appStore.currentTimeline && appStore.currentTimeline.event_count > 0"
+          :loading="embedJob?.status === 'running' || embedJob?.status === 'queued'"
+          :disabled="embedJob?.status === 'running' || embedJob?.status === 'queued'"
+          color="secondary"
+          variant="text"
+          prepend-icon="mdi-vector-arrange-below"
+          class="mr-2"
+          @click="startEmbed"
+        >
+          {{ appStore.currentTimeline.vector_count > 0 ? "Re-embed" : "Generate embeddings" }}
+        </v-btn>
         <UploadFormButton
           :case-id="caseId"
           :timeline-id="timelineId"
           @uploaded="onUploaded"
         />
       </v-toolbar>
+      <v-progress-linear
+        v-if="embedJob?.status === 'running' || embedJob?.status === 'queued'"
+        :model-value="
+          embedJob.progress.total > 0
+            ? (embedJob.progress.processed / embedJob.progress.total) * 100
+            : 0
+        "
+        color="secondary"
+        height="6"
+        class="mb-2 rounded"
+      />
+      <v-alert
+        v-if="embedJob?.status === 'failed'"
+        type="error"
+        density="compact"
+        class="mb-2"
+        closable
+        @click:close="embedJob = null"
+      >
+        Embedding failed: {{ embedJob.error }}
+      </v-alert>
 
       <v-card class="mb-3">
         <v-card-text>
@@ -153,7 +186,7 @@ import EventTable from "@/components/Explore/EventTable.vue";
 import UploadFormButton from "@/components/UploadFormButton.vue";
 import { useAppStore } from "@/stores/app";
 import type { FilterState, SavedView, SimilarityResult } from "@/services/api";
-import { getAnomalies, createView } from "@/services/api";
+import { getAnomalies, createView, startEmbedding, getJob } from "@/services/api";
 
 const route = useRoute();
 const appStore = useAppStore();
@@ -168,6 +201,8 @@ const saveViewDialog = ref(false);
 const viewName = ref("");
 const anomalies = ref<SimilarityResult[]>([]);
 const anomaliesLoading = ref(false);
+const embedJob = ref<{ id: string; status: string; progress: { total: number; processed: number }; error: string | null } | null>(null);
+const embedPolling = ref<number | null>(null);
 
 async function loadAll() {
   await appStore.loadTimeline(caseId, timelineId);
@@ -195,6 +230,7 @@ function onSelectionChange(ids: Set<string>) {
 }
 
 function onUploaded() {
+  embedJob.value = null;
   appStore.loadTimeline(caseId, timelineId);
   appStore.loadEvents(caseId, timelineId, filters.value);
 }
@@ -317,6 +353,42 @@ async function loadAnomalies() {
     anomalies.value = await getAnomalies(caseId, timelineId);
   } finally {
     anomaliesLoading.value = false;
+  }
+}
+
+async function startEmbed() {
+  if (embedJob.value?.status === "running" || embedJob.value?.status === "queued") {
+    return;
+  }
+  try {
+    const { job_id, status } = await startEmbedding(caseId, timelineId);
+    embedJob.value = { id: job_id, status, progress: { total: 0, processed: 0 }, error: null };
+    pollEmbedJob();
+  } catch {
+    // Error is shown by global notification interceptor.
+  }
+}
+
+async function pollEmbedJob() {
+  if (!embedJob.value) return;
+  if (embedPolling.value !== null) {
+    window.clearTimeout(embedPolling.value);
+  }
+  try {
+    const { job } = await getJob(embedJob.value.id);
+    embedJob.value = {
+      id: job.id,
+      status: job.status,
+      progress: job.progress || { total: 0, processed: 0 },
+      error: job.error,
+    };
+    if (job.status === "running" || job.status === "queued") {
+      embedPolling.value = window.setTimeout(pollEmbedJob, 2000);
+    } else if (job.status === "completed") {
+      await appStore.loadTimeline(caseId, timelineId);
+    }
+  } catch {
+    // Error is shown by global notification interceptor.
   }
 }
 

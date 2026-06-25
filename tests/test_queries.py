@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -96,7 +96,7 @@ def _find_query(
 def test_basic_query_parameterizes_case_id(service: EventQueryService) -> None:
     service.query(EventQuery(case_id="case-1"))
     query, params = _last_query(service)
-    assert "case_id = :p0" in query
+    assert "case_id = {p0:String}" in query
     assert params is not None
     assert params.get("p0") == "case-1"
 
@@ -104,14 +104,14 @@ def test_basic_query_parameterizes_case_id(service: EventQueryService) -> None:
 def test_timeline_filter_is_parameterized(service: EventQueryService) -> None:
     service.query(EventQuery(case_id="case-1", timeline_id="tl-1"))
     query, params = _last_query(service)
-    assert "timeline_id = :p1" in query
+    assert "timeline_id = {p1:String}" in query
     assert params.get("p1") == "tl-1"
 
 
 def test_text_search_uses_parameterized_like(service: EventQueryService) -> None:
     service.query(EventQuery(case_id="case-1", q="login"))
     query, params = _last_query(service)
-    assert "message ILIKE :p1" in query
+    assert "message ILIKE {p1:String}" in query
     assert params.get("p1") == "%login%"
 
 
@@ -120,19 +120,19 @@ def test_source_and_tag_filters_are_parameterized(
 ) -> None:
     service.query(EventQuery(case_id="case-1", source="auth", tag="success"))
     query, params = _last_query(service)
-    assert "source = :p1" in query
-    assert "has(tags, :p2)" in query
+    assert "source = {p1:String}" in query
+    assert "has(tags, {p2:String})" in query
     assert params.get("p1") == "auth"
     assert params.get("p2") == "success"
 
 
 def test_time_range_filter_formats_datetime(service: EventQueryService) -> None:
-    start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    end = datetime(2024, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+    start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    end = datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC)
     service.query(EventQuery(case_id="case-1", start=start, end=end))
     query, params = _last_query(service)
-    assert "timestamp >= :p1" in query
-    assert "timestamp <= :p2" in query
+    assert "timestamp >= {p1:String}" in query
+    assert "timestamp <= {p2:String}" in query
     assert params.get("p1") == "2024-01-01 12:00:00"
     assert params.get("p2") == "2024-01-02 12:00:00"
 
@@ -145,7 +145,7 @@ def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
         )
     )
     query, params = _last_query(service)
-    assert "display_name = :p1" in query
+    assert "display_name = {p1:String}" in query
     assert params.get("p1") == "auth.log"
 
 
@@ -159,7 +159,7 @@ def test_unknown_field_filter_uses_attributes_map(
         )
     )
     query, params = _last_query(service)
-    assert "attributes[:p1] = :p2" in query
+    assert "attributes[{p1:String}] = {p2:String}" in query
     assert params.get("p1") == "ip_address_city"
     assert params.get("p2") == "Falkenstein"
 
@@ -172,7 +172,7 @@ def test_field_exclusion_uses_not_equals(service: EventQueryService) -> None:
         )
     )
     query, params = _last_query(service)
-    assert "display_name != :p1" in query
+    assert "display_name != {p1:String}" in query
     assert params.get("p1") == "auth.log"
 
 
@@ -200,11 +200,11 @@ def test_combined_query_builds_single_where_clause(
         )
     )
     count_query, count_params = _find_query(service, "SELECT count()")
-    assert "case_id = :p0" in count_query
-    assert "timeline_id = :p1" in count_query
-    assert "message ILIKE :p2" in count_query
-    assert "source = :p3" in count_query
-    assert "attributes[:p4] = :p5" in count_query
-    assert "attributes[:p6] != :p7" in count_query
+    assert "case_id = {p0:String}" in count_query
+    assert "timeline_id = {p1:String}" in count_query
+    assert "message ILIKE {p2:String}" in count_query
+    assert "source = {p3:String}" in count_query
+    assert "attributes[{p4:String}] = {p5:String}" in count_query
+    assert "attributes[{p6:String}] != {p7:String}" in count_query
     assert count_params is not None
     assert set(count_params.keys()) == {f"p{i}" for i in range(8)}
