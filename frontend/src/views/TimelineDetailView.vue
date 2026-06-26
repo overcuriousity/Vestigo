@@ -30,6 +30,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           :can-save="appStore.hasActiveFilters"
           @select="loadView"
           @save-current="saveCurrentView"
+          @delete="(id) => appStore.deleteView(caseId, id)"
         />
         <Anomalies
           :results="anomalies"

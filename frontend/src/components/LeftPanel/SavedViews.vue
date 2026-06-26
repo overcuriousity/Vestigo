@@ -32,7 +32,19 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           :title="view.name"
           link
           @click="emit('select', view)"
-        />
+        >
+          <template #append>
+            <v-btn
+              icon
+              variant="text"
+              size="x-small"
+              color="error"
+              @click.stop="emit('delete', view.id)"
+            >
+              <v-icon size="small">mdi-close</v-icon>
+            </v-btn>
+          </template>
+        </v-list-item>
         <v-list-item v-if="views.length === 0">
           <v-list-item-title class="text-caption text-disabled">
             No saved views yet.
@@ -64,5 +76,6 @@ defineProps<{
 const emit = defineEmits<{
   (e: "select", view: SavedView): void;
   (e: "save-current"): void;
+  (e: "delete", viewId: string): void;
 }>();
 </script>

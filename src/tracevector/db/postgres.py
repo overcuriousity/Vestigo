@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, JSON, String, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -84,6 +84,41 @@ class Timeline(Base):
             "embedding_model": self.embedding_model,
             "event_count": self.event_count,
             "vector_count": self.vector_count,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class View(Base):
+    """A saved filter view within a case."""
+
+    __tablename__ = "views"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    query: Mapped[str] = mapped_column(String(4096), nullable=False, default="")
+    view_filter: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary matching the SavedView frontend interface."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "name": self.name,
+            "query": self.query,
+            "filter": self.view_filter or {},
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -199,6 +234,68 @@ class PostgresStore:
                 .order_by(Timeline.created_at.desc())
             )
             return list(result.scalars().all())
+
+    async def list_views(self, case_id: str) -> list[View]:
+        """Return all saved views for a case ordered by creation time (newest first)."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(View)
+                .where(View.case_id == case_id)
+                .order_by(View.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def get_view(self, case_id: str, view_id: str) -> View | None:
+        """Return a saved view by case and view IDs."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(View).where(View.case_id == case_id, View.id == view_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def create_view(
+        self,
+        case_id: str,
+        view_id: str,
+        name: str,
+        query: str = "",
+        view_filter: dict | None = None,
+    ) -> View:
+        """Create a new saved view within a case."""
+        view = View(
+            id=view_id,
+            case_id=case_id,
+            name=name,
+            query=query,
+            view_filter=view_filter or {},
+        )
+        async with self.session_factory() as session:
+            session.add(view)
+            await session.commit()
+            await session.refresh(view)
+            return view
+
+    async def delete_view(self, case_id: str, view_id: str) -> bool:
+        """Delete a saved view row.
+
+        Returns True if the row existed and was removed.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(View).where(View.case_id == case_id, View.id == view_id)
+            )
+            view = result.scalar_one_or_none()
+            if view is None:
+                return False
+            await session.delete(view)
+            await session.commit()
+            return True
 
     async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
         """Delete a timeline row.

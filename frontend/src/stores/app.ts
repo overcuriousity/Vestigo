@@ -35,6 +35,7 @@ import {
   listViews,
   deleteTimeline as apiDeleteTimeline,
   deleteCase as apiDeleteCase,
+  deleteView as apiDeleteView,
 } from "@/services/api";
 
 export const useAppStore = defineStore("app", () => {
@@ -174,6 +175,11 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
+  async function deleteView(caseId: string, viewId: string) {
+    await apiDeleteView(caseId, viewId);
+    savedViews.value = savedViews.value.filter((v) => v.id !== viewId);
+  }
+
   async function loadSavedViews(caseId: string) {
     try {
       savedViews.value = await listViews(caseId);
@@ -243,6 +249,7 @@ export const useAppStore = defineStore("app", () => {
     loadSavedViews,
     deleteTimeline,
     deleteCase,
+    deleteView,
     setPage,
     setLimit,
     selectEvent,

@@ -1,6 +1,6 @@
 # TraceVector Implementation Progress
 
-Last updated: 2026-06-26
+Last updated: 2026-06-26 (session 2)
 
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in
@@ -34,7 +34,7 @@ This document tracks implementation progress against the MVP defined in
 ## Known gaps / next logical steps
 
 1. **Event annotations** — add tags/comments to one or more selected events.
-2. **Saved views** — persist filter sets per case/timeline.
+2. ✅ **Saved views** — `View` model in PostgreSQL; GET/POST/DELETE `/api/cases/{id}/views` endpoints; delete affordance in SavedViews panel.
 3. **Export** — download filtered or full event sets as CSV/JSONL.
 4. **Anomaly panel** — use Qdrant nearest-neighbor search to surface outliers and enable semantic similarity search.
 5. **Authentication** — basic user auth for team access.

@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from tracevector.core.config import get_settings
 from tracevector.core.jobs import JobStore, get_job_store
 from tracevector.db.clickhouse import ClickHouseStore
-from tracevector.db.postgres import PostgresStore, generate_id
+from tracevector.db.postgres import PostgresStore, View, generate_id
 from tracevector.db.qdrant import QdrantStore
 from tracevector.ingestion.parser import detect_format
 from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -33,6 +33,14 @@ class TimelineCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=4096)
     parser: str | None = Field(default=None)
+
+
+class ViewCreate(BaseModel):
+    """Payload to create a saved view."""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    query: str = Field(default="")
+    filter: dict[str, Any] = Field(default_factory=dict)
 
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
@@ -216,6 +224,42 @@ async def delete_case(case_id: str) -> dict[str, Any]:
     await store.delete_case(case_id)
 
     return {"deleted": True, "case_id": case_id}
+
+
+@router.get("/{case_id}/views")
+async def list_views(case_id: str) -> dict[str, Any]:
+    """List all saved views for a case."""
+    store = get_store()
+    views = await store.list_views(case_id)
+    return {"views": [v.to_dict() for v in views]}
+
+
+@router.post("/{case_id}/views")
+async def create_view(case_id: str, payload: ViewCreate) -> dict[str, Any]:
+    """Create a new saved view within a case."""
+    store = get_store()
+    case = await store.get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    view_id = generate_id(payload.name)
+    view = await store.create_view(
+        case_id=case_id,
+        view_id=view_id,
+        name=payload.name,
+        query=payload.query,
+        view_filter=payload.filter,
+    )
+    return {"view": view.to_dict()}
+
+
+@router.delete("/{case_id}/views/{view_id}")
+async def delete_view(case_id: str, view_id: str) -> dict[str, Any]:
+    """Delete a saved view."""
+    store = get_store()
+    deleted = await store.delete_view(case_id, view_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="View not found")
+    return {"deleted": True, "view_id": view_id}
 
 
 def _run_embedding_job(
