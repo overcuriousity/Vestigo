@@ -18,33 +18,31 @@ The following Timesketch features are **not** planned for this phase:
 
 ## In scope
 
-### 1. Richer Explore view
+### 1. Richer Explore view ✅ (mostly done)
 
 The main investigation screen (`TimelineDetailView`) should feel like a real
 forensic timeline explorer:
 
-- **Event details side panel**
-  - Clicking a row opens a right-hand (or expandable) panel showing the full
-    event: message, timestamp, timestamp_desc, source, source_long,
-    display_name, tags, and all attributes.
-- **Tag / comment annotations**
+- ✅ **Event details inline panel** — clicking anywhere on a row expands it
+  in-place showing the full event: message, timestamp, timestamp_desc, source,
+  source_long, display_name, tags, and all attributes. Persistent chevron icon;
+  single-row expand (others collapse). Column visibility picker for optional
+  columns.
+- ✅ **Tag / comment annotations**
   - Multi-select events in the table.
-  - "Add tag" and "Add comment" actions in the toolbar.
-  - Backend: add `Annotation` model in PostgreSQL and endpoints:
-    - `GET /api/cases/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations`
-    - `POST /api/cases/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations`
-  - Frontend: render tags/comments in the event table and details panel.
-- **Saved views that actually persist**
-  - Backend: add `View` model in PostgreSQL and endpoints:
-    - `GET /api/cases/{case_id}/views`
-    - `POST /api/cases/{case_id}/views`
-    - `DELETE /api/cases/{case_id}/views/{view_id}`
-  - Frontend: load real saved views in the left panel, apply them, and allow
-    saving the current filter set.
+  - "Tag" and "Comment" toolbar actions apply to all selected events.
+  - Backend: `Annotation` model in PostgreSQL; endpoints for per-event
+    GET/POST/DELETE plus a bulk GET for table chips.
+  - Frontend: user-tag chips (secondary colour + account-tag icon) and comment
+    indicator in the table row; full CRUD in the expanded detail panel.
+- ✅ **Saved views that actually persist**
+  - Backend: `View` model in PostgreSQL; GET/POST/DELETE `/api/cases/{id}/views`.
+  - Frontend: saved views left panel, apply on click, save current filter set,
+    delete affordance.
 - **Export CSV / JSONL**
   - Backend: `POST /api/cases/{case_id}/timelines/{timeline_id}/export`
     accepting `format` and the current `FilterState`.
-  - Frontend: "Export" button in the event table toolbar.
+  - Frontend: "Export" button in the event table toolbar (stub wired, endpoint pending).
 
 ### 2. Real column filtering ✅
 
@@ -102,9 +100,10 @@ Turn the current stub panel into a working feature:
 3. ✅ Add case/timeline delete endpoints and UI.
 4. ✅ Persisted saved views + backend endpoints.
 5. ✅ Tag/comment annotations + backend endpoints.
-6. Export CSV/JSONL + backend endpoint.
-7. Time visualization histogram.
-8. Anomaly/similarity panel wired to Qdrant.
+6. ✅ Event table UX — single-row expand on click, persistent chevron, column picker.
+7. Export CSV/JSONL + backend endpoint.
+8. Time visualization histogram.
+9. Anomaly/similarity panel wired to Qdrant.
 
 ## Notes
 

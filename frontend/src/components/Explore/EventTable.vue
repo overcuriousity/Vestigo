@@ -17,27 +17,29 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
 -->
 <template>
   <v-data-table
-    :headers="headers"
+    :headers="visibleHeaders"
     :items="events"
     :items-per-page="limit"
     :page="page"
     :loading="loading"
-    hide-default-footer
+    item-value="event_id"
+    v-model:expanded="expanded"
     show-expand
+    hide-default-footer
     class="elevation-0 event-table"
+    @click:row="onRowClick"
   >
+    <!-- ── Toolbar ── -->
     <template #top>
       <v-toolbar density="compact" flat color="surface">
         <v-checkbox
           v-model="selectAll"
           hide-details
           density="compact"
-          class="ml-2"
+          class="ml-2 flex-grow-0"
           @update:model-value="toggleSelectAll"
         />
-        <v-toolbar-title class="text-body-2">
-          {{ selectedCount }} selected
-        </v-toolbar-title>
+        <span class="text-body-2 ml-1">{{ selectedCount }} selected</span>
         <v-spacer />
         <v-btn
           size="small"
@@ -66,9 +68,65 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         >
           Export
         </v-btn>
+
+        <!-- Column picker -->
+        <v-menu :close-on-content-click="false" location="bottom end">
+          <template #activator="{ props: menuProps }">
+            <v-btn
+              size="small"
+              variant="text"
+              icon="mdi-view-column-outline"
+              title="Toggle columns"
+              v-bind="menuProps"
+            />
+          </template>
+          <v-card min-width="180">
+            <v-list density="compact" select-strategy="independent">
+              <v-list-item
+                v-for="col in OPTIONAL_COLUMNS"
+                :key="col.key"
+                :title="col.title"
+              >
+                <template #prepend>
+                  <v-checkbox
+                    :model-value="visibleKeys.has(col.key)"
+                    hide-details
+                    density="compact"
+                    class="mr-1"
+                    @click.stop
+                    @update:model-value="toggleColumn(col.key, !!$event)"
+                  />
+                </template>
+              </v-list-item>
+            </v-list>
+          </v-card>
+        </v-menu>
       </v-toolbar>
     </template>
 
+    <!-- ── Per-row checkbox (custom column so it never triggers expand) ── -->
+    <template #item.check="{ item }">
+      <v-checkbox
+        :model-value="selectedIds.has(item.event_id)"
+        hide-details
+        density="compact"
+        @click.stop
+        @update:model-value="onSelect(item.event_id, !!$event)"
+      />
+    </template>
+
+    <!-- ── Expand chevron – always visible, always correct ── -->
+    <template #item.data-table-expand="{ item }">
+      <v-btn
+        :icon="expanded.includes(item.event_id) ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+        variant="text"
+        size="small"
+        density="compact"
+        @click.stop="toggleRow(item.event_id)"
+      />
+    </template>
+
+    <!-- ── Cell renderers ── -->
     <template #item.timestamp="{ item }">
       {{ formatDate(item.timestamp) }}
     </template>
@@ -84,7 +142,6 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       >
         {{ tag }}
       </v-chip>
-      <!-- User tag annotations — distinct style with account-tag icon -->
       <template v-if="annotationsByEvent[item.event_id]">
         <v-chip
           v-for="ann in annotationsByEvent[item.event_id].filter(
@@ -98,13 +155,8 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         >
           {{ ann.content }}
         </v-chip>
-        <!-- Comment indicator badge -->
         <v-icon
-          v-if="
-            annotationsByEvent[item.event_id].some(
-              (a) => a.annotation_type === 'comment',
-            )
-          "
+          v-if="annotationsByEvent[item.event_id].some((a) => a.annotation_type === 'comment')"
           size="small"
           color="secondary"
           title="Has comments"
@@ -124,17 +176,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       </v-chip>
     </template>
 
-    <template
-      #item.data-table-select="{ internalItem, isSelected, toggleSelect }"
-    >
-      <v-checkbox
-        :model-value="isSelected(internalItem)"
-        hide-details
-        density="compact"
-        @update:model-value="toggleSelect(internalItem)"
-      />
-    </template>
-
+    <!-- ── Expanded detail row ── -->
     <template #expanded-row="{ columns, item }">
       <td :colspan="columns.length" class="pa-4 bg-surface-light">
         <EventDetail
@@ -160,6 +202,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
     </template>
   </v-data-table>
 
+  <!-- ── Pagination bar ── -->
   <v-row class="pa-4 align-center" no-gutters>
     <v-col cols="auto">
       <v-select
@@ -224,15 +267,67 @@ const emit = defineEmits<{
   ): void;
 }>();
 
+// ── Column definitions ──────────────────────────────────────────────────────
+
+const FIXED_COLUMNS = [
+  { title: "", key: "check", width: "48px", sortable: false },
+] as const;
+
+const OPTIONAL_COLUMNS = [
+  { title: "Time", key: "timestamp", width: "180px" },
+  { title: "Source", key: "source", width: "140px" },
+  { title: "Message", key: "message" },
+  { title: "Tags", key: "tags", width: "160px" },
+  { title: "Description", key: "timestamp_desc", width: "160px" },
+  { title: "Display name", key: "display_name", width: "160px" },
+] as const;
+
+type ColumnKey = (typeof OPTIONAL_COLUMNS)[number]["key"];
+
+const visibleKeys = ref<Set<ColumnKey>>(
+  new Set(["timestamp", "source", "message", "tags"]),
+);
+
+function toggleColumn(key: ColumnKey, show: boolean) {
+  const next = new Set(visibleKeys.value);
+  if (show) next.add(key);
+  else next.delete(key);
+  visibleKeys.value = next;
+}
+
+const visibleHeaders = computed(() => [
+  ...FIXED_COLUMNS,
+  ...OPTIONAL_COLUMNS.filter((c) => visibleKeys.value.has(c.key)),
+]);
+
+// ── Expansion ───────────────────────────────────────────────────────────────
+
+const expanded = ref<string[]>([]);
+
+function toggleRow(eventId: string) {
+  expanded.value = expanded.value[0] === eventId ? [] : [eventId];
+}
+
+function onRowClick(event: Event, { item }: { item: EventRecord }) {
+  // Ignore clicks on interactive elements so chips/buttons work independently.
+  const target = event.target as HTMLElement;
+  if (target.closest("button, a, .v-chip, input, .v-checkbox, .v-selection-control")) return;
+  toggleRow(item.event_id);
+}
+
+// Collapse open row when the page changes.
+watch(
+  () => props.events,
+  () => {
+    expanded.value = [];
+    selectAll.value = false;
+  },
+);
+
+// ── Selection ───────────────────────────────────────────────────────────────
+
 const localLimit = ref(props.limit);
 const selectAll = ref(false);
-
-const headers = [
-  { title: "Time", key: "timestamp", width: "180px" },
-  { title: "Source", key: "source", width: "120px" },
-  { title: "Message", key: "message" },
-  { title: "Tags", key: "tags", width: "150px" },
-];
 
 const selectedCount = computed(() => props.selectedIds.size);
 
@@ -243,22 +338,21 @@ watch(
   },
 );
 
-watch(
-  () => props.events,
-  () => {
-    selectAll.value = false;
-  },
-);
+function onSelect(eventId: string, selected: boolean) {
+  const next = new Set(props.selectedIds);
+  if (selected) next.add(eventId);
+  else next.delete(eventId);
+  emit("update:selectedIds", next);
+}
 
 function toggleSelectAll(selected: boolean | null) {
-  const newSet = new Set(props.selectedIds);
-  if (selected) {
-    props.events.forEach((e) => newSet.add(e.event_id));
-  } else {
-    props.events.forEach((e) => newSet.delete(e.event_id));
-  }
-  emit("update:selectedIds", newSet);
+  const next = new Set(props.selectedIds);
+  if (selected) props.events.forEach((e) => next.add(e.event_id));
+  else props.events.forEach((e) => next.delete(e.event_id));
+  emit("update:selectedIds", next);
 }
+
+// ── Formatting ──────────────────────────────────────────────────────────────
 
 function formatDate(value: string | null): string {
   if (!value) return "—";
@@ -267,7 +361,8 @@ function formatDate(value: string | null): string {
 </script>
 
 <style scoped lang="scss">
-.event-table :deep(tbody tr) {
+.event-table :deep(tbody tr:hover) {
+  background: rgba(var(--v-theme-on-surface), 0.04);
   cursor: pointer;
 }
 </style>
