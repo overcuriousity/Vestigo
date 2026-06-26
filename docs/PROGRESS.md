@@ -16,7 +16,7 @@ This document tracks implementation progress against the MVP defined in
 |---|---------|--------|-------|
 | 1 | **Ingestion (CLI-first)** | ✅ Done | Streaming CSV/JSONL parsers, `tv ingest` CLI, plus web-based drag-and-drop upload. |
 | 2 | **Storage & Vector Backend** | ✅ Done | ClickHouse `events` table with token-bloom full-text index; Qdrant collections with embedding-config-hash isolation and vector-size config-match checks. |
-| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Replaced the minimal scaffold with a Timesketch-v3-inspired shell: AppBar, navigation, Pinia store, Home/Case/Sketch views, and an Explore-style investigation view. Supports search chips, source/tag filters, time-range filters, field-level include/exclude filters on event attributes, selectable event table, saved-views UI, and export stubs. Backend endpoints for saved views, annotations, and export are still pending. |
+| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Timesketch-v3-inspired shell with search chips, source/tag filters, time-range, field-level include/exclude filters, selectable event table, persisted saved views (✅), case/timeline delete (✅). Backend endpoints for annotations and export still pending. |
 | 4 | **Anomaly & Similarity Panel** | 🟡 UI stubbed | Frontend anomaly panel and similarity search UI added; backend endpoints (`/anomalies`, `/similar`) still need Qdrant nearest-neighbor implementation. |
 | 5 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml`, `uv` workflow, environment-based config. Missing: authentication, GPU index selection, strict offline-mode guard for model downloads. |
 
