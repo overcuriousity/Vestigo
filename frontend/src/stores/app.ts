@@ -33,6 +33,8 @@ import {
   getTimeline,
   listEvents,
   listViews,
+  deleteTimeline as apiDeleteTimeline,
+  deleteCase as apiDeleteCase,
 } from "@/services/api";
 
 export const useAppStore = defineStore("app", () => {
@@ -154,6 +156,24 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
+  async function deleteTimeline(caseId: string, timelineId: string) {
+    await apiDeleteTimeline(caseId, timelineId);
+    timelines.value = timelines.value.filter((t) => t.id !== timelineId);
+    if (currentTimeline.value?.id === timelineId) {
+      currentTimeline.value = null;
+    }
+  }
+
+  async function deleteCase(caseId: string) {
+    await apiDeleteCase(caseId);
+    cases.value = cases.value.filter((c) => c.id !== caseId);
+    if (currentCase.value?.id === caseId) {
+      currentCase.value = null;
+      currentTimeline.value = null;
+      timelines.value = [];
+    }
+  }
+
   async function loadSavedViews(caseId: string) {
     try {
       savedViews.value = await listViews(caseId);
@@ -221,6 +241,8 @@ export const useAppStore = defineStore("app", () => {
     loadTimeline,
     loadEvents,
     loadSavedViews,
+    deleteTimeline,
+    deleteCase,
     setPage,
     setLimit,
     selectEvent,

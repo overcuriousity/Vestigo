@@ -212,6 +212,10 @@ export async function deleteTimeline(
   await api.delete(`/api/cases/${caseId}/timelines/${timelineId}`);
 }
 
+export async function deleteCase(caseId: string): Promise<void> {
+  await api.delete(`/api/cases/${caseId}`);
+}
+
 export async function uploadTimeline(
   caseId: string,
   timelineId: string,

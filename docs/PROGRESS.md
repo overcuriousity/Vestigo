@@ -1,6 +1,6 @@
 # TraceVector Implementation Progress
 
-Last updated: 2026-06-25
+Last updated: 2026-06-26
 
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in
@@ -8,7 +8,7 @@ This document tracks implementation progress against the MVP defined in
 
 ## Overall completion
 
-**Estimated MVP completion: 60–70 %**
+**Estimated MVP completion: 70–75 %**
 
 ## MVP feature checklist
 
@@ -39,5 +39,5 @@ This document tracks implementation progress against the MVP defined in
 4. **Anomaly panel** — use Qdrant nearest-neighbor search to surface outliers and enable semantic similarity search.
 5. **Authentication** — basic user auth for team access.
 6. **Offline-mode enforcement** — prevent HuggingFace network calls when `allow_online=false`.
-7. **Case/timeline deletion** — `DELETE` endpoints and UI actions.
+7. ✅ **Case/timeline deletion** — `DELETE` endpoints with cascade across ClickHouse + Qdrant + PostgreSQL; confirmation UI on CaseDetailView and CaseList.
 8. **Time visualization** — histogram endpoint and chart above the event table.

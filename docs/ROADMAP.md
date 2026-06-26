@@ -98,8 +98,8 @@ Turn the current stub panel into a working feature:
 ## Implementation order
 
 1. ✅ Real column filtering (include/exclude on fields and attributes).
-2. Fix create-timeline refresh bug (quick win).
-3. Add case/timeline delete endpoints and UI.
+2. ✅ Fix create-timeline refresh bug (quick win).
+3. ✅ Add case/timeline delete endpoints and UI.
 4. Persisted saved views + backend endpoints.
 5. Tag/comment annotations + backend endpoints.
 6. Export CSV/JSONL + backend endpoint.

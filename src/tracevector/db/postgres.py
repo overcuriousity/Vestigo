@@ -200,6 +200,43 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
+    async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
+        """Delete a timeline row.
+
+        Returns True if a row was removed, False if it did not exist.
+        """
+        from sqlalchemy import delete, select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return False
+            await session.delete(timeline)
+            await session.commit()
+            return True
+
+    async def delete_case(self, case_id: str) -> bool:
+        """Delete a case and all its timeline rows in one transaction.
+
+        Returns True if the case existed and was removed, False otherwise.
+        """
+        from sqlalchemy import delete, select
+
+        async with self.session_factory() as session:
+            case = await session.get(Case, case_id)
+            if case is None:
+                return False
+            await session.execute(delete(Timeline).where(Timeline.case_id == case_id))
+            await session.delete(case)
+            await session.commit()
+            return True
+
 
 def generate_id(base: str) -> str:
     """Return a URL-safe identifier from ``base`` with a short random suffix."""

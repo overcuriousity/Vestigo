@@ -12,6 +12,9 @@ from typing import Any
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
     PointStruct,
     VectorParams,
 )
@@ -136,6 +139,49 @@ class QdrantStore:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to count vectors in {name!r}") from exc
         return result.count
+
+    def case_collections(self, case_id: str) -> list[str]:
+        """Return the names of all Qdrant collections that belong to ``case_id``.
+
+        A case can have multiple collections (one per distinct embedding
+        configuration hash).  All share the prefix
+        ``{collection_prefix}_{safe_case}_``.
+        """
+        safe_case = "".join(c if c.isalnum() else "_" for c in case_id)
+        prefix = f"{self.collection_prefix}_{safe_case}_"
+        collections = self.client.get_collections()
+        return [c.name for c in collections.collections if c.name.startswith(prefix)]
+
+    def delete_timeline_points(self, case_id: str, timeline_id: str) -> None:
+        """Delete all vector points for ``timeline_id`` across all case collections.
+
+        The ``timeline_id`` is stored in the Qdrant point payload (see
+        ``Event.to_qdrant_payload``), so a payload filter cleanly selects
+        only the affected points.  Collections that do not exist are skipped.
+        """
+        for name in self.case_collections(case_id):
+            try:
+                self.client.delete(
+                    collection_name=name,
+                    points_selector=Filter(
+                        must=[
+                            FieldCondition(
+                                key="timeline_id",
+                                match=MatchValue(value=timeline_id),
+                            )
+                        ]
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    def delete_case_collections(self, case_id: str) -> None:
+        """Delete all Qdrant collections that belong to ``case_id``."""
+        for name in self.case_collections(case_id):
+            try:
+                self.client.delete_collection(name)
+            except Exception:  # noqa: BLE001
+                pass
 
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the Qdrant connection."""

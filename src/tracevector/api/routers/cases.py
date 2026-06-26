@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 
 from tracevector.core.config import get_settings
 from tracevector.core.jobs import JobStore, get_job_store
+from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.postgres import PostgresStore, generate_id
+from tracevector.db.qdrant import QdrantStore
 from tracevector.ingestion.parser import detect_format
 from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -164,6 +166,56 @@ async def upload_timeline(
         }
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@router.delete("/{case_id}/timelines/{timeline_id}")
+async def delete_timeline(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """Delete a timeline and cascade-remove its events and vectors.
+
+    Removes data from all three stores in this order:
+    1. Qdrant vector points filtered by timeline_id (payload filter, per-collection).
+    2. ClickHouse events partition (case_id, timeline_id) via DROP PARTITION.
+    3. PostgreSQL Timeline row.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    qdrant = QdrantStore()
+    ch = ClickHouseStore()
+    qdrant.delete_timeline_points(case_id, timeline_id)
+    ch.delete_timeline_events(case_id, timeline_id)
+    await store.delete_timeline(case_id, timeline_id)
+
+    return {"deleted": True, "timeline_id": timeline_id}
+
+
+@router.delete("/{case_id}")
+async def delete_case(case_id: str) -> dict[str, Any]:
+    """Delete a case and cascade-remove all its timelines, events, and vectors.
+
+    Removes data from all three stores in this order:
+    1. Qdrant vector points per timeline, then all case collections.
+    2. ClickHouse events partitions per timeline.
+    3. PostgreSQL Case row (and Timeline rows via delete_case).
+    """
+    store = get_store()
+    case = await store.get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    timelines = await store.list_timelines(case_id)
+
+    qdrant = QdrantStore()
+    ch = ClickHouseStore()
+    for tl in timelines:
+        qdrant.delete_timeline_points(case_id, tl.id)
+        ch.delete_timeline_events(case_id, tl.id)
+    qdrant.delete_case_collections(case_id)
+    await store.delete_case(case_id)
+
+    return {"deleted": True, "case_id": case_id}
 
 
 def _run_embedding_job(

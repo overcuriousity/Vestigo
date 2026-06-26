@@ -181,6 +181,27 @@ class ClickHouseStore:
         columns = result.column_names
         return [dict(zip(columns, row, strict=False)) for row in result.result_rows]
 
+    def delete_timeline_events(self, case_id: str, timeline_id: str) -> None:
+        """Remove all events for a timeline by dropping its ClickHouse partition.
+
+        The ``events`` table is partitioned by ``(case_id, timeline_id)`` so
+        ``DROP PARTITION`` is instant and does not require a full-table scan.
+        If the partition does not exist (timeline was never uploaded) the call
+        is a silent no-op.
+        """
+        try:
+            # clickhouse-connect does not support parameterised DDL.  The IDs
+            # produced by generate_id() contain only [a-zA-Z0-9_-] so
+            # direct interpolation is safe here.
+            partition_expr = f"tuple('{case_id}', '{timeline_id}')"
+            self.client.command(
+                f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
+            )
+        except Exception:  # noqa: BLE001
+            # Partition may not exist (timeline never ingested any events); that
+            # is fine — treat as a no-op.
+            pass
+
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the ClickHouse connection."""
         try:
