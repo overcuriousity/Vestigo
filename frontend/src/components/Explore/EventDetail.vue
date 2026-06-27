@@ -109,13 +109,17 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       </v-col>
     </v-row>
 
-    <!-- Annotations section -->
+    <!-- ── Human annotations ───────────────────────────────────────────────── -->
     <v-row>
       <v-col cols="12">
         <p class="text-caption text-disabled mb-1">Annotations</p>
-        <v-table v-if="annotations.length > 0" density="compact" class="mb-2">
+        <v-table
+          v-if="userAnnotations.length > 0"
+          density="compact"
+          class="mb-2"
+        >
           <tbody>
-            <tr v-for="ann in annotations" :key="ann.id">
+            <tr v-for="ann in userAnnotations" :key="ann.id">
               <td style="width: 32px">
                 <v-icon
                   size="small"
@@ -175,17 +179,104 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         </div>
       </v-col>
     </v-row>
+
+    <!-- ── System analysis annotations ────────────────────────────────────── -->
+    <v-row v-if="systemAnnotations.length > 0">
+      <v-col cols="12">
+        <p class="text-caption text-medium-emphasis mb-1">
+          <v-icon size="x-small" class="mr-1">mdi-sigma</v-icon>
+          Analysis
+        </p>
+        <v-table density="compact" class="mb-2">
+          <tbody>
+            <tr v-for="ann in systemAnnotations" :key="ann.id">
+              <td style="width: 32px">
+                <v-icon size="small" color="warning">mdi-sigma</v-icon>
+              </td>
+              <td class="text-body-2">
+                {{ ann.content }}
+                <template v-if="ann.details">
+                  <br />
+                  <span class="text-caption text-disabled">
+                    method: {{ ann.details.method }} &nbsp;·&nbsp;
+                    distance: {{ ann.details.distance.toFixed(4) }} &nbsp;·&nbsp;
+                    sample: {{ ann.details.sample_size }}
+                  </span>
+                </template>
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+      </v-col>
+    </v-row>
+
+    <!-- ── Similarity search ────────────────────────────────────────────────── -->
+    <v-row>
+      <v-col cols="12">
+        <div class="d-flex align-center gap-2 mb-2">
+          <p class="text-caption text-disabled mb-0">
+            <v-icon size="x-small" class="mr-1">mdi-vector-link</v-icon>
+            Similar Events
+          </p>
+          <v-btn
+            size="x-small"
+            variant="tonal"
+            color="primary"
+            :loading="similarLoading"
+            prepend-icon="mdi-magnify"
+            @click="loadSimilar"
+          >
+            Find similar
+          </v-btn>
+        </div>
+        <template v-if="similarStatus === 'not_embedded'">
+          <p class="text-caption text-disabled">
+            Embeddings not generated — run "Generate embeddings" first.
+          </p>
+        </template>
+        <template v-else-if="similarStatus === 'vector_not_found'">
+          <p class="text-caption text-disabled">
+            No vector stored for this event.
+          </p>
+        </template>
+        <template v-else-if="similarResults.length > 0">
+          <v-list density="compact" class="pa-0">
+            <v-list-item
+              v-for="result in similarResults"
+              :key="result.event_id"
+              class="px-0"
+            >
+              <v-list-item-title class="text-caption text-truncate">
+                {{ result.event.message || "(no message)" }}
+              </v-list-item-title>
+              <v-list-item-subtitle class="text-caption">
+                similarity: {{ result.score.toFixed(3) }}
+              </v-list-item-subtitle>
+            </v-list-item>
+          </v-list>
+        </template>
+        <p
+          v-else-if="!similarLoading && similarSearched"
+          class="text-caption text-disabled"
+        >
+          No similar events found.
+        </p>
+      </v-col>
+    </v-row>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
-import type { Annotation, EventRecord } from "@/services/api";
+import { ref, computed } from "vue";
+import type { Annotation, EventRecord, SimilarityResult, VectorStatus } from "@/services/api";
+import { searchSimilar } from "@/services/api";
 import FieldRow from "@/components/Explore/FieldRow.vue";
 
-defineProps<{
+const props = defineProps<{
   event: EventRecord;
   annotations: Annotation[];
+  caseId?: string;
+  timelineId?: string;
 }>();
 
 const emit = defineEmits<{
@@ -194,6 +285,14 @@ const emit = defineEmits<{
   (e: "add-annotation", payload: { type: "comment" | "tag"; content: string }): void;
   (e: "delete-annotation", annotationId: string): void;
 }>();
+
+// Split annotations by origin.
+const userAnnotations = computed(() =>
+  props.annotations.filter((a) => (a.origin ?? "user") === "user"),
+);
+const systemAnnotations = computed(() =>
+  props.annotations.filter((a) => a.origin === "system"),
+);
 
 const newAnnotationContent = ref("");
 
@@ -216,6 +315,31 @@ async function copyValue(value: string) {
     await navigator.clipboard.writeText(value);
   } catch {
     // Clipboard may be unavailable; ignore silently.
+  }
+}
+
+// Similarity search state (local to this detail panel instance).
+const similarResults = ref<SimilarityResult[]>([]);
+const similarLoading = ref(false);
+const similarStatus = ref<VectorStatus | "">("");
+const similarSearched = ref(false);
+
+async function loadSimilar() {
+  if (!props.caseId || !props.timelineId) return;
+  similarLoading.value = true;
+  similarSearched.value = true;
+  try {
+    const resp = await searchSimilar(
+      props.caseId,
+      props.timelineId,
+      props.event.event_id,
+    );
+    similarStatus.value = resp.status;
+    similarResults.value = resp.results;
+  } catch {
+    similarStatus.value = "not_embedded";
+  } finally {
+    similarLoading.value = false;
   }
 }
 </script>

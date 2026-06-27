@@ -1,6 +1,6 @@
 # TraceVector Implementation Progress
 
-Last updated: 2026-06-26 (session 4)
+Last updated: 2026-06-27 (session 5)
 
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in
@@ -8,7 +8,7 @@ This document tracks implementation progress against the MVP defined in
 
 ## Overall completion
 
-**Estimated MVP completion: 87 %**
+**Estimated MVP completion: 95 %**
 
 ## MVP feature checklist
 
@@ -17,7 +17,7 @@ This document tracks implementation progress against the MVP defined in
 | 1 | **Ingestion (CLI-first)** | ✅ Done | Streaming CSV/JSONL parsers, `tv ingest` CLI, plus web-based drag-and-drop upload. |
 | 2 | **Storage & Vector Backend** | ✅ Done | ClickHouse `events` table with token-bloom full-text index; Qdrant collections with embedding-config-hash isolation and vector-size config-match checks. |
 | 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Timesketch-v3-inspired shell with search chips, source/tag filters, time-range, field-level include/exclude filters, selectable event table (✅ column picker), single-row click-to-expand detail (✅), persisted saved views (✅), case/timeline delete (✅), tag/comment annotations (✅), CSV/JSONL export (✅). |
-| 4 | **Anomaly & Similarity Panel** | 🟡 UI stubbed | Frontend anomaly panel and similarity search UI added; backend endpoints (`/anomalies`, `/similar`) still need Qdrant nearest-neighbor implementation. |
+| 4 | **Anomaly & Similarity Panel** | ✅ Done | Distance-to-centroid outlier detection + similarity search wired end-to-end. Backend: `GET /anomalies`, `GET /events/{id}/similar`, `POST /anomalies/tag`. Frontend: "Unusual Events" panel with honest triage framing, guide-to-embed UX, one-click "Tag Outliers" writing system annotations (separate from human annotations, rendered with `mdi-sigma` chips and "Analysis" section in event detail), "Find similar events" in detail panel. |
 | 5 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml` with fully-qualified image names (podman-compatible), `uv` workflow, environment-based config. Missing: authentication, GPU index selection, strict offline-mode guard for model downloads. |
 
 ## Completed architectural decisions
@@ -38,7 +38,7 @@ This document tracks implementation progress against the MVP defined in
 3. ✅ **Event table UX** — `item-value="event_id"` fixes single-row expand; click anywhere on a row to expand/collapse its detail (skips chips/buttons); persistent chevron icon; column visibility picker (`mdi-view-column-outline`) for Time, Source, Message, Tags, Description, Display name.
 4. ✅ **Podman compatibility** — `docker-compose.yml` updated to use fully-qualified `docker.io/…` image names; tested with podman-compose.
 5. ✅ **Export** — `POST /api/cases/{id}/timelines/{id}/export`; streams CSV or JSONL respecting active filters; browser download triggered from the Export dropdown in the event table toolbar.
-6. **Anomaly panel** — use Qdrant nearest-neighbor search to surface outliers and enable semantic similarity search.
+6. ✅ **Anomaly panel** — distance-to-centroid outlier scoring via Qdrant; similarity search; system annotations with math; one-click "Tag Outliers" action.
 7. **Authentication** — basic user auth for team access.
 8. **Offline-mode enforcement** — prevent HuggingFace network calls when `allow_online=false`.
 9. ✅ **Case/timeline deletion** — `DELETE` endpoints with cascade across ClickHouse + Qdrant + PostgreSQL; confirmation UI on CaseDetailView and CaseList.

@@ -35,7 +35,12 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         <Anomalies
           :results="anomalies"
           :loading="anomaliesLoading"
+          :tagging="anomaliesTagging"
+          :embed-running="embedJob?.status === 'running' || embedJob?.status === 'queued'"
+          :status="anomaliesStatus"
           @load="loadAnomalies"
+          @tag="tagOutliers"
+          @generate-embeddings="startEmbed"
         />
       </v-expansion-panels>
     </template>
@@ -120,6 +125,8 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           :loading="appStore.loading"
           :selected-ids="appStore.selectedEventIds"
           :annotations-by-event="appStore.annotationsByEvent"
+          :case-id="caseId"
+          :timeline-id="timelineId"
           @update:page="onPageChange"
           @update:limit="onLimitChange"
           @update:selected-ids="onSelectionChange"
@@ -212,9 +219,10 @@ import FilterChips from "@/components/Explore/FilterChips.vue";
 import EventTable from "@/components/Explore/EventTable.vue";
 import UploadFormButton from "@/components/UploadFormButton.vue";
 import { useAppStore } from "@/stores/app";
-import type { FilterState, SavedView, SimilarityResult } from "@/services/api";
+import type { FilterState, SavedView, SimilarityResult, VectorStatus } from "@/services/api";
 import {
   getAnomalies,
+  tagAnomalies,
   createView,
   startEmbedding,
   getJob,
@@ -236,6 +244,8 @@ const saveViewDialog = ref(false);
 const viewName = ref("");
 const anomalies = ref<SimilarityResult[]>([]);
 const anomaliesLoading = ref(false);
+const anomaliesTagging = ref(false);
+const anomaliesStatus = ref<VectorStatus | "">("");
 const embedJob = ref<{ id: string; status: string; progress: { total: number; processed: number }; error: string | null } | null>(null);
 const embedPolling = ref<number | null>(null);
 
@@ -461,9 +471,33 @@ async function exportEvents(format: "csv" | "jsonl") {
 async function loadAnomalies() {
   anomaliesLoading.value = true;
   try {
-    anomalies.value = await getAnomalies(caseId, timelineId);
+    const resp = await getAnomalies(caseId, timelineId);
+    anomaliesStatus.value = resp.status;
+    anomalies.value = resp.results;
+  } catch {
+    // Error shown by global notification interceptor.
   } finally {
     anomaliesLoading.value = false;
+  }
+}
+
+async function tagOutliers() {
+  anomaliesTagging.value = true;
+  try {
+    const resp = await tagAnomalies(caseId, timelineId);
+    anomaliesStatus.value = resp.status;
+    anomalies.value = resp.results;
+    // Refresh annotations so outlier chips appear in the event table.
+    await appStore.loadTimelineAnnotations(caseId, timelineId);
+    window.dispatchEvent(
+      new CustomEvent("app-success", {
+        detail: `Tagged ${resp.tagged} outlier${resp.tagged !== 1 ? "s" : ""} in timeline`,
+      }),
+    );
+  } catch {
+    // Error shown by global notification interceptor.
+  } finally {
+    anomaliesTagging.value = false;
   }
 }
 

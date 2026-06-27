@@ -70,17 +70,21 @@ Add a histogram/timeline chart above the event table:
 - Backend: add `GET /api/cases/{case_id}/timelines/{timeline_id}/histogram`
     returning bucket counts.
 
-### 4. Anomaly / similarity panel
+### 4. Anomaly / similarity panel ✅
 
 Turn the current stub panel into a working feature:
 
 - Backend: expose Qdrant nearest-neighbor search:
-  - `GET /api/cases/{case_id}/timelines/{timeline_id}/events/{event_id}/similar`
-  - `GET /api/cases/{case_id}/timelines/{timeline_id}/anomalies`
-- Frontend panel:
-  - "Find similar events" for the selected event.
-  - "Find outliers" across the timeline.
-  - Render results in a compact list with similarity scores.
+  - ✅ `GET /api/cases/{case_id}/timelines/{timeline_id}/events/{event_id}/similar`
+  - ✅ `GET /api/cases/{case_id}/timelines/{timeline_id}/anomalies`
+  - ✅ `POST /api/cases/{case_id}/timelines/{timeline_id}/anomalies/tag`
+- Frontend panel ("Unusual Events"):
+  - ✅ "Find Unusual Lines" — distance-to-centroid outlier detection; results with score + rank.
+  - ✅ "Tag Outliers in Timeline" — one-click bulk-tag; writes system annotations with math.
+  - ✅ "Find similar events" in the event detail panel.
+  - ✅ Guide-to-embed UX: shows "Generate Embeddings" button when no vectors exist.
+  - ✅ Machine annotations rendered separately from human annotations: `mdi-sigma` chips in the event table and a read-only "Analysis" section in the detail panel with full math breakdown.
+  - Algorithm: distance-to-centroid (O(1) ANN query); honest "triage, not threat detection" framing.
 
 ### 5. Case / timeline management
 
@@ -105,7 +109,7 @@ Turn the current stub panel into a working feature:
 6. ✅ Event table UX — single-row expand on click, persistent chevron, column picker.
 7. ✅ Export CSV/JSONL + backend endpoint.
 8. Time visualization histogram.
-9. Anomaly/similarity panel wired to Qdrant.
+9. ✅ Anomaly/similarity panel wired to Qdrant.
 
 ## Notes
 

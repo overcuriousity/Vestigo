@@ -13,8 +13,9 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from tracevector.db.postgres import PostgresStore
+from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.db.queries import EventQuery, EventQueryService
+from tracevector.db.similarity import SimilarityService
 
 router = APIRouter(prefix="/api/cases", tags=["events"])
 
@@ -212,3 +213,168 @@ async def export_events(
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── Similarity / outlier endpoints ───────────────────────────────────────────
+
+_similarity_service: SimilarityService | None = None
+
+
+def _get_similarity_service() -> SimilarityService:
+    global _similarity_service  # noqa: PLW0603
+    if _similarity_service is None:
+        _similarity_service = SimilarityService()
+    return _similarity_service
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/events/{event_id}/similar")
+async def find_similar_events(
+    case_id: str,
+    timeline_id: str,
+    event_id: str,
+    limit: int = Query(default=10, ge=1, le=100),
+) -> dict[str, Any]:
+    """Return events semantically similar to ``event_id`` using vector search.
+
+    Requires embeddings to have been generated for the timeline.  Returns
+    ``status="not_embedded"`` when no vectors exist, ``status="vector_not_found"``
+    when the specific event has no vector.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    svc = _get_similarity_service()
+    result = svc.find_similar(case_id, timeline_id, event_id, limit=limit)
+    return {
+        "status": result.status,
+        "results": [
+            {"event_id": r.event_id, "score": r.score, "event": r.event}
+            for r in result.results
+        ],
+    }
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/anomalies")
+async def list_anomalies(
+    case_id: str,
+    timeline_id: str,
+    limit: int = Query(default=50, ge=1, le=500),
+    sample_size: int = Query(default=5000, ge=10, le=100000),
+) -> dict[str, Any]:
+    """Return the most unusual events in a timeline (read-only preview).
+
+    Uses distance-to-centroid scoring over the timeline's vector embeddings.
+    Results are statistical outliers — *rare* lines, not necessarily malicious.
+    Requires embeddings to have been generated first.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    svc = _get_similarity_service()
+    result = svc.find_anomalies(
+        case_id, timeline_id, limit=limit, sample_size=sample_size
+    )
+    return {
+        "status": result.status,
+        "sample_size": result.sample_size,
+        "embedding_config_hash": result.embedding_config_hash,
+        "results": [
+            {
+                "event_id": r.event_id,
+                "score": r.score,
+                "event": r.event,
+                "details": r.details,
+            }
+            for r in result.results
+        ],
+    }
+
+
+class TagAnomaliesRequest(BaseModel):
+    """Request body for the tag-outliers endpoint."""
+
+    limit: int = Field(default=50, ge=1, le=500)
+    sample_size: int = Field(default=5000, ge=10, le=100000)
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/anomalies/tag")
+async def tag_anomalies(
+    case_id: str,
+    timeline_id: str,
+    body: TagAnomaliesRequest,
+) -> dict[str, Any]:
+    """Re-compute outliers and persist them as system annotations.
+
+    Clears any existing system outlier annotations for the timeline first,
+    so repeated calls replace rather than accumulate results.  Each outlier
+    receives:
+    - ``annotation_type="outlier"`` / ``origin="system"``
+    - A human-readable ``content`` summarising the score.
+    - A structured ``details`` JSON with the raw math for the Analysis panel.
+
+    Returns the same result shape as ``GET /anomalies`` plus a ``tagged`` count.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    svc = _get_similarity_service()
+    result = svc.find_anomalies(
+        case_id, timeline_id, limit=body.limit, sample_size=body.sample_size
+    )
+
+    if result.status != "ok":
+        return {
+            "status": result.status,
+            "tagged": 0,
+            "sample_size": result.sample_size,
+            "embedding_config_hash": result.embedding_config_hash,
+            "results": [],
+        }
+
+    # Clear prior system outlier annotations for this timeline.
+    await store.delete_system_annotations(case_id, timeline_id, "outlier")
+
+    # Write one system annotation per outlier.
+    rows = []
+    for r in result.results:
+        d = r.details
+        content = (
+            f"Outlier — cosine distance {d['distance']:.4f} from timeline centroid "
+            f"(rank {d['rank']}/{d['of']}, sample {d['sample_size']})"
+        )
+        rows.append(
+            {
+                "annotation_id": generate_id(f"{r.event_id}_outlier"),
+                "case_id": case_id,
+                "timeline_id": timeline_id,
+                "event_id": r.event_id,
+                "annotation_type": "outlier",
+                "content": content,
+                "origin": "system",
+                "details": d,
+            }
+        )
+
+    tagged = await store.bulk_create_annotations(rows)
+
+    return {
+        "status": "ok",
+        "tagged": tagged,
+        "sample_size": result.sample_size,
+        "embedding_config_hash": result.embedding_config_hash,
+        "results": [
+            {
+                "event_id": r.event_id,
+                "score": r.score,
+                "event": r.event,
+                "details": r.details,
+            }
+            for r in result.results
+        ],
+    }
