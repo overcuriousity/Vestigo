@@ -17,6 +17,7 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     PointStruct,
+    ScoredPoint,
     VectorParams,
 )
 
@@ -173,6 +174,109 @@ class QdrantStore:
                         ]
                     ),
                 )
+
+    def find_timeline_collection(self, case_id: str, timeline_id: str) -> str | None:
+        """Return the Qdrant collection name that holds vectors for ``timeline_id``.
+
+        Iterates collections for the case and returns the first (by vector count,
+        largest first) that contains at least one point with the given timeline_id
+        in its payload.  Returns ``None`` when no embeddings exist for the timeline.
+        """
+        names = self.case_collections(case_id)
+        if not names:
+            return None
+
+        # Rank candidates by how many points they hold for this timeline_id.
+        best: tuple[int, str] | None = None
+        timeline_filter = Filter(
+            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
+        )
+        for name in names:
+            with contextlib.suppress(Exception):
+                result = self.client.count(
+                    collection_name=name,
+                    count_filter=timeline_filter,
+                    exact=False,
+                )
+                count = result.count
+                if count > 0 and (best is None or count > best[0]):
+                    best = (count, name)
+
+        return best[1] if best is not None else None
+
+    def scroll_vectors(
+        self,
+        collection_name: str,
+        timeline_id: str,
+        limit: int,
+        with_vectors: bool = True,
+    ) -> list[ScoredPoint]:
+        """Return up to ``limit`` points for a timeline, with vectors.
+
+        Uses the Qdrant ``scroll`` API which returns arbitrary (non-ranked) points —
+        suitable for centroid computation where ranking does not matter.
+
+        Returns a list of :class:`qdrant_client.models.Record` objects.
+        """
+        timeline_filter = Filter(
+            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
+        )
+        records, _next = self.client.scroll(
+            collection_name=collection_name,
+            scroll_filter=timeline_filter,
+            limit=limit,
+            with_vectors=with_vectors,
+            with_payload=True,
+        )
+        return list(records)  # type: ignore[return-value]
+
+    def search(
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        timeline_id: str,
+        limit: int,
+        with_vectors: bool = True,
+    ) -> list[ScoredPoint]:
+        """Return up to ``limit`` nearest neighbours of ``query_vector``.
+
+        Results are filtered to ``timeline_id`` via a payload filter and returned
+        in descending score (similarity) order.
+        """
+        timeline_filter = Filter(
+            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
+        )
+        return self.client.query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            query_filter=timeline_filter,
+            limit=limit,
+            with_vectors=with_vectors,
+            with_payload=True,
+        ).points
+
+    def retrieve_vector(
+        self, collection_name: str, event_id: str
+    ) -> list[float] | None:
+        """Retrieve the stored vector for a single point by its event_id.
+
+        Returns ``None`` if the point does not exist in the collection.
+        """
+        results = self.client.retrieve(
+            collection_name=collection_name,
+            ids=[event_id],
+            with_vectors=True,
+            with_payload=False,
+        )
+        if not results:
+            return None
+        vec = results[0].vector
+        if isinstance(vec, list):
+            return vec
+        # Named vectors dict (shouldn't occur for single unnamed vector collections)
+        if isinstance(vec, dict):
+            return next(iter(vec.values()), None)
+        return None
 
     def delete_case_collections(self, case_id: str) -> None:
         """Delete all Qdrant collections that belong to ``case_id``."""

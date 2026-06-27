@@ -160,9 +160,10 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         {{ tag }}
       </v-chip>
       <template v-if="annotationsByEvent[item.event_id]">
+        <!-- Human tag annotations -->
         <v-chip
           v-for="ann in annotationsByEvent[item.event_id].filter(
-            (a) => a.annotation_type === 'tag',
+            (a) => a.annotation_type === 'tag' && (a.origin ?? 'user') === 'user',
           )"
           :key="ann.id"
           size="x-small"
@@ -172,14 +173,35 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         >
           {{ ann.content }}
         </v-chip>
+        <!-- Human comment indicator -->
         <v-icon
-          v-if="annotationsByEvent[item.event_id].some((a) => a.annotation_type === 'comment')"
+          v-if="annotationsByEvent[item.event_id].some(
+            (a) => a.annotation_type === 'comment' && (a.origin ?? 'user') === 'user',
+          )"
           size="small"
           color="secondary"
           title="Has comments"
         >
           mdi-comment-text
         </v-icon>
+        <!-- System outlier chip (distinct style, no delete affordance) -->
+        <v-chip
+          v-if="annotationsByEvent[item.event_id].some(
+            (a) => a.annotation_type === 'outlier' && a.origin === 'system',
+          )"
+          size="x-small"
+          class="mr-1"
+          color="warning"
+          variant="tonal"
+          prepend-icon="mdi-sigma"
+          :title="
+            annotationsByEvent[item.event_id]
+              .find((a) => a.annotation_type === 'outlier' && a.origin === 'system')
+              ?.content ?? 'Statistical outlier'
+          "
+        >
+          outlier
+        </v-chip>
       </template>
     </template>
 
@@ -199,6 +221,8 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         <EventDetail
           :event="item"
           :annotations="annotationsByEvent[item.event_id] ?? []"
+          :case-id="props.caseId"
+          :timeline-id="props.timelineId"
           @filter-field="emit('filter-field', $event)"
           @exclude-field="emit('exclude-field', $event)"
           @add-annotation="
@@ -262,6 +286,8 @@ const props = defineProps<{
   loading: boolean;
   selectedIds: Set<string>;
   annotationsByEvent: Record<string, Annotation[]>;
+  caseId?: string;
+  timelineId?: string;
 }>();
 
 const emit = defineEmits<{

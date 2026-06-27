@@ -181,6 +181,41 @@ class ClickHouseStore:
         columns = result.column_names
         return [dict(zip(columns, row, strict=False)) for row in result.result_rows]
 
+    def get_events_by_ids(
+        self, case_id: str, timeline_id: str, event_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Return a mapping of event_id → event dict for a list of IDs.
+
+        Only returns rows that exist in ClickHouse.  Unknown IDs are silently
+        absent from the result (callers should fall back to the Qdrant payload).
+        """
+        if not event_ids:
+            return {}
+        self.init_schema()
+        # Build parameterized IN clause: {p0:String},{p1:String},...
+        param_names = [f"p{i}" for i in range(len(event_ids))]
+        in_clause = ", ".join(f"{{{name}:String}}" for name in param_names)
+        parameters: dict[str, str] = dict(zip(param_names, event_ids, strict=False))
+        parameters["case_id"] = case_id
+        parameters["timeline_id"] = timeline_id
+        result = self.client.query(
+            f"""
+            SELECT
+                event_id, case_id, timeline_id, source_file, byte_offset, line_number,
+                content_hash, parser_name, parser_version, ingest_time, message,
+                timestamp, timestamp_desc, source, source_long, display_name,
+                tags, attributes, embedding_model, embedding_config_hash, vector_id
+            FROM {self.database}.events
+            WHERE case_id = {{case_id:String}}
+              AND timeline_id = {{timeline_id:String}}
+              AND toString(event_id) IN ({in_clause})
+            """,
+            parameters=parameters,
+        )
+        columns = result.column_names
+        rows = [dict(zip(columns, row, strict=False)) for row in result.result_rows]
+        return {str(row["event_id"]): row for row in rows}
+
     def delete_timeline_events(self, case_id: str, timeline_id: str) -> None:
         """Remove all events for a timeline by dropping its ClickHouse partition.
 

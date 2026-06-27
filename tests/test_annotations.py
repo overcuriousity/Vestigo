@@ -36,6 +36,8 @@ def test_annotation_to_dict_shape():
         annotation_type="tag",
         content="malware",
         created_by=None,
+        origin="user",
+        details=None,
         created_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
     d = ann.to_dict()
@@ -46,12 +48,16 @@ def test_annotation_to_dict_shape():
         "content",
         "created_at",
         "created_by",
+        "origin",
+        "details",
     }
     assert d["id"] == "ann_abc123"
     assert d["event_id"] == "evt1"
     assert d["annotation_type"] == "tag"
     assert d["content"] == "malware"
     assert d["created_by"] is None
+    assert d["origin"] == "user"
+    assert d["details"] is None
     assert "2024-01-01" in d["created_at"]
 
 
@@ -181,3 +187,125 @@ async def test_to_dict_round_trip(store: PostgresStore):
     assert d["content"] == "looks like C2 traffic"
     assert d["created_by"] == "analyst@example.com"
     assert d["created_at"] is not None
+    assert d["origin"] == "user"
+    assert d["details"] is None
+
+
+# ---------------------------------------------------------------------------
+# System annotation (origin / details)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_system_annotation_origin_and_details(store: PostgresStore):
+    """System annotations store origin='system' and structured details."""
+    details = {
+        "method": "centroid-distance",
+        "distance": 0.87,
+        "rank": 1,
+        "of": 50,
+        "sample_size": 5000,
+        "embedding_config_hash": "abc123",
+    }
+    ann = await store.create_annotation(
+        case_id="c5",
+        timeline_id="t5",
+        event_id="e7",
+        annotation_id="ann_sys",
+        annotation_type="outlier",
+        content="Outlier — distance 0.87",
+        origin="system",
+        details=details,
+    )
+    assert ann.origin == "system"
+    assert ann.details is not None
+    assert ann.details["rank"] == 1
+    d = ann.to_dict()
+    assert d["origin"] == "system"
+    assert d["details"]["distance"] == 0.87
+
+
+@pytest.mark.asyncio
+async def test_delete_annotation_cannot_delete_system(store: PostgresStore):
+    """delete_annotation must not remove system-origin annotations."""
+    await store.create_annotation(
+        case_id="c6",
+        timeline_id="t6",
+        event_id="e8",
+        annotation_id="ann_sys2",
+        annotation_type="outlier",
+        content="system content",
+        origin="system",
+    )
+    # delete_annotation only removes origin='user' rows.
+    deleted = await store.delete_annotation("c6", "e8", "ann_sys2")
+    assert deleted is False
+    results = await store.list_annotations("c6", "t6", "e8")
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_annotations(store: PostgresStore):
+    """bulk_create_annotations inserts multiple rows atomically."""
+    rows = [
+        {
+            "annotation_id": f"bulk_{i}",
+            "case_id": "c7",
+            "timeline_id": "t7",
+            "event_id": f"e{i}",
+            "annotation_type": "outlier",
+            "content": f"Outlier rank {i}",
+            "origin": "system",
+            "details": {"rank": i},
+        }
+        for i in range(5)
+    ]
+    count = await store.bulk_create_annotations(rows)
+    assert count == 5
+    results = await store.list_timeline_annotations("c7", "t7")
+    assert len(results) == 5
+    assert all(r.origin == "system" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_delete_system_annotations(store: PostgresStore):
+    """delete_system_annotations removes only system outlier rows."""
+    # System outlier annotations.
+    await store.bulk_create_annotations(
+        [
+            {
+                "annotation_id": f"sys_{i}",
+                "case_id": "c8",
+                "timeline_id": "t8",
+                "event_id": f"e{i}",
+                "annotation_type": "outlier",
+                "content": "outlier",
+                "origin": "system",
+            }
+            for i in range(3)
+        ]
+    )
+    # Human tag that must survive.
+    await store.create_annotation(
+        case_id="c8",
+        timeline_id="t8",
+        event_id="e0",
+        annotation_id="human_tag",
+        annotation_type="tag",
+        content="suspicious",
+        origin="user",
+    )
+
+    deleted_count = await store.delete_system_annotations("c8", "t8", "outlier")
+    assert deleted_count == 3
+
+    remaining = await store.list_timeline_annotations("c8", "t8")
+    assert len(remaining) == 1
+    assert remaining[0].id == "human_tag"
+
+
+@pytest.mark.asyncio
+async def test_delete_system_annotations_idempotent(store: PostgresStore):
+    """delete_system_annotations is a no-op when nothing matches."""
+    count = await store.delete_system_annotations("c_empty", "t_empty", "outlier")
+    assert count == 0
