@@ -31,8 +31,6 @@ export const DEFAULT_COLUMNS = [
   "timestamp",
   "source",
   "message",
-  "tags",
-  "_annotations",
 ];
 
 export const useUiStore = create<UiState>()(

@@ -1,10 +1,12 @@
 /**
  * TriageMeter — compact summary bar shown in the Explorer header.
- * Shows triage coverage and outlier-reviewed progress derived from annotations.
+ * Shows session-momentum (events you've triaged this session) and the
+ * outlier-reviewed progress derived from annotations.
  */
-import { CoverageRing } from "./CoverageRing";
+import { SessionMomentum } from "./SessionMomentum";
 import { Progress } from "@/components/ui/Progress";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { SESSION_START } from "@/lib/session";
 import type { Annotation } from "@/api/types";
 
 interface Props {
@@ -20,12 +22,6 @@ function computeProgress(annotations: Annotation[]) {
     byEvent.set(a.event_id, list);
   }
 
-  // Annotated = events with ≥1 user annotation
-  const annotatedEventIds = new Set<string>();
-  for (const [eid, anns] of byEvent) {
-    if (anns.some((a) => a.origin === "user")) annotatedEventIds.add(eid);
-  }
-
   // Outlier events = those tagged by system
   const outlierEventIds = new Set<string>(
     annotations
@@ -38,15 +34,24 @@ function computeProgress(annotations: Annotation[]) {
     (byEvent.get(eid) ?? []).some((a) => a.origin === "user"),
   ).length;
 
+  // Events triaged this session = distinct events with a user annotation
+  // created at or after SESSION_START
+  const sessionEventIds = new Set<string>();
+  for (const a of annotations) {
+    if (a.origin === "user" && new Date(a.created_at).getTime() >= SESSION_START) {
+      sessionEventIds.add(a.event_id);
+    }
+  }
+
   return {
-    annotated: annotatedEventIds.size,
     totalOutliers: outlierEventIds.size,
     outliersReviewed,
+    triagedThisSession: sessionEventIds.size,
   };
 }
 
-export function TriageMeter({ annotations, totalEvents }: Props) {
-  const { annotated, totalOutliers, outliersReviewed } =
+export function TriageMeter({ annotations, totalEvents: _totalEvents }: Props) {
+  const { totalOutliers, outliersReviewed, triagedThisSession } =
     computeProgress(annotations);
 
   const outlierPct =
@@ -54,19 +59,8 @@ export function TriageMeter({ annotations, totalEvents }: Props) {
 
   return (
     <div className="flex items-center gap-4">
-      {/* Coverage ring */}
-      <Tooltip
-        content={`${annotated.toLocaleString()} / ${totalEvents.toLocaleString()} events annotated`}
-      >
-        <div className="flex items-center gap-2">
-          <CoverageRing annotated={annotated} total={totalEvents} size={36} />
-          <div className="hidden sm:block">
-            <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
-              Triage
-            </p>
-          </div>
-        </div>
-      </Tooltip>
+      {/* Session momentum */}
+      <SessionMomentum count={triagedThisSession} />
 
       {/* Outliers meter — only shown when outliers exist */}
       {totalOutliers > 0 && (

@@ -1,10 +1,9 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Tag, MessageSquare, X } from "lucide-react";
-import { annotationsApi } from "@/api/annotations";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
+import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 
 interface Props {
   selectedIds: string[];
@@ -16,28 +15,22 @@ interface Props {
 export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Props) {
   const [mode, setMode] = useState<"tag" | "comment" | null>(null);
   const [value, setValue] = useState("");
-  const qc = useQueryClient();
+  const { add } = useAnnotationMutations(caseId, timelineId);
 
-  const { mutate, isPending } = useMutation({
-    mutationFn: async () => {
-      const type = mode === "tag" ? "tag" : "comment";
-      await Promise.all(
-        selectedIds.map((eventId) =>
-          annotationsApi.create(caseId, timelineId, eventId, type, value.trim()),
-        ),
-      );
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["annotations", caseId, timelineId] });
+  function applyToAll() {
+    if (!mode || !value.trim()) return;
+    const type = mode === "tag" ? "tag" : "comment";
+    // Fire all creates in parallel; the shared hook invalidates on success.
+    Promise.all(
+      selectedIds.map((eventId) =>
+        add.mutateAsync({ eventId, type, content: value.trim() }),
+      ),
+    ).finally(() => {
       onClear();
       setMode(null);
       setValue("");
-    },
-    onError: () => {
-      // Partial successes may have committed; refresh to reflect actual state.
-      qc.invalidateQueries({ queryKey: ["annotations", caseId, timelineId] });
-    },
-  });
+    });
+  }
 
   if (selectedIds.length === 0) return null;
 
@@ -73,7 +66,7 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && value.trim()) mutate();
+              if (e.key === "Enter" && value.trim()) applyToAll();
               if (e.key === "Escape") setMode(null);
             }}
             className="flex-1 max-w-xs"
@@ -81,10 +74,10 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
           <Button
             variant="accent"
             size="sm"
-            disabled={!value.trim() || isPending}
-            onClick={() => mutate()}
+            disabled={!value.trim() || add.isPending}
+            onClick={applyToAll}
           >
-            {isPending ? <Spinner size={13} /> : "Apply"}
+            {add.isPending ? <Spinner size={13} /> : "Apply"}
           </Button>
           <Button variant="ghost" size="sm" onClick={() => setMode(null)}>
             Cancel

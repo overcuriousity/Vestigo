@@ -1,15 +1,20 @@
 import { useState } from "react";
-import { X, Copy, Search, Filter, FilterX } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { Input } from "@/components/ui/Input";
+import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampFull, fmtRelative } from "@/lib/time";
 import { truncateHash } from "@/lib/format";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import type { Event, Annotation } from "@/api/types";
 
 interface Props {
   event: Event;
   annotations: Annotation[];
+  caseId: string;
+  timelineId: string;
   onClose: () => void;
   onFindSimilar: (event: Event) => void;
   /** Called when the user clicks filter-in or filter-out on a field row. */
@@ -101,15 +106,69 @@ function FieldRow({
   );
 }
 
+/** Inline add-annotation form (tag or comment). */
+function AddAnnotationForm({
+  type,
+  onSubmit,
+  onCancel,
+  isPending,
+}: {
+  type: "tag" | "comment";
+  onSubmit: (content: string) => void;
+  onCancel: () => void;
+  isPending: boolean;
+}) {
+  const [value, setValue] = useState("");
+  return (
+    <div className="flex items-center gap-1.5 mt-2">
+      <Input
+        autoFocus
+        placeholder={type === "tag" ? "tag label…" : "your comment…"}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && value.trim()) onSubmit(value.trim());
+          if (e.key === "Escape") onCancel();
+        }}
+        className="flex-1 h-7 text-xs"
+      />
+      <Button
+        variant="accent"
+        size="sm"
+        disabled={!value.trim() || isPending}
+        onClick={() => value.trim() && onSubmit(value.trim())}
+      >
+        {isPending ? <Spinner size={12} /> : "Add"}
+      </Button>
+      <Button variant="ghost" size="sm" onClick={onCancel}>
+        Cancel
+      </Button>
+    </div>
+  );
+}
+
 export function EventDetailPanel({
   event,
   annotations,
+  caseId,
+  timelineId,
   onClose,
   onFindSimilar,
   onAddFilter,
 }: Props) {
+  const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
+  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+
   const userAnnotations = annotations.filter((a) => a.origin === "user");
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
+
+  function handleAdd(content: string) {
+    if (!addMode) return;
+    add.mutate(
+      { eventId: event.event_id, type: addMode, content },
+      { onSuccess: () => setAddMode(null) },
+    );
+  }
 
   return (
     <div className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] w-96 shrink-0">
@@ -251,25 +310,50 @@ export function EventDetailPanel({
           </div>
         )}
 
-        {/* Annotations */}
+        {/* Annotations — editable */}
         <div className="mb-3">
           <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
             Annotations
           </p>
-          {userAnnotations.length === 0 && (
-            <p className="text-xs text-[var(--color-fg-muted)]">None</p>
+
+          {/* User annotations — deletable */}
+          {userAnnotations.length === 0 && addMode === null && (
+            <p className="text-xs text-[var(--color-fg-muted)] mb-2">None</p>
           )}
           {userAnnotations.map((a) => (
             <div
               key={a.id}
-              className="mb-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-xs"
+              className="group/ann mb-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-2 text-xs"
             >
-              <span className="font-medium text-[var(--color-fg-secondary)] capitalize">
-                {a.annotation_type}:
-              </span>{" "}
-              <span className="text-[var(--color-fg-primary)]">{a.content}</span>
+              <div className="flex items-start gap-1.5">
+                {a.annotation_type === "tag" ? (
+                  <Tag size={11} className="shrink-0 mt-0.5 text-[var(--color-accent)]" />
+                ) : (
+                  <MessageSquare size={11} className="shrink-0 mt-0.5 text-[var(--color-info)]" />
+                )}
+                <span className="flex-1 text-[var(--color-fg-primary)] break-all leading-snug">{a.content}</span>
+                <Tooltip content="Delete annotation" side="top">
+                  <button
+                    onClick={() =>
+                      remove.mutate({ eventId: event.event_id, annotationId: a.id })
+                    }
+                    disabled={remove.isPending}
+                    className="shrink-0 rounded p-0.5 opacity-0 group-hover/ann:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)] transition-base"
+                  >
+                    <Trash2 size={11} />
+                  </button>
+                </Tooltip>
+              </div>
+              <Tooltip content={fmtTimestampFull(a.created_at)} side="bottom">
+                <p className="mt-1 flex items-center gap-1 text-[9px] text-[var(--color-fg-muted)]">
+                  <Clock size={8} />
+                  {a.created_by ?? "anonymous"} · {fmtRelative(a.created_at)}
+                </p>
+              </Tooltip>
             </div>
           ))}
+
+          {/* System annotations (outliers) — read-only */}
           {systemAnnotations.map((a) => (
             <div
               key={a.id}
@@ -281,6 +365,37 @@ export function EventDetailPanel({
               <span className="text-[var(--color-fg-primary)]">{a.content}</span>
             </div>
           ))}
+
+          {/* Inline add form */}
+          {addMode !== null ? (
+            <AddAnnotationForm
+              type={addMode}
+              onSubmit={handleAdd}
+              onCancel={() => setAddMode(null)}
+              isPending={add.isPending}
+            />
+          ) : (
+            <div className="flex gap-1.5 mt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setAddMode("tag")}
+              >
+                <Plus size={11} />
+                <Tag size={11} />
+                Tag
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setAddMode("comment")}
+              >
+                <Plus size={11} />
+                <MessageSquare size={11} />
+                Comment
+              </Button>
+            </div>
+          )}
         </div>
 
         {/* Provenance — display-only, no filter buttons */}

@@ -33,8 +33,6 @@ const TOP_LEVEL_LABELS: Record<string, string> = {
   display_name: "Display Name",
   message: "Message",
   timestamp_desc: "Timestamp Desc",
-  tags: "Parser Tags",
-  _annotations: "Annotations",
 };
 
 function ColumnRow({

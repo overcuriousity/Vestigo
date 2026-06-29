@@ -354,6 +354,8 @@ export function ExplorerPage() {
                   offset={offset}
                   annotations={annotationMap}
                   selectedIds={selectedIds}
+                  caseId={caseId!}
+                  timelineId={timelineId!}
                   onToggleSelect={handleToggleSelect}
                   expandedId={expandedEvent?.event_id ?? null}
                   onExpand={setExpandedEvent}
@@ -367,6 +369,8 @@ export function ExplorerPage() {
                   <EventDetailPanel
                     event={expandedEvent}
                     annotations={annotationMap.get(expandedEvent.event_id) ?? []}
+                    caseId={caseId!}
+                    timelineId={timelineId!}
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
