@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Index, String, func
+from sqlalchemy import JSON, DateTime, Index, String, func, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -328,18 +328,32 @@ class PostgresStore:
     ) -> None:
         """Update stored event/vector counts for a timeline.
 
+        ``event_count`` is treated as a delta and added atomically to the
+        stored value (preventing lost updates under concurrent uploads).
+        ``vector_count`` is set to the supplied absolute value.
         Pass ``None`` for a count that should not be changed.
         """
-        timeline = await self.get_timeline(case_id, timeline_id)
-        if timeline is None:
-            return
-        if event_count is not None:
-            timeline.event_count = event_count
+        values: dict = {"updated_at": datetime.now(UTC)}
         if vector_count is not None:
-            timeline.vector_count = vector_count
-        timeline.updated_at = datetime.now(UTC)
+            values["vector_count"] = vector_count
         async with self.session_factory() as session:
-            session.add(timeline)
+            if event_count is not None:
+                # Atomic increment avoids the read-then-write race when two
+                # uploads complete concurrently for the same timeline.
+                await session.execute(
+                    update(Timeline)
+                    .where(Timeline.id == timeline_id, Timeline.case_id == case_id)
+                    .values(
+                        event_count=Timeline.event_count + event_count,
+                        **{k: v for k, v in values.items()},
+                    )
+                )
+            elif values:
+                await session.execute(
+                    update(Timeline)
+                    .where(Timeline.id == timeline_id, Timeline.case_id == case_id)
+                    .values(**values)
+                )
             await session.commit()
 
     async def get_timeline_upload_by_hash(

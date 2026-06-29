@@ -413,7 +413,7 @@ class EventQueryService:
             SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
                    count() AS c
             FROM {database}.events
-            WHERE {where}
+            WHERE {where} AND timestamp IS NOT NULL
             GROUP BY bucket
             ORDER BY bucket
             """,

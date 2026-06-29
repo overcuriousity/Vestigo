@@ -207,6 +207,7 @@ class ExportFilter(BaseModel):
     q: str | None = None
     source: str | None = None
     tag: str | None = None
+    exclude_tag: str | None = None
     start: datetime | None = None
     end: datetime | None = None
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
@@ -294,6 +295,7 @@ async def export_events(
         q=body.filter.q,
         source=body.filter.source,
         tag=body.filter.tag,
+        exclude_tag=body.filter.exclude_tag,
         start=body.filter.start,
         end=body.filter.end,
         field_filters=body.filter.fields,

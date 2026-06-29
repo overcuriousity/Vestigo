@@ -186,11 +186,10 @@ async def upload_timeline(
             source_name=file.filename or tmp_path.name,
         )
         result = pipeline.run(tmp_path, format_name=fmt)
-        new_event_count = (timeline.event_count or 0) + result.events_inserted
         await store.update_timeline_counts(
             case_id=case_id,
             timeline_id=timeline_id,
-            event_count=new_event_count,
+            event_count=result.events_inserted,
             vector_count=0,
         )
         await store.create_timeline_upload(
