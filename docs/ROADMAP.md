@@ -2,6 +2,10 @@
 
 This document tracks the agreed scope for the TraceVector API and UI.
 
+> **Next major phase:** Model refactor (Case / Source / Timeline / Artifact vocabulary).
+> Full design in [`docs/MODEL_REFINEMENT.md`](./MODEL_REFINEMENT.md).
+> The items below are scoped to the **current** (pre-refactor) model.
+
 ## Out of scope
 
 The following Timesketch features are **not** planned for this phase:

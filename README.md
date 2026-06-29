@@ -31,6 +31,9 @@ The frontend is being redesigned — tech stack TBD.
 
 - [Concept](docs/CONCEPT.md)
 - [Tech Stack](docs/TECH_STACK.md)
+- [Model Refinement](docs/MODEL_REFINEMENT.md) — approved Case / Source / Timeline / Artifact redesign
+- [Roadmap](docs/ROADMAP.md)
+- [Progress](docs/PROGRESS.md)
 
 ## License
 

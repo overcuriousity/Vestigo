@@ -24,15 +24,22 @@ TraceVector is a focused, self-hosted alternative: ingest huge logs, explore the
 - **Forensic rigor**: Immutable ingestion, config-stability checks for embedding models, and offline-by-default operation.
 
 ## 5. Key Concepts / Data Model
+
+> ⚠️ **This table is superseded.** The vocabulary below has been refined and approved in
+> [`docs/MODEL_REFINEMENT.md`](./MODEL_REFINEMENT.md). Implementation should follow that
+> document, not this one. The table is kept here for historical context only.
+
 | Concept | Description |
 |--------|-------------|
 | **Case** | An investigation container (e.g. "Compromised endpoint ACME-123"). |
-| **Timeline** | A single imported data source inside a case; has a schema and ingestion metadata. |
-| **Event** | One row in a timeline; the atomic unit of filtering, annotation, and embedding. |
-| **Raw Log** | The original, immutable source file or chunk stored for audit/re-download. |
+| **Timeline** | ~~A single imported data source inside a case~~ → see MODEL_REFINEMENT.md. |
+| **Source** | One ingested file; the unit of forensic provenance and immutability. (New.) |
+| **Event** | One record from a Source; stamped with its **Artifact** type. |
+| **Artifact** | The per-event Plaso class (`LOG`, `WEBHIST`, `FILE`, …). Renamed from `source`/`source_long`. |
+| **Raw Log / Source file** | Original file — SHA-256 hashed on upload; to be retained for re-download (see MODEL_REFINEMENT.md). |
 | **Embedding** | A dense vector representation of an event's textual content, produced by a local model. |
-| **Vector Collection** | A Qdrant collection holding event embeddings for a case or timeline. |
-| **View** | A saved set of filters (time range, full-text, field values) applied to events. |
+| **Vector Collection** | A Qdrant collection holding event embeddings for a case/source. |
+| **View** | A saved set of filters (time range, full-text, field values) applied to a Timeline. |
 | **Annotation** | A comment, tag, or highlight attached to one or more events. |
 
 ## 6. Proposed MVP Feature Set
