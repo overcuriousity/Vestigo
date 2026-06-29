@@ -301,13 +301,19 @@ class SimilarityService:
             )
 
         # Compute the normal-set centroid to derive a meaningful distance score.
-        normal_vecs_raw = self.qdrant.scroll_vectors(
-            collection, timeline_id, limit=len(normal_ids) + 1, with_vectors=True
+        # Fetch the specific normal-event vectors by ID so we always retrieve the
+        # right points regardless of timeline size (scroll_vectors returns arbitrary
+        # points and would miss the normal events on any large timeline).
+        normal_vecs_raw = self.qdrant.client.retrieve(
+            collection_name=collection,
+            ids=normal_ids,
+            with_vectors=True,
+            with_payload=False,
         )
         normal_vecs = [
             np.array(r.vector, dtype=np.float32)
             for r in normal_vecs_raw
-            if str(r.id) in normal_id_set
+            if r.vector is not None
         ]
         if normal_vecs:
             centroid: np.ndarray = np.mean(normal_vecs, axis=0)

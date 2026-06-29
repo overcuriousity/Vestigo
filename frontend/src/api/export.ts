@@ -13,6 +13,7 @@ export async function downloadExport(
       q: filters.q,
       source: filters.source,
       tag: filters.tag,
+      exclude_tag: filters.excludeTag,
       start: filters.start,
       end: filters.end,
       fields: filters.filters ?? {},

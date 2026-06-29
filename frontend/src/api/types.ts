@@ -217,6 +217,7 @@ export interface ExportRequest {
     q?: string;
     source?: string;
     tag?: string;
+    exclude_tag?: string;
     start?: string;
     end?: string;
     fields?: Record<string, string>;
