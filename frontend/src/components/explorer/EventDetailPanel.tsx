@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -104,6 +104,44 @@ function FieldRow({
         <CopyButton value={value} />
       </div>
     </div>
+  );
+}
+
+/** Button to toggle "normal operation" annotation on an event. */
+function NormalToggleButton({
+  event,
+  annotations,
+  add,
+  remove,
+}: {
+  event: Event;
+  annotations: Annotation[];
+  add: ReturnType<typeof useAnnotationMutations>["add"];
+  remove: ReturnType<typeof useAnnotationMutations>["remove"];
+}) {
+  const normalAnn = annotations.find(
+    (a) => a.annotation_type === "normal" && a.origin === "user",
+  );
+  const isNormal = !!normalAnn;
+
+  const handleClick = () => {
+    if (isNormal && normalAnn) {
+      remove.mutate({ eventId: event.event_id, annotationId: normalAnn.id });
+    } else {
+      add.mutate({ eventId: event.event_id, type: "normal", content: "normal operation" });
+    }
+  };
+
+  return (
+    <Button
+      variant={isNormal ? "accent" : "outline"}
+      size="sm"
+      onClick={handleClick}
+      disabled={add.isPending || remove.isPending}
+    >
+      <ShieldCheck size={11} />
+      {isNormal ? "Normal ✓" : "Mark Normal"}
+    </Button>
   );
 }
 
@@ -412,7 +450,7 @@ export function EventDetailPanel({
               isPending={add.isPending}
             />
           ) : (
-            <div className="flex gap-1.5 mt-2">
+            <div className="flex flex-wrap gap-1.5 mt-2">
               <Button
                 variant="outline"
                 size="sm"
@@ -431,6 +469,12 @@ export function EventDetailPanel({
                 <MessageSquare size={11} />
                 Comment
               </Button>
+              <NormalToggleButton
+                event={event}
+                annotations={annotations}
+                add={add}
+                remove={remove}
+              />
             </div>
           )}
         </div>

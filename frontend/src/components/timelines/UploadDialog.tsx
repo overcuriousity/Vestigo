@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Upload, FileText } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
@@ -27,12 +27,30 @@ export function UploadDialog({ caseId, timelineId, timelineName }: Props) {
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
-      // Show result in status; don't auto-close so user sees the outcome
       console.info("Upload result", result);
+      // Auto-close on successful new uploads after a short delay so the user
+      // cannot immediately click Upload again on the same selection. Keep the
+      // dialog open for duplicates so the message is visible.
+      if (!result.duplicate) {
+        window.setTimeout(() => {
+          setOpen(false);
+          setFile(null);
+          setParser("");
+        }, 1200);
+      }
     },
   });
 
   const handleFile = (f: File) => setFile(f);
+
+  // Reset selection whenever the dialog is reopened so a previous upload does
+  // not linger.
+  useEffect(() => {
+    if (open) {
+      setFile(null);
+      setParser("");
+    }
+  }, [open]);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -113,7 +131,12 @@ export function UploadDialog({ caseId, timelineId, timelineName }: Props) {
           </div>
 
           {/* Result */}
-          {data && (
+          {data && data.duplicate && (
+            <div className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning-dim)] px-3 py-2 text-xs text-[var(--color-warning)]">
+              This file has already been ingested ({data.events_parsed.toLocaleString()} events).
+            </div>
+          )}
+          {data && !data.duplicate && (
             <div className="rounded border border-[var(--color-success)]/40 bg-[var(--color-success-dim)] px-3 py-2 text-xs text-[var(--color-success)]">
               Ingested {data.events_inserted.toLocaleString()} events via{" "}
               <span className="font-mono">{data.parser}</span>

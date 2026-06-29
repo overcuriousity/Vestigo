@@ -23,6 +23,7 @@ _EVENT_COLUMNS = [
     "byte_offset",
     "line_number",
     "content_hash",
+    "file_hash",
     "parser_name",
     "parser_version",
     "ingest_time",
@@ -48,11 +49,12 @@ CREATE TABLE IF NOT EXISTS {database}.events (
     byte_offset UInt64,
     line_number UInt64,
     content_hash FixedString(64),
+    file_hash FixedString(64),
     parser_name LowCardinality(String),
     parser_version LowCardinality(String),
     ingest_time DateTime64(3),
     message String,
-    timestamp DateTime64(3),
+    timestamp Nullable(DateTime64(3)),
     timestamp_desc LowCardinality(String),
     source LowCardinality(String),
     source_long LowCardinality(String),
@@ -68,7 +70,7 @@ CREATE TABLE IF NOT EXISTS {database}.events (
 ENGINE = MergeTree()
 ORDER BY (case_id, timeline_id, timestamp, event_id)
 PARTITION BY (case_id, timeline_id)
-SETTINGS index_granularity = 8192
+SETTINGS index_granularity = 8192, allow_nullable_key = 1
 """.strip()
 
 
@@ -99,6 +101,11 @@ class ClickHouseStore:
         """Create the target database and events table if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
+        # Idempotent migration: add file_hash to deployments created before this
+        # column was introduced.
+        self.client.command(
+            f"ALTER TABLE {self.database}.events ADD COLUMN IF NOT EXISTS file_hash FixedString(64)"
+        )
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse.
@@ -156,6 +163,7 @@ class ClickHouseStore:
                 byte_offset,
                 line_number,
                 content_hash,
+                file_hash,
                 parser_name,
                 parser_version,
                 ingest_time,
@@ -202,8 +210,8 @@ class ClickHouseStore:
             f"""
             SELECT
                 event_id, case_id, timeline_id, source_file, byte_offset, line_number,
-                content_hash, parser_name, parser_version, ingest_time, message,
-                timestamp, timestamp_desc, source, source_long, display_name,
+                content_hash, file_hash, parser_name, parser_version, ingest_time,
+                message, timestamp, timestamp_desc, source, source_long, display_name,
                 tags, attributes, embedding_model, embedding_config_hash, vector_id
             FROM {self.database}.events
             WHERE case_id = {{case_id:String}}

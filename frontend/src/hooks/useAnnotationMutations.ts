@@ -4,13 +4,19 @@ import type { AnnotationType } from "@/api/types";
 
 /**
  * Shared hook for creating and deleting annotations on events within a timeline.
- * Invalidates the timeline annotations query on success so all consumers
- * (EventGrid chips, EventDetailPanel, TriageMeter) refresh automatically.
+ * Invalidates both the timeline annotations query and the anomalies query on
+ * success so all consumers (EventGrid chips, EventDetailPanel, TriageMeter,
+ * AnomaliesList) refresh automatically.  The anomaly refresh is important
+ * because marking/unmarking Normal events changes the active algorithm mode.
  */
 export function useAnnotationMutations(caseId: string, timelineId: string) {
   const qc = useQueryClient();
-  const invalidate = () =>
+
+  const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["annotations", caseId, timelineId] });
+    // Marking an event Normal changes which anomaly algorithm is active.
+    qc.invalidateQueries({ queryKey: ["anomalies", caseId, timelineId] });
+  };
 
   const add = useMutation({
     mutationFn: (v: { eventId: string; type: AnnotationType; content: string }) =>

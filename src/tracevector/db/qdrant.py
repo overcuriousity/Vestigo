@@ -17,6 +17,9 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     PointStruct,
+    RecommendInput,
+    RecommendQuery,
+    RecommendStrategy,
     ScoredPoint,
     VectorParams,
 )
@@ -249,6 +252,42 @@ class QdrantStore:
         return self.client.query_points(
             collection_name=collection_name,
             query=query_vector,
+            query_filter=timeline_filter,
+            limit=limit,
+            with_vectors=with_vectors,
+            with_payload=True,
+        ).points
+
+    def recommend_anomalies(
+        self,
+        collection_name: str,
+        timeline_id: str,
+        negative_ids: list[str],
+        limit: int,
+        with_vectors: bool = True,
+    ) -> list[ScoredPoint]:
+        """Return up to ``limit`` points most unlike the ``negative_ids`` set.
+
+        Uses Qdrant's native Recommendation API with the analyst's "normal"
+        events as negative examples.  With *negative-only* examples the engine
+        returns points that are maximally dissimilar to the normal set —
+        exactly the anomalies.
+
+        ``negative_ids`` must be valid point IDs (event_id strings) already
+        stored in ``collection_name``.  Results are filtered to ``timeline_id``
+        and sorted by descending anomaly relevance score.
+        """
+        timeline_filter = Filter(
+            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
+        )
+        return self.client.query_points(
+            collection_name=collection_name,
+            query=RecommendQuery(
+                recommend=RecommendInput(
+                    negative=negative_ids,
+                    strategy=RecommendStrategy.AVERAGE_VECTOR,
+                )
+            ),
             query_filter=timeline_filter,
             limit=limit,
             with_vectors=with_vectors,

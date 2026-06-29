@@ -18,7 +18,7 @@ import {
   type ColumnDef,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown } from "lucide-react";
+import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck } from "lucide-react";
 import type { Event, Annotation } from "@/api/types";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
@@ -241,7 +241,42 @@ function CommentPopover({
   );
 }
 
-/** Combined annotation column: outlier indicator + tag popover + comment popover. */
+/** Mark-normal toggle button: adds/removes a "normal" user annotation. */
+function NormalToggle({ eventId, anns, caseId, timelineId }: AnnotationCellProps) {
+  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const normalAnn = anns.find((a) => a.annotation_type === "normal" && a.origin === "user");
+  const isNormal = !!normalAnn;
+
+  const handleClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isNormal && normalAnn) {
+      remove.mutate({ eventId, annotationId: normalAnn.id });
+    } else {
+      add.mutate({ eventId, type: "normal", content: "normal operation" });
+    }
+  };
+
+  return (
+    <Tooltip
+      content={isNormal ? "Marked Normal — click to unmark" : "Mark as Normal operation"}
+      side="top"
+    >
+      <button
+        onClick={handleClick}
+        className={cn(
+          "rounded p-1 transition-base",
+          isNormal
+            ? "text-[var(--color-success)]"
+            : "text-[var(--color-fg-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--color-success)]",
+        )}
+      >
+        <ShieldCheck size={13} />
+      </button>
+    </Tooltip>
+  );
+}
+
+/** Combined annotation column: outlier indicator + normal toggle + tag popover + comment popover. */
 function AnnotationCell(props: AnnotationCellProps) {
   const hasOutlier = props.anns.some((a) => a.annotation_type === "outlier");
   return (
@@ -258,6 +293,7 @@ function AnnotationCell(props: AnnotationCellProps) {
       ) : (
         <span className="p-1 w-[29px]" /> /* placeholder to keep layout stable */
       )}
+      <NormalToggle {...props} />
       <TagPopover {...props} />
       <CommentPopover {...props} />
     </div>
@@ -508,8 +544,12 @@ export function EventGrid({
             const event = row.original;
             const isExpanded = expandedId === event.event_id;
             const isSelected = selectedIds.has(event.event_id);
-            const hasOutlier = (annotations.get(event.event_id) ?? []).some(
+            const eventAnns = annotations.get(event.event_id) ?? [];
+            const hasOutlier = eventAnns.some(
               (a) => a.annotation_type === "outlier",
+            );
+            const hasNormal = eventAnns.some(
+              (a) => a.annotation_type === "normal" && a.origin === "user",
             );
 
             return (
@@ -532,6 +572,8 @@ export function EventGrid({
                       : "hover:bg-[var(--color-bg-hover)]",
                   hasOutlier && !isSelected && !isExpanded &&
                     "border-l-2 border-l-[var(--color-outlier)]/50",
+                  hasNormal && !hasOutlier && !isSelected && !isExpanded &&
+                    "border-l-2 border-l-[var(--color-success)]/50",
                 )}
               >
                 {row.getVisibleCells().map((cell) => (

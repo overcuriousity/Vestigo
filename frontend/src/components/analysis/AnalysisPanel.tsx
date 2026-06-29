@@ -1,34 +1,35 @@
 import { useState } from "react";
-import { X, AlertTriangle, Search } from "lucide-react";
+import { X, AlertTriangle, Search, BookOpen } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { AnomaliesList } from "./AnomaliesList";
 import { SimilarEvents } from "./SimilarEvents";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
+import { MethodologyPanel } from "./MethodologyPanel";
 import { cn } from "@/lib/cn";
-import type { Event } from "@/api/types";
+import type { Event, Timeline } from "@/api/types";
 
-type Tab = "anomalies" | "similar";
+type Tab = "anomalies" | "similar" | "methodology";
 
 interface Props {
   caseId: string;
   timelineId: string;
+  timeline: Timeline;
   hasVectors: boolean;
   similarAnchor: Event | null;
   onClose: () => void;
   onSelectEvent: (event: Event) => void;
   onSimilarClose: () => void;
-  onEmbed: () => void;
 }
 
 export function AnalysisPanel({
   caseId,
   timelineId,
+  timeline,
   hasVectors,
   similarAnchor,
   onClose,
   onSelectEvent,
   onSimilarClose,
-  onEmbed,
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
 
@@ -52,6 +53,7 @@ export function AnalysisPanel({
         {([
           ["anomalies", AlertTriangle, "Anomalies"],
           ["similar", Search, "Similarity"],
+          ["methodology", BookOpen, "Method"],
         ] as [Tab, React.ElementType, string][]).map(([id, Icon, label]) => (
           <button
             key={id}
@@ -72,7 +74,7 @@ export function AnalysisPanel({
       <div className="flex-1 overflow-y-auto p-4">
         {!hasVectors && (
           <div className="mb-4">
-            <EmbeddingStatusBanner status="not_embedded" onEmbed={onEmbed} />
+            <EmbeddingStatusBanner status="not_embedded" timeline={timeline} />
           </div>
         )}
 
@@ -97,6 +99,14 @@ export function AnalysisPanel({
             Click the search icon on any event row to find similar events.
           </p>
         ) : null}
+
+        {tab === "methodology" && (
+          <MethodologyPanel
+            caseId={caseId}
+            timelineId={timelineId}
+            timeline={timeline}
+          />
+        )}
       </div>
     </div>
   );

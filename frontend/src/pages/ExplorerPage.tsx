@@ -24,7 +24,6 @@ import { eventsApi } from "@/api/events";
 import { annotationsApi } from "@/api/annotations";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
-import { useJobsStore } from "@/stores/jobs";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 
@@ -137,8 +136,6 @@ export function ExplorerPage() {
   const setSortDir = useUiStore((s) => s.setSortDir);
 
   // ── Data queries ───────────────────────────────────────────────────────
-  const addJob = useJobsStore((s) => s.addJob);
-
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
@@ -214,13 +211,7 @@ export function ExplorerPage() {
     if (!isFetching && hasNextPage) fetchNextPage();
   }, [isFetching, hasNextPage, fetchNextPage]);
 
-  const handleEmbed = useCallback(async () => {
-    if (!caseId || !timelineId || !timeline) return;
-    const result = await timelinesApi.embed(caseId, timelineId);
-    addJob(result.job_id, `Embedding "${timeline.name}"`, `${caseId}/${timelineId}`);
-  }, [caseId, timelineId, timeline, addJob]);
-
-  const handleFindSimilar = useCallback((event: Event) => {
+const handleFindSimilar = useCallback((event: Event) => {
     setSimilarAnchor(event);
     setAnalysisPanelOpen(true);
   }, []);
@@ -373,10 +364,11 @@ export function ExplorerPage() {
                 )}
 
                 {/* Analysis panel */}
-                {analysisPanelOpen && (
+                {analysisPanelOpen && timeline && (
                   <AnalysisPanel
                     caseId={caseId!}
                     timelineId={timelineId!}
+                    timeline={timeline}
                     hasVectors={hasVectors}
                     similarAnchor={similarAnchor}
                     onClose={() => {
@@ -385,7 +377,6 @@ export function ExplorerPage() {
                     }}
                     onSelectEvent={(ev) => setExpandedEvent(ev)}
                     onSimilarClose={() => setSimilarAnchor(null)}
-                    onEmbed={handleEmbed}
                   />
                 )}
               </div>

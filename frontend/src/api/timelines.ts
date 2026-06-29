@@ -1,5 +1,5 @@
 import { del, get, post, postForm } from "./client";
-import type { Timeline, UploadResult } from "./types";
+import type { EmbeddingFieldConfig, Timeline, UploadResult } from "./types";
 
 export const timelinesApi = {
   list: (caseId: string) =>
@@ -36,8 +36,13 @@ export const timelinesApi = {
     );
   },
 
-  embed: (caseId: string, timelineId: string) =>
+  embed: (
+    caseId: string,
+    timelineId: string,
+    embeddingConfig?: EmbeddingFieldConfig,
+  ) =>
     post<{ job_id: string; status: string }>(
       `/cases/${caseId}/timelines/${timelineId}/embed`,
+      embeddingConfig != null ? { embedding_config: embeddingConfig } : undefined,
     ),
 };

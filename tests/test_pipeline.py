@@ -203,6 +203,36 @@ def test_pipeline_raises_on_missing_path(tmp_path: Path) -> None:
         pipeline.run(tmp_path / "does-not-exist.jsonl")
 
 
+def test_pipeline_deduplicates_identical_file_hash(sample_jsonl: Path) -> None:
+    """Re-running with the same file_hash produces duplicate event IDs, so the
+    second run should not increase the stored row count (simulating ClickHouse
+    identity collision or an upstream idempotency guard).
+    """
+    clickhouse = FakeClickHouseStore()
+
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        timeline_id="timeline1",
+        clickhouse=clickhouse,
+        batch_size=2,
+        file_hash="abc123",
+        source_name="events.jsonl",
+    )
+
+    first = pipeline.run(sample_jsonl)
+    assert first.events_inserted == 3
+    assert len(clickhouse.events) == 3
+    first_ids = [e.event_id for e in clickhouse.events]
+
+    second = pipeline.run(sample_jsonl)
+    assert second.events_inserted == 3
+    # Fake store simply appends, so we verify determinism by ID overlap.
+    second_ids = [e.event_id for e in clickhouse.events[3:]]
+    assert first_ids == second_ids
+    assert all(e.file_hash == "abc123" for e in clickhouse.events)
+    assert all(e.source_file == Path("events.jsonl") for e in clickhouse.events)
+
+
 def test_qdrant_config_mismatch_is_rejected() -> None:
     qdrant = FakeQdrantStore()
     qdrant.init_collection("case1", "hash1", vector_size=384)

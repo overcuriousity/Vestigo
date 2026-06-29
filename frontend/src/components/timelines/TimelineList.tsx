@@ -9,7 +9,7 @@ import { Spinner } from "@/components/ui/Spinner";
 import { CreateTimelineDialog } from "./CreateTimelineDialog";
 import { DeleteTimelineDialog } from "./DeleteTimelineDialog";
 import { UploadDialog } from "./UploadDialog";
-import { EmbedButton } from "./EmbedButton";
+import { EmbedWizard } from "./EmbedWizard";
 import type { Timeline } from "@/api/types";
 
 interface Props {
@@ -50,11 +50,10 @@ function TimelineRow({ caseId, tl }: { caseId: string; tl: Timeline }) {
           timelineId={tl.id}
           timelineName={tl.name}
         />
-        <EmbedButton
+        <EmbedWizard
           caseId={caseId}
           timelineId={tl.id}
-          timelineName={tl.name}
-          vectorCount={tl.vector_count}
+          timeline={tl}
         />
         <DeleteTimelineDialog caseId={caseId} timeline={tl} />
       </div>

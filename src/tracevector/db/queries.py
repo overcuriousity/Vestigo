@@ -302,6 +302,75 @@ class EventQueryService:
             "attributes": sorted(raw_keys),
         }
 
+    def list_fields_by_source(
+        self, case_id: str, timeline_id: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return per-source field information for the embedding wizard.
+
+        For each distinct ``source`` value in the timeline, returns the event
+        count, the available top-level embedding fields, and the dynamic
+        attribute keys found in that source's events.  A ``recommended`` list
+        preselects ``message`` (always) plus ``display_name`` and ``source_long``
+        where present, and all attribute keys (they are source-specific by
+        definition).  The analyst trims in the wizard.
+
+        Results are based on a sample of up to 50 000 events per source.
+        """
+        self.store.init_schema()
+        database = self.store.database
+
+        # Top-level fields that are meaningful for embedding (not IDs/provenance).
+        EMBEDDABLE_TOP_LEVEL = [
+            "message",
+            "timestamp_desc",
+            "source_long",
+            "display_name",
+            "tags",
+        ]
+
+        result = self.store.client.query(
+            f"""
+            SELECT
+                source,
+                count() AS n,
+                groupUniqArrayArray(mapKeys(attributes)) AS attr_keys
+            FROM (
+                SELECT source, attributes
+                FROM {database}.events
+                WHERE case_id = {{p0:String}} AND timeline_id = {{p1:String}}
+                LIMIT 50000
+            )
+            GROUP BY source
+            ORDER BY n DESC
+            """,
+            parameters={"p0": case_id, "p1": timeline_id},
+        )
+
+        sources = []
+        for row in result.result_rows:
+            source_name = row[0] or ""
+            count = row[1]
+            attr_keys = sorted(row[2]) if row[2] else []
+
+            # Recommended = always message, plus optional top-level, plus all attrs.
+            recommended: list[str] = ["message"]
+            for f in ("display_name", "source_long", "timestamp_desc", "tags"):
+                if f not in recommended:
+                    recommended.append(f)
+            recommended.extend(f"attr:{k}" for k in attr_keys)
+
+            sources.append(
+                {
+                    "source": source_name,
+                    "count": count,
+                    "top_level": EMBEDDABLE_TOP_LEVEL,
+                    "attributes": attr_keys,
+                    "recommended": recommended,
+                }
+            )
+
+        return {"sources": sources}
+
     def histogram(
         self, query: EventQuery, buckets: int = 60
     ) -> dict[str, Any]:

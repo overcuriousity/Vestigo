@@ -1,5 +1,5 @@
 import { get } from "./client";
-import type { EventFilters, EventPage, FieldsResponse, HistogramResponse } from "./types";
+import type { EmbeddingFieldsResponse, EventFilters, EventPage, FieldsResponse, HistogramResponse } from "./types";
 
 export const eventsApi = {
   list: (
@@ -33,6 +33,14 @@ export const eventsApi = {
 
   fields: (caseId: string, timelineId: string): Promise<FieldsResponse> =>
     get<FieldsResponse>(`/cases/${caseId}/timelines/${timelineId}/fields`),
+
+  embeddingFields: (
+    caseId: string,
+    timelineId: string,
+  ): Promise<EmbeddingFieldsResponse> =>
+    get<EmbeddingFieldsResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/embedding-fields`,
+    ),
 
   histogram: (
     caseId: string,

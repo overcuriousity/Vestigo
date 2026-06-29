@@ -70,10 +70,19 @@ def _normalise_tag_field(value: str) -> list[str]:
 class Parser(ABC):
     """Abstract base class for TraceVector streaming parsers."""
 
-    def __init__(self, case_id: str, timeline_id: str, config: ParserConfig) -> None:
+    def __init__(
+        self,
+        case_id: str,
+        timeline_id: str,
+        config: ParserConfig,
+        file_hash: str | None = None,
+        source_name: str | None = None,
+    ) -> None:
         self.case_id = case_id
         self.timeline_id = timeline_id
         self.config = config
+        self.file_hash = file_hash
+        self.source_name = source_name
 
     @abstractmethod
     def parse(self, path: Path) -> Iterator[Event]:
@@ -96,13 +105,17 @@ class Parser(ABC):
         attributes: dict[str, Any] | None = None,
     ) -> Event:
         """Build an :py:class:`Event` with forensic metadata populated."""
+        # Fall back to the read path when no explicit source name is supplied
+        # (e.g. CLI one-off ingestion).
+        provenance_file = Path(self.source_name) if self.source_name else source_file
         return Event(
             case_id=self.case_id,
             timeline_id=self.timeline_id,
-            source_file=source_file,
+            source_file=provenance_file,
             byte_offset=byte_offset,
             line_number=line_number,
             content_hash=content_hash(raw_line),
+            file_hash=self.file_hash or content_hash(raw_line),
             parser_name=self.config.name,
             parser_version=self.config.version,
             raw_line=raw_line,
@@ -173,9 +186,7 @@ class TimesketchCsvParser(Parser):
             lines = list(fh)
             line_byte_offsets = [0]
             for line in lines:
-                line_byte_offsets.append(
-                    line_byte_offsets[-1] + len(line.encode("utf-8"))
-                )
+                line_byte_offsets.append(line_byte_offsets[-1] + len(line.encode("utf-8")))
 
             wrapper = _RecordTrackingIterator(lines)
             row_reader = csv.DictReader(
@@ -334,12 +345,24 @@ def get_parser(
     case_id: str,
     timeline_id: str,
     options: dict[str, Any] | None = None,
+    file_hash: str | None = None,
+    source_name: str | None = None,
 ) -> Parser:
     """Return a parser instance for ``format_name``.
 
     Supported formats:
       - ``timesketch_csv`` / ``csv``: Timesketch-compatible CSV.
       - ``jsonl`` / ``json``: JSON Lines.
+
+    Args:
+        format_name: Parser format identifier.
+        case_id: Investigation case identifier.
+        timeline_id: Timeline identifier within the case.
+        options: Optional parser-specific options.
+        file_hash: Optional SHA-256 hex digest of the whole source file. When
+            supplied it drives deterministic event identity.
+        source_name: Optional provenance name (e.g. original filename) to store
+            as ``source_file`` instead of the transient read path.
     """
     config = ParserConfig(
         name=format_name,
@@ -348,9 +371,13 @@ def get_parser(
     )
     name = format_name.lower()
     if name in {"timesketch_csv", "csv"}:
-        return TimesketchCsvParser(case_id, timeline_id, config)
+        return TimesketchCsvParser(
+            case_id, timeline_id, config, file_hash=file_hash, source_name=source_name
+        )
     if name in {"jsonl", "json"}:
-        return JsonlParser(case_id, timeline_id, config)
+        return JsonlParser(
+            case_id, timeline_id, config, file_hash=file_hash, source_name=source_name
+        )
     raise ValueError(f"Unsupported parser format: {format_name}")
 
 

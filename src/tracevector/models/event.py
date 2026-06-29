@@ -38,16 +38,30 @@ class ParserConfig:
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingConfig:
-    """Immutable embedding configuration used for provenance tracking."""
+    """Immutable embedding configuration used for provenance tracking.
+
+    ``field_config_hash`` captures the per-source field selection chosen by the
+    analyst via the embedding wizard.  A different field selection produces a
+    different hash and therefore lands in a separate Qdrant collection, keeping
+    embeddings from different configurations isolated.
+    """
 
     model_name: str
     device: str = "cpu"
     vector_dimension: int | None = None
     normalize: bool = True
     pooling: str = "mean"
+    # SHA-256 of the canonical JSON of the per-source field config chosen by
+    # the analyst.  Empty string when no custom config was supplied (legacy
+    # all-fields behaviour).
+    field_config_hash: str = ""
 
     def config_hash(self) -> str:
-        """Return a SHA-256 hex hash of this embedding configuration."""
+        """Return a SHA-256 hex hash of this embedding configuration.
+
+        Includes ``field_config_hash`` so that different field selections
+        always produce different collection names.
+        """
         canonical = json.dumps(
             {
                 "model_name": self.model_name,
@@ -55,6 +69,7 @@ class EmbeddingConfig:
                 "vector_dimension": self.vector_dimension,
                 "normalize": self.normalize,
                 "pooling": self.pooling,
+                "field_config_hash": self.field_config_hash,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -70,6 +85,7 @@ class EmbeddingConfig:
             "vector_dimension": self.vector_dimension,
             "normalize": self.normalize,
             "pooling": self.pooling,
+            "field_config_hash": self.field_config_hash,
         }
 
 
@@ -78,14 +94,15 @@ class Event:
     """A single forensic event produced by a parser.
 
     Attributes:
-        event_id: Deterministic UUIDv5 derived from case, source file,
+        event_id: Deterministic UUIDv5 derived from case, timeline, file hash,
             byte offset, and content hash.
         case_id: Investigation case identifier.
         timeline_id: Timeline identifier within the case.
-        source_file: Absolute path to the original source file.
+        source_file: Original source file identifier (filename or path) for
+            display and provenance. Not used in event identity calculation.
         byte_offset: Byte offset in the source file where the raw record starts.
-        line_number: Optional 1-based line number for text formats.
         content_hash: SHA-256 hex digest of the canonical raw content.
+        file_hash: SHA-256 hex digest of the whole source file.
         parser_name: Name of the parser that produced this event.
         parser_version: Version/hash of the parser configuration.
         ingest_time: UTC timestamp when the event was ingested.
@@ -112,6 +129,7 @@ class Event:
     parser_version: str
     raw_line: str
     message: str
+    file_hash: str = ""
     line_number: int | None = None
     ingest_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     timestamp: str | None = None
@@ -131,11 +149,21 @@ class Event:
         object.__setattr__(self, "vector_id", str(self.event_id))
 
     def _derive_id(self) -> uuid.UUID:
-        """Derive a deterministic UUIDv5 for this event."""
+        """Derive a deterministic UUIDv5 for this event.
+
+        Identity is based on the file-level hash when available, not the
+        transient path where the file happened to be stored during ingestion.
+        This makes re-uploads of the same source file produce identical event
+        IDs. When no file hash is supplied (e.g. CLI one-off ingestion) the
+        resolved source path is used as a fallback.
+        """
         namespace = uuid.uuid5(uuid.NAMESPACE_URL, f"tracevector:{self.case_id}")
+        source_identity = (
+            self.file_hash if self.file_hash else self.source_file.resolve().as_posix()
+        )
         digest_input = (
             f"{self.timeline_id}\n"
-            f"{self.source_file.resolve().as_posix()}\n"
+            f"{source_identity}\n"
             f"{self.byte_offset}\n"
             f"{self.content_hash}\n"
             f"{self.parser_name}\n"
@@ -147,33 +175,34 @@ class Event:
         """Return the canonical content used for hashing and embedding."""
         return self.raw_line
 
-    def text_for_embedding(self) -> str:
+    def text_for_embedding(
+        self,
+        source_fields: dict[str, list[str]] | None = None,
+    ) -> str:
         """Build a single text representation for embedding.
 
-        Prefers a structured message + key context, falling back to the raw line.
+        Delegates to the canonical implementation in
+        ``tracevector.ingestion.pipeline._text_for_embedding`` using a transient
+        dict row derived from this event.  Passing ``source_fields`` applies the
+        same analyst-defined per-source field selection used by the pipeline;
+        omitting it falls back to the legacy all-fields behaviour.
+
+        Falls back to ``self.raw_line`` when the result would otherwise be empty.
         """
-        parts: list[str] = []
-        if self.message:
-            parts.append(self.message)
-        if self.timestamp:
-            parts.append(f"time={self.timestamp}")
-        if self.timestamp_desc:
-            parts.append(f"time_desc={self.timestamp_desc}")
-        if self.source:
-            parts.append(f"source={self.source}")
-        if self.source_long:
-            parts.append(f"source_long={self.source_long}")
-        if self.display_name:
-            parts.append(f"display_name={self.display_name}")
-        if self.tags:
-            parts.append(f"tags={','.join(sorted(self.tags))}")
-        for key in sorted(self.attributes):
-            value = self.attributes[key]
-            if value is not None and value != "":
-                parts.append(f"{key}={value}")
-        if not parts:
-            return self.raw_line
-        return " | ".join(parts)
+        from tracevector.ingestion.pipeline import _text_for_embedding
+
+        row: dict[str, Any] = {
+            "message": self.message,
+            "timestamp": self.timestamp,
+            "timestamp_desc": self.timestamp_desc,
+            "source": self.source,
+            "source_long": self.source_long,
+            "display_name": self.display_name,
+            "tags": self.tags,
+            "attributes": self.attributes,
+        }
+        result = _text_for_embedding(row, source_fields)
+        return result if result else self.raw_line
 
     def to_clickhouse_row(self) -> dict[str, Any]:
         """Serialize to a ClickHouse-ready row dictionary."""
@@ -182,15 +211,16 @@ class Event:
             "event_id": str(self.event_id),
             "case_id": self.case_id,
             "timeline_id": self.timeline_id,
-            "source_file": str(self.source_file.resolve()),
+            "source_file": str(self.source_file),
             "byte_offset": self.byte_offset,
             "line_number": self.line_number if self.line_number is not None else 0,
             "content_hash": self.content_hash,
+            "file_hash": self.file_hash,
             "parser_name": self.parser_name,
             "parser_version": self.parser_version,
             "ingest_time": self.ingest_time,
             "message": self.message,
-            "timestamp": parsed_ts if parsed_ts is not None else "",
+            "timestamp": parsed_ts if parsed_ts is not None else None,
             "timestamp_desc": self.timestamp_desc or "",
             "source": self.source or "",
             "source_long": self.source_long or "",
@@ -208,10 +238,11 @@ class Event:
             "event_id": str(self.event_id),
             "case_id": self.case_id,
             "timeline_id": self.timeline_id,
-            "source_file": str(self.source_file.resolve()),
+            "source_file": str(self.source_file),
             "byte_offset": self.byte_offset,
             "line_number": self.line_number,
             "content_hash": self.content_hash,
+            "file_hash": self.file_hash,
             "parser_name": self.parser_name,
             "parser_version": self.parser_version,
             "message": self.message,

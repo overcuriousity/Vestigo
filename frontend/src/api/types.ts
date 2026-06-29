@@ -8,6 +8,15 @@ export interface Case {
   updated_at: string;
 }
 
+/**
+ * Per-source field selection stored on a timeline after the embedding wizard.
+ * Shape: { version: 1, sources: { "<source>": ["message", "attr:user_agent"] } }
+ */
+export interface EmbeddingFieldConfig {
+  version: 1;
+  sources: Record<string, string[]>;
+}
+
 export interface Timeline {
   id: string;
   case_id: string;
@@ -15,6 +24,8 @@ export interface Timeline {
   description: string | null;
   parser: string | null;
   embedding_model: string | null;
+  /** Analyst-defined per-source field selection, null when not yet configured. */
+  embedding_config: EmbeddingFieldConfig | null;
   event_count: number;
   vector_count: number;
   created_at: string;
@@ -62,7 +73,7 @@ export interface View {
   created_at: string;
 }
 
-export type AnnotationType = "comment" | "tag" | "outlier";
+export type AnnotationType = "comment" | "tag" | "outlier" | "normal";
 export type AnnotationOrigin = "user" | "system";
 
 export interface Annotation {
@@ -99,11 +110,16 @@ export interface SimilarityResponse {
 }
 
 export interface OutlierDetails {
+  /** "centroid-distance" | "normal-baseline" */
+  method: string;
   distance: number;
   rank: number;
   of: number;
-  sample_size: number;
-  centroid_distance: number;
+  /** Number of events sampled for global centroid. Present in centroid-distance mode. */
+  sample_size?: number;
+  /** Number of analyst-marked normal events. Present in normal-baseline mode. */
+  baseline_size?: number;
+  embedding_config_hash: string;
 }
 
 export interface AnomalyResult {
@@ -114,8 +130,11 @@ export interface AnomalyResult {
 }
 
 export interface AnomaliesResponse {
-  status: "ok" | "not_embedded";
+  status: "ok" | "not_embedded" | "insufficient_vectors";
+  /** "centroid-distance" | "normal-baseline" */
+  method: string;
   sample_size: number;
+  baseline_size: number;
   embedding_config_hash: string | null;
   results: AnomalyResult[];
 }
@@ -124,11 +143,28 @@ export interface TagAnomaliesResponse extends AnomaliesResponse {
   tagged: number;
 }
 
+/** Per-source field info returned by /embedding-fields */
+export interface EmbeddingSourceInfo {
+  source: string;
+  count: number;
+  /** Fixed top-level fields available for embedding */
+  top_level: string[];
+  /** Dynamic attribute keys found for this source */
+  attributes: string[];
+  /** Recommended preselection (tokens like "message", "attr:user_agent") */
+  recommended: string[];
+}
+
+export interface EmbeddingFieldsResponse {
+  sources: EmbeddingSourceInfo[];
+}
+
 export interface UploadResult {
   timeline_id: string;
   events_parsed: number;
   events_inserted: number;
   parser: string;
+  duplicate?: boolean;
 }
 
 export interface HealthResponse {

@@ -17,6 +17,7 @@ from qdrant_client.models import PointStruct
 from tracevector.core.config import get_settings
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.qdrant import QdrantStore
+from tracevector.ingestion.files import hash_file
 from tracevector.ingestion.parser import Parser, detect_format, get_parser
 from tracevector.models.embeddings import EmbeddingModel
 from tracevector.models.event import Event
@@ -75,11 +76,15 @@ class IngestionPipeline:
         timeline_id: str,
         clickhouse: ClickHouseStore | None = None,
         batch_size: int | None = None,
+        file_hash: str | None = None,
+        source_name: str | None = None,
     ) -> None:
         self.case_id = case_id
         self.timeline_id = timeline_id
         self.clickhouse = clickhouse or ClickHouseStore()
         self.batch_size = batch_size or get_settings().embedding_batch_size
+        self.file_hash = file_hash
+        self.source_name = source_name
 
     def run(
         self,
@@ -103,9 +108,20 @@ class IngestionPipeline:
         self.clickhouse.init_schema()
 
         first_exception: BaseException | None = None
+        single_file = len(files) == 1
         for file_path in files:
             fmt = format_name or detect_format(file_path)
-            parser = get_parser(fmt, self.case_id, self.timeline_id)
+            # Use the caller-supplied file hash for a single-file upload; for
+            # directory ingestion compute a per-file hash.
+            file_hash = self.file_hash if single_file else hash_file(file_path)
+            source_name = self.source_name if single_file else file_path.name
+            parser = get_parser(
+                fmt,
+                self.case_id,
+                self.timeline_id,
+                file_hash=file_hash,
+                source_name=source_name or file_path.name,
+            )
             try:
                 self._ingest_file(file_path, parser, result)
             except Exception as exc:  # noqa: BLE001
@@ -153,6 +169,13 @@ class IngestionPipeline:
 class EmbeddingPipeline:
     """Background embedding pipeline: read events from ClickHouse, embed,
     and write vectors to Qdrant.
+
+    ``field_config`` is the analyst-defined per-source field selection
+    (shape: ``{"version": 1, "sources": {"<source>": ["message", "attr:k"]}}``)
+    produced by the embedding wizard.  When ``None``, the legacy all-fields
+    behaviour applies and all sources are embedded.  When supplied, only sources
+    listed in ``field_config["sources"]`` are embedded, and only the selected
+    fields are used to build the embedding text.
     """
 
     def __init__(
@@ -164,6 +187,7 @@ class EmbeddingPipeline:
         qdrant: QdrantStore | None = None,
         batch_size: int | None = None,
         progress_callback: Any | None = None,
+        field_config: dict[str, Any] | None = None,
     ) -> None:
         self.case_id = case_id
         self.timeline_id = timeline_id
@@ -172,6 +196,7 @@ class EmbeddingPipeline:
         self.qdrant = qdrant or QdrantStore()
         self.batch_size = batch_size or get_settings().embedding_batch_size
         self.progress_callback = progress_callback
+        self.field_config = field_config  # None → legacy all-fields
 
     def run(self) -> EmbeddingResult:
         """Generate embeddings for all events of the configured timeline."""
@@ -181,11 +206,30 @@ class EmbeddingPipeline:
         )
 
         self.clickhouse.init_schema()
-        config = self.embedding_model.as_config()
+        # Build embedding config, incorporating the field-config hash so that
+        # different analyst field selections land in distinct Qdrant collections.
+        import hashlib as _hashlib  # local to avoid shadowing
+        import json as _json  # local to avoid shadowing
+
+        field_config_hash = ""
+        if self.field_config is not None:
+            canonical = _json.dumps(self.field_config, sort_keys=True, separators=(",", ":"))
+            field_config_hash = _hashlib.sha256(canonical.encode()).hexdigest()
+        from tracevector.models.event import EmbeddingConfig as _EC
+
+        base_config = self.embedding_model.as_config()
+        config = _EC(
+            model_name=base_config.model_name,
+            device=base_config.device,
+            vector_dimension=base_config.vector_dimension,
+            normalize=base_config.normalize,
+            pooling=base_config.pooling,
+            field_config_hash=field_config_hash,
+        )
         self.qdrant.init_collection(
             case_id=self.case_id,
             embedding_config_hash=config.config_hash(),
-            vector_size=config.vector_dimension or self.embedding_model.vector_dimension(),
+            vector_size=base_config.vector_dimension or self.embedding_model.vector_dimension(),
         )
 
         total = self.clickhouse.count_events(
@@ -245,8 +289,24 @@ class EmbeddingPipeline:
         batch: list[dict[str, Any]],
         config: Any,
     ) -> int:
-        """Embed one batch and persist vectors to Qdrant."""
-        texts = [_text_for_embedding(row) for row in batch]
+        """Embed one batch and persist vectors to Qdrant.
+
+        When ``self.field_config`` is set, rows whose ``source`` is not listed
+        in the config are silently skipped (not embedded).  This allows the
+        analyst to exclude noisy sources entirely.
+        """
+        source_fields: dict[str, list[str]] | None = None
+        if self.field_config is not None:
+            source_fields = self.field_config.get("sources", {})
+
+        # Filter out rows for unconfigured sources when a field config is set.
+        if source_fields is not None:
+            batch = [row for row in batch if (row.get("source") or "") in source_fields]
+
+        if not batch:
+            return 0
+
+        texts = [_text_for_embedding(row, source_fields) for row in batch]
         vectors = self.embedding_model.encode(texts)
 
         config_hash = config.config_hash()
@@ -274,35 +334,74 @@ class EmbeddingPipeline:
             self.progress_callback(total=total, processed=processed)
 
 
-def _text_for_embedding(row: dict[str, Any]) -> str:
-    """Build a single text representation for embedding from a stored event row."""
+def _text_for_embedding(
+    row: dict[str, Any],
+    source_fields: dict[str, list[str]] | None = None,
+) -> str:
+    """Build a single text representation for embedding from a stored event row.
+
+    ``source_fields`` maps each source name to the list of field tokens chosen
+    by the analyst in the embedding wizard.  Field tokens are either plain
+    top-level column names (``"message"``, ``"display_name"``, …) or
+    ``"attr:<key>"`` for entries in the ``attributes`` map.
+
+    When ``source_fields`` is ``None`` (legacy / no config), the original
+    all-fields behaviour is preserved: every non-empty field is included.
+    """
     parts: list[str] = []
-    message = row.get("message")
-    if message:
-        parts.append(str(message))
-    timestamp = row.get("timestamp")
-    if timestamp:
-        parts.append(f"time={timestamp}")
-    timestamp_desc = row.get("timestamp_desc")
-    if timestamp_desc:
-        parts.append(f"time_desc={timestamp_desc}")
-    source = row.get("source")
-    if source:
-        parts.append(f"source={source}")
-    source_long = row.get("source_long")
-    if source_long:
-        parts.append(f"source_long={source_long}")
-    display_name = row.get("display_name")
-    if display_name:
-        parts.append(f"display_name={display_name}")
-    tags = row.get("tags") or []
-    if tags:
-        parts.append(f"tags={','.join(sorted(str(t) for t in tags))}")
     attributes = row.get("attributes") or {}
-    for key in sorted(attributes):
-        value = attributes[key]
-        if value is not None and value != "":
-            parts.append(f"{key}={value}")
+    message = row.get("message")
+
+    if source_fields is not None:
+        source = row.get("source") or ""
+        selected = source_fields.get(source, [])
+        for token in selected:
+            if token.startswith("attr:"):
+                key = token[5:]
+                value = attributes.get(key)
+                if value is not None and value != "":
+                    parts.append(f"{key}={value}")
+            else:
+                # top-level column
+                if token == "message":
+                    value = message
+                    if value:
+                        parts.append(str(value))
+                elif token == "tags":
+                    tags = row.get("tags") or []
+                    if tags:
+                        parts.append(f"tags={','.join(sorted(str(t) for t in tags))}")
+                else:
+                    value = row.get(token)
+                    if value:
+                        parts.append(f"{token}={value}")
+    else:
+        # Legacy: include every non-empty field.
+        if message:
+            parts.append(str(message))
+        timestamp = row.get("timestamp")
+        if timestamp:
+            parts.append(f"time={timestamp}")
+        timestamp_desc = row.get("timestamp_desc")
+        if timestamp_desc:
+            parts.append(f"time_desc={timestamp_desc}")
+        source = row.get("source")
+        if source:
+            parts.append(f"source={source}")
+        source_long = row.get("source_long")
+        if source_long:
+            parts.append(f"source_long={source_long}")
+        display_name = row.get("display_name")
+        if display_name:
+            parts.append(f"display_name={display_name}")
+        tags = row.get("tags") or []
+        if tags:
+            parts.append(f"tags={','.join(sorted(str(t) for t in tags))}")
+        for key in sorted(attributes):
+            value = attributes[key]
+            if value is not None and value != "":
+                parts.append(f"{key}={value}")
+
     if not parts:
         return str(message) if message else ""
     return " | ".join(parts)

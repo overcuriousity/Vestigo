@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Tag } from "lucide-react";
+import { AlertTriangle, Tag, ShieldCheck, Info } from "lucide-react";
 import { similarityApi } from "@/api/similarity";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -53,18 +53,52 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
     );
   }
 
+  const isBaselineMode = data.method === "normal-baseline";
+
   return (
     <div className="space-y-3">
-      {/* Framing note */}
-      <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2 text-xs text-[var(--color-fg-muted)]">
-        <AlertTriangle size={11} className="inline mr-1 text-[var(--color-warning)]" />
-        These are <strong className="text-[var(--color-fg-secondary)]">statistically rare</strong>{" "}
-        events, not confirmed threats. Use for triage, not attribution.
-        <br />
-        Sample: {data.sample_size.toLocaleString()} events · Algorithm: centroid distance
+      {/* Framing note — varies by active mode */}
+      <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2 text-xs text-[var(--color-fg-muted)] space-y-1">
+        {isBaselineMode ? (
+          <>
+            <p className="flex items-center gap-1.5">
+              <ShieldCheck size={11} className="text-[var(--color-success)] shrink-0" />
+              <span>
+                Ranked by distance from{" "}
+                <strong className="text-[var(--color-fg-secondary)]">
+                  {data.baseline_size} Normal event{data.baseline_size !== 1 ? "s" : ""}
+                </strong>{" "}
+                you marked as baseline.
+              </span>
+            </p>
+            <p className="opacity-70">
+              Mark more routine events as Normal in the timeline to refine results.
+              Use for triage — proximity to your baseline ≠ confirmed threat.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="flex items-center gap-1.5">
+              <AlertTriangle size={11} className="text-[var(--color-warning)] shrink-0" />
+              <span>
+                Ranked by distance from the{" "}
+                <strong className="text-[var(--color-fg-secondary)]">
+                  statistical bulk
+                </strong>{" "}
+                of this timeline ({data.sample_size.toLocaleString()} events sampled).
+              </span>
+            </p>
+            <p className="flex items-center gap-1 opacity-70">
+              <Info size={10} />
+              Statistically rare, not confirmed threats. Mark routine events as{" "}
+              <strong className="text-[var(--color-fg-secondary)]">Normal</strong> to
+              switch to analyst-defined baseline mode.
+            </p>
+          </>
+        )}
       </div>
 
-      {/* Tag all button */}
+      {/* Persist all as annotations */}
       <Button
         variant="outline"
         size="sm"
@@ -89,8 +123,13 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
                 dist {fmtScore(r.details.distance)}
               </Badge>
               <span className="text-xs text-[var(--color-fg-muted)] font-mono">
-                rank {r.details.rank}/{r.details.of}
+                #{r.details.rank}
               </span>
+              {isBaselineMode && (
+                <span className="text-xs text-[var(--color-fg-muted)] opacity-60">
+                  baseline
+                </span>
+              )}
               <span className="ml-auto text-xs text-[var(--color-fg-muted)] font-mono">
                 {fmtTimestamp(r.event.timestamp)}
               </span>
@@ -100,6 +139,11 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
             </p>
           </button>
         ))}
+        {data.results.length === 0 && (
+          <p className="text-xs text-center text-[var(--color-fg-muted)] py-4">
+            No anomalies found.
+          </p>
+        )}
       </div>
     </div>
   );

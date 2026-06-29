@@ -1,12 +1,12 @@
 """Tests for TraceVector streaming parsers."""
 
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from tracevector.ingestion.parser import JsonlParser, TimesketchCsvParser, detect_format, get_parser
-from tracevector.models.event import ParserConfig, content_hash
+from tracevector.models.event import Event, ParserConfig, content_hash
 
 
 @pytest.fixture
@@ -90,6 +90,41 @@ def test_csv_parser_event_id_is_deterministic(timesketch_csv: Path) -> None:
     assert first_run == second_run
 
 
+def test_event_id_uses_file_hash_not_path(tmp_path: Path) -> None:
+    """Identical content under different temp paths yields identical IDs when file_hash matches."""
+    content = "datetime,message\n2024-01-01T00:00:00+00:00,Hello\n"
+    path_a = tmp_path / "a.csv"
+    path_b = tmp_path / "b.csv"
+    path_a.write_text(content)
+    path_b.write_text(content)
+
+    config = ParserConfig(name="timesketch_csv", version="0.1.0")
+    parser_a = TimesketchCsvParser(
+        "case1", "timeline1", config, file_hash="same_hash", source_name="source.csv"
+    )
+    parser_b = TimesketchCsvParser(
+        "case1", "timeline1", config, file_hash="same_hash", source_name="source.csv"
+    )
+    ids_a = [e.event_id for e in parser_a.parse(path_a)]
+    ids_b = [e.event_id for e in parser_b.parse(path_b)]
+    assert ids_a == ids_b
+    # Provenance should be the supplied source name, not the temp path.
+    assert parser_a.parse(path_a).__next__().source_file == Path("source.csv")
+
+
+def test_different_file_hash_produces_different_event_ids(timesketch_csv: Path) -> None:
+    config = ParserConfig(name="timesketch_csv", version="0.1.0")
+    parser_a = TimesketchCsvParser(
+        "case1", "timeline1", config, file_hash="hash_a", source_name="a.csv"
+    )
+    parser_b = TimesketchCsvParser(
+        "case1", "timeline1", config, file_hash="hash_b", source_name="b.csv"
+    )
+    ids_a = [e.event_id for e in parser_a.parse(timesketch_csv)]
+    ids_b = [e.event_id for e in parser_b.parse(timesketch_csv)]
+    assert ids_a != ids_b
+
+
 def test_csv_parser_preserves_unknown_columns(timesketch_csv: Path, tmp_path: Path) -> None:
     path = tmp_path / "extra.csv"
     path.write_text("datetime,message,unknown_column\n2024-01-01T00:00:00+00:00,Hello,world\n")
@@ -164,18 +199,46 @@ def test_parse_timestamp_normalizes_common_formats() -> None:
     assert _parse_timestamp("2024-01-01T00:00:00+00:00") == datetime(
         2024, 1, 1, 0, 0, 0, tzinfo=UTC
     )
-    assert _parse_timestamp("2024-01-01 00:00:00") == datetime(
-        2024, 1, 1, 0, 0, 0, tzinfo=UTC
-    )
-    assert _parse_timestamp("1704067200") == datetime(
-        2024, 1, 1, 0, 0, 0, tzinfo=UTC
-    )
-    assert _parse_timestamp("1704067200000") == datetime(
-        2024, 1, 1, 0, 0, tzinfo=UTC
-    )
+    assert _parse_timestamp("2024-01-01 00:00:00") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    assert _parse_timestamp("1704067200") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    assert _parse_timestamp("1704067200000") == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     assert _parse_timestamp("1764367341913908") == datetime(
         2025, 11, 28, 22, 2, 21, 913908, tzinfo=UTC
     )
     assert _parse_timestamp(None) is None
     assert _parse_timestamp("") is None
     assert _parse_timestamp("not-a-date") is None
+
+
+def test_event_to_clickhouse_row_parses_timestamp() -> None:
+    event = Event(
+        case_id="c",
+        timeline_id="t",
+        source_file=Path("/tmp/test.log"),
+        byte_offset=0,
+        content_hash="abc",
+        parser_name="p",
+        parser_version="1",
+        raw_line="line",
+        message="msg",
+        timestamp="2024-01-01T00:00:00+00:00",
+    )
+    row = event.to_clickhouse_row()
+    assert row["timestamp"] == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def test_event_to_clickhouse_row_null_for_bad_timestamp() -> None:
+    event = Event(
+        case_id="c",
+        timeline_id="t",
+        source_file=Path("/tmp/test.log"),
+        byte_offset=0,
+        content_hash="abc",
+        parser_name="p",
+        parser_version="1",
+        raw_line="line",
+        message="msg",
+        timestamp="not-a-date",
+    )
+    row = event.to_clickhouse_row()
+    assert row["timestamp"] is None

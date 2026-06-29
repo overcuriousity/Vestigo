@@ -32,6 +32,7 @@ class FakeClickHouseClient:
             "byte_offset",
             "line_number",
             "content_hash",
+            "file_hash",
             "parser_name",
             "parser_version",
             "ingest_time",

@@ -16,6 +16,7 @@ from tracevector.core.jobs import JobStore, get_job_store
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.db.qdrant import QdrantStore
+from tracevector.ingestion.files import hash_file
 from tracevector.ingestion.parser import detect_format
 from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -46,7 +47,7 @@ class ViewCreate(BaseModel):
 class AnnotationCreate(BaseModel):
     """Payload to create an event annotation."""
 
-    annotation_type: str = Field(..., pattern="^(comment|tag)$")
+    annotation_type: str = Field(..., pattern="^(comment|tag|normal)$")
     content: str = Field(..., min_length=1, max_length=4096)
 
 
@@ -143,12 +144,30 @@ async def upload_timeline(
     """Upload a timeline file and ingest events into ClickHouse.
 
     Embeddings are *not* generated here; use the embed endpoint for that.
+    Uploading a file whose SHA-256 hash has already been ingested for this
+    timeline is idempotent and returns the existing result without creating
+    duplicate events.
     """
     store = get_store()
     await store.init_schema()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+
+    file_hash = hash_file(file.file)
+    existing_upload = await store.get_timeline_upload_by_hash(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        file_hash=file_hash,
+    )
+    if existing_upload is not None:
+        return {
+            "timeline_id": timeline_id,
+            "events_parsed": existing_upload.event_count,
+            "events_inserted": 0,
+            "parser": parser or existing_upload.parser or "auto",
+            "duplicate": True,
+        }
 
     suffix = Path(file.filename or "upload").suffix or ".tmp"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -163,19 +182,32 @@ async def upload_timeline(
             case_id=case_id,
             timeline_id=timeline_id,
             batch_size=get_settings().embedding_batch_size,
+            file_hash=file_hash,
+            source_name=file.filename or tmp_path.name,
         )
         result = pipeline.run(tmp_path, format_name=fmt)
+        new_event_count = (timeline.event_count or 0) + result.events_inserted
         await store.update_timeline_counts(
             case_id=case_id,
             timeline_id=timeline_id,
-            event_count=result.events_inserted,
+            event_count=new_event_count,
             vector_count=0,
+        )
+        await store.create_timeline_upload(
+            case_id=case_id,
+            timeline_id=timeline_id,
+            upload_id=generate_id(f"{timeline_id}:{file_hash}"),
+            file_hash=file_hash,
+            filename=file.filename,
+            event_count=result.events_inserted,
+            parser=fmt,
         )
         return {
             "timeline_id": timeline_id,
             "events_parsed": result.events_parsed,
             "events_inserted": result.events_inserted,
             "parser": fmt,
+            "duplicate": False,
         }
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -199,6 +231,7 @@ async def delete_timeline(case_id: str, timeline_id: str) -> dict[str, Any]:
     ch = ClickHouseStore()
     qdrant.delete_timeline_points(case_id, timeline_id)
     ch.delete_timeline_events(case_id, timeline_id)
+    await store.delete_timeline_uploads_for_timeline(case_id, timeline_id)
     await store.delete_timeline(case_id, timeline_id)
 
     return {"deleted": True, "timeline_id": timeline_id}
@@ -279,9 +312,7 @@ async def list_timeline_annotations(case_id: str, timeline_id: str) -> dict[str,
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations")
-async def list_event_annotations(
-    case_id: str, timeline_id: str, event_id: str
-) -> dict[str, Any]:
+async def list_event_annotations(case_id: str, timeline_id: str, event_id: str) -> dict[str, Any]:
     """List annotations for a single event."""
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
@@ -316,9 +347,7 @@ async def create_event_annotation(
     return {"annotation": annotation.to_dict()}
 
 
-@router.delete(
-    "/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations/{annotation_id}"
-)
+@router.delete("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations/{annotation_id}")
 async def delete_event_annotation(
     case_id: str,
     timeline_id: str,
@@ -333,11 +362,30 @@ async def delete_event_annotation(
     return {"deleted": True, "annotation_id": annotation_id}
 
 
+class EmbedRequest(BaseModel):
+    """Optional body for the embed endpoint.
+
+    When ``embedding_config`` is provided it is persisted on the timeline and
+    used to drive per-source field selection.  Omit the body (or send an empty
+    object) to reuse the timeline's stored config, falling back to legacy
+    all-fields behaviour when none has been saved.
+    """
+
+    embedding_config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            'Per-source field selection. Shape: {"version": 1, "sources": '
+            '{"<source>": ["message", "attr:user_agent", ...]}}'
+        ),
+    )
+
+
 def _run_embedding_job(
     job_id: str,
     case_id: str,
     timeline_id: str,
     job_store: JobStore,
+    field_config: dict[str, Any] | None = None,
 ) -> None:
     """Run the embedding pipeline and update the job store."""
 
@@ -354,6 +402,7 @@ def _run_embedding_job(
             timeline_id=timeline_id,
             batch_size=get_settings().embedding_batch_size,
             progress_callback=progress_callback,
+            field_config=field_config,
         )
         result = pipeline.run()
 
@@ -381,12 +430,27 @@ async def start_embedding(
     case_id: str,
     timeline_id: str,
     background_tasks: BackgroundTasks,
+    body: EmbedRequest | None = None,
 ) -> dict[str, Any]:
-    """Start a background job to generate embeddings for a timeline."""
+    """Start a background job to generate embeddings for a timeline.
+
+    Accepts an optional ``embedding_config`` body produced by the embedding
+    wizard.  When supplied it is persisted on the timeline and used to control
+    which fields of which sources get embedded.  Omit the body to reuse the
+    timeline's previously stored config (or fall back to all-fields behaviour).
+    """
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+
+    # Resolve effective field config: request body > stored on timeline > None.
+    field_config: dict[str, Any] | None = None
+    if body is not None and body.embedding_config is not None:
+        field_config = body.embedding_config
+        await store.update_timeline_embedding_config(case_id, timeline_id, field_config)
+    elif timeline.embedding_config is not None:
+        field_config = timeline.embedding_config
 
     job_store = get_job_store()
     job = job_store.create(
@@ -399,5 +463,6 @@ async def start_embedding(
         case_id,
         timeline_id,
         job_store,
+        field_config,
     )
     return {"job_id": job.id, "status": job.status}

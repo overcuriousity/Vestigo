@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Tag, MessageSquare, X } from "lucide-react";
+import { Tag, MessageSquare, ShieldCheck, X } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -32,6 +32,16 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
     });
   }
 
+  function markAllNormal() {
+    Promise.all(
+      selectedIds.map((eventId) =>
+        add.mutateAsync({ eventId, type: "normal", content: "normal operation" }),
+      ),
+    ).finally(() => {
+      onClear();
+    });
+  }
+
   if (selectedIds.length === 0) return null;
 
   return (
@@ -47,6 +57,15 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
           </Button>
           <Button variant="outline" size="sm" onClick={() => setMode("comment")}>
             <MessageSquare size={13} /> Comment
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={add.isPending}
+            onClick={markAllNormal}
+          >
+            {add.isPending ? <Spinner size={13} /> : <ShieldCheck size={13} />}
+            Mark Normal
           </Button>
           <Button
             variant="ghost"

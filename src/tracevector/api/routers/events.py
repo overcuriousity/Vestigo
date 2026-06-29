@@ -133,6 +133,27 @@ async def list_fields(
     return service.list_fields(case_id, timeline_id)
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")
+async def list_embedding_fields(
+    case_id: str,
+    timeline_id: str,
+) -> dict[str, Any]:
+    """Return per-source field information for the embedding wizard.
+
+    For each distinct ``source`` in the timeline, returns the event count,
+    the embeddable top-level fields, available attribute keys, and a
+    recommended preselection.  Used by the frontend embedding wizard to
+    let analysts choose which fields of which sources to embed.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    service = _get_query_service()
+    return service.list_fields_by_source(case_id, timeline_id)
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/histogram")
 async def get_histogram(
     case_id: str,
@@ -356,12 +377,19 @@ async def list_anomalies(
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     svc = _get_similarity_service()
+    # Resolve normal IDs here (in async context) before calling sync find_anomalies.
+    normal_ids = await store.list_event_ids_by_annotation_type(
+        case_id, timeline_id, "normal"
+    )
     result = svc.find_anomalies(
-        case_id, timeline_id, limit=limit, sample_size=sample_size
+        case_id, timeline_id, limit=limit, sample_size=sample_size,
+        normal_ids=normal_ids,
     )
     return {
         "status": result.status,
+        "method": result.method,
         "sample_size": result.sample_size,
+        "baseline_size": result.baseline_size,
         "embedding_config_hash": result.embedding_config_hash,
         "results": [
             {
@@ -405,15 +433,21 @@ async def tag_anomalies(
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     svc = _get_similarity_service()
+    normal_ids = await store.list_event_ids_by_annotation_type(
+        case_id, timeline_id, "normal"
+    )
     result = svc.find_anomalies(
-        case_id, timeline_id, limit=body.limit, sample_size=body.sample_size
+        case_id, timeline_id, limit=body.limit, sample_size=body.sample_size,
+        normal_ids=normal_ids,
     )
 
     if result.status != "ok":
         return {
             "status": result.status,
+            "method": result.method,
             "tagged": 0,
             "sample_size": result.sample_size,
+            "baseline_size": result.baseline_size,
             "embedding_config_hash": result.embedding_config_hash,
             "results": [],
         }
@@ -425,10 +459,17 @@ async def tag_anomalies(
     rows = []
     for r in result.results:
         d = r.details
-        content = (
-            f"Outlier — cosine distance {d['distance']:.4f} from timeline centroid "
-            f"(rank {d['rank']}/{d['of']}, sample {d['sample_size']})"
-        )
+        method = d.get("method", "centroid-distance")
+        if method == "normal-baseline":
+            content = (
+                f"Outlier — distance {d['distance']:.4f} from analyst-defined normal baseline "
+                f"({d['baseline_size']} normal events, rank {d['rank']}/{d['of']})"
+            )
+        else:
+            content = (
+                f"Outlier — cosine distance {d['distance']:.4f} from timeline centroid "
+                f"(rank {d['rank']}/{d['of']}, sample {d.get('sample_size', '?')})"
+            )
         rows.append(
             {
                 "annotation_id": generate_id(f"{r.event_id}_outlier"),
@@ -446,8 +487,10 @@ async def tag_anomalies(
 
     return {
         "status": "ok",
+        "method": result.method,
         "tagged": tagged,
         "sample_size": result.sample_size,
+        "baseline_size": result.baseline_size,
         "embedding_config_hash": result.embedding_config_hash,
         "results": [
             {
