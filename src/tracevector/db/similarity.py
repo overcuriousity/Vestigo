@@ -6,20 +6,21 @@ Anomaly detection — two modes depending on analyst feedback:
 
 1. Collect the IDs of all events annotated ``annotation_type="normal"`` via
    the PostgresStore helper.
-2. Pass them as *negative examples* to Qdrant's Recommendation API.
-   With negative-only examples Qdrant returns points maximally unlike the
-   normal set — the analyst's definition of anomaly.
-3. Exclude the normal events themselves from results.
-4. Recompute exact cosine distance from the normal-set centroid for each
+2. Compute the centroid of the stored vectors for those normal events.
+3. Query Qdrant for the points nearest to the *negated* normal-set centroid.
+   For COSINE collections, closest to ``-centroid`` == farthest from the
+   normal baseline == candidate anomalies.
+4. Exclude the normal events themselves from results.
+5. Recompute exact cosine distance from the normal-set centroid for each
    result, sort descending, and hydrate from ClickHouse.
    Details carry ``method="normal-baseline"`` and ``baseline_size``.
 
 **Centroid mode** (no normal annotations, or fallback):
 
-1. Discover which Qdrant collection holds the timeline's vectors.
+1. Discover which Qdrant collection holds the source IDs' vectors.
    Return ``status="not_embedded"`` when none exist.
 2. Scroll up to ``sample_size`` points to compute an approximate centroid
-   of the timeline's embedding space.  On huge timelines this is a
+   of the sources' embedding space.  On huge timelines this is a
    representative sample; on small ones it covers everything.
 3. Query Qdrant for the nearest points to the *negated* centroid.
    For COSINE collections, closest to ``-centroid`` == farthest from
@@ -31,7 +32,7 @@ Anomaly detection — two modes depending on analyst feedback:
 
 For similarity search:
 1. Retrieve the stored vector for the query event_id from Qdrant.
-2. Query for the K+1 nearest neighbours (timeline-filtered).
+2. Query for the K+1 nearest neighbours (filtered to the timeline's sources).
 3. Drop the query event itself; return the rest with cosine similarity scores.
 """
 
@@ -124,12 +125,12 @@ def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_id": payload.get("event_id", ""),
         "case_id": payload.get("case_id", ""),
-        "timeline_id": payload.get("timeline_id", ""),
+        "source_id": payload.get("source_id", ""),
         "message": payload.get("message", ""),
         "timestamp": ts,
         "timestamp_desc": payload.get("timestamp_desc", ""),
-        "source": payload.get("source", ""),
-        "source_long": payload.get("source_long", ""),
+        "artifact": payload.get("artifact", ""),
+        "artifact_long": payload.get("artifact_long", ""),
         "display_name": payload.get("display_name", ""),
         "tags": payload.get("tags") or [],
         "attributes": {},
@@ -138,6 +139,7 @@ def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
         "byte_offset": payload.get("byte_offset"),
         "line_number": payload.get("line_number"),
         "content_hash": payload.get("content_hash", ""),
+        "file_hash": payload.get("file_hash", ""),
         "parser_name": payload.get("parser_name", ""),
         "parser_version": payload.get("parser_version", ""),
         "embedding_model": payload.get("embedding_model", ""),
@@ -164,12 +166,12 @@ def _row_to_event(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_id": str(row.get("event_id", "")),
         "case_id": row.get("case_id", ""),
-        "timeline_id": row.get("timeline_id", ""),
+        "source_id": row.get("source_id", ""),
         "message": row.get("message", ""),
         "timestamp": ts,
         "timestamp_desc": row.get("timestamp_desc", ""),
-        "source": row.get("source", ""),
-        "source_long": row.get("source_long", ""),
+        "artifact": row.get("artifact", ""),
+        "artifact_long": row.get("artifact_long", ""),
         "display_name": row.get("display_name", ""),
         "tags": row.get("tags") or [],
         "attributes": row.get("attributes") or {},
@@ -177,6 +179,7 @@ def _row_to_event(row: dict[str, Any]) -> dict[str, Any]:
         "byte_offset": row.get("byte_offset"),
         "line_number": row.get("line_number"),
         "content_hash": row.get("content_hash", ""),
+        "file_hash": row.get("file_hash", ""),
         "parser_name": row.get("parser_name", ""),
         "parser_version": row.get("parser_version", ""),
         "embedding_model": row.get("embedding_model", ""),
@@ -209,12 +212,12 @@ class SimilarityService:
     def find_anomalies(
         self,
         case_id: str,
-        timeline_id: str,
+        source_ids: list[str],
         limit: int = 50,
         sample_size: int = 5000,
         normal_ids: list[str] | None = None,
     ) -> AnomalyResult:
-        """Return the ``limit`` most unusual events in a timeline.
+        """Return the ``limit`` most unusual events across the given sources.
 
         Operates in one of two modes depending on analyst feedback:
 
@@ -231,9 +234,9 @@ class SimilarityService:
         handler via ``await postgres.list_event_ids_by_annotation_type(...)``).
 
         Returns :class:`AnomalyResult` with ``status="not_embedded"`` when
-        the timeline has no stored vectors.
+        the sources have no stored vectors.
         """
-        collection = self.qdrant.find_timeline_collection(case_id, timeline_id)
+        collection = self.qdrant.find_timeline_collection(case_id, source_ids)
         if collection is None:
             return AnomalyResult(status="not_embedded")
 
@@ -247,7 +250,7 @@ class SimilarityService:
             return self._find_anomalies_baseline(
                 collection=collection,
                 case_id=case_id,
-                timeline_id=timeline_id,
+                source_ids=source_ids,
                 limit=limit,
                 config_hash=config_hash,
                 normal_ids=normal_ids,
@@ -256,7 +259,7 @@ class SimilarityService:
         return self._find_anomalies_centroid(
             collection=collection,
             case_id=case_id,
-            timeline_id=timeline_id,
+            source_ids=source_ids,
             limit=limit,
             sample_size=sample_size,
             config_hash=config_hash,
@@ -266,7 +269,7 @@ class SimilarityService:
         self,
         collection: str,
         case_id: str,
-        timeline_id: str,
+        source_ids: list[str],
         limit: int,
         config_hash: str,
         normal_ids: list[str],
@@ -274,19 +277,27 @@ class SimilarityService:
     ) -> AnomalyResult:
         """Anomaly detection driven by analyst-defined normal baseline.
 
-        Uses Qdrant's Recommendation API with the normal events as negatives.
-        Normal events are excluded from the returned results.
+        Computes the centroid of the analyst-marked normal events and returns the
+        events that are farthest from that centroid.  Normal events are excluded
+        from the returned results.
         """
         # Filter normal_ids to only those that exist in the Qdrant collection.
         # IDs come from Postgres annotations which may predate embedding.
         existing_points = self.qdrant.client.retrieve(
             collection_name=collection,
             ids=normal_ids,
-            with_vectors=False,
+            with_vectors=True,
             with_payload=False,
         )
-        existing_ids = [str(p.id) for p in existing_points]
-        if not existing_ids:
+        normal_vecs = [
+            np.array(p.vector, dtype=np.float32)
+            for p in existing_points
+            if p.vector is not None
+        ]
+        normal_ids = [str(p.id) for p in existing_points if p.vector is not None]
+        normal_id_set = set(normal_ids)
+
+        if not normal_ids or not normal_vecs:
             return AnomalyResult(
                 status="ok",
                 results=[],
@@ -295,15 +306,20 @@ class SimilarityService:
                 baseline_size=0,
                 method="normal-baseline",
             )
-        normal_ids = existing_ids
-        normal_id_set = set(existing_ids)
 
+        # Compute the normal-set centroid.
+        centroid: np.ndarray = np.mean(normal_vecs, axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+
+        # Query for nearest points to -centroid (= farthest from normal centroid).
         # Request extra results so we can drop normal events from the list.
         fetch_limit = limit + len(normal_ids)
-        hits = self.qdrant.recommend_anomalies(
+        hits = self.qdrant.search(
             collection_name=collection,
-            timeline_id=timeline_id,
-            negative_ids=normal_ids,
+            query_vector=(-centroid).tolist(),
+            source_ids=source_ids,
             limit=fetch_limit,
             with_vectors=True,
         )
@@ -321,31 +337,8 @@ class SimilarityService:
                 method="normal-baseline",
             )
 
-        # Compute the normal-set centroid to derive a meaningful distance score.
-        # Fetch the specific normal-event vectors by ID so we always retrieve the
-        # right points regardless of timeline size (scroll_vectors returns arbitrary
-        # points and would miss the normal events on any large timeline).
-        normal_vecs_raw = self.qdrant.client.retrieve(
-            collection_name=collection,
-            ids=normal_ids,
-            with_vectors=True,
-            with_payload=False,
-        )
-        normal_vecs = [
-            np.array(r.vector, dtype=np.float32)
-            for r in normal_vecs_raw
-            if r.vector is not None
-        ]
-        if normal_vecs:
-            centroid: np.ndarray = np.mean(normal_vecs, axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
-        else:
-            centroid = None
-
         event_ids = [str(h.id) for h in hits]
-        ch_rows = self.clickhouse.get_events_by_ids(case_id, timeline_id, event_ids)
+        ch_rows = self.clickhouse.get_events_by_ids(case_id, source_ids, event_ids)
 
         results: list[OutlierResult] = []
         for rank, hit in enumerate(hits, start=1):
@@ -355,7 +348,7 @@ class SimilarityService:
             else:
                 event = _payload_to_event(hit.payload or {})
 
-            if centroid is not None and hit.vector is not None:
+            if hit.vector is not None:
                 vec = np.array(hit.vector, dtype=np.float32)
                 distance = _cosine_distance(vec, centroid)
             else:
@@ -392,7 +385,7 @@ class SimilarityService:
         self,
         collection: str,
         case_id: str,
-        timeline_id: str,
+        source_ids: list[str],
         limit: int,
         sample_size: int,
         config_hash: str,
@@ -400,7 +393,7 @@ class SimilarityService:
         """Anomaly detection via distance-to-global-centroid (no baseline)."""
         # 1. Sample vectors to compute an approximate centroid.
         records = self.qdrant.scroll_vectors(
-            collection, timeline_id, limit=sample_size, with_vectors=True
+            collection, source_ids, limit=sample_size, with_vectors=True
         )
         if len(records) < 2:
             return AnomalyResult(status="insufficient_vectors")
@@ -418,7 +411,7 @@ class SimilarityService:
         hits = self.qdrant.search(
             collection_name=collection,
             query_vector=neg_centroid,
-            timeline_id=timeline_id,
+            source_ids=source_ids,
             limit=limit,
             with_vectors=True,
         )
@@ -433,7 +426,7 @@ class SimilarityService:
 
         # 3. Recompute exact cosine distance and hydrate from ClickHouse.
         event_ids = [str(h.id) for h in hits]
-        ch_rows = self.clickhouse.get_events_by_ids(case_id, timeline_id, event_ids)
+        ch_rows = self.clickhouse.get_events_by_ids(case_id, source_ids, event_ids)
 
         results: list[OutlierResult] = []
         for rank, hit in enumerate(hits, start=1):
@@ -480,7 +473,7 @@ class SimilarityService:
     def find_similar(
         self,
         case_id: str,
-        timeline_id: str,
+        source_ids: list[str],
         event_id: str,
         limit: int = 10,
     ) -> SimilaritySearchResult:
@@ -489,10 +482,10 @@ class SimilarityService:
         The query event itself is excluded from results.  Scores are cosine
         similarity (0–1; higher = more similar).
 
-        Returns ``status="not_embedded"`` when the timeline has no vectors, or
+        Returns ``status="not_embedded"`` when the sources have no vectors, or
         ``status="vector_not_found"`` when the specific event has no vector.
         """
-        collection = self.qdrant.find_timeline_collection(case_id, timeline_id)
+        collection = self.qdrant.find_timeline_collection(case_id, source_ids)
         if collection is None:
             return SimilaritySearchResult(status="not_embedded")
 
@@ -504,7 +497,7 @@ class SimilarityService:
         hits = self.qdrant.search(
             collection_name=collection,
             query_vector=query_vector,
-            timeline_id=timeline_id,
+            source_ids=source_ids,
             limit=limit + 1,
             with_vectors=False,
         )
@@ -514,7 +507,7 @@ class SimilarityService:
             return SimilaritySearchResult(status="ok", results=[])
 
         event_ids = [str(h.id) for h in hits]
-        ch_rows = self.clickhouse.get_events_by_ids(case_id, timeline_id, event_ids)
+        ch_rows = self.clickhouse.get_events_by_ids(case_id, source_ids, event_ids)
 
         results: list[SimilarResult] = []
         for hit in hits:

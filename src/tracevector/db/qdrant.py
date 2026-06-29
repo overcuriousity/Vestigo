@@ -3,6 +3,9 @@
 One collection is created per case.  The collection name embeds the
 embedding-config hash so that vectors produced with different models or
 normalisation settings are never mixed.
+
+Points are scoped by ``source_id`` (one ingested file) so a Source can be
+reused across multiple Timelines without duplicating vectors.
 """
 
 from __future__ import annotations
@@ -15,11 +18,9 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    MatchAny,
     MatchValue,
     PointStruct,
-    RecommendInput,
-    RecommendQuery,
-    RecommendStrategy,
     ScoredPoint,
     VectorParams,
 )
@@ -157,48 +158,91 @@ class QdrantStore:
         collections = self.client.get_collections()
         return [c.name for c in collections.collections if c.name.startswith(prefix)]
 
-    def delete_timeline_points(self, case_id: str, timeline_id: str) -> None:
-        """Delete all vector points for ``timeline_id`` across all case collections.
+    def _source_filter(self, source_id: str) -> Filter:
+        """Return a Qdrant filter matching a single source_id."""
+        return Filter(
+            must=[
+                FieldCondition(
+                    key="source_id",
+                    match=MatchValue(value=source_id),
+                )
+            ]
+        )
 
-        The ``timeline_id`` is stored in the Qdrant point payload (see
-        ``Event.to_qdrant_payload``), so a payload filter cleanly selects
-        only the affected points.  Collections that do not exist are skipped.
-        """
+    def _sources_filter(self, source_ids: list[str]) -> Filter:
+        """Return a Qdrant filter matching any of the given source IDs."""
+        return Filter(
+            must=[
+                FieldCondition(
+                    key="source_id",
+                    match=MatchAny(any=list(source_ids)),
+                )
+            ]
+        )
+
+    def delete_source_points(self, case_id: str, source_id: str) -> None:
+        """Delete all vector points for ``source_id`` across all case collections."""
         for name in self.case_collections(case_id):
             with contextlib.suppress(Exception):
                 self.client.delete(
                     collection_name=name,
-                    points_selector=Filter(
-                        must=[
-                            FieldCondition(
-                                key="timeline_id",
-                                match=MatchValue(value=timeline_id),
-                            )
-                        ]
-                    ),
+                    points_selector=self._source_filter(source_id),
                 )
 
-    def find_timeline_collection(self, case_id: str, timeline_id: str) -> str | None:
-        """Return the Qdrant collection name that holds vectors for ``timeline_id``.
+    def delete_timeline_points(self, case_id: str, source_ids: list[str]) -> None:
+        """Delete all vector points for a timeline's sources across all case collections."""
+        for name in self.case_collections(case_id):
+            with contextlib.suppress(Exception):
+                self.client.delete(
+                    collection_name=name,
+                    points_selector=self._sources_filter(source_ids),
+                )
+
+    def find_source_collection(self, case_id: str, source_id: str) -> str | None:
+        """Return the Qdrant collection name that holds vectors for ``source_id``.
 
         Iterates collections for the case and returns the first (by vector count,
-        largest first) that contains at least one point with the given timeline_id
-        in its payload.  Returns ``None`` when no embeddings exist for the timeline.
+        largest first) that contains at least one point with the given source_id
+        in its payload.  Returns ``None`` when no embeddings exist for the source.
         """
         names = self.case_collections(case_id)
         if not names:
             return None
 
-        # Rank candidates by how many points they hold for this timeline_id.
         best: tuple[int, str] | None = None
-        timeline_filter = Filter(
-            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
-        )
+        source_filter = self._source_filter(source_id)
         for name in names:
             with contextlib.suppress(Exception):
                 result = self.client.count(
                     collection_name=name,
-                    count_filter=timeline_filter,
+                    count_filter=source_filter,
+                    exact=False,
+                )
+                count = result.count
+                if count > 0 and (best is None or count > best[0]):
+                    best = (count, name)
+
+        return best[1] if best is not None else None
+
+    def find_timeline_collection(
+        self, case_id: str, source_ids: list[str]
+    ) -> str | None:
+        """Return the Qdrant collection name that holds vectors for a timeline.
+
+        Returns the collection with the most points matching any of the timeline's
+        source IDs. Returns ``None`` when no embeddings exist.
+        """
+        names = self.case_collections(case_id)
+        if not names or not source_ids:
+            return None
+
+        best: tuple[int, str] | None = None
+        sources_filter = self._sources_filter(source_ids)
+        for name in names:
+            with contextlib.suppress(Exception):
+                result = self.client.count(
+                    collection_name=name,
+                    count_filter=sources_filter,
                     exact=False,
                 )
                 count = result.count
@@ -210,23 +254,20 @@ class QdrantStore:
     def scroll_vectors(
         self,
         collection_name: str,
-        timeline_id: str,
+        source_ids: list[str],
         limit: int,
         with_vectors: bool = True,
     ) -> list[ScoredPoint]:
-        """Return up to ``limit`` points for a timeline, with vectors.
+        """Return up to ``limit`` points for source IDs, with vectors.
 
         Uses the Qdrant ``scroll`` API which returns arbitrary (non-ranked) points —
         suitable for centroid computation where ranking does not matter.
 
         Returns a list of :class:`qdrant_client.models.Record` objects.
         """
-        timeline_filter = Filter(
-            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
-        )
         records, _next = self.client.scroll(
             collection_name=collection_name,
-            scroll_filter=timeline_filter,
+            scroll_filter=self._sources_filter(source_ids),
             limit=limit,
             with_vectors=with_vectors,
             with_payload=True,
@@ -237,58 +278,19 @@ class QdrantStore:
         self,
         collection_name: str,
         query_vector: list[float],
-        timeline_id: str,
+        source_ids: list[str],
         limit: int,
         with_vectors: bool = True,
     ) -> list[ScoredPoint]:
         """Return up to ``limit`` nearest neighbours of ``query_vector``.
 
-        Results are filtered to ``timeline_id`` via a payload filter and returned
+        Results are filtered to ``source_ids`` via a payload filter and returned
         in descending score (similarity) order.
         """
-        timeline_filter = Filter(
-            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
-        )
         return self.client.query_points(
             collection_name=collection_name,
             query=query_vector,
-            query_filter=timeline_filter,
-            limit=limit,
-            with_vectors=with_vectors,
-            with_payload=True,
-        ).points
-
-    def recommend_anomalies(
-        self,
-        collection_name: str,
-        timeline_id: str,
-        negative_ids: list[str],
-        limit: int,
-        with_vectors: bool = True,
-    ) -> list[ScoredPoint]:
-        """Return up to ``limit`` points most unlike the ``negative_ids`` set.
-
-        Uses Qdrant's native Recommendation API with the analyst's "normal"
-        events as negative examples.  With *negative-only* examples the engine
-        returns points that are maximally dissimilar to the normal set —
-        exactly the anomalies.
-
-        ``negative_ids`` must be valid point IDs (event_id strings) already
-        stored in ``collection_name``.  Results are filtered to ``timeline_id``
-        and sorted by descending anomaly relevance score.
-        """
-        timeline_filter = Filter(
-            must=[FieldCondition(key="timeline_id", match=MatchValue(value=timeline_id))]
-        )
-        return self.client.query_points(
-            collection_name=collection_name,
-            query=RecommendQuery(
-                recommend=RecommendInput(
-                    negative=negative_ids,
-                    strategy=RecommendStrategy.AVERAGE_VECTOR,
-                )
-            ),
-            query_filter=timeline_filter,
+            query_filter=self._sources_filter(source_ids),
             limit=limit,
             with_vectors=with_vectors,
             with_payload=True,
