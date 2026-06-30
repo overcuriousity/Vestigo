@@ -4,15 +4,22 @@ Anomaly detection — two modes depending on analyst feedback:
 
 **Baseline mode** (analyst has marked ≥1 events as "normal"):
 
+One-class novelty detection scored by distance to the *nearest* normal event,
+not to the normal-set average.  This is deliberate: in DFIR "normal operation"
+is multimodal (logons, scheduled tasks, DNS, service starts, ... each form
+their own cluster in embedding space), so a single centroid lands in the empty
+space between those clusters and mislabels routine events as outliers.  A
+candidate only has to resemble *one* normal exemplar to count as routine.
+
 1. Collect the IDs of all events annotated ``annotation_type="normal"`` via
    the PostgresStore helper.
-2. Compute the centroid of the stored vectors for those normal events.
-3. Query Qdrant for the points nearest to the *negated* normal-set centroid.
-   For COSINE collections, closest to ``-centroid`` == farthest from the
-   normal baseline == candidate anomalies.
-4. Exclude the normal events themselves from results.
-5. Recompute exact cosine distance from the normal-set centroid for each
-   result, sort descending, and hydrate from ClickHouse.
+2. Retrieve the stored vectors for those normal events (dropping any that have
+   no vector yet) and L2-normalise them into a baseline matrix.
+3. Scroll up to ``sample_size`` candidate vectors for the sources and exclude
+   the normal events themselves.
+4. For each candidate compute the maximum cosine similarity to any normal
+   vector; the anomaly score is ``1 - max_similarity`` (cosine distance to the
+   nearest normal).  Sort descending and hydrate from ClickHouse.
    Details carry ``method="normal-baseline"`` and ``baseline_size``.
 
 **Centroid mode** (no normal annotations, or fallback):
@@ -110,6 +117,18 @@ def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     # Clamp to [-1, 1] for numerical safety.
     dot = max(-1.0, min(1.0, dot))
     return 1.0 - dot
+
+
+def _l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    """Return ``matrix`` with each row scaled to unit L2 norm.
+
+    Stored embedding vectors are already normalised, but normalising defensively
+    means a plain dot product between two rows is their cosine similarity.
+    Zero-norm rows are left unchanged (their similarity to anything is 0).
+    """
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return matrix / norms
 
 
 def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
@@ -222,9 +241,10 @@ class SimilarityService:
         Operates in one of two modes depending on analyst feedback:
 
         **Baseline mode** — when ``normal_ids`` is a non-empty list of event IDs
-        marked as "normal" by the analyst, uses Qdrant's Recommendation API with
-        those events as negatives (maximally unlike the normal set).  Normal events
-        are excluded from results.  Details carry ``method="normal-baseline"``.
+        marked as "normal" by the analyst, scores each candidate by its cosine
+        distance to the *nearest* normal event (one-class novelty detection).
+        Normal events are excluded from results.  Details carry
+        ``method="normal-baseline"``.
 
         **Centroid mode** — when ``normal_ids`` is empty or ``None``, uses distance-
         to-centroid scoring over a random sample.  Rare ≠ malicious; this is
@@ -244,7 +264,6 @@ class SimilarityService:
         config_hash = collection.rsplit("_", 1)[-1]
 
         normal_ids = normal_ids or []
-        normal_id_set = set(normal_ids)
 
         if normal_ids:
             return self._find_anomalies_baseline(
@@ -252,9 +271,9 @@ class SimilarityService:
                 case_id=case_id,
                 source_ids=source_ids,
                 limit=limit,
+                sample_size=sample_size,
                 config_hash=config_hash,
                 normal_ids=normal_ids,
-                normal_id_set=normal_id_set,
             )
         return self._find_anomalies_centroid(
             collection=collection,
@@ -271,33 +290,37 @@ class SimilarityService:
         case_id: str,
         source_ids: list[str],
         limit: int,
+        sample_size: int,
         config_hash: str,
         normal_ids: list[str],
-        normal_id_set: set[str],
     ) -> AnomalyResult:
-        """Anomaly detection driven by analyst-defined normal baseline.
+        """Anomaly detection by distance to the *nearest* analyst-marked normal.
 
-        Computes the centroid of the analyst-marked normal events and returns the
-        events that are farthest from that centroid.  Normal events are excluded
-        from the returned results.
+        One-class novelty detection: each candidate is scored by ``1 - s`` where
+        ``s`` is its maximum cosine similarity to any normal event.  Scoring
+        against the nearest normal (rather than the normal-set centroid) keeps a
+        multimodal baseline honest — a candidate only has to resemble one normal
+        exemplar to be treated as routine.  Normal events are excluded from the
+        returned results.
         """
-        # Filter normal_ids to only those that exist in the Qdrant collection.
-        # IDs come from Postgres annotations which may predate embedding.
-        existing_points = self.qdrant.client.retrieve(
+        # Retrieve stored vectors for the analyst-marked normal events.  IDs come
+        # from Postgres annotations and may predate embedding, so drop any that
+        # have no vector in this collection yet.
+        normal_points = self.qdrant.client.retrieve(
             collection_name=collection,
             ids=normal_ids,
             with_vectors=True,
             with_payload=False,
         )
         normal_vecs = [
-            np.array(p.vector, dtype=np.float32)
-            for p in existing_points
+            np.asarray(p.vector, dtype=np.float32)
+            for p in normal_points
             if p.vector is not None
         ]
-        normal_ids = [str(p.id) for p in existing_points if p.vector is not None]
-        normal_id_set = set(normal_ids)
+        normal_id_set = {str(p.id) for p in normal_points if p.vector is not None}
+        baseline_size = len(normal_vecs)
 
-        if not normal_ids or not normal_vecs:
+        if not normal_vecs:
             return AnomalyResult(
                 status="ok",
                 results=[],
@@ -307,59 +330,61 @@ class SimilarityService:
                 method="normal-baseline",
             )
 
-        # Compute the normal-set centroid.
-        centroid: np.ndarray = np.mean(normal_vecs, axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid = centroid / norm
+        # Unit-normalise the baseline so a dot product is cosine similarity.
+        normal_matrix = _l2_normalize_rows(np.vstack(normal_vecs))
 
-        # Query for nearest points to -centroid (= farthest from normal centroid).
-        # Request extra results so we can drop normal events from the list.
-        fetch_limit = limit + len(normal_ids)
-        hits = self.qdrant.search(
-            collection_name=collection,
-            query_vector=(-centroid).tolist(),
-            source_ids=source_ids,
-            limit=fetch_limit,
-            with_vectors=True,
+        # Scan candidate vectors for the sources, excluding the normals themselves.
+        # Bounded by sample_size for performance; raise it to scan a larger slice
+        # of very large timelines.
+        records = self.qdrant.scroll_vectors(
+            collection, source_ids, limit=sample_size, with_vectors=True
         )
+        candidates = [
+            r
+            for r in records
+            if r.vector is not None and str(r.id) not in normal_id_set
+        ]
 
-        # Exclude normal events from results.
-        hits = [h for h in hits if str(h.id) not in normal_id_set][:limit]
-
-        if not hits:
+        if not candidates:
             return AnomalyResult(
                 status="ok",
                 results=[],
-                sample_size=0,
+                sample_size=len(records),
                 embedding_config_hash=config_hash,
-                baseline_size=len(normal_ids),
+                baseline_size=baseline_size,
                 method="normal-baseline",
             )
 
-        event_ids = [str(h.id) for h in hits]
+        cand_matrix = _l2_normalize_rows(
+            np.vstack([np.asarray(r.vector, dtype=np.float32) for r in candidates])
+        )
+        # Cosine similarity of every candidate to every normal exemplar, then the
+        # nearest-normal similarity per candidate.  Distance = 1 - nearest_sim.
+        sims = cand_matrix @ normal_matrix.T
+        nearest_sim = np.clip(sims.max(axis=1), -1.0, 1.0)
+        distances = 1.0 - nearest_sim
+
+        # Rank by distance descending and keep the top `limit`.
+        order = np.argsort(-distances, kind="stable")[:limit]
+        top = [(candidates[i], float(distances[i])) for i in order]
+
+        event_ids = [str(rec.id) for rec, _ in top]
         ch_rows = self.clickhouse.get_events_by_ids(case_id, source_ids, event_ids)
 
         results: list[OutlierResult] = []
-        for rank, hit in enumerate(hits, start=1):
-            eid = str(hit.id)
+        for rank, (rec, distance) in enumerate(top, start=1):
+            eid = str(rec.id)
             if eid in ch_rows:
                 event = _row_to_event(ch_rows[eid])
             else:
-                event = _payload_to_event(hit.payload or {})
-
-            if hit.vector is not None:
-                vec = np.array(hit.vector, dtype=np.float32)
-                distance = _cosine_distance(vec, centroid)
-            else:
-                distance = float(1 - hit.score) if hit.score is not None else 0.0
+                event = _payload_to_event(rec.payload or {})
 
             details: dict[str, Any] = {
                 "method": "normal-baseline",
                 "distance": round(distance, 6),
                 "rank": rank,
-                "of": len(hits),
-                "baseline_size": len(normal_ids),
+                "of": len(top),
+                "baseline_size": baseline_size,
                 "embedding_config_hash": config_hash,
             }
             results.append(
@@ -371,13 +396,12 @@ class SimilarityService:
                 )
             )
 
-        results.sort(key=lambda r: r.score, reverse=True)
         return AnomalyResult(
             status="ok",
             results=results,
-            sample_size=0,
+            sample_size=len(records),
             embedding_config_hash=config_hash,
-            baseline_size=len(normal_ids),
+            baseline_size=baseline_size,
             method="normal-baseline",
         )
 

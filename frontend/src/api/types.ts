@@ -160,6 +160,16 @@ export interface TagAnomaliesResponse extends AnomaliesResponse {
   tagged: number;
 }
 
+/** Per-field heuristic verdict from the wizard recommender. */
+export interface FieldVerdict {
+  /** "message" or "attr:<key>" */
+  token: string;
+  recommended: boolean;
+  /** "text" | "numeric" | "hash" | "guid" | "id" | "constant" | "empty" */
+  kind: string;
+  reason: string;
+}
+
 /** Per-artifact field info returned by /embedding-fields */
 export interface EmbeddingArtifactInfo {
   artifact: string;
@@ -170,6 +180,10 @@ export interface EmbeddingArtifactInfo {
   attributes: string[];
   /** Recommended preselection (tokens like "message", "attr:user_agent") */
   recommended: string[];
+  /** Per-field verdict explaining why each field was kept or dropped */
+  field_analysis: FieldVerdict[];
+  /** Groups of fields whose values embed close together (semantically related) */
+  related_groups: string[][];
 }
 
 export interface EmbeddingFieldsResponse {

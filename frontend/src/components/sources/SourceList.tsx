@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
 import { Button } from "@/components/ui/Button";
 import { UploadDialog } from "@/components/timelines/UploadDialog";
-import { EmbedButton } from "@/components/timelines/EmbedButton";
+import { EmbedWizard } from "@/components/timelines/EmbedWizard";
 import type { Source } from "@/api/types";
 
 interface Props {
@@ -44,7 +44,7 @@ function SourceRow({ caseId, source }: { caseId: string; source: Source }) {
         </div>
       </div>
       <div className="flex items-center gap-2 shrink-0">
-        <EmbedButton caseId={caseId} source={source} />
+        <EmbedWizard caseId={caseId} source={source} />
         <Button variant="ghost" size="icon" asChild title="Download original file">
           <a href={sourcesApi.downloadUrl(caseId, source.id)} download>
             <Download size={14} />

@@ -384,6 +384,45 @@ def test_find_anomalies_baseline_returns_empty_when_normals_not_embedded():
     assert result.baseline_size == 0
 
 
+def test_find_anomalies_baseline_multimodal_normal():
+    """A routine event near one normal cluster must outrank a true outlier.
+
+    With a multimodal normal set (two well-separated clusters) the average of
+    the normal vectors lands between them, so a centroid baseline would flag a
+    perfectly routine member of either cluster.  Nearest-normal scoring must
+    instead rank the event unlike *both* clusters first.
+    """
+    qdrant = FakeQdrantStore()
+    # Cluster A along +x, cluster B along +y — their centroid is the diagonal.
+    qdrant._add_point("col1", "normal_a1", _unit([1.0, 0.0]), "s1", "normal a1")
+    qdrant._add_point("col1", "normal_a2", _unit([1.0, 0.05]), "s1", "normal a2")
+    qdrant._add_point("col1", "normal_b1", _unit([0.0, 1.0]), "s1", "normal b1")
+    qdrant._add_point("col1", "normal_b2", _unit([0.05, 1.0]), "s1", "normal b2")
+    # Routine event sitting inside cluster B — close to a normal, far from centroid.
+    qdrant._add_point("col1", "routine_b", _unit([0.0, 1.0]), "s1", "routine b")
+    # True outlier pointing away from both clusters.
+    qdrant._add_point("col1", "outlier", _unit([-1.0, -1.0]), "s1", "real outlier")
+
+    ch = FakeClickHouseStore()
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+    result = svc.find_anomalies(
+        "case1",
+        ["s1"],
+        limit=5,
+        normal_ids=["normal_a1", "normal_a2", "normal_b1", "normal_b2"],
+    )
+
+    assert result.status == "ok"
+    assert result.method == "normal-baseline"
+    ranked = [r.event_id for r in result.results]
+    # The true outlier ranks first; the routine in-cluster event ranks below it.
+    assert ranked[0] == "outlier"
+    assert ranked.index("outlier") < ranked.index("routine_b")
+    routine_score = next(r.score for r in result.results if r.event_id == "routine_b")
+    # routine_b coincides with a normal, so its distance to nearest normal ~0.
+    assert routine_score < 0.01
+
+
 # ---------------------------------------------------------------------------
 # find_similar tests
 # ---------------------------------------------------------------------------

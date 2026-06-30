@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from tracevector.db.clickhouse import ClickHouseStore
+from tracevector.db.field_recommend import recommend_fields
 
 
 @dataclass
@@ -28,6 +29,20 @@ class EventQuery:
     limit: int = 50
     offset: int = 0
     order: Literal["asc", "desc"] = "desc"
+
+
+def _iter_attr_items(attrs: Any) -> Iterator[tuple[str, Any]]:
+    """Yield ``(key, value)`` from a ClickHouse Map column.
+
+    clickhouse-connect returns Map columns as a ``dict``, but tolerate a list of
+    pairs as well so the caller never has to care about the driver shape.
+    """
+    if isinstance(attrs, dict):
+        yield from attrs.items()
+    elif isinstance(attrs, (list, tuple)):
+        for item in attrs:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                yield item[0], item[1]
 
 
 @dataclass
@@ -329,39 +344,51 @@ class EventQueryService:
             "attributes": sorted(raw_keys),
         }
 
+    # Top-level fields meaningful for embedding (not IDs/provenance).
+    _EMBEDDABLE_TOP_LEVEL = [
+        "message",
+        "timestamp_desc",
+        "artifact_long",
+        "display_name",
+        "tags",
+    ]
+
     def list_fields_by_artifact(
-        self, case_id: str, source_ids: list[str]
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        encode: Callable[[list[str]], list[list[float]]] | None = None,
+        sample_per_artifact: int = 400,
     ) -> dict[str, list[dict[str, Any]]]:
         """Return per-artifact field information for the embedding wizard.
 
-        For each distinct ``artifact`` value across the timeline's sources,
-        returns the event count, the available top-level embedding fields, and
-        the dynamic attribute keys found in that artifact's events.  A
-        ``recommended`` list preselects ``message`` (always) plus
-        ``display_name`` and ``artifact_long`` where present, and all attribute
-        keys.  The analyst trims in the wizard.
+        For each distinct ``artifact`` across the sources, returns the event
+        count, the available top-level embedding fields, the dynamic attribute
+        keys, and a *content-aware* recommendation produced by the hybrid
+        heuristic→pairs strategy (see :mod:`tracevector.db.field_recommend`):
 
-        Results are based on a sample of up to 50 000 events per artifact.
+        - ``recommended`` — tokens whose sampled values look semantically rich.
+        - ``field_analysis`` — per-field verdict (recommended / kind / reason)
+          so the wizard can explain why each field was kept or dropped.
+        - ``related_groups`` — groups of fields whose values embed close together
+          (only populated when an ``encode`` callable is supplied).
+
+        ``encode`` is the embedding callable used for stage 2; pass ``None`` for
+        a fast heuristic-only result.  Field values are sampled per artifact
+        (``sample_per_artifact`` rows, randomised).
         """
         self.store.init_schema()
         database = self.store.database
 
-        params: dict[str, str] = {"p0": case_id}
+        params: dict[str, Any] = {"p0": case_id, "per": sample_per_artifact}
         source_params = [f"s{i}" for i in range(len(source_ids))]
         source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
         for name, value in zip(source_params, source_ids, strict=False):
             params[name] = value
 
-        # Top-level fields that are meaningful for embedding (not IDs/provenance).
-        EMBEDDABLE_TOP_LEVEL = [
-            "message",
-            "timestamp_desc",
-            "artifact_long",
-            "display_name",
-            "tags",
-        ]
-
-        result = self.store.client.query(
+        # 1. Full attribute-key inventory + event count per artifact.
+        inv = self.store.client.query(
             f"""
             SELECT
                 artifact,
@@ -378,27 +405,75 @@ class EventQueryService:
             """,
             parameters=params,
         )
+        inventory = {
+            (row[0] or ""): (row[1], sorted(row[2]) if row[2] else [])
+            for row in inv.result_rows
+        }
+
+        # 2. Randomised value sample per artifact for content classification.
+        cols = ["message", "timestamp_desc", "artifact_long", "display_name", "tags"]
+        sample = self.store.client.query(
+            f"""
+            SELECT artifact, {", ".join(cols)}, attributes
+            FROM (
+                SELECT artifact, {", ".join(cols)}, attributes,
+                       row_number() OVER (PARTITION BY artifact ORDER BY rand()) AS _rn
+                FROM (
+                    SELECT artifact, {", ".join(cols)}, attributes
+                    FROM {database}.events
+                    WHERE case_id = {{p0:String}} AND source_id IN ({source_in})
+                    LIMIT 200000
+                )
+            )
+            WHERE _rn <= {{per:UInt32}}
+            """,
+            parameters=params,
+        )
+
+        # artifact -> token -> list of sampled values
+        samples: dict[str, dict[str, list[Any]]] = {}
+        for row in sample.result_rows:
+            artifact_name = row[0] or ""
+            bucket = samples.setdefault(artifact_name, {})
+            for i, col in enumerate(cols, start=1):
+                value = row[i]
+                if col == "tags" and isinstance(value, (list, tuple)):
+                    value = " ".join(str(t) for t in value)
+                bucket.setdefault(col, []).append(value)
+            attrs = row[len(cols) + 1]
+            for key, value in _iter_attr_items(attrs):
+                bucket.setdefault(f"attr:{key}", []).append(value)
 
         artifacts = []
-        for row in result.result_rows:
-            artifact_name = row[0] or ""
-            count = row[1]
-            attr_keys = sorted(row[2]) if row[2] else []
+        for artifact_name, (count, attr_keys) in inventory.items():
+            bucket = samples.get(artifact_name, {})
+            # Seed every candidate token so each gets a verdict, even if unsampled.
+            field_samples: dict[str, list[Any]] = {
+                t: bucket.get(t, []) for t in self._EMBEDDABLE_TOP_LEVEL
+            }
+            for key in attr_keys:
+                token = f"attr:{key}"
+                field_samples[token] = bucket.get(token, [])
 
-            # Recommended = always message, plus optional top-level, plus all attrs.
-            recommended: list[str] = ["message"]
-            for f in ("display_name", "artifact_long", "timestamp_desc", "tags"):
-                if f not in recommended:
-                    recommended.append(f)
-            recommended.extend(f"attr:{k}" for k in attr_keys)
+            rec = recommend_fields(field_samples, encode=encode)
 
             artifacts.append(
                 {
                     "artifact": artifact_name,
                     "count": count,
-                    "top_level": EMBEDDABLE_TOP_LEVEL,
+                    "top_level": self._EMBEDDABLE_TOP_LEVEL,
                     "attributes": attr_keys,
-                    "recommended": recommended,
+                    "recommended": rec.recommended,
+                    "field_analysis": [
+                        {
+                            "token": v.token,
+                            "recommended": v.recommended,
+                            "kind": v.kind,
+                            "reason": v.reason,
+                        }
+                        for v in rec.verdicts
+                    ],
+                    "related_groups": rec.related_groups,
                 }
             )
 

@@ -27,6 +27,28 @@ def _get_query_service() -> EventQueryService:
     return _query_service
 
 
+_embedding_model: Any = None
+
+
+def _get_field_encoder() -> Any:
+    """Return the embedding ``encode`` callable for wizard field pairing.
+
+    Cached across calls so the model loads at most once.  Returns ``None`` when
+    the model cannot be loaded (e.g. airgapped without cached weights), which
+    degrades the wizard gracefully to heuristic-only recommendations.
+    """
+    global _embedding_model  # noqa: PLW0603
+    if _embedding_model is None:
+        try:
+            from tracevector.models.embeddings import EmbeddingModel
+
+            _embedding_model = EmbeddingModel()
+            _embedding_model.load()
+        except Exception:  # noqa: BLE001
+            return None
+    return _embedding_model.encode
+
+
 router = APIRouter(prefix="/api/cases", tags=["events"])
 
 _store: PostgresStore | None = None
@@ -153,7 +175,26 @@ async def list_embedding_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
-    return service.list_fields_by_artifact(case_id, source_ids)
+    return service.list_fields_by_artifact(
+        case_id, source_ids, encode=_get_field_encoder()
+    )
+
+
+@router.get("/{case_id}/sources/{source_id}/embedding-fields")
+async def list_source_embedding_fields(
+    case_id: str,
+    source_id: str,
+) -> dict[str, Any]:
+    """Per-artifact field recommendations for a single source's embedding wizard.
+
+    Same payload as the timeline-scoped endpoint but scoped to one source, which
+    is the unit the embed job operates on.  Runs the hybrid heuristic→pairs
+    recommender; field pairing degrades to heuristic-only if the model can't load.
+    """
+    service = _get_query_service()
+    return service.list_fields_by_artifact(
+        case_id, [source_id], encode=_get_field_encoder()
+    )
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/histogram")
@@ -454,7 +495,7 @@ async def tag_anomalies(
         method = d.get("method", "centroid-distance")
         if method == "normal-baseline":
             content = (
-                f"Outlier — distance {d['distance']:.4f} from analyst-defined normal baseline "
+                f"Outlier — distance {d['distance']:.4f} from nearest analyst-defined normal "
                 f"({d['baseline_size']} normal events, rank {d['rank']}/{d['of']})"
             )
         else:

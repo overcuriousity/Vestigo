@@ -1,7 +1,16 @@
 import { del, get, post, postForm } from "./client";
-import type { Source, UploadResult } from "./types";
+import type {
+  EmbeddingFieldsResponse,
+  Source,
+  UploadResult,
+} from "./types";
 
 export const sourcesApi = {
+  embeddingFields: (caseId: string, sourceId: string) =>
+    get<EmbeddingFieldsResponse>(
+      `/cases/${caseId}/sources/${sourceId}/embedding-fields`,
+    ),
+
   list: (caseId: string) =>
     get<{ sources: Source[] }>(`/cases/${caseId}/sources`).then(
       (r) => r.sources,
