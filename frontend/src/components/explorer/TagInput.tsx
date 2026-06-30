@@ -22,6 +22,8 @@ interface Props {
   placeholder?: string;
   className?: string;
   autoFocus?: boolean;
+  /** Render the suggestion dropdown above the input instead of below. */
+  dropUp?: boolean;
 }
 
 export function TagInput({
@@ -34,6 +36,7 @@ export function TagInput({
   placeholder = "tag label…",
   className,
   autoFocus,
+  dropUp = false,
 }: Props) {
   const [highlightIdx, setHighlightIdx] = useState(-1);
   const [open, setOpen] = useState(false);
@@ -102,7 +105,10 @@ export function TagInput({
         }}
       />
       {open && (
-        <ul className="absolute z-50 mt-0.5 w-full min-w-[10rem] max-h-48 overflow-y-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] shadow-lg text-xs">
+        <ul className={cn(
+          "absolute z-50 w-full min-w-[10rem] max-h-48 overflow-y-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] shadow-lg text-xs",
+          dropUp ? "bottom-full mb-0.5" : "top-full mt-0.5",
+        )}>
           {filtered.map((tag, i) => (
             <li
               key={tag}

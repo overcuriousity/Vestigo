@@ -75,9 +75,11 @@ function TagPopover({
   const userTags = anns.filter((a) => a.annotation_type === "tag" && a.origin === "user");
 
   function submit() {
-    if (!value.trim()) return;
+    const tag = value.trim();
+    if (!tag) return;
+    if (userTags.some((t) => t.content === tag)) { setValue(""); return; }
     add.mutate(
-      { eventId, type: "tag", content: value.trim() },
+      { eventId, type: "tag", content: tag },
       { onSuccess: () => setValue("") },
     );
   }
@@ -107,18 +109,17 @@ function TagPopover({
               {userTags.map((t) => (
                 <div
                   key={t.id}
-                  className="group/tag flex items-center gap-1.5 rounded bg-[var(--color-accent-dim)] px-2 py-1"
+                  className="group/tag flex items-center gap-1 min-w-0 rounded bg-[var(--color-accent-dim)] px-2 py-1"
                 >
                   <Tag size={9} className="shrink-0 text-[var(--color-accent)]" />
-                  <span className="flex-1 text-[11px] text-[var(--color-accent)] font-medium">{t.content}</span>
-                  <Tooltip content={fmtTimestampFull(t.created_at)} side="top">
-                    <span className="text-[11px] text-[var(--color-fg-muted)] whitespace-nowrap">
-                      {t.created_by ? `${t.created_by} · ` : ""}{fmtRelative(t.created_at)}
+                  <Tooltip content={`${t.created_by ? t.created_by + " · " : ""}${fmtRelative(t.created_at)} — ${fmtTimestampFull(t.created_at)}`} side="top">
+                    <span className="flex-1 min-w-0 truncate text-[11px] text-[var(--color-accent)] font-medium cursor-default">
+                      {t.content}
                     </span>
                   </Tooltip>
                   <button
                     onClick={() => remove.mutate({ eventId, annotationId: t.id })}
-                    className="opacity-0 group-hover/tag:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)] transition-base"
+                    className="shrink-0 opacity-0 group-hover/tag:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)] transition-base"
                   >
                     <Trash2 size={9} />
                   </button>

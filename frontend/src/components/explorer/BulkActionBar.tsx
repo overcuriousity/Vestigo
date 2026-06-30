@@ -188,6 +188,7 @@ export function BulkActionBar({
               {mode === "tag" ? (
                 <TagInput
                   autoFocus
+                  dropUp
                   value={value}
                   onChange={setValue}
                   onSubmit={(v) => { setValue(v); requestAction("tag", v); }}
