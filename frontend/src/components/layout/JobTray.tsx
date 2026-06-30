@@ -51,7 +51,7 @@ function JobRow({ job }: { job: TrackedJob }) {
   return (
     <div
       className={cn(
-        "flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-3 py-2 text-xs min-w-[200px] max-w-[260px]",
+        "flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-3 py-2 text-xs w-72",
         job.status === "failed" && "border-[var(--color-danger)]/40",
       )}
     >
@@ -64,11 +64,11 @@ function JobRow({ job }: { job: TrackedJob }) {
           {job.status}
           {pct != null && ` · ${pct}%`}
         </div>
-        {pct != null && (
+        {pct != null && job.status !== "failed" && (
           <Progress value={pct} className="mt-1.5" />
         )}
         {job.error && (
-          <div className="mt-1 text-[var(--color-danger)] truncate">{job.error}</div>
+          <div className="mt-1 text-[var(--color-danger)] line-clamp-2 break-all">{job.error}</div>
         )}
       </div>
       {isTerminal && (
@@ -90,7 +90,7 @@ export function JobTray() {
   if (visible.length === 0) return null;
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="absolute right-4 top-full z-50 mt-1 flex flex-col gap-2">
       {visible.map((j) => (
         <JobRow key={j.id} job={j} />
       ))}

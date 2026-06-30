@@ -250,8 +250,8 @@ export interface EventFilters {
   end?: string;
   /** key=value field equality filters */
   filters?: Record<string, string>;
-  /** key=value field exclusion filters */
-  exclusions?: Record<string, string>;
+  /** key=[values] field exclusion filters — multiple values per field are OR'd (NOT IN) */
+  exclusions?: Record<string, string[]>;
   limit?: number;
   offset?: number;
   /** Chronological sort direction (default: desc) */
@@ -290,6 +290,6 @@ export interface ExportRequest {
     start?: string;
     end?: string;
     fields?: Record<string, string>;
-    exclude?: Record<string, string>;
+    exclude?: Record<string, string[]>;
   };
 }

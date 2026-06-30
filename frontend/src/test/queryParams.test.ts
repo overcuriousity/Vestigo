@@ -34,12 +34,12 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   it("round-trips field include/exclude filters", () => {
     const f: EventFilters = {
       filters: { ip_address_city: "Falkenstein", status_code: "200" },
-      exclusions: { user_agent: "bot" },
+      exclusions: { user_agent: ["bot"] },
     };
     const p = filtersToParams(f);
     const out = paramsToFilters(p);
     expect(out.filters).toEqual({ ip_address_city: "Falkenstein", status_code: "200" });
-    expect(out.exclusions).toEqual({ user_agent: "bot" });
+    expect(out.exclusions).toEqual({ user_agent: ["bot"] });
   });
 
   it("omits undefined fields from params", () => {
@@ -56,13 +56,13 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
     const f: EventFilters = {
       q: "mimikatz",
       filters: { event_id: "4624" },
-      exclusions: { status: "ok" },
+      exclusions: { status: ["ok"] },
     };
     const payload = filtersToViewPayload(f);
     const out = viewPayloadToFilters(payload);
     expect(out.q).toBe("mimikatz");
     expect(out.filters).toEqual({ event_id: "4624" });
-    expect(out.exclusions).toEqual({ status: "ok" });
+    expect(out.exclusions).toEqual({ status: ["ok"] });
   });
 
   it("handles empty filters gracefully", () => {

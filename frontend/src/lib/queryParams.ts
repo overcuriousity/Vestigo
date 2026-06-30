@@ -94,7 +94,7 @@ export function viewPayloadToFilters(
     f.filters = payload.filters as Record<string, string>;
   }
   if (payload.exclusions && typeof payload.exclusions === "object") {
-    f.exclusions = payload.exclusions as Record<string, string>;
+    f.exclusions = payload.exclusions as Record<string, string[]>;
   }
   return f;
 }

@@ -78,6 +78,30 @@ def _parse_json_object(value: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
+    """Parse a JSON string into a string-to-list[str] dict for exclusion filters.
+
+    Accepts both ``{"key": "value"}`` (legacy single-value) and
+    ``{"key": ["v1", "v2"]}`` (multi-value distillation).
+    Returns an empty dict for ``None`` or empty input.
+    """
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON filter: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="Filter must be a JSON object")
+    result: dict[str, list[str]] = {}
+    for k, v in parsed.items():
+        if isinstance(v, list):
+            result[str(k)] = [str(item) for item in v]
+        else:
+            result[str(k)] = [str(v)]
+    return result
+
+
 async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[str]:
     """Return the source IDs attached to a timeline."""
     store = get_store()
@@ -130,7 +154,7 @@ async def list_events(
             start=start,
             end=end,
             field_filters=_parse_json_object(filters),
-            field_exclusions=_parse_json_object(exclusions),
+            field_exclusions=_parse_exclusions_object(exclusions),
             limit=limit,
             offset=offset,
             order=order,  # type: ignore[arg-type]
@@ -233,7 +257,7 @@ async def get_histogram(
             start=start,
             end=end,
             field_filters=_parse_json_object(filters),
-            field_exclusions=_parse_json_object(exclusions),
+            field_exclusions=_parse_exclusions_object(exclusions),
         ),
         buckets=buckets,
     )
@@ -254,7 +278,7 @@ class ExportFilter(BaseModel):
     end: datetime | None = None
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
     fields: dict[str, str] = Field(default_factory=dict)
-    exclude: dict[str, str] = Field(default_factory=dict)
+    exclude: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class ExportRequest(BaseModel):

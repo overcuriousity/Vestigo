@@ -37,8 +37,8 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
     onChange({
       ...filters,
       exclusions: {
-        ...(filters.exclusions ?? {}),
-        [excludeKey.trim()]: excludeVal.trim(),
+        ...(filters.exclusions ?? {}) as Record<string, string[]>,
+        [excludeKey.trim()]: [...(filters.exclusions?.[excludeKey.trim()] ?? []), excludeVal.trim()],
       },
     });
     setExcludeKey("");

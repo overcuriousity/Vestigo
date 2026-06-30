@@ -64,14 +64,24 @@ export function ExplorerPage() {
   );
 
   const removeFilter = useCallback(
-    (key: keyof EventFilters | string, fieldKey?: string) => {
+    (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
       const f = { ...filters };
       if (key === "filters" && fieldKey) {
         const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
         f.filters = rest;
       } else if (key === "exclusions" && fieldKey) {
-        const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
-        f.exclusions = rest;
+        if (value !== undefined) {
+          const remaining = (f.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
+          if (remaining.length === 0) {
+            const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
+            f.exclusions = rest;
+          } else {
+            f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: remaining };
+          }
+        } else {
+          const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
+          f.exclusions = rest;
+        }
       } else {
         delete f[key as keyof EventFilters];
       }
@@ -100,7 +110,10 @@ export function ExplorerPage() {
         if (include) {
           f.artifact = value;
         } else {
-          f.exclusions = { ...(f.exclusions ?? {}), artifact: value };
+          const prev = f.exclusions?.artifact ?? [];
+          if (!prev.includes(value)) {
+            f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, artifact: [...prev, value] };
+          }
         }
       } else if (fieldKey === "tag") {
         if (include) {
@@ -111,7 +124,10 @@ export function ExplorerPage() {
       } else if (include) {
         f.filters = { ...(f.filters ?? {}), [fieldKey]: value };
       } else {
-        f.exclusions = { ...(f.exclusions ?? {}), [fieldKey]: value };
+        const prev = f.exclusions?.[fieldKey] ?? [];
+        if (!prev.includes(value)) {
+          f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
+        }
       }
 
       setFilters(f);

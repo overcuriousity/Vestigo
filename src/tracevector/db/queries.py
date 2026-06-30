@@ -30,7 +30,7 @@ class EventQuery:
     start: datetime | None = None
     end: datetime | None = None
     field_filters: dict[str, str] = field(default_factory=dict)
-    field_exclusions: dict[str, str] = field(default_factory=dict)
+    field_exclusions: dict[str, list[str]] = field(default_factory=dict)
     limit: int = 50
     offset: int = 0
     order: Literal["asc", "desc"] = "desc"
@@ -166,10 +166,15 @@ class _ParameterizedQueryBuilder:
         column = self._column_expr(key)
         self.add_param(f"{column} = :name", value)
 
-    def add_field_exclusion(self, key: str, value: str) -> None:
-        """Add a not-equals exclusion on a top-level column or attribute."""
+    def add_field_exclusion(self, key: str, values: list[str]) -> None:
+        """Add a NOT IN exclusion on a top-level column or attribute."""
         column = self._column_expr(key)
-        self.add_param(f"{column} != :name", value)
+        if len(values) == 1:
+            self.add_param(f"{column} != :name", values[0])
+        else:
+            name = self._param_name()
+            self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
+            self.parameters[name] = values
 
     def add_tag_exclusion(self, value: str) -> None:
         """Exclude events that have *value* in their tags array."""
@@ -239,8 +244,8 @@ class EventQueryService:
         for key, value in (query.field_filters or {}).items():
             builder.add_field_filter(key, value)
 
-        for key, value in (query.field_exclusions or {}).items():
-            builder.add_field_exclusion(key, value)
+        for key, values in (query.field_exclusions or {}).items():
+            builder.add_field_exclusion(key, values)
 
         return builder.where_clause(), builder.parameters
 
