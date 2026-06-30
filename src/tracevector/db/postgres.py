@@ -16,7 +16,6 @@ from sqlalchemy import (
     delete,
     func,
     select,
-    text,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -315,17 +314,6 @@ class PostgresStore:
         """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Additive migrations — only supported on PostgreSQL; SQLite (used
-            # in tests) handles all columns via create_all on fresh databases.
-            if conn.dialect.name == "postgresql":
-                for stmt in (
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(255)",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config JSON",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config_hash VARCHAR(128)",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_source_ids JSON",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
-                ):
-                    await conn.execute(text(stmt))
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""
