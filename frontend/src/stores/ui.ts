@@ -37,7 +37,7 @@ export const DEFAULT_COLUMNS = [
   "message",
 ];
 
-const RETIRED_COLUMN_IDS: Record<string, string> = {
+export const RETIRED_COLUMN_IDS: Record<string, string> = {
   source: "artifact",
   source_long: "artifact_long",
 };

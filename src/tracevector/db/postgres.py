@@ -86,7 +86,7 @@ class Source(Base):
     vector_count: Mapped[int] = mapped_column(default=0)
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Per-source field selection chosen by the analyst in the embedding wizard.
-    # Shape: {"version": 1, "sources": {"<artifact>": ["message", "attr:key", ...]}}
+    # Shape: {"version": 1, "artifacts": {"<artifact>": ["message", "attr:key", ...]}}
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -316,16 +316,22 @@ class PostgresStore:
         """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Additive migration: timeline embedding-state columns (added in
-            # the timeline-level embedding refactor).  Safe to run repeatedly.
-            for stmt in (
-                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(255)",
-                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config JSON",
-                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config_hash VARCHAR(128)",
-                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_source_ids JSON",
-                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
-            ):
-                await conn.execute(text(stmt))
+            # Additive migrations — only supported on PostgreSQL; SQLite (used
+            # in tests) handles all columns via create_all on fresh databases.
+            if conn.dialect.name == "postgresql":
+                for stmt in (
+                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(255)",
+                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config JSON",
+                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config_hash VARCHAR(128)",
+                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_source_ids JSON",
+                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
+                    # Model-refactor migration: annotations scoped by source_id instead
+                    # of timeline_id.  Add the new column and back-fill from the old one
+                    # so existing annotations remain visible after upgrade.
+                    "ALTER TABLE annotations ADD COLUMN IF NOT EXISTS source_id VARCHAR(64)",
+                    "UPDATE annotations SET source_id = timeline_id WHERE source_id IS NULL",
+                ):
+                    await conn.execute(text(stmt))
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""

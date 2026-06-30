@@ -2,7 +2,7 @@
  * Forensic methodology documentation panel.
  *
  * Shows a human-readable, reproducible record of:
- *   - Which embedding model was used
+ *   - Which embedding model was used per source
  *   - Exactly which fields of which artifacts were embedded
  *   - The embedding config hash that pins this configuration
  *   - The active anomaly algorithm and its key parameters
@@ -17,7 +17,7 @@ import type { Source } from "@/api/types";
 interface Props {
   caseId: string;
   timelineId: string;
-  source: Source | null;
+  sources: Source[];
 }
 
 const TOP_LEVEL_LABELS: Record<string, string> = {
@@ -33,16 +33,16 @@ function tokenLabel(token: string): string {
   return TOP_LEVEL_LABELS[token] ?? token;
 }
 
-export function MethodologyPanel({ caseId, timelineId, source }: Props) {
+export function MethodologyPanel({ caseId, timelineId, sources }: Props) {
+  const hasVectors = sources.some((s) => s.vector_count > 0);
+
   const { data: anomalyData } = useQuery({
     queryKey: ["anomalies", caseId, timelineId],
     queryFn: () => similarityApi.listAnomalies(caseId, timelineId, 1, 100),
     staleTime: 60_000,
-    enabled: (source?.vector_count ?? 0) > 0,
+    enabled: hasVectors,
   });
 
-  const cfg = source?.embedding_config;
-  const hasVectors = (source?.vector_count ?? 0) > 0;
   const method = anomalyData?.method ?? "centroid-distance";
   const baselineSize = anomalyData?.baseline_size ?? 0;
   const sampleSize = anomalyData?.sample_size ?? 0;
@@ -50,73 +50,89 @@ export function MethodologyPanel({ caseId, timelineId, source }: Props) {
 
   return (
     <div className="space-y-4 text-xs">
-      {/* Embedding section */}
+      {/* Embedding section — one block per source */}
       <section className="space-y-2">
         <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-[10px]">
           <Cpu size={11} /> Embedding
         </h4>
 
-        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+        {!hasVectors && (
+          <p className="text-[var(--color-warning)] flex items-center gap-1">
+            <Info size={10} /> No embeddings generated yet.
+          </p>
+        )}
+
+        {configHash && (
           <div className="flex items-start gap-2">
-            <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Model</span>
-            <span className="font-mono text-[var(--color-fg-primary)] break-all">
-              {source?.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
+            <span className="text-[var(--color-fg-muted)] w-24 shrink-0 flex items-center gap-1">
+              <Hash size={10} /> Config hash
+            </span>
+            <span className="font-mono text-[var(--color-fg-muted)] break-all text-[10px]">
+              {configHash}
             </span>
           </div>
+        )}
 
-          {configHash && (
-            <div className="flex items-start gap-2">
-              <span className="text-[var(--color-fg-muted)] w-24 shrink-0 flex items-center gap-1">
-                <Hash size={10} /> Config hash
-              </span>
-              <span className="font-mono text-[var(--color-fg-muted)] break-all text-[10px]">
-                {configHash}
-              </span>
-            </div>
-          )}
+        {sources.map((source) => {
+          // Fall back to the old "sources" key for configs written before the rename.
+          const rawCfg = source.embedding_config;
+          const cfg = rawCfg
+            ? { ...rawCfg, artifacts: rawCfg.artifacts ?? rawCfg.sources }
+            : undefined;
 
-          {!hasVectors && (
-            <p className="text-[var(--color-warning)] flex items-center gap-1">
-              <Info size={10} /> No embeddings generated yet.
-            </p>
-          )}
-        </div>
-
-        {/* Field selection */}
-        {cfg ? (
-          <div className="space-y-2">
-            {Object.entries(cfg.artifacts).map(([artifact, fields]) => (
-              <div
-                key={artifact}
-                className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2.5 space-y-1.5"
-              >
-                <p className="font-semibold font-mono text-[var(--color-fg-primary)]">
-                  {artifact || "(unknown artifact)"}
-                </p>
-                <div className="flex flex-wrap gap-1">
-                  {(fields as string[]).map((f) => (
-                    <span
-                      key={f}
-                      className="rounded bg-[var(--color-accent-dim)] px-1.5 py-0.5 font-mono text-[var(--color-accent)] text-[10px]"
-                    >
-                      {tokenLabel(f)}
-                    </span>
-                  ))}
-                  {fields.length === 0 && (
-                    <span className="text-[var(--color-warning)]">No fields selected</span>
-                  )}
-                </div>
+          return (
+            <div
+              key={source.id}
+              className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2"
+            >
+              <div className="flex items-start gap-2">
+                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Source</span>
+                <span className="font-mono text-[var(--color-fg-primary)] break-all text-[10px]">
+                  {source.name}
+                </span>
               </div>
-            ))}
-          </div>
-        ) : hasVectors ? (
-          <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2.5">
-            <p className="text-[var(--color-fg-muted)]">
-              Legacy embedding — all fields from all artifacts were included.
-              Re-embed with the wizard to configure per-artifact field selection.
-            </p>
-          </div>
-        ) : null}
+              <div className="flex items-start gap-2">
+                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Model</span>
+                <span className="font-mono text-[var(--color-fg-primary)] break-all">
+                  {source.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
+                </span>
+              </div>
+
+              {cfg ? (
+                <div className="space-y-1.5">
+                  {Object.entries(cfg.artifacts).map(([artifact, fields]) => (
+                    <div
+                      key={artifact}
+                      className="rounded border border-[var(--color-border)] px-2.5 py-2 space-y-1"
+                    >
+                      <p className="font-semibold font-mono text-[var(--color-fg-primary)]">
+                        {artifact || "(unknown artifact)"}
+                      </p>
+                      <div className="flex flex-wrap gap-1">
+                        {(fields as string[]).map((f) => (
+                          <span
+                            key={f}
+                            className="rounded bg-[var(--color-accent-dim)] px-1.5 py-0.5 font-mono text-[var(--color-accent)] text-[10px]"
+                          >
+                            {tokenLabel(f)}
+                          </span>
+                        ))}
+                        {fields.length === 0 && (
+                          <span className="text-[var(--color-warning)]">No fields selected</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : source.vector_count > 0 ? (
+                <p className="text-[var(--color-fg-muted)]">
+                  Legacy embedding — all fields from all artifacts were included.
+                  Re-embed with the wizard to configure per-artifact field selection.
+                </p>
+              ) : null}
+            </div>
+          );
+        })}
       </section>
 
       {/* Anomaly algorithm section */}

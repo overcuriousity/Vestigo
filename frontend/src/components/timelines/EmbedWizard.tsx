@@ -251,7 +251,9 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
   const initialised = Object.keys(selected).length > 0;
   if (open && data && !initialised && data.artifacts.length > 0) {
     const next: Record<string, Set<string>> = {};
-    const stored = timeline.embedding_config?.artifacts;
+    // Fall back to the old "sources" key for configs written before the rename.
+    const storedCfg = timeline.embedding_config;
+    const stored = storedCfg?.artifacts ?? storedCfg?.sources;
     for (const art of data.artifacts) {
       next[art.artifact] = new Set(
         stored?.[art.artifact] ?? art.recommended,

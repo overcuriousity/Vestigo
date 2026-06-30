@@ -173,7 +173,7 @@ export function AnomaliesList({ caseId, timelineId, sourceCount = 1, onSelectEve
                 {fmtTimestamp(r.event.timestamp)}
               </span>
             </div>
-            <p className="text-xs text-[var(--color-fg-secondary)] leading-relaxed">
+            <p className="text-xs text-[var(--color-fg-secondary)] leading-relaxed break-words">
               {truncate(r.event.message ?? "", 160)}
             </p>
           </button>

@@ -45,12 +45,10 @@ export function AnalysisPanel({
     refetchInterval: 30_000,
   });
 
-  // Derive source list for MethodologyPanel (first source carries embedding config).
   const { data: sources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
     queryFn: () => timelinesApi.listSources(caseId, timelineId),
   });
-  const firstSource = sources?.[0] ?? null;
 
   // Show the banner when: not embedded at all, OR embedded-but-stale.
   const showBanner = !hasVectors || (timeline?.is_stale ?? false);
@@ -128,7 +126,7 @@ export function AnalysisPanel({
           <MethodologyPanel
             caseId={caseId}
             timelineId={timelineId}
-            source={firstSource}
+            sources={sources ?? []}
           />
         )}
       </div>

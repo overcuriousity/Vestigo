@@ -29,6 +29,7 @@ import { Spinner } from "@/components/ui/Spinner";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
+import { RETIRED_COLUMN_IDS } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 
 const ROW_HEIGHT = 34; // px — compact forensic density (chips inline with message)
@@ -491,10 +492,8 @@ export function EventGrid({
     };
 
     for (let colId of visibleColumns) {
-      // Retired column IDs that have been superseded by the model refactor.
       if (colId === "tags" || colId === "_annotations") continue;
-      if (colId === "source") colId = "artifact";
-      if (colId === "source_long") colId = "artifact_long";
+      colId = RETIRED_COLUMN_IDS[colId] ?? colId;
       const def = colDefs[colId];
       if (def) {
         cols.push(def);
