@@ -568,13 +568,19 @@ class PostgresStore:
         async with self.session_factory() as session:
             session.add(timeline)
             if source_ids:
-                sources = await session.execute(
-                    select(Source).where(
+                # Resolve only source IDs that actually exist so we don't
+                # create dangling join rows.
+                valid = await session.execute(
+                    select(Source.id).where(
                         Source.case_id == case_id,
                         Source.id.in_(source_ids),
                     )
                 )
-                timeline.sources.extend(sources.scalars().all())
+                for sid in valid.scalars().all():
+                    # Insert via the join table directly — accessing
+                    # timeline.sources on a new object triggers a sync lazy-load
+                    # inside the async session which raises MissingGreenlet.
+                    session.add(TimelineSource(timeline_id=timeline_id, source_id=sid))
             await session.commit()
             await session.refresh(timeline)
             # Eagerly load sources for the returned instance so ``to_dict()`` works
