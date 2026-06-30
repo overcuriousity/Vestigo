@@ -10,6 +10,7 @@ export interface AnomalyParams {
   /** Temporal baseline end: values absent before this time and present after are flagged */
   baseline_start?: string;
   limit?: number;
+  [key: string]: string | number | boolean | null | undefined;
 }
 
 export interface TagAnomalyParams extends AnomalyParams {

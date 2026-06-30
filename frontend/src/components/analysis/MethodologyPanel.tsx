@@ -9,7 +9,6 @@
  * No API calls for the anomaly section — the detectors are parameter-driven
  * and work on any ingested data; the methodology is stable.
  */
-import { useQuery } from "@tanstack/react-query";
 import {
   Info,
   Hash,
@@ -139,9 +138,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
 
         {sources.map((source) => {
           const rawCfg = source.embedding_config;
-          const cfg = rawCfg
-            ? { ...rawCfg, artifacts: rawCfg.artifacts ?? rawCfg.sources }
-            : undefined;
+          const cfg = rawCfg ?? undefined;
 
           return (
             <div
@@ -202,16 +199,6 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
                 </p>
               ) : null}
 
-              {cfg && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[var(--color-fg-muted)] w-24 shrink-0 flex items-center gap-1">
-                    <Hash size={10} /> Config hash
-                  </span>
-                  <span className="font-mono text-[var(--color-fg-muted)] break-all text-[10px]">
-                    {source.embedding_config_hash ?? "—"}
-                  </span>
-                </div>
-              )}
             </div>
           );
         })}
