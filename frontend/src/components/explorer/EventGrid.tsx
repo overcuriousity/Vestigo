@@ -279,17 +279,17 @@ function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) 
   );
 }
 
-/** Combined annotation column: outlier indicator + normal toggle + tag popover + comment popover. */
+/** Combined annotation column: anomaly indicator + normal toggle + tag popover + comment popover. */
 function AnnotationCell(props: AnnotationCellProps) {
-  const hasOutlier = props.anns.some((a) => a.annotation_type === "outlier");
+  const hasAnomaly = props.anns.some((a) => a.annotation_type === "anomaly");
   return (
     <div
       className="flex items-center gap-0.5"
       onClick={(e) => e.stopPropagation()}
     >
-      {hasOutlier ? (
-        <Tooltip content="System-flagged outlier" side="top">
-          <span className="p-1 text-[var(--color-outlier)]">
+      {hasAnomaly ? (
+        <Tooltip content="System-detected anomaly" side="top">
+          <span className="p-1 text-[var(--color-anomaly)]">
             <AlertTriangle size={13} />
           </span>
         </Tooltip>
@@ -591,8 +591,8 @@ export function EventGrid({
             const isExpanded = expandedId === event.event_id;
             const isSelected = selectedIds.has(event.event_id);
             const eventAnns = annotations.get(event.event_id) ?? [];
-            const hasOutlier = eventAnns.some(
-              (a) => a.annotation_type === "outlier",
+            const hasAnomaly = eventAnns.some(
+              (a) => a.annotation_type === "anomaly",
             );
             const hasNormal = eventAnns.some(
               (a) => a.annotation_type === "normal" && a.origin === "user",
@@ -616,9 +616,9 @@ export function EventGrid({
                     : isSelected
                       ? "bg-[var(--color-accent-dim)]"
                       : "hover:bg-[var(--color-bg-hover)]",
-                  hasOutlier && !isSelected && !isExpanded &&
-                    "border-l-2 border-l-[var(--color-outlier)]/50",
-                  hasNormal && !hasOutlier && !isSelected && !isExpanded &&
+                  hasAnomaly && !isSelected && !isExpanded &&
+                    "border-l-2 border-l-[var(--color-anomaly)]/50",
+                  hasNormal && !hasAnomaly && !isSelected && !isExpanded &&
                     "border-l-2 border-l-[var(--color-success)]/50",
                 )}
               >

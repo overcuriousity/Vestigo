@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     embedding_device: str = "cpu"
     embedding_batch_size: int = 64
 
+    # Statistical anomaly detection
+    # Maximum occurrence count below which a value is flagged as rare (value_novelty).
+    stat_rarity_floor: int = 3
+    # Z-score threshold for flagging a frequency window as anomalous.
+    stat_z_threshold: float = 2.5
+    # Number of time buckets for frequency analysis (same math as histogram).
+    stat_frequency_buckets: int = 60
+    # Default per-field limit when scanning for rare values.
+    stat_per_field_limit: int = 25
+
     # Source file retention
     source_retention_path: str = "data/sources"
 

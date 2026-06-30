@@ -1,4 +1,4 @@
-"""Tests for the SimilarityService (outlier detection and similarity search).
+"""Tests for the SimilarityService (semantic similarity search).
 
 All tests use in-memory fakes for Qdrant and ClickHouse so they run without
 any external services.
@@ -11,7 +11,7 @@ from typing import Any
 from tracevector.db.similarity import SimilarityService
 
 # ---------------------------------------------------------------------------
-# Fake Qdrant store (extends the pipeline fake with search/scroll/retrieve)
+# Fake Qdrant store
 # ---------------------------------------------------------------------------
 
 
@@ -49,7 +49,6 @@ class FakeQdrantStore:
     """In-memory Qdrant store that supports similarity service methods."""
 
     def __init__(self) -> None:
-        # collection_name -> list of FakeScoredPoint
         self._points: dict[str, list[FakeScoredPoint]] = {}
         self.client = self
 
@@ -60,7 +59,6 @@ class FakeQdrantStore:
         with_vectors: bool = True,
         with_payload: bool = True,
     ) -> list[_FakeRetrieveResult]:
-        """Return stored points matching the requested IDs."""
         points = self._points.get(collection_name, [])
         id_set = set(ids)
         results = []
@@ -128,14 +126,13 @@ class FakeQdrantStore:
         limit: int,
         with_vectors: bool = True,
     ) -> list[FakeScoredPoint]:
+        import numpy as np
+
         points = self._points.get(collection_name, [])
         source_set = set(source_ids)
         filtered = [
             p for p in points if p.payload.get("source_id") in source_set
         ]
-        # Compute cosine similarity between query and each point vector.
-        import numpy as np
-
         q = np.array(query_vector, dtype=np.float32)
         scored = []
         for p in filtered:
@@ -197,239 +194,6 @@ def _unit(v: list[float]) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# find_anomalies tests
-# ---------------------------------------------------------------------------
-
-
-def test_find_anomalies_not_embedded_returns_status():
-    """find_anomalies returns not_embedded when the source has no vectors."""
-    qdrant = FakeQdrantStore()  # empty
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies("case1", ["s1"])
-    assert result.status == "not_embedded"
-    assert result.results == []
-
-
-def test_find_anomalies_insufficient_vectors():
-    """find_anomalies returns insufficient_vectors with only one embedded event."""
-    qdrant = FakeQdrantStore()
-    qdrant._add_point("col1", "evt1", _unit([1.0, 0.0, 0.0]), "s1")
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies("case1", ["s1"])
-    assert result.status == "insufficient_vectors"
-
-
-def test_find_anomalies_plants_outlier_first():
-    """The most distant vector from the centroid should rank first."""
-    qdrant = FakeQdrantStore()
-    # Three events aligned along x-axis (these form the "normal" bulk).
-    for i in range(3):
-        qdrant._add_point("col1", f"normal_{i}", _unit([1.0, 0.0, 0.0]), "s1", f"normal {i}")
-    # One obvious outlier: anti-parallel to the bulk.
-    qdrant._add_point("col1", "outlier", _unit([-1.0, 0.0, 0.0]), "s1", "outlier event")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies("case1", ["s1"], limit=4, sample_size=100)
-
-    assert result.status == "ok"
-    assert len(result.results) > 0
-    assert result.results[0].event_id == "outlier"
-    # Score should be high (close to 2.0 in cosine distance, normalised here).
-    assert result.results[0].score > 0.5
-
-
-def test_find_anomalies_details_shape():
-    """Each OutlierResult carries the expected math in details."""
-    qdrant = FakeQdrantStore()
-    qdrant._add_point("col1", "a", _unit([1.0, 0.0]), "s1")
-    qdrant._add_point("col1", "b", _unit([0.0, 1.0]), "s1")
-    qdrant._add_point("col1", "c", _unit([-1.0, 0.0]), "s1")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies("case1", ["s1"], limit=3)
-
-    assert result.status == "ok"
-    r = result.results[0]
-    d = r.details
-    assert d["method"] == "centroid-distance"
-    assert "distance" in d
-    assert "rank" in d
-    assert "of" in d
-    assert "sample_size" in d
-    assert "embedding_config_hash" in d
-    assert isinstance(d["distance"], float)
-
-
-def test_find_anomalies_hydrates_from_clickhouse():
-    """Events found in ClickHouse should have richer attributes than payload-only."""
-    qdrant = FakeQdrantStore()
-    qdrant._add_point("col1", "evt_a", _unit([1.0, 0.0]), "s1", "payload msg")
-    qdrant._add_point("col1", "evt_b", _unit([-1.0, 0.0]), "s1", "payload outlier")
-
-    ch_row = {
-        "event_id": "evt_b",
-        "case_id": "case1",
-        "source_id": "s1",
-        "message": "CH-sourced outlier message",
-        "timestamp": "2024-01-01T00:00:00",
-        "timestamp_desc": "File Modified",
-        "artifact": "test",
-        "artifact_long": "",
-        "display_name": "",
-        "tags": [],
-        "attributes": {"key": "value"},
-        "source_file": "/tmp/f",
-        "byte_offset": 0,
-        "line_number": 1,
-        "content_hash": "abc",
-        "parser_name": "p",
-        "parser_version": "1",
-        "embedding_model": "m",
-        "embedding_config_hash": "h",
-        "vector_id": "evt_b",
-        "ingest_time": None,
-    }
-    ch = FakeClickHouseStore(rows={"evt_b": ch_row})
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies("case1", ["s1"], limit=2)
-
-    assert result.status == "ok"
-    # The outlier (evt_b) should appear and have the rich ClickHouse message.
-    outlier = next((r for r in result.results if r.event_id == "evt_b"), None)
-    assert outlier is not None
-    assert outlier.event["message"] == "CH-sourced outlier message"
-    assert outlier.event["attributes"] == {"key": "value"}
-
-
-def test_find_anomalies_fallback_to_payload_when_ch_missing():
-    """Events not in ClickHouse fall back to the Qdrant payload."""
-    qdrant = FakeQdrantStore()
-    qdrant._add_point("col1", "evt_a", _unit([1.0, 0.0]), "s1", "msg a")
-    qdrant._add_point("col1", "evt_b", _unit([-1.0, 0.0]), "s1", "outlier msg")
-
-    ch = FakeClickHouseStore(rows={})  # nothing in CH
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies("case1", ["s1"], limit=2)
-
-    assert result.status == "ok"
-    outlier = next((r for r in result.results if r.event_id == "evt_b"), None)
-    assert outlier is not None
-    # Should fall back to the Qdrant payload message.
-    assert outlier.event["message"] == "outlier msg"
-
-
-def test_find_anomalies_baseline_excludes_normal_events():
-    """Normal-baseline mode must not return the analyst-marked normal events."""
-    qdrant = FakeQdrantStore()
-    # Two normal events pointing in the same direction.
-    qdrant._add_point("col1", "normal_a", _unit([1.0, 0.0]), "s1", "normal a")
-    qdrant._add_point("col1", "normal_b", _unit([1.0, 0.1]), "s1", "normal b")
-    # An outlier anti-parallel to the normal direction.
-    qdrant._add_point("col1", "outlier", _unit([-1.0, 0.0]), "s1", "outlier")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies(
-        "case1",
-        ["s1"],
-        limit=3,
-        normal_ids=["normal_a", "normal_b"],
-    )
-
-    assert result.status == "ok"
-    assert result.method == "normal-baseline"
-    returned_ids = [r.event_id for r in result.results]
-    assert "normal_a" not in returned_ids
-    assert "normal_b" not in returned_ids
-    assert "outlier" in returned_ids
-
-
-def test_find_anomalies_baseline_outlier_first():
-    """The event most unlike the analyst baseline should rank first."""
-    qdrant = FakeQdrantStore()
-    for i in range(3):
-        qdrant._add_point("col1", f"normal_{i}", _unit([1.0, 0.0]), "s1", f"normal {i}")
-    qdrant._add_point("col1", "outlier", _unit([-1.0, 0.0]), "s1", "outlier event")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies(
-        "case1",
-        ["s1"],
-        limit=4,
-        normal_ids=["normal_0", "normal_1", "normal_2"],
-    )
-
-    assert result.status == "ok"
-    assert len(result.results) > 0
-    assert result.results[0].event_id == "outlier"
-    assert result.results[0].score > 0.5
-    assert result.baseline_size == 3
-
-
-def test_find_anomalies_baseline_returns_empty_when_normals_not_embedded():
-    """Baseline mode should return empty results when normal IDs have no vectors."""
-    qdrant = FakeQdrantStore()
-    qdrant._add_point("col1", "outlier", _unit([-1.0, 0.0]), "s1", "outlier")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies(
-        "case1",
-        ["s1"],
-        limit=3,
-        normal_ids=["missing_normal"],
-    )
-
-    assert result.status == "ok"
-    assert result.results == []
-    assert result.baseline_size == 0
-
-
-def test_find_anomalies_baseline_multimodal_normal():
-    """A routine event near one normal cluster must outrank a true outlier.
-
-    With a multimodal normal set (two well-separated clusters) the average of
-    the normal vectors lands between them, so a centroid baseline would flag a
-    perfectly routine member of either cluster.  Nearest-normal scoring must
-    instead rank the event unlike *both* clusters first.
-    """
-    qdrant = FakeQdrantStore()
-    # Cluster A along +x, cluster B along +y — their centroid is the diagonal.
-    qdrant._add_point("col1", "normal_a1", _unit([1.0, 0.0]), "s1", "normal a1")
-    qdrant._add_point("col1", "normal_a2", _unit([1.0, 0.05]), "s1", "normal a2")
-    qdrant._add_point("col1", "normal_b1", _unit([0.0, 1.0]), "s1", "normal b1")
-    qdrant._add_point("col1", "normal_b2", _unit([0.05, 1.0]), "s1", "normal b2")
-    # Routine event sitting inside cluster B — close to a normal, far from centroid.
-    qdrant._add_point("col1", "routine_b", _unit([0.0, 1.0]), "s1", "routine b")
-    # True outlier pointing away from both clusters.
-    qdrant._add_point("col1", "outlier", _unit([-1.0, -1.0]), "s1", "real outlier")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    result = svc.find_anomalies(
-        "case1",
-        ["s1"],
-        limit=5,
-        normal_ids=["normal_a1", "normal_a2", "normal_b1", "normal_b2"],
-    )
-
-    assert result.status == "ok"
-    assert result.method == "normal-baseline"
-    ranked = [r.event_id for r in result.results]
-    # The true outlier ranks first; the routine in-cluster event ranks below it.
-    assert ranked[0] == "outlier"
-    assert ranked.index("outlier") < ranked.index("routine_b")
-    routine_score = next(r.score for r in result.results if r.event_id == "routine_b")
-    # routine_b coincides with a normal, so its distance to nearest normal ~0.
-    assert routine_score < 0.01
-
-
-# ---------------------------------------------------------------------------
 # find_similar tests
 # ---------------------------------------------------------------------------
 
@@ -482,138 +246,62 @@ def test_find_similar_returns_nearest_first():
 
     assert result.status == "ok"
     assert len(result.results) == 2
-    # "close" should rank before "far".
     assert result.results[0].event_id == "close"
     assert result.results[0].score > result.results[1].score
 
 
-# ---------------------------------------------------------------------------
-# Per-source batch-effect correction tests
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_per_source_centroid_mode_surfaces_within_source_outlier():
-    """Per-source centering promotes within-source outliers over cross-source ones.
-
-    Setup:
-    - Source S1: events clustered around +x direction.
-    - Source S2: events clustered around +y direction.
-    - ``cross_outlier``: an S2 event pointing toward -y (far from S1's +x,
-      but also genuinely anomalous within S2). With no centering S2 events
-      generally rank above S1 events because S2 is far from the global centroid
-      (which leans toward +x since S1 contributes more bulk). With centering
-      the planted within-S1 outlier (pointing -x in the S1 cluster's space)
-      should outrank plain cross-source distance.
-    """
-    import numpy as np
-
+def test_find_similar_hydrates_from_clickhouse():
+    """Events found in ClickHouse carry the richer ClickHouse attributes."""
     qdrant = FakeQdrantStore()
-    # S1: cluster around +x (4 bulk events)
-    for i in range(4):
-        qdrant._add_point("col1", f"s1_bulk_{i}", _unit([1.0, 0.05 * i, 0.0]), "s1",
-                          f"s1 bulk {i}")
-    # S1: one within-source outlier pointing -x (anomalous within S1)
-    qdrant._add_point("col1", "s1_outlier", _unit([-1.0, 0.0, 0.0]), "s1",
-                      "s1 outlier")
-    # S2: cluster around +y (4 bulk events)
-    for i in range(4):
-        qdrant._add_point("col1", f"s2_bulk_{i}", _unit([0.05 * i, 1.0, 0.0]), "s2",
-                          f"s2 bulk {i}")
+    qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1")
+    qdrant._add_point("col1", "similar", _unit([0.98, 0.2]), "s1", "payload msg")
 
-    ch = FakeClickHouseStore()
+    ch_row = {
+        "event_id": "similar",
+        "case_id": "case1",
+        "source_id": "s1",
+        "message": "CH-sourced message",
+        "timestamp": "2024-01-01T00:00:00",
+        "timestamp_desc": "File Modified",
+        "artifact": "test",
+        "artifact_long": "",
+        "display_name": "",
+        "tags": [],
+        "attributes": {"key": "value"},
+        "source_file": "/tmp/f",
+        "byte_offset": 0,
+        "line_number": 1,
+        "content_hash": "abc",
+        "file_hash": "xyz",
+        "parser_name": "p",
+        "parser_version": "1",
+        "embedding_model": "m",
+        "embedding_config_hash": "h",
+        "vector_id": "similar",
+        "ingest_time": None,
+    }
+    ch = FakeClickHouseStore(rows={"similar": ch_row})
     svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+    result = svc.find_similar("case1", ["s1"], "query", limit=2)
 
-    # Without centering: global-centroid mode. The global centroid blends S1 and
-    # S2 bulk; S2 events (far from the S1-dominated centroid) may rank high.
-    result_raw = svc.find_anomalies("case1", ["s1", "s2"], limit=10, sample_size=100,
-                                    normalize_per_source=False)
-    assert result_raw.status == "ok"
-    assert result_raw.method == "centroid-distance"
-
-    # With per-source centering: each event is scored vs its own source centroid.
-    result_centered = svc.find_anomalies("case1", ["s1", "s2"], limit=10,
-                                         sample_size=100, normalize_per_source=True)
-    assert result_centered.status == "ok"
-    assert result_centered.method == "per-source-centroid"
-
-    # The within-S1 outlier (s1_outlier) must rank first in centered mode.
-    centered_ids = [r.event_id for r in result_centered.results]
-    assert "s1_outlier" in centered_ids
-    assert centered_ids[0] == "s1_outlier", (
-        f"Expected s1_outlier first, got {centered_ids[0]}"
-    )
-
-    # Verify normalized_per_source flag is surfaced in details.
-    for r in result_centered.results:
-        assert r.details.get("normalized_per_source") is True
-
-
-def test_normalize_per_source_baseline_mode_unchanged():
-    """Passing normalize_per_source in baseline mode does NOT change ranking.
-
-    Per-source centering is disabled in baseline mode because the analyst's
-    Normal annotations already provide per-source calibration.  Centering
-    normal events (which sit near the source mean) reduces them to near-zero
-    vectors and destroys their discriminative content.  The flag is accepted
-    by the API but the ranking must be identical to the un-flagged case.
-    """
-    qdrant = FakeQdrantStore()
-    # S1 normals clustered around +x; outlier anti-parallel.
-    for i in range(3):
-        qdrant._add_point("col1", f"s1_normal_{i}", _unit([1.0, 0.05 * i, 0.0]),
-                          "s1", f"s1 normal {i}")
-    qdrant._add_point("col1", "s1_outlier", _unit([-1.0, 0.0, 0.0]), "s1", "s1 outlier")
-    # S2 bulk and normal.
-    for i in range(3):
-        qdrant._add_point("col1", f"s2_bulk_{i}", _unit([0.05 * i, 1.0, 0.0]),
-                          "s2", f"s2 bulk {i}")
-    qdrant._add_point("col1", "s2_normal", _unit([0.0, 1.0, 0.0]), "s2", "s2 normal")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-    normal_ids = ["s1_normal_0", "s1_normal_1", "s1_normal_2", "s2_normal"]
-
-    result_raw = svc.find_anomalies(
-        "case1", ["s1", "s2"], limit=10, sample_size=100,
-        normal_ids=normal_ids, normalize_per_source=False,
-    )
-    result_flagged = svc.find_anomalies(
-        "case1", ["s1", "s2"], limit=10, sample_size=100,
-        normal_ids=normal_ids, normalize_per_source=True,
-    )
-
-    # Both must use normal-baseline method.
-    assert result_flagged.method == "normal-baseline"
-    # Normal events excluded.
-    for nid in normal_ids:
-        assert nid not in [r.event_id for r in result_flagged.results]
-    # Rankings identical.
-    assert [r.event_id for r in result_raw.results] == [
-        r.event_id for r in result_flagged.results
-    ]
-    # Flag surfaced as False (centering not applied in baseline mode).
-    for r in result_flagged.results:
-        assert r.details.get("normalized_per_source") is False
-
-
-def test_normalize_per_source_noop_single_source():
-    """Per-source centering is a no-op for single-source timelines.
-
-    The result must be identical to the unnormalized case (no crash, correct
-    ranking) when only one source is present.
-    """
-    qdrant = FakeQdrantStore()
-    for i in range(3):
-        qdrant._add_point("col1", f"normal_{i}", _unit([1.0, 0.0]), "s1", f"normal {i}")
-    qdrant._add_point("col1", "outlier", _unit([-1.0, 0.0]), "s1", "outlier")
-
-    ch = FakeClickHouseStore()
-    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
-
-    # Single source: flag should be silently ignored (effective_normalize=False).
-    result = svc.find_anomalies("case1", ["s1"], limit=4, sample_size=100,
-                                normalize_per_source=True)
     assert result.status == "ok"
-    # Single source — falls through to global centroid mode.
-    assert result.method == "centroid-distance"
-    assert result.results[0].event_id == "outlier"
+    sim = next((r for r in result.results if r.event_id == "similar"), None)
+    assert sim is not None
+    assert sim.event["message"] == "CH-sourced message"
+    assert sim.event["attributes"] == {"key": "value"}
+
+
+def test_find_similar_falls_back_to_payload():
+    """Events absent from ClickHouse fall back to the Qdrant payload."""
+    qdrant = FakeQdrantStore()
+    qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1")
+    qdrant._add_point("col1", "similar", _unit([0.98, 0.2]), "s1", "payload msg")
+
+    ch = FakeClickHouseStore(rows={})
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+    result = svc.find_similar("case1", ["s1"], "query", limit=2)
+
+    assert result.status == "ok"
+    sim = next((r for r in result.results if r.event_id == "similar"), None)
+    assert sim is not None
+    assert sim.event["message"] == "payload msg"

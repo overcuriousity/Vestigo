@@ -18,8 +18,8 @@ export function EmbeddingStatusBanner({ status, timeline, caseId }: Props) {
       <div className="flex items-center gap-3 rounded border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2.5 text-xs">
         <AlertTriangle size={14} className="text-[var(--color-warning)] shrink-0" />
         <p className="flex-1 text-[var(--color-fg-secondary)]">
-          Sources have changed since the last embedding run — similarity and
-          anomaly results may be incomplete. Re-embed to include all sources.
+          Sources have changed since the last embedding run — similarity
+          search results may be incomplete. Re-embed to include all sources.
         </p>
         <EmbedWizard caseId={caseId} timeline={timeline} />
       </div>
@@ -33,7 +33,7 @@ export function EmbeddingStatusBanner({ status, timeline, caseId }: Props) {
         <Cpu size={14} className="text-[var(--color-warning)] shrink-0" />
         <p className="flex-1 text-[var(--color-fg-secondary)]">
           No embeddings found for this timeline. Generate embeddings to enable
-          similarity search and anomaly detection.
+          similarity search.
         </p>
         <EmbedWizard caseId={caseId} timeline={timeline} />
       </div>

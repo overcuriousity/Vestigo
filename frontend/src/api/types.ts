@@ -102,7 +102,7 @@ export interface View {
   created_at: string;
 }
 
-export type AnnotationType = "comment" | "tag" | "outlier" | "normal";
+export type AnnotationType = "comment" | "tag" | "anomaly" | "normal";
 export type AnnotationOrigin = "user" | "system";
 
 export interface Annotation {
@@ -138,34 +138,51 @@ export interface SimilarityResponse {
   results: SimilarResult[];
 }
 
-export interface OutlierDetails {
-  /** "centroid-distance" | "normal-baseline" */
-  method: string;
-  distance: number;
-  rank: number;
-  of: number;
-  /** Number of events sampled for global centroid. Present in centroid-distance mode. */
-  sample_size?: number;
-  /** Number of analyst-marked normal events. Present in normal-baseline mode. */
-  baseline_size?: number;
-  embedding_config_hash: string;
+// ---------------------------------------------------------------------------
+// Statistical anomaly detection types
+// ---------------------------------------------------------------------------
+
+/** One rare / first-seen value finding from the value_novelty detector. */
+export interface ValueNoveltyFinding {
+  type: "value_novelty";
+  field: string;
+  value: string;
+  count: number;
+  /** -log(count/total) — higher is rarer. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
 }
 
-export interface AnomalyResult {
-  event_id: string;
+/** One anomalous time window from the frequency detector. */
+export interface FrequencyFinding {
+  type: "frequency";
+  series_field: string;
+  series_value: string;
+  window_start: string;
+  window_end: string;
+  observed: number;
+  expected: number;
+  z_score: number;
+  /** |z_score| — used for ranking. */
   score: number;
-  event: Event;
-  details: OutlierDetails;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
 }
+
+export type AnomalyFinding = ValueNoveltyFinding | FrequencyFinding;
 
 export interface AnomaliesResponse {
-  status: "ok" | "not_embedded" | "insufficient_vectors";
-  /** "centroid-distance" | "normal-baseline" */
+  status: "ok" | "no_data" | "insufficient_data";
+  /** "value_novelty" | "frequency" */
+  detector: string;
+  /** "self-baseline" | "temporal" | "z-score" | "temporal-z-score" */
   method: string;
-  sample_size: number;
   baseline_size: number;
-  embedding_config_hash: string | null;
-  results: AnomalyResult[];
+  results: AnomalyFinding[];
 }
 
 export interface TagAnomaliesResponse extends AnomaliesResponse {

@@ -1,7 +1,7 @@
 /**
  * TriageMeter — compact summary bar shown in the Explorer header.
  * Shows session-momentum (events you've triaged this session) and the
- * outlier-reviewed progress derived from annotations.
+ * anomaly-reviewed progress derived from system annotations.
  */
 import { SessionMomentum } from "./SessionMomentum";
 import { Progress } from "@/components/ui/Progress";
@@ -22,15 +22,15 @@ function computeProgress(annotations: Annotation[]) {
     byEvent.set(a.event_id, list);
   }
 
-  // Outlier events = those tagged by system
-  const outlierEventIds = new Set<string>(
+  // Anomaly events = those tagged by system
+  const anomalyEventIds = new Set<string>(
     annotations
-      .filter((a) => a.annotation_type === "outlier" && a.origin === "system")
+      .filter((a) => a.annotation_type === "anomaly" && a.origin === "system")
       .map((a) => a.event_id),
   );
 
-  // Outliers reviewed = outlier events that also have a user annotation
-  const outliersReviewed = [...outlierEventIds].filter((eid) =>
+  // Anomalies reviewed = anomaly events that also have a user annotation
+  const anomaliesReviewed = [...anomalyEventIds].filter((eid) =>
     (byEvent.get(eid) ?? []).some((a) => a.origin === "user"),
   ).length;
 
@@ -44,41 +44,41 @@ function computeProgress(annotations: Annotation[]) {
   }
 
   return {
-    totalOutliers: outlierEventIds.size,
-    outliersReviewed,
+    totalAnomalies: anomalyEventIds.size,
+    anomaliesReviewed,
     triagedThisSession: sessionEventIds.size,
   };
 }
 
 export function TriageMeter({ annotations, totalEvents: _totalEvents }: Props) {
-  const { totalOutliers, outliersReviewed, triagedThisSession } =
+  const { totalAnomalies, anomaliesReviewed, triagedThisSession } =
     computeProgress(annotations);
 
-  const outlierPct =
-    totalOutliers > 0 ? Math.round((outliersReviewed / totalOutliers) * 100) : 0;
+  const anomalyPct =
+    totalAnomalies > 0 ? Math.round((anomaliesReviewed / totalAnomalies) * 100) : 0;
 
   return (
     <div className="flex items-center gap-4">
       {/* Session momentum */}
       <SessionMomentum count={triagedThisSession} />
 
-      {/* Outliers meter — only shown when outliers exist */}
-      {totalOutliers > 0 && (
+      {/* Anomalies meter — only shown when anomalies exist */}
+      {totalAnomalies > 0 && (
         <Tooltip
-          content={`${outliersReviewed} / ${totalOutliers} outliers reviewed`}
+          content={`${anomaliesReviewed} / ${totalAnomalies} anomalies reviewed`}
         >
           <div className="hidden sm:flex items-center gap-2 w-28">
             <div className="flex-1">
               <p className="text-[11px] font-medium uppercase tracking-wide text-[var(--color-fg-muted)] mb-1">
-                Outliers
+                Anomalies
               </p>
               <Progress
-                value={outlierPct}
-                indicatorClassName="bg-[var(--color-outlier)]"
+                value={anomalyPct}
+                indicatorClassName="bg-[var(--color-anomaly)]"
               />
             </div>
-            <span className="text-[11px] font-mono text-[var(--color-outlier)]">
-              {outlierPct}%
+            <span className="text-[11px] font-mono text-[var(--color-anomaly)]">
+              {anomalyPct}%
             </span>
           </div>
         </Tooltip>

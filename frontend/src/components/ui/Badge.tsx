@@ -1,6 +1,6 @@
 import { cn } from "@/lib/cn";
 
-type BadgeVariant = "default" | "accent" | "success" | "danger" | "outlier" | "muted";
+type BadgeVariant = "default" | "accent" | "success" | "danger" | "anomaly" | "muted";
 
 interface BadgeProps {
   children: React.ReactNode;
@@ -17,8 +17,8 @@ const variantClasses: Record<BadgeVariant, string> = {
     "bg-[var(--color-success-dim)] text-[var(--color-success)] border border-[var(--color-success)]/30",
   danger:
     "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border border-[var(--color-danger)]/30",
-  outlier:
-    "bg-[var(--color-outlier-dim)] text-[var(--color-outlier)] border border-[var(--color-outlier)]/30",
+  anomaly:
+    "bg-[var(--color-anomaly-dim)] text-[var(--color-anomaly)] border border-[var(--color-anomaly)]/30",
   muted: "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]",
 };
 

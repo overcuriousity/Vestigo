@@ -561,8 +561,8 @@ def timeline_cohesion_summary(
             source_count=source_count,
             message=(
                 "No shared fields with computable cohesion. "
-                "Cross-source outliers will likely track source format rather than behaviour. "
-                "Enable per-source centering to score events against their own source's bulk."
+                "Similarity search across sources may reflect source format rather than content. "
+                "Consider limiting search to events within a single source."
             ),
         )
 
@@ -581,17 +581,16 @@ def timeline_cohesion_summary(
         msg = (
             f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
             f"moderate cohesion ({mean_c:.2f}). "
-            "Results may reflect some source-format variation — "
-            "consider enabling per-source centering or using the analyst-baseline mode."
+            "Similarity search results may reflect some source-format variation. "
+            "Consider deselecting divergent fields in the embedding wizard."
         )
     else:
         level = "weak"
         msg = (
             f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
             f"weak cohesion ({mean_c:.2f}). "
-            "Cross-source outliers will likely track source format rather than behaviour. "
-            "Enable per-source centering to score events against their own source's bulk, "
-            "or mark representative 'Normal' events to switch to nearest-normal baseline scoring."
+            "Similarity scores across sources may reflect log format rather than content. "
+            "Deselect divergent fields in the embedding wizard for better results."
         )
 
     return CohesionSummary(

@@ -204,29 +204,30 @@ async def test_to_dict_round_trip(store: PostgresStore):
 async def test_system_annotation_origin_and_details(store: PostgresStore):
     """System annotations store origin='system' and structured details."""
     details = {
-        "method": "centroid-distance",
-        "distance": 0.87,
-        "rank": 1,
-        "of": 50,
-        "sample_size": 5000,
-        "embedding_config_hash": "abc123",
+        "detector": "value_novelty",
+        "method": "self-baseline",
+        "field": "artifact",
+        "value": "suspicious.exe",
+        "count": 1,
+        "total_events": 5000,
+        "surprise": 8.517,
     }
     ann = await store.create_annotation(
         case_id="c5",
         source_id="s5",
         event_id="e7",
         annotation_id="ann_sys",
-        annotation_type="outlier",
-        content="Outlier — distance 0.87",
+        annotation_type="anomaly",
+        content="Rare value — artifact='suspicious.exe' (count 1, surprise 8.52)",
         origin="system",
         details=details,
     )
     assert ann.origin == "system"
     assert ann.details is not None
-    assert ann.details["rank"] == 1
+    assert ann.details["count"] == 1
     d = ann.to_dict()
     assert d["origin"] == "system"
-    assert d["details"]["distance"] == 0.87
+    assert d["details"]["surprise"] == 8.517
 
 
 @pytest.mark.asyncio
@@ -237,7 +238,7 @@ async def test_delete_annotation_cannot_delete_system(store: PostgresStore):
         source_id="s6",
         event_id="e8",
         annotation_id="ann_sys2",
-        annotation_type="outlier",
+        annotation_type="anomaly",
         content="system content",
         origin="system",
     )
@@ -257,7 +258,7 @@ async def test_bulk_create_annotations(store: PostgresStore):
             "case_id": "c7",
             "source_id": "s7",
             "event_id": f"e{i}",
-            "annotation_type": "outlier",
+            "annotation_type": "anomaly",
             "content": f"Outlier rank {i}",
             "origin": "system",
             "details": {"rank": i},
@@ -273,8 +274,8 @@ async def test_bulk_create_annotations(store: PostgresStore):
 
 @pytest.mark.asyncio
 async def test_delete_system_annotations(store: PostgresStore):
-    """delete_system_annotations removes only system outlier rows."""
-    # System outlier annotations.
+    """delete_system_annotations removes only system anomaly rows."""
+    # System anomaly annotations.
     await store.bulk_create_annotations(
         [
             {
@@ -282,8 +283,8 @@ async def test_delete_system_annotations(store: PostgresStore):
                 "case_id": "c8",
                 "source_id": "s8",
                 "event_id": f"e{i}",
-                "annotation_type": "outlier",
-                "content": "outlier",
+                "annotation_type": "anomaly",
+                "content": "rare value detected",
                 "origin": "system",
             }
             for i in range(3)
@@ -300,7 +301,7 @@ async def test_delete_system_annotations(store: PostgresStore):
         origin="user",
     )
 
-    deleted_count = await store.delete_system_annotations("c8", ["s8"], "outlier")
+    deleted_count = await store.delete_system_annotations("c8", ["s8"], "anomaly")
     assert deleted_count == 3
 
     remaining = await store.list_source_annotations("c8", ["s8"])
@@ -311,5 +312,5 @@ async def test_delete_system_annotations(store: PostgresStore):
 @pytest.mark.asyncio
 async def test_delete_system_annotations_idempotent(store: PostgresStore):
     """delete_system_annotations is a no-op when nothing matches."""
-    count = await store.delete_system_annotations("c_empty", ["s_empty"], "outlier")
+    count = await store.delete_system_annotations("c8", ["s8"], "anomaly")
     assert count == 0

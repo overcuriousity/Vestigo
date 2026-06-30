@@ -451,13 +451,13 @@ export function EventDetailPanel({
             </div>
           ))}
 
-          {/* System annotations (outliers) — read-only */}
+          {/* System annotations (anomalies) — read-only */}
           {systemAnnotations.map((a) => (
             <div
               key={a.id}
-              className="mb-1 rounded border border-[var(--color-outlier)]/30 bg-[var(--color-outlier-dim)] px-2.5 py-1.5 text-xs"
+              className="mb-1 rounded border border-[var(--color-anomaly)]/30 bg-[var(--color-anomaly-dim)] px-2.5 py-1.5 text-xs"
             >
-              <span className="font-medium text-[var(--color-outlier)]">
+              <span className="font-medium text-[var(--color-anomaly)]">
                 ⚠ {a.annotation_type}:
               </span>{" "}
               <span className="text-[var(--color-fg-primary)]">{a.content}</span>

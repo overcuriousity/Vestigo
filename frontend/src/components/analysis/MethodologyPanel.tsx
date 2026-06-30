@@ -1,17 +1,23 @@
 /**
  * Forensic methodology documentation panel.
  *
- * Shows a human-readable, reproducible record of:
- *   - Which embedding model was used per source
- *   - Exactly which fields of which artifacts were embedded
- *   - The embedding config hash that pins this configuration
- *   - The active anomaly algorithm and its key parameters
+ * Documents exactly what is running under the hood so analysts can defend
+ * their analytical choices:
+ *   - Statistical anomaly engine (value novelty + frequency detectors)
+ *   - Semantic similarity search substrate (embeddings, model, field config)
  *
- * Intended to let analysts document and defend their analytical choices.
+ * No API calls for the anomaly section — the detectors are parameter-driven
+ * and work on any ingested data; the methodology is stable.
  */
 import { useQuery } from "@tanstack/react-query";
-import { similarityApi } from "@/api/similarity";
-import { Info, Hash, Cpu, AlertTriangle, ShieldCheck } from "lucide-react";
+import {
+  Info,
+  Hash,
+  Cpu,
+  Activity,
+  ShieldCheck,
+  BarChart2,
+} from "lucide-react";
 import type { Source } from "@/api/types";
 
 interface Props {
@@ -33,48 +39,105 @@ function tokenLabel(token: string): string {
   return TOP_LEVEL_LABELS[token] ?? token;
 }
 
-export function MethodologyPanel({ caseId, timelineId, sources }: Props) {
+export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sources }: Props) {
   const hasVectors = sources.some((s) => s.vector_count > 0);
 
-  const { data: anomalyData } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId],
-    queryFn: () => similarityApi.listAnomalies(caseId, timelineId, 1, 100),
-    staleTime: 60_000,
-    enabled: hasVectors,
-  });
-
-  const method = anomalyData?.method ?? "centroid-distance";
-  const baselineSize = anomalyData?.baseline_size ?? 0;
-  const sampleSize = anomalyData?.sample_size ?? 0;
-  const configHash = anomalyData?.embedding_config_hash ?? null;
-
   return (
-    <div className="space-y-4 text-xs">
-      {/* Embedding section — one block per source */}
+    <div className="space-y-5 text-xs">
+
+      {/* Statistical anomaly engine */}
       <section className="space-y-2">
         <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-[10px]">
-          <Cpu size={11} /> Embedding
+          <BarChart2 size={11} /> Statistical Anomaly Engine
+        </h4>
+
+        {/* Value novelty */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Hash size={11} /> Rare values (value_novelty)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Self-baseline (whole timeline) or temporal (baseline window vs
+              detect window — analyst supplies split point).
+            </Row>
+            <Row label="Signal">
+              Events with field values that appear ≤ rarity floor times in the
+              corpus, or values absent in the baseline window but present in the
+              detect window.
+            </Row>
+            <Row label="Score">
+              −log(count / total events) — interpretable surprise score.
+              Higher = rarer. Carried in{" "}
+              <code className="font-mono text-[10px]">details.surprise</code>.
+            </Row>
+            <Row label="Fields">
+              artifact, timestamp_desc, display_name (default).
+              Analyst can extend to any top-level column or attributes key.
+            </Row>
+            <Row label="Backend">
+              Pure ClickHouse GROUP BY aggregations — no embeddings or ML.
+              Works immediately after ingestion.
+            </Row>
+          </div>
+        </div>
+
+        {/* Frequency */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Activity size={11} /> Frequency spikes (frequency)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Z-score against the series' own event-count distribution.
+              Optional temporal variant: baseline/detect split.
+            </Row>
+            <Row label="Signal">
+              Time windows where the event count per (field, value) series
+              deviates more than the z-threshold standard deviations from the
+              series mean. Detects both spikes and unusual silences.
+            </Row>
+            <Row label="Score">
+              |z| — absolute z-score. Carried in{" "}
+              <code className="font-mono text-[10px]">details.z_score</code>.
+            </Row>
+            <Row label="Bucketing">
+              Same interval math as the timeline histogram: duration / bucket
+              count (default 60). Groups: any top-level column or attributes key.
+            </Row>
+            <Row label="Backend">
+              ClickHouse GROUP BY time bucket — no embeddings or ML.
+            </Row>
+          </div>
+        </div>
+
+        <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)]">
+          <ShieldCheck size={10} className="mt-0.5 shrink-0 text-[var(--color-success)]" />
+          <span>
+            Both detectors are forensically defensible: every finding carries
+            the exact field, value, count, and baseline in{" "}
+            <code className="font-mono">details</code>. Rare ≠ malicious — use
+            for triage. Confirmed findings can be tagged as{" "}
+            <strong className="text-[var(--color-fg-secondary)]">anomaly</strong>{" "}
+            system annotations for case reporting.
+          </span>
+        </div>
+      </section>
+
+      {/* Semantic similarity search */}
+      <section className="space-y-2">
+        <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-[10px]">
+          <Cpu size={11} /> Semantic Similarity Search
         </h4>
 
         {!hasVectors && (
           <p className="text-[var(--color-warning)] flex items-center gap-1">
-            <Info size={10} /> No embeddings generated yet.
+            <Info size={10} /> No embeddings generated yet — similarity search
+            unavailable.
           </p>
         )}
 
-        {configHash && (
-          <div className="flex items-start gap-2">
-            <span className="text-[var(--color-fg-muted)] w-24 shrink-0 flex items-center gap-1">
-              <Hash size={10} /> Config hash
-            </span>
-            <span className="font-mono text-[var(--color-fg-muted)] break-all text-[10px]">
-              {configHash}
-            </span>
-          </div>
-        )}
-
         {sources.map((source) => {
-          // Fall back to the old "sources" key for configs written before the rename.
           const rawCfg = source.embedding_config;
           const cfg = rawCfg
             ? { ...rawCfg, artifacts: rawCfg.artifacts ?? rawCfg.sources }
@@ -97,6 +160,14 @@ export function MethodologyPanel({ caseId, timelineId, sources }: Props) {
                   {source.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
                 </span>
               </div>
+              {source.vector_count > 0 && (
+                <div className="flex items-start gap-2">
+                  <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Vectors</span>
+                  <span className="text-[var(--color-fg-primary)]">
+                    {source.vector_count.toLocaleString()}
+                  </span>
+                </div>
+              )}
 
               {cfg ? (
                 <div className="space-y-1.5">
@@ -126,89 +197,49 @@ export function MethodologyPanel({ caseId, timelineId, sources }: Props) {
                 </div>
               ) : source.vector_count > 0 ? (
                 <p className="text-[var(--color-fg-muted)]">
-                  Legacy embedding — all fields from all artifacts were included.
-                  Re-embed with the wizard to configure per-artifact field selection.
+                  All fields embedded. Re-embed with the wizard to configure
+                  per-artifact field selection.
                 </p>
               ) : null}
+
+              {cfg && (
+                <div className="flex items-start gap-2">
+                  <span className="text-[var(--color-fg-muted)] w-24 shrink-0 flex items-center gap-1">
+                    <Hash size={10} /> Config hash
+                  </span>
+                  <span className="font-mono text-[var(--color-fg-muted)] break-all text-[10px]">
+                    {source.embedding_config_hash ?? "—"}
+                  </span>
+                </div>
+              )}
             </div>
           );
         })}
-      </section>
 
-      {/* Anomaly algorithm section */}
-      <section className="space-y-2">
-        <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-[10px]">
-          <AlertTriangle size={11} /> Anomaly Algorithm
-        </h4>
-        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
-          {method === "normal-baseline" ? (
-            <>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Method</span>
-                <span className="flex items-center gap-1 text-[var(--color-success)] font-medium">
-                  <ShieldCheck size={11} /> Analyst-defined baseline
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Baseline</span>
-                <span className="text-[var(--color-fg-primary)]">
-                  {baselineSize} event{baselineSize !== 1 ? "s" : ""} marked Normal
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Scoring</span>
-                <span className="text-[var(--color-fg-secondary)]">
-                  Nearest-normal max-similarity. Each candidate is scored by its
-                  cosine similarity to the closest baseline event; the least
-                  similar (highest distance) are ranked as outliers.
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Distance</span>
-                <span className="text-[var(--color-fg-primary)]">Cosine (L2-normalised)</span>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Method</span>
-                <span className="text-[var(--color-fg-primary)] font-medium">
-                  Centroid distance
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Sample</span>
-                <span className="text-[var(--color-fg-primary)]">
-                  {sampleSize > 0
-                    ? `${sampleSize.toLocaleString()} events`
-                    : "up to 5 000 events"}
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Scoring</span>
-                <span className="text-[var(--color-fg-secondary)]">
-                  Events ranked by cosine distance from the global mean vector
-                  (negated-centroid ANN query). Higher distance = more unusual.
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Distance</span>
-                <span className="text-[var(--color-fg-primary)]">Cosine (L2-normalised)</span>
-              </div>
-            </>
-          )}
-
-          <div className="pt-1 border-t border-[var(--color-border)] flex items-start gap-1.5 text-[var(--color-fg-muted)]">
-            <Info size={10} className="mt-0.5 shrink-0" />
-            <span>
-              Statistical outliers, not confirmed threats. Use for triage —
-              rare ≠ malicious. Mark routine events as{" "}
-              <strong className="text-[var(--color-fg-secondary)]">Normal</strong> in the
-              timeline to refine the baseline.
-            </span>
-          </div>
+        <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)]">
+          <Info size={10} className="mt-0.5 shrink-0" />
+          <span>
+            Similarity search uses cosine distance in 384-dim embedding space
+            (L2-normalised). The config hash pins the field selection so results
+            are reproducible across sessions.
+          </span>
         </div>
       </section>
+    </div>
+  );
+}
+
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <span className="w-20 shrink-0 text-[var(--color-fg-muted)]">{label}</span>
+      <span className="flex-1 text-[var(--color-fg-secondary)]">{children}</span>
     </div>
   );
 }

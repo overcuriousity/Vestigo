@@ -6,8 +6,7 @@ import type { AnnotationType } from "@/api/types";
  * Shared hook for creating and deleting annotations on events within a source.
  * Invalidates both the timeline annotations query and the anomalies query on
  * success so all consumers (EventGrid chips, EventDetailPanel, TriageMeter,
- * AnomaliesList) refresh automatically.  The anomaly refresh is important
- * because marking/unmarking Normal events changes the active algorithm mode.
+ * ValueNoveltyView, FrequencyView) refresh automatically.
  */
 export function useAnnotationMutations(caseId: string, sourceId: string) {
   const qc = useQueryClient();
