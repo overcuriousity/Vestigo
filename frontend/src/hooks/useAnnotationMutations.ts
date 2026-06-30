@@ -18,6 +18,8 @@ export function useAnnotationMutations(caseId: string, sourceId: string) {
     qc.invalidateQueries({ queryKey: ["annotations", caseId] });
     // Marking an event Normal changes which anomaly algorithm is active.
     qc.invalidateQueries({ queryKey: ["anomalies", caseId] });
+    // Refresh tag autocomplete suggestions when a new tag is created.
+    qc.invalidateQueries({ queryKey: ["tags", caseId] });
   };
 
   const add = useMutation({

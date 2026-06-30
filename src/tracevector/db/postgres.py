@@ -1002,6 +1002,31 @@ class PostgresStore:
             await session.commit()
             return True
 
+    async def list_distinct_tag_contents(
+        self,
+        case_id: str,
+        source_ids: list[str],
+    ) -> list[str]:
+        """Return the distinct annotation-tag labels used in this timeline.
+
+        Used to power tag autocomplete in the UI.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.content)
+                .where(
+                    Annotation.case_id == case_id,
+                    Annotation.source_id.in_(source_ids),
+                    Annotation.annotation_type == "tag",
+                    Annotation.origin == "user",
+                )
+                .distinct()
+                .order_by(Annotation.content)
+            )
+            return [row[0] for row in result.all()]
+
     async def list_event_ids_by_annotation_type(
         self,
         case_id: str,

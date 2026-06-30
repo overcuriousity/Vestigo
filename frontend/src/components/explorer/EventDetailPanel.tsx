@@ -9,6 +9,7 @@ import { truncateHash } from "@/lib/format";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { useUiStore } from "@/stores/ui";
+import { TagInput } from "@/components/explorer/TagInput";
 import type { Event, Annotation } from "@/api/types";
 
 interface Props {
@@ -20,6 +21,8 @@ interface Props {
   onFindSimilar: (event: Event) => void;
   /** Called when the user clicks filter-in or filter-out on a field row. */
   onAddFilter: (fieldKey: string, value: string, include: boolean) => void;
+  /** Existing annotation-tag labels for autocomplete. */
+  tagSuggestions?: string[];
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -151,37 +154,56 @@ function AddAnnotationForm({
   onSubmit,
   onCancel,
   isPending,
+  suggestions = [],
 }: {
   type: "tag" | "comment";
   onSubmit: (content: string) => void;
   onCancel: () => void;
   isPending: boolean;
+  suggestions?: string[];
 }) {
   const [value, setValue] = useState("");
   return (
     <div className="flex items-center gap-1.5 mt-2">
-      <Input
-        autoFocus
-        placeholder={type === "tag" ? "tag label…" : "your comment…"}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && value.trim()) onSubmit(value.trim());
-          if (e.key === "Escape") onCancel();
-        }}
-        className="flex-1 h-7 text-xs"
-      />
-      <Button
-        variant="accent"
-        size="sm"
-        disabled={!value.trim() || isPending}
-        onClick={() => value.trim() && onSubmit(value.trim())}
-      >
-        {isPending ? <Spinner size={12} /> : "Add"}
-      </Button>
-      <Button variant="ghost" size="sm" onClick={onCancel}>
-        Cancel
-      </Button>
+      {type === "tag" ? (
+        <TagInput
+          autoFocus
+          value={value}
+          onChange={setValue}
+          onSubmit={onSubmit}
+          onCancel={onCancel}
+          suggestions={suggestions}
+          isPending={isPending}
+          className="flex-1"
+        />
+      ) : (
+        <Input
+          autoFocus
+          placeholder="your comment…"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && value.trim()) onSubmit(value.trim());
+            if (e.key === "Escape") onCancel();
+          }}
+          className="flex-1 h-7 text-xs"
+        />
+      )}
+      {type === "comment" && (
+        <>
+          <Button
+            variant="accent"
+            size="sm"
+            disabled={!value.trim() || isPending}
+            onClick={() => value.trim() && onSubmit(value.trim())}
+          >
+            {isPending ? <Spinner size={12} /> : "Add"}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+        </>
+      )}
     </div>
   );
 }
@@ -194,6 +216,7 @@ export function EventDetailPanel({
   onClose,
   onFindSimilar,
   onAddFilter,
+  tagSuggestions = [],
 }: Props) {
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
@@ -248,7 +271,7 @@ export function EventDetailPanel({
         style={{ marginLeft: -2 }}
       />
       {/* Header */}
-      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-3">
+      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-2">
         <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
           Event Detail
         </h3>
@@ -262,7 +285,7 @@ export function EventDetailPanel({
         </Button>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+      <div className="flex-1 overflow-y-auto px-3 py-2">
         {/* Message — filterable on click */}
         <div className="mb-3 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3">
           <div className="flex items-center justify-between mb-1">
@@ -448,6 +471,7 @@ export function EventDetailPanel({
               onSubmit={handleAdd}
               onCancel={() => setAddMode(null)}
               isPending={add.isPending}
+              suggestions={tagSuggestions}
             />
           ) : (
             <div className="flex flex-wrap gap-1.5 mt-2">

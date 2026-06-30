@@ -455,6 +455,22 @@ async def delete_view(case_id: str, view_id: str) -> dict[str, Any]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/tags")
+async def list_timeline_tags(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """Return the distinct user annotation-tag labels for a timeline's sources.
+
+    Used to power tag autocomplete in the UI.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    source_ids = [s.id for s in sources]
+    tags = await store.list_distinct_tag_contents(case_id, source_ids)
+    return {"tags": tags}
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/annotations")
 async def list_timeline_annotations(case_id: str, timeline_id: str) -> dict[str, Any]:
     """List all annotations for a timeline's sources (used for event-table chips)."""

@@ -321,6 +321,26 @@ class EventQueryService:
                 break
             offset += batch_size
 
+    def query_event_refs(
+        self, query: EventQuery, cap: int = 100_000
+    ) -> list[tuple[str, str]]:
+        """Return (event_id, source_id) pairs for all events matching *query*.
+
+        Like :py:meth:`query` but only fetches the two identifier columns,
+        making it suitable for server-side bulk annotation.  ``limit`` and
+        ``offset`` on *query* are ignored — the full matching set is returned
+        up to *cap* rows to bound runaway writes.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+
+        result = self.store.client.query(
+            f"SELECT event_id, source_id FROM {database}.events WHERE {where} LIMIT {cap}",
+            parameters=parameters,
+        )
+        return [(row[0], row[1]) for row in result.result_rows]
+
     def list_fields(
         self, case_id: str, source_ids: list[str]
     ) -> dict[str, list[str]]:
@@ -339,12 +359,8 @@ class EventQueryService:
         result = self.store.client.query(
             f"""
             SELECT groupUniqArrayArray(mapKeys(attributes)) AS keys
-            FROM (
-                SELECT attributes
-                FROM {database}.events
-                WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
-                LIMIT 50000
-            )
+            FROM {database}.events
+            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
             """,
             parameters=params,
         )
@@ -406,12 +422,8 @@ class EventQueryService:
                 artifact,
                 count() AS n,
                 groupUniqArrayArray(mapKeys(attributes)) AS attr_keys
-            FROM (
-                SELECT artifact, attributes
-                FROM {database}.events
-                WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
-                LIMIT 50000
-            )
+            FROM {database}.events
+            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
             GROUP BY artifact
             ORDER BY n DESC
             """,

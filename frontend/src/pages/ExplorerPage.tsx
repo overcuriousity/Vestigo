@@ -46,6 +46,14 @@ import type { Event, EventFilters, Annotation } from "@/api/types";
 
 const PAGE_SIZE = 100;
 
+/** Discriminated selection state.
+ *  "ids"  — explicit per-row selection (IDs of in-memory events).
+ *  "all"  — all events matching the current filter (resolved server-side).
+ */
+type SelectionState =
+  | { mode: "ids"; ids: Set<string> }
+  | { mode: "all" };
+
 export function ExplorerPage() {
   const { caseId, timelineId } = useParams<{
     caseId: string;
@@ -141,7 +149,7 @@ export function ExplorerPage() {
   const analysisPanelOpen = useUiStore((s) => s.analysisPanelOpen);
   const setAnalysisPanelOpen = useUiStore((s) => s.setAnalysisPanelOpen);
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
   const tlKey = `${caseId}/${timelineId}`;
@@ -154,7 +162,7 @@ export function ExplorerPage() {
   // Clear selection when filters or sort direction change so stale IDs are
   // never bulk-annotated against a different result set.
   useEffect(() => {
-    setSelectedIds(new Set());
+    setSelection({ mode: "ids", ids: new Set() });
   }, [filters, sortDir]);
 
   // ── Data queries ───────────────────────────────────────────────────────
@@ -209,6 +217,12 @@ export function ExplorerPage() {
     enabled: !!caseId,
   });
 
+  const { data: tagSuggestions = [] } = useQuery({
+    queryKey: ["tags", caseId, timelineId],
+    queryFn: () => annotationsApi.listDistinctTags(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
   // ── Derived ────────────────────────────────────────────────────────────
   const annotationMap = useMemo<Map<string, Annotation[]>>(() => {
     const m = new Map<string, Annotation[]>();
@@ -225,15 +239,46 @@ export function ExplorerPage() {
   const hasVectors =
     (timelineSources?.some((s) => s.vector_count > 0) ?? false);
 
+  // Derive a plain Set<string> of selected IDs for components that don't know
+  // about the "all" mode (EventGrid checkboxes). In "all" mode we show all
+  // loaded rows as selected.
+  const selectedIds = useMemo<Set<string>>(() => {
+    if (selection.mode === "all") return new Set(events.map((e) => e.event_id));
+    return selection.ids;
+  }, [selection, events]);
+
+  // Total count shown in BulkActionBar label
+  const selectionCount = selection.mode === "all" ? total : selection.ids.size;
+
+  // Show the "select all N matching" banner when all loaded rows are in "ids"
+  // mode selection and there are more events not yet loaded.
+  const showSelectAllBanner =
+    selection.mode === "ids" &&
+    selection.ids.size === events.length &&
+    events.length > 0 &&
+    total > events.length;
+
   // ── Handlers ───────────────────────────────────────────────────────────
   const handleToggleSelect = useCallback((id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+    setSelection((prev) => {
+      // Clicking a row while in "all" mode collapses back to "ids"
+      const ids = prev.mode === "ids" ? new Set(prev.ids) : new Set<string>();
+      if (ids.has(id)) ids.delete(id);
+      else ids.add(id);
+      return { mode: "ids", ids };
     });
   }, []);
+
+  const handleToggleSelectAll = useCallback(() => {
+    setSelection((prev) => {
+      if (prev.mode === "ids" && prev.ids.size === events.length && events.length > 0) {
+        // All loaded are selected → deselect all
+        return { mode: "ids", ids: new Set() };
+      }
+      // Select all currently loaded events
+      return { mode: "ids", ids: new Set(events.map((e) => e.event_id)) };
+    });
+  }, [events]);
 
   const handleLoadMore = useCallback(() => {
     if (!isFetching && hasNextPage) fetchNextPage();
@@ -359,6 +404,25 @@ const handleFindSimilar = useCallback((event: Event) => {
             </div>
           ) : (
             <div className="flex flex-1 min-w-0 flex-col overflow-hidden">
+              {/* Select-all-matching-filter notice */}
+              {showSelectAllBanner && (
+                <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent)] px-3 py-1 text-xs text-[var(--color-accent-fg)]">
+                  <span className="font-medium">All {events.length.toLocaleString()} loaded events selected.</span>
+                  <button
+                    className="font-semibold underline hover:no-underline"
+                    onClick={() => setSelection({ mode: "all" })}
+                  >
+                    Select all {total.toLocaleString()} matching this filter
+                  </button>
+                  <span className="opacity-50">·</span>
+                  <button
+                    className="opacity-70 hover:opacity-100"
+                    onClick={() => setSelection({ mode: "ids", ids: new Set() })}
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
               <div className="flex flex-1 min-h-0 overflow-hidden">
                 {/* Event grid — always present, fills all available width */}
                 <EventGrid
@@ -369,6 +433,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                   caseId={caseId!}
                   timelineId={timelineId!}
                   onToggleSelect={handleToggleSelect}
+                  onToggleSelectAll={handleToggleSelectAll}
                   expandedId={expandedEvent?.event_id ?? null}
                   onExpand={setExpandedEvent}
                   onLoadMore={handleLoadMore}
@@ -388,6 +453,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
+                    tagSuggestions={tagSuggestions}
                   />
                 )}
 
@@ -411,8 +477,13 @@ const handleFindSimilar = useCallback((event: Event) => {
               {/* Bulk action bar */}
               <BulkActionBar
                 selectedEvents={events.filter((e) => selectedIds.has(e.event_id))}
+                selectionCount={selectionCount}
+                selectionMode={selection.mode}
                 caseId={caseId!}
-                onClear={() => setSelectedIds(new Set())}
+                timelineId={timelineId!}
+                filters={filters}
+                onClear={() => setSelection({ mode: "ids", ids: new Set() })}
+                tagSuggestions={tagSuggestions}
               />
             </div>
           )}

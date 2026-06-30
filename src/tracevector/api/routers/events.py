@@ -168,6 +168,86 @@ async def list_events(
     }
 
 
+class BulkAnnotateByFilterRequest(BaseModel):
+    annotation_type: str = Field(
+        ..., description="Annotation type: 'tag', 'comment', or 'normal'."
+    )
+    content: str = Field(..., min_length=1, max_length=4096)
+    q: str | None = None
+    artifact: str | None = None
+    source_id: str | None = None
+    tag: str | None = None
+    exclude_tag: str | None = None
+    start: datetime | None = None
+    end: datetime | None = None
+    filters: str | None = Field(
+        default=None,
+        description='JSON field-equality filters, e.g. {"ip_address_city":"Berlin"}',
+    )
+    exclusions: str | None = Field(
+        default=None,
+        description='JSON field-exclusion filters, e.g. {"status_code":["200"]}',
+    )
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/events/annotations/bulk")
+async def bulk_annotate_by_filter(
+    case_id: str,
+    timeline_id: str,
+    body: BulkAnnotateByFilterRequest,
+) -> dict[str, Any]:
+    """Create an annotation on every event matching the given filter.
+
+    The filter parameters mirror those accepted by ``list_events`` and are
+    resolved server-side so that events beyond the first loaded page are
+    also tagged.  At most 100 000 events are written per call.
+    """
+    allowed_types = {"tag", "comment", "normal"}
+    if body.annotation_type not in allowed_types:
+        raise HTTPException(
+            status_code=422,
+            detail=f"annotation_type must be one of {sorted(allowed_types)}",
+        )
+
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+
+    service = _get_query_service()
+    refs = service.query_event_refs(
+        EventQuery(
+            case_id=case_id,
+            source_ids=source_ids,
+            q=body.q,
+            artifact=body.artifact,
+            source_id=body.source_id,
+            tag=body.tag,
+            exclude_tag=body.exclude_tag,
+            start=body.start,
+            end=body.end,
+            field_filters=_parse_json_object(body.filters),
+            field_exclusions=_parse_exclusions_object(body.exclusions),
+        )
+    )
+
+    if not refs:
+        return {"tagged": 0}
+
+    store = get_store()
+    rows = [
+        {
+            "annotation_id": generate_id(f"{event_id}_{body.annotation_type}"),
+            "case_id": case_id,
+            "source_id": str(src_id),
+            "event_id": str(event_id),  # ClickHouse may return UUID objects
+            "annotation_type": body.annotation_type,
+            "content": body.content.strip(),
+            "origin": "user",
+        }
+        for event_id, src_id in refs
+    ]
+    tagged = await store.bulk_create_annotations(rows)
+    return {"tagged": tagged}
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/fields")
 async def list_fields(
     case_id: str,
