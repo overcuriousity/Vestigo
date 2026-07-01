@@ -115,6 +115,16 @@ TOP_LEVEL_DISPLAY_COLUMNS = [
 ]
 
 
+def _escape_like(value: str) -> str:
+    """Escape ClickHouse LIKE/ILIKE metacharacters in a literal search value.
+
+    Without this, a literal ``%`` or ``_`` in the analyst's search text is
+    interpreted as a wildcard, silently matching more than the literal
+    substring they typed.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _format_clickhouse_datetime(value: datetime) -> str:
     """Format a datetime for ClickHouse SQL."""
     return value.strftime("%Y-%m-%d %H:%M:%S")
@@ -250,7 +260,7 @@ class _ParameterizedQueryBuilder:
         tags, and every value in the ``attributes`` Map — not just ``message``.
         """
         name = self._param_name()
-        self.parameters[name] = f"%{value}%"
+        self.parameters[name] = f"%{_escape_like(value)}%"
         columns = [
             "message",
             "display_name",

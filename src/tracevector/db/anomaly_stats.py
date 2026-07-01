@@ -18,8 +18,13 @@ already-ingested data.
 
 **frequency** (``detector="frequency"``)
     Detect event-count spikes and silences in time windows per ``series_field``
-    value using z-score.  The same bucket math as the histogram endpoint is
-    reused.  Score = |z|; windows above ``z_threshold`` are returned.
+    value using z-score.  Buckets are computed with the same
+    ``duration / bucket_count`` interval formula as the histogram endpoint, but
+    over the *unfiltered* timeline for the given ``case_id``/``source_ids`` —
+    it does not honor the events-view's ``q``/``artifact``/``tag``/time-range
+    filters the way ``QueryService.histogram`` does, so anomaly windows can be
+    computed over a different span than what a filtered histogram displays.
+    Score = |z|; windows above ``z_threshold`` are returned.
 
     Two sub-modes mirror value_novelty:
 
@@ -74,6 +79,12 @@ _RECOMMENDER_MAX_ATTR_KEYS = 50
 
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
+
+# Floor applied to the leave-one-out std in self-baseline mode so that a
+# near-constant rest-of-series doesn't divide by ~0 when scoring the
+# excluded point (half an event-count unit — small enough to still flag any
+# real deviation, large enough to avoid blowing up the z-score to inf/NaN).
+_MIN_FREQUENCY_STD = 0.5
 
 # Columns selected when hydrating a representative event.
 _EVENT_COLUMNS = (
@@ -205,6 +216,44 @@ def _ensure_utc(dt: Any) -> datetime:
     if hasattr(dt, "tzinfo") and dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt
+
+
+def _freq_finding(
+    series_field: str,
+    series_value: Any,
+    bucket_dt: datetime,
+    interval: int,
+    cnt: int,
+    mean_val: float,
+    z: float,
+    method: str,
+) -> FreqFinding:
+    """Build a `FreqFinding` for one anomalous bucket."""
+    window_end_dt = bucket_dt + timedelta(seconds=interval)
+    return FreqFinding(
+        series_field=series_field,
+        series_value=str(series_value),
+        window_start=bucket_dt.isoformat(),
+        window_end=window_end_dt.isoformat(),
+        observed=cnt,
+        expected=round(mean_val, 2),
+        z_score=round(z, 4),
+        score=round(abs(z), 4),
+        event_id=None,
+        event=None,
+        details={
+            "detector": "frequency",
+            "method": method,
+            "series_field": series_field,
+            "series_value": str(series_value),
+            "window_start": bucket_dt.isoformat(),
+            "window_end": window_end_dt.isoformat(),
+            "observed": cnt,
+            "expected": round(mean_val, 2),
+            "z_score": round(z, 4),
+            "interval_seconds": interval,
+        },
+    )
 
 
 def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
@@ -771,6 +820,7 @@ class StatisticalAnomalyService:
 
         # Z-score each bucket, collect anomalous windows.
         findings: list[FreqFinding] = []
+        evaluated_series = 0
 
         for sv, pts in series.items():
             pts_aware = [(_ensure_utc(b), c) for b, c in pts]
@@ -784,53 +834,55 @@ class StatisticalAnomalyService:
                 counts_bl = np.array([c for _, c in bl_pts], dtype=np.float64)
                 mean_val = float(counts_bl.mean())
                 std_val = float(counts_bl.std(ddof=1))
-                score_pts = detect_pts
+                if std_val < 1e-9:
+                    continue  # Perfectly constant baseline — no z-score possible.
+                evaluated_series += 1
+                for bucket_dt, cnt in detect_pts:
+                    z = (cnt - mean_val) / std_val
+                    if abs(z) >= z_threshold:
+                        findings.append(
+                            _freq_finding(
+                                series_field, sv, bucket_dt, interval, cnt,
+                                mean_val, z, method,
+                            )
+                        )
             else:
                 if len(pts_aware) < _MIN_FREQUENCY_BUCKETS:
                     continue
                 baseline_size += sum(c for _, c in pts_aware)
+                # Leave-one-out mean/std: score each bucket against the rest of
+                # the series, not against itself. Otherwise a single dominant
+                # spike inflates its own baseline and can suppress detection
+                # of the very spike being scored.
                 counts = np.array([c for _, c in pts_aware], dtype=np.float64)
-                mean_val = float(counts.mean())
-                std_val = float(counts.std(ddof=1))
-                score_pts = pts_aware
-
-            if std_val < 1e-9:
-                continue  # Perfectly constant series — no z-score possible.
-
-            for bucket_dt, cnt in score_pts:
-                z = (cnt - mean_val) / std_val
-                if abs(z) >= z_threshold:
-                    window_end_dt = bucket_dt + timedelta(seconds=interval)
-                    findings.append(
-                        FreqFinding(
-                            series_field=series_field,
-                            series_value=str(sv),
-                            window_start=bucket_dt.isoformat(),
-                            window_end=window_end_dt.isoformat(),
-                            observed=cnt,
-                            expected=round(mean_val, 2),
-                            z_score=round(z, 4),
-                            score=round(abs(z), 4),
-                            event_id=None,
-                            event=None,
-                            details={
-                                "detector": "frequency",
-                                "method": method,
-                                "series_field": series_field,
-                                "series_value": str(sv),
-                                "window_start": bucket_dt.isoformat(),
-                                "window_end": window_end_dt.isoformat(),
-                                "observed": cnt,
-                                "expected": round(mean_val, 2),
-                                "z_score": round(z, 4),
-                                "interval_seconds": interval,
-                            },
-                        )
+                n = len(counts)
+                total = float(counts.sum())
+                total_sq = float(np.square(counts).sum())
+                evaluated_series += 1
+                for (bucket_dt, cnt), c in zip(pts_aware, counts, strict=False):
+                    n_loo = n - 1
+                    mean_val = (total - c) / n_loo
+                    var_loo = (total_sq - c * c - n_loo * mean_val * mean_val) / (
+                        n_loo - 1
                     )
+                    # Floor the leave-one-out std rather than skipping when the
+                    # rest of the series is constant (or near it) — otherwise a
+                    # single outlier bucket, scored against a baseline it was
+                    # excluded from, would divide by ~0 and either blow up or
+                    # (previously) get silently dropped instead of flagged.
+                    std_val = max(math.sqrt(max(var_loo, 0.0)), _MIN_FREQUENCY_STD)
+                    z = (cnt - mean_val) / std_val
+                    if abs(z) >= z_threshold:
+                        findings.append(
+                            _freq_finding(
+                                series_field, sv, bucket_dt, interval, int(cnt),
+                                mean_val, z, method,
+                            )
+                        )
 
         if not findings:
             return StatAnomalyResult(
-                status="ok",
+                status="ok" if evaluated_series > 0 else "insufficient_data",
                 detector="frequency",
                 method=method,
                 baseline_size=baseline_size,

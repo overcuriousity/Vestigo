@@ -1183,6 +1183,7 @@ async def tag_anomalies(
             "detector": result.detector,
             "method": result.method,
             "tagged": 0,
+            "skipped_unresolved": 0,
             "baseline_size": result.baseline_size,
             "results": [],
             "z_threshold": result.z_threshold,
@@ -1200,6 +1201,7 @@ async def tag_anomalies(
     # Write one system annotation per finding, skipping events that already
     # have a pinned annotation to avoid a duplicate row for the same event.
     annotation_rows = []
+    skipped_unresolved = 0
     for r in result.results:
         if isinstance(r, ValueFinding):
             event_id = r.event_id or ""
@@ -1239,7 +1241,12 @@ async def tag_anomalies(
                     f"event-count distribution, which includes this window "
                     f"(z={r.z_score:.2f})"
                 )
-        if not event_id or event_id in pinned_event_ids:
+        if not event_id:
+            # Representative event couldn't be resolved (e.g. deleted between
+            # detection and tagging) — nothing to attach the annotation to.
+            skipped_unresolved += 1
+            continue
+        if event_id in pinned_event_ids:
             continue
         annotation_rows.append(
             {
@@ -1262,6 +1269,7 @@ async def tag_anomalies(
         "detector": result.detector,
         "method": result.method,
         "tagged": tagged,
+        "skipped_unresolved": skipped_unresolved,
         "baseline_size": result.baseline_size,
         "results": [_serialize_finding(r) for r in result.results],
         "z_threshold": result.z_threshold,

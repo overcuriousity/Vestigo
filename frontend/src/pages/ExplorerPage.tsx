@@ -407,8 +407,11 @@ export function ExplorerPage() {
 
   const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
   // Only the initial, uncursored page carries a real COUNT(*) — later pages
-  // (forward, backward, or a jump-to-time seek) return `total: null`.
-  const total = eventsData?.pages.find((p) => p.total != null)?.total ?? 0;
+  // (forward, backward, or a jump-to-time seek) return `total: null`. Keep it
+  // `null` rather than defaulting to 0 — a jump-to-time session may never load
+  // an offset-mode page, and 0 would read as "no matching events" when the
+  // true count is simply unknown.
+  const total = eventsData?.pages.find((p) => p.total != null)?.total ?? null;
 
   // Derive a plain Set<string> of selected IDs for components that don't know
   // about the "all" mode (EventGrid checkboxes). In "all" mode we show all
@@ -419,7 +422,7 @@ export function ExplorerPage() {
   }, [selection, events]);
 
   // Total count shown in BulkActionBar label
-  const selectionCount = selection.mode === "all" ? total : selection.ids.size;
+  const selectionCount = selection.mode === "all" ? (total ?? events.length) : selection.ids.size;
 
   // Show the "select all N matching" banner when all loaded rows are in "ids"
   // mode selection and there are more events not yet loaded.
@@ -427,7 +430,7 @@ export function ExplorerPage() {
     selection.mode === "ids" &&
     selection.ids.size === events.length &&
     events.length > 0 &&
-    total > events.length;
+    (total === null || total > events.length);
 
   // ── Handlers ───────────────────────────────────────────────────────────
   const handleToggleSelect = useCallback((id: string) => {
@@ -759,7 +762,8 @@ const handleFindSimilar = useCallback((event: Event) => {
                     className="font-semibold underline hover:no-underline"
                     onClick={() => setSelection({ mode: "all" })}
                   >
-                    Select all {total.toLocaleString()} matching this filter
+                    Select all {total !== null ? `${total.toLocaleString()} ` : ""}matching this
+                    filter
                   </button>
                   <span className="opacity-50">·</span>
                   <button
@@ -787,6 +791,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                   onLoadMore={handleLoadMore}
                   onLoadEarlier={handleLoadEarlier}
                   hasPreviousPage={!!hasPreviousPage}
+                  hasNextPage={!!hasNextPage}
                   isFetching={isFetching}
                   visibleColumns={visibleColumns}
                   sortDir={sortDir}

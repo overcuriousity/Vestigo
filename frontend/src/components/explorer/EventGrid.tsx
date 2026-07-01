@@ -37,7 +37,8 @@ const OVERSCAN = 10;
 
 interface Props {
   events: Event[];
-  total: number;
+  /** Total matching event count, or `null` when unknown (e.g. after a jump-to-time seek). */
+  total: number | null;
   annotations: Map<string, Annotation[]>; // eventId → annotations
   selectedIds: Set<string>;
   caseId: string;
@@ -52,6 +53,8 @@ interface Props {
   onLoadEarlier: () => void;
   /** Whether an earlier (older/newer, depending on sort) page is known to exist. */
   hasPreviousPage: boolean;
+  /** Whether a further page is known to exist — independent of `total`, which can be unknown. */
+  hasNextPage: boolean;
   isFetching: boolean;
   visibleColumns: string[];
   sortDir: "asc" | "desc";
@@ -347,6 +350,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   onLoadMore,
   onLoadEarlier,
   hasPreviousPage,
+  hasNextPage,
   isFetching,
   visibleColumns,
   sortDir,
@@ -839,10 +843,12 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       {/* Footer */}
       <div className="flex shrink-0 items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-surface)] px-4 py-1.5 text-xs text-[var(--color-fg-muted)]">
         <span>
-          {events.length.toLocaleString()} of {total.toLocaleString()} events loaded
-          {events.length >= total && total > 0 && " · all loaded"}
+          {total != null
+            ? `${events.length.toLocaleString()} of ${total.toLocaleString()} events loaded`
+            : `${events.length.toLocaleString()} events loaded`}
+          {!hasNextPage && " · all loaded"}
         </span>
-        {events.length < total && (
+        {hasNextPage && (
           <button
             className="text-[var(--color-accent)] hover:underline transition-base"
             onClick={onLoadMore}

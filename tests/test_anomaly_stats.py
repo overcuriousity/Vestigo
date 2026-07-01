@@ -431,7 +431,9 @@ def test_frequency_constant_series_ignored():
 
 
 def test_frequency_insufficient_buckets_series_skipped():
-    """Series with < _MIN_FREQUENCY_BUCKETS data points are skipped."""
+    """Series with < _MIN_FREQUENCY_BUCKETS data points are skipped, and the
+    result says so via status="insufficient_data" rather than a silent "ok"
+    with an empty result list (indistinguishable from "nothing anomalous")."""
     from datetime import datetime
 
     min_dt = datetime(2024, 1, 1, tzinfo=UTC)
@@ -448,7 +450,7 @@ def test_frequency_insufficient_buckets_series_skipped():
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies("c1", ["s1"], z_threshold=1.0)
-    assert result.status == "ok"
+    assert result.status == "insufficient_data"
     assert result.results == []
 
 

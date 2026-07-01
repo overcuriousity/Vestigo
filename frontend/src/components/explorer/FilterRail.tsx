@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText } from "lucide-react";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -304,6 +304,33 @@ export function FilterRail({
             placeholder="add artifact…"
             className="text-xs"
           />
+        </div>
+
+        {/* Source ID — filter to events from one ingested source */}
+        <div>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <Database size={11} /> Source ID
+          </label>
+          <div className="flex gap-1">
+            <Input
+              placeholder="source_id…"
+              value={filters.sourceId ?? ""}
+              onChange={(e) =>
+                onChange({ ...filters, sourceId: e.target.value.trim() || undefined })
+              }
+              className="text-xs"
+            />
+            {filters.sourceId && (
+              <Button
+                size="icon"
+                variant="outline"
+                type="button"
+                onClick={() => onChange({ ...filters, sourceId: undefined })}
+              >
+                <X size={12} />
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Field include */}

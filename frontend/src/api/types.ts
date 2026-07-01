@@ -229,6 +229,8 @@ export interface AnomalyMarker {
 
 export interface TagAnomaliesResponse extends AnomaliesResponse {
   tagged: number;
+  /** Findings whose representative event couldn't be resolved and were skipped. */
+  skipped_unresolved: number;
 }
 
 /** One field candidate returned by GET /anomalies/fields. */

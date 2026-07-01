@@ -10,7 +10,7 @@ interface Props {
   caseId: string;
   timelineId: string;
   filters: EventFilters;
-  total: number;
+  total: number | null;
 }
 
 export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
@@ -41,7 +41,11 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
       </DialogTrigger>
       <DialogContent
         title="Export Events"
-        description={`Download all ${total.toLocaleString()} matching events with current filters applied.`}
+        description={
+          total !== null
+            ? `Download all ${total.toLocaleString()} matching events with current filters applied.`
+            : "Download all matching events with current filters applied."
+        }
       >
         <div className="space-y-4">
           <div>

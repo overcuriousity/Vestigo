@@ -11,7 +11,7 @@ import type { Annotation } from "@/api/types";
 
 interface Props {
   annotations: Annotation[];
-  totalEvents: number;
+  totalEvents: number | null;
 }
 
 function computeProgress(annotations: Annotation[]) {

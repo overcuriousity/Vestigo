@@ -409,6 +409,15 @@ export function ValueNoveltyView({
           {tagMutation.isSuccess && (
             <span className="text-[10px] text-[var(--color-success)]">
               ✓ {(tagMutation.data as { tagged?: number } | undefined)?.tagged ?? 0} tagged
+              {!!(tagMutation.data as { skipped_unresolved?: number } | undefined)
+                ?.skipped_unresolved && (
+                <>
+                  {" "}
+                  (
+                  {(tagMutation.data as { skipped_unresolved?: number }).skipped_unresolved}{" "}
+                  skipped — event no longer exists)
+                </>
+              )}
             </span>
           )}
           {tagMutation.isError && (
