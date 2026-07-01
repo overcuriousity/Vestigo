@@ -32,7 +32,7 @@ export function MiniSparkline({
         const heightPct = Math.max(8, Math.round((v / maxVal) * 100));
         const isAnomaly = i === anomalyIndex;
         const barColor = isAnomaly
-          ? "var(--color-error, #f87171)"
+          ? "var(--color-anomaly, #c97fff)"
           : (color ?? "var(--color-accent)");
         return (
           <div
