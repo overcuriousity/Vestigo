@@ -20,10 +20,10 @@ const buttonVariants = cva(
           "border border-[var(--color-border-strong)] text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)]",
       },
       size: {
-        sm: "h-7 px-2.5 text-xs",
-        md: "h-8 px-3",
-        lg: "h-9 px-4",
-        icon: "h-7 w-7 p-0",
+        sm: "h-8 px-3 text-xs",
+        md: "h-9 px-3.5 text-sm",
+        lg: "h-10 px-4",
+        icon: "h-8 w-8 p-0",
       },
     },
     defaultVariants: {

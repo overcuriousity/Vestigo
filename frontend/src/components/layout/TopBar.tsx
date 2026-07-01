@@ -1,11 +1,12 @@
 import { Link, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Wifi, WifiOff, Activity, Sun, Moon } from "lucide-react";
+import { Wifi, WifiOff, Activity, Sun, Moon, Rows2, Rows3 } from "lucide-react";
 import { healthApi } from "@/api/health";
 import { JobTray } from "./JobTray";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { cn } from "@/lib/cn";
 import { useThemeStore } from "@/stores/theme";
+import { useUiStore } from "@/stores/ui";
 
 function ThemeToggle() {
   const theme = useThemeStore((s) => s.theme);
@@ -21,6 +22,25 @@ function ThemeToggle() {
         aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}
       >
         {isDark ? <Sun size={14} /> : <Moon size={14} />}
+      </button>
+    </Tooltip>
+  );
+}
+
+function DensityToggle() {
+  const density = useUiStore((s) => s.density);
+  const setDensity = useUiStore((s) => s.setDensity);
+  const isCompact = density === "compact";
+
+  return (
+    <Tooltip content={isCompact ? "Switch to comfortable density" : "Switch to compact density"}>
+      <button
+        type="button"
+        onClick={() => setDensity(isCompact ? "comfortable" : "compact")}
+        className="flex items-center justify-center rounded p-1.5 text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)] transition-base"
+        aria-label={isCompact ? "Switch to comfortable density" : "Switch to compact density"}
+      >
+        {isCompact ? <Rows3 size={14} /> : <Rows2 size={14} />}
       </button>
     </Tooltip>
   );
@@ -112,6 +132,7 @@ export function TopBar() {
       <div className="ml-auto flex items-center gap-2">
         <JobTray />
         <HealthIndicator />
+        <DensityToggle />
         <ThemeToggle />
       </div>
     </header>

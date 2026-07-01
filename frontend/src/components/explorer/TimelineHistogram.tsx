@@ -365,7 +365,7 @@ export function TimelineHistogram({
       })()}
 
       {/* X-axis labels */}
-      <div className="flex justify-between px-2 pb-1 text-[11px] text-[var(--color-fg-muted)]">
+      <div className="flex justify-between px-2 pb-1 text-xs text-[var(--color-fg-muted)]">
         <span>{data.min ? fmtShort(data.min) : ""}</span>
         <span>
           {buckets[Math.floor(buckets.length / 2)]
@@ -378,7 +378,7 @@ export function TimelineHistogram({
       {/* Tooltip */}
       {tooltip && (
         <div
-          className="pointer-events-none absolute bottom-full mb-1 -translate-x-1/2 rounded bg-[var(--color-bg-elevated)] border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-fg-primary)] whitespace-nowrap shadow"
+          className="pointer-events-none absolute bottom-full mb-1 -translate-x-1/2 rounded bg-[var(--color-bg-elevated)] border border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-fg-primary)] whitespace-nowrap shadow"
           style={{ left: tooltip.x + 8 }}
         >
           {tooltip.text}

@@ -5,7 +5,13 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
+export type Density = "comfortable" | "compact";
+
 interface UiState {
+  /** Layout density — comfortable (default) or compact. */
+  density: Density;
+  setDensity: (density: Density) => void;
+
   /** Per-timeline column selections, keyed by "caseId/timelineId". */
   visibleColumnsByTimeline: Record<string, string[]>;
   setVisibleColumns: (key: string, cols: string[]) => void;
@@ -68,6 +74,9 @@ function migrateColumns(cols: string[] | undefined): string[] {
 export const useUiStore = create<UiState>()(
   persist(
     (set) => ({
+      density: "comfortable",
+      setDensity: (density) => set({ density }),
+
       visibleColumnsByTimeline: {},
       setVisibleColumns: (key, cols) =>
         set((s) => ({
@@ -86,7 +95,7 @@ export const useUiStore = create<UiState>()(
       sortDir: "desc",
       setSortDir: (dir) => set({ sortDir: dir }),
 
-      detailPanelWidth: 384,
+      detailPanelWidth: 420,
       setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
 
       columnWidths: {},
@@ -95,7 +104,7 @@ export const useUiStore = create<UiState>()(
     }),
     {
       name: "tv-ui",
-      version: 2,
+      version: 3,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -107,6 +116,9 @@ export const useUiStore = create<UiState>()(
         }
         if (version < 2) {
           state.columnWidths = state.columnWidths ?? {};
+        }
+        if (version < 3) {
+          state.density = state.density ?? "comfortable";
         }
         return state;
       },

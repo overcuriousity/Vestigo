@@ -73,11 +73,11 @@ function FieldRow({
 
   return (
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
-      <span className="w-32 shrink-0 text-xs text-[var(--color-fg-secondary)] pt-0.5 select-none">
+      <span className="w-36 shrink-0 text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
       </span>
       <span
-        className={`flex-1 min-w-0 break-all text-xs text-[var(--color-fg-primary)] ${mono ? "font-mono" : ""}`}
+        className={`flex-1 min-w-0 break-all text-sm text-[var(--color-fg-primary)] ${mono ? "font-mono" : ""}`}
       >
         {value}
       </span>
@@ -200,7 +200,7 @@ function AddAnnotationForm({
             if (e.key === "Enter" && value.trim()) onSubmit(value.trim());
             if (e.key === "Escape") onCancel();
           }}
-          className="flex-1 h-7 text-xs"
+          className="flex-1"
         />
       )}
       {type === "comment" && (
@@ -335,7 +335,7 @@ export function EventDetailPanel({
         </h3>
         {anomalyReasons.length > 0 && (
           <Tooltip content={anomalyReasons.join(" · ")} side="bottom">
-            <span className="flex items-center gap-1 rounded-full border border-[var(--color-anomaly)]/40 bg-[var(--color-anomaly-dim)] px-2 py-0.5 text-[11px] font-medium text-[var(--color-anomaly)]">
+            <span className="flex items-center gap-1 rounded-full border border-[var(--color-anomaly)]/40 bg-[var(--color-anomaly-dim)] px-2 py-0.5 text-xs font-medium text-[var(--color-anomaly)]">
               <AlertTriangle size={11} />
               {anomalyReasons.length} anomal{anomalyReasons.length === 1 ? "y" : "ies"}
             </span>
@@ -381,14 +381,14 @@ export function EventDetailPanel({
               </div>
             )}
           </div>
-          <p className="text-sm text-[var(--color-fg-primary)] break-words leading-relaxed">
+          <p className="text-base text-[var(--color-fg-primary)] break-words leading-relaxed">
             {event.message || "—"}
           </p>
         </div>
 
         {/* Timestamps */}
         <div className="mb-3">
-          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Timestamps
           </p>
           <FieldRow
@@ -412,7 +412,7 @@ export function EventDetailPanel({
 
         {/* Artifact */}
         <div className="mb-3">
-          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Artifact
           </p>
           <FieldRow
@@ -440,7 +440,7 @@ export function EventDetailPanel({
         {/* Parser tags */}
         {(event.tags ?? []).length > 0 && (
           <div className="mb-3">
-            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Parser Tags
             </p>
             <div className="flex flex-wrap gap-1">
@@ -457,7 +457,7 @@ export function EventDetailPanel({
                 </button>
               ))}
             </div>
-            <p className="mt-1 text-[11px] text-[var(--color-fg-muted)]">
+            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
               Click a tag to filter
             </p>
           </div>
@@ -466,9 +466,9 @@ export function EventDetailPanel({
         {/* Attributes — every row has filter-in / filter-out */}
         {Object.keys(event.attributes ?? {}).length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Attributes
-              <span className="ml-2 normal-case font-normal text-[var(--color-fg-muted)] text-[11px] opacity-60">
+              <span className="ml-2 normal-case font-normal text-[var(--color-fg-muted)] text-xs opacity-60">
                 hover to filter
               </span>
             </p>
@@ -487,7 +487,7 @@ export function EventDetailPanel({
 
         {/* Annotations — editable */}
         <div className="mb-3">
-          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Annotations
           </p>
 
@@ -498,7 +498,7 @@ export function EventDetailPanel({
           {userAnnotations.map((a) => (
             <div
               key={a.id}
-              className="group/ann mb-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-2 text-xs"
+              className="group/ann mb-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-3 text-sm"
             >
               <div className="flex items-start gap-1.5">
                 {a.annotation_type === "tag" ? (
@@ -520,7 +520,7 @@ export function EventDetailPanel({
                 </Tooltip>
               </div>
               <Tooltip content={fmtTimestampFull(a.created_at)} side="bottom">
-                <p className="mt-1 flex items-center gap-1 text-[11px] text-[var(--color-fg-muted)]">
+                <p className="mt-1 flex items-center gap-1 text-xs text-[var(--color-fg-muted)]">
                   <Clock size={8} />
                   {a.created_by ?? "anonymous"} · {fmtRelative(a.created_at)}
                 </p>
@@ -532,7 +532,7 @@ export function EventDetailPanel({
           {systemAnnotations.map((a) => (
             <div
               key={a.id}
-              className="mb-1 rounded border border-[var(--color-anomaly)]/30 bg-[var(--color-anomaly-dim)] px-2.5 py-1.5 text-xs"
+              className="mb-1 rounded border border-[var(--color-anomaly)]/30 bg-[var(--color-anomaly-dim)] px-3 py-2 text-sm"
             >
               <span className="font-medium text-[var(--color-anomaly)]">
                 ⚠ {a.annotation_type}:
@@ -547,18 +547,18 @@ export function EventDetailPanel({
           {effectiveLiveFindings.map((finding, i) => (
             <div
               key={i}
-              className="mb-1 flex items-start gap-1.5 rounded border border-dashed border-[var(--color-anomaly)]/40 px-2.5 py-1.5 text-xs"
+              className="mb-1 flex items-start gap-1.5 rounded border border-dashed border-[var(--color-anomaly)]/40 px-3 py-2 text-sm"
             >
               <span className="text-[var(--color-anomaly)]">⚠</span>
               <span className="min-w-0 flex-1 break-all text-[var(--color-fg-primary)]">
                 {finding.detail}
-                <span className="ml-1 text-[10px] text-[var(--color-fg-muted)]">(not yet tagged)</span>
+                <span className="ml-1 text-xs text-[var(--color-fg-muted)]">(not yet tagged)</span>
               </span>
               <Tooltip content="Persist this finding as a system annotation" side="top">
                 <button
                   onClick={() => persistMutation.mutate(finding)}
                   disabled={persistMutation.isPending}
-                  className="shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
+                  className="shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
                 >
                   {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
                   Persist
@@ -608,7 +608,7 @@ export function EventDetailPanel({
 
         {/* Provenance — display-only, no filter buttons */}
         <div className="mb-3">
-          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Provenance
           </p>
           <FieldRow label="event_id" value={event.event_id} mono filterKey={null} />

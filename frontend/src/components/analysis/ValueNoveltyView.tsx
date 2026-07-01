@@ -119,7 +119,7 @@ function FindingRow({
         <div className="min-w-0 flex-1 space-y-0.5">
           {/* Field badge + value */}
           <div className="flex flex-wrap items-center gap-1">
-            <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-fg-muted)]">
+            <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]">
               {fieldLabel(finding.field)}
             </span>
             <span
@@ -140,7 +140,7 @@ function FindingRow({
           </div>
 
           {/* Meta line */}
-          <div className="flex flex-wrap items-center gap-2 text-[10px] text-[var(--color-fg-muted)]">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--color-fg-muted)]">
             <span>
               count <strong className="text-[var(--color-fg-secondary)]">{finding.count}</strong>
             </span>
@@ -195,7 +195,7 @@ function FindingRow({
 
       {/* Expanded details */}
       {expanded && (
-        <div className="border-t border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2 space-y-1 text-[10px] font-mono text-[var(--color-fg-muted)]">
+        <div className="border-t border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2 space-y-1 text-xs font-mono text-[var(--color-fg-muted)]">
           {Object.entries(finding.details).map(([k, v]) => (
             <div key={k} className="flex gap-2">
               <span className="w-24 shrink-0">{k}</span>
@@ -309,14 +309,14 @@ export function ValueNoveltyView({
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
+        <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
           Mode
         </span>
         {(["self", "temporal"] as const).map((m) => (
           <button
             key={m}
             className={cn(
-              "rounded px-2 py-0.5 text-[10px] font-medium transition-colors",
+              "rounded px-2 py-0.5 text-xs font-medium transition-colors",
               mode === m
                 ? "bg-[var(--color-accent)] text-white"
                 : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
@@ -344,7 +344,7 @@ export function ValueNoveltyView({
 
       {/* Status line */}
       {data && (
-        <div className="flex items-center gap-2 text-[10px] text-[var(--color-fg-muted)]">
+        <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
           <span className="capitalize">{data.method}</span>
           <span>·</span>
           <span>{data.baseline_size.toLocaleString()} events in baseline</span>
@@ -407,7 +407,7 @@ export function ValueNoveltyView({
             Tag {findings.length} as anomaly
           </Button>
           {tagMutation.isSuccess && (
-            <span className="text-[10px] text-[var(--color-success)]">
+            <span className="text-xs text-[var(--color-success)]">
               ✓ {(tagMutation.data as { tagged?: number } | undefined)?.tagged ?? 0} tagged
               {!!(tagMutation.data as { skipped_unresolved?: number } | undefined)
                 ?.skipped_unresolved && (
@@ -421,13 +421,13 @@ export function ValueNoveltyView({
             </span>
           )}
           {tagMutation.isError && (
-            <span className="text-[10px] text-[var(--color-error)]">Failed</span>
+            <span className="text-xs text-[var(--color-error)]">Failed</span>
           )}
         </div>
       )}
 
       {/* Methodology note */}
-      <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)] pt-1">
+      <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
           Rare ≠ malicious. Rare values appear in &lt;= rarity floor events.

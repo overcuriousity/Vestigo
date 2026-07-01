@@ -17,6 +17,19 @@
   --radius-lg: 10px;
 }
 
+:root {
+  /* Density tokens — default (comfortable) */
+  --grid-row-height: 42px;
+  --grid-cell-x: 12px;
+  --grid-cell-y: 8px;
+}
+
+[data-density="compact"] {
+  --grid-row-height: 34px;
+  --grid-cell-x: 8px;
+  --grid-cell-y: 4px;
+}
+
 :root,
 [data-theme="light"] {
   /* Background tiers: base → surface → elevated → overlay */
@@ -122,10 +135,14 @@
 }
 
 html {
-  font-size: 13.5px;
+  font-size: 16px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+}
+
+html[data-density="compact"] {
+  font-size: 13.5px;
 }
 
 body {
@@ -146,7 +163,7 @@ body {
 /* ── Monospace class ─────────────────────────────────────────────────────── */
 .mono {
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  line-height: 1.5;
   letter-spacing: 0;
 }
 

@@ -109,7 +109,7 @@ export function AnalysisPanel({
         <div className="flex gap-px border-b border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5">
           <button
             className={cn(
-              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-[11px] font-medium transition-colors",
+              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-xs font-medium transition-colors",
               anomalySubTab === "novelty"
                 ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-primary)]"
                 : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
@@ -121,7 +121,7 @@ export function AnalysisPanel({
           </button>
           <button
             className={cn(
-              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-[11px] font-medium transition-colors",
+              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-xs font-medium transition-colors",
               anomalySubTab === "frequency"
                 ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-primary)]"
                 : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",

@@ -32,7 +32,8 @@ import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 
-const ROW_HEIGHT = 34; // px — compact forensic density (chips inline with message)
+// Keep in sync with --grid-row-height in index.css.
+const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
 const OVERSCAN = 10;
 
 interface Props {
@@ -118,7 +119,7 @@ function TagPopover({
         >
           <Tag size={13} />
           {userTags.length > 0 && (
-            <span className="ml-0.5 text-[11px] font-mono">{userTags.length}</span>
+            <span className="ml-0.5 text-xs font-mono">{userTags.length}</span>
           )}
         </PopoverTrigger>
       </Tooltip>
@@ -133,7 +134,7 @@ function TagPopover({
                 >
                   <Tag size={9} className="shrink-0 text-[var(--color-accent)]" />
                   <Tooltip content={`${t.created_by ? t.created_by + " · " : ""}${fmtRelative(t.created_at)} — ${fmtTimestampFull(t.created_at)}`} side="top">
-                    <span className="flex-1 min-w-0 truncate text-[11px] text-[var(--color-accent)] font-medium cursor-default">
+                    <span className="flex-1 min-w-0 truncate text-xs text-[var(--color-accent)] font-medium cursor-default">
                       {t.content}
                     </span>
                   </Tooltip>
@@ -157,7 +158,7 @@ function TagPopover({
                 if (e.key === "Enter") submit();
                 if (e.key === "Escape") { setOpen(false); setValue(""); }
               }}
-              className="flex-1 h-7 text-xs"
+              className="flex-1"
             />
             <Button
               variant="accent"
@@ -207,7 +208,7 @@ function CommentPopover({
         >
           <MessageSquare size={13} />
           {userComments.length > 0 && (
-            <span className="ml-0.5 text-[11px] font-mono">{userComments.length}</span>
+            <span className="ml-0.5 text-xs font-mono">{userComments.length}</span>
           )}
         </PopoverTrigger>
       </Tooltip>
@@ -230,7 +231,7 @@ function CommentPopover({
                     </button>
                   </div>
                   <Tooltip content={fmtTimestampFull(c.created_at)} side="bottom">
-                    <p className="mt-1 text-[11px] text-[var(--color-fg-muted)]">
+                    <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
                       {c.created_by ?? "anonymous"} · {fmtRelative(c.created_at)}
                     </p>
                   </Tooltip>
@@ -248,7 +249,7 @@ function CommentPopover({
                 if (e.key === "Enter") submit();
                 if (e.key === "Escape") { setOpen(false); setValue(""); }
               }}
-              className="flex-1 h-7 text-xs"
+              className="flex-1"
             />
             <Button
               variant="accent"
@@ -358,13 +359,15 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   highlightRange,
 }, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const density = useUiStore((s) => s.density);
+  const ROW_HEIGHT = ROW_HEIGHT_BY_DENSITY[density];
 
   const columns = useMemo<ColumnDef<Event>[]>(() => {
     const cols: ColumnDef<Event>[] = [
       // Checkbox
       {
         id: "_select",
-        size: 36,
+        size: 44,
         enableResizing: false,
         header: () => {
           const allChecked = events.length > 0 && selectedIds.size === events.length;
@@ -375,7 +378,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
               ref={(el) => { if (el) el.indeterminate = indeterminate; }}
               checked={allChecked}
               onChange={onToggleSelectAll}
-              className="h-3.5 w-3.5 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
+              className="h-4 w-4 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
               onClick={(e) => e.stopPropagation()}
               title={allChecked ? "Deselect all" : "Select all loaded"}
             />
@@ -386,7 +389,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             type="checkbox"
             checked={selectedIds.has(row.original.event_id)}
             onChange={() => onToggleSelect(row.original.event_id)}
-            className="h-3.5 w-3.5 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
+            className="h-4 w-4 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
             onClick={(e) => e.stopPropagation()}
           />
         ),
@@ -426,7 +429,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         minSize: 60,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-xs text-[var(--color-fg-secondary)]">
+          <span className="font-mono text-sm leading-snug text-[var(--color-fg-secondary)]">
             {fmtTimestamp(row.original.timestamp)}
           </span>
         ),
@@ -440,7 +443,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         cell: ({ row }) => {
           const value = row.original.artifact || row.original.source_file || null;
           return (
-            <span className="font-mono text-xs truncate text-[var(--color-info)]">
+            <span className="font-mono text-sm leading-snug truncate text-[var(--color-info)]">
               {value ?? "—"}
             </span>
           );
@@ -453,7 +456,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         minSize: 60,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-xs truncate text-[var(--color-info)]">
+          <span className="font-mono text-sm leading-snug truncate text-[var(--color-info)]">
             {row.original.artifact_long ?? "—"}
           </span>
         ),
@@ -465,7 +468,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         minSize: 60,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
+          <span className="font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
             {row.original.source_id}
           </span>
         ),
@@ -477,7 +480,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         minSize: 60,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="text-xs truncate text-[var(--color-fg-secondary)]">
+          <span className="text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
             {row.original.timestamp_desc ?? "—"}
           </span>
         ),
@@ -489,7 +492,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         minSize: 60,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="text-xs truncate text-[var(--color-fg-secondary)]">
+          <span className="text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
             {row.original.display_name ?? "—"}
           </span>
         ),
@@ -507,16 +510,16 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           );
           return (
             <div className="flex items-center gap-1 min-w-0">
-              <span className="text-xs text-[var(--color-fg-primary)] truncate leading-none shrink">
+              <span className="text-sm text-[var(--color-fg-primary)] truncate leading-snug shrink">
                 {truncate(row.original.message, 300)}
               </span>
               {parserTags.slice(0, 3).map((t) => (
-                <Badge key={t} variant="muted" className="text-[10px] py-0 px-1 leading-none shrink-0">
+                <Badge key={t} variant="muted" className="text-xs py-0.5 px-1.5 shrink-0">
                   {t}
                 </Badge>
               ))}
               {userTags.map((t) => (
-                <Badge key={t.id} variant="accent" className="text-[10px] py-0 px-1 leading-none shrink-0">
+                <Badge key={t.id} variant="accent" className="text-xs py-0.5 px-1.5 shrink-0">
                   {t.content}
                 </Badge>
               ))}
@@ -559,7 +562,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           minSize: 60,
           maxSize: 600,
           cell: ({ row }) => (
-            <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
+            <span className="font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
               {row.original.attributes[colId] ?? "—"}
             </span>
           ),
@@ -570,7 +573,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     // Expand toggle
     cols.push({
       id: "_expand",
-      size: 32,
+      size: 38,
       enableResizing: false,
       header: () => null,
       cell: ({ row }) => (
@@ -734,7 +737,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="relative px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
+              className="relative px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : undefined,
@@ -817,7 +820,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                 {row.getVisibleCells().map((cell) => (
                   <div
                     key={cell.id}
-                    className="px-2 truncate"
+                    className="px-[var(--grid-cell-x)] truncate"
                     style={{
                       width:
                         cell.column.id === "message"

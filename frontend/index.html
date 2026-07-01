@@ -18,6 +18,18 @@
           document.documentElement.setAttribute("data-theme", "light");
         }
       })();
+      (function () {
+        try {
+          var stored = JSON.parse(localStorage.getItem("tv-ui"));
+          var density = stored && stored.state && stored.state.density;
+          document.documentElement.setAttribute(
+            "data-density",
+            density === "compact" ? "compact" : "comfortable",
+          );
+        } catch (e) {
+          document.documentElement.setAttribute("data-density", "comfortable");
+        }
+      })();
     </script>
   </head>
   <body>

@@ -46,7 +46,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
 
       {/* Statistical anomaly engine */}
       <section className="space-y-2">
-        <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-[10px]">
+        <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-xs">
           <BarChart2 size={11} /> Statistical Anomaly Engine
         </h4>
 
@@ -68,13 +68,13 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
             <Row label="Score">
               −log(count / total events) — interpretable surprise score.
               Higher = rarer. Carried in{" "}
-              <code className="font-mono text-[10px]">details.surprise</code>.
+              <code className="font-mono text-xs">details.surprise</code>.
             </Row>
             <Row label="Fields">
               Auto-selected by cardinality: constant and near-unique (identifier)
               fields are skipped; moderate-cardinality categoricals are
               recommended. Analyst can override via the Fields picker — any
-              top-level column or <code className="font-mono text-[10px]">attr:key</code> is accepted.
+              top-level column or <code className="font-mono text-xs">attr:key</code> is accepted.
             </Row>
             <Row label="Backend">
               Pure ClickHouse GROUP BY aggregations — no embeddings or ML.
@@ -100,7 +100,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
             </Row>
             <Row label="Score">
               |z| — absolute z-score. Carried in{" "}
-              <code className="font-mono text-[10px]">details.z_score</code>.
+              <code className="font-mono text-xs">details.z_score</code>.
             </Row>
             <Row label="Bucketing">
               Same interval math as the timeline histogram: duration / bucket
@@ -112,7 +112,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
           </div>
         </div>
 
-        <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)]">
+        <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)]">
           <ShieldCheck size={10} className="mt-0.5 shrink-0 text-[var(--color-success)]" />
           <span>
             Both detectors are forensically defensible: every finding carries
@@ -127,7 +127,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
 
       {/* Semantic similarity search */}
       <section className="space-y-2">
-        <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-[10px]">
+        <h4 className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-secondary)] uppercase tracking-wide text-xs">
           <Cpu size={11} /> Semantic Similarity Search
         </h4>
 
@@ -149,7 +149,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
             >
               <div className="flex items-start gap-2">
                 <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Source</span>
-                <span className="font-mono text-[var(--color-fg-primary)] break-all text-[10px]">
+                <span className="font-mono text-[var(--color-fg-primary)] break-all text-xs">
                   {source.name}
                 </span>
               </div>
@@ -182,7 +182,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
                         {(fields as string[]).map((f) => (
                           <span
                             key={f}
-                            className="rounded bg-[var(--color-accent-dim)] px-1.5 py-0.5 font-mono text-[var(--color-accent)] text-[10px]"
+                            className="rounded bg-[var(--color-accent-dim)] px-1.5 py-0.5 font-mono text-[var(--color-accent)] text-xs"
                           >
                             {tokenLabel(f)}
                           </span>
@@ -205,7 +205,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
           );
         })}
 
-        <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)]">
+        <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)]">
           <Info size={10} className="mt-0.5 shrink-0" />
           <span>
             Similarity search uses cosine distance in 384-dim embedding space

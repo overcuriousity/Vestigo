@@ -114,13 +114,13 @@ function CohesionBanner({ cohesion }: { cohesion: CohesionSummary }) {
           )}
         </span>
         {cohesion.shared_field_count > 0 && (
-          <span className="ml-auto text-[10px] text-[var(--color-fg-muted)]">
+          <span className="ml-auto text-xs text-[var(--color-fg-muted)]">
             {cohesion.shared_field_count} shared field
             {cohesion.shared_field_count !== 1 ? "s" : ""}
           </span>
         )}
       </div>
-      <p className="text-[11px] text-[var(--color-fg-secondary)] leading-snug">
+      <p className="text-xs text-[var(--color-fg-secondary)] leading-snug">
         {cohesion.message}
       </p>
     </div>
@@ -156,7 +156,7 @@ function ArtifactSection({
         <span className="font-mono text-xs font-semibold text-[var(--color-fg-primary)]">
           {info.artifact || "(no artifact)"}
         </span>
-        <span className="text-[10px] text-[var(--color-fg-muted)]">
+        <span className="text-xs text-[var(--color-fg-muted)]">
           {info.count.toLocaleString()} events
         </span>
       </div>
@@ -176,7 +176,7 @@ function ArtifactSection({
               key={token}
               type="button"
               onClick={() => onToggle(token)}
-              className={`flex items-center gap-1 rounded border px-2 py-1 text-[11px] transition-colors ${
+              className={`flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors ${
                 on
                   ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-fg-primary)]"
                   : "border-[var(--color-border)] text-[var(--color-fg-muted)] hover:border-[var(--color-fg-muted)]"
@@ -204,7 +204,7 @@ function ArtifactSection({
 
       {info.related_groups.length > 0 && (
         <div className="mt-2.5 space-y-1 border-t border-[var(--color-border)] pt-2">
-          <div className="flex items-center gap-1 text-[10px] text-[var(--color-fg-muted)]">
+          <div className="flex items-center gap-1 text-xs text-[var(--color-fg-muted)]">
             <Info size={10} /> Semantically related — toggle as a group:
           </div>
           <div className="flex flex-wrap gap-1.5">
@@ -213,7 +213,7 @@ function ArtifactSection({
                 key={i}
                 type="button"
                 onClick={() => onToggleGroup(group)}
-                className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-0.5 text-[10px] text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
+                className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-0.5 text-xs text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
               >
                 <Link2 size={9} />
                 {group.map(tokenLabel).join(" + ")}

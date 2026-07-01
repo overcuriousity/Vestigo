@@ -115,7 +115,7 @@ function FreqFindingRow({ finding, onDrillField, onJumpToTime }: FreqFindingRowP
       <div className="min-w-0 flex-1 space-y-0.5">
         {/* Series value */}
         <div className="flex flex-wrap items-center gap-1">
-          <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-fg-muted)]">
+          <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]">
             {finding.series_field}
           </span>
           <span className="font-mono text-xs text-[var(--color-fg-primary)] font-medium break-all">
@@ -124,12 +124,12 @@ function FreqFindingRow({ finding, onDrillField, onJumpToTime }: FreqFindingRowP
         </div>
 
         {/* Window label */}
-        <div className="text-[10px] text-[var(--color-fg-muted)]">
+        <div className="text-xs text-[var(--color-fg-muted)]">
           {fmtTs(finding.window_start)} – {fmtTs(finding.window_end)}
         </div>
 
         {/* Count vs expected */}
-        <div className="flex flex-wrap items-center gap-2 text-[10px]">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="text-[var(--color-fg-secondary)]">
             <strong>{finding.observed}</strong> events
           </span>
@@ -272,13 +272,13 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-fg-muted)] shrink-0">
+        <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)] shrink-0">
           Group by
         </span>
         <select
           value={seriesField}
           onChange={(e) => setSeriesField(e.target.value)}
-          className="flex-1 min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+          className="flex-1 min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
         >
           <optgroup label="Standard">
             {seriesFieldOptions
@@ -301,7 +301,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
             </optgroup>
           )}
         </select>
-        <span className="flex items-center gap-1 text-[10px] text-[var(--color-fg-muted)] shrink-0">
+        <span className="flex items-center gap-1 text-xs text-[var(--color-fg-muted)] shrink-0">
           z ≥
           <input
             type="number"
@@ -310,7 +310,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
             value={zThresholdInput}
             onChange={(e) => setZThresholdInput(e.target.value)}
             title="|z| cutoff — windows at or above this many standard deviations are flagged"
-            className="w-12 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-[11px] text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+            className="w-12 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
           />
         </span>
         <button
@@ -324,7 +324,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
 
       {/* Status line */}
       {data && (
-        <div className="flex items-center gap-2 text-[10px] text-[var(--color-fg-muted)]">
+        <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
           <span className="capitalize">{data.method}</span>
           <span>·</span>
           <span>z ≥ {data.z_threshold ?? zThresholdParam ?? "?"}</span>
@@ -384,7 +384,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
             Tag {findings.length} windows
           </Button>
           {tagMutation.isSuccess && (
-            <span className="text-[10px] text-[var(--color-success)]">
+            <span className="text-xs text-[var(--color-success)]">
               ✓ {(tagMutation.data as { tagged?: number } | undefined)?.tagged ?? 0} tagged
               {!!(tagMutation.data as { skipped_unresolved?: number } | undefined)
                 ?.skipped_unresolved && (
@@ -398,13 +398,13 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
             </span>
           )}
           {tagMutation.isError && (
-            <span className="text-[10px] text-[var(--color-error)]">Failed</span>
+            <span className="text-xs text-[var(--color-error)]">Failed</span>
           )}
         </div>
       )}
 
       {/* Hint */}
-      <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)]">
+      <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)]">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
           Click any window to filter the explorer to that series value and

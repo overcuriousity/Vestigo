@@ -33,7 +33,7 @@ export function SessionMomentum({ count }: Props) {
           }
         />
         <div className="w-24">
-          <p className="text-[11px] font-medium uppercase tracking-wide text-[var(--color-fg-muted)] mb-1">
+          <p className="text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)] mb-1">
             {count > 0 ? `${count} triaged` : "Triaged"}
           </p>
           <Progress
