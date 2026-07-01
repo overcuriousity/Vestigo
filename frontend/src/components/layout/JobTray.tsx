@@ -1,5 +1,6 @@
 /**
- * GlobalJobTray — live ingest/embed job progress shown in the top bar.
+ * GlobalJobTray — live ingest/embed job progress shown as a fixed
+ * bottom-right toast tray so it never overlaps a page's own toolbar.
  * Polls /api/jobs/{id} for each active job, updates store on completion.
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -90,7 +91,7 @@ export function JobTray() {
   if (visible.length === 0) return null;
 
   return (
-    <div className="absolute right-4 top-full z-50 mt-1 flex flex-col gap-2">
+    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
       {visible.map((j) => (
         <JobRow key={j.id} job={j} />
       ))}

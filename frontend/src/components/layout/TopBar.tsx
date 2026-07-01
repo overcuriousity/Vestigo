@@ -53,7 +53,7 @@ export function TopBar() {
   }
 
   return (
-    <header className="relative flex h-11 shrink-0 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)] px-4">
+    <header className="flex h-11 shrink-0 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)] px-4">
       {/* Logo */}
       <Link
         to="/"
