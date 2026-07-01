@@ -94,7 +94,7 @@ class FakeQdrantStore:
     def case_collections(self, case_id: str) -> list[str]:
         return list(self._points.keys())
 
-    def find_timeline_collection(
+    def find_collection_for_sources(
         self, case_id: str, source_ids: list[str]
     ) -> str | None:
         source_set = set(source_ids)
@@ -177,6 +177,19 @@ class FakeClickHouseStore:
         self, case_id: str, source_ids: list[str], event_ids: list[str]
     ) -> dict[str, dict]:
         return {eid: self._rows[eid] for eid in event_ids if eid in self._rows}
+
+
+class FakeEmbeddingModel:
+    """Stand-in for EmbeddingModel that maps fixed strings to fixed vectors."""
+
+    def __init__(self, vectors_by_text: dict[str, list[float]]) -> None:
+        self._vectors_by_text = vectors_by_text
+
+    def load(self) -> None:
+        pass
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        return [self._vectors_by_text[t] for t in texts]
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +318,34 @@ def test_find_similar_falls_back_to_payload():
     sim = next((r for r in result.results if r.event_id == "similar"), None)
     assert sim is not None
     assert sim.event["message"] == "payload msg"
+
+
+# ---------------------------------------------------------------------------
+# find_similar_by_text tests
+# ---------------------------------------------------------------------------
+
+
+def test_find_similar_by_text_not_embedded():
+    """find_similar_by_text returns not_embedded when no vectors exist."""
+    qdrant = FakeQdrantStore()
+    ch = FakeClickHouseStore()
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+    result = svc.find_similar_by_text("case1", ["s1"], "some query")
+    assert result.status == "not_embedded"
+
+
+def test_find_similar_by_text_returns_nearest_first():
+    """The event closest to the embedded query text should score highest."""
+    qdrant = FakeQdrantStore()
+    qdrant._add_point("col1", "close", _unit([0.99, 0.14]), "s1")
+    qdrant._add_point("col1", "far", _unit([0.0, 1.0]), "s1")
+
+    ch = FakeClickHouseStore()
+    embedding_model = FakeEmbeddingModel({"login failure": _unit([1.0, 0.0])})
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch, embedding_model=embedding_model)
+    result = svc.find_similar_by_text("case1", ["s1"], "login failure", limit=2)
+
+    assert result.status == "ok"
+    assert len(result.results) == 2
+    assert result.results[0].event_id == "close"
+    assert result.results[0].score > result.results[1].score

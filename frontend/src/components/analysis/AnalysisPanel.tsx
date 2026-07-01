@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { ValueNoveltyView } from "./ValueNoveltyView";
 import { FrequencyView } from "./FrequencyView";
 import { SimilarEvents } from "./SimilarEvents";
+import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
 import { timelinesApi } from "@/api/timelines";
@@ -161,19 +162,30 @@ export function AnalysisPanel({
           />
         )}
 
-        {tab === "similar" && similarAnchor ? (
-          <SimilarEvents
-            caseId={caseId}
-            timelineId={timelineId}
-            anchorEvent={similarAnchor}
-            onClose={onSimilarClose}
-            onSelectEvent={onSelectEvent}
-          />
-        ) : tab === "similar" ? (
-          <p className="text-xs text-[var(--color-fg-muted)]">
-            Click the search icon on any event row to find similar events.
-          </p>
-        ) : null}
+        {tab === "similar" && (
+          <div className="space-y-5">
+            <SemanticSearch
+              caseId={caseId}
+              timelineId={timelineId}
+              onSelectEvent={onSelectEvent}
+            />
+            <div className="border-t border-[var(--color-border)] pt-4">
+              {similarAnchor ? (
+                <SimilarEvents
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  anchorEvent={similarAnchor}
+                  onClose={onSimilarClose}
+                  onSelectEvent={onSelectEvent}
+                />
+              ) : (
+                <p className="text-xs text-[var(--color-fg-muted)]">
+                  Click the search icon on any event row to find similar events.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {tab === "methodology" && (
           <MethodologyPanel

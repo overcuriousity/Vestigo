@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Upload, FileText } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
+import { useJobsStore } from "@/stores/jobs";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -18,6 +19,7 @@ export function UploadDialog({ caseId }: Props) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const qc = useQueryClient();
+  const addJob = useJobsStore((s) => s.addJob);
 
   const { mutate, isPending, error, data } = useMutation({
     mutationFn: () =>
@@ -30,6 +32,9 @@ export function UploadDialog({ caseId }: Props) {
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
+      if (result.embed_job_id) {
+        addJob(result.embed_job_id, `Embedding "${file?.name ?? "source"}"`);
+      }
       console.info("Upload result", result);
       // Auto-close on successful new uploads after a short delay so the user
       // cannot immediately click Upload again on the same selection. Keep the

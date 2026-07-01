@@ -1,4 +1,4 @@
-import { del, get, post, postForm } from "./client";
+import { del, get, postForm } from "./client";
 import type {
   EmbeddingFieldsResponse,
   Source,
@@ -39,16 +39,4 @@ export const sourcesApi = {
 
   downloadUrl: (caseId: string, sourceId: string) =>
     `/api/cases/${caseId}/sources/${sourceId}/download`,
-
-  embed: (
-    caseId: string,
-    sourceId: string,
-    embeddingConfig?: { version: 1; artifacts: Record<string, string[]> },
-  ) =>
-    post<{ job_id: string; status: string }>(
-      `/cases/${caseId}/sources/${sourceId}/embed`,
-      embeddingConfig != null
-        ? { embedding_config: embeddingConfig }
-        : undefined,
-    ),
 };

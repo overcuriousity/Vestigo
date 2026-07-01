@@ -238,7 +238,10 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
 
   const isEmbedded = timeline.is_embedded;
   const isStale = timeline.is_stale;
-  const label = isEmbedded ? "Re-embed" : "Embed";
+  // Sources get a default all-fields embedding automatically on ingest, so
+  // this wizard's role is curating a better field selection, not a required
+  // first step.
+  const label = isEmbedded ? "Re-embed" : "Improve search quality";
 
   const { data, isLoading } = useQuery({
     queryKey: ["timeline-embedding-fields", caseId, timeline.id],
@@ -332,8 +335,8 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
         title="Embedding wizard"
         description={
           timeline.source_ids.length > 1
-            ? "Choose which fields to embed across all sources in this timeline. Fields are recommended based on shared content and cross-source cohesion."
-            : "Choose which fields of which artifacts to embed. Recommendations are based on each field's content."
+            ? "Sources are already embedded with a default all-fields configuration. Choose a curated field selection across all sources in this timeline for higher-quality search — recommendations are based on shared content and cross-source cohesion."
+            : "This source is already embedded with a default all-fields configuration. Choose a curated field selection for higher-quality search — recommendations are based on each field's content."
         }
         className="max-w-2xl"
       >

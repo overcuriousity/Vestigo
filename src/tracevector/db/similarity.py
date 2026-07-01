@@ -17,6 +17,7 @@ import numpy as np
 
 from tracevector.db.clickhouse import ClickHouseStore  # noqa: I001
 from tracevector.db.qdrant import QdrantStore
+from tracevector.models.embeddings import EmbeddingModel
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -162,9 +163,19 @@ class SimilarityService:
         self,
         qdrant: QdrantStore | None = None,
         clickhouse: ClickHouseStore | None = None,
+        embedding_model: EmbeddingModel | None = None,
     ) -> None:
         self.qdrant = qdrant or QdrantStore()
         self.clickhouse = clickhouse or ClickHouseStore()
+        # Lazily loaded on first free-text query so anchor-event searches
+        # (the common case) never pay the model-load cost.
+        self._embedding_model = embedding_model
+
+    def _get_embedding_model(self) -> EmbeddingModel:
+        if self._embedding_model is None:
+            self._embedding_model = EmbeddingModel()
+            self._embedding_model.load()
+        return self._embedding_model
 
     def find_similar(
         self,
@@ -181,7 +192,7 @@ class SimilarityService:
         Returns ``status="not_embedded"`` when the sources have no vectors, or
         ``status="vector_not_found"`` when the specific event has no vector.
         """
-        collection = self.qdrant.find_timeline_collection(case_id, source_ids)
+        collection = self.qdrant.find_collection_for_sources(case_id, source_ids)
         if collection is None:
             return SimilaritySearchResult(status="not_embedded")
 
@@ -189,7 +200,49 @@ class SimilarityService:
         if query_vector is None:
             return SimilaritySearchResult(status="vector_not_found")
 
-        # Fetch limit+1 and drop the query event itself.
+        return self._search_and_hydrate(
+            case_id,
+            collection,
+            query_vector,
+            source_ids,
+            limit,
+            exclude_event_id=event_id,
+        )
+
+    def find_similar_by_text(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        query: str,
+        limit: int = 10,
+    ) -> SimilaritySearchResult:
+        """Return the ``limit`` events most semantically similar to free-text ``query``.
+
+        The query text is embedded with the same model used at ingest time.
+        Returns ``status="not_embedded"`` when the sources have no vectors.
+        """
+        collection = self.qdrant.find_collection_for_sources(case_id, source_ids)
+        if collection is None:
+            return SimilaritySearchResult(status="not_embedded")
+
+        query_vector = self._get_embedding_model().encode([query])[0]
+        return self._search_and_hydrate(case_id, collection, query_vector, source_ids, limit)
+
+    def _search_and_hydrate(
+        self,
+        case_id: str,
+        collection: str,
+        query_vector: list[float],
+        source_ids: list[str],
+        limit: int,
+        exclude_event_id: str | None = None,
+    ) -> SimilaritySearchResult:
+        """Run a vector search and hydrate hits into event dicts.
+
+        Shared by :py:meth:`find_similar` (anchor-event query) and
+        :py:meth:`find_similar_by_text` (free-text query).
+        """
+        # Fetch limit+1 so dropping the anchor event (if any) still leaves `limit` results.
         hits = self.qdrant.search(
             collection_name=collection,
             query_vector=query_vector,
@@ -197,7 +250,9 @@ class SimilarityService:
             limit=limit + 1,
             with_vectors=False,
         )
-        hits = [h for h in hits if str(h.id) != event_id][:limit]
+        if exclude_event_id is not None:
+            hits = [h for h in hits if str(h.id) != exclude_event_id]
+        hits = hits[:limit]
 
         if not hits:
             return SimilaritySearchResult(status="ok", results=[])

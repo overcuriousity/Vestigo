@@ -26,14 +26,16 @@ export function EmbeddingStatusBanner({ status, timeline, caseId }: Props) {
     );
   }
 
-  // Not embedded at all.
+  // Not embedded at all — normally brief, since ingest starts an embed job
+  // automatically; this only shows while that job is still running or if it
+  // failed.
   if (status === "not_embedded") {
     return (
       <div className="flex items-center gap-3 rounded border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2.5 text-xs">
         <Cpu size={14} className="text-[var(--color-warning)] shrink-0" />
         <p className="flex-1 text-[var(--color-fg-secondary)]">
-          No embeddings found for this timeline. Generate embeddings to enable
-          similarity search.
+          No embeddings found yet for this timeline's sources — they may still
+          be processing after ingest.
         </p>
         <EmbedWizard caseId={caseId} timeline={timeline} />
       </div>

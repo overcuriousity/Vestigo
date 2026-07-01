@@ -630,22 +630,64 @@ def _get_stat_anomaly_service() -> StatisticalAnomalyService:
     return _stat_anomaly_service
 
 
-@router.get("/{case_id}/timelines/{timeline_id}/events/{event_id}/similar")
+async def _resolve_similarity_source_ids(
+    case_id: str, timeline_id: str | None
+) -> list[str]:
+    """Return the source IDs to search: a timeline's sources, or the whole case's.
+
+    Similarity search is not timeline-specific at the storage layer (Qdrant
+    collections are per-case, points tagged by ``source_id``), so scoping to
+    a timeline is an optional narrowing, not a requirement.
+    """
+    if timeline_id is not None:
+        return await _resolve_timeline_source_ids(case_id, timeline_id)
+    store = get_store()
+    sources = await store.list_sources(case_id)
+    return [s.id for s in sources]
+
+
+@router.get("/{case_id}/events/{event_id}/similar")
 async def find_similar_events(
     case_id: str,
-    timeline_id: str,
     event_id: str,
     limit: int = Query(default=10, ge=1, le=100),
+    timeline_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """Return events semantically similar to ``event_id`` using vector search.
 
-    Requires embeddings to have been generated for the timeline's sources.
-    Returns ``status="not_embedded"`` when no vectors exist,
-    ``status="vector_not_found"`` when the specific event has no vector.
+    Searches across the whole case by default; pass ``timeline_id`` to narrow
+    to one timeline's sources. Returns ``status="not_embedded"`` when no
+    vectors exist, ``status="vector_not_found"`` when the specific event has
+    no vector.
     """
-    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
     result = svc.find_similar(case_id, source_ids, event_id, limit=limit)
+    return {
+        "status": result.status,
+        "results": [
+            {"event_id": r.event_id, "score": r.score, "event": r.event}
+            for r in result.results
+        ],
+    }
+
+
+@router.get("/{case_id}/events/semantic-search")
+async def semantic_search_events(
+    case_id: str,
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=10, ge=1, le=100),
+    timeline_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Return events semantically similar to a free-text query.
+
+    Searches across the whole case by default; pass ``timeline_id`` to narrow
+    to one timeline's sources. Returns ``status="not_embedded"`` when no
+    vectors exist for the searched sources.
+    """
+    source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
+    svc = _get_similarity_service()
+    result = svc.find_similar_by_text(case_id, source_ids, q, limit=limit)
     return {
         "status": result.status,
         "results": [

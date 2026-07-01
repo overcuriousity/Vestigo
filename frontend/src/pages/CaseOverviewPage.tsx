@@ -1,11 +1,32 @@
 import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { casesApi } from "@/api/cases";
+import { sourcesApi } from "@/api/sources";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
 import { Spinner } from "@/components/ui/Spinner";
+import { Badge } from "@/components/ui/Badge";
 import { fmtRelative } from "@/lib/time";
-import { FolderOpen } from "lucide-react";
+import { FolderOpen, Cpu } from "lucide-react";
+
+function EmbeddingStatusBadge({ caseId }: { caseId: string }) {
+  const { data: sources } = useQuery({
+    queryKey: ["sources", caseId],
+    queryFn: () => sourcesApi.list(caseId),
+    refetchInterval: 15_000,
+  });
+
+  if (!sources || sources.length === 0) return null;
+  const embedded = sources.filter((s) => s.vector_count > 0).length;
+  const allEmbedded = embedded === sources.length;
+
+  return (
+    <Badge variant={allEmbedded ? "success" : "accent"}>
+      <Cpu size={11} className="mr-1" />
+      {embedded}/{sources.length} sources embedded
+    </Badge>
+  );
+}
 
 export function CaseOverviewPage() {
   const { caseId } = useParams<{ caseId: string }>();
@@ -54,6 +75,9 @@ export function CaseOverviewPage() {
               Created {fmtRelative(case_.created_at)} · ID{" "}
               <span className="font-mono">{case_.id}</span>
             </p>
+          </div>
+          <div className="ml-auto">
+            <EmbeddingStatusBadge caseId={caseId!} />
           </div>
         </div>
 
