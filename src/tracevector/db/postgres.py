@@ -15,7 +15,9 @@ from sqlalchemy import (
     String,
     delete,
     func,
+    inspect,
     select,
+    text,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -273,6 +275,11 @@ class Annotation(Base):
     )
     # Structured math for system annotations (null for human annotations).
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Which detector produced this system annotation (e.g. "value_novelty",
+    # "frequency"); null for human annotations. Scopes pin/clear behavior so a
+    # pinned finding from one detector doesn't suppress a distinct finding
+    # from another detector on the same event.
+    detector: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # True only for a system annotation created via the per-event "Persist"
     # action. Bulk "Tag N as anomaly" re-runs clear and rewrite system
     # annotations wholesale (see delete_system_annotations) — pinned rows are
@@ -298,6 +305,7 @@ class Annotation(Base):
             "origin": self.origin,
             "details": self.details,
             "pinned": self.pinned,
+            "detector": self.detector,
         }
 
 
@@ -314,15 +322,28 @@ class PostgresStore:
         )
 
     async def init_schema(self) -> None:
-        """Create metadata tables if they do not exist.
+        """Create metadata tables if they do not exist, then apply additive migrations.
 
-        Only creates missing tables — does not add columns to a table that
-        already exists. A model field added after a table's first creation
-        (e.g. ``Annotation.pinned``) requires dropping and recreating that
-        table on any database created before the field was added.
+        ``create_all`` only creates missing tables — it never adds columns to
+        a table that already exists, so any model field added after a
+        table's first creation must be migrated explicitly below. Column
+        presence is checked via the dialect-agnostic inspector rather than
+        ``ADD COLUMN IF NOT EXISTS``, since SQLite (used in tests) doesn't
+        support that clause.
         """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            existing_columns = await conn.run_sync(
+                lambda sync_conn: {
+                    col["name"] for col in inspect(sync_conn).get_columns("annotations")
+                }
+            )
+            for column, ddl in (
+                ("pinned", "ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false"),
+                ("detector", "ALTER TABLE annotations ADD COLUMN detector VARCHAR(32)"),
+            ):
+                if column not in existing_columns:
+                    await conn.execute(text(ddl))
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""
@@ -897,6 +918,7 @@ class PostgresStore:
         origin: str = "user",
         details: dict | None = None,
         pinned: bool = False,
+        detector: str | None = None,
     ) -> Annotation:
         """Persist a new annotation and return it."""
         annotation = Annotation(
@@ -910,6 +932,7 @@ class PostgresStore:
             origin=origin,
             details=details,
             pinned=pinned,
+            detector=detector,
         )
         async with self.session_factory() as session:
             session.add(annotation)
@@ -937,6 +960,7 @@ class PostgresStore:
                 origin=row.get("origin", "user"),
                 details=row.get("details"),
                 pinned=row.get("pinned", False),
+                detector=row.get("detector"),
             )
             for row in rows
         ]
@@ -950,6 +974,7 @@ class PostgresStore:
         case_id: str,
         source_ids: list[str],
         annotation_type: str,
+        detector: str | None = None,
     ) -> int:
         """Delete all non-pinned system-origin annotations of a given type.
 
@@ -957,20 +982,24 @@ class PostgresStore:
         does not accumulate duplicate machine annotations. Rows with
         ``pinned=True`` (created via the per-event "Persist" action) are
         excluded, so a manually-confirmed finding survives even if a later
-        re-scan no longer surfaces it. Returns the count of deleted rows.
+        re-scan no longer surfaces it. When ``detector`` is given, only rows
+        from that detector are cleared — findings from a different detector
+        (e.g. ``frequency`` vs ``value_novelty``) on the same sources are left
+        untouched. Returns the count of deleted rows.
         """
         from sqlalchemy import delete
 
+        conditions = [
+            Annotation.case_id == case_id,
+            Annotation.source_id.in_(source_ids),
+            Annotation.annotation_type == annotation_type,
+            Annotation.origin == "system",
+            Annotation.pinned.is_(False),
+        ]
+        if detector is not None:
+            conditions.append(Annotation.detector == detector)
         async with self.session_factory() as session:
-            result = await session.execute(
-                delete(Annotation).where(
-                    Annotation.case_id == case_id,
-                    Annotation.source_id.in_(source_ids),
-                    Annotation.annotation_type == annotation_type,
-                    Annotation.origin == "system",
-                    Annotation.pinned.is_(False),
-                )
-            )
+            result = await session.execute(delete(Annotation).where(*conditions))
             await session.commit()
             return result.rowcount
 
@@ -979,19 +1008,28 @@ class PostgresStore:
         case_id: str,
         source_ids: list[str],
         annotation_type: str,
+        detector: str | None = None,
     ) -> list[str]:
         """Return event_ids with a pinned (manually-persisted) annotation.
 
         Used by the bulk tag endpoint to avoid writing a second, duplicate
-        system annotation for an event that already has a pinned one.
+        system annotation for an event that already has a pinned one. When
+        ``detector`` is given, only pins from that detector count — a pinned
+        ``value_novelty`` finding no longer suppresses a distinct
+        ``frequency`` finding on the same event.
         """
+        conditions = [
+            Annotation.case_id == case_id,
+            Annotation.source_id.in_(source_ids),
+            Annotation.annotation_type == annotation_type,
+            Annotation.origin == "system",
+        ]
+        if detector is not None:
+            conditions.append(Annotation.detector == detector)
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Annotation.event_id).where(
-                    Annotation.case_id == case_id,
-                    Annotation.source_id.in_(source_ids),
-                    Annotation.annotation_type == annotation_type,
-                    Annotation.origin == "system",
+                    *conditions,
                     Annotation.pinned.is_(True),
                 ).distinct()
             )

@@ -129,6 +129,8 @@ export interface Annotation {
   created_at: string;
   /** True only for a system annotation created via the per-event "Persist" action. */
   pinned: boolean;
+  /** Which detector produced this system annotation ("value_novelty" | "frequency"); null for human annotations. */
+  detector: string | null;
 }
 
 export interface Job {

@@ -696,6 +696,8 @@ class StatisticalAnomalyService:
         baseline-window buckets only; the detect window is then scored against
         that baseline (temporal sub-mode).
         """
+        if baseline_end is not None:
+            baseline_end = _ensure_utc(baseline_end)
         self.ch.init_schema()
         db = self.ch.database
         ctr: list[int] = [0]
@@ -761,8 +763,11 @@ class StatisticalAnomalyService:
             if sv:
                 series[sv].append((bucket, int(cnt)))
 
-        baseline_size = sum(sum(c for _, c in pts) for pts in series.values())
         method = "z-score" if baseline_end is None else "temporal-z-score"
+
+        # In temporal mode, "baseline" means the pre-baseline_end window only;
+        # in self-baseline mode the whole series is its own baseline.
+        baseline_size = 0
 
         # Z-score each bucket, collect anomalous windows.
         findings: list[FreqFinding] = []
@@ -775,16 +780,18 @@ class StatisticalAnomalyService:
                 detect_pts = [(b, c) for b, c in pts_aware if b >= baseline_end]
                 if len(bl_pts) < _MIN_FREQUENCY_BUCKETS or not detect_pts:
                     continue
+                baseline_size += sum(c for _, c in bl_pts)
                 counts_bl = np.array([c for _, c in bl_pts], dtype=np.float64)
                 mean_val = float(counts_bl.mean())
-                std_val = float(counts_bl.std())
+                std_val = float(counts_bl.std(ddof=1))
                 score_pts = detect_pts
             else:
                 if len(pts_aware) < _MIN_FREQUENCY_BUCKETS:
                     continue
+                baseline_size += sum(c for _, c in pts_aware)
                 counts = np.array([c for _, c in pts_aware], dtype=np.float64)
                 mean_val = float(counts.mean())
-                std_val = float(counts.std())
+                std_val = float(counts.std(ddof=1))
                 score_pts = pts_aware
 
             if std_val < 1e-9:

@@ -54,6 +54,7 @@ def test_annotation_to_dict_shape():
         "origin",
         "details",
         "pinned",
+        "detector",
     }
     assert d["id"] == "ann_abc123"
     assert d["event_id"] == "evt1"

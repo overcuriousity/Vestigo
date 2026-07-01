@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -930,7 +931,9 @@ async def list_anomaly_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
-    fields: list[NoveltyFieldInfo] = svc.recommend_novelty_fields(case_id, source_ids)
+    fields: list[NoveltyFieldInfo] = await run_in_threadpool(
+        svc.recommend_novelty_fields, case_id, source_ids
+    )
     return {
         "fields": [
             {
@@ -1001,7 +1004,9 @@ async def list_anomalies(
     # Resolve temporal split point.
     effective_baseline_end = baseline_start
     if temporal and effective_baseline_end is None:
-        effective_baseline_end = svc.get_timeline_midpoint(case_id, source_ids)
+        effective_baseline_end = await run_in_threadpool(
+            svc.get_timeline_midpoint, case_id, source_ids
+        )
 
     # Fetch events marked "normal" by the analyst for suppression.
     normal_ids = await store.list_event_ids_by_annotation_type(
@@ -1010,7 +1015,8 @@ async def list_anomalies(
     exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
 
     if detector == "frequency":
-        result = svc.find_frequency_anomalies(
+        result = await run_in_threadpool(
+            svc.find_frequency_anomalies,
             case_id=case_id,
             source_ids=source_ids,
             series_field=series_field,
@@ -1022,7 +1028,8 @@ async def list_anomalies(
         )
     else:
         parsed_fields = _parse_novelty_fields(fields)
-        result = svc.find_value_novelty(
+        result = await run_in_threadpool(
+            svc.find_value_novelty,
             case_id=case_id,
             source_ids=source_ids,
             fields=parsed_fields,
@@ -1103,7 +1110,9 @@ async def tag_anomalies(
     # Resolve temporal split point.
     effective_baseline_end = body.baseline_start
     if body.temporal and effective_baseline_end is None:
-        effective_baseline_end = svc.get_timeline_midpoint(case_id, source_ids)
+        effective_baseline_end = await run_in_threadpool(
+            svc.get_timeline_midpoint, case_id, source_ids
+        )
 
     # Fetch events marked "normal" by the analyst for suppression.
     normal_ids = await store.list_event_ids_by_annotation_type(
@@ -1112,7 +1121,8 @@ async def tag_anomalies(
     exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
 
     if body.detector == "frequency":
-        result = svc.find_frequency_anomalies(
+        result = await run_in_threadpool(
+            svc.find_frequency_anomalies,
             case_id=case_id,
             source_ids=source_ids,
             series_field=body.series_field,
@@ -1124,7 +1134,8 @@ async def tag_anomalies(
         )
     else:
         parsed_fields = _parse_novelty_fields(body.fields)
-        result = svc.find_value_novelty(
+        result = await run_in_threadpool(
+            svc.find_value_novelty,
             case_id=case_id,
             source_ids=source_ids,
             fields=parsed_fields,
@@ -1150,8 +1161,10 @@ async def tag_anomalies(
     # sources. Pinned rows — created via the per-event "Persist" action — are
     # left alone so a manually-confirmed finding survives even if this
     # re-scan no longer surfaces it.
-    await store.delete_system_annotations(case_id, source_ids, "anomaly")
-    pinned_event_ids = set(await store.list_pinned_event_ids(case_id, source_ids, "anomaly"))
+    await store.delete_system_annotations(case_id, source_ids, "anomaly", detector=body.detector)
+    pinned_event_ids = set(
+        await store.list_pinned_event_ids(case_id, source_ids, "anomaly", detector=body.detector)
+    )
 
     # Write one system annotation per finding, skipping events that already
     # have a pinned annotation to avoid a duplicate row for the same event.
@@ -1207,6 +1220,7 @@ async def tag_anomalies(
                 "content": content,
                 "origin": "system",
                 "details": r.details,
+                "detector": result.detector,
             }
         )
 
@@ -1270,5 +1284,6 @@ async def persist_anomaly_finding(
         origin="system",
         details=body.details,
         pinned=True,
+        detector=body.detector,
     )
     return {"annotation": annotation.to_dict()}
