@@ -8,8 +8,11 @@ spinning up a FastAPI TestClient.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 
 from tracevector.api.routers import events
 from tracevector.db.postgres import PostgresStore
@@ -124,3 +127,45 @@ async def test_index_annotations_by_event_groups_by_event_id(patched_store):
     assert {a.id for a in indexed["e1"]} == {"a1", "a2"}
     assert {a.id for a in indexed["e2"]} == {"a3"}
     assert "e3" not in indexed
+
+
+# ---------------------------------------------------------------------------
+# _parse_cursor (keyset pagination query param)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_cursor_returns_none_for_empty_value():
+    assert events._parse_cursor(None, param_name="after") is None
+    assert events._parse_cursor("", param_name="after") is None
+
+
+def test_parse_cursor_splits_timestamp_and_event_id():
+    ts, event_id = events._parse_cursor(
+        "2026-06-25T07:30:01+00:00,evt-1", param_name="after"
+    )
+    assert ts == datetime.fromisoformat("2026-06-25T07:30:01+00:00")
+    assert event_id == "evt-1"
+
+
+def test_parse_cursor_rejects_malformed_value():
+    with pytest.raises(HTTPException) as exc_info:
+        events._parse_cursor("not-a-cursor", param_name="before")
+    assert exc_info.value.status_code == 400
+
+
+def test_parse_cursor_accepts_empty_event_id_as_synthetic_lower_bound():
+    """A jump-to-time target may only have a timestamp (e.g. a Frequency
+    finding's window_start with no representative event) — the trailing
+    comma with nothing after it is a valid synthetic cursor, not malformed.
+    """
+    ts, event_id = events._parse_cursor(
+        "2026-06-25T07:30:01+00:00,", param_name="before"
+    )
+    assert ts == datetime.fromisoformat("2026-06-25T07:30:01+00:00")
+    assert event_id == ""
+
+
+def test_parse_cursor_rejects_bad_timestamp():
+    with pytest.raises(HTTPException) as exc_info:
+        events._parse_cursor("not-a-timestamp,evt-1", param_name="after")
+    assert exc_info.value.status_code == 400

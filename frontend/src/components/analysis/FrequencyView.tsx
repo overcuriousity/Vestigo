@@ -17,6 +17,7 @@ import {
   Info,
   TrendingUp,
   TrendingDown,
+  Clock,
 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { Button } from "@/components/ui/Button";
@@ -34,6 +35,8 @@ interface Props {
   onDrillField?: (field: string, value: string, start: string, end: string) => void;
   /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
   onFindingsChange?: (markers: AnomalyMarker[]) => void;
+  /** Scrolls the main grid to the window's start, clearing filters first, and highlights the window. */
+  onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
 
 const STATIC_SERIES_FIELD_OPTIONS = [
@@ -61,9 +64,10 @@ function fmtTs(iso: string): string {
 interface FreqFindingRowProps {
   finding: FrequencyFinding;
   onDrillField?: (field: string, value: string, start: string, end: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
 
-function FreqFindingRow({ finding, onDrillField }: FreqFindingRowProps) {
+function FreqFindingRow({ finding, onDrillField, onJumpToTime }: FreqFindingRowProps) {
   const isSpike = finding.z_score > 0;
   const severity =
     Math.abs(finding.z_score) >= 5
@@ -147,11 +151,26 @@ function FreqFindingRow({ finding, onDrillField }: FreqFindingRowProps) {
           </span>
         </div>
       </div>
+
+      {onJumpToTime && (
+        <div className="shrink-0 flex items-center opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            title="Jump to this window's start — clears active filters and highlights the window"
+            className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
+            onClick={(e) => {
+              e.stopPropagation();
+              onJumpToTime(finding.window_start, finding.event_id ?? undefined, finding.window_end);
+            }}
+          >
+            <Clock size={12} />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChange }: Props) {
+export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChange, onJumpToTime }: Props) {
   const [seriesField, setSeriesField] = useState("artifact");
   const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
@@ -241,6 +260,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
         sourceId: f.event?.source_id,
         detector: "frequency" as const,
         rawDetails: f.details,
+        windowEnd: f.window_end,
       };
     });
     onFindingsChange(markers);
@@ -344,6 +364,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
               key={`${f.series_value}:${f.window_start}:${i}`}
               finding={f}
               onDrillField={onDrillField}
+              onJumpToTime={onJumpToTime}
             />
           ))}
         </div>

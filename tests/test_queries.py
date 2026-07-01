@@ -275,6 +275,103 @@ def test_event_timestamps_get_explicit_utc_offset(service: EventQueryService) ->
     assert event["ingest_time"] == "2026-06-25T08:00:00+00:00"
 
 
+# ── keyset cursor pagination tests ─────────────────────────────────────────────
+
+
+def _cursor_row(event_id: str, ts: datetime) -> list[Any]:
+    return [
+        event_id, "case-1", "src-1", "file.log", 0, 1, "hash", "hash",
+        "parser", "1.0", ts, "hello", ts, "desc",
+        "artifact", "artifact_long", "display", [], {}, None, None, None,
+    ]
+
+
+def test_after_cursor_uses_lt_predicate_for_default_desc_order(
+    service: EventQueryService,
+) -> None:
+    ts = datetime(2026, 6, 25, 7, 30, 1)
+    service.query(EventQuery(case_id="case-1", after=(ts, "evt-1")))
+    query, params = _last_query(service)
+    assert (
+        "(timestamp, toString(event_id)) < "
+        "({p1:DateTime64(3)}, {p2:String})" in query
+    )
+    assert params["p1"] == "2026-06-25 07:30:01.000"
+    assert params["p2"] == "evt-1"
+    assert "OFFSET" not in query
+
+
+def test_before_cursor_uses_gt_predicate_and_reversed_fetch_direction(
+    service: EventQueryService,
+) -> None:
+    ts = datetime(2026, 6, 25, 7, 30, 1)
+    service.query(EventQuery(case_id="case-1", before=(ts, "evt-1")))
+    query, _ = _last_query(service)
+    assert (
+        "(timestamp, toString(event_id)) > "
+        "({p1:DateTime64(3)}, {p2:String})" in query
+    )
+    assert "ORDER BY timestamp ASC, event_id ASC" in query
+
+
+def test_after_and_before_together_rejected(service: EventQueryService) -> None:
+    ts = datetime(2026, 6, 25, 7, 30, 1)
+    with pytest.raises(ValueError):
+        service.query(EventQuery(case_id="case-1", after=(ts, "a"), before=(ts, "b")))
+
+
+def test_cursor_mode_skips_count_query(service: EventQueryService) -> None:
+    ts = datetime(2026, 6, 25, 7, 30, 1)
+    page = service.query(EventQuery(case_id="case-1", after=(ts, "evt-1")))
+    assert not any(
+        q.strip().startswith("SELECT count()") for q, _ in service.store.client.queries
+    )
+    assert page.total is None
+
+
+def test_after_cursor_has_more_after_when_extra_row_returned() -> None:
+    rows = [_cursor_row(f"evt-{i}", datetime(2026, 6, 25, 7, 30, i)) for i in range(3)]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(
+            case_id="case-1", limit=2, after=(datetime(2026, 6, 25, 7, 29, 0), "evt-0")
+        )
+    )
+    assert len(page.events) == 2
+    assert page.has_more_after is True
+    assert page.has_more_before is False
+    assert page.total is None
+
+
+def test_before_cursor_reverses_rows_back_to_display_order() -> None:
+    rows = [
+        _cursor_row("evt-1", datetime(2026, 6, 25, 7, 30, 1)),
+        _cursor_row("evt-2", datetime(2026, 6, 25, 7, 30, 2)),
+    ]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(
+            case_id="case-1",
+            limit=2,
+            before=(datetime(2026, 6, 25, 7, 30, 5), "evt-5"),
+        )
+    )
+    assert [e["event_id"] for e in page.events] == ["evt-2", "evt-1"]
+
+
+def test_cursor_page_echoes_next_and_prev_cursor() -> None:
+    rows = [
+        _cursor_row("evt-1", datetime(2026, 6, 25, 7, 30, 1)),
+        _cursor_row("evt-2", datetime(2026, 6, 25, 7, 30, 2)),
+    ]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(case_id="case-1", limit=2, after=(datetime(2026, 6, 25, 7, 29, 0), "evt-0"))
+    )
+    assert page.prev_cursor == ("2026-06-25T07:30:01+00:00", "evt-1")
+    assert page.next_cursor == ("2026-06-25T07:30:02+00:00", "evt-2")
+
+
 # ── iter_events tests ──────────────────────────────────────────────────────────
 
 

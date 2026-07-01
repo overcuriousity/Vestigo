@@ -37,6 +37,12 @@ class EventQuery:
     limit: int = 50
     offset: int = 0
     order: Literal["asc", "desc"] = "desc"
+    # Keyset cursors for bidirectional pagination — mutually exclusive with
+    # each other and with `offset`. `after` seeks further in the requested
+    # `order` direction (scroll down); `before` seeks backwards (scroll up).
+    # Both are (timestamp, event_id) tuples matching the table's sort key.
+    after: tuple[datetime, str] | None = None
+    before: tuple[datetime, str] | None = None
 
 
 def _iter_attr_items(attrs: Any) -> Iterator[tuple[str, Any]]:
@@ -57,10 +63,18 @@ def _iter_attr_items(attrs: Any) -> Iterator[tuple[str, Any]]:
 class EventPage:
     """Paginated event query result."""
 
-    total: int
+    # `None` on keyset-cursor pages — the (expensive) COUNT(*) only runs on
+    # the initial, uncursored fetch; later pages rely on `has_more_*` instead.
+    total: int | None
     offset: int
     limit: int
     events: list[dict[str, Any]]
+    has_more_after: bool = False
+    has_more_before: bool = False
+    # (timestamp, event_id) of the first/last row of this page — echoed back
+    # so the caller can request the adjacent page without inspecting rows.
+    next_cursor: tuple[str, str] | None = None
+    prev_cursor: tuple[str, str] | None = None
 
 
 # Columns that exist directly on the events table. Any other field key is
@@ -100,6 +114,17 @@ TOP_LEVEL_DISPLAY_COLUMNS = [
 def _format_clickhouse_datetime(value: datetime) -> str:
     """Format a datetime for ClickHouse SQL."""
     return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_clickhouse_datetime_precise(value: datetime) -> str:
+    """Format a datetime with millisecond precision for keyset cursors.
+
+    Unlike `_format_clickhouse_datetime` (second precision, fine for range
+    boundaries), cursor comparisons must match the `timestamp` column's
+    DateTime64(3) precision exactly, or events sharing a truncated second
+    could be skipped or duplicated across a page boundary.
+    """
+    return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
@@ -209,6 +234,23 @@ class _ParameterizedQueryBuilder:
         """Exclude events that have *value* in their tags array."""
         self.add_param("NOT has(tags, :name)", value)
 
+    def add_cursor(self, op: str, ts: datetime, event_id: str) -> None:
+        """Add a keyset predicate ``(timestamp, event_id) {op} (ts, event_id)``.
+
+        ClickHouse supports native tuple comparison, so ties at equal
+        timestamps are broken by ``event_id`` in a single comparison — exactly
+        matching the table's ``ORDER BY (..., timestamp, event_id)`` sort key,
+        which is what makes this seek efficient (no OR-chain needed).
+        """
+        ts_name = self._param_name()
+        id_name = self._param_name()
+        self.conditions.append(
+            f"(timestamp, toString(event_id)) {op} "
+            f"({{{ts_name}:DateTime64(3)}}, {{{id_name}:String}})"
+        )
+        self.parameters[ts_name] = _format_clickhouse_datetime_precise(ts)
+        self.parameters[id_name] = event_id
+
     def _column_expr(self, key: str) -> str:
         normalized = key.strip().lower()
         if normalized in _TOP_LEVEL_FILTER_COLUMNS:
@@ -273,6 +315,16 @@ class EventQueryService:
         if query.event_ids is not None:
             builder.add_in_list("event_id", query.event_ids)
 
+        if query.after is not None:
+            ts, event_id = query.after
+            op = "<" if query.order == "desc" else ">"
+            builder.add_cursor(op, ts, event_id)
+
+        if query.before is not None:
+            ts, event_id = query.before
+            op = ">" if query.order == "desc" else "<"
+            builder.add_cursor(op, ts, event_id)
+
         for key, value in (query.field_filters or {}).items():
             builder.add_field_filter(key, value)
 
@@ -282,42 +334,97 @@ class EventQueryService:
         return builder.where_clause(), builder.parameters
 
     def query(self, query: EventQuery) -> EventPage:
-        """Execute an :py:class:`EventQuery` and return a paginated result."""
+        """Execute an :py:class:`EventQuery` and return a paginated result.
+
+        Two modes:
+          - **Offset mode** (no `after`/`before` set): the original
+            OFFSET/LIMIT behaviour, with a COUNT(*) for `total`. Used for the
+            very first, unfiltered-by-cursor page.
+          - **Cursor mode** (`after` or `before` set): seeks using the
+            keyset predicate from `_build_where`, fetches `limit + 1` rows to
+            derive `has_more_after`/`has_more_before` cheaply (no COUNT), and
+            — for `before` — queries in the reverse sort direction to find
+            the nearest preceding rows, then reverses them back into the
+            page's natural (`query.order`) order before returning.
+        """
+        if query.after is not None and query.before is not None:
+            raise ValueError("EventQuery cannot set both 'after' and 'before'")
+
         self.store.init_schema()
 
         where, parameters = self._build_where(query)
         database = self.store.database
+        cursor_mode = query.after is not None or query.before is not None
+        display_dir = query.order.upper()
 
-        count_result = self.store.client.query(
-            f"SELECT count() FROM {database}.events WHERE {where}",
-            parameters=parameters,
-        )
-        total = count_result.result_rows[0][0] if count_result.result_rows else 0
+        total: int | None = None
+        if not cursor_mode:
+            count_result = self.store.client.query(
+                f"SELECT count() FROM {database}.events WHERE {where}",
+                parameters=parameters,
+            )
+            total = count_result.result_rows[0][0] if count_result.result_rows else 0
 
-        sort_dir = query.order.upper()
-        event_result = self.store.client.query(
-            f"""
+        # A `before` seek wants the rows nearest the cursor, which means
+        # scanning toward it — the opposite of the page's display order —
+        # then reversing the result back into display order.
+        if query.before is not None:
+            fetch_dir = "ASC" if display_dir == "DESC" else "DESC"
+        else:
+            fetch_dir = display_dir
+
+        fetch_limit = query.limit + 1 if cursor_mode else query.limit
+        sql = f"""
             SELECT {_EVENT_SELECT_COLUMNS}
             FROM {database}.events
             WHERE {where}
-            ORDER BY timestamp {sort_dir}, event_id
-            LIMIT {query.limit}
-            OFFSET {query.offset}
-            """,
-            parameters=parameters,
-        )
+            ORDER BY timestamp {fetch_dir}, event_id {fetch_dir}
+            LIMIT {fetch_limit}
+        """
+        if not cursor_mode:
+            sql += f" OFFSET {query.offset}"
 
+        event_result = self.store.client.query(sql, parameters=parameters)
         columns = event_result.column_names
+        rows = event_result.result_rows
+
+        has_more_after = False
+        has_more_before = False
+        if cursor_mode:
+            has_extra = len(rows) > query.limit
+            rows = rows[: query.limit]
+            if query.before is not None:
+                has_more_before = has_extra
+            else:
+                has_more_after = has_extra
+        elif total is not None:
+            # Offset mode (only used for the very first page): derive
+            # has_more_after from the COUNT already computed above, since
+            # there's no cursor-side limit+1 trick to lean on here.
+            has_more_after = (query.offset + len(rows)) < total
+
         events = [
             _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
-            for row in event_result.result_rows
+            for row in rows
         ]
+        if query.before is not None:
+            events.reverse()
+
+        next_cursor = None
+        prev_cursor = None
+        if events:
+            prev_cursor = (events[0]["timestamp"], str(events[0]["event_id"]))
+            next_cursor = (events[-1]["timestamp"], str(events[-1]["event_id"]))
 
         return EventPage(
             total=total,
             offset=query.offset,
             limit=query.limit,
             events=events,
+            has_more_after=has_more_after,
+            has_more_before=has_more_before,
+            next_cursor=next_cursor,
+            prev_cursor=prev_cursor,
         )
 
     def iter_events(

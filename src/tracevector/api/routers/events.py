@@ -85,6 +85,33 @@ def _parse_json_object(value: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+def _parse_cursor(value: str | None, *, param_name: str) -> tuple[datetime, str] | None:
+    """Parse a `"<iso-ts>,<event_id>"` keyset cursor query param.
+
+    Split from the right since ISO timestamps never contain a comma and
+    event_id (UUID) doesn't either, so a single rsplit is unambiguous. An
+    empty `event_id` is valid — it's a synthetic lower bound meaning "before
+    every event at exactly this timestamp" (empty string sorts before any
+    real event_id string), used when the caller only knows a target time and
+    not a specific anchor event (e.g. a Frequency finding's window start).
+    """
+    if not value:
+        return None
+    ts_str, sep, event_id = value.rpartition(",")
+    if not sep or not ts_str:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {param_name} cursor — expected '<iso-timestamp>,<event_id>'",
+        )
+    try:
+        ts = datetime.fromisoformat(ts_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {param_name} cursor timestamp: {exc}"
+        ) from exc
+    return ts, event_id
+
+
 def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
     """Parse a JSON string into a string-to-list[str] dict for exclusion filters.
 
@@ -188,6 +215,10 @@ async def list_events(
     exclude_tag: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
     end: datetime | None = Query(default=None),  # noqa: B008
+    event_id: str | None = Query(
+        default=None,
+        description="Fetch a single event by its exact event_id, ignoring all other filters.",
+    ),
     filters: str | None = Query(
         default=None,
         description='JSON object of field equality filters, e.g. {"ip_address_city":"Falkenstein"}',
@@ -212,6 +243,22 @@ async def list_events(
             "branch of `annotated` so it also matches live findings."
         ),
     ),
+    after: str | None = Query(
+        default=None,
+        description=(
+            "Keyset cursor '<iso-timestamp>,<event_id>' — fetch the next page "
+            "of events further in the requested `order` direction. Mutually "
+            "exclusive with `before`."
+        ),
+    ),
+    before: str | None = Query(
+        default=None,
+        description=(
+            "Keyset cursor '<iso-timestamp>,<event_id>' — fetch the page of "
+            "events immediately preceding this point (opposite direction of "
+            "`after`). Mutually exclusive with `after`."
+        ),
+    ),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     order: str = Query(default="desc", description="Sort order: asc or desc"),
@@ -220,9 +267,20 @@ async def list_events(
     if order not in ("asc", "desc"):
         order = "desc"
 
+    after_cursor = _parse_cursor(after, param_name="after")
+    before_cursor = _parse_cursor(before, param_name="before")
+    if after_cursor is not None and before_cursor is not None:
+        raise HTTPException(
+            status_code=400, detail="Cannot set both 'after' and 'before' cursors"
+        )
+
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, annotated, annotation_tag_value, live_event_ids
+    event_ids = (
+        [event_id]
+        if event_id
+        else await _resolve_annotated_event_ids(
+            case_id, source_ids, annotated, annotation_tag_value, live_event_ids
+        )
     )
 
     service = _get_query_service()
@@ -243,6 +301,8 @@ async def list_events(
             limit=limit,
             offset=offset,
             order=order,  # type: ignore[arg-type]
+            after=after_cursor,
+            before=before_cursor,
         )
     )
     return {
@@ -250,6 +310,10 @@ async def list_events(
         "offset": page.offset,
         "limit": page.limit,
         "events": page.events,
+        "has_more_after": page.has_more_after,
+        "has_more_before": page.has_more_before,
+        "next_cursor": page.next_cursor,
+        "prev_cursor": page.prev_cursor,
     }
 
 

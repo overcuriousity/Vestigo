@@ -26,6 +26,8 @@ interface Props {
   markers?: AnomalyMarker[];
   /** Timestamp of the row currently scrolled into view in the event grid. */
   currentPositionTs?: string | null;
+  /** Persistent time-window overlay (e.g. a Frequency finding's anomalous window). */
+  highlightRange?: { start: string; end: string } | null;
 }
 
 /** Where a marker's timestamp falls relative to the rendered bars. */
@@ -104,6 +106,7 @@ export function TimelineHistogram({
   onRangeSelect,
   markers,
   currentPositionTs,
+  highlightRange,
 }: Props) {
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ["histogram", caseId, timelineId, filters],
@@ -321,6 +324,28 @@ export function TimelineHistogram({
           </div>
         </div>
       )}
+
+      {/* Persistent window highlight (e.g. a Frequency finding's anomalous
+          window) — visually distinct from the transient brush-drag rectangle,
+          which is cleared on mouseup. */}
+      {highlightRange && (() => {
+        const startPlotted = plotMarker(highlightRange.start, buckets, data.interval_seconds);
+        const endPlotted = plotMarker(highlightRange.end, buckets, data.interval_seconds);
+        if (!startPlotted || !endPlotted) return null;
+        const left = Math.min(startPlotted.pct, endPlotted.pct);
+        const width = Math.max(0.5, Math.abs(endPlotted.pct - startPlotted.pct));
+        return (
+          <div
+            className="pointer-events-none absolute inset-x-0 top-0 h-16 px-2"
+            title="Anomalous window"
+          >
+            <div
+              className="absolute top-0 bottom-0 border-x border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10"
+              style={{ left: `${left}%`, width: `${width}%` }}
+            />
+          </div>
+        );
+      })()}
 
       {/* Current scroll position — where the event grid is currently scrolled to */}
       {currentPositionTs && (() => {

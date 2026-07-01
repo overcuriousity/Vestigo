@@ -12,11 +12,13 @@ import {
   RefreshCw,
   Tag,
   ChevronsRight,
+  Clock,
   Info,
   ChevronDown,
   ChevronUp,
 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
+import { eventsApi } from "@/api/events";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -31,6 +33,8 @@ interface Props {
   onDrillField?: (field: string, value: string) => void;
   /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
   onFindingsChange?: (markers: AnomalyMarker[]) => void;
+  /** Scrolls the main grid to this finding's timestamp, clearing filters first. */
+  onJumpToTime?: (ts: string, eventId?: string) => void;
 }
 
 /** Friendly display label for a field token. */
@@ -64,19 +68,35 @@ function fmtTs(iso: string): string {
 }
 
 interface FindingRowProps {
+  caseId: string;
+  timelineId: string;
   finding: ValueNoveltyFinding;
   onSelectEvent: (event: Event) => void;
   onDrillField?: (field: string, value: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string) => void;
   isFirstSeen: boolean;
 }
 
 function FindingRow({
+  caseId,
+  timelineId,
   finding,
   onSelectEvent,
   onDrillField,
+  onJumpToTime,
   isFirstSeen,
 }: FindingRowProps) {
   const [expanded, setExpanded] = useState(false);
+
+  // The detector's finding only carries a lightweight, partial "event" stub
+  // (missing artifact/tags/attributes/etc.) for bookkeeping — fetch the full
+  // event record before handing it to the Event Detail panel.
+  const openEvent = useMutation({
+    mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id!),
+    onSuccess: (event) => {
+      if (event) onSelectEvent(event);
+    },
+  });
 
   return (
     <div
@@ -91,8 +111,8 @@ function FindingRow({
       <div
         className="flex items-start gap-2 p-2"
         onClick={() => {
-          if (finding.event && onSelectEvent) {
-            onSelectEvent(finding.event as unknown as Event);
+          if (finding.event_id) {
+            openEvent.mutate();
           }
         }}
       >
@@ -147,6 +167,19 @@ function FindingRow({
               <ChevronsRight size={12} />
             </button>
           )}
+          {onJumpToTime && (
+            <button
+              title="Jump to this event's time — clears active filters"
+              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
+              onClick={(e) => {
+                e.stopPropagation();
+                const ts = finding.event?.timestamp ?? finding.first_seen;
+                if (ts) onJumpToTime(ts, finding.event_id ?? undefined);
+              }}
+            >
+              <Clock size={12} />
+            </button>
+          )}
           <button
             title={expanded ? "Collapse" : "Details"}
             className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"
@@ -183,6 +216,7 @@ export function ValueNoveltyView({
   onSelectEvent,
   onDrillField,
   onFindingsChange,
+  onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<"self" | "temporal">("self");
   // null = use backend smart default; string[] = explicit analyst selection.
@@ -347,9 +381,12 @@ export function ValueNoveltyView({
           {findings.map((f, i) => (
             <FindingRow
               key={`${f.field}:${f.value}:${i}`}
+              caseId={caseId}
+              timelineId={timelineId}
               finding={f}
               onSelectEvent={onSelectEvent}
               onDrillField={onDrillField}
+              onJumpToTime={onJumpToTime}
               isFirstSeen={data?.method === "temporal"}
             />
           ))}

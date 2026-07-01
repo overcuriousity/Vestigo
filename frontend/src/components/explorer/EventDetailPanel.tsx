@@ -23,6 +23,8 @@ interface Props {
   onFindSimilar: (event: Event) => void;
   /** Called when the user clicks filter-in or filter-out on a field row. */
   onAddFilter: (fieldKey: string, value: string, include: boolean) => void;
+  /** Scrolls the main grid to this event's position, clearing filters first. */
+  onJumpToTime?: (ts: string, eventId?: string) => void;
   /** Existing annotation-tag labels for autocomplete. */
   tagSuggestions?: string[];
   /** Active, not-yet-tagged analysis findings that apply to this event. */
@@ -228,6 +230,7 @@ export function EventDetailPanel({
   onClose,
   onFindSimilar,
   onAddFilter,
+  onJumpToTime,
   tagSuggestions = [],
   liveFindings = [],
 }: Props) {
@@ -328,6 +331,17 @@ export function EventDetailPanel({
               <AlertTriangle size={11} />
               {anomalyReasons.length} anomal{anomalyReasons.length === 1 ? "y" : "ies"}
             </span>
+          </Tooltip>
+        )}
+        {onJumpToTime && event.timestamp && (
+          <Tooltip content="Locate this event in the timeline — clears active filters">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => onJumpToTime(event.timestamp!, event.event_id)}
+            >
+              <Clock size={14} />
+            </Button>
           </Tooltip>
         )}
         <Tooltip content="Find similar events (vector search)">
@@ -515,7 +529,7 @@ export function EventDetailPanel({
               <span className="font-medium text-[var(--color-anomaly)]">
                 ⚠ {a.annotation_type}:
               </span>{" "}
-              <span className="text-[var(--color-fg-primary)]">{a.content}</span>
+              <span className="break-all text-[var(--color-fg-primary)]">{a.content}</span>
             </div>
           ))}
 
@@ -528,7 +542,7 @@ export function EventDetailPanel({
               className="mb-1 flex items-start gap-1.5 rounded border border-dashed border-[var(--color-anomaly)]/40 px-2.5 py-1.5 text-xs"
             >
               <span className="text-[var(--color-anomaly)]">⚠</span>
-              <span className="flex-1 text-[var(--color-fg-primary)]">
+              <span className="min-w-0 flex-1 break-all text-[var(--color-fg-primary)]">
                 {finding.detail}
                 <span className="ml-1 text-[10px] text-[var(--color-fg-muted)]">(not yet tagged)</span>
               </span>

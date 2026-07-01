@@ -10,7 +10,7 @@
  * Parser tags and user annotation tags both appear as chips under the message.
  * The annotation column shows outlier/tag/comment icons that open edit popovers.
  */
-import { useMemo, useRef, useCallback, useState, useEffect } from "react";
+import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -48,6 +48,10 @@ interface Props {
   expandedId: string | null;
   onExpand: (event: Event | null) => void;
   onLoadMore: () => void;
+  /** Fetches the page immediately preceding the currently-loaded window. */
+  onLoadEarlier: () => void;
+  /** Whether an earlier (older/newer, depending on sort) page is known to exist. */
+  hasPreviousPage: boolean;
   isFetching: boolean;
   visibleColumns: string[];
   sortDir: "asc" | "desc";
@@ -56,6 +60,14 @@ interface Props {
   liveAnomalies?: Map<string, AnomalyMarker[]>;
   /** Called with the timestamp of the topmost visible row whenever scroll position changes. */
   onVisibleTimestampChange?: (ts: string | null) => void;
+  /** Soft visual highlight for a time window (e.g. a Frequency finding's anomalous window). */
+  highlightRange?: { start: string; end: string } | null;
+}
+
+export interface EventGridHandle {
+  /** Scrolls to the row closest to `ts` — prefers an exact `eventId` match when loaded. */
+  scrollToTimestamp: (ts: string, eventId?: string) => void;
+  scrollToIndex: (index: number) => void;
 }
 
 // ── Annotation column ────────────────────────────────────────────────────────
@@ -321,7 +333,7 @@ function AnnotationCell(props: AnnotationCellProps) {
 
 // ── Main grid ────────────────────────────────────────────────────────────────
 
-export function EventGrid({
+export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   events,
   total,
   annotations,
@@ -333,13 +345,16 @@ export function EventGrid({
   expandedId,
   onExpand,
   onLoadMore,
+  onLoadEarlier,
+  hasPreviousPage,
   isFetching,
   visibleColumns,
   sortDir,
   onSortToggle,
   liveAnomalies,
   onVisibleTimestampChange,
-}: Props) {
+  highlightRange,
+}, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
 
   const columns = useMemo<ColumnDef<Event>[]>(() => {
@@ -589,6 +604,33 @@ export function EventGrid({
     reportVisibleTimestamp();
   }, [reportVisibleTimestamp]);
 
+  // Prepending earlier events shifts every existing row's index by the
+  // prepended count — the virtualizer's scrollOffset doesn't auto-adjust,
+  // which would otherwise cause a visible jump. Capture an anchor right
+  // before requesting the earlier page, then correct scrollTop once the new
+  // rows land (row height is fixed, so this is exact, cheap arithmetic).
+  const prependAnchorRef = useRef<{ scrollTop: number; firstEventId: string } | null>(null);
+
+  const handleLoadEarlier = useCallback(() => {
+    const el = parentRef.current;
+    const firstEventId = events[0]?.event_id;
+    if (el && firstEventId) {
+      prependAnchorRef.current = { scrollTop: el.scrollTop, firstEventId };
+    }
+    onLoadEarlier();
+  }, [events, onLoadEarlier]);
+
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    const el = parentRef.current;
+    if (!anchor || !el) return;
+    const newIndex = events.findIndex((e) => e.event_id === anchor.firstEventId);
+    if (newIndex > 0) {
+      el.scrollTop = anchor.scrollTop + newIndex * ROW_HEIGHT;
+    }
+    prependAnchorRef.current = null;
+  }, [events]);
+
   const handleScroll = useCallback(() => {
     const el = parentRef.current;
     if (el && !isFetching) {
@@ -596,9 +638,46 @@ export function EventGrid({
       if (nearBottom && events.length < total) {
         onLoadMore();
       }
+      const nearTop = el.scrollTop < 200;
+      if (nearTop && hasPreviousPage) {
+        handleLoadEarlier();
+      }
     }
     reportVisibleTimestamp();
-  }, [isFetching, events.length, total, onLoadMore, reportVisibleTimestamp]);
+  }, [isFetching, events.length, total, onLoadMore, hasPreviousPage, handleLoadEarlier, reportVisibleTimestamp]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      scrollToIndex: (index: number) => {
+        rowVirtualizer.scrollToIndex(index, { align: "center" });
+      },
+      scrollToTimestamp: (ts: string, eventId?: string) => {
+        if (events.length === 0) return;
+        if (eventId) {
+          const exact = events.findIndex((e) => e.event_id === eventId);
+          if (exact >= 0) {
+            rowVirtualizer.scrollToIndex(exact, { align: "center" });
+            return;
+          }
+        }
+        // Events are sorted by timestamp in `sortDir` order — binary-search
+        // for the first row at or past the target.
+        const targetTime = new Date(ts).getTime();
+        let lo = 0;
+        let hi = events.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          const midTime = new Date(events[mid].timestamp ?? 0).getTime();
+          const pastTarget = sortDir === "desc" ? midTime <= targetTime : midTime >= targetTime;
+          if (pastTarget) hi = mid;
+          else lo = mid + 1;
+        }
+        rowVirtualizer.scrollToIndex(lo, { align: "center" });
+      },
+    }),
+    [events, sortDir, rowVirtualizer],
+  );
 
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">
@@ -639,6 +718,11 @@ export function EventGrid({
             const hasNormal = eventAnns.some(
               (a) => a.annotation_type === "normal" && a.origin === "user",
             );
+            const inHighlightRange =
+              !!highlightRange &&
+              !!event.timestamp &&
+              event.timestamp >= highlightRange.start &&
+              event.timestamp <= highlightRange.end;
 
             return (
               <div
@@ -657,7 +741,9 @@ export function EventGrid({
                     ? "bg-[var(--color-bg-active)] border-[var(--color-accent)]/40"
                     : isSelected
                       ? "bg-[var(--color-accent-dim)]"
-                      : "hover:bg-[var(--color-bg-hover)]",
+                      : inHighlightRange
+                        ? "bg-[var(--color-accent)]/10 hover:bg-[var(--color-bg-hover)]"
+                        : "hover:bg-[var(--color-bg-hover)]",
                   hasAnomaly && !isSelected && !isExpanded &&
                     "border-l-2 border-l-[var(--color-anomaly)]/50",
                   hasNormal && !hasAnomaly && !isSelected && !isExpanded &&
@@ -705,4 +791,4 @@ export function EventGrid({
       </div>
     </div>
   );
-}
+});

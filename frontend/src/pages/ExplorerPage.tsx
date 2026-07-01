@@ -9,9 +9,9 @@
  * All filter state lives in the URL so investigation links are shareable.
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
  */
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
+import { useQuery, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FlaskConical,
   RefreshCw,
@@ -29,7 +29,7 @@ import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
 import { FilterChips } from "@/components/explorer/FilterChips";
-import { EventGrid } from "@/components/explorer/EventGrid";
+import { EventGrid, type EventGridHandle } from "@/components/explorer/EventGrid";
 import { EventDetailPanel } from "@/components/explorer/EventDetailPanel";
 import { BulkActionBar } from "@/components/explorer/BulkActionBar";
 import { ExportDialog } from "@/components/explorer/ExportDialog";
@@ -42,9 +42,16 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { AnomalyMarker, Event, EventFilters, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation } from "@/api/types";
 
 const PAGE_SIZE = 100;
+
+/** Keyset pagination page param — `{}` requests the initial offset-0 page. */
+type EventsPageParam = { after?: string; before?: string };
+
+function cursorParam(cursor: [string, string] | null): string | undefined {
+  return cursor ? `${cursor[0]},${cursor[1]}` : undefined;
+}
 
 /** Discriminated selection state.
  *  "ids"  — explicit per-row selection (IDs of in-memory events).
@@ -200,6 +207,13 @@ export function ExplorerPage() {
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [scrollPositionTs, setScrollPositionTs] = useState<string | null>(null);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
+  const gridRef = useRef<EventGridHandle>(null);
+  // Snapshot of `filters` taken right before a "jump to time" cleared them —
+  // drives the "back to filtered view" breadcrumb. `rangeHighlight` is purely
+  // visual (a Frequency finding's anomalous window), never a URL filter.
+  const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(null);
+  const [rangeHighlight, setRangeHighlight] = useState<{ start: string; end: string } | null>(null);
+  const pendingJumpRef = useRef<{ ts: string; eventId?: string } | null>(null);
   const tlKey = `${caseId}/${timelineId}`;
   const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
@@ -249,6 +263,9 @@ export function ExplorerPage() {
     enabled: !!(caseId && timelineId),
   });
 
+  const queryClient = useQueryClient();
+  const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
+
   const {
     data: eventsData,
     isLoading: eventsLoading,
@@ -257,20 +274,27 @@ export function ExplorerPage() {
     refetch,
     fetchNextPage,
     hasNextPage,
+    fetchPreviousPage,
+    hasPreviousPage,
   } = useInfiniteQuery({
-    queryKey: ["events", caseId, timelineId, effectiveFilters, sortDir],
+    queryKey: eventsQueryKey,
     queryFn: ({ pageParam, signal }) =>
       eventsApi.list(
         caseId!,
         timelineId!,
-        { ...effectiveFilters, limit: PAGE_SIZE, offset: pageParam, order: sortDir },
+        { ...effectiveFilters, limit: PAGE_SIZE, order: sortDir },
         signal,
+        pageParam,
       ),
-    initialPageParam: 0,
-    getNextPageParam: (lastPage, allPages) => {
-      const loaded = allPages.reduce((sum, p) => sum + p.events.length, 0);
-      return loaded < lastPage.total ? loaded : undefined;
-    },
+    initialPageParam: {} as EventsPageParam,
+    getNextPageParam: (lastPage) =>
+      lastPage.has_more_after && lastPage.next_cursor
+        ? { after: cursorParam(lastPage.next_cursor) }
+        : undefined,
+    getPreviousPageParam: (firstPage) =>
+      firstPage.has_more_before && firstPage.prev_cursor
+        ? { before: cursorParam(firstPage.prev_cursor) }
+        : undefined,
     enabled: !!(caseId && timelineId),
     placeholderData: (prev) => prev,
   });
@@ -320,7 +344,9 @@ export function ExplorerPage() {
   }, [anomalyMarkers]);
 
   const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
-  const total = eventsData?.pages[0]?.total ?? 0;
+  // Only the initial, uncursored page carries a real COUNT(*) — later pages
+  // (forward, backward, or a jump-to-time seek) return `total: null`.
+  const total = eventsData?.pages.find((p) => p.total != null)?.total ?? 0;
   const hasVectors =
     (timelineSources?.some((s) => s.vector_count > 0) ?? false);
 
@@ -369,6 +395,10 @@ export function ExplorerPage() {
     if (!isFetching && hasNextPage) fetchNextPage();
   }, [isFetching, hasNextPage, fetchNextPage]);
 
+  const handleLoadEarlier = useCallback(() => {
+    if (!isFetching && hasPreviousPage) fetchPreviousPage();
+  }, [isFetching, hasPreviousPage, fetchPreviousPage]);
+
 const handleFindSimilar = useCallback((event: Event) => {
     setSimilarAnchor(event);
     setAnalysisPanelOpen(true);
@@ -380,6 +410,113 @@ const handleFindSimilar = useCallback((event: Event) => {
     },
     [filters, setFilters],
   );
+
+  /**
+   * Wired to the Analysis panel's "jump to time" buttons and the Event
+   * Detail panel's "locate in timeline" button. The finding's timestamp may
+   * not match the currently active filters at all, so this clears them
+   * outright (guaranteeing the target is visible) rather than trying to
+   * merge — the analyst can restore the prior view via the breadcrumb this
+   * leaves behind. Since the target likely isn't in the already-loaded
+   * window, this also seeds the query cache with a fresh page anchored at
+   * the target, so bidirectional scroll continues correctly from there.
+   *
+   * A plain `before`-cursor seek would exclude the target event itself
+   * (cursors are strict boundaries — that's correct for normal pagination,
+   * where the caller already has the anchor row and wants the *next* batch).
+   * For a seek we need the target row present so it can be scrolled to,
+   * highlighted (via the detail panel's "expanded" row styling), and opened
+   * — so when `eventId` is known, fetch the surrounding pages on both sides
+   * and splice the target event itself (via `getById`) in between.
+   */
+  const handleJumpToTime = useCallback(
+    async (ts: string, eventId?: string, windowEnd?: string) => {
+      if (!caseId || !timelineId) return;
+      setPreJumpFilters((prev) => prev ?? filters);
+      setRangeHighlight(windowEnd ? { start: ts, end: windowEnd } : null);
+      pendingJumpRef.current = { ts, eventId };
+      setFilters({});
+
+      let anchorPage: EventPage;
+      if (eventId) {
+        const halfBefore = Math.floor(PAGE_SIZE / 2);
+        const halfAfter = PAGE_SIZE - halfBefore - 1;
+        const [targetEvent, beforePage, afterPage] = await Promise.all([
+          eventsApi.getById(caseId, timelineId, eventId),
+          eventsApi.list(
+            caseId,
+            timelineId,
+            { limit: halfBefore, order: sortDir },
+            undefined,
+            { before: `${ts},${eventId}` },
+          ),
+          eventsApi.list(
+            caseId,
+            timelineId,
+            { limit: halfAfter, order: sortDir },
+            undefined,
+            { after: `${ts},${eventId}` },
+          ),
+        ]);
+        const combinedEvents = [
+          ...beforePage.events,
+          ...(targetEvent ? [targetEvent] : []),
+          ...afterPage.events,
+        ];
+        const first = combinedEvents[0];
+        const last = combinedEvents[combinedEvents.length - 1];
+        anchorPage = {
+          total: null,
+          offset: 0,
+          limit: PAGE_SIZE,
+          events: combinedEvents,
+          has_more_after: afterPage.has_more_after,
+          has_more_before: beforePage.has_more_before,
+          next_cursor: last ? [last.timestamp ?? "", last.event_id] : null,
+          prev_cursor: first ? [first.timestamp ?? "", first.event_id] : null,
+        };
+      } else {
+        anchorPage = await eventsApi.list(
+          caseId,
+          timelineId,
+          { limit: PAGE_SIZE, order: sortDir },
+          undefined,
+          { before: `${ts},` },
+        );
+      }
+      queryClient.setQueryData(["events", caseId, timelineId, {}, sortDir], {
+        pages: [anchorPage],
+        pageParams: [{} as EventsPageParam],
+      });
+    },
+    [caseId, timelineId, filters, setFilters, sortDir, queryClient],
+  );
+
+  const handleBackToFiltered = useCallback(() => {
+    if (preJumpFilters) setFilters(preJumpFilters);
+    setPreJumpFilters(null);
+    setRangeHighlight(null);
+  }, [preJumpFilters, setFilters]);
+
+  // Once the jump target's anchor page has landed in `events`, scroll the
+  // grid to it, open its detail panel (so the target is unmistakable — the
+  // detail panel's own "expanded" row styling doubles as the highlight),
+  // and clear the pending marker. Findings without a specific event (e.g. a
+  // Frequency window) have nothing to expand — the range highlight already
+  // marks the window instead.
+  useEffect(() => {
+    const pending = pendingJumpRef.current;
+    if (!pending) return;
+    const foundEvent = pending.eventId
+      ? events.find((e) => e.event_id === pending.eventId)
+      : undefined;
+    const ready = pending.eventId ? !!foundEvent : events.length > 0;
+    if (ready) {
+      gridRef.current?.scrollToTimestamp(pending.ts, pending.eventId);
+      if (foundEvent) setExpandedEvent(foundEvent);
+      pendingJumpRef.current = null;
+    }
+  }, [events]);
 
   const hasActiveFilters = Object.values(filters).some((v) =>
     v && (typeof v === "string" ? v.length > 0 : Object.keys(v).length > 0),
@@ -477,7 +614,21 @@ const handleFindSimilar = useCallback((event: Event) => {
             onRangeSelect={handleHistogramRange}
             markers={analysisPanelOpen ? anomalyMarkers : []}
             currentPositionTs={scrollPositionTs}
+            highlightRange={rangeHighlight}
           />
+        )}
+
+        {/* "Jumped to time" breadcrumb — shown after a jump-to-time cleared filters */}
+        {preJumpFilters && (
+          <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
+            <span>Jumped to a point in time — filters cleared.</span>
+            <button
+              className="font-semibold text-[var(--color-accent)] hover:underline"
+              onClick={handleBackToFiltered}
+            >
+              Back to filtered view
+            </button>
+          </div>
         )}
 
         {/* Main area */}
@@ -514,6 +665,7 @@ const handleFindSimilar = useCallback((event: Event) => {
               <div className="flex flex-1 min-h-0 overflow-hidden">
                 {/* Event grid — always present, fills all available width */}
                 <EventGrid
+                  ref={gridRef}
                   events={events}
                   total={total}
                   annotations={annotationMap}
@@ -525,12 +677,15 @@ const handleFindSimilar = useCallback((event: Event) => {
                   expandedId={expandedEvent?.event_id ?? null}
                   onExpand={setExpandedEvent}
                   onLoadMore={handleLoadMore}
+                  onLoadEarlier={handleLoadEarlier}
+                  hasPreviousPage={!!hasPreviousPage}
                   isFetching={isFetching}
                   visibleColumns={visibleColumns}
                   sortDir={sortDir}
                   onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
                   liveAnomalies={liveAnomaliesByEvent}
                   onVisibleTimestampChange={setScrollPositionTs}
+                  highlightRange={rangeHighlight}
                 />
 
                 {/* Detail panel */}
@@ -544,6 +699,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
+                    onJumpToTime={handleJumpToTime}
                     tagSuggestions={tagSuggestions}
                   />
                 )}
@@ -564,6 +720,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                     onDrillField={handleDrillField}
                     onFrequencyDrill={handleFrequencyDrill}
                     onAnomalyMarkers={setAnomalyMarkers}
+                    onJumpToTime={handleJumpToTime}
                   />
                 )}
               </div>

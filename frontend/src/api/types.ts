@@ -87,10 +87,21 @@ export interface Event {
 }
 
 export interface EventPage {
-  total: number;
+  /** Only computed on the initial, uncursored fetch — null on cursor pages. */
+  total: number | null;
   offset: number;
   limit: number;
   events: Event[];
+  has_more_after: boolean;
+  has_more_before: boolean;
+  next_cursor: [string, string] | null;
+  prev_cursor: [string, string] | null;
+}
+
+/** Keyset pagination cursor: "<iso-timestamp>,<event_id>". */
+export interface EventCursor {
+  after?: string;
+  before?: string;
 }
 
 export interface View {
@@ -210,6 +221,8 @@ export interface AnomalyMarker {
   detector: "value_novelty" | "frequency";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
+  /** End of the anomalous window, for frequency findings — enables a range highlight. */
+  windowEnd?: string | null;
 }
 
 export interface TagAnomaliesResponse extends AnomaliesResponse {
