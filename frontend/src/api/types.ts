@@ -327,10 +327,12 @@ export interface EventFilters {
   tag?: string;
   excludeTag?: string;
   /**
-   * Unified tag filter — matches either a user annotation tag or a
+   * Unified tag filter (OR'd) — matches either a user annotation tag or a
    * parser-derived Event.tags value with this exact content.
    */
-  tagValue?: string;
+  tagsInclude?: string[];
+  /** Unified tag values to exclude — an event is dropped if it has any of these. */
+  tagsExclude?: string[];
   start?: string;
   end?: string;
   /** key=value field equality filters */
@@ -389,7 +391,8 @@ export interface ExportRequest {
     source_id?: string;
     tag?: string;
     exclude_tag?: string;
-    tag_value?: string;
+    tags_include?: string;
+    tags_exclude?: string;
     ids?: string;
     start?: string;
     end?: string;

@@ -1098,13 +1098,15 @@ class PostgresStore:
         annotation_type: str,
         origin: str = "user",
         content: str | None = None,
+        content_in: list[str] | None = None,
     ) -> list[str]:
         """Return the event_ids that have at least one annotation of the given type.
 
         Used by the anomaly service to retrieve the analyst-defined normal set,
         and by the events API to filter to tagged/anomaly-flagged events.
         ``content`` optionally narrows to a specific annotation value (e.g. a
-        specific tag label).
+        specific tag label); ``content_in`` narrows to any of several values
+        (OR semantics) — the two are mutually exclusive.
         """
         from sqlalchemy import select
 
@@ -1117,6 +1119,8 @@ class PostgresStore:
             ]
             if content is not None:
                 conditions.append(Annotation.content == content)
+            if content_in is not None:
+                conditions.append(Annotation.content.in_(content_in))
             result = await session.execute(
                 select(Annotation.event_id).where(*conditions).distinct()
             )

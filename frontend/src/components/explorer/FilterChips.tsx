@@ -52,13 +52,22 @@ export function FilterChips({ filters, onRemove }: Props) {
       onRemove: () => onRemove("tag"),
       variant: "include",
     });
-  if (filters.tagValue)
+  for (const t of filters.tagsInclude ?? []) {
     chips.push({
-      label: "tags",
-      value: filters.tagValue,
-      onRemove: () => onRemove("tagValue"),
+      label: "tag",
+      value: t,
+      onRemove: () => onRemove("tagsInclude", undefined, t),
       variant: "include",
     });
+  }
+  for (const t of filters.tagsExclude ?? []) {
+    chips.push({
+      label: "!tag",
+      value: t,
+      onRemove: () => onRemove("tagsExclude", undefined, t),
+      variant: "exclude",
+    });
+  }
   for (const t of filters.annotated ?? []) {
     chips.push({
       label: "flagged",

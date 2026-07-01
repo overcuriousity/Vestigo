@@ -14,7 +14,12 @@ export function filtersToParams(filters: EventFilters): URLSearchParams {
   if (filters.sourceId) p.set("sourceId", filters.sourceId);
   if (filters.tag) p.set("tag", filters.tag);
   if (filters.excludeTag) p.set("excludeTag", filters.excludeTag);
-  if (filters.tagValue) p.set("tagValue", filters.tagValue);
+  if (filters.tagsInclude && filters.tagsInclude.length > 0) {
+    p.set("tagsInclude", filters.tagsInclude.join(","));
+  }
+  if (filters.tagsExclude && filters.tagsExclude.length > 0) {
+    p.set("tagsExclude", filters.tagsExclude.join(","));
+  }
   if (filters.start) p.set("start", filters.start);
   if (filters.end) p.set("end", filters.end);
   if (filters.filters && Object.keys(filters.filters).length > 0) {
@@ -40,7 +45,8 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   const sourceId = params.get("sourceId");
   const tag = params.get("tag");
   const excludeTag = params.get("excludeTag");
-  const tagValue = params.get("tagValue");
+  const tagsInclude = params.get("tagsInclude");
+  const tagsExclude = params.get("tagsExclude");
   const start = params.get("start");
   const end = params.get("end");
   const rawFilters = params.get("filters");
@@ -56,7 +62,12 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   if (sourceId) filters.sourceId = sourceId;
   if (tag) filters.tag = tag;
   if (excludeTag) filters.excludeTag = excludeTag;
-  if (tagValue) filters.tagValue = tagValue;
+  if (tagsInclude) {
+    filters.tagsInclude = tagsInclude.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  if (tagsExclude) {
+    filters.tagsExclude = tagsExclude.split(",").map((t) => t.trim()).filter(Boolean);
+  }
   if (start) filters.start = start;
   if (end) filters.end = end;
   if (rawFilters) {
@@ -94,7 +105,8 @@ export function filtersToViewPayload(
     sourceId: filters.sourceId ?? null,
     tag: filters.tag ?? null,
     excludeTag: filters.excludeTag ?? null,
-    tagValue: filters.tagValue ?? null,
+    tagsInclude: filters.tagsInclude ?? [],
+    tagsExclude: filters.tagsExclude ?? [],
     start: filters.start ?? null,
     end: filters.end ?? null,
     filters: filters.filters ?? {},
@@ -122,8 +134,16 @@ export function viewPayloadToFilters(
   if (typeof payload.tag === "string" && payload.tag) f.tag = payload.tag;
   if (typeof payload.excludeTag === "string" && payload.excludeTag)
     f.excludeTag = payload.excludeTag;
-  if (typeof payload.tagValue === "string" && payload.tagValue)
-    f.tagValue = payload.tagValue;
+  if (Array.isArray(payload.tagsInclude) && payload.tagsInclude.length > 0) {
+    f.tagsInclude = (payload.tagsInclude as unknown[]).filter(
+      (t): t is string => typeof t === "string" && t.length > 0,
+    );
+  }
+  if (Array.isArray(payload.tagsExclude) && payload.tagsExclude.length > 0) {
+    f.tagsExclude = (payload.tagsExclude as unknown[]).filter(
+      (t): t is string => typeof t === "string" && t.length > 0,
+    );
+  }
   if (typeof payload.start === "string" && payload.start) f.start = payload.start;
   if (typeof payload.end === "string" && payload.end) f.end = payload.end;
   if (payload.filters && typeof payload.filters === "object") {

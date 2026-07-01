@@ -44,12 +44,14 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
 
   it("round-trips the merged tag filter and multi-select artifacts", () => {
     const f: EventFilters = {
-      tagValue: "exfil",
+      tagsInclude: ["exfil", "malware"],
+      tagsExclude: ["benign"],
       artifacts: ["WinEvtx", "Prefetch"],
     };
     const p = filtersToParams(f);
     const out = paramsToFilters(p);
-    expect(out.tagValue).toBe("exfil");
+    expect(out.tagsInclude).toEqual(["exfil", "malware"]);
+    expect(out.tagsExclude).toEqual(["benign"]);
     expect(out.artifacts).toEqual(["WinEvtx", "Prefetch"]);
   });
 

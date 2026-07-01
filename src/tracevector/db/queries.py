@@ -35,6 +35,9 @@ class EventQuery:
     # Optional event_id allowlist (e.g. resolved from an annotation filter).
     # None means "no restriction"; an empty list matches zero events.
     event_ids: list[str] | None = None
+    # Optional event_id denylist (e.g. resolved from an excluded tag filter).
+    # None means "no restriction"; entries here are subtracted from the result.
+    exclude_event_ids: list[str] | None = None
     limit: int = 50
     offset: int = 0
     order: Literal["asc", "desc"] = "desc"
@@ -216,6 +219,12 @@ class _ParameterizedQueryBuilder:
         self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
         self.parameters[name] = values
 
+    def add_not_in_list(self, column: str, values: list[str]) -> None:
+        """Add a negated membership condition — the inverse of :py:meth:`add_in_list`."""
+        name = self._param_name()
+        self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
+        self.parameters[name] = values
+
     def add_field_filter(self, key: str, value: str) -> None:
         """Add an equality filter on a top-level column or attribute."""
         column = self._column_expr(key)
@@ -345,6 +354,9 @@ class EventQueryService:
 
         if query.event_ids is not None:
             builder.add_in_list("event_id", query.event_ids)
+
+        if query.exclude_event_ids:
+            builder.add_not_in_list("event_id", query.exclude_event_ids)
 
         if query.after is not None:
             ts, event_id = query.after
@@ -584,19 +596,19 @@ class EventQueryService:
         )
         return sorted(result.result_rows[0][0]) if result.result_rows else []
 
-    def list_event_ids_by_parser_tag(
-        self, case_id: str, source_ids: list[str], tag_value: str
+    def list_event_ids_by_parser_tags(
+        self, case_id: str, source_ids: list[str], tag_values: list[str]
     ) -> list[str]:
-        """Return event_ids whose parser-derived ``tags`` array contains *tag_value*."""
+        """Return event_ids whose parser-derived ``tags`` array contains any of *tag_values*."""
         self.store.init_schema()
         database = self.store.database
-        params: dict[str, Any] = {"p0": case_id, "src": source_ids, "tag": tag_value}
+        params: dict[str, Any] = {"p0": case_id, "src": source_ids, "tags": tag_values}
         result = self.store.client.query(
             f"""
             SELECT toString(event_id)
             FROM {database}.events
             WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
-                AND has(tags, {{tag:String}})
+                AND hasAny(tags, {{tags:Array(String)}})
             """,
             parameters=params,
         )

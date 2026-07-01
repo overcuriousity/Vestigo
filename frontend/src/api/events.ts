@@ -16,7 +16,6 @@ export const eventsApi = {
         source_id: filters.sourceId,
         tag: filters.tag,
         exclude_tag: filters.excludeTag,
-        tag_value: filters.tagValue,
         start: filters.start,
         end: filters.end,
         limit: filters.limit ?? 100,
@@ -27,6 +26,12 @@ export const eventsApi = {
       };
     if (filters.artifacts && filters.artifacts.length > 0) {
       params.artifacts = filters.artifacts.join(",");
+    }
+    if (filters.tagsInclude && filters.tagsInclude.length > 0) {
+      params.tags_include = filters.tagsInclude.join(",");
+    }
+    if (filters.tagsExclude && filters.tagsExclude.length > 0) {
+      params.tags_exclude = filters.tagsExclude.join(",");
     }
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);
@@ -91,13 +96,18 @@ export const eventsApi = {
       source_id: filters.sourceId,
       tag: filters.tag,
       exclude_tag: filters.excludeTag,
-      tag_value: filters.tagValue,
       start: filters.start,
       end: filters.end,
       buckets,
     };
     if (filters.artifacts && filters.artifacts.length > 0) {
       params.artifacts = filters.artifacts.join(",");
+    }
+    if (filters.tagsInclude && filters.tagsInclude.length > 0) {
+      params.tags_include = filters.tagsInclude.join(",");
+    }
+    if (filters.tagsExclude && filters.tagsExclude.length > 0) {
+      params.tags_exclude = filters.tagsExclude.join(",");
     }
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);

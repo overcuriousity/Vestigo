@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
+import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import type { EventFilters, View } from "@/api/types";
 import { fmtRelative } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
@@ -45,7 +46,6 @@ export function FilterRail({
   searchPending,
 }: Props) {
   const [searchInput, setSearchInput] = useState(filters.q ?? "");
-  const [tagValueInput, setTagValueInput] = useState("");
   const [artifactInput, setArtifactInput] = useState("");
   const [fieldKey, setFieldKey] = useState("");
   const [fieldVal, setFieldVal] = useState("");
@@ -93,13 +93,13 @@ export function FilterRail({
     onChange(f);
   };
 
-  const setTagValue = (value: string) => {
-    const v = value.trim();
+  const setTagSelection = (include: string[], exclude: string[]) => {
     const f = { ...filters };
-    if (v) f.tagValue = v;
-    else delete f.tagValue;
+    if (include.length > 0) f.tagsInclude = include;
+    else delete f.tagsInclude;
+    if (exclude.length > 0) f.tagsExclude = exclude;
+    else delete f.tagsExclude;
     onChange(f);
-    setTagValueInput("");
   };
 
   const annotated = filters.annotated ?? [];
@@ -261,24 +261,18 @@ export function FilterRail({
           <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
             <Tag size={11} /> Tags
           </label>
-          {filters.tagValue ? (
-            <span className="inline-flex items-center gap-1 rounded border border-[var(--color-info)]/30 bg-[var(--color-info-dim)] px-2 py-0.5 text-xs text-[var(--color-info)]">
-              {filters.tagValue}
-              <button onClick={() => setTagValue("")} className="opacity-60 hover:opacity-100">
-                <X size={10} />
-              </button>
-            </span>
-          ) : (
-            <TagInput
-              value={tagValueInput}
-              onChange={setTagValueInput}
-              onSubmit={setTagValue}
-              onCancel={() => setTagValueInput("")}
-              suggestions={mergedTagSuggestions}
-              placeholder="tag value…"
-              className="text-xs"
-            />
-          )}
+          <TagFacetPanel
+            tags={Array.from(
+              new Set([
+                ...mergedTagSuggestions,
+                ...(filters.tagsInclude ?? []),
+                ...(filters.tagsExclude ?? []),
+              ]),
+            ).sort()}
+            include={filters.tagsInclude ?? []}
+            exclude={filters.tagsExclude ?? []}
+            onChange={setTagSelection}
+          />
         </div>
 
         {/* Artifact — multi-select autocomplete */}

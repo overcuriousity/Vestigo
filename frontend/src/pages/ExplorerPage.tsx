@@ -108,6 +108,18 @@ export function ExplorerPage() {
           : [];
         if (remaining.length > 0) f.artifacts = remaining;
         else delete f.artifacts;
+      } else if (key === "tagsInclude") {
+        const remaining = value !== undefined
+          ? (f.tagsInclude ?? []).filter((t) => t !== value)
+          : [];
+        if (remaining.length > 0) f.tagsInclude = remaining;
+        else delete f.tagsInclude;
+      } else if (key === "tagsExclude") {
+        const remaining = value !== undefined
+          ? (f.tagsExclude ?? []).filter((t) => t !== value)
+          : [];
+        if (remaining.length > 0) f.tagsExclude = remaining;
+        else delete f.tagsExclude;
       } else if (key === "annotated") {
         const remaining = value !== undefined
           ? (f.annotated ?? []).filter((t) => t !== value)
