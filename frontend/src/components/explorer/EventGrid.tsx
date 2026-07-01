@@ -680,7 +680,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     const el = parentRef.current;
     if (el && !isFetching) {
       const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-      if (nearBottom && events.length < total) {
+      if (nearBottom) {
         onLoadMore();
       }
       const nearTop = el.scrollTop < 200;
@@ -689,7 +689,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       }
     }
     reportVisibleTimestamp();
-  }, [isFetching, events.length, total, onLoadMore, hasPreviousPage, handleLoadEarlier, reportVisibleTimestamp]);
+  }, [isFetching, onLoadMore, hasPreviousPage, handleLoadEarlier, reportVisibleTimestamp]);
 
   useImperativeHandle(
     ref,
@@ -772,11 +772,19 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             const hasNormal = eventAnns.some(
               (a) => a.annotation_type === "normal" && a.origin === "user",
             );
-            const inHighlightRange =
-              !!highlightRange &&
-              !!event.timestamp &&
-              event.timestamp >= highlightRange.start &&
-              event.timestamp <= highlightRange.end;
+            const inHighlightRange = (() => {
+              if (!highlightRange || !event.timestamp) return false;
+              const t = new Date(event.timestamp).getTime();
+              const start = new Date(highlightRange.start).getTime();
+              const end = new Date(highlightRange.end).getTime();
+              return (
+                Number.isFinite(t) &&
+                Number.isFinite(start) &&
+                Number.isFinite(end) &&
+                t >= start &&
+                t <= end
+              );
+            })();
 
             return (
               <div
