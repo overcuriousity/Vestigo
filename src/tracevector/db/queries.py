@@ -102,6 +102,26 @@ def _format_clickhouse_datetime(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
+    """Attach an explicit UTC offset to an event row's timestamp columns.
+
+    The `events` table's `timestamp`/`ingest_time` columns have no explicit
+    timezone component, so clickhouse-connect returns naive `datetime`
+    objects for them. Left as-is, FastAPI's JSON encoder calls `.isoformat()`
+    on the naive value, which omits the timezone offset — and a bare
+    "YYYY-MM-DDTHH:MM:SS" string is ambiguous to JS's `Date` parser (browsers
+    treat it as local time), silently shifting every event's displayed and
+    compared timestamp by the browser's UTC offset.
+    """
+    for key in ("timestamp", "ingest_time"):
+        value = row.get(key)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            row[key] = value.isoformat()
+    return row
+
+
 # Columns selected in every event query (shared between paginated query and export).
 _EVENT_SELECT_COLUMNS = """
     event_id,
@@ -155,13 +175,19 @@ class _ParameterizedQueryBuilder:
     def add_in_list(self, column: str, values: list[str]) -> None:
         """Add a membership condition for a list of string values.
 
-        Uses ``has({arr:Array(String)}, column)`` rather than
+        Uses ``has({arr:Array(String)}, toString(column))`` rather than
         ``column IN ({p0}, {p1}, ...)`` because ClickHouse 24.x requires the
         second argument of ``IN`` to be a constant or table expression — a list
         of individual parameterized strings does not qualify.
+
+        The column is wrapped in ``toString()`` because this is also used for
+        ``event_id``, a native ``UUID`` column — ``has()`` requires a common
+        type between the array and the column, and there is no implicit
+        common type between ``Array(String)`` and ``UUID`` (this fails with
+        ClickHouse error 386 NO_COMMON_TYPE), even when the array is empty.
         """
         name = self._param_name()
-        self.conditions.append(f"has({{{name}:Array(String)}}, {column})")
+        self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
         self.parameters[name] = values
 
     def add_field_filter(self, key: str, value: str) -> None:
@@ -282,7 +308,10 @@ class EventQueryService:
         )
 
         columns = event_result.column_names
-        events = [dict(zip(columns, row, strict=False)) for row in event_result.result_rows]
+        events = [
+            _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
+            for row in event_result.result_rows
+        ]
 
         return EventPage(
             total=total,
@@ -322,7 +351,7 @@ class EventQueryService:
             columns = result.column_names
             rows = result.result_rows
             for row in rows:
-                yield dict(zip(columns, row, strict=False))
+                yield _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
             if len(rows) < batch_size:
                 break
             offset += batch_size

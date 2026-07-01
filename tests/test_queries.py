@@ -22,8 +22,9 @@ class FakeQueryResult:
 class FakeClickHouseClient:
     """Records queries and parameters, returns canned results."""
 
-    def __init__(self) -> None:
+    def __init__(self, event_rows: list[list[Any]] | None = None) -> None:
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
+        self.event_rows = event_rows or []
         self.event_columns = [
             "event_id",
             "case_id",
@@ -59,7 +60,7 @@ class FakeClickHouseClient:
         if query.strip().startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
         return FakeQueryResult(
-            result_rows=[],
+            result_rows=self.event_rows,
             column_names=self.event_columns,
         )
 
@@ -67,9 +68,9 @@ class FakeClickHouseClient:
 class FakeClickHouseStore:
     """Minimal ClickHouseStore stand-in."""
 
-    def __init__(self) -> None:
+    def __init__(self, event_rows: list[list[Any]] | None = None) -> None:
         self.database = "tracevector"
-        self.client = FakeClickHouseClient()
+        self.client = FakeClickHouseClient(event_rows)
         self.schema_initialized = False
 
     def init_schema(self) -> None:
@@ -103,11 +104,15 @@ def test_basic_query_parameterizes_case_id(service: EventQueryService) -> None:
 
 
 def test_source_ids_filter_is_parameterized(service: EventQueryService) -> None:
+    """Multiple source_ids use has(Array(String), toString(col)) — not IN(...) —
+    because ClickHouse 24.x requires the second IN argument to be a constant
+    or table expression, and source_id/event_id may be non-String columns
+    (event_id is UUID), so the column is cast via toString() for a common type.
+    """
     service.query(EventQuery(case_id="case-1", source_ids=["s1", "s2"]))
     query, params = _last_query(service)
-    assert "source_id IN ({p1:String}, {p2:String})" in query
-    assert params.get("p1") == "s1"
-    assert params.get("p2") == "s2"
+    assert "has({p1:Array(String)}, toString(source_id))" in query
+    assert params.get("p1") == ["s1", "s2"]
 
 
 def test_single_source_id_filter_is_parameterized(service: EventQueryService) -> None:
@@ -174,10 +179,12 @@ def test_unknown_field_filter_uses_attributes_map(
 
 
 def test_field_exclusion_uses_not_equals(service: EventQueryService) -> None:
+    """A single exclusion value uses != — field_exclusions values are lists
+    (multiple excluded values per field use NOT IN {Array(String)} instead)."""
     service.query(
         EventQuery(
             case_id="case-1",
-            field_exclusions={"display_name": "auth.log"},
+            field_exclusions={"display_name": ["auth.log"]},
         )
     )
     query, params = _last_query(service)
@@ -205,18 +212,67 @@ def test_combined_query_builds_single_where_clause(
             q="token",
             artifact="auth",
             field_filters={"ip_address_city": "Falkenstein"},
-            field_exclusions={"status_code": "200"},
+            field_exclusions={"status_code": ["200"]},
         )
     )
     count_query, count_params = _find_query(service, "SELECT count()")
     assert "case_id = {p0:String}" in count_query
-    assert "source_id IN ({p1:String})" in count_query
+    assert "has({p1:Array(String)}, toString(source_id))" in count_query
     assert "message ILIKE {p2:String}" in count_query
     assert "artifact = {p3:String}" in count_query
     assert "attributes[{p4:String}] = {p5:String}" in count_query
     assert "attributes[{p6:String}] != {p7:String}" in count_query
     assert count_params is not None
     assert set(count_params.keys()) == {f"p{i}" for i in range(8)}
+
+
+def test_event_ids_filter_uses_tostring_for_uuid_column(
+    service: EventQueryService,
+) -> None:
+    """event_id is a native ClickHouse UUID column — has(Array(String), event_id)
+    has no common type (ClickHouse error 386 NO_COMMON_TYPE) and fails at query
+    time regardless of whether the list is empty or populated. The column must
+    be cast via toString() for has() to compare it against a String array.
+    """
+    service.query(EventQuery(case_id="case-1", event_ids=["e1", "e2"]))
+    query, params = _last_query(service)
+    assert "has({p1:Array(String)}, toString(event_id))" in query
+    assert params.get("p1") == ["e1", "e2"]
+
+
+def test_empty_event_ids_filter_matches_nothing_not_stale_syntax(
+    service: EventQueryService,
+) -> None:
+    """An empty (but non-None) event_ids list means 'match zero events' (e.g. a
+    tag/anomaly filter that currently has no matches) — it must still produce
+    valid, type-compatible SQL rather than erroring or being silently ignored.
+    """
+    service.query(EventQuery(case_id="case-1", event_ids=[]))
+    query, params = _last_query(service)
+    assert "has({p1:Array(String)}, toString(event_id))" in query
+    assert params.get("p1") == []
+
+
+def test_event_timestamps_get_explicit_utc_offset(service: EventQueryService) -> None:
+    """timestamp/ingest_time come back from clickhouse-connect as naive
+    datetimes (the columns have no explicit timezone component). Serializing
+    a naive datetime omits the UTC offset, which JS's Date parser then treats
+    as local time — silently shifting every displayed/compared timestamp by
+    the browser's UTC offset. Both fields must carry an explicit '+00:00'.
+    """
+    naive_ts = datetime(2026, 6, 25, 7, 30, 1)
+    naive_ingest = datetime(2026, 6, 25, 8, 0, 0)
+    row = [
+        "evt-1", "case-1", "src-1", "file.log", 0, 1, "hash", "hash",
+        "parser", "1.0", naive_ingest, "hello", naive_ts, "desc",
+        "artifact", "artifact_long", "display", [], {}, None, None, None,
+    ]
+    seeded = EventQueryService(store=FakeClickHouseStore(event_rows=[row]))
+    page = seeded.query(EventQuery(case_id="case-1"))
+    assert len(page.events) == 1
+    event = page.events[0]
+    assert event["timestamp"] == "2026-06-25T07:30:01+00:00"
+    assert event["ingest_time"] == "2026-06-25T08:00:00+00:00"
 
 
 # ── iter_events tests ──────────────────────────────────────────────────────────

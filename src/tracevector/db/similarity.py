@@ -10,6 +10,7 @@ requiring embeddings.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 import numpy as np
@@ -73,12 +74,7 @@ def _l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
 
 def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
     """Convert a Qdrant point payload into a minimal EventRecord-compatible dict."""
-    ts = payload.get("timestamp")
-    if ts is not None and not isinstance(ts, str):
-        try:
-            ts = ts.isoformat()
-        except AttributeError:
-            ts = str(ts)
+    ts = _to_utc_iso(payload.get("timestamp"))
     return {
         "event_id": payload.get("event_id", ""),
         "case_id": payload.get("case_id", ""),
@@ -105,20 +101,29 @@ def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _to_utc_iso(value: Any) -> Any:
+    """Attach UTC to a naive datetime before serializing.
+
+    `timestamp`/`ingest_time` have no explicit timezone component, so
+    clickhouse-connect returns naive `datetime` objects. A bare
+    "YYYY-MM-DDTHH:MM:SS" string (no offset) is ambiguous to JS's `Date`
+    parser, which treats it as local time and silently shifts the
+    displayed/compared timestamp by the browser's UTC offset.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    try:
+        if getattr(value, "tzinfo", None) is None:
+            value = value.replace(tzinfo=UTC)
+        return value.isoformat()
+    except AttributeError:
+        return str(value)
+
+
 def _row_to_event(row: dict[str, Any]) -> dict[str, Any]:
     """Serialise a ClickHouse row to an EventRecord-compatible dict."""
-    ts = row.get("timestamp")
-    if ts is not None and not isinstance(ts, str):
-        try:
-            ts = ts.isoformat()
-        except AttributeError:
-            ts = str(ts)
-    ingest = row.get("ingest_time")
-    if ingest is not None and not isinstance(ingest, str):
-        try:
-            ingest = ingest.isoformat()
-        except AttributeError:
-            ingest = str(ingest)
+    ts = _to_utc_iso(row.get("timestamp"))
+    ingest = _to_utc_iso(row.get("ingest_time"))
     return {
         "event_id": str(row.get("event_id", "")),
         "case_id": row.get("case_id", ""),

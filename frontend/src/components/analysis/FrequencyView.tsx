@@ -21,7 +21,7 @@ import {
 import { anomaliesApi } from "@/api/anomalies";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
-import type { FrequencyFinding } from "@/api/types";
+import type { AnomalyMarker, FrequencyFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
 
 interface Props {
@@ -32,8 +32,8 @@ interface Props {
    * window's time range and filters to series_field=series_value.
    */
   onDrillField?: (field: string, value: string, start: string, end: string) => void;
-  /** Called whenever the finding set changes — feeds the histogram overlay. */
-  onFindingsChange?: (markers: { ts: string; label: string }[]) => void;
+  /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
+  onFindingsChange?: (markers: AnomalyMarker[]) => void;
 }
 
 const STATIC_SERIES_FIELD_OPTIONS = [
@@ -153,8 +153,14 @@ function FreqFindingRow({ finding, onDrillField }: FreqFindingRowProps) {
 
 export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChange }: Props) {
   const [seriesField, setSeriesField] = useState("artifact");
-  const [zThreshold, _setZThreshold] = useState(2.5);
+  const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
+
+  // Only send a well-formed positive number; otherwise omit the param and let
+  // the backend use its own default (also reflected back in `data.z_threshold`).
+  const parsedZThreshold = Number(zThresholdInput);
+  const zThresholdParam =
+    Number.isFinite(parsedZThreshold) && parsedZThreshold > 0 ? parsedZThreshold : undefined;
 
   // Fetch dynamic attribute fields to extend the GROUP BY dropdown.
   const { data: fieldsData } = useQuery({
@@ -175,11 +181,12 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies-frequency", caseId, timelineId, seriesField],
+    queryKey: ["anomalies-frequency", caseId, timelineId, seriesField, zThresholdParam],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
         series_field: seriesField,
+        z_threshold: zThresholdParam,
         limit: 30,
       }),
     staleTime: 60_000,
@@ -190,6 +197,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
       anomaliesApi.tag(caseId, timelineId, {
         detector: "frequency",
         series_field: seriesField,
+        z_threshold: zThresholdParam,
         limit: 30,
       }),
     onSuccess: () => {
@@ -209,10 +217,32 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
 
   useEffect(() => {
     if (!onFindingsChange) return;
-    const markers = findings.map((f) => ({
-      ts: f.window_start,
-      label: `${f.series_field}=${f.series_value} spike`,
-    }));
+    const markers: AnomalyMarker[] = findings.map((f) => {
+      const label = `${f.series_field}=${f.series_value} spike`;
+      const direction = f.z_score > 0 ? "spike" : "drop";
+      // In self-baseline (non-temporal) z-score mode, "expected" comes from
+      // this series' own overall mean/std, which includes the flagged window
+      // itself — a real caveat worth stating explicitly rather than implying
+      // an independent baseline, which is only true in temporal mode.
+      const baselineClause =
+        data?.method === "temporal-z-score"
+          ? "expected from the pre-baseline event-count distribution"
+          : "expected from this series' own overall event-count distribution, which includes this window";
+      const detail =
+        `Frequency ${direction}: ${f.series_field}=${f.series_value} — ` +
+        `${f.observed} events observed vs ${f.expected.toFixed(1)} ${baselineClause} ` +
+        `(z=${f.z_score > 0 ? "+" : ""}${f.z_score.toFixed(2)}) between ` +
+        `${fmtTs(f.window_start)}–${fmtTs(f.window_end)}`;
+      return {
+        ts: f.window_start,
+        label,
+        detail,
+        eventId: f.event_id,
+        sourceId: f.event?.source_id,
+        detector: "frequency" as const,
+        rawDetails: f.details,
+      };
+    });
     onFindingsChange(markers);
     return () => onFindingsChange([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -251,6 +281,18 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
             </optgroup>
           )}
         </select>
+        <span className="flex items-center gap-1 text-[10px] text-[var(--color-fg-muted)] shrink-0">
+          z ≥
+          <input
+            type="number"
+            min="0.1"
+            step="0.1"
+            value={zThresholdInput}
+            onChange={(e) => setZThresholdInput(e.target.value)}
+            title="|z| cutoff — windows at or above this many standard deviations are flagged"
+            className="w-12 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-[11px] text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+          />
+        </span>
         <button
           title="Refresh"
           className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"
@@ -265,7 +307,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
         <div className="flex items-center gap-2 text-[10px] text-[var(--color-fg-muted)]">
           <span className="capitalize">{data.method}</span>
           <span>·</span>
-          <span>z ≥ {zThreshold}</span>
+          <span>z ≥ {data.z_threshold ?? zThresholdParam ?? "?"}</span>
           <span>·</span>
           <span>{data.baseline_size.toLocaleString()} events in baseline</span>
           {data.status !== "ok" && (

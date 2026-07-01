@@ -9,7 +9,7 @@ import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
 import { timelinesApi } from "@/api/timelines";
 import { cn } from "@/lib/cn";
-import type { Event } from "@/api/types";
+import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
 type AnomalySubTab = "novelty" | "frequency";
@@ -26,8 +26,8 @@ interface Props {
   onDrillField?: (field: string, value: string) => void;
   /** Passed to FrequencyView — narrows the time range and the series field=value. */
   onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
-  /** Called with the active anomaly tab's finding timestamps — feeds the histogram overlay. */
-  onAnomalyMarkers?: (markers: { ts: string; label: string }[]) => void;
+  /** Called with the active anomaly tab's findings — feeds the histogram overlay and event grid. */
+  onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
 }
 
 export function AnalysisPanel({

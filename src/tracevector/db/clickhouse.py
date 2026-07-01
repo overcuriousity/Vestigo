@@ -12,12 +12,33 @@ member source IDs and use ``source_id IN (...)`` filtering.
 
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any
 
 import clickhouse_connect
 
 from tracevector.core.config import get_settings
 from tracevector.models.event import Event
+
+
+def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
+    """Attach an explicit UTC offset to an event row's timestamp columns.
+
+    The `events` table's `timestamp`/`ingest_time` columns have no explicit
+    timezone component, so clickhouse-connect returns naive `datetime`
+    objects for them. Left naive, a downstream `.isoformat()` call omits the
+    timezone offset — and a bare "YYYY-MM-DDTHH:MM:SS" string is ambiguous to
+    JS's `Date` parser (browsers treat it as local time), silently shifting
+    the displayed/compared timestamp by the browser's UTC offset.
+    """
+    for key in ("timestamp", "ingest_time"):
+        value = row.get(key)
+        if value is None or isinstance(value, str):
+            continue
+        if getattr(value, "tzinfo", None) is None:
+            value = value.replace(tzinfo=UTC)
+        row[key] = value.isoformat()
+    return row
 
 _EVENT_COLUMNS = [
     "event_id",
@@ -194,7 +215,10 @@ class ClickHouseStore:
             parameters={"case_id": case_id, "source_id": source_id},
         )
         columns = result.column_names
-        return [dict(zip(columns, row, strict=False)) for row in result.result_rows]
+        return [
+            _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
+            for row in result.result_rows
+        ]
 
     def get_events_by_ids(
         self,
@@ -233,7 +257,10 @@ class ClickHouseStore:
             parameters=parameters,
         )
         columns = result.column_names
-        rows = [dict(zip(columns, row, strict=False)) for row in result.result_rows]
+        rows = [
+            _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
+            for row in result.result_rows
+        ]
         return {str(row["event_id"]): row for row in rows}
 
     def delete_source_events(self, case_id: str, source_id: str) -> None:

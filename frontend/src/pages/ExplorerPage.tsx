@@ -42,7 +42,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { Event, EventFilters, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, EventFilters, Annotation } from "@/api/types";
 
 const PAGE_SIZE = 100;
 
@@ -197,7 +197,8 @@ export function ExplorerPage() {
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
-  const [anomalyMarkers, setAnomalyMarkers] = useState<{ ts: string; label: string }[]>([]);
+  const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
+  const [scrollPositionTs, setScrollPositionTs] = useState<string | null>(null);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
   const tlKey = `${caseId}/${timelineId}`;
   const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
@@ -211,6 +212,29 @@ export function ExplorerPage() {
   useEffect(() => {
     setSelection({ mode: "ids", ids: new Set() });
   }, [filters, sortDir]);
+
+  // Event IDs currently flagged by the active (not-yet-persisted) Analysis
+  // tab. Only meaningful to the events/histogram/export queries when the
+  // "Anomaly" filter checkbox is active — merged in below so that filter
+  // also matches live findings, not just persisted anomaly annotations.
+  const liveAnomalyEventIds = useMemo(
+    () =>
+      Array.from(
+        new Set(anomalyMarkers.map((m) => m.eventId).filter((id): id is string => !!id)),
+      ),
+    [anomalyMarkers],
+  );
+
+  // The filter object actually sent to the events/histogram/export queries.
+  // `filters` itself stays URL-serializable/shareable — this augments it
+  // with ephemeral live-finding event IDs only while relevant, so switching
+  // detector tabs or field selections correctly refetches the filtered view.
+  const effectiveFilters = useMemo<EventFilters>(() => {
+    if (!filters.annotated?.includes("anomaly") || liveAnomalyEventIds.length === 0) {
+      return filters;
+    }
+    return { ...filters, liveAnomalyEventIds };
+  }, [filters, liveAnomalyEventIds]);
 
   // ── Data queries ───────────────────────────────────────────────────────
   const { data: timeline } = useQuery({
@@ -234,12 +258,12 @@ export function ExplorerPage() {
     fetchNextPage,
     hasNextPage,
   } = useInfiniteQuery({
-    queryKey: ["events", caseId, timelineId, filters, sortDir],
+    queryKey: ["events", caseId, timelineId, effectiveFilters, sortDir],
     queryFn: ({ pageParam, signal }) =>
       eventsApi.list(
         caseId!,
         timelineId!,
-        { ...filters, limit: PAGE_SIZE, offset: pageParam, order: sortDir },
+        { ...effectiveFilters, limit: PAGE_SIZE, offset: pageParam, order: sortDir },
         signal,
       ),
     initialPageParam: 0,
@@ -280,6 +304,20 @@ export function ExplorerPage() {
     }
     return m;
   }, [annotations]);
+
+  // Findings from the active (not-yet-tagged) analysis tab, keyed by event ID —
+  // lets the grid mark rows and the detail panel show/persist findings before
+  // they're saved as annotations via the "Tag" button.
+  const liveAnomaliesByEvent = useMemo<Map<string, AnomalyMarker[]>>(() => {
+    const m = new Map<string, AnomalyMarker[]>();
+    for (const marker of anomalyMarkers) {
+      if (!marker.eventId) continue;
+      const list = m.get(marker.eventId) ?? [];
+      list.push(marker);
+      m.set(marker.eventId, list);
+    }
+    return m;
+  }, [anomalyMarkers]);
 
   const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
   const total = eventsData?.pages[0]?.total ?? 0;
@@ -411,7 +449,7 @@ const handleFindSimilar = useCallback((event: Event) => {
             <ExportDialog
               caseId={caseId!}
               timelineId={timelineId!}
-              filters={filters}
+              filters={effectiveFilters}
               total={total}
             />
 
@@ -435,9 +473,10 @@ const handleFindSimilar = useCallback((event: Event) => {
           <TimelineHistogram
             caseId={caseId}
             timelineId={timelineId}
-            filters={filters}
+            filters={effectiveFilters}
             onRangeSelect={handleHistogramRange}
             markers={analysisPanelOpen ? anomalyMarkers : []}
+            currentPositionTs={scrollPositionTs}
           />
         )}
 
@@ -490,6 +529,8 @@ const handleFindSimilar = useCallback((event: Event) => {
                   visibleColumns={visibleColumns}
                   sortDir={sortDir}
                   onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
+                  liveAnomalies={liveAnomaliesByEvent}
+                  onVisibleTimestampChange={setScrollPositionTs}
                 />
 
                 {/* Detail panel */}
@@ -497,6 +538,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                   <EventDetailPanel
                     event={expandedEvent}
                     annotations={annotationMap.get(expandedEvent.event_id) ?? []}
+                    liveFindings={liveAnomaliesByEvent.get(expandedEvent.event_id) ?? []}
                     caseId={caseId!}
                     sourceId={expandedEvent.source_id}
                     onClose={() => setExpandedEvent(null)}

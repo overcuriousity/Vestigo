@@ -149,6 +149,8 @@ class StatAnomalyResult:
     method: str         # "self-baseline" | "temporal" | "z-score" | "temporal-z-score"
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[ValueFinding | FreqFinding] = field(default_factory=list)
+    # Effective |z| cutoff used by the frequency detector; None for value_novelty.
+    z_threshold: float | None = None
 
 
 @dataclass
@@ -206,13 +208,21 @@ def _ensure_utc(dt: Any) -> datetime:
 
 
 def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
-    """Convert a ClickHouse result row into an Event-compatible dict."""
+    """Convert a ClickHouse result row into an Event-compatible dict.
+
+    `timestamp`/`ingest_time` come back as naive `datetime` objects (the
+    columns have no explicit timezone component) — attach UTC before
+    serializing, otherwise the resulting "YYYY-MM-DDTHH:MM:SS" string (no
+    offset) is ambiguous to JS's `Date` parser, which treats it as local time
+    and silently shifts the displayed/compared timestamp by the browser's
+    UTC offset.
+    """
     d: dict[str, Any] = dict(zip(columns, row, strict=False))
     for key in ("timestamp", "ingest_time"):
         v = d.get(key)
         if v is not None and not isinstance(v, str):
             try:
-                d[key] = v.isoformat()
+                d[key] = _ensure_utc(v).isoformat()
             except AttributeError:
                 d[key] = str(v)
     if "event_id" in d:
@@ -528,7 +538,7 @@ class StatisticalAnomalyService:
                     SELECT
                         {col} AS val,
                         count() AS cnt,
-                        toString(min(timestamp)) AS first_seen,
+                        min(timestamp) AS first_seen,
                         toString(argMin(event_id, timestamp)) AS evt_id,
                         argMin(source_id, timestamp) AS src_id,
                         argMin(message, timestamp) AS msg
@@ -550,7 +560,7 @@ class StatisticalAnomalyService:
                         {col} AS val,
                         countIf(timestamp >= {{bl:String}}) AS detect_cnt,
                         countIf(timestamp < {{bl:String}}) AS baseline_cnt,
-                        toString(minIf(timestamp, timestamp >= {{bl:String}})) AS first_seen,
+                        minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
                         toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id,
                         argMinIf(source_id, timestamp, timestamp >= {{bl:String}}) AS src_id,
                         argMinIf(message, timestamp, timestamp >= {{bl:String}}) AS msg
@@ -583,7 +593,13 @@ class StatisticalAnomalyService:
                     if effective_cnt > 0 and total_events > 0
                     else 0.0
                 )
-                first_seen_str = str(first_seen) if first_seen else None
+                # min(timestamp)/minIf(...) now return a native DateTime (not a
+                # ClickHouse-formatted string) so we can attach an explicit UTC
+                # offset before serializing — a bare "YYYY-MM-DD HH:MM:SS"
+                # string is ambiguous to JS's Date parser (browsers treat it as
+                # local time), which silently shifted the histogram markers and
+                # event-grid anomaly matching by the browser's UTC offset.
+                first_seen_str = _ensure_utc(first_seen).isoformat() if first_seen else None
                 evt_id_str = str(evt_id) if evt_id else None
                 mini_event: dict[str, Any] | None = None
                 if evt_id:
@@ -704,6 +720,7 @@ class StatisticalAnomalyService:
                 detector="frequency",
                 method="z-score" if baseline_end is None else "temporal-z-score",
                 baseline_size=0,
+                z_threshold=z_threshold,
             )
 
         min_ts = _ensure_utc(min_ts)
@@ -734,6 +751,7 @@ class StatisticalAnomalyService:
                 detector="frequency",
                 method="z-score" if baseline_end is None else "temporal-z-score",
                 baseline_size=0,
+                z_threshold=z_threshold,
             )
 
         # Build series dict: series_val → [(bucket_dt, cnt)].
@@ -810,6 +828,7 @@ class StatisticalAnomalyService:
                 method=method,
                 baseline_size=baseline_size,
                 results=[],
+                z_threshold=z_threshold,
             )
 
         # Sort by |z| descending, apply limit, hydrate representative events.
@@ -832,6 +851,7 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=baseline_size,
             results=top,
+            z_threshold=z_threshold,
         )
 
     def _hydrate_freq_findings(

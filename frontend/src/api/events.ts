@@ -33,6 +33,9 @@ export const eventsApi = {
     if (filters.annotationTagValue) {
       params.annotation_tag_value = filters.annotationTagValue;
     }
+    if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
+      params.live_event_ids = filters.liveAnomalyEventIds.join(",");
+    }
     return get<EventPage>(
       `/cases/${caseId}/timelines/${timelineId}/events`,
       params,
@@ -78,6 +81,9 @@ export const eventsApi = {
     }
     if (filters.annotationTagValue) {
       params.annotation_tag_value = filters.annotationTagValue;
+    }
+    if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
+      params.live_event_ids = filters.liveAnomalyEventIds.join(",");
     }
     return get<HistogramResponse>(
       `/cases/${caseId}/timelines/${timelineId}/histogram`,

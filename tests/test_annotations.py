@@ -39,6 +39,7 @@ def test_annotation_to_dict_shape():
         created_by=None,
         origin="user",
         details=None,
+        pinned=False,
         created_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
     d = ann.to_dict()
@@ -52,6 +53,7 @@ def test_annotation_to_dict_shape():
         "created_by",
         "origin",
         "details",
+        "pinned",
     }
     assert d["id"] == "ann_abc123"
     assert d["event_id"] == "evt1"
@@ -61,6 +63,7 @@ def test_annotation_to_dict_shape():
     assert d["created_by"] is None
     assert d["origin"] == "user"
     assert d["details"] is None
+    assert d["pinned"] is False
     assert "2024-01-01" in d["created_at"]
 
 
@@ -314,3 +317,72 @@ async def test_delete_system_annotations_idempotent(store: PostgresStore):
     """delete_system_annotations is a no-op when nothing matches."""
     count = await store.delete_system_annotations("c8", ["s8"], "anomaly")
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_system_annotations_preserves_pinned(store: PostgresStore):
+    """A pinned system annotation (from the per-event 'Persist' action) must
+    survive the bulk 'Tag N as anomaly' re-run's clear-and-replace, even if a
+    later detector pass no longer surfaces that finding."""
+    await store.create_annotation(
+        case_id="c9",
+        source_id="s9",
+        event_id="pinned-evt",
+        annotation_id="pinned_ann",
+        annotation_type="anomaly",
+        content="manually confirmed finding",
+        origin="system",
+        pinned=True,
+    )
+    await store.bulk_create_annotations(
+        [
+            {
+                "annotation_id": "bulk_ann",
+                "case_id": "c9",
+                "source_id": "s9",
+                "event_id": "bulk-evt",
+                "annotation_type": "anomaly",
+                "content": "bulk-tagged finding",
+                "origin": "system",
+                "pinned": False,
+            }
+        ]
+    )
+
+    deleted_count = await store.delete_system_annotations("c9", ["s9"], "anomaly")
+    assert deleted_count == 1  # only the non-pinned bulk row
+
+    remaining = await store.list_source_annotations("c9", ["s9"])
+    assert len(remaining) == 1
+    assert remaining[0].id == "pinned_ann"
+    assert remaining[0].pinned is True
+
+
+@pytest.mark.asyncio
+async def test_list_pinned_event_ids(store: PostgresStore):
+    """list_pinned_event_ids returns only events with a pinned system
+    anomaly annotation — used by the bulk tag endpoint to avoid writing a
+    second, duplicate row for an event that already has a pinned one."""
+    await store.create_annotation(
+        case_id="c10",
+        source_id="s10",
+        event_id="pinned-evt",
+        annotation_id="pinned_ann2",
+        annotation_type="anomaly",
+        content="confirmed",
+        origin="system",
+        pinned=True,
+    )
+    await store.create_annotation(
+        case_id="c10",
+        source_id="s10",
+        event_id="unpinned-evt",
+        annotation_id="unpinned_ann",
+        annotation_type="anomaly",
+        content="not confirmed",
+        origin="system",
+        pinned=False,
+    )
+
+    pinned_ids = await store.list_pinned_event_ids("c10", ["s10"], "anomaly")
+    assert pinned_ids == ["pinned-evt"]

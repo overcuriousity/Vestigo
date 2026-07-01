@@ -119,17 +119,43 @@ async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[s
     return [s.id for s in sources]
 
 
+_FIELDS_NONE_TOKEN = "__none__"
+
+
+def _parse_novelty_fields(fields: str | None) -> list[str] | None:
+    """Parse the ``fields`` param for value_novelty scans.
+
+    ``None`` (param omitted) → ``None``, meaning the backend auto-selects
+    fields. The reserved ``"__none__"`` token means the analyst explicitly
+    deselected every field in the picker, so no fields should be scanned —
+    it maps to ``[]`` rather than falling back to auto-selection.
+    """
+    if fields is None:
+        return None
+    if fields == _FIELDS_NONE_TOKEN:
+        return []
+    return [f.strip() for f in fields.split(",") if f.strip()]
+
+
 async def _resolve_annotated_event_ids(
     case_id: str,
     source_ids: list[str],
     annotated: str | None,
     tag_value: str | None,
+    live_event_ids: str | None = None,
 ) -> list[str] | None:
     """Resolve the ``annotated``/``annotation_tag_value`` filter to an event_id list.
 
     ``annotated`` is a comma-separated subset of ``{"tag", "anomaly"}``. Matching
     event_ids across the requested types are unioned (OR semantics). Returns
     ``None`` when no filter is requested (no restriction).
+
+    ``live_event_ids`` is a comma-separated list of event IDs the frontend
+    currently shows as flagged by the *active* (not-yet-persisted) Analysis
+    tab. Live findings never reach the database, so the "anomaly" branch
+    can't see them from annotations alone — when "anomaly" is requested,
+    these are unioned in too, so the filter matches detected-but-unconfirmed
+    findings as well as tagged/persisted ones.
     """
     if not annotated:
         return None
@@ -146,6 +172,8 @@ async def _resolve_annotated_event_ids(
             case_id, source_ids, "anomaly", origin="system"
         )
         event_ids.update(ids)
+        if live_event_ids:
+            event_ids.update(e.strip() for e in live_event_ids.split(",") if e.strip())
     return list(event_ids)
 
 
@@ -176,6 +204,14 @@ async def list_events(
         default=None,
         description="Narrow the 'tag' annotation type to a specific tag value.",
     ),
+    live_event_ids: str | None = Query(
+        default=None,
+        description=(
+            "Comma-separated event IDs currently flagged by the active, "
+            "not-yet-persisted Analysis tab — unioned into the 'anomaly' "
+            "branch of `annotated` so it also matches live findings."
+        ),
+    ),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     order: str = Query(default="desc", description="Sort order: asc or desc"),
@@ -186,7 +222,7 @@ async def list_events(
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     event_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, annotated, annotation_tag_value
+        case_id, source_ids, annotated, annotation_tag_value, live_event_ids
     )
 
     service = _get_query_service()
@@ -365,6 +401,7 @@ async def get_histogram(
     exclusions: str | None = Query(default=None),
     annotated: str | None = Query(default=None),
     annotation_tag_value: str | None = Query(default=None),
+    live_event_ids: str | None = Query(default=None),
     buckets: int = Query(default=60, ge=10, le=200),
 ) -> dict[str, Any]:
     """Return a bucketed event-count histogram for a timeline.
@@ -376,7 +413,7 @@ async def get_histogram(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     event_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, annotated, annotation_tag_value
+        case_id, source_ids, annotated, annotation_tag_value, live_event_ids
     )
     service = _get_query_service()
     return service.histogram(
@@ -416,6 +453,7 @@ class ExportFilter(BaseModel):
     exclude: dict[str, list[str]] = Field(default_factory=dict)
     annotated: str | None = None
     annotation_tag_value: str | None = None
+    live_event_ids: str | None = None
 
 
 class ExportRequest(BaseModel):
@@ -441,18 +479,35 @@ _CSV_COLUMNS = [
     "attributes",
     "content_hash",
     "file_hash",
+    "user_tags",
+    "comments",
+    "anomaly_findings",
 ]
 
 
-def _stream_jsonl(query: EventQuery) -> Generator[str]:
-    """Yield one JSONL line per matching event."""
+def _index_annotations_by_event(
+    annotations: list[Any],
+) -> dict[str, list[Any]]:
+    """Group annotation ORM rows by event_id for O(1) lookup while streaming."""
+    by_event: dict[str, list[Any]] = {}
+    for a in annotations:
+        by_event.setdefault(a.event_id, []).append(a)
+    return by_event
+
+
+def _stream_jsonl(query: EventQuery, annotations_by_event: dict[str, list[Any]]) -> Generator[str]:
+    """Yield one JSONL line per matching event, with its annotations attached."""
     service = EventQueryService()
     for event in service.iter_events(query):
-        yield json.dumps(event, default=str) + "\n"
+        row = dict(event)
+        row["annotations"] = [
+            a.to_dict() for a in annotations_by_event.get(row["event_id"], [])
+        ]
+        yield json.dumps(row, default=str) + "\n"
 
 
-def _stream_csv(query: EventQuery) -> Generator[str]:
-    """Yield CSV rows for all matching events (header first)."""
+def _stream_csv(query: EventQuery, annotations_by_event: dict[str, list[Any]]) -> Generator[str]:
+    """Yield CSV rows for all matching events (header first), annotations flattened."""
     buf = io.StringIO()
     writer = csv.DictWriter(
         buf,
@@ -474,6 +529,18 @@ def _stream_csv(query: EventQuery) -> Generator[str]:
         attrs = row.get("attributes")
         if isinstance(attrs, dict):
             row["attributes"] = json.dumps(attrs)
+
+        anns = annotations_by_event.get(row["event_id"], [])
+        row["user_tags"] = ";".join(
+            a.content for a in anns if a.annotation_type == "tag" and a.origin == "user"
+        )
+        row["comments"] = " | ".join(
+            a.content for a in anns if a.annotation_type == "comment" and a.origin == "user"
+        )
+        row["anomaly_findings"] = " | ".join(
+            a.content for a in anns if a.annotation_type == "anomaly" and a.origin == "system"
+        )
+
         buf.seek(0)
         buf.truncate()
         writer.writerow(row)
@@ -489,10 +556,24 @@ async def export_events(
     timeline_id: str,
     body: ExportRequest,
 ) -> StreamingResponse:
-    """Stream all events matching the given filters as CSV or JSONL."""
+    """Stream all events matching the given filters as CSV or JSONL.
+
+    Each row/line carries its annotations (user tags, comments, and any
+    persisted anomaly findings) so the export is a self-contained record —
+    tagging a finding is what makes it show up here.
+    """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     event_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, body.filter.annotated, body.filter.annotation_tag_value
+        case_id,
+        source_ids,
+        body.filter.annotated,
+        body.filter.annotation_tag_value,
+        body.filter.live_event_ids,
+    )
+
+    store = get_store()
+    annotations_by_event = _index_annotations_by_event(
+        await store.list_source_annotations(case_id, source_ids)
     )
 
     eq = EventQuery(
@@ -513,11 +594,11 @@ async def export_events(
     if body.format == "jsonl":
         media_type = "application/x-ndjson"
         ext = "jsonl"
-        content = _stream_jsonl(eq)
+        content = _stream_jsonl(eq, annotations_by_event)
     else:
         media_type = "text/csv"
         ext = "csv"
-        content = _stream_csv(eq)
+        content = _stream_csv(eq, annotations_by_event)
 
     filename = f"{case_id}-{timeline_id}-events.{ext}"
     return StreamingResponse(
@@ -656,6 +737,11 @@ async def list_anomalies(
         default="artifact",
         description="Field to group frequency series by.",
     ),
+    z_threshold: float | None = Query(
+        default=None,
+        gt=0,
+        description="|z| cutoff for the frequency detector. Omit to use the server default.",
+    ),
     baseline_start: datetime | None = Query(  # noqa: B008
         default=None,
         description="Explicit temporal baseline end timestamp (detect window = after this).",
@@ -702,16 +788,12 @@ async def list_anomalies(
             series_field=series_field,
             limit=limit,
             bucket_count=cfg.stat_frequency_buckets,
-            z_threshold=cfg.stat_z_threshold,
+            z_threshold=z_threshold if z_threshold is not None else cfg.stat_z_threshold,
             baseline_end=effective_baseline_end,
             exclude_event_ids=exclude_ids,
         )
     else:
-        parsed_fields = (
-            [f.strip() for f in fields.split(",") if f.strip()]
-            if fields
-            else None
-        )
+        parsed_fields = _parse_novelty_fields(fields)
         result = svc.find_value_novelty(
             case_id=case_id,
             source_ids=source_ids,
@@ -729,6 +811,7 @@ async def list_anomalies(
         "method": result.method,
         "baseline_size": result.baseline_size,
         "results": [_serialize_finding(r) for r in result.results],
+        "z_threshold": result.z_threshold,
     }
 
 
@@ -746,6 +829,11 @@ class TagAnomaliesRequest(BaseModel):
     series_field: str = Field(
         default="artifact",
         description="Field to group frequency series by.",
+    )
+    z_threshold: float | None = Field(
+        default=None,
+        gt=0,
+        description="|z| cutoff for the frequency detector. Omit to use the server default.",
     )
     baseline_start: datetime | None = Field(
         default=None,
@@ -802,16 +890,12 @@ async def tag_anomalies(
             series_field=body.series_field,
             limit=body.limit,
             bucket_count=cfg.stat_frequency_buckets,
-            z_threshold=cfg.stat_z_threshold,
+            z_threshold=body.z_threshold if body.z_threshold is not None else cfg.stat_z_threshold,
             baseline_end=effective_baseline_end,
             exclude_event_ids=exclude_ids,
         )
     else:
-        parsed_fields = (
-            [f.strip() for f in body.fields.split(",") if f.strip()]
-            if body.fields
-            else None
-        )
+        parsed_fields = _parse_novelty_fields(body.fields)
         result = svc.find_value_novelty(
             case_id=case_id,
             source_ids=source_ids,
@@ -831,30 +915,59 @@ async def tag_anomalies(
             "tagged": 0,
             "baseline_size": result.baseline_size,
             "results": [],
+            "z_threshold": result.z_threshold,
         }
 
-    # Clear prior system anomaly annotations for this timeline's sources.
+    # Clear prior (non-pinned) system anomaly annotations for this timeline's
+    # sources. Pinned rows — created via the per-event "Persist" action — are
+    # left alone so a manually-confirmed finding survives even if this
+    # re-scan no longer surfaces it.
     await store.delete_system_annotations(case_id, source_ids, "anomaly")
+    pinned_event_ids = set(await store.list_pinned_event_ids(case_id, source_ids, "anomaly"))
 
-    # Write one system annotation per finding.
+    # Write one system annotation per finding, skipping events that already
+    # have a pinned annotation to avoid a duplicate row for the same event.
     annotation_rows = []
     for r in result.results:
         if isinstance(r, ValueFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
-            content = (
-                f"Rare value — {r.field}={r.value!r} "
-                f"(count {r.count}, surprise {r.score:.2f})"
-            )
+            if result.method == "temporal":
+                # Every temporal-mode finding is, by construction, absent from
+                # the baseline window (backend filters on baseline_cnt = 0) —
+                # a materially stronger, more specific claim than "rare", so
+                # say exactly that rather than reusing the self-baseline text.
+                content = (
+                    f"New value — {r.field}={r.value!r}: absent from the "
+                    f"{result.baseline_size:,}-event baseline window; first "
+                    f"appears in the detect window at {r.first_seen} "
+                    f"({r.count} occurrence(s) there; surprise {r.score:.2f})"
+                )
+            else:
+                content = (
+                    f"Rare value — {r.field}={r.value!r}: appears {r.count} "
+                    f"time(s) of {result.baseline_size:,} events in the "
+                    f"corpus (surprise {r.score:.2f})"
+                )
         else:
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
-            content = (
-                f"Frequency spike — {r.series_field}={r.series_value!r} "
-                f"at {r.window_start}: {r.observed} events "
-                f"(expected {r.expected:.1f}, z={r.z_score:.2f})"
-            )
-        if not event_id:
+            if result.method == "temporal-z-score":
+                content = (
+                    f"Frequency spike — {r.series_field}={r.series_value!r} "
+                    f"at {r.window_start}: {r.observed} events observed vs "
+                    f"{r.expected:.1f} expected from the pre-baseline_end "
+                    f"event-count distribution (z={r.z_score:.2f})"
+                )
+            else:
+                content = (
+                    f"Frequency spike — {r.series_field}={r.series_value!r} "
+                    f"at {r.window_start}: {r.observed} events observed vs "
+                    f"{r.expected:.1f} expected from this series' own overall "
+                    f"event-count distribution, which includes this window "
+                    f"(z={r.z_score:.2f})"
+                )
+        if not event_id or event_id in pinned_event_ids:
             continue
         annotation_rows.append(
             {
@@ -878,4 +991,56 @@ async def tag_anomalies(
         "tagged": tagged,
         "baseline_size": result.baseline_size,
         "results": [_serialize_finding(r) for r in result.results],
+        "z_threshold": result.z_threshold,
     }
+
+
+class PersistAnomalyFindingRequest(BaseModel):
+    """Body for persisting one live (not-yet-tagged) anomaly finding."""
+
+    detector: str = Field(
+        ..., description="'value_novelty' or 'frequency' — which detector produced this finding."
+    )
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Human-readable finding description, as shown in the Analysis panel.",
+    )
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/{case_id}/sources/{source_id}/events/{event_id}/anomalies/persist")
+async def persist_anomaly_finding(
+    case_id: str,
+    source_id: str,
+    event_id: str,
+    body: PersistAnomalyFindingRequest,
+) -> dict[str, Any]:
+    """Persist a single live anomaly finding as a system annotation.
+
+    Unlike ``/anomalies/tag`` (which re-runs a detector and replaces every
+    system annotation for the timeline's sources), this writes exactly one
+    row for this event and leaves every other tagged finding untouched — it's
+    the action behind the event detail panel's per-finding "Persist" button,
+    for confirming one finding without re-tagging everything else.
+
+    Written with ``pinned=True`` so a later bulk "Tag N as anomaly" re-run
+    (which clears and rewrites non-pinned system annotations) doesn't delete
+    this manually-confirmed finding, even if the re-scan no longer surfaces it.
+    """
+    store = get_store()
+    await store.init_schema()
+    annotation_id = generate_id(f"{event_id}_anomaly_{body.detector}")
+    annotation = await store.create_annotation(
+        case_id=case_id,
+        source_id=source_id,
+        event_id=event_id,
+        annotation_id=annotation_id,
+        annotation_type="anomaly",
+        content=body.content,
+        origin="system",
+        details=body.details,
+        pinned=True,
+    )
+    return {"annotation": annotation.to_dict()}

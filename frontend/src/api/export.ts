@@ -21,6 +21,10 @@ export async function downloadExport(
       exclude: filters.exclusions ?? {},
       annotated: filters.annotated && filters.annotated.length > 0 ? filters.annotated.join(",") : undefined,
       annotation_tag_value: filters.annotationTagValue,
+      live_event_ids:
+        filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0
+          ? filters.liveAnomalyEventIds.join(",")
+          : undefined,
     },
   };
 

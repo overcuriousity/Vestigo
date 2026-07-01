@@ -139,15 +139,17 @@ def test_value_novelty_self_baseline_returns_rare_values():
         # artifact field: two rare values
         FakeQueryResult(
             result_rows=[
-                ("suspicious.exe", 1, "2024-01-02 00:00:00", "evt-1", "s1", "msg1"),
-                ("unusual_tool", 2, "2024-01-01 00:00:00", "evt-2", "s1", "msg2"),
+                # Naive datetimes — matches clickhouse-connect's real return type
+                # for a DateTime column with no explicit timezone.
+                ("suspicious.exe", 1, datetime(2024, 1, 2), "evt-1", "s1", "msg1"),
+                ("unusual_tool", 2, datetime(2024, 1, 1), "evt-2", "s1", "msg2"),
             ],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),
         # timestamp_desc field: one rare value
         FakeQueryResult(
             result_rows=[
-                ("Malware execution", 1, "2024-01-02 01:00:00", "evt-3", "s1", "msg3"),
+                ("Malware execution", 1, datetime(2024, 1, 2, 1), "evt-3", "s1", "msg3"),
             ],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),
@@ -197,7 +199,7 @@ def test_value_novelty_self_baseline_limit_applied():
     per_field = [
         FakeQueryResult(
             result_rows=[
-                (f"val_{i}", 1, "2024-01-01", f"evt-{j*3+i}", "s1", "m")
+                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j*3+i}", "s1", "m")
                 for i in range(3)
             ],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
@@ -222,7 +224,7 @@ def test_value_novelty_event_id_populated():
     svc = _svc([
         FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
         FakeQueryResult(
-            result_rows=[("backdoor.exe", 1, "2024-01-01", "evt-abc", "s1", "bad msg")],
+            result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc", "s1", "bad msg")],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),
     ])
@@ -234,6 +236,13 @@ def test_value_novelty_event_id_populated():
     assert r.event is not None
     assert r.event["message"] == "bad msg"
     assert r.value == "backdoor.exe"
+    # first_seen must carry an explicit UTC offset — a bare "YYYY-MM-DD
+    # HH:MM:SS" string is ambiguous to JS's Date parser (browsers treat it as
+    # local time), which silently shifted histogram markers and event-grid
+    # anomaly matching by the browser's UTC offset.
+    assert r.first_seen is not None
+    assert r.first_seen.endswith("+00:00") or r.first_seen.endswith("Z")
+    assert r.event["timestamp"] == r.first_seen
 
 
 def test_value_novelty_skips_empty_values():
@@ -242,8 +251,8 @@ def test_value_novelty_skips_empty_values():
         FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("", 1, "2024-01-01", "evt-1", "s1", "msg"),
-                ("real_value", 2, "2024-01-01", "evt-2", "s1", "msg2"),
+                ("", 1, datetime(2024, 1, 1), "evt-1", "s1", "msg"),
+                ("real_value", 2, datetime(2024, 1, 1), "evt-2", "s1", "msg2"),
             ],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),
@@ -271,7 +280,7 @@ def test_value_novelty_temporal_baseline_first_seen():
         # artifact field: one first-seen value
         FakeQueryResult(
             result_rows=[
-                ("first_time_process.exe", 3, 0, "2024-01-16 00:00:00", "evt-9", "s1", "new exe"),
+                ("first_time_process.exe", 3, 0, datetime(2024, 1, 16), "evt-9", "s1", "new exe"),
             ],
             column_names=["val", "detect_cnt", "baseline_cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),
@@ -690,7 +699,7 @@ def test_value_novelty_smart_default_calls_recommender():
         # find_value_novelty (recommended fields = artifact + attr:status_code):
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),   # total
         FakeQueryResult(
-            result_rows=[("404", 2, "2024-01-01", "evt-1", "s1", "404 not found")],
+            result_rows=[("404", 2, datetime(2024, 1, 1), "evt-1", "s1", "404 not found")],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),  # artifact field scan
         FakeQueryResult(
@@ -717,8 +726,8 @@ def test_value_novelty_exclude_event_ids():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("malware.exe", 1, "2024-01-01", "evt-bad", "s1", "msg"),
-                ("tool.exe", 2, "2024-01-01", "evt-ok", "s1", "msg2"),
+                ("malware.exe", 1, datetime(2024, 1, 1), "evt-bad", "s1", "msg"),
+                ("tool.exe", 2, datetime(2024, 1, 1), "evt-ok", "s1", "msg2"),
             ],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         ),

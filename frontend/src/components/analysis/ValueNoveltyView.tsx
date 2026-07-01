@@ -4,9 +4,6 @@
  * Calls the value_novelty detector endpoint and shows each finding as an
  * interactive row: field badge + value + surprise score + first-seen timestamp
  * + click-to-drill.  "First-seen in detect window" findings are highlighted.
- *
- * No chart dependency — scores rendered as inline proportional bars
- * via MiniSparkline (div-bar idiom, airgap-safe).
  */
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -23,7 +20,7 @@ import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
-import type { Event, ValueNoveltyFinding } from "@/api/types";
+import type { AnomalyMarker, Event, ValueNoveltyFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
 
 interface Props {
@@ -32,8 +29,8 @@ interface Props {
   onSelectEvent: (event: Event) => void;
   /** Called when analyst drills into findings — passes a field filter. */
   onDrillField?: (field: string, value: string) => void;
-  /** Called whenever the finding set changes — feeds the histogram overlay. */
-  onFindingsChange?: (markers: { ts: string; label: string }[]) => void;
+  /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
+  onFindingsChange?: (markers: AnomalyMarker[]) => void;
 }
 
 /** Friendly display label for a field token. */
@@ -66,14 +63,8 @@ function fmtTs(iso: string): string {
   }
 }
 
-/** Score-to-width percentage (capped at 100). */
-function scorePct(score: number, maxScore: number): number {
-  return maxScore > 0 ? Math.min(100, Math.round((score / maxScore) * 100)) : 0;
-}
-
 interface FindingRowProps {
   finding: ValueNoveltyFinding;
-  maxScore: number;
   onSelectEvent: (event: Event) => void;
   onDrillField?: (field: string, value: string) => void;
   isFirstSeen: boolean;
@@ -81,13 +72,11 @@ interface FindingRowProps {
 
 function FindingRow({
   finding,
-  maxScore,
   onSelectEvent,
   onDrillField,
   isFirstSeen,
 }: FindingRowProps) {
   const [expanded, setExpanded] = useState(false);
-  const pct = scorePct(finding.score, maxScore);
 
   return (
     <div
@@ -107,17 +96,6 @@ function FindingRow({
           }
         }}
       >
-        {/* Rarity bar */}
-        <div className="mt-1.5 shrink-0 w-16 h-1.5 rounded-full bg-[var(--color-bg-elevated)] overflow-hidden">
-          <div
-            className={cn(
-              "h-full rounded-full transition-all",
-              isFirstSeen ? "bg-[var(--color-accent)]" : "bg-[var(--color-warning)]",
-            )}
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-
         <div className="min-w-0 flex-1 space-y-0.5">
           {/* Field badge + value */}
           <div className="flex flex-wrap items-center gap-1">
@@ -211,11 +189,16 @@ export function ValueNoveltyView({
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
-  // Compute comma-separated fields string for the API (null → omit param → backend auto-selects).
+  // Compute the fields param for the API. null → omit param → backend
+  // auto-selects. [] (explicitly deselected every field) can't be sent as an
+  // empty string — the API client drops empty-string params — so it's sent as
+  // the reserved "__none__" token, which the backend maps to "scan nothing".
   const fieldsParam =
-    selectedFields !== null && selectedFields.length > 0
-      ? selectedFields.join(",")
-      : undefined;
+    selectedFields === null
+      ? undefined
+      : selectedFields.length > 0
+        ? selectedFields.join(",")
+        : "__none__";
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["anomalies-novelty", caseId, timelineId, mode, fieldsParam ?? "__auto__"],
@@ -251,16 +234,38 @@ export function ValueNoveltyView({
       ),
     [data],
   );
-  const maxScore = Math.max(1, ...findings.map((r) => r.score));
 
   useEffect(() => {
     if (!onFindingsChange) return;
-    const markers = findings
-      .map((f) => ({
-        ts: f.event?.timestamp ?? f.first_seen,
-        label: `${fieldLabel(f.field)}=${f.value}`,
-      }))
-      .filter((m): m is { ts: string; label: string } => !!m.ts);
+    const markers: AnomalyMarker[] = findings.flatMap((f) => {
+      const ts = f.event?.timestamp ?? f.first_seen;
+      if (!ts) return [];
+      const label = `${fieldLabel(f.field)}=${f.value}`;
+      // Temporal-mode findings are, by construction, absent from the
+      // baseline window (the backend only returns baseline_cnt = 0 rows) —
+      // a materially stronger, more specific claim than "rare", so say
+      // exactly that rather than reusing the self-baseline phrasing.
+      const detail =
+        data?.method === "temporal"
+          ? `New value: ${label} — absent from the ${(data.baseline_size ?? 0).toLocaleString()}-event ` +
+            `baseline window; first appears in the detect window` +
+            `${f.first_seen ? ` at ${fmtTs(f.first_seen)}` : ""} ` +
+            `(${f.count} occurrence${f.count === 1 ? "" : "s"} here; surprise ${f.score.toFixed(2)})`
+          : `Rare value: ${label} — appears ${f.count} time${f.count === 1 ? "" : "s"}` +
+            `${data?.baseline_size ? ` of ${data.baseline_size.toLocaleString()} events in the corpus` : ""} ` +
+            `(surprise ${f.score.toFixed(2)})`;
+      return [
+        {
+          ts,
+          label,
+          detail,
+          eventId: f.event_id,
+          sourceId: f.event?.source_id,
+          detector: "value_novelty" as const,
+          rawDetails: f.details,
+        },
+      ];
+    });
     onFindingsChange(markers);
     return () => onFindingsChange([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -327,10 +332,11 @@ export function ValueNoveltyView({
         <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
           <Info size={13} />
           <span>
-            No rare values detected.{" "}
-            {data?.status === "no_data"
-              ? "No events ingested yet."
-              : "All field values appear frequently."}
+            {selectedFields !== null && selectedFields.length === 0
+              ? "No fields selected to scan. Pick fields above, or reset to auto."
+              : data?.status === "no_data"
+                ? "No rare values detected. No events ingested yet."
+                : "No rare values detected. All field values appear frequently."}
           </span>
         </div>
       )}
@@ -342,7 +348,6 @@ export function ValueNoveltyView({
             <FindingRow
               key={`${f.field}:${f.value}:${i}`}
               finding={f}
-              maxScore={maxScore}
               onSelectEvent={onSelectEvent}
               onDrillField={onDrillField}
               isFirstSeen={data?.method === "temporal"}

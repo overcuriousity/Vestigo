@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck } from "lucide-react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck, AlertTriangle, Save } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -10,7 +11,8 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
-import type { Event, Annotation } from "@/api/types";
+import { anomaliesApi } from "@/api/anomalies";
+import type { AnomalyMarker, Event, Annotation } from "@/api/types";
 
 interface Props {
   event: Event;
@@ -23,6 +25,8 @@ interface Props {
   onAddFilter: (fieldKey: string, value: string, include: boolean) => void;
   /** Existing annotation-tag labels for autocomplete. */
   tagSuggestions?: string[];
+  /** Active, not-yet-tagged analysis findings that apply to this event. */
+  liveFindings?: AnomalyMarker[];
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -225,9 +229,23 @@ export function EventDetailPanel({
   onFindSimilar,
   onAddFilter,
   tagSuggestions = [],
+  liveFindings = [],
 }: Props) {
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
+  const qc = useQueryClient();
+
+  const persistMutation = useMutation({
+    mutationFn: (finding: AnomalyMarker) =>
+      anomaliesApi.persistFinding(caseId, sourceId, event.event_id, {
+        detector: finding.detector,
+        content: finding.detail,
+        details: finding.rawDetails,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["annotations"] });
+    },
+  });
 
   // ── Resize drag ────────────────────────────────────────────────────────
   const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
@@ -258,9 +276,30 @@ export function EventDetailPanel({
 
   const userAnnotations = annotations.filter((a) => a.origin === "user");
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
+  const persistedAnomalies = systemAnnotations.filter((a) => a.annotation_type === "anomaly");
+  // Once an event has been tagged, the persisted annotation is the durable
+  // record of that finding — the live (still-active) finding from the
+  // Analysis tab is the same thing, just not yet saved, so showing both
+  // duplicates the same information. Suppress the live copy once tagged.
+  const effectiveLiveFindings = persistedAnomalies.length > 0 ? [] : liveFindings;
+  // Aggregated across every anomaly kind — persisted (tagged) system
+  // annotations plus whatever the currently active analysis tab is showing
+  // but hasn't been tagged yet — so this is always visible regardless of
+  // which detector flagged the event or whether it's been saved.
+  const anomalyReasons = [
+    ...persistedAnomalies.map((a) => a.content),
+    ...effectiveLiveFindings.map((f) => `${f.detail} (not yet tagged)`),
+  ];
 
   function handleAdd(content: string) {
     if (!addMode) return;
+    if (
+      addMode === "tag" &&
+      userAnnotations.some((a) => a.annotation_type === "tag" && a.content === content)
+    ) {
+      setAddMode(null);
+      return;
+    }
     add.mutate(
       { eventId: event.event_id, type: addMode, content },
       { onSuccess: () => setAddMode(null) },
@@ -283,6 +322,14 @@ export function EventDetailPanel({
         <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
           Event Detail
         </h3>
+        {anomalyReasons.length > 0 && (
+          <Tooltip content={anomalyReasons.join(" · ")} side="bottom">
+            <span className="flex items-center gap-1 rounded-full border border-[var(--color-anomaly)]/40 bg-[var(--color-anomaly-dim)] px-2 py-0.5 text-[11px] font-medium text-[var(--color-anomaly)]">
+              <AlertTriangle size={11} />
+              {anomalyReasons.length} anomal{anomalyReasons.length === 1 ? "y" : "ies"}
+            </span>
+          </Tooltip>
+        )}
         <Tooltip content="Find similar events (vector search)">
           <Button variant="ghost" size="icon" onClick={() => onFindSimilar(event)}>
             <Search size={14} />
@@ -469,6 +516,32 @@ export function EventDetailPanel({
                 ⚠ {a.annotation_type}:
               </span>{" "}
               <span className="text-[var(--color-fg-primary)]">{a.content}</span>
+            </div>
+          ))}
+
+          {/* Live findings — from the active analysis tab, not yet persisted.
+              Suppressed once this event already has a tagged anomaly
+              annotation, to avoid showing the same finding twice. */}
+          {effectiveLiveFindings.map((finding, i) => (
+            <div
+              key={i}
+              className="mb-1 flex items-start gap-1.5 rounded border border-dashed border-[var(--color-anomaly)]/40 px-2.5 py-1.5 text-xs"
+            >
+              <span className="text-[var(--color-anomaly)]">⚠</span>
+              <span className="flex-1 text-[var(--color-fg-primary)]">
+                {finding.detail}
+                <span className="ml-1 text-[10px] text-[var(--color-fg-muted)]">(not yet tagged)</span>
+              </span>
+              <Tooltip content="Persist this finding as a system annotation" side="top">
+                <button
+                  onClick={() => persistMutation.mutate(finding)}
+                  disabled={persistMutation.isPending}
+                  className="shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
+                >
+                  {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
+                  Persist
+                </button>
+              </Tooltip>
             </div>
           ))}
 

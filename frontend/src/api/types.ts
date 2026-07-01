@@ -116,6 +116,8 @@ export interface Annotation {
   created_by: string | null;
   details: Record<string, unknown> | null;
   created_at: string;
+  /** True only for a system annotation created via the per-event "Persist" action. */
+  pinned: boolean;
 }
 
 export interface Job {
@@ -183,6 +185,31 @@ export interface AnomaliesResponse {
   method: string;
   baseline_size: number;
   results: AnomalyFinding[];
+  /** Effective |z| cutoff used by the frequency detector; null for value_novelty. */
+  z_threshold: number | null;
+}
+
+/** One active finding fed to the histogram overlay / event grid highlighting. */
+export interface AnomalyMarker {
+  ts: string;
+  /** Short "field=value" form — used for compact contexts (histogram flag hover). */
+  label: string;
+  /**
+   * Full, human-readable explanation of the finding (field/value/count/score,
+   * or window/observed/expected/z-score) — shown in the event detail panel so
+   * an analyst can see *why* an event was flagged without re-opening the
+   * Analysis panel. Falls back to `label` when a fuller explanation isn't
+   * available.
+   */
+  detail: string;
+  /** Representative event for this finding, when the detector supplied one. */
+  eventId?: string | null;
+  /** Source id of the representative event — required to persist this finding. */
+  sourceId?: string | null;
+  /** Which detector produced this finding — required to persist this finding. */
+  detector: "value_novelty" | "frequency";
+  /** Raw structured finding data — stored verbatim on the persisted annotation. */
+  rawDetails: Record<string, unknown>;
 }
 
 export interface TagAnomaliesResponse extends AnomaliesResponse {
@@ -291,6 +318,13 @@ export interface EventFilters {
   annotated?: ("tag" | "anomaly")[];
   /** Narrows the "tag" annotation type to a specific tag value */
   annotationTagValue?: string;
+  /**
+   * Event IDs currently flagged by the active (not-yet-persisted) Analysis
+   * tab — merged server-side with persisted anomaly annotations when
+   * `annotated` includes "anomaly", so the filter also matches live findings.
+   * Derived from session state, not serialized to the URL/saved views.
+   */
+  liveAnomalyEventIds?: string[];
   limit?: number;
   offset?: number;
   /** Chronological sort direction (default: desc) */
@@ -332,5 +366,6 @@ export interface ExportRequest {
     exclude?: Record<string, string[]>;
     annotated?: string;
     annotation_tag_value?: string;
+    live_event_ids?: string;
   };
 }

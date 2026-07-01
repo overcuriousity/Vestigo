@@ -10,7 +10,7 @@
  * Parser tags and user annotation tags both appear as chips under the message.
  * The annotation column shows outlier/tag/comment icons that open edit popovers.
  */
-import { useMemo, useRef, useCallback, useState } from "react";
+import { useMemo, useRef, useCallback, useState, useEffect } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -19,7 +19,7 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck } from "lucide-react";
-import type { Event, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, Annotation } from "@/api/types";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
@@ -52,6 +52,10 @@ interface Props {
   visibleColumns: string[];
   sortDir: "asc" | "desc";
   onSortToggle: () => void;
+  /** Active (not-yet-tagged) analysis findings, keyed by event ID. */
+  liveAnomalies?: Map<string, AnomalyMarker[]>;
+  /** Called with the timestamp of the topmost visible row whenever scroll position changes. */
+  onVisibleTimestampChange?: (ts: string | null) => void;
 }
 
 // ── Annotation column ────────────────────────────────────────────────────────
@@ -61,6 +65,8 @@ interface AnnotationCellProps {
   anns: Annotation[];
   caseId: string;
   sourceId: string;
+  /** Active, not-yet-tagged findings for this event. */
+  liveFindings?: AnomalyMarker[];
 }
 
 function TagPopover({
@@ -282,14 +288,23 @@ function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) 
 
 /** Combined annotation column: anomaly indicator + normal toggle + tag popover + comment popover. */
 function AnnotationCell(props: AnnotationCellProps) {
-  const hasAnomaly = props.anns.some((a) => a.annotation_type === "anomaly");
+  const persistedAnomalies = props.anns.filter((a) => a.annotation_type === "anomaly");
+  // Once tagged, the persisted annotation is the durable record — suppress
+  // the live (still-active, not-yet-saved) copy so the tooltip doesn't list
+  // the same finding twice.
+  const liveFindings = persistedAnomalies.length > 0 ? [] : (props.liveFindings ?? []);
+  const hasAnomaly = persistedAnomalies.length > 0 || liveFindings.length > 0;
+  const tooltipLines = [
+    ...persistedAnomalies.map((a) => a.content),
+    ...liveFindings.map((f) => `${f.detail} (not yet tagged)`),
+  ];
   return (
     <div
       className="flex items-center gap-0.5"
       onClick={(e) => e.stopPropagation()}
     >
       {hasAnomaly ? (
-        <Tooltip content="System-detected anomaly" side="top">
+        <Tooltip content={tooltipLines.join(" · ")} side="top">
           <span className="p-1 text-[var(--color-anomaly)]">
             <AlertTriangle size={13} />
           </span>
@@ -322,6 +337,8 @@ export function EventGrid({
   visibleColumns,
   sortDir,
   onSortToggle,
+  liveAnomalies,
+  onVisibleTimestampChange,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
 
@@ -367,6 +384,7 @@ export function EventGrid({
             anns={annotations.get(row.original.event_id) ?? []}
             caseId={caseId}
             sourceId={row.original.source_id}
+            liveFindings={liveAnomalies?.get(row.original.event_id)}
           />
         ),
       },
@@ -530,7 +548,7 @@ export function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, timelineId, sortDir, onSortToggle]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, timelineId, sortDir, onSortToggle, liveAnomalies]);
 
   const table = useReactTable({
     data: events,
@@ -550,14 +568,37 @@ export function EventGrid({
   const virtualItems = rowVirtualizer.getVirtualItems();
   const totalHeight = rowVirtualizer.getTotalSize();
 
+  // Report the timestamp of the topmost visible row so the histogram can show
+  // a "current position" indicator. Guarded against redundant calls.
+  const lastReportedTsRef = useRef<string | null>(null);
+  const reportVisibleTimestamp = useCallback(() => {
+    if (!onVisibleTimestampChange) return;
+    const el = parentRef.current;
+    const ts =
+      el && rows.length > 0
+        ? (rows[Math.min(rows.length - 1, Math.max(0, Math.floor(el.scrollTop / ROW_HEIGHT)))]
+            ?.original.timestamp ?? null)
+        : null;
+    if (ts !== lastReportedTsRef.current) {
+      lastReportedTsRef.current = ts;
+      onVisibleTimestampChange(ts);
+    }
+  }, [rows, onVisibleTimestampChange]);
+
+  useEffect(() => {
+    reportVisibleTimestamp();
+  }, [reportVisibleTimestamp]);
+
   const handleScroll = useCallback(() => {
     const el = parentRef.current;
-    if (!el || isFetching) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-    if (nearBottom && events.length < total) {
-      onLoadMore();
+    if (el && !isFetching) {
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
+      if (nearBottom && events.length < total) {
+        onLoadMore();
+      }
     }
-  }, [isFetching, events.length, total, onLoadMore]);
+    reportVisibleTimestamp();
+  }, [isFetching, events.length, total, onLoadMore, reportVisibleTimestamp]);
 
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">
@@ -592,9 +633,9 @@ export function EventGrid({
             const isExpanded = expandedId === event.event_id;
             const isSelected = selectedIds.has(event.event_id);
             const eventAnns = annotations.get(event.event_id) ?? [];
-            const hasAnomaly = eventAnns.some(
-              (a) => a.annotation_type === "anomaly",
-            );
+            const hasAnomaly =
+              eventAnns.some((a) => a.annotation_type === "anomaly") ||
+              (liveAnomalies?.get(event.event_id)?.length ?? 0) > 0;
             const hasNormal = eventAnns.some(
               (a) => a.annotation_type === "normal" && a.origin === "user",
             );

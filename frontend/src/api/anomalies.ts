@@ -1,5 +1,5 @@
 import { get, post } from "./client";
-import type { AnomaliesResponse, NoveltyFieldsResponse, TagAnomaliesResponse } from "./types";
+import type { AnomaliesResponse, Annotation, NoveltyFieldsResponse, TagAnomaliesResponse } from "./types";
 
 export interface AnomalyParams {
   detector?: "value_novelty" | "frequency";
@@ -7,6 +7,8 @@ export interface AnomalyParams {
   fields?: string;
   /** Field to group frequency series by */
   series_field?: string;
+  /** |z| cutoff for the frequency detector. Omit to use the server default. */
+  z_threshold?: number;
   /** Explicit temporal baseline end timestamp */
   baseline_start?: string;
   /** Enable temporal mode (backend uses timeline midpoint when baseline_start is absent) */
@@ -36,5 +38,21 @@ export const anomaliesApi = {
   fields: (caseId: string, timelineId: string) =>
     get<NoveltyFieldsResponse>(
       `/cases/${caseId}/timelines/${timelineId}/anomalies/fields`,
+    ),
+
+  /**
+   * Persist a single live (not-yet-tagged) finding as a system annotation,
+   * without re-running the detector or touching any other tagged finding —
+   * the per-event "Persist" action in the event detail panel.
+   */
+  persistFinding: (
+    caseId: string,
+    sourceId: string,
+    eventId: string,
+    body: { detector: "value_novelty" | "frequency"; content: string; details: Record<string, unknown> },
+  ) =>
+    post<{ annotation: Annotation }>(
+      `/cases/${caseId}/sources/${sourceId}/events/${eventId}/anomalies/persist`,
+      body,
     ),
 };

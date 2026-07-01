@@ -273,6 +273,12 @@ class Annotation(Base):
     )
     # Structured math for system annotations (null for human annotations).
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # True only for a system annotation created via the per-event "Persist"
+    # action. Bulk "Tag N as anomaly" re-runs clear and rewrite system
+    # annotations wholesale (see delete_system_annotations) — pinned rows are
+    # excluded from that clear so a manually-confirmed finding survives a
+    # later re-scan that no longer surfaces it.
+    pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -291,6 +297,7 @@ class Annotation(Base):
             "created_by": self.created_by,
             "origin": self.origin,
             "details": self.details,
+            "pinned": self.pinned,
         }
 
 
@@ -309,8 +316,10 @@ class PostgresStore:
     async def init_schema(self) -> None:
         """Create metadata tables if they do not exist.
 
-        Runs additive ``ALTER TABLE … ADD COLUMN IF NOT EXISTS`` statements for
-        columns that post-date the initial schema.  Safe to call repeatedly.
+        Only creates missing tables — does not add columns to a table that
+        already exists. A model field added after a table's first creation
+        (e.g. ``Annotation.pinned``) requires dropping and recreating that
+        table on any database created before the field was added.
         """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -887,6 +896,7 @@ class PostgresStore:
         created_by: str | None = None,
         origin: str = "user",
         details: dict | None = None,
+        pinned: bool = False,
     ) -> Annotation:
         """Persist a new annotation and return it."""
         annotation = Annotation(
@@ -899,6 +909,7 @@ class PostgresStore:
             created_by=created_by,
             origin=origin,
             details=details,
+            pinned=pinned,
         )
         async with self.session_factory() as session:
             session.add(annotation)
@@ -925,6 +936,7 @@ class PostgresStore:
                 created_by=row.get("created_by"),
                 origin=row.get("origin", "user"),
                 details=row.get("details"),
+                pinned=row.get("pinned", False),
             )
             for row in rows
         ]
@@ -939,11 +951,13 @@ class PostgresStore:
         source_ids: list[str],
         annotation_type: str,
     ) -> int:
-        """Delete all system-origin annotations of a given type for sources.
+        """Delete all non-pinned system-origin annotations of a given type.
 
         Used before re-writing outlier tags so that a fresh "Tag outliers" run
-        does not accumulate duplicate machine annotations.  Returns the count of
-        deleted rows.
+        does not accumulate duplicate machine annotations. Rows with
+        ``pinned=True`` (created via the per-event "Persist" action) are
+        excluded, so a manually-confirmed finding survives even if a later
+        re-scan no longer surfaces it. Returns the count of deleted rows.
         """
         from sqlalchemy import delete
 
@@ -954,10 +968,34 @@ class PostgresStore:
                     Annotation.source_id.in_(source_ids),
                     Annotation.annotation_type == annotation_type,
                     Annotation.origin == "system",
+                    Annotation.pinned.is_(False),
                 )
             )
             await session.commit()
             return result.rowcount
+
+    async def list_pinned_event_ids(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        annotation_type: str,
+    ) -> list[str]:
+        """Return event_ids with a pinned (manually-persisted) annotation.
+
+        Used by the bulk tag endpoint to avoid writing a second, duplicate
+        system annotation for an event that already has a pinned one.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.event_id).where(
+                    Annotation.case_id == case_id,
+                    Annotation.source_id.in_(source_ids),
+                    Annotation.annotation_type == annotation_type,
+                    Annotation.origin == "system",
+                    Annotation.pinned.is_(True),
+                ).distinct()
+            )
+            return [row[0] for row in result.all()]
 
     async def delete_annotation(
         self,
