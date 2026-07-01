@@ -462,10 +462,10 @@ export function ExplorerPage() {
     if (!isFetching && hasPreviousPage) fetchPreviousPage();
   }, [isFetching, hasPreviousPage, fetchPreviousPage]);
 
-const handleFindSimilar = useCallback((event: Event) => {
+  const handleFindSimilar = useCallback((event: Event) => {
     setSimilarAnchor(event);
     setAnalysisPanelOpen(true);
-  }, []);
+  }, [setAnalysisPanelOpen]);
 
   const handleHistogramRange = useCallback(
     (start: string, end: string) => {
@@ -783,7 +783,6 @@ const handleFindSimilar = useCallback((event: Event) => {
                   annotations={annotationMap}
                   selectedIds={selectedIds}
                   caseId={caseId!}
-                  timelineId={timelineId!}
                   onToggleSelect={handleToggleSelect}
                   onToggleSelectAll={handleToggleSelectAll}
                   expandedId={expandedEvent?.event_id ?? null}

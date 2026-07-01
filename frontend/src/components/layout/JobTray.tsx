@@ -98,9 +98,3 @@ export function JobTray() {
     </div>
   );
 }
-
-/** Hook to register a new job with the tray. */
-export function useRegisterJob() {
-  const addJob = useJobsStore((s) => s.addJob);
-  return (id: string, label: string) => addJob(id, label);
-}

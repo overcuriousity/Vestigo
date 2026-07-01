@@ -39,11 +39,12 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
 
+from tracevector.db._dt import ensure_utc, ensure_utc_iso
 from tracevector.db.clickhouse import ClickHouseStore
 
 # ---------------------------------------------------------------------------
@@ -211,13 +212,6 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _ensure_utc(dt: Any) -> datetime:
-    """Attach UTC if the datetime is naive."""
-    if hasattr(dt, "tzinfo") and dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt
-
-
 def _freq_finding(
     series_field: str,
     series_value: Any,
@@ -270,54 +264,10 @@ def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
     for key in ("timestamp", "ingest_time"):
         v = d.get(key)
         if v is not None and not isinstance(v, str):
-            try:
-                d[key] = _ensure_utc(v).isoformat()
-            except AttributeError:
-                d[key] = str(v)
+            d[key] = ensure_utc_iso(v)
     if "event_id" in d:
         d["event_id"] = str(d["event_id"])
     return d
-
-
-def _fetch_event(
-    ch: ClickHouseStore,
-    db: str,
-    case_id: str,
-    source_ids: list[str],
-    col: str,
-    field_value: str,
-    window_start: str,
-    window_end: str,
-    extra_params: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Return one representative event for a (field_value, time_window) pair."""
-    params = {
-        **extra_params,
-        "cid": case_id,
-        "src": source_ids,
-        "sv": field_value,
-        "ws": window_start[:19].replace("T", " "),
-        "we": window_end[:19].replace("T", " "),
-    }
-    cols_sql = ", ".join(_EVENT_COLUMNS)
-    sql = f"""
-        SELECT {cols_sql}
-        FROM {db}.events
-        WHERE case_id = {{cid:String}}
-          AND has({{src:Array(String)}}, source_id)
-          AND {col} = {{sv:String}}
-          AND timestamp >= {{ws:String}}
-          AND timestamp < {{we:String}}
-        ORDER BY timestamp
-        LIMIT 1
-    """
-    try:
-        res = ch.client.query(sql, parameters=params)
-        if res.result_rows:
-            return _row_to_event(_EVENT_COLUMNS, res.result_rows[0])
-    except Exception:  # noqa: BLE001
-        pass
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +450,8 @@ class StatisticalAnomalyService:
         min_ts, max_ts = res.result_rows[0]
         if min_ts is None or max_ts is None:
             return None
-        min_dt = _ensure_utc(min_ts)
-        max_dt = _ensure_utc(max_ts)
+        min_dt = ensure_utc(min_ts)
+        max_dt = ensure_utc(max_ts)
         return min_dt + (max_dt - min_dt) / 2
 
     # ------------------------------------------------------------------
@@ -648,7 +598,7 @@ class StatisticalAnomalyService:
                 # string is ambiguous to JS's Date parser (browsers treat it as
                 # local time), which silently shifted the histogram markers and
                 # event-grid anomaly matching by the browser's UTC offset.
-                first_seen_str = _ensure_utc(first_seen).isoformat() if first_seen else None
+                first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
                 evt_id_str = str(evt_id) if evt_id else None
                 mini_event: dict[str, Any] | None = None
                 if evt_id:
@@ -746,7 +696,7 @@ class StatisticalAnomalyService:
         that baseline (temporal sub-mode).
         """
         if baseline_end is not None:
-            baseline_end = _ensure_utc(baseline_end)
+            baseline_end = ensure_utc(baseline_end)
         self.ch.init_schema()
         db = self.ch.database
         ctr: list[int] = [0]
@@ -774,8 +724,8 @@ class StatisticalAnomalyService:
                 z_threshold=z_threshold,
             )
 
-        min_ts = _ensure_utc(min_ts)
-        max_ts = _ensure_utc(max_ts)
+        min_ts = ensure_utc(min_ts)
+        max_ts = ensure_utc(max_ts)
         duration = (max_ts - min_ts).total_seconds()
         interval = max(1, int(duration / bucket_count))
 
@@ -823,12 +773,33 @@ class StatisticalAnomalyService:
         evaluated_series = 0
 
         for sv, pts in series.items():
-            pts_aware = [(_ensure_utc(b), c) for b, c in pts]
+            pts_aware = [(ensure_utc(b), c) for b, c in pts]
 
             if baseline_end is not None:
                 bl_pts = [(b, c) for b, c in pts_aware if b < baseline_end]
                 detect_pts = [(b, c) for b, c in pts_aware if b >= baseline_end]
-                if len(bl_pts) < _MIN_FREQUENCY_BUCKETS or not detect_pts:
+                if not detect_pts:
+                    continue
+                if not bl_pts:
+                    # Series absent from the baseline entirely but active in
+                    # the detect window — no std can be computed from zero
+                    # points, so score against a zero baseline instead of
+                    # skipping (mirrors find_value_novelty's
+                    # baseline_cnt == 0 case: "new activity after the
+                    # incident start" is exactly what temporal mode should
+                    # surface, not silently drop).
+                    evaluated_series += 1
+                    for bucket_dt, cnt in detect_pts:
+                        z = cnt / _MIN_FREQUENCY_STD
+                        if abs(z) >= z_threshold:
+                            findings.append(
+                                _freq_finding(
+                                    series_field, sv, bucket_dt, interval, cnt,
+                                    0.0, z, method,
+                                )
+                            )
+                    continue
+                if len(bl_pts) < _MIN_FREQUENCY_BUCKETS:
                     continue
                 baseline_size += sum(c for _, c in bl_pts)
                 counts_bl = np.array([c for _, c in bl_pts], dtype=np.float64)
@@ -890,19 +861,23 @@ class StatisticalAnomalyService:
                 z_threshold=z_threshold,
             )
 
-        # Sort by |z| descending, apply limit, hydrate representative events.
-        findings.sort(key=lambda f: f.score, reverse=True)
-        top = findings[:limit]
-        top = self._hydrate_freq_findings(
-            top, case_id, source_ids, col, db, field_params, interval
+        # Hydrate representative events for every candidate finding (one
+        # batched query, not one per finding) and suppress any whose event
+        # was marked normal *before* ranking/limiting — filtering after the
+        # `[:limit]` slice would shrink the page below `limit` instead of
+        # backfilling from the next-ranked window (find_value_novelty
+        # filters before slicing for the same reason).
+        findings = self._hydrate_freq_findings(
+            findings, case_id, source_ids, col, db, field_params, interval
         )
-
-        # Suppress findings whose representative event was marked normal.
         if exclude_event_ids:
-            top = [
-                f for f in top
+            findings = [
+                f for f in findings
                 if not f.event_id or f.event_id not in exclude_event_ids
             ]
+
+        findings.sort(key=lambda f: f.score, reverse=True)
+        top = findings[:limit]
 
         return StatAnomalyResult(
             status="ok",
@@ -923,38 +898,57 @@ class StatisticalAnomalyService:
         field_params: dict[str, Any],
         interval: int,
     ) -> list[FreqFinding]:
-        """Fetch one representative event per frequency finding."""
+        """Fetch one representative event per (series_value, window) pair.
+
+        A single grouped query replaces one query per finding: every
+        (bucket, series value) pair here was already aggregated together in
+        ``find_frequency_anomalies``'s bucket scan, so ``argMin(..., timestamp)``
+        recovers the earliest event of each pair in one round-trip.
+        """
+        if not findings:
+            return findings
+
+        series_values = sorted({f.series_value for f in findings})
+        buckets = sorted({
+            datetime.fromisoformat(f.window_start).replace(tzinfo=None)
+            for f in findings
+        })
+        params: dict[str, Any] = {
+            **field_params,
+            "cid": case_id,
+            "src": source_ids,
+            "vals": series_values,
+            "buckets": buckets,
+            "iv": interval,
+        }
+        agg_cols_sql = ", ".join(f"argMin({c}, timestamp) AS {c}" for c in _EVENT_COLUMNS)
+        sql = f"""
+            SELECT
+                toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
+                {col} AS series_val,
+                {agg_cols_sql}
+            FROM {db}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND {col} IN {{vals:Array(String)}}
+              AND toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) IN {{buckets:Array(DateTime)}}
+            GROUP BY bucket, series_val
+        """
+        rows = self.ch.client.query(sql, parameters=params).result_rows
+
+        by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            bucket, series_val = row[0], row[1]
+            evt = _row_to_event(_EVENT_COLUMNS, row[2:])
+            by_key[(str(series_val), ensure_utc(bucket).isoformat())] = evt
+
         hydrated: list[FreqFinding] = []
-        cols_sql = ", ".join(_EVENT_COLUMNS)
         for f in findings:
-            params: dict[str, Any] = {
-                **field_params,
-                "cid": case_id,
-                "src": source_ids,
-                "sv": f.series_value,
-                "ws": f.window_start[:19].replace("T", " "),
-                "we": f.window_end[:19].replace("T", " "),
-            }
-            sql = f"""
-                SELECT {cols_sql}
-                FROM {db}.events
-                WHERE case_id = {{cid:String}}
-                  AND has({{src:Array(String)}}, source_id)
-                  AND {col} = {{sv:String}}
-                  AND timestamp >= {{ws:String}}
-                  AND timestamp < {{we:String}}
-                ORDER BY timestamp
-                LIMIT 1
-            """
-            try:
-                res = self.ch.client.query(sql, parameters=params)
-                if res.result_rows:
-                    evt = _row_to_event(_EVENT_COLUMNS, res.result_rows[0])
-                    hydrated.append(
-                        replace(f, event_id=str(evt.get("event_id", "")), event=evt)
-                    )
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-            hydrated.append(f)
+            evt = by_key.get((f.series_value, f.window_start))
+            if evt is not None:
+                hydrated.append(
+                    replace(f, event_id=str(evt.get("event_id", "")), event=evt)
+                )
+            else:
+                hydrated.append(f)
         return hydrated

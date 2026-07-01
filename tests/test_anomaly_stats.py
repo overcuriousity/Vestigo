@@ -8,9 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock, patch
-
-import pytest
 
 from tracevector.db.anomaly_stats import (
     FreqFinding,
@@ -20,7 +17,6 @@ from tracevector.db.anomaly_stats import (
     _classify_field,
     _col_expr,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake ClickHouse infrastructure
@@ -318,8 +314,8 @@ def _make_freq_responses(
     max_dt = datetime.strptime(max_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
 
     if bucket_rows is None:
-        # Default: flat series of 5 buckets + one spike.
-        interval = 14400  # 4h buckets for a 24h window with 6 buckets
+        # Default: flat series of 5 buckets + one spike (4h buckets for a
+        # 24h window with 6 buckets).
         bucket_rows = [
             (min_dt, "LOG", 10),
             (min_dt.replace(hour=4), "LOG", 10),
@@ -519,6 +515,85 @@ def test_frequency_temporal_baseline():
     spike = result.results[0]
     assert spike.observed == 200
     assert spike.z_score > 0
+
+
+def test_frequency_temporal_baseline_zero_baseline_flagged():
+    """A series absent from the baseline but active in the detect window is flagged.
+
+    Regression test: previously any series with zero baseline buckets was
+    skipped outright (no std computable), silently missing exactly the
+    "brand-new activity after the incident start" case temporal mode exists
+    to surface.
+    """
+    from datetime import datetime, timedelta
+
+    baseline_end = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    min_dt = datetime(2024, 1, 1, tzinfo=UTC)
+    max_dt = datetime(2024, 1, 2, tzinfo=UTC)
+    bucket_rows = [
+        # "NEWPROC" never appears before baseline_end, only after.
+        (min_dt + timedelta(hours=13), "NEWPROC", 50),
+        (min_dt + timedelta(hours=14), "NEWPROC", 60),
+    ]
+    svc = _svc([
+        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+        FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+    ])
+    svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"],
+        baseline_end=baseline_end,
+        z_threshold=2.0,
+    )
+    assert result.status == "ok"
+    values = {r.series_value for r in result.results}
+    assert "NEWPROC" in values
+
+
+def test_frequency_exclude_event_ids_backfills_from_next_ranked():
+    """Excluded findings must be dropped before the limit slice, not after.
+
+    Regression test: filtering exclude_event_ids after `[:limit]` silently
+    shrinks the page below `limit` when the top-ranked finding is excluded,
+    instead of promoting the next-ranked finding to fill the slot.
+    """
+    from dataclasses import replace as _replace
+    from datetime import datetime as _dt
+
+    min_dt = _dt(2024, 1, 1, tzinfo=UTC)
+    bucket_rows = [
+        # Series "A": baseline of 10s + a huge spike (highest-ranked finding).
+        (min_dt, "A", 10),
+        (min_dt.replace(hour=4), "A", 10),
+        (min_dt.replace(hour=8), "A", 10),
+        (min_dt.replace(hour=12), "A", 100),
+        # Series "B": baseline of 10s + a smaller spike (lower-ranked finding).
+        (min_dt.replace(hour=16), "B", 10),
+        (min_dt.replace(hour=18), "B", 10),
+        (min_dt.replace(hour=20), "B", 10),
+        (min_dt.replace(hour=22), "B", 40),
+    ]
+    svc = _svc(_make_freq_responses(bucket_rows=bucket_rows))
+
+    def _fake_hydrate(findings, *a, **kw):
+        # Assign event ids in insertion order: series "A" is scanned first,
+        # so its spike (the higher-ranked finding) becomes evt-0.
+        return [_replace(f, event_id=f"evt-{i}") for i, f in enumerate(findings)]
+
+    svc._hydrate_freq_findings = _fake_hydrate  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"],
+        z_threshold=1.0,
+        limit=1,
+        exclude_event_ids={"evt-0"},
+    )
+    assert result.status == "ok"
+    # With the top-ranked finding (series "A") excluded, series "B"'s
+    # finding must backfill the slot rather than leaving the page empty.
+    assert len(result.results) == 1
+    assert result.results[0].series_value == "B"
 
 
 # ---------------------------------------------------------------------------
@@ -748,8 +823,6 @@ def test_value_novelty_exclude_event_ids():
 
 def test_frequency_exclude_event_ids():
     """Findings whose event_id is in exclude_event_ids are suppressed after hydration."""
-    from datetime import timedelta
-
     svc = _svc(_make_freq_responses())
 
     # Hydrate with a pre-set event_id so we can test suppression.
@@ -771,21 +844,72 @@ def test_frequency_exclude_event_ids():
     assert all(f.event_id != "evt-0" for f in result.results)
 
 
+def test_hydrate_freq_findings_batches_into_a_single_query():
+    """_hydrate_freq_findings issues one query for all findings, not one each.
+
+    Regression test: hydration previously ran one ClickHouse round-trip per
+    finding (up to `limit`, capped at 500); it must now batch every
+    (series_value, window) pair into a single grouped query.
+    """
+    from datetime import timedelta
+
+    from tracevector.db.anomaly_stats import _EVENT_COLUMNS, FreqFinding
+
+    bucket_a = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    bucket_b = datetime(2024, 1, 1, 4, 0, 0, tzinfo=UTC)
+    findings = [
+        FreqFinding(
+            series_field="artifact", series_value="A",
+            window_start=bucket_a.isoformat(),
+            window_end=(bucket_a + timedelta(hours=1)).isoformat(),
+            observed=100, expected=10.0, z_score=90.0, score=90.0,
+            event_id=None, event=None, details={},
+        ),
+        FreqFinding(
+            series_field="artifact", series_value="B",
+            window_start=bucket_b.isoformat(),
+            window_end=(bucket_b + timedelta(hours=1)).isoformat(),
+            observed=40, expected=10.0, z_score=30.0, score=30.0,
+            event_id=None, event=None, details={},
+        ),
+    ]
+
+    row_a = ("evt-a", "c1", "s1", "spike A") + (None,) * (len(_EVENT_COLUMNS) - 4)
+    row_b = ("evt-b", "c1", "s1", "spike B") + (None,) * (len(_EVENT_COLUMNS) - 4)
+    svc = _svc([
+        FakeQueryResult(
+            result_rows=[
+                (bucket_a.replace(tzinfo=None), "A", *row_a),
+                (bucket_b.replace(tzinfo=None), "B", *row_b),
+            ],
+            column_names=["bucket", "series_val", *_EVENT_COLUMNS],
+        ),
+    ])
+
+    hydrated = svc._hydrate_freq_findings(
+        findings, "c1", ["s1"], "artifact", "tracevector", {}, 3600,
+    )
+
+    assert len(svc.ch.client._calls) == 1
+    assert {f.event_id for f in hydrated} == {"evt-a", "evt-b"}
+    by_value = {f.series_value: f for f in hydrated}
+    assert by_value["A"].event["message"] == "spike A"
+    assert by_value["B"].event["message"] == "spike B"
+
+
 # ---------------------------------------------------------------------------
 # get_timeline_midpoint
 # ---------------------------------------------------------------------------
 
 
 def test_get_timeline_midpoint_returns_midpoint():
-    from datetime import datetime, timezone
-
-    min_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    max_dt = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    min_dt = datetime(2024, 1, 1, tzinfo=UTC)
+    max_dt = datetime(2024, 1, 3, tzinfo=UTC)
     svc = _svc([
         FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
     ])
     mid = svc.get_timeline_midpoint("c1", ["s1"])
-    assert mid == datetime(2024, 1, 2, tzinfo=timezone.utc)
+    assert mid == datetime(2024, 1, 2, tzinfo=UTC)
 
 
 def test_get_timeline_midpoint_returns_none_when_no_events():

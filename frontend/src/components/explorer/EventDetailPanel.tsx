@@ -280,11 +280,19 @@ export function EventDetailPanel({
   const userAnnotations = annotations.filter((a) => a.origin === "user");
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
   const persistedAnomalies = systemAnnotations.filter((a) => a.annotation_type === "anomaly");
-  // Once an event has been tagged, the persisted annotation is the durable
-  // record of that finding — the live (still-active) finding from the
-  // Analysis tab is the same thing, just not yet saved, so showing both
-  // duplicates the same information. Suppress the live copy once tagged.
-  const effectiveLiveFindings = persistedAnomalies.length > 0 ? [] : liveFindings;
+  const persistedDetectors = new Set(persistedAnomalies.map((a) => a.detector));
+  // Once an event has been tagged for a given detector, the persisted
+  // annotation is the durable record of that detector's finding — the live
+  // (still-active) finding from the Analysis tab is the same thing, just
+  // not yet saved, so showing both duplicates the same information.
+  // Suppress only the live copy for detectors already persisted — a
+  // different detector's still-live finding on the same event must stay
+  // visible, since detectors are independent (see postgres.py
+  // delete_system_annotations/list_pinned_event_ids, both scoped by
+  // `detector`).
+  const effectiveLiveFindings = liveFindings.filter(
+    (f) => !persistedDetectors.has(f.detector),
+  );
   // Aggregated across every anomaly kind — persisted (tagged) system
   // annotations plus whatever the currently active analysis tab is showing
   // but hasn't been tagged yet — so this is always visible regardless of

@@ -104,6 +104,57 @@ async def test_resolve_annotated_dedupes_overlap_between_persisted_and_live(
 
 
 # ---------------------------------------------------------------------------
+# bulk_annotate_by_filter
+# ---------------------------------------------------------------------------
+
+
+class _FakeQueryService:
+    """Captures the EventQuery passed by bulk_annotate_by_filter."""
+
+    def __init__(self, refs: list[tuple[str, str]]) -> None:
+        self.refs = refs
+        self.last_query = None
+
+    def query_event_refs(self, query, cap: int = 100_000):
+        self.last_query = query
+        return self.refs
+
+
+@pytest.mark.asyncio
+async def test_bulk_annotate_by_filter_honors_annotated_restriction(
+    patched_store, monkeypatch
+):
+    """The 'apply to all matching filter' bulk action must not silently
+    ignore an active `annotated` (e.g. anomaly) filter — regression test for
+    a bug where BulkAnnotateByFilterRequest had no `annotated` field at all,
+    so bulk-tagging while filtered to flagged events wrote to every event
+    matching the other filters instead of just the flagged subset."""
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source(
+        "c1", "s1", "source one", file_hash="h1", size_bytes=10
+    )
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+    await patched_store.create_annotation(
+        case_id="c1", source_id="s1", event_id="flagged-evt",
+        annotation_id="ann1", annotation_type="anomaly",
+        content="tagged", origin="system",
+    )
+
+    fake_service = _FakeQueryService(refs=[("flagged-evt", "s1")])
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
+
+    body = events.BulkAnnotateByFilterRequest(
+        annotation_type="tag",
+        content="reviewed",
+        annotated="anomaly",
+    )
+    result = await events.bulk_annotate_by_filter("c1", "t1", body)
+
+    assert result == {"tagged": 1}
+    assert fake_service.last_query.event_ids == ["flagged-evt"]
+
+
+# ---------------------------------------------------------------------------
 # _index_annotations_by_event (export enrichment)
 # ---------------------------------------------------------------------------
 

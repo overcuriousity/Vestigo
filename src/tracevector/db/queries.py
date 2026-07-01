@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
 
+from tracevector.db._dt import ensure_utc, ensure_utc_iso
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.field_recommend import (
     recommend_fields,
@@ -155,9 +156,7 @@ def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("timestamp", "ingest_time"):
         value = row.get(key)
         if isinstance(value, datetime):
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=UTC)
-            row[key] = value.isoformat()
+            row[key] = ensure_utc_iso(value)
     return row
 
 
@@ -820,7 +819,7 @@ class EventQueryService:
         if is_multi_source:
             # Build source_id -> token -> [values] pooled across all artifacts.
             pooled_by_source: dict[str, dict[str, list[Any]]] = {}
-            for artifact_name, src_map in samples_by_src.items():
+            for _artifact_name, src_map in samples_by_src.items():
                 for src_id, token_map in src_map.items():
                     dest = pooled_by_source.setdefault(src_id, {})
                     for token, vals in token_map.items():
@@ -881,10 +880,8 @@ class EventQueryService:
             return {"interval_seconds": 0, "min": None, "max": None, "buckets": []}
 
         # Ensure timezone-aware for arithmetic.
-        if hasattr(min_ts, "tzinfo") and min_ts.tzinfo is None:
-            min_ts = min_ts.replace(tzinfo=UTC)
-        if hasattr(max_ts, "tzinfo") and max_ts.tzinfo is None:
-            max_ts = max_ts.replace(tzinfo=UTC)
+        min_ts = ensure_utc(min_ts)
+        max_ts = ensure_utc(max_ts)
 
         duration = (max_ts - min_ts).total_seconds()
         interval = max(1, int(duration / buckets))
@@ -901,15 +898,8 @@ class EventQueryService:
             parameters=parameters,
         )
 
-        def _to_utc_iso(dt: Any) -> str:
-            if hasattr(dt, "isoformat"):
-                if hasattr(dt, "tzinfo") and dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=UTC)
-                return dt.isoformat()
-            return str(dt)
-
         bucket_list = [
-            {"start": _to_utc_iso(row[0]), "count": row[1]}
+            {"start": ensure_utc_iso(row[0]), "count": row[1]}
             for row in bucket_result.result_rows
         ]
         return {

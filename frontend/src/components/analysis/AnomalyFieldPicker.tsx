@@ -97,7 +97,7 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
     staleTime: 5 * 60 * 1000,
   });
 
-  const allFields = data?.fields ?? [];
+  const allFields = useMemo(() => data?.fields ?? [], [data]);
 
   // Standard fields = top-level columns (no "attr:" prefix).
   // Dynamic fields = attribute keys.

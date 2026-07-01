@@ -10,7 +10,7 @@
  * Brush state uses refs (not React state) so mouseup reliably reads the
  * current selection even when no re-render has occurred since mousedown.
  */
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { eventsApi } from "@/api/events";
 import { Spinner } from "@/components/ui/Spinner";
@@ -128,7 +128,7 @@ export function TimelineHistogram({
     text: string;
   } | null>(null);
 
-  const buckets = data?.buckets ?? [];
+  const buckets = useMemo(() => data?.buckets ?? [], [data]);
   const maxCount = Math.max(1, ...buckets.map((b: HistogramBucket) => b.count));
 
   const applyBrush = useCallback(

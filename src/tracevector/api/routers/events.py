@@ -424,6 +424,22 @@ class BulkAnnotateByFilterRequest(BaseModel):
         default=None,
         description='JSON field-exclusion filters, e.g. {"status_code":["200"]}',
     )
+    annotated: str | None = Field(
+        default=None,
+        description='Comma-separated annotation types to restrict to, e.g. "tag,anomaly".',
+    )
+    annotation_tag_value: str | None = Field(
+        default=None,
+        description="Narrow the 'tag' annotation type to a specific tag value.",
+    )
+    live_event_ids: str | None = Field(
+        default=None,
+        description=(
+            "Comma-separated event IDs currently flagged by the active, "
+            "not-yet-persisted Analysis tab — unioned into the 'anomaly' "
+            "branch of `annotated` so bulk actions can apply to live findings."
+        ),
+    )
 
 
 @router.post("/{case_id}/timelines/{timeline_id}/events/annotations/bulk")
@@ -446,13 +462,18 @@ async def bulk_annotate_by_filter(
         )
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    annotated_ids = await _resolve_annotated_event_ids(
+        case_id, source_ids, body.annotated, body.annotation_tag_value, body.live_event_ids
+    )
     tags_include_ids = await _resolve_tags_event_ids(
         case_id, source_ids, _parse_str_list(body.tags_include)
     )
     tags_exclude_ids = await _resolve_tags_event_ids(
         case_id, source_ids, _parse_str_list(body.tags_exclude)
     )
-    event_ids = _intersect_optional(tags_include_ids, _parse_id_list(body.ids))
+    event_ids = _intersect_optional(
+        annotated_ids, tags_include_ids, _parse_id_list(body.ids)
+    )
 
     service = _get_query_service()
     refs = service.query_event_refs(

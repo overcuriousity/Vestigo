@@ -67,6 +67,12 @@ export const annotationsApi = {
         end: filters.end ?? null,
         filters: filters.filters ? JSON.stringify(filters.filters) : null,
         exclusions: filters.exclusions ? JSON.stringify(filters.exclusions) : null,
+        annotated: filters.annotated && filters.annotated.length > 0 ? filters.annotated.join(",") : null,
+        annotation_tag_value: filters.annotationTagValue ?? null,
+        live_event_ids:
+          filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0
+            ? filters.liveAnomalyEventIds.join(",")
+            : null,
       },
     );
   },

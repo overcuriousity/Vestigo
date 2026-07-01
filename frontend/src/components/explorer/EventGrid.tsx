@@ -42,7 +42,6 @@ interface Props {
   annotations: Map<string, Annotation[]>; // eventId → annotations
   selectedIds: Set<string>;
   caseId: string;
-  timelineId: string;
   onToggleSelect: (id: string) => void;
   /** Toggles selection of all currently-loaded events. */
   onToggleSelectAll: () => void;
@@ -342,7 +341,6 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   annotations,
   selectedIds,
   caseId,
-  timelineId,
   onToggleSelect,
   onToggleSelectAll,
   expandedId,
@@ -587,7 +585,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, timelineId, sortDir, onSortToggle, liveAnomalies]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, sortDir, onSortToggle, liveAnomalies]);
 
   const columnWidths = useUiStore((s) => s.columnWidths);
   const setColumnWidth = useUiStore((s) => s.setColumnWidth);
