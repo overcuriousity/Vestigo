@@ -118,7 +118,10 @@ class EmbeddingModel:
         vectors: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
-            response = client.post("/embeddings", json={"model": self.model_name, "input": batch})
+            response = client.post(
+                "/embeddings",
+                json={"model": self.model_name, "input": batch, "encoding_format": "float"},
+            )
             response.raise_for_status()
             data = sorted(response.json()["data"], key=lambda item: item["index"])
             vectors.extend(item["embedding"] for item in data)
