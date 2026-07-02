@@ -28,9 +28,18 @@
 - Aligns with ScalarForensic and the broader ML/Python tooling ecosystem.
 - FastAPI gives async request handling and auto-generated OpenAPI docs with minimal boilerplate.
 - `uv` provides fast dependency resolution and lockfiles; supports PyTorch ROCm/CUDA index overrides.
-- CPU-only PyTorch is the default to keep installs small. GPU acceleration is opt-in:
+- CPU-only PyTorch is the default in `pyproject.toml` (`tool.uv.index`/`tool.uv.sources`), so
+  `uv sync` works out of the box on any machine with no GPU-specific setup — this is the
+  right choice for evaluation and for deployments that don't run the embedding pipeline.
+  GPU acceleration is opt-in and is the recommended path for **production use of the
+  embedding features** (`tv embed`, semantic search, similarity) — embedding large
+  timelines on CPU is significantly slower:
   - **AMD ROCm 6.4** is the primary GPU target (mirrors ScalarForensic).
   - **NVIDIA CUDA 12.8** is also supported.
+  - To switch, uncomment the matching index block in `pyproject.toml` and comment out the
+    CPU block, then `uv lock && uv sync`. See the comments in `pyproject.toml` for the
+    caveats (`explicit = true` on every index; ROCm needs `pytorch-triton-rocm` added as a
+    direct dependency since it's a transitive-only dep of `torch`).
 
 ### 3.2 Frontend — React 19 + Vite
 

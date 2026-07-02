@@ -67,8 +67,16 @@ build-backend = "hatchling.build"
 packages = ["src/tracevector"]
 
 # --- UV package indexes ------------------------------------------------------
-# Default: CPU-only PyTorch for the smallest install footprint.
-# Uncomment ONE GPU block below to enable acceleration.
+# Default: CPU-only PyTorch, so `uv sync` works out of the box on any machine
+# with no GPU-specific setup ("plug and play"). This is fine for evaluation
+# and for deployments that don't run the embedding pipeline.
+# For production use of the embedding features (`tv embed`, semantic search,
+# similarity), switch to a GPU index below — embedding large timelines on CPU
+# is significantly slower.
+# Uncomment ONE GPU block below to enable acceleration. Both `[[tool.uv.index]]`
+# entries must keep `explicit = true`, or uv will consider that index for ALL
+# dependencies (not just torch/torchvision), which can pull incompatible
+# transitive versions (e.g. an ancient urllib3 pin) instead of PyPI's.
 # ROCm is the primary GPU target; CUDA is also supported.
 # See https://docs.astral.sh/uv/concepts/projects/config/#project-indexes
 
@@ -82,19 +90,28 @@ explicit = true
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 
-# --- AMD ROCm 6.4 (primary GPU target) ---
+# --- AMD ROCm 6.4 (primary GPU target; recommended for production embedding workloads) ---
 # [[tool.uv.index]]
 # name = "pytorch-rocm64"
 # url = "https://download.pytorch.org/whl/rocm6.4"
+# explicit = true
 #
 # [tool.uv.sources]
 # torch = { index = "pytorch-rocm64" }
 # torchvision = { index = "pytorch-rocm64" }
+# pytorch-triton-rocm = { index = "pytorch-rocm64" }
+#
+# NOTE: torch's own dependency on pytorch-triton-rocm is only resolved from
+# this index if it's also a direct project dependency (uv doesn't route
+# purely-transitive deps through `tool.uv.sources`). Also add, in
+# [project.dependencies] above:
+#   "pytorch-triton-rocm; sys_platform == 'linux'",
 
 # --- NVIDIA CUDA 12.8 (secondary GPU target) ---
 # [[tool.uv.index]]
 # name = "pytorch-cu128"
 # url = "https://download.pytorch.org/whl/cu128"
+# explicit = true
 #
 # [tool.uv.sources]
 # torch = { index = "pytorch-cu128" }
