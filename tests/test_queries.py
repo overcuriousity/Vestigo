@@ -897,3 +897,242 @@ def test_histogram_empty_dataset_returns_empty_buckets() -> None:
     result = svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]))
     assert result["buckets"] == []
     assert result["min"] is None
+
+
+# ── viz aggregation tests (field_terms / field_numeric_stats / field_value_timeseries) ─────
+
+
+class _VizFakeClient:
+    """Dispatches canned results by matching a substring in the query text.
+
+    *responses* is tried in order — put more specific substrings first so a
+    query matching several markers gets the intended canned result.
+    """
+
+    def __init__(self, responses: list[tuple[str, FakeQueryResult]]) -> None:
+        self._responses = responses
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def query(
+        self, query: str, parameters: dict[str, Any] | None = None, **_kwargs: Any
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        for substr, result in self._responses:
+            if substr in query:
+                return result
+        raise AssertionError(f"No fake response configured for query:\n{query}")
+
+
+def _viz_service(responses: list[tuple[str, FakeQueryResult]]) -> EventQueryService:
+    store = FakeClickHouseStore()
+    store.client = _VizFakeClient(responses)  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_field_terms_returns_top_values_and_other_count() -> None:
+    svc = _viz_service(
+        [
+            ("uniqExact(", FakeQueryResult(result_rows=[[100, 5]])),
+            (
+                "GROUP BY val",
+                FakeQueryResult(result_rows=[["GET", 60], ["POST", 30]]),
+            ),
+        ]
+    )
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    assert result["total"] == 100
+    assert result["distinct"] == 5
+    assert result["values"] == [{"value": "GET", "count": 60}, {"value": "POST", "count": 30}]
+    assert result["other_count"] == 10
+
+
+def test_field_terms_empty_dataset_skips_terms_query() -> None:
+    svc = _viz_service([("uniqExact(", FakeQueryResult(result_rows=[[0, 0]]))])
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    assert result == {
+        "field": "artifact",
+        "total": 0,
+        "distinct": 0,
+        "values": [],
+        "other_count": 0,
+    }
+    # No GROUP BY terms query should have been attempted since total is 0.
+    assert not any("GROUP BY val" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+
+
+def test_field_terms_top_level_column_uses_bare_column() -> None:
+    svc = _viz_service(
+        [
+            ("uniqExact(", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["auth", 1]])),
+        ]
+    )
+    svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    query, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "uniqExact(artifact)" in query
+    assert "attributes[" not in query
+
+
+def test_field_terms_attribute_field_uses_map_lookup() -> None:
+    svc = _viz_service(
+        [
+            ("uniqExact(", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["200", 1]])),
+        ]
+    )
+    svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code")
+    query, params = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "attributes[{field_key:String}]" in query
+    assert params is not None
+    assert params.get("field_key") == "status_code"
+
+
+def test_field_terms_honors_field_filters() -> None:
+    """field_terms must reuse _build_where so it respects the same filters as the grid."""
+    svc = _viz_service(
+        [
+            ("uniqExact(", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["ok", 1]])),
+        ]
+    )
+    svc.field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"], field_filters={"artifact": "auth"}),
+        "artifact",
+    )
+    query, params = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "artifact = {p2:String}" in query
+    assert params is not None
+    assert params.get("p2") == "auth"
+
+
+def test_field_numeric_stats_returns_stats_and_fixed_width_bins() -> None:
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[
+                        [10, 0.0, 100.0, 50.0, 10.0, 1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+                    ]
+                ),
+            ),
+            (
+                "toUInt32(floor(",
+                FakeQueryResult(result_rows=[[0, 5], [1, 5]]),
+            ),
+        ]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:bytes_sent", bins=2
+    )
+    assert result["count"] == 10
+    assert result["min"] == 0.0
+    assert result["max"] == 100.0
+    assert result["mean"] == 50.0
+    assert result["stddev"] == 10.0
+    assert result["quantiles"]["0.5"] == 50.0
+    assert result["quantiles"]["0.99"] == 99.0
+    assert len(result["bins"]) == 2
+    assert result["bins"][0] == {"x0": 0.0, "x1": 50.0, "count": 5}
+    assert result["bins"][1] == {"x0": 50.0, "x1": 100.0, "count": 5}
+
+
+def test_field_numeric_stats_fills_empty_bins_with_zero() -> None:
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[[4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]]
+                ),
+            ),
+            # Only bin 0 has data — bins 1-3 must still appear, count 0.
+            ("toUInt32(floor(", FakeQueryResult(result_rows=[[0, 4]])),
+        ]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:latency_ms", bins=4
+    )
+    assert [b["count"] for b in result["bins"]] == [4, 0, 0, 0]
+
+
+def test_field_numeric_stats_non_numeric_field_returns_zero_count() -> None:
+    """count == 0 signals the caller to fall back to categorical treatment."""
+    svc = _viz_service(
+        [("stddevPop(v)", FakeQueryResult(result_rows=[[0, None, None, None, None]]))]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:user_agent", bins=10
+    )
+    assert result == {
+        "field": "attr:user_agent",
+        "count": 0,
+        "min": None,
+        "max": None,
+        "mean": None,
+        "stddev": None,
+        "quantiles": {},
+        "bins": [],
+    }
+    # No histogram bin query should have been attempted for a non-numeric field.
+    assert not any("toUInt32(floor(" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+
+
+def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    bucket1 = min_ts
+    bucket2 = min_ts + timedelta(hours=12)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("uniqExact(", FakeQueryResult(result_rows=[[3, 2]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2], ["b", 1]])),
+            (
+                "toStartOfInterval",
+                FakeQueryResult(
+                    result_rows=[
+                        [bucket1, "a", 2],
+                        [bucket1, "b", 1],
+                        [bucket2, "a", 1],
+                    ]
+                ),
+            ),
+        ]
+    )
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code", buckets=2, series_limit=12
+    )
+    assert result["interval_seconds"] > 0
+    series_by_value = {s["value"]: s for s in result["series"]}
+    assert set(series_by_value) == {"a", "b"}
+    # "b" has no row for bucket2 — must be zero-filled, not omitted.
+    b_counts = {b["start"]: b["count"] for b in series_by_value["b"]["buckets"]}
+    assert len(b_counts) == 2
+    assert sum(b_counts.values()) == 1
+
+
+def test_field_value_timeseries_empty_range_returns_empty_series() -> None:
+    svc = _viz_service([("min(timestamp)", FakeQueryResult(result_rows=[[None, None]]))])
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "artifact", buckets=60
+    )
+    assert result["series"] == []
+    assert result["min"] is None
+
+
+def test_field_value_timeseries_no_values_returns_empty_series_without_bucket_query() -> None:
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("uniqExact(", FakeQueryResult(result_rows=[[0, 0]])),
+        ]
+    )
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "artifact", buckets=60
+    )
+    assert result["series"] == []
+    assert result["min"] == min_ts.isoformat()
+    assert not any("toStartOfInterval" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]

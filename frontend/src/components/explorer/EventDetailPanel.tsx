@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck, AlertTriangle, Save } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck, AlertTriangle, Save, BarChart2 } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -23,6 +23,9 @@ interface Props {
   onFindSimilar: (event: Event) => void;
   /** Called when the user clicks filter-in or filter-out on a field row. */
   onAddFilter: (fieldKey: string, value: string, include: boolean) => void;
+  /** Called when the user clicks the histogram button on a field row —
+   * opens the per-value histogram modal for `fieldKey = value`. */
+  onShowFieldHistogram?: (fieldKey: string, value: string) => void;
   /** Scrolls the main grid to this event's position, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string) => void;
   /** Existing annotation-tag labels for autocomplete. */
@@ -61,12 +64,14 @@ function FieldRow({
   mono = false,
   filterKey,
   onAddFilter,
+  onShowHistogram,
 }: {
   label: string;
   value: string | null | undefined;
   mono?: boolean;
   filterKey?: string | null;
   onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
+  onShowHistogram?: (fieldKey: string, value: string) => void;
 }) {
   if (!value) return null;
   const canFilter = !!filterKey && !!onAddFilter;
@@ -108,6 +113,19 @@ function FieldRow({
                 <FilterX size={11} />
               </button>
             </Tooltip>
+            {onShowHistogram && (
+              <Tooltip content={`Histogram of ${label}`} side="top">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onShowHistogram(filterKey!, value);
+                  }}
+                  className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-base"
+                >
+                  <BarChart2 size={11} />
+                </button>
+              </Tooltip>
+            )}
           </>
         )}
         <CopyButton value={value} />
@@ -230,6 +248,7 @@ export function EventDetailPanel({
   onClose,
   onFindSimilar,
   onAddFilter,
+  onShowFieldHistogram,
   onJumpToTime,
   tagSuggestions = [],
   liveFindings = [],
@@ -402,6 +421,7 @@ export function EventDetailPanel({
             value={event.timestamp_desc}
             filterKey="timestamp_desc"
             onAddFilter={onAddFilter}
+            onShowHistogram={onShowFieldHistogram}
           />
           <FieldRow
             label="ingest_time"
@@ -421,6 +441,7 @@ export function EventDetailPanel({
             mono
             filterKey="artifact"
             onAddFilter={onAddFilter}
+            onShowHistogram={onShowFieldHistogram}
           />
           <FieldRow
             label="artifact_long"
@@ -428,12 +449,14 @@ export function EventDetailPanel({
             mono
             filterKey="artifact_long"
             onAddFilter={onAddFilter}
+            onShowHistogram={onShowFieldHistogram}
           />
           <FieldRow
             label="display_name"
             value={event.display_name}
             filterKey="display_name"
             onAddFilter={onAddFilter}
+            onShowHistogram={onShowFieldHistogram}
           />
         </div>
 
@@ -480,6 +503,7 @@ export function EventDetailPanel({
                 mono
                 filterKey={k}
                 onAddFilter={onAddFilter}
+                onShowHistogram={onShowFieldHistogram}
               />
             ))}
           </div>

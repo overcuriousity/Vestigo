@@ -455,6 +455,66 @@ export interface HistogramResponse {
   buckets: HistogramBucket[];
 }
 
+/** One value's count from a `viz/field-terms` terms aggregation. */
+export interface FieldTermCount {
+  value: string;
+  count: number;
+}
+
+/** Top-N value/count terms aggregation for a field, honoring the active filters. */
+export interface FieldTermsResponse {
+  field: string;
+  /** Total non-empty matching rows (across all values, not just the top-N returned). */
+  total: number;
+  /** Number of distinct non-empty values. */
+  distinct: number;
+  values: FieldTermCount[];
+  /** Count of non-empty values outside the returned top-N — render as an "Other" slice. */
+  other_count: number;
+}
+
+/** One fixed-width bin of a numeric field's value distribution. */
+export interface FieldNumericBin {
+  x0: number;
+  x1: number;
+  count: number;
+}
+
+/**
+ * Summary statistics + fixed-width histogram for a numeric field.
+ * `count === 0` means the field has no numeric values in the current filter
+ * set — callers should fall back to treating it as categorical.
+ */
+export interface FieldNumericResponse {
+  field: string;
+  count: number;
+  min: number | null;
+  max: number | null;
+  mean: number | null;
+  stddev: number | null;
+  /** Keyed by quantile, e.g. "0.5" (median), "0.25", "0.95", ... */
+  quantiles: Record<string, number>;
+  bins: FieldNumericBin[];
+}
+
+/** One time-bucketed series (a single field value's counts over time). */
+export interface FieldTimeseriesSeries {
+  value: string;
+  buckets: HistogramBucket[];
+}
+
+/**
+ * Per-value event counts bucketed over time, restricted to the top
+ * `series_limit` values by overall count (see `vizApi.fieldTimeseries`).
+ */
+export interface FieldTimeseriesResponse {
+  field: string;
+  interval_seconds: number;
+  min: string | null;
+  max: string | null;
+  series: FieldTimeseriesSeries[];
+}
+
 /** Body for export endpoint */
 export interface ExportRequest {
   format: "csv" | "jsonl";

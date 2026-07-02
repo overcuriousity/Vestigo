@@ -185,6 +185,23 @@ def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
 _EVENT_SELECT_COLUMNS = ",\n    ".join(EVENT_SELECT_COLUMNS)
 
 
+def _field_column_expr(field_token: str, parameters: dict[str, Any], param_name: str) -> str:
+    """Resolve *field_token* to a SQL expression, binding an attribute key if needed.
+
+    Mirrors ``_ParameterizedQueryBuilder._column_expr`` but is deliberately a
+    free function taking an explicit, caller-chosen *param_name* rather than
+    an auto-incrementing ``pN`` — the viz aggregations below build their WHERE
+    clause via ``_build_where`` first (which already claims ``p0..pN``) and
+    then need one more parameter for the field-under-analysis without risking
+    a name collision with those.
+    """
+    column, attr_key = resolve_column_token(field_token)
+    if column is not None:
+        return column
+    parameters[param_name] = attr_key
+    return f"attributes[{{{param_name}:String}}]"
+
+
 class _ParameterizedQueryBuilder:
     """Build a ClickHouse WHERE clause using named parameters."""
 
@@ -912,4 +929,241 @@ class EventQueryService:
             "min": min_ts.isoformat(),
             "max": max_ts.isoformat(),
             "buckets": bucket_list,
+        }
+
+    def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
+        """Return a top-N terms aggregation (value → count) for *field_token*.
+
+        Honors all query filters (same ``_build_where`` as every other
+        aggregation here), so the result always matches the currently
+        filtered Explorer view. Powers both the per-value histogram modal's
+        top-list and the Visualization page's nominal/ordinal chart types.
+
+        ``other_count`` is the count of non-empty values that fall outside
+        the top *limit* — present so a bar/pie chart can render a truthful
+        "Other" slice instead of silently dropping the tail.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+
+        totals_result = self.store.client.query(
+            f"""
+            SELECT count() AS n, uniqExact({col_expr}) AS d
+            FROM {database}.events
+            WHERE {where} AND {col_expr} != ''
+            """,
+            parameters=parameters,
+        )
+        total, distinct = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+
+        values: list[dict[str, Any]] = []
+        if total:
+            terms_result = self.store.client.query(
+                f"""
+                SELECT {col_expr} AS val, count() AS c
+                FROM {database}.events
+                WHERE {where} AND {col_expr} != ''
+                GROUP BY val
+                ORDER BY c DESC, val ASC
+                LIMIT {int(limit)}
+                """,
+                parameters=parameters,
+            )
+            values = [{"value": row[0], "count": row[1]} for row in terms_result.result_rows]
+
+        other_count = total - sum(v["count"] for v in values)
+        return {
+            "field": field_token,
+            "total": total,
+            "distinct": distinct,
+            "values": values,
+            "other_count": max(0, other_count),
+        }
+
+    # Quantiles reported for every numeric field — chosen to cover both the
+    # box-plot five-number summary (0.25/0.5/0.75, whiskers approximated from
+    # the data range) and tail behavior an analyst investigating a DoS or
+    # outlier burst cares about (0.01/0.05/0.95/0.99).
+    _NUMERIC_QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+
+    def field_numeric_stats(
+        self, query: EventQuery, field_token: str, bins: int = 30
+    ) -> dict[str, Any]:
+        """Return summary statistics and a fixed-width histogram for a numeric field.
+
+        Values are cast with ``toFloat64OrNull(toString(...))`` since dynamic
+        attributes are stored as strings; non-numeric values are silently
+        dropped from the cast (become NULL) rather than erroring. ``count ==
+        0`` is the signal callers use to fall back to treating the field as
+        categorical instead.
+
+        Bins are **fixed-width** (evenly spaced across ``[min, max]``), not
+        ClickHouse's adaptive ``histogram()`` function — reproducibility (the
+        same filters always produce the same bin edges) matters more here
+        than adaptive bin placement.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+
+        quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
+        stats_result = self.store.client.query(
+            f"""
+            SELECT count(v) AS n, min(v) AS mn, max(v) AS mx, avg(v) AS mean,
+                   stddevPop(v) AS sd, {quantile_exprs}
+            FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            """,
+            parameters=parameters,
+        )
+        row = stats_result.result_rows[0] if stats_result.result_rows else None
+        count = row[0] if row else 0
+
+        empty: dict[str, Any] = {
+            "field": field_token,
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "stddev": None,
+            "quantiles": {},
+            "bins": [],
+        }
+        if not count:
+            return empty
+
+        mn, mx, mean, sd, *quantile_values = row[1:]
+        quantiles = dict(
+            zip((str(q) for q in self._NUMERIC_QUANTILES), quantile_values, strict=True)
+        )
+
+        bin_count = max(1, int(bins))
+        span = mx - mn
+        bin_width = span / bin_count if span > 0 else 1.0
+
+        hist_result = self.store.client.query(
+            f"""
+            SELECT least({bin_count - 1}, toUInt32(floor((v - {{mn:Float64}}) / {{bw:Float64}}))) AS bin_idx,
+                   count() AS c
+            FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            GROUP BY bin_idx
+            ORDER BY bin_idx
+            """,
+            parameters={**parameters, "mn": mn, "bw": bin_width},
+        )
+        counts_by_bin = {row[0]: row[1] for row in hist_result.result_rows}
+        bins_out = [
+            {
+                "x0": mn + i * bin_width,
+                "x1": mn + (i + 1) * bin_width,
+                "count": counts_by_bin.get(i, 0),
+            }
+            for i in range(bin_count)
+        ]
+
+        return {
+            "field": field_token,
+            "count": count,
+            "min": mn,
+            "max": mx,
+            "mean": mean,
+            "stddev": sd,
+            "quantiles": quantiles,
+            "bins": bins_out,
+        }
+
+    def field_value_timeseries(
+        self,
+        query: EventQuery,
+        field_token: str,
+        buckets: int = 60,
+        series_limit: int = 12,
+    ) -> dict[str, Any]:
+        """Return per-value event counts bucketed over time for *field_token*.
+
+        Restricts to the top *series_limit* values by overall count (via
+        :py:meth:`field_terms`) so a high-cardinality field doesn't explode
+        into hundreds of series — the Visualization page surfaces
+        ``field_terms``' ``other_count``/``distinct`` alongside this so the
+        analyst knows series were capped. Powers the multi-series line chart
+        and the value×time heatmap.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+
+        if query.start is not None and query.end is not None:
+            min_ts: datetime | None = ensure_utc(query.start)
+            max_ts: datetime | None = ensure_utc(query.end)
+        else:
+            min_ts, max_ts = query_timestamp_range(self.store.client, database, where, parameters)
+
+        empty: dict[str, Any] = {
+            "field": field_token,
+            "interval_seconds": 0,
+            "min": None,
+            "max": None,
+            "series": [],
+        }
+        if min_ts is None or max_ts is None:
+            return empty
+
+        terms = self.field_terms(query, field_token, limit=series_limit)
+        top_values = [v["value"] for v in terms["values"]]
+        if not top_values:
+            return {
+                **empty,
+                "interval_seconds": 0,
+                "min": min_ts.isoformat(),
+                "max": max_ts.isoformat(),
+            }
+
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        parameters["series_values"] = top_values
+
+        bucket_result = self.store.client.query(
+            f"""
+            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                   {col_expr} AS val,
+                   count() AS c
+            FROM {database}.events
+            WHERE {where} AND timestamp IS NOT NULL
+                AND has({{series_values:Array(String)}}, {col_expr})
+            GROUP BY bucket, val
+            ORDER BY bucket
+            """,
+            parameters=parameters,
+        )
+
+        # Pivot into one bucket-list per value, in the same top-N order as
+        # `terms`, filling buckets with zero rows so every series has an
+        # entry for every bucket the chart draws.
+        by_value: dict[str, dict[str, int]] = {v: {} for v in top_values}
+        for bucket_ts, val, count in bucket_result.result_rows:
+            by_value.setdefault(val, {})[ensure_utc_iso(bucket_ts)] = count
+
+        all_starts = sorted({ensure_utc_iso(row[0]) for row in bucket_result.result_rows})
+        series = [
+            {
+                "value": value,
+                "buckets": [
+                    {"start": start, "count": by_value.get(value, {}).get(start, 0)}
+                    for start in all_starts
+                ],
+            }
+            for value in top_values
+        ]
+
+        return {
+            "field": field_token,
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "series": series,
         }

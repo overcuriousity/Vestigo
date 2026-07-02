@@ -14,7 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tracevector import __version__
 from tracevector.api.deps import get_store, resolve_user_optional
-from tracevector.api.routers import admin, auth, cases, events, jobs, stream
+from tracevector.api.routers import admin, auth, cases, events, jobs, stream, viz
 from tracevector.core.config import get_settings
 from tracevector.core.security import hash_password
 from tracevector.db.postgres import generate_id
@@ -256,6 +256,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(cases.router)
     app.include_router(events.router)
+    app.include_router(viz.router)
     app.include_router(jobs.router)
     app.include_router(stream.router)
 
