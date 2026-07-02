@@ -22,7 +22,7 @@ from tracevector.db.anomaly_stats import (
     ValueFinding,
 )
 from tracevector.db.postgres import PostgresStore, generate_id
-from tracevector.db.queries import EventQuery, EventQueryService
+from tracevector.db.queries import EventQuery, EventQueryService, TagFilter
 from tracevector.db.similarity import SimilarityService
 
 _query_service: EventQueryService | None = None
@@ -172,10 +172,10 @@ def _parse_novelty_fields(fields: str | None) -> list[str] | None:
     return [f.strip() for f in fields.split(",") if f.strip()]
 
 
-async def _resolve_tags_event_ids(
+async def _resolve_tags_filter(
     case_id: str, source_ids: list[str], tag_values: list[str] | None
-) -> list[str] | None:
-    """Resolve a set of unified tag values to an event_id list (OR across values).
+) -> TagFilter | None:
+    """Resolve a set of unified tag values to a :class:`TagFilter` (OR across values).
 
     Merges two independent tagging systems that share a UI: user annotation
     tags (Postgres) and parser-derived ``Event.tags`` (ClickHouse) — an event
@@ -183,28 +183,20 @@ async def _resolve_tags_event_ids(
     doesn't need to know or care which system a given tag value came from.
     Shared by both the include and exclude resolvers below.
 
-    For a tag matching a very large number of events, ``parser_ids`` fully
-    materializes a ClickHouse-native ``hasAny(tags, ...)`` match into Python
-    only to re-inject it into the caller's *next* ClickHouse query as an
-    array parameter — a real extra round trip that could instead be a
-    ``hasAny(tags, ...)`` predicate pushed directly into that query's WHERE
-    clause. Doing that correctly needs its own AND'd-with-everything-else,
-    OR'd-between-systems predicate (``hasAny(tags, :values) OR has(:pg_ids,
-    toString(event_id))``) that can't be expressed through the generic
-    ``event_ids`` intersection path all four callers currently share (see
-    ``_resolve_event_id_filters``) without also changing that shared
-    contract — deferred rather than done as a narrow, easy-to-regress patch
-    alongside it.
+    Only the Postgres half is resolved here (it can't be expressed inside a
+    ClickHouse WHERE clause); the parser-tag half is matched natively via
+    ``hasAny(tags, ...)`` inside the ClickHouse query itself
+    (:meth:`~tracevector.db.queries.EventQueryService._build_where`), so this
+    no longer does a second ClickHouse round trip just to union event_ids in
+    Python.
     """
     if not tag_values:
         return None
     store = get_store()
-    service = _get_query_service()
     ann_ids = await store.list_event_ids_by_annotation_type(
         case_id, source_ids, "tag", origin="user", content_in=tag_values
     )
-    parser_ids = service.list_event_ids_by_parser_tags(case_id, source_ids, tag_values)
-    return list(set(ann_ids) | set(parser_ids))
+    return TagFilter(tag_values=tag_values, postgres_event_ids=ann_ids)
 
 
 def _intersect_optional(*id_lists: list[str] | None) -> list[str] | None:
@@ -231,12 +223,30 @@ def _parse_str_list(value: str | None) -> list[str] | None:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+async def _resolve_run_event_ids(case_id: str, run_id: str | None) -> list[str]:
+    """Resolve a persisted detector ``run_id`` to its finding event_ids.
+
+    Replaces the old ``live_event_ids`` approach (a comma-separated ID list
+    re-uploaded on every request) — the client now references a persisted
+    :class:`~tracevector.db.postgres.DetectorRun` by a single short ID
+    instead. 404s on an unknown/foreign-case run_id rather than silently
+    matching nothing, since a stale run_id is a client bug worth surfacing.
+    """
+    if not run_id:
+        return []
+    store = get_store()
+    run = await store.get_detector_run(case_id, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Unknown detector run: {run_id}")
+    return [r["event_id"] for r in run.result.get("results", []) if r.get("event_id")]
+
+
 async def _resolve_annotated_event_ids(
     case_id: str,
     source_ids: list[str],
     annotated: str | None,
     tag_value: str | None,
-    live_event_ids: str | None = None,
+    run_id: str | None = None,
 ) -> list[str] | None:
     """Resolve the ``annotated``/``annotation_tag_value`` filter to an event_id list.
 
@@ -244,21 +254,12 @@ async def _resolve_annotated_event_ids(
     event_ids across the requested types are unioned (OR semantics). Returns
     ``None`` when no filter is requested (no restriction).
 
-    ``live_event_ids`` is a comma-separated list of event IDs the frontend
-    currently shows as flagged by the *active* (not-yet-persisted) Analysis
-    tab. Live findings never reach the database, so the "anomaly" branch
-    can't see them from annotations alone — when "anomaly" is requested,
-    these are unioned in too, so the filter matches detected-but-unconfirmed
-    findings as well as tagged/persisted ones.
-
-    Known limitation: this ships the client's full unpersisted finding-ID set
-    on every request (GET query string or POST body) — at ``limit=500`` findings
-    that's tens of KB of UUIDs, past some proxies' URL-length limits for the
-    GET endpoints specifically. A structural fix (persisting detector runs
-    server-side under a run ID that the client references by ID instead of
-    resending, or filtering live findings purely client-side after the fact)
-    is a bigger design change than fits opportunistically alongside other
-    cleanup — deferred, not overlooked.
+    ``run_id`` references a persisted detector run (see
+    ``_resolve_run_event_ids``). Live findings from that run don't otherwise
+    reach the database as annotations, so the "anomaly" branch can't see them
+    from annotations alone — when "anomaly" is requested, the run's finding
+    event_ids are unioned in too, so the filter matches detected-but-
+    unconfirmed findings as well as tagged/persisted ones.
     """
     if not annotated:
         return None
@@ -275,8 +276,7 @@ async def _resolve_annotated_event_ids(
             case_id, source_ids, "anomaly", origin="system"
         )
         event_ids.update(ids)
-        if live_event_ids:
-            event_ids.update(e.strip() for e in live_event_ids.split(",") if e.strip())
+        event_ids.update(await _resolve_run_event_ids(case_id, run_id))
     return list(event_ids)
 
 
@@ -286,31 +286,35 @@ async def _resolve_event_id_filters(
     *,
     annotated: str | None,
     annotation_tag_value: str | None,
-    live_event_ids: str | None,
+    run_id: str | None,
     tags_include: str | None,
     tags_exclude: str | None,
     ids: str | None,
-) -> tuple[list[str] | None, list[str] | None]:
+) -> tuple[list[str] | None, TagFilter | None, TagFilter | None]:
     """Resolve the annotated/tags_include/tags_exclude/ids filter combo shared
     by list_events, bulk_annotate_by_filter, get_histogram, and export_events.
 
-    Returns ``(event_ids, exclude_event_ids)`` ready to pass straight into
-    :class:`EventQuery`. Each of the four endpoints previously re-implemented
-    this same resolve-and-intersect sequence with ~10 identical query params;
-    a filter added to one and not the others silently made the grid,
-    histogram, bulk-tag, and export disagree on which events match.
+    Returns ``(event_ids, tags_include, tags_exclude)`` ready to pass straight
+    into :class:`EventQuery`. ``tags_include``/``tags_exclude`` are kept
+    separate from ``event_ids`` rather than intersected into it, since they
+    carry OR-between-two-systems semantics that ``EventQuery`` applies as its
+    own ANDed predicate (see :class:`~tracevector.db.queries.TagFilter`).
+    Each of the four endpoints previously re-implemented this same
+    resolve-and-intersect sequence with ~10 identical query params; a filter
+    added to one and not the others silently made the grid, histogram,
+    bulk-tag, and export disagree on which events match.
     """
     annotated_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, annotated, annotation_tag_value, live_event_ids
+        case_id, source_ids, annotated, annotation_tag_value, run_id
     )
-    tags_include_ids = await _resolve_tags_event_ids(
+    tags_include_filter = await _resolve_tags_filter(
         case_id, source_ids, _parse_str_list(tags_include)
     )
-    tags_exclude_ids = await _resolve_tags_event_ids(
+    tags_exclude_filter = await _resolve_tags_filter(
         case_id, source_ids, _parse_str_list(tags_exclude)
     )
-    event_ids = _intersect_optional(annotated_ids, tags_include_ids, _parse_str_list(ids))
-    return event_ids, tags_exclude_ids
+    event_ids = _intersect_optional(annotated_ids, _parse_str_list(ids))
+    return event_ids, tags_include_filter, tags_exclude_filter
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/events")
@@ -369,12 +373,12 @@ async def list_events(
         default=None,
         description="Narrow the 'tag' annotation type to a specific tag value.",
     ),
-    live_event_ids: str | None = Query(
+    run_id: str | None = Query(
         default=None,
         description=(
-            "Comma-separated event IDs currently flagged by the active, "
-            "not-yet-persisted Analysis tab — unioned into the 'anomaly' "
-            "branch of `annotated` so it also matches live findings."
+            "ID of a persisted detector run (from GET .../anomalies) — its "
+            "finding event IDs are unioned into the 'anomaly' branch of "
+            "`annotated` so it also matches not-yet-tagged findings."
         ),
     ),
     after: str | None = Query(
@@ -413,16 +417,17 @@ async def list_events(
         # already knows the exact event, and skipping them avoids wasted
         # annotation/tag lookups on this hot single-event-lookup path.
         event_ids: list[str] | None = [event_id]
-        tags_exclude_ids = await _resolve_tags_event_ids(
+        tags_include_filter = None
+        tags_exclude_filter = await _resolve_tags_filter(
             case_id, source_ids, _parse_str_list(tags_exclude)
         )
     else:
-        event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+        event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
             case_id,
             source_ids,
             annotated=annotated,
             annotation_tag_value=annotation_tag_value,
-            live_event_ids=live_event_ids,
+            run_id=run_id,
             tags_include=tags_include,
             tags_exclude=tags_exclude,
             ids=ids,
@@ -444,7 +449,8 @@ async def list_events(
             field_filters=_parse_json_object(filters),
             field_exclusions=_parse_exclusions_object(exclusions),
             event_ids=event_ids,
-            exclude_event_ids=tags_exclude_ids,
+            tags_include=tags_include_filter,
+            tags_exclude=tags_exclude_filter,
             limit=limit,
             offset=offset,
             order=order,  # type: ignore[arg-type]
@@ -494,12 +500,12 @@ class BulkAnnotateByFilterRequest(BaseModel):
         default=None,
         description="Narrow the 'tag' annotation type to a specific tag value.",
     )
-    live_event_ids: str | None = Field(
+    run_id: str | None = Field(
         default=None,
         description=(
-            "Comma-separated event IDs currently flagged by the active, "
-            "not-yet-persisted Analysis tab — unioned into the 'anomaly' "
-            "branch of `annotated` so bulk actions can apply to live findings."
+            "ID of a persisted detector run (from GET .../anomalies) — its "
+            "finding event IDs are unioned into the 'anomaly' branch of "
+            "`annotated` so bulk actions can apply to not-yet-tagged findings."
         ),
     )
 
@@ -524,12 +530,12 @@ async def bulk_annotate_by_filter(
         )
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+    event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
         annotated=body.annotated,
         annotation_tag_value=body.annotation_tag_value,
-        live_event_ids=body.live_event_ids,
+        run_id=body.run_id,
         tags_include=body.tags_include,
         tags_exclude=body.tags_exclude,
         ids=body.ids,
@@ -551,7 +557,8 @@ async def bulk_annotate_by_filter(
             field_filters=_parse_json_object(body.filters),
             field_exclusions=_parse_exclusions_object(body.exclusions),
             event_ids=event_ids,
-            exclude_event_ids=tags_exclude_ids,
+            tags_include=tags_include_filter,
+            tags_exclude=tags_exclude_filter,
         )
     )
 
@@ -608,7 +615,7 @@ async def list_merged_tags(case_id: str, timeline_id: str) -> dict[str, Any]:
     """Return the union of distinct user annotation tags and parser-derived tags.
 
     Powers the unified "Tags" filter panel, which matches a value against
-    either tagging system (see ``_resolve_tags_event_ids``).
+    either tagging system (see ``_resolve_tags_filter``).
     Distinct from ``GET /timelines/{timeline_id}/tags`` (annotation tags
     only), which is what the "add tag" annotation UI uses — you can only
     create annotation tags, not parser tags, so that list must stay pure.
@@ -676,7 +683,7 @@ async def get_histogram(
     exclusions: str | None = Query(default=None),
     annotated: str | None = Query(default=None),
     annotation_tag_value: str | None = Query(default=None),
-    live_event_ids: str | None = Query(default=None),
+    run_id: str | None = Query(default=None),
     buckets: int = Query(default=60, ge=10, le=200),
 ) -> dict[str, Any]:
     """Return a bucketed event-count histogram for a timeline.
@@ -687,12 +694,12 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+    event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
         annotated=annotated,
         annotation_tag_value=annotation_tag_value,
-        live_event_ids=live_event_ids,
+        run_id=run_id,
         tags_include=tags_include,
         tags_exclude=tags_exclude,
         ids=ids,
@@ -713,7 +720,8 @@ async def get_histogram(
             field_filters=_parse_json_object(filters),
             field_exclusions=_parse_exclusions_object(exclusions),
             event_ids=event_ids,
-            exclude_event_ids=tags_exclude_ids,
+            tags_include=tags_include_filter,
+            tags_exclude=tags_exclude_filter,
         ),
         buckets=buckets,
     )
@@ -741,7 +749,7 @@ class ExportFilter(BaseModel):
     exclude: dict[str, list[str]] = Field(default_factory=dict)
     annotated: str | None = None
     annotation_tag_value: str | None = None
-    live_event_ids: str | None = None
+    run_id: str | None = None
 
 
 class ExportRequest(BaseModel):
@@ -849,12 +857,12 @@ async def export_events(
     tagging a finding is what makes it show up here.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+    event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
         annotated=body.filter.annotated,
         annotation_tag_value=body.filter.annotation_tag_value,
-        live_event_ids=body.filter.live_event_ids,
+        run_id=body.filter.run_id,
         tags_include=body.filter.tags_include,
         tags_exclude=body.filter.tags_exclude,
         ids=body.filter.ids,
@@ -879,7 +887,8 @@ async def export_events(
         field_filters=body.filter.fields,
         field_exclusions=body.filter.exclude,
         event_ids=event_ids,
-        exclude_event_ids=tags_exclude_ids,
+        tags_include=tags_include_filter,
+        tags_exclude=tags_exclude_filter,
     )
 
     if body.format == "jsonl":
@@ -1108,6 +1117,66 @@ async def list_anomaly_fields(
     }
 
 
+def _serialize_stat_result(result: Any) -> dict[str, Any]:
+    """Serialize a StatAnomalyResult to the shape shared by list_anomalies/tag_anomalies."""
+    return {
+        "status": result.status,
+        "detector": result.detector,
+        "method": result.method,
+        "baseline_size": result.baseline_size,
+        "results": [_serialize_finding(r) for r in result.results],
+        "z_threshold": result.z_threshold,
+    }
+
+
+async def _persist_detector_run(
+    case_id: str,
+    timeline_id: str,
+    *,
+    detector: str,
+    fields: str | None,
+    series_field: str,
+    z_threshold: float | None,
+    baseline_end: datetime | None,
+    temporal: bool,
+    limit: int,
+    payload: dict[str, Any],
+) -> str:
+    """Persist a detector scan's request params + serialized result, return the run_id."""
+    store = get_store()
+    run = await store.create_detector_run(
+        case_id,
+        timeline_id,
+        detector,
+        params={
+            "fields": fields,
+            "series_field": series_field,
+            "z_threshold": z_threshold,
+            "baseline_end": baseline_end.isoformat() if baseline_end else None,
+            "temporal": temporal,
+            "limit": limit,
+        },
+        result=payload,
+    )
+    return run.id
+
+
+@router.get("/{case_id}/detector-runs/{run_id}")
+async def get_detector_run(case_id: str, run_id: str) -> dict[str, Any]:
+    """Return a persisted detector run's params and findings.
+
+    Lets the client (or an analyst debugging a filter) inspect what a
+    ``run_id`` — as referenced by ``list_events``/``histogram``/bulk-annotate/
+    export's ``run_id`` filter param — actually contains, without re-running
+    the detector.
+    """
+    store = get_store()
+    run = await store.get_detector_run(case_id, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Unknown detector run: {run_id}")
+    return run.to_dict()
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/anomalies")
 async def list_anomalies(
     case_id: str,
@@ -1145,6 +1214,14 @@ async def list_anomalies(
         ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
+    persist: bool = Query(
+        default=True,
+        description=(
+            "Persist this scan as a DetectorRun and return its run_id, so the "
+            "client can reference the finding set by ID (e.g. to filter the "
+            "grid to 'anomaly') instead of re-uploading event IDs."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Run a statistical anomaly detector on the timeline and return findings.
 
@@ -1169,14 +1246,23 @@ async def list_anomalies(
         limit=limit,
     )
 
-    return {
-        "status": result.status,
-        "detector": result.detector,
-        "method": result.method,
-        "baseline_size": result.baseline_size,
-        "results": [_serialize_finding(r) for r in result.results],
-        "z_threshold": result.z_threshold,
-    }
+    payload = _serialize_stat_result(result)
+    run_id = None
+    if persist and result.status == "ok":
+        run_id = await _persist_detector_run(
+            case_id,
+            timeline_id,
+            detector=detector,
+            fields=fields,
+            series_field=series_field,
+            z_threshold=z_threshold,
+            baseline_end=baseline_end,
+            temporal=temporal,
+            limit=limit,
+            payload=payload,
+        )
+    payload["run_id"] = run_id
+    return payload
 
 
 class TagAnomaliesRequest(BaseModel):
@@ -1255,6 +1341,7 @@ async def tag_anomalies(
             "baseline_size": result.baseline_size,
             "results": [],
             "z_threshold": result.z_threshold,
+            "run_id": None,
         }
 
     # Clear prior (non-pinned) system anomaly annotations for this timeline's
@@ -1332,6 +1419,20 @@ async def tag_anomalies(
 
     tagged = await store.bulk_create_annotations(annotation_rows) if annotation_rows else 0
 
+    payload = _serialize_stat_result(result)
+    run_id = await _persist_detector_run(
+        case_id,
+        timeline_id,
+        detector=body.detector,
+        fields=body.fields,
+        series_field=body.series_field,
+        z_threshold=body.z_threshold,
+        baseline_end=body.baseline_end,
+        temporal=body.temporal,
+        limit=body.limit,
+        payload=payload,
+    )
+
     return {
         "status": "ok",
         "detector": result.detector,
@@ -1339,8 +1440,9 @@ async def tag_anomalies(
         "tagged": tagged,
         "skipped_unresolved": skipped_unresolved,
         "baseline_size": result.baseline_size,
-        "results": [_serialize_finding(r) for r in result.results],
+        "results": payload["results"],
         "z_threshold": result.z_threshold,
+        "run_id": run_id,
     }
 
 

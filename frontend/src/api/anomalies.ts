@@ -14,6 +14,8 @@ export interface AnomalyParams {
   /** Enable temporal mode (backend uses timeline midpoint when baseline_end is absent) */
   temporal?: boolean;
   limit?: number;
+  /** Persist this scan as a DetectorRun and return its run_id (default: true). */
+  persist?: boolean;
   [key: string]: string | number | boolean | null | undefined;
 }
 

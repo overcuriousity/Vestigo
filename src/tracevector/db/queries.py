@@ -41,6 +41,23 @@ _MIN_EVENT_ID = "00000000-0000-0000-0000-000000000000"
 
 
 @dataclass
+class TagFilter:
+    """A unified tag match, pushed into ClickHouse as one OR'd predicate.
+
+    A tag value can come from either of two independent tagging systems: a
+    user annotation tag (Postgres) or a parser-derived ``Event.tags`` array
+    entry (ClickHouse). ``postgres_event_ids`` is pre-resolved by the caller
+    (a Postgres lookup can't be expressed inside a ClickHouse WHERE clause);
+    ``tag_values`` is matched natively via ``hasAny(tags, ...)``. The two are
+    OR'd together to reproduce "matches either system" without a second
+    ClickHouse round trip to resolve parser-tag matches into Python first.
+    """
+
+    tag_values: list[str]
+    postgres_event_ids: list[str]
+
+
+@dataclass
 class EventQuery:
     """Query parameters for the event viewer."""
 
@@ -62,6 +79,11 @@ class EventQuery:
     # Optional event_id denylist (e.g. resolved from an excluded tag filter).
     # None means "no restriction"; entries here are subtracted from the result.
     exclude_event_ids: list[str] | None = None
+    # Unified tag include/exclude filters — distinct from event_ids/exclude_event_ids
+    # because they carry OR-between-two-systems semantics internally, ANDed
+    # alongside every other restriction (see TagFilter).
+    tags_include: TagFilter | None = None
+    tags_exclude: TagFilter | None = None
     limit: int = 50
     offset: int = 0
     order: Literal["asc", "desc"] = "desc"
@@ -209,6 +231,25 @@ class _ParameterizedQueryBuilder:
         name = self._param_name()
         self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
         self.parameters[name] = values
+
+    def add_tag_filter(self, filt: TagFilter, negate: bool) -> None:
+        """Add a unified tag predicate: ``hasAny(tags, :values) OR has(:ids, toString(event_id))``.
+
+        OR-combines the two tagging systems in one ClickHouse expression
+        instead of resolving parser-tag matches into Python and re-injecting
+        them as a second event_id list (see :class:`TagFilter`). Negated as a
+        whole for the exclude side, so "has neither" rather than "doesn't
+        have one specific half."
+        """
+        tags_name = self._param_name()
+        ids_name = self._param_name()
+        clause = (
+            f"(hasAny(tags, {{{tags_name}:Array(String)}}) "
+            f"OR has({{{ids_name}:Array(String)}}, toString(event_id)))"
+        )
+        self.conditions.append(f"NOT {clause}" if negate else clause)
+        self.parameters[tags_name] = filt.tag_values
+        self.parameters[ids_name] = filt.postgres_event_ids
 
     def add_field_filter(self, key: str, value: str) -> None:
         """Add an equality filter on a top-level column or attribute."""
@@ -364,6 +405,12 @@ class EventQueryService:
 
         if query.exclude_event_ids:
             builder.add_not_in_list("event_id", query.exclude_event_ids)
+
+        if query.tags_include is not None:
+            builder.add_tag_filter(query.tags_include, negate=False)
+
+        if query.tags_exclude is not None:
+            builder.add_tag_filter(query.tags_exclude, negate=True)
 
         if query.after is not None:
             ts, event_id = query.after
@@ -598,24 +645,6 @@ class EventQueryService:
             parameters=params,
         )
         return sorted(result.result_rows[0][0]) if result.result_rows else []
-
-    def list_event_ids_by_parser_tags(
-        self, case_id: str, source_ids: list[str], tag_values: list[str]
-    ) -> list[str]:
-        """Return event_ids whose parser-derived ``tags`` array contains any of *tag_values*."""
-        self.store.init_schema()
-        database = self.store.database
-        params: dict[str, Any] = {"p0": case_id, "src": source_ids, "tags": tag_values}
-        result = self.store.client.query(
-            f"""
-            SELECT toString(event_id)
-            FROM {database}.events
-            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
-                AND hasAny(tags, {{tags:Array(String)}})
-            """,
-            parameters=params,
-        )
-        return [row[0] for row in result.result_rows]
 
     # Top-level fields meaningful for embedding (not IDs/provenance).
     _EMBEDDABLE_TOP_LEVEL = [

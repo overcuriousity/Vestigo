@@ -37,6 +37,8 @@ interface Props {
   onDrillField?: (field: string, value: string, start: string, end: string) => void;
   /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
   onFindingsChange?: (markers: AnomalyMarker[]) => void;
+  /** Called with the latest scan's persisted run_id, so the grid can filter to it. */
+  onRunIdChange?: (runId: string | undefined) => void;
   /** Scrolls the main grid to the window's start, clearing filters first, and highlights the window. */
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
@@ -158,7 +160,14 @@ function FreqFindingRow({ finding, onDrillField, onJumpToTime }: FreqFindingRowP
   );
 }
 
-export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChange, onJumpToTime }: Props) {
+export function FrequencyView({
+  caseId,
+  timelineId,
+  onDrillField,
+  onFindingsChange,
+  onRunIdChange,
+  onJumpToTime,
+}: Props) {
   const [seriesField, setSeriesField] = useState("artifact");
   const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
@@ -259,6 +268,12 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
     return () => onFindingsChange([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [findings]);
+
+  useEffect(() => {
+    if (!onRunIdChange) return;
+    onRunIdChange(data?.run_id ?? undefined);
+    return () => onRunIdChange(undefined);
+  }, [data?.run_id, onRunIdChange]);
 
   return (
     <div className="space-y-3">

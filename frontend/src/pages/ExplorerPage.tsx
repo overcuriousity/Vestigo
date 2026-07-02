@@ -229,6 +229,7 @@ export function ExplorerPage() {
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
+  const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
   // Scroll position feeds TimelineHistogram only, via a store subscribed
   // solely by that component (C15) — not page state, so scrolling doesn't
   // re-render EventGrid/FilterRail/AnalysisPanel on every row crossed.
@@ -259,18 +260,6 @@ export function ExplorerPage() {
   useEffect(() => {
     setSelection({ mode: "ids", ids: new Set() });
   }, [filters, sortDir]);
-
-  // Event IDs currently flagged by the active (not-yet-persisted) Analysis
-  // tab. Only meaningful to the events/histogram/export queries when the
-  // "Anomaly" filter checkbox is active — merged in below so that filter
-  // also matches live findings, not just persisted anomaly annotations.
-  const liveAnomalyEventIds = useMemo(
-    () =>
-      Array.from(
-        new Set(anomalyMarkers.map((m) => m.eventId).filter((id): id is string => !!id)),
-      ),
-    [anomalyMarkers],
-  );
 
   // ── Data queries ───────────────────────────────────────────────────────
   const { data: timeline } = useQuery({
@@ -305,13 +294,13 @@ export function ExplorerPage() {
 
   // The filter object actually sent to the events/histogram/export queries.
   // `filters` itself stays URL-serializable/shareable — this augments it
-  // with ephemeral live-finding event IDs and semantic search candidates
-  // only while relevant, so switching detector tabs or field selections
-  // correctly refetches the filtered view.
+  // with the active Analysis tab's persisted run_id and semantic search
+  // candidates only while relevant, so switching detector tabs or field
+  // selections correctly refetches the filtered view.
   const effectiveFilters = useMemo<EventFilters>(() => {
     let f = filters;
-    if (filters.annotated?.includes("anomaly") && liveAnomalyEventIds.length > 0) {
-      f = { ...f, liveAnomalyEventIds };
+    if (filters.annotated?.includes("anomaly") && anomalyRunId) {
+      f = { ...f, anomalyRunId };
     }
     // Semantic candidates replace the broadened keyword search server-side
     // (rather than ANDing with it) — a semantically relevant event may not
@@ -320,7 +309,7 @@ export function ExplorerPage() {
       f = { ...f, q: undefined, ids: semanticSearchIds };
     }
     return f;
-  }, [filters, liveAnomalyEventIds, semanticSearchIds]);
+  }, [filters, anomalyRunId, semanticSearchIds]);
 
   const queryClient = useQueryClient();
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
@@ -882,6 +871,7 @@ export function ExplorerPage() {
                     onDrillField={handleDrillField}
                     onFrequencyDrill={handleFrequencyDrill}
                     onAnomalyMarkers={setAnomalyMarkers}
+                    onAnomalyRunId={setAnomalyRunId}
                     onJumpToTime={handleJumpToTime}
                   />
                 )}

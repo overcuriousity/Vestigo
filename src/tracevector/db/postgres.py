@@ -243,6 +243,51 @@ class View(Base):
         }
 
 
+class DetectorRun(Base):
+    """A persisted statistical-anomaly-detector scan result.
+
+    Exists so the client can reference a scan's finding-event-id list by a
+    short ``run_id`` instead of re-uploading it as a URL query param on every
+    subsequent request (the ``live_event_ids`` approach this replaces — see
+    ``_resolve_event_id_filters`` in ``api/routers/events.py``). Rows
+    accumulate rather than being overwritten, matching the forensic-
+    reproducibility posture of ``Annotation``/``View``: a case's history of
+    what was scanned, with what parameters, and what it found, stays
+    auditable rather than being silently replaced by the next scan.
+    """
+
+    __tablename__ = "detector_runs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    detector: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Request params the scan was run with (fields/series_field, z_threshold,
+    # baseline_end, temporal, limit, ...) — kept for forensic reproducibility.
+    params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Serialized StatAnomalyResult (status/method/baseline_size/z_threshold/
+    # results), the same shape returned to the client by list_anomalies —
+    # see _serialize_finding in api/routers/events.py.
+    result: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the DetectorRun API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "detector": self.detector,
+            "params": self.params,
+            "result": self.result,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class Annotation(Base):
     """A tag or comment annotation attached to a single event.
 
@@ -764,9 +809,15 @@ class PostgresStore:
             return True
 
     async def delete_case(self, case_id: str) -> bool:
-        """Delete a case and all its timelines and sources in one transaction.
+        """Delete a case and all its owned rows in one transaction.
 
         Returns True if the case existed and was removed, False otherwise.
+
+        ``View``, ``Annotation``, and ``DetectorRun`` are case-scoped by a
+        plain ``case_id`` column (no FK/cascade — they aren't declared with
+        a ``ForeignKey`` to ``cases.id``), so they must be deleted explicitly
+        here alongside ``Timeline``/``Source`` or they'd silently orphan on
+        every case delete.
         """
         from sqlalchemy import delete
 
@@ -776,6 +827,9 @@ class PostgresStore:
                 return False
             await session.execute(delete(Timeline).where(Timeline.case_id == case_id))
             await session.execute(delete(Source).where(Source.case_id == case_id))
+            await session.execute(delete(View).where(View.case_id == case_id))
+            await session.execute(delete(Annotation).where(Annotation.case_id == case_id))
+            await session.execute(delete(DetectorRun).where(DetectorRun.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True
@@ -843,6 +897,43 @@ class PostgresStore:
             await session.delete(view)
             await session.commit()
             return True
+
+    # ------------------------------------------------------------------
+    # Detector runs
+    # ------------------------------------------------------------------
+
+    async def create_detector_run(
+        self,
+        case_id: str,
+        timeline_id: str,
+        detector: str,
+        params: dict,
+        result: dict,
+    ) -> DetectorRun:
+        """Persist a detector scan result and return the created row."""
+        run = DetectorRun(
+            id=generate_id(f"run_{detector}"),
+            case_id=case_id,
+            timeline_id=timeline_id,
+            detector=detector,
+            params=params,
+            result=result,
+        )
+        async with self.session_factory() as session:
+            session.add(run)
+            await session.commit()
+            await session.refresh(run)
+            return run
+
+    async def get_detector_run(self, case_id: str, run_id: str) -> DetectorRun | None:
+        """Return a persisted detector run by case and run IDs."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(DetectorRun).where(DetectorRun.case_id == case_id, DetectorRun.id == run_id)
+            )
+            return result.scalar_one_or_none()
 
     # ------------------------------------------------------------------
     # Annotations

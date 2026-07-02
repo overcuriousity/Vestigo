@@ -36,6 +36,18 @@ async def patched_store(store, monkeypatch):
     return store
 
 
+async def _make_run(store, case_id: str, timeline_id: str, event_ids: list[str]) -> str:
+    """Seed a DetectorRun row with the given finding event_ids and return its run_id."""
+    run = await store.create_detector_run(
+        case_id,
+        timeline_id,
+        "value_novelty",
+        params={},
+        result={"results": [{"event_id": eid} for eid in event_ids]},
+    )
+    return run.id
+
+
 # ---------------------------------------------------------------------------
 # _resolve_annotated_event_ids
 # ---------------------------------------------------------------------------
@@ -63,10 +75,11 @@ async def test_resolve_annotated_anomaly_matches_persisted_only(patched_store):
 
 
 @pytest.mark.asyncio
-async def test_resolve_annotated_anomaly_unions_live_event_ids(patched_store):
-    """Live (not-yet-persisted) findings never reach the annotations table —
-    the frontend passes their event IDs directly, and the anomaly branch
-    must union them in rather than requiring persistence first."""
+async def test_resolve_annotated_anomaly_unions_run_event_ids(patched_store):
+    """Live (not-yet-tagged) findings never reach the annotations table —
+    the frontend references them by a persisted run_id, and the anomaly
+    branch must union the run's finding event_ids in rather than requiring
+    annotation-persistence first."""
     await patched_store.create_annotation(
         case_id="c1",
         source_id="s1",
@@ -76,30 +89,28 @@ async def test_resolve_annotated_anomaly_unions_live_event_ids(patched_store):
         content="tagged",
         origin="system",
     )
-    result = await events._resolve_annotated_event_ids(
-        "c1", ["s1"], "anomaly", None, live_event_ids="live-evt-1,live-evt-2"
-    )
+    run_id = await _make_run(patched_store, "c1", "t1", ["live-evt-1", "live-evt-2"])
+    result = await events._resolve_annotated_event_ids("c1", ["s1"], "anomaly", None, run_id=run_id)
     assert set(result) == {"persisted-evt", "live-evt-1", "live-evt-2"}
 
 
 @pytest.mark.asyncio
-async def test_resolve_annotated_live_event_ids_ignored_without_anomaly_type(
+async def test_resolve_annotated_run_id_ignored_without_anomaly_type(
     patched_store,
 ):
-    """live_event_ids should only ever apply to the 'anomaly' branch — passing
-    it while filtering on 'tag' alone must not leak it into the result."""
-    result = await events._resolve_annotated_event_ids(
-        "c1", ["s1"], "tag", None, live_event_ids="live-evt-1"
-    )
+    """run_id should only ever apply to the 'anomaly' branch — passing it
+    while filtering on 'tag' alone must not leak it into the result."""
+    run_id = await _make_run(patched_store, "c1", "t1", ["live-evt-1"])
+    result = await events._resolve_annotated_event_ids("c1", ["s1"], "tag", None, run_id=run_id)
     assert result == []
 
 
 @pytest.mark.asyncio
-async def test_resolve_annotated_dedupes_overlap_between_persisted_and_live(
+async def test_resolve_annotated_dedupes_overlap_between_persisted_and_run(
     patched_store,
 ):
-    """The same event flagged both ways (e.g. persisted after being live)
-    must not appear twice in the resolved list."""
+    """The same event flagged both ways (e.g. persisted after being a live
+    finding) must not appear twice in the resolved list."""
     await patched_store.create_annotation(
         case_id="c1",
         source_id="s1",
@@ -109,10 +120,18 @@ async def test_resolve_annotated_dedupes_overlap_between_persisted_and_live(
         content="tagged",
         origin="system",
     )
-    result = await events._resolve_annotated_event_ids(
-        "c1", ["s1"], "anomaly", None, live_event_ids="same-evt"
-    )
+    run_id = await _make_run(patched_store, "c1", "t1", ["same-evt"])
+    result = await events._resolve_annotated_event_ids("c1", ["s1"], "anomaly", None, run_id=run_id)
     assert result == ["same-evt"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_annotated_unknown_run_id_raises_404(patched_store):
+    with pytest.raises(HTTPException) as exc_info:
+        await events._resolve_annotated_event_ids(
+            "c1", ["s1"], "anomaly", None, run_id="no-such-run"
+        )
+    assert exc_info.value.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -123,18 +142,19 @@ async def test_resolve_annotated_dedupes_overlap_between_persisted_and_live(
 
 @pytest.mark.asyncio
 async def test_resolve_event_id_filters_no_filters_means_no_restriction(patched_store):
-    event_ids, exclude_ids = await events._resolve_event_id_filters(
+    event_ids, tags_include, tags_exclude = await events._resolve_event_id_filters(
         "c1",
         ["s1"],
         annotated=None,
         annotation_tag_value=None,
-        live_event_ids=None,
+        run_id=None,
         tags_include=None,
         tags_exclude=None,
         ids=None,
     )
     assert event_ids is None
-    assert exclude_ids is None
+    assert tags_include is None
+    assert tags_exclude is None
 
 
 @pytest.mark.asyncio
@@ -148,23 +168,24 @@ async def test_resolve_event_id_filters_intersects_annotated_and_ids(patched_sto
         content="tagged",
         origin="system",
     )
-    event_ids, exclude_ids = await events._resolve_event_id_filters(
+    event_ids, tags_include, tags_exclude = await events._resolve_event_id_filters(
         "c1",
         ["s1"],
         annotated="anomaly",
         annotation_tag_value=None,
-        live_event_ids=None,
+        run_id=None,
         tags_include=None,
         tags_exclude=None,
         ids="flagged-evt,other-evt",
     )
     assert event_ids == ["flagged-evt"]
-    assert exclude_ids is None
+    assert tags_include is None
+    assert tags_exclude is None
 
 
 @pytest.mark.asyncio
-async def test_resolve_event_id_filters_returns_exclude_ids_independently(
-    patched_store, monkeypatch
+async def test_resolve_event_id_filters_returns_tags_exclude_filter_independently(
+    patched_store,
 ):
     await patched_store.create_annotation(
         case_id="c1",
@@ -176,24 +197,81 @@ async def test_resolve_event_id_filters_returns_exclude_ids_independently(
         content="noisy",
     )
 
-    class _FakeQueryServiceNoParserTags:
-        def list_event_ids_by_parser_tags(self, case_id, source_ids, tag_values):
-            return []
-
-    monkeypatch.setattr(events, "_get_query_service", lambda: _FakeQueryServiceNoParserTags())
-
-    event_ids, exclude_ids = await events._resolve_event_id_filters(
+    event_ids, tags_include, tags_exclude = await events._resolve_event_id_filters(
         "c1",
         ["s1"],
         annotated=None,
         annotation_tag_value=None,
-        live_event_ids=None,
+        run_id=None,
         tags_include=None,
         tags_exclude="noisy",
         ids=None,
     )
     assert event_ids is None
-    assert exclude_ids == ["tagged-evt"]
+    assert tags_include is None
+    assert tags_exclude.tag_values == ["noisy"]
+    assert tags_exclude.postgres_event_ids == ["tagged-evt"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_event_id_filters_returns_tags_include_filter_separately(patched_store):
+    """tags_include must not be folded into event_ids — it's an OR-between-
+    systems predicate applied via EventQuery.tags_include, not an ID
+    restriction ANDed via _intersect_optional."""
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="tagged-evt",
+        annotation_id="ann1",
+        annotation_type="tag",
+        origin="user",
+        content="urgent",
+    )
+
+    event_ids, tags_include, tags_exclude = await events._resolve_event_id_filters(
+        "c1",
+        ["s1"],
+        annotated=None,
+        annotation_tag_value=None,
+        run_id=None,
+        tags_include="urgent",
+        tags_exclude=None,
+        ids=None,
+    )
+    assert event_ids is None
+    assert tags_include.tag_values == ["urgent"]
+    assert tags_include.postgres_event_ids == ["tagged-evt"]
+    assert tags_exclude is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_tags_filter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_tags_filter_returns_none_for_no_values(patched_store):
+    assert await events._resolve_tags_filter("c1", ["s1"], None) is None
+    assert await events._resolve_tags_filter("c1", ["s1"], []) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_tags_filter_resolves_only_postgres_side(patched_store):
+    """Only the Postgres (user annotation) half is resolved here — the
+    parser-tag half is matched natively in ClickHouse via EventQuery.tags_include,
+    not fetched into Python (that round trip is exactly what C13 removed)."""
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="ann-evt",
+        annotation_id="ann1",
+        annotation_type="tag",
+        origin="user",
+        content="suspicious",
+    )
+    result = await events._resolve_tags_filter("c1", ["s1"], ["suspicious"])
+    assert result.tag_values == ["suspicious"]
+    assert result.postgres_event_ids == ["ann-evt"]
 
 
 # ---------------------------------------------------------------------------
@@ -500,3 +578,135 @@ async def test_run_stat_detector_excludes_normal_annotated_events(patched_store,
         limit=50,
     )
     assert fake_svc.value_novelty_calls[0]["exclude_event_ids"] == {"normal-evt"}
+
+
+# ---------------------------------------------------------------------------
+# list_anomalies / tag_anomalies — C18 DetectorRun persistence
+# ---------------------------------------------------------------------------
+
+
+def _make_stat_result(status="ok", event_id="evt-1"):
+    from tracevector.db.anomaly_stats import StatAnomalyResult, ValueFinding
+
+    finding = ValueFinding(
+        field="artifact",
+        value="rare-value",
+        count=1,
+        score=4.2,
+        first_seen=None,
+        event_id=event_id,
+        event={"source_id": "s1"},
+        details={},
+    )
+    return StatAnomalyResult(
+        status=status,
+        detector="value_novelty",
+        method="self-baseline",
+        baseline_size=100,
+        results=[finding] if status == "ok" else [],
+        z_threshold=None,
+    )
+
+
+class _FakeStatAnomalyServiceWithResult:
+    """Returns a real StatAnomalyResult, for exercising the persist path."""
+
+    def __init__(self, result):
+        self._result = result
+
+    def get_timeline_midpoint(self, case_id, source_ids):
+        return None
+
+    def find_value_novelty(self, **kwargs):
+        return self._result
+
+    def find_frequency_anomalies(self, **kwargs):
+        return self._result
+
+
+@pytest_asyncio.fixture()
+async def timeline_setup(patched_store):
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+    return patched_store
+
+
+def _call_list_anomalies(persist: bool = True):
+    return events.list_anomalies(
+        "c1",
+        "t1",
+        detector="value_novelty",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+        persist=persist,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_anomalies_persists_run_by_default(timeline_setup, monkeypatch):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies()
+
+    assert response["run_id"] is not None
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run is not None
+    assert run.result["results"][0]["event_id"] == "evt-1"
+
+
+@pytest.mark.asyncio
+async def test_list_anomalies_persist_false_does_not_write_a_run(timeline_setup, monkeypatch):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies(persist=False)
+
+    assert response["run_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_anomalies_does_not_persist_when_status_not_ok(timeline_setup, monkeypatch):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result(status="no_data"))
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies()
+
+    assert response["run_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_tag_anomalies_always_persists_a_run(timeline_setup, monkeypatch):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    body = events.TagAnomaliesRequest(detector="value_novelty")
+    response = await events.tag_anomalies("c1", "t1", body)
+
+    assert response["run_id"] is not None
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run is not None
+
+
+@pytest.mark.asyncio
+async def test_get_detector_run_endpoint_returns_persisted_run(timeline_setup, monkeypatch):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    scan = await _call_list_anomalies()
+    fetched = await events.get_detector_run("c1", scan["run_id"])
+
+    assert fetched["detector"] == "value_novelty"
+    assert fetched["result"]["results"][0]["event_id"] == "evt-1"
+
+
+@pytest.mark.asyncio
+async def test_get_detector_run_endpoint_404s_for_unknown_id(timeline_setup):
+    with pytest.raises(HTTPException) as exc_info:
+        await events.get_detector_run("c1", "no-such-run")
+    assert exc_info.value.status_code == 404
