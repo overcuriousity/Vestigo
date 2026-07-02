@@ -5,7 +5,7 @@ import { format as formatNum } from "d3-format";
 import { AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
-import { kdeFromBins } from "@/components/viz/lib/stats";
+import { kdeFromBins, numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
 const fmtValue = formatNum(",.3~f");
@@ -46,7 +46,10 @@ export function ViolinPlot({
     <div className="relative">
       <ChartFrame height={height} svgRef={ref} margin={{ top: 16, right: 24, bottom: 24, left: 56 }}>
         {({ innerWidth, innerHeight, margin }) => {
-          const y = scaleLinear().domain([stats.min!, stats.max!]).nice().range([innerHeight, 0]);
+          const y = scaleLinear()
+            .domain(numericDomain(stats.min!, stats.max!))
+            .nice()
+            .range([innerHeight, 0]);
           const w = scaleLinear().domain([0, maxDensity]).range([0, MAX_HALF_WIDTH]);
           const cx = innerWidth / 2;
 

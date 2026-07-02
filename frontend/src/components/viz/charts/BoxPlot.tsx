@@ -4,7 +4,7 @@ import { format as formatNum } from "d3-format";
 import { AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
-import { boxPlotStats } from "@/components/viz/lib/stats";
+import { boxPlotStats, numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
 const fmtValue = formatNum(",.3~f");
@@ -38,7 +38,10 @@ export function BoxPlot({ stats, svgRef, height = 260, color = "var(--color-acce
     <div className="relative">
       <ChartFrame height={height} svgRef={ref} margin={{ top: 16, right: 24, bottom: 24, left: 56 }}>
         {({ innerWidth, innerHeight, margin }) => {
-          const y = scaleLinear().domain([box.min, box.max]).nice().range([innerHeight, 0]);
+          const y = scaleLinear()
+            .domain(numericDomain(box.min, box.max))
+            .nice()
+            .range([innerHeight, 0]);
           const cx = innerWidth / 2;
           const boxTop = y(box.q3);
           const boxBottom = y(box.q1);

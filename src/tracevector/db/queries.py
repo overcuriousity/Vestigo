@@ -8,7 +8,11 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from tracevector.db._buckets import bucket_interval_seconds, query_timestamp_range
-from tracevector.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
+from tracevector.db._columns import (
+    EVENT_SELECT_COLUMNS,
+    TOP_LEVEL_NON_STRING_COLUMNS,
+    resolve_column_token,
+)
 from tracevector.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.field_recommend import (
@@ -197,6 +201,8 @@ def _field_column_expr(field_token: str, parameters: dict[str, Any], param_name:
     """
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
+        if column in TOP_LEVEL_NON_STRING_COLUMNS:
+            return f"toString({column})"
         return column
     parameters[param_name] = attr_key
     return f"attributes[{{{param_name}:String}}]"
@@ -1148,7 +1154,19 @@ class EventQueryService:
         for bucket_ts, val, count in bucket_result.result_rows:
             by_value.setdefault(val, {})[ensure_utc_iso(bucket_ts)] = count
 
-        all_starts = sorted({ensure_utc_iso(row[0]) for row in bucket_result.result_rows})
+        # Derive bucket starts from [min_ts, max_ts] rather than from the
+        # query result rows: a bucket where *none* of the top-N values had
+        # any events produces no GROUP BY row at all, and would otherwise be
+        # missing from every series instead of zero-filled. `toStartOfInterval`
+        # aligns to Unix epoch, so replicate that alignment here.
+        start_epoch = int(min_ts.timestamp() // interval) * interval
+        end_epoch = int(max_ts.timestamp() // interval) * interval
+        if end_epoch <= start_epoch:
+            end_epoch = start_epoch + interval
+        all_starts = [
+            ensure_utc_iso(datetime.fromtimestamp(epoch, tz=UTC))
+            for epoch in range(start_epoch, end_epoch, interval)
+        ]
         series = [
             {
                 "value": value,

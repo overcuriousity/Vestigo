@@ -8,6 +8,19 @@
  */
 import type { FieldNumericBin, FieldNumericResponse } from "@/api/types";
 
+/**
+ * Pad a `[min, max]` domain when it's degenerate (`min === max`, e.g. every
+ * matching event shares one value). d3's linear scale doesn't error on a
+ * zero-span domain, but it maps every input to a constant midpoint — every
+ * bar/point in the chart collapses to the same pixel, rendering as visually
+ * empty. A tiny symmetric pad keeps the single value visible and centered.
+ */
+export function numericDomain(min: number, max: number): [number, number] {
+  if (min !== max) return [min, max];
+  const pad = min !== 0 ? Math.abs(min) * 0.05 : 0.5;
+  return [min - pad, max + pad];
+}
+
 export interface BoxPlotStats {
   min: number;
   q1: number;

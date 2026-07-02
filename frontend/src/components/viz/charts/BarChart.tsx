@@ -4,7 +4,7 @@ import { format as formatNum } from "d3-format";
 import { AxisBottom } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
-import { buildSeriesColorMap, OTHER_LABEL } from "@/components/viz/lib/colors";
+import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
 import type { FieldTermsResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -38,8 +38,10 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
   const fallbackRef = useRef<SVGSVGElement | null>(null);
   const ref = svgRef ?? fallbackRef;
 
-  const rows = terms.values.map((v) => ({ label: v.value, count: v.count }));
-  if (terms.other_count > 0) rows.push({ label: OTHER_LABEL, count: terms.other_count });
+  const rows = terms.values.map((v) => ({ key: v.value, label: v.value, count: v.count }));
+  if (terms.other_count > 0) {
+    rows.push({ key: OTHER_KEY, label: OTHER_LABEL, count: terms.other_count });
+  }
 
   if (rows.length === 0) {
     return (
@@ -49,7 +51,9 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
     );
   }
 
-  const colorMap = buildSeriesColorMap(rows.map((r) => r.label));
+  const colorMap = buildSeriesColorMap(
+    rows.map((r) => ({ key: r.key, isOther: r.key === OTHER_KEY })),
+  );
   const resolvedHeight = height ?? Math.max(120, rows.length * rowHeight + 40);
 
   return (
@@ -61,7 +65,7 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
       >
         {({ innerWidth, innerHeight, margin }) => {
           const y = scaleBand()
-            .domain(rows.map((r) => r.label))
+            .domain(rows.map((r) => r.key))
             .range([0, innerHeight])
             .padding(0.25);
           const maxCount = Math.max(1, ...rows.map((r) => r.count));
@@ -78,15 +82,15 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
                 tickFormat={(v) => fmtCount(v as number)}
               />
               {rows.map((r) => {
-                const by = y(r.label) ?? 0;
+                const by = y(r.key) ?? 0;
                 const bw = x(r.count);
                 const bh = y.bandwidth();
-                const color = colorMap.get(r.label) ?? "var(--color-accent)";
+                const color = colorMap.get(r.key) ?? "var(--color-accent)";
                 const label =
                   r.label.length > 22 ? r.label.slice(0, 21) + "…" : r.label;
                 return (
                   <g
-                    key={r.label}
+                    key={r.key}
                     onMouseEnter={() =>
                       setHover({
                         x: bw + margin.left + 6,

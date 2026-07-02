@@ -5,7 +5,7 @@ import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
-import { ecdfFromBins } from "@/components/viz/lib/stats";
+import { ecdfFromBins, numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
 const fmtValue = formatNum(",.3~f");
@@ -41,7 +41,9 @@ export function EcdfChart({ stats, svgRef, height = 220, color = "var(--color-ac
     <div className="relative">
       <ChartFrame height={height} svgRef={ref}>
         {({ innerWidth, innerHeight, margin }) => {
-          const x = scaleLinear().domain([stats.min!, stats.max!]).range([0, innerWidth]);
+          const x = scaleLinear()
+            .domain(numericDomain(stats.min!, stats.max!))
+            .range([0, innerWidth]);
           const y = scaleLinear().domain([0, 1]).range([innerHeight, 0]);
           const lineGen = d3line<{ x: number; p: number }>()
             .curve(curveStepAfter)

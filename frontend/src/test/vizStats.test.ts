@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { boxPlotStats, kdeFromBins, ecdfFromBins } from "@/components/viz/lib/stats";
+import { boxPlotStats, kdeFromBins, ecdfFromBins, numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
 function makeStats(overrides: Partial<FieldNumericResponse> = {}): FieldNumericResponse {
@@ -85,5 +85,21 @@ describe("ecdfFromBins", () => {
 
   it("returns an empty array when there are no observations", () => {
     expect(ecdfFromBins([{ x0: 0, x1: 1, count: 0 }])).toEqual([]);
+  });
+});
+
+describe("numericDomain", () => {
+  it("returns [min, max] unchanged when they differ", () => {
+    expect(numericDomain(0, 100)).toEqual([0, 100]);
+  });
+
+  it("pads a degenerate domain (min === max) so it isn't zero-span", () => {
+    const [lo, hi] = numericDomain(42, 42);
+    expect(lo).toBeLessThan(42);
+    expect(hi).toBeGreaterThan(42);
+  });
+
+  it("pads a degenerate domain at zero using a fixed fallback, not a zero-scaled pad", () => {
+    expect(numericDomain(0, 0)).toEqual([-0.5, 0.5]);
   });
 });

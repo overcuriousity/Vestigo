@@ -4,7 +4,7 @@ import { format as formatNum } from "d3-format";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
-import { buildSeriesColorMap, OTHER_LABEL } from "@/components/viz/lib/colors";
+import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
 import type { FieldTermsResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -26,8 +26,10 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
   const fallbackRef = useRef<SVGSVGElement | null>(null);
   const ref = svgRef ?? fallbackRef;
 
-  const rows = terms.values.map((v) => ({ label: v.value, count: v.count }));
-  if (terms.other_count > 0) rows.push({ label: OTHER_LABEL, count: terms.other_count });
+  const rows = terms.values.map((v) => ({ key: v.value, label: v.value, count: v.count }));
+  if (terms.other_count > 0) {
+    rows.push({ key: OTHER_KEY, label: OTHER_LABEL, count: terms.other_count });
+  }
   const total = rows.reduce((s, r) => s + r.count, 0);
 
   if (rows.length === 0 || total === 0) {
@@ -38,8 +40,10 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
     );
   }
 
-  const colorMap = buildSeriesColorMap(rows.map((r) => r.label));
-  const pieLayout = pie<{ label: string; count: number }>()
+  const colorMap = buildSeriesColorMap(
+    rows.map((r) => ({ key: r.key, isOther: r.key === OTHER_KEY })),
+  );
+  const pieLayout = pie<{ key: string; label: string; count: number }>()
     .value((d) => d.count)
     .sort(null);
   const arcs = pieLayout(rows);
@@ -66,7 +70,7 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
                 const [lx, ly] = labelArc.centroid(a);
                 return (
                   <g
-                    key={a.data.label}
+                    key={a.data.key}
                     onMouseEnter={() =>
                       setHover({
                         x: cx + margin.left + lx,
@@ -79,7 +83,7 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
                   >
                     <path
                       d={path}
-                      fill={colorMap.get(a.data.label) ?? "var(--color-accent)"}
+                      fill={colorMap.get(a.data.key) ?? "var(--color-accent)"}
                       stroke="var(--color-bg-elevated)"
                       strokeWidth={2}
                     />
@@ -105,7 +109,7 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
       <Legend
         entries={rows.map((r) => ({
           label: `${r.label} (${fmtCount(r.count)})`,
-          color: colorMap.get(r.label) ?? "var(--color-accent)",
+          color: colorMap.get(r.key) ?? "var(--color-accent)",
         }))}
       />
       <ChartTooltip x={hover?.x ?? 0} y={hover?.y ?? 0} visible={hover != null}>

@@ -12,7 +12,24 @@ existing behavior, tests, or CSS rules were removed, and no CLAUDE.md rule viola
 found. Verification did surface real correctness bugs, mostly at the edges of the new
 aggregation queries and the D3 scale/color logic, plus a set of cleanup opportunities.
 
-**Status: not yet resolved.** This file is a fix-it reference for whoever picks this up next.
+**Status: partially resolved.** 5 of 7 correctness bugs fixed (2026-07-02, same session);
+2 remain open. This file is a fix-it reference for whoever picks this up next.
+
+## Resolution summary
+
+| # | Status | What happened |
+|---|--------|----------------|
+| 1 | ✅ Fixed | `field_value_timeseries` now derives `all_starts` from `[min_ts, max_ts]`/`interval` (replicating ClickHouse's `toStartOfInterval` epoch alignment in Python) instead of from the sparse query result — quiet buckets are zero-filled, not dropped. Added `test_field_value_timeseries_zero_fills_buckets_with_no_top_value_events` covering a bucket with zero events across every top-N value. |
+| 2 | ✅ Fixed | Added `TOP_LEVEL_NON_STRING_COLUMNS` (`db/_columns.py`) and had `_field_column_expr` wrap those columns (`timestamp`) in `toString(...)` before the caller does string comparisons/grouping — `field_terms`/`field_value_timeseries` on `field=timestamp` no longer throws a ClickHouse type error. Added `test_field_terms_on_timestamp_column_casts_to_string`. |
+| 3 | ✅ Fixed | Added `numericDomain(min, max)` to `lib/stats.ts` — pads a degenerate (`min === max`) domain by a small symmetric epsilon instead of leaving it zero-span. Applied to `NumericHistogram`, `EcdfChart` (previously unguarded), and also `BoxPlot`/`ViolinPlot` (their existing `.nice()` call turned out **not** to fix a zero-span domain either — confirmed by reading d3-array's `nice()` source, which early-returns `[start, stop]` unchanged when the tick step is 0 — so those two had the identical latent bug). Added `numericDomain` unit tests in `vizStats.test.ts`. |
+| 4 | ✅ Fixed | `buildSeriesColorMap` now folds any series past the 8-slot categorical palette into the neutral `OTHER_COLOR` instead of wrapping `% 8` and silently reusing an earlier series' hue. |
+| 5 | ✅ Fixed | Bucketed under the same code change as #4: `buildSeriesColorMap` now takes `(string \| {key, isOther})[]` and a reserved sentinel `OTHER_KEY` (a NUL-prefixed string no real ClickHouse value can produce) identifies the synthesized "outside top-N" row structurally, not by comparing display text to the literal string `"Other"`. `BarChart`/`PieChart` rows now carry a `key` distinct from `label`, used for the `scaleBand`/`pie` domain, React `key`, and color-map lookups — a real field value literally named `"Other"` no longer collides with the synthesized bucket. Extended `vizColors.test.ts` with folding and non-collision cases. |
+| 6 | ⬜ Not started | `AxisBottomBand` 13-char truncation vs. `Heatmap`'s ~20-char timestamp labels. |
+| 7 | ⬜ Not started | Export filenames (`FieldHistogramModal`/`lib/export.ts`) not sanitized against `/`/`:` from file-path-valued fields. |
+
+Verified after each fix: backend `uv run pytest` (274 passed) and `uv run ruff check .` clean;
+frontend `npm run test` (59 passed), `npm run typecheck`, and `npm run lint` clean (lint's 3
+warnings are pre-existing, unrelated to this PR).
 
 ## Correctness bugs (verified against the code)
 

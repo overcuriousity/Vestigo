@@ -4,6 +4,7 @@ import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
+import { numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -48,7 +49,9 @@ export function NumericHistogram({
     <div className="relative">
       <ChartFrame height={height} svgRef={ref}>
         {({ innerWidth, innerHeight, margin }) => {
-          const x = scaleLinear().domain([stats.min!, stats.max!]).range([0, innerWidth]);
+          const x = scaleLinear()
+            .domain(numericDomain(stats.min!, stats.max!))
+            .range([0, innerWidth]);
           const y = scaleLinear().domain([0, maxCount]).nice().range([innerHeight, 0]);
           const gap = 1;
 
