@@ -23,9 +23,11 @@ uv sync
 uv run tv-web
 ```
 
-The API is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`).
+The API is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`), serving the
+built frontend from `frontend/dist` (auto-built on first run).
 
-The frontend is being redesigned — tech stack TBD.
+For active frontend development, run `npm install && npm run dev` in `frontend/` alongside
+`uv run tv-web` — see `frontend/README.md`.
 
 ## Documentation
 

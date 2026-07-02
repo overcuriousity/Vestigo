@@ -111,14 +111,14 @@ Decisions are recorded in [`docs/TECH_STACK.md`](./TECH_STACK.md):
 
 1. ✅ Primary event store: **ClickHouse**.
 2. ✅ Backend language/framework: **Python 3.13 + FastAPI/Uvicorn**.
-3. 🔄 Frontend stack: **TBD** — redesign in progress.
-4. ✅ Embedding model: general sentence-transformer baseline (`all-MiniLM-L6-v2`), with a swappable registry for log-specific models later.
+3. ✅ Frontend stack: **React 19 + Vite 8 + TypeScript** (Zustand + TanStack Query/Table/Virtual).
+4. ✅ Embedding model: general sentence-transformer baseline (`all-MiniLM-L6-v2`), with a swappable registry and an OpenAI-compatible remote endpoint option.
 5. ✅ Deployment target: single-node Docker Compose reference deployment; application runs via `uv`.
 
 ## 11. Next Steps
 1. ✅ Finalize and approve this concept.
 2. ✅ Produce an architecture/tech-stack decision record.
 3. ✅ Implement the Case / Source / Timeline / Artifact model refactor.
-4. ⬜ Implement authentication.
-5. ⬜ Implement strict offline-mode enforcement.
-6. ⬜ Rebuild the frontend UI once the stack is chosen.
+4. ✅ Rebuild the frontend UI (React 19 + Vite).
+5. ⬜ Implement authentication.
+6. ⬜ Implement strict offline-mode enforcement (`allow_online` flag exists but is not yet checked anywhere).

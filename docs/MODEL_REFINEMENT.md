@@ -136,13 +136,13 @@ FilterRail, EventGrid, EventDetailPanel, and routing.
 | Step | Status | Notes |
 |---|---|---|
 | 1. Contract (`types.ts`) | ✅ Done | `Source` and `Timeline` interfaces updated; `Event` uses `source_id`, `artifact`, `artifact_long`; filters include `artifact` and `source_id`. |
-| 2. Case Overview page | 🟡 Partial | Source list/upload and timeline creation routes exist in the backend; the React page layer is stubbed and will be finished once the frontend redesign resumes. |
+| 2. Case Overview page | ✅ Done | Source list/upload and timeline creation are full React pages (`components/cases/`, `components/timelines/`), built out during the React 19 + Vite frontend rebuild. |
 | 3. Explorer — merged timeline view | ✅ Done | Event grid renamed the old "Source" column to "Artifact"; source legend/toggle and color-stripe hooks are wired through the updated types and API. |
 | 4. Routing | ✅ Done | Explorer route remains `/cases/:caseId/timelines/:timelineId`; source management routes and breadcrumbs use names where available. |
 
-> **Note:** The frontend UI is intentionally lean right now (the stack is TBD per
-> `TECH_STACK.md`). The TypeScript contract and API layer are fully aligned with the
-> new model, so a redesign can build on top without further vocabulary changes.
+> **Note:** This table predates the frontend rebuild. The frontend stack was resolved
+> (React 19 + Vite + TypeScript, see `TECH_STACK.md`) and is now fully built out — see
+> `docs/PROGRESS.md` for current frontend completeness.
 
 ---
 
@@ -151,10 +151,11 @@ FilterRail, EventGrid, EventDetailPanel, and routing.
 - **Unit/integration tests.** ✅ `uv run pytest tests -q` — 80 passed.
 - **Lint.** ✅ `uv run ruff check src tests` — all checks passed.
 - **Frontend typecheck.** ✅ `cd frontend && npm run typecheck` — passed.
-- **End-to-end (manual).** ⬜ Not yet run. The backend model and API are ready for a manual
-  smoke test: upload two log files as Sources, create a Timeline spanning both, and confirm
-  merged Explorer view with per-source toggles and Artifact column. Source re-download can be
-  verified against the original SHA-256.
+- **End-to-end (manual).** ✅ Superseded by ongoing real usage — the Explorer, embed wizard,
+  and anomaly panels have since been exercised repeatedly against multi-source cases and a
+  live 3.4M-event sample dataset during later feature and review passes (see
+  `docs/PROGRESS.md`), covering the merged view, per-source toggles, and Artifact column this
+  item asked to verify.
 
 ---
 
