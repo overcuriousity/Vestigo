@@ -30,6 +30,14 @@ TOP_LEVEL_EVENT_COLUMNS = frozenset(
 )
 
 
+# Top-level columns that aren't `String`-typed — every other member of
+# `TOP_LEVEL_EVENT_COLUMNS` is a plain string column, but `timestamp` is
+# `Nullable(DateTime64(3))`. Callers building string-comparison SQL (e.g.
+# `col != ''`) around a resolved column must cast these first, or ClickHouse
+# raises a type error instead of returning results.
+TOP_LEVEL_NON_STRING_COLUMNS = frozenset({"timestamp"})
+
+
 # Full per-event column projection, shared by `queries.py` (paginated query
 # + export) and `anomaly_stats.py` (representative-event hydration) so a
 # schema change only has to be made in one place — a column added to one but

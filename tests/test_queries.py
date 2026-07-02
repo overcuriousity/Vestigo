@@ -946,6 +946,23 @@ def test_field_terms_returns_top_values_and_other_count() -> None:
     assert result["other_count"] == 10
 
 
+def test_field_terms_on_timestamp_column_casts_to_string() -> None:
+    """`timestamp` is a `DateTime64` top-level column, not `String` — the
+    generated SQL must cast it before comparing/grouping, or ClickHouse
+    raises a type error on `col != ''`."""
+    svc = _viz_service(
+        [
+            ("uniqExact(", FakeQueryResult(result_rows=[[10, 10]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["2024-01-01 00:00:00.000", 1]])),
+        ]
+    )
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "timestamp")
+    assert result["total"] == 10
+    queries = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert any("toString(timestamp)" in q for q in queries)
+    assert not any("AND timestamp != ''" in q for q in queries)
+
+
 def test_field_terms_empty_dataset_skips_terms_query() -> None:
     svc = _viz_service([("uniqExact(", FakeQueryResult(result_rows=[[0, 0]]))])
     result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
@@ -1110,6 +1127,38 @@ def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:
     b_counts = {b["start"]: b["count"] for b in series_by_value["b"]["buckets"]}
     assert len(b_counts) == 2
     assert sum(b_counts.values()) == 1
+
+
+def test_field_value_timeseries_zero_fills_buckets_with_no_top_value_events() -> None:
+    """A bucket where *none* of the top-N values fired must still appear,
+    zero-filled — not be silently dropped from every series."""
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    bucket1 = min_ts
+    bucket4 = min_ts + timedelta(hours=18)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("uniqExact(", FakeQueryResult(result_rows=[[2, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2]])),
+            (
+                "toStartOfInterval",
+                # Only bucket1 and bucket4 have rows — bucket2 (06:00) and
+                # bucket3 (12:00) had zero matching events entirely and are
+                # absent from the GROUP BY result.
+                FakeQueryResult(result_rows=[[bucket1, "a", 1], [bucket4, "a", 1]]),
+            ),
+        ]
+    )
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code", buckets=4, series_limit=12
+    )
+    series_a = next(s for s in result["series"] if s["value"] == "a")
+    starts = [b["start"] for b in series_a["buckets"]]
+    assert len(starts) == 4
+    counts = {b["start"]: b["count"] for b in series_a["buckets"]}
+    assert sum(counts.values()) == 2
+    assert sorted(counts.values()) == [0, 0, 1, 1]
 
 
 def test_field_value_timeseries_empty_range_returns_empty_series() -> None:

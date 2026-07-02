@@ -4,6 +4,7 @@ import {
   seriesColorVar,
   sequentialColor,
   buildSeriesColorMap,
+  OTHER_KEY,
   OTHER_LABEL,
   OTHER_COLOR,
 } from "@/components/viz/lib/colors";
@@ -44,12 +45,29 @@ describe("buildSeriesColorMap", () => {
     expect(map1.get("POST")).toBe("var(--viz-series-2)");
   });
 
-  it("always maps OTHER_LABEL to the fixed neutral color, not a categorical slot", () => {
-    const map = buildSeriesColorMap(["a", "b", OTHER_LABEL]);
-    expect(map.get(OTHER_LABEL)).toBe(OTHER_COLOR);
+  it("always maps the synthesized Other bucket (OTHER_KEY) to the fixed neutral color", () => {
+    const map = buildSeriesColorMap(["a", "b", { key: OTHER_KEY, isOther: true }]);
+    expect(map.get(OTHER_KEY)).toBe(OTHER_COLOR);
     // "a"/"b" still get the first two categorical slots — Other doesn't
     // consume a slot in the sequence.
     expect(map.get("a")).toBe("var(--viz-series-1)");
     expect(map.get("b")).toBe("var(--viz-series-2)");
+  });
+
+  it("does not special-case a real value that happens to be the literal string 'Other'", () => {
+    // A real field value named "Other" is just an ordinary series here —
+    // only entries keyed by OTHER_KEY/isOther get the neutral color.
+    const map = buildSeriesColorMap(["a", OTHER_LABEL]);
+    expect(map.get(OTHER_LABEL)).toBe("var(--viz-series-2)");
+  });
+
+  it("folds the 9th+ real series into the neutral Other color instead of reusing an earlier hue", () => {
+    const values = Array.from({ length: 10 }, (_, i) => `v${i}`);
+    const map = buildSeriesColorMap(values);
+    expect(map.get("v7")).toBe("var(--viz-series-8)");
+    // 9th and 10th series (index 8, 9) must NOT silently reuse series-1/2's
+    // color — they fold into the neutral color instead.
+    expect(map.get("v8")).toBe(OTHER_COLOR);
+    expect(map.get("v9")).toBe(OTHER_COLOR);
   });
 });
