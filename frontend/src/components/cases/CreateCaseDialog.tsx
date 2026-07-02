@@ -1,6 +1,7 @@
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { casesApi } from "@/api/cases";
+import { adminApi } from "@/api/admin";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -18,7 +19,18 @@ export function CreateCaseDialog() {
   const [teamId, setTeamId] = useState<string>(PERSONAL);
   const qc = useQueryClient();
   const user = useAuthStore((s) => s.user);
-  const teams = manageableTeams(user);
+
+  // Admins can create a case for any team, not just ones they're a member of —
+  // fetch the full team list for them instead of relying on `user.teams`.
+  const { data: allTeams } = useQuery({
+    queryKey: ["admin", "teams"],
+    queryFn: adminApi.listTeams,
+    enabled: !!user?.is_admin && open,
+  });
+  const teams = useMemo(
+    () => (user?.is_admin ? (allTeams ?? []).map((t) => ({ id: t.id, name: t.name })) : manageableTeams(user)),
+    [user, allTeams],
+  );
 
   const { mutate, isPending, error } = useMutation({
     mutationFn: () =>

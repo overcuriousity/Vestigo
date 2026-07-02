@@ -27,8 +27,10 @@ export function canManageCase(case_: Case, user: User | null): boolean {
   return resolveCaseAccess(case_, user) === "manage";
 }
 
-/** Teams the user may create a *team* case for (must be a manager, or admin sees none
- * here — admins can still create personal cases and aren't forced to pick a team). */
+/** Teams the user may create a *team* case for, based on their own memberships
+ * (must be a manager of the team). Admins are not necessarily a member of any
+ * team, so callers should combine this with the full team list (fetched via
+ * `adminApi.listTeams`) for admin users — see CreateCaseDialog. */
 export function manageableTeams(user: User | null): { id: string; name: string }[] {
   return (user?.teams ?? []).filter((t) => t.role === "manager").map((t) => ({ id: t.id, name: t.name }));
 }
