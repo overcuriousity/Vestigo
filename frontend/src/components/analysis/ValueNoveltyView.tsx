@@ -35,6 +35,8 @@ interface Props {
   onDrillField?: (field: string, value: string) => void;
   /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
   onFindingsChange?: (markers: AnomalyMarker[]) => void;
+  /** Called with the latest scan's persisted run_id, so the grid can filter to it. */
+  onRunIdChange?: (runId: string | undefined) => void;
   /** Scrolls the main grid to this finding's timestamp, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }
@@ -188,6 +190,7 @@ export function ValueNoveltyView({
   onSelectEvent,
   onDrillField,
   onFindingsChange,
+  onRunIdChange,
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<"self" | "temporal">("self");
@@ -276,6 +279,12 @@ export function ValueNoveltyView({
     return () => onFindingsChange([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [findings]);
+
+  useEffect(() => {
+    if (!onRunIdChange) return;
+    onRunIdChange(data?.run_id ?? undefined);
+    return () => onRunIdChange(undefined);
+  }, [data?.run_id, onRunIdChange]);
 
   return (
     <div className="space-y-3">

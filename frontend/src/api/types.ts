@@ -200,6 +200,13 @@ export interface AnomaliesResponse {
   results: AnomalyFinding[];
   /** Effective |z| cutoff used by the frequency detector; null for value_novelty. */
   z_threshold: number | null;
+  /**
+   * ID of the persisted DetectorRun for this scan (null when `status` isn't
+   * "ok", or when the request opted out via `persist=false`). Reference this
+   * by `EventFilters.anomalyRunId` to filter the grid/histogram/export to
+   * this scan's findings instead of re-uploading event IDs.
+   */
+  run_id: string | null;
 }
 
 /** One active finding fed to the histogram overlay / event grid highlighting. */
@@ -345,12 +352,13 @@ export interface EventFilters {
   /** Narrows the "tag" annotation type to a specific tag value */
   annotationTagValue?: string;
   /**
-   * Event IDs currently flagged by the active (not-yet-persisted) Analysis
-   * tab — merged server-side with persisted anomaly annotations when
-   * `annotated` includes "anomaly", so the filter also matches live findings.
-   * Derived from session state, not serialized to the URL/saved views.
+   * ID of a persisted detector run (from the Analysis tab's most recent
+   * scan) — merged server-side with persisted anomaly annotations when
+   * `annotated` includes "anomaly", so the filter also matches not-yet-
+   * tagged findings. Derived from session state, not serialized to the
+   * URL/saved views.
    */
-  liveAnomalyEventIds?: string[];
+  anomalyRunId?: string;
   /**
    * Event_id allowlist — e.g. results from a semantic search narrowing the
    * grid. Derived from session state, not serialized to the URL/saved views.
@@ -401,6 +409,6 @@ export interface ExportRequest {
     exclude?: Record<string, string[]>;
     annotated?: string;
     annotation_tag_value?: string;
-    live_event_ids?: string;
+    run_id?: string;
   };
 }

@@ -21,7 +21,7 @@ export interface SerializedEventFilterFields {
   end?: string;
   annotated?: string;
   annotation_tag_value?: string;
-  live_event_ids?: string;
+  run_id?: string;
 }
 
 /**
@@ -64,9 +64,7 @@ export function serializeEventFilterFields(
     out.annotated = filters.annotated.join(",");
   }
   if (filters.annotationTagValue) out.annotation_tag_value = filters.annotationTagValue;
-  if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
-    out.live_event_ids = filters.liveAnomalyEventIds.join(",");
-  }
+  if (filters.anomalyRunId) out.run_id = filters.anomalyRunId;
   return out;
 }
 

@@ -29,6 +29,8 @@ interface Props {
   onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
   /** Called with the active anomaly tab's findings — feeds the histogram overlay and event grid. */
   onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
+  /** Called with the active anomaly tab's persisted run_id, so the grid can filter to it. */
+  onAnomalyRunId?: (runId: string | undefined) => void;
   /** Scrolls the main grid to a finding's timestamp, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
@@ -44,6 +46,7 @@ export function AnalysisPanel({
   onDrillField,
   onFrequencyDrill,
   onAnomalyMarkers,
+  onAnomalyRunId,
   onJumpToTime,
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
@@ -153,6 +156,7 @@ export function AnalysisPanel({
             onSelectEvent={onSelectEvent}
             onDrillField={onDrillField}
             onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
             onJumpToTime={onJumpToTime}
           />
         )}
@@ -163,6 +167,7 @@ export function AnalysisPanel({
             timelineId={timelineId}
             onDrillField={onFrequencyDrill}
             onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
             onJumpToTime={onJumpToTime}
           />
         )}

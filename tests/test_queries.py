@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from tracevector.db.queries import EventQuery, EventQueryService
+from tracevector.db.queries import EventQuery, EventQueryService, TagFilter
 
 
 @dataclass
@@ -281,6 +281,60 @@ def test_empty_event_ids_filter_matches_nothing_not_stale_syntax(
     query, params = _last_query(service)
     assert "has({p1:Array(String)}, toString(event_id))" in query
     assert params.get("p1") == []
+
+
+def test_tags_include_filter_emits_compound_or_predicate(
+    service: EventQueryService,
+) -> None:
+    """C13: the unified tag filter must OR-combine ClickHouse-native
+    hasAny(tags, ...) with the pre-resolved Postgres event_id list in a
+    single predicate, ANDed with everything else — not a second ClickHouse
+    round trip resolved into event_ids.
+    """
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            tags_include=TagFilter(tag_values=["urgent"], postgres_event_ids=["ann-evt"]),
+        )
+    )
+    query, params = _last_query(service)
+    assert (
+        "(hasAny(tags, {p1:Array(String)}) OR has({p2:Array(String)}, toString(event_id)))" in query
+    )
+    assert "NOT (hasAny" not in query
+    assert params.get("p1") == ["urgent"]
+    assert params.get("p2") == ["ann-evt"]
+
+
+def test_tags_exclude_filter_negates_whole_predicate(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            tags_exclude=TagFilter(tag_values=["noisy"], postgres_event_ids=["tagged-evt"]),
+        )
+    )
+    query, params = _last_query(service)
+    assert (
+        "NOT (hasAny(tags, {p1:Array(String)}) OR has({p2:Array(String)}, toString(event_id)))"
+        in query
+    )
+    assert params.get("p1") == ["noisy"]
+    assert params.get("p2") == ["tagged-evt"]
+
+
+def test_tags_include_and_exclude_are_independent_predicates(
+    service: EventQueryService,
+) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            tags_include=TagFilter(tag_values=["a"], postgres_event_ids=["e1"]),
+            tags_exclude=TagFilter(tag_values=["b"], postgres_event_ids=["e2"]),
+        )
+    )
+    query, _params = _last_query(service)
+    assert query.count("hasAny(tags,") == 2
+    assert "NOT (hasAny(tags, {p3:Array(String)})" in query
 
 
 def test_event_timestamps_get_explicit_utc_offset(service: EventQueryService) -> None:
