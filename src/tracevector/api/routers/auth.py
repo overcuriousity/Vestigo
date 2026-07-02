@@ -97,10 +97,8 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     """Authenticate with a local username/password and start a session."""
     store = get_store()
     user = await store.get_user_by_username(payload.username)
-    if (
-        user is None
-        or user.auth_provider != "local"
-        or not await asyncio.to_thread(verify_password, payload.password, user.password_hash)
+    if user is None or not await asyncio.to_thread(
+        verify_password, payload.password, user.password_hash
     ):
         await store.record_audit(
             action="auth.login_failed",

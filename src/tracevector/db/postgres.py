@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -24,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 
 from tracevector.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -1832,9 +1835,12 @@ class PostgresStore:
             user_agent=user_agent,
             detail=detail,
         )
-        async with self.session_factory() as session:
-            session.add(row)
-            await session.commit()
+        try:
+            async with self.session_factory() as session:
+                session.add(row)
+                await session.commit()
+        except Exception:
+            logger.exception("Failed to record audit row (action=%s)", action)
 
     async def query_audit(
         self,

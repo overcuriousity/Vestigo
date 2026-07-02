@@ -43,9 +43,9 @@ function extractErrorDetail(json: unknown, fallback: string): string {
 
 /**
  * Called whenever a request comes back 401 (no/expired/revoked session).
- * Wired up by `stores/auth.ts` to clear the cached user and redirect to
- * `/login`, without creating an import cycle between the API layer and the
- * auth store.
+ * Wired up by `App.tsx` via `setUnauthorizedHandler(...)` to clear the
+ * cached user and redirect to `/login`, without creating an import cycle
+ * between the API layer and the auth store.
  */
 let onUnauthorized: (() => void) | null = null;
 
