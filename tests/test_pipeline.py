@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
-from tracevector.models.embeddings import EmbeddingConfig, EmbeddingModel
-from tracevector.models.event import Event
+from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
+from tracesignal.models.embeddings import EmbeddingConfig, EmbeddingModel
+from tracesignal.models.event import Event
 
 
 class FakeClickHouseStore:
@@ -97,7 +97,7 @@ class FakeQdrantStore:
 
     @staticmethod
     def _name(case_id: str, embedding_config_hash: str) -> str:
-        return f"tracevector_{case_id}_{embedding_config_hash}"
+        return f"tracesignal_{case_id}_{embedding_config_hash}"
 
 
 class FakeEmbeddingModel(EmbeddingModel):

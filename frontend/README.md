@@ -1,12 +1,12 @@
-# TraceVector Frontend
+# TraceSignal Frontend
 
-React 19 + TypeScript + Vite SPA for the TraceVector forensic log-analysis tool.
+React 19 + TypeScript + Vite SPA for the TraceSignal forensic log-analysis tool.
 
 ## Development
 
 ```bash
 # Start backend (from repo root)
-uv run tv-web                    # FastAPI on :8080
+uv run tsig-web                    # FastAPI on :8080
 docker compose up -d             # backing services
 
 # Start frontend dev server

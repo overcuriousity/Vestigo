@@ -19,8 +19,8 @@ export function LoginPage() {
   const from = (location.state as { from?: Location })?.from?.pathname ?? "/";
 
   // The health endpoint is unauthenticated and reflects the server's live
-  // TV_OIDC_ENABLED setting, unlike a build-time Vite env var, which
-  // tv-web's auto-build never sets — see docs/reviews/PR7-auth-rbac-audit-review.md #6.
+  // TS_OIDC_ENABLED setting, unlike a build-time Vite env var, which
+  // tsig-web's auto-build never sets — see docs/reviews/PR7-auth-rbac-audit-review.md #6.
   const { data: health } = useQuery({
     queryKey: ["health"],
     queryFn: healthApi.check,
@@ -45,7 +45,7 @@ export function LoginPage() {
       <div className="w-full max-w-sm rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] p-6">
         <div className="mb-1 flex items-center gap-2">
           <ShieldAlert size={22} className="text-[var(--color-accent)]" />
-          <h1 className="text-lg font-semibold text-[var(--color-fg-primary)]">TraceVector</h1>
+          <h1 className="text-lg font-semibold text-[var(--color-fg-primary)]">TraceSignal</h1>
         </div>
         <p className="mb-5 text-sm text-[var(--color-fg-muted)]">Sign in to continue.</p>
         <form

@@ -1,5 +1,5 @@
 [project]
-name = "tracevector"
+name = "tracesignal"
 version = "0.1.0"
 description = "Local-first, forensic-grade log investigation platform with vector-backed anomaly detection."
 readme = "README.md"
@@ -43,13 +43,13 @@ dependencies = [
 ]
 
 [project.scripts]
-tv = "tracevector.cli.main:app"
-tv-web = "tracevector.web.app:start"
+tsig = "tracesignal.cli.main:app"
+tsig-web = "tracesignal.web.app:start"
 
 [project.urls]
-Homepage = "https://github.com/ScalarForensic/TraceVector"
-Repository = "https://github.com/ScalarForensic/TraceVector"
-Documentation = "https://github.com/ScalarForensic/TraceVector/blob/main/docs/CONCEPT.md"
+Homepage = "https://github.com/ScalarForensic/TraceSignal"
+Repository = "https://github.com/ScalarForensic/TraceSignal"
+Documentation = "https://github.com/ScalarForensic/TraceSignal/blob/main/docs/CONCEPT.md"
 
 [dependency-groups]
 dev = [
@@ -66,13 +66,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tracevector"]
+packages = ["src/tracesignal"]
 
 # --- UV package indexes ------------------------------------------------------
 # Default: CPU-only PyTorch, so `uv sync` works out of the box on any machine
 # with no GPU-specific setup ("plug and play"). This is fine for evaluation
 # and for deployments that don't run the embedding pipeline.
-# For production use of the embedding features (`tv embed`, semantic search,
+# For production use of the embedding features (`tsig embed`, semantic search,
 # similarity), switch to a GPU index below — embedding large timelines on CPU
 # is significantly slower.
 # Uncomment ONE GPU block below to enable acceleration. Both `[[tool.uv.index]]`
@@ -155,4 +155,4 @@ indent-style = "space"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "--cov=tracevector --cov-report=term-missing"
+addopts = "--cov=tracesignal --cov-report=term-missing"

@@ -1,4 +1,4 @@
-# TraceVector — Application Concept
+# TraceSignal — Application Concept
 
 ## 1. Vision (one-liner)
 A local-first, forensic-grade log investigation platform for small security teams: ingest Timesketch-compatible timelines at scale, explore them through an ELK-like web interface, and detect anomalies by embedding every log line into a vector database.
@@ -9,7 +9,7 @@ Incident responders and forensic analysts work with massive timeline-shaped data
 - **Notebook scripts** that are flexible but not reproducible or team-friendly.
 - **Timesketch** which is powerful but operationally heavy and broad.
 
-TraceVector is a focused, self-hosted alternative: ingest huge logs, explore them like an ELK stack, and let local embeddings surface the needles in the haystack.
+TraceSignal is a focused, self-hosted alternative: ingest huge logs, explore them like an ELK stack, and let local embeddings surface the needles in the haystack.
 
 ## 3. Target User
 **Small security team (2–10 analysts), self-hosted, often airgapped.**
@@ -77,7 +77,7 @@ The current vocabulary is defined and implemented in
 - Explain scores by showing nearest neighbors and distance metrics.
 
 ### 6.5 Deployment & Operation
-- TraceVector is a native Python application managed with `uv`.
+- TraceSignal is a native Python application managed with `uv`.
 - Backing services (PostgreSQL, ClickHouse, Qdrant) are external; the operator provides them via Docker, native packages, managed services, etc.
 - Optional reference `docker-compose.yml` for one-command setup.
 - Airgapped mode by default: no outbound network calls for model downloads or telemetry.

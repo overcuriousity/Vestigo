@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tracevector.core.jobs import JobStore
+from tracesignal.core.jobs import JobStore
 
 
 def test_create_returns_job_with_progress() -> None:

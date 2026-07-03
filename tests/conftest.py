@@ -15,10 +15,10 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
-from tracevector.api import deps
-from tracevector.api.main import create_app
-from tracevector.core.config import get_settings
-from tracevector.db.postgres import PostgresStore, User
+from tracesignal.api import deps
+from tracesignal.api.main import create_app
+from tracesignal.core.config import get_settings
+from tracesignal.db.postgres import PostgresStore, User
 
 
 @pytest_asyncio.fixture()
@@ -34,11 +34,11 @@ async def store(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def admin_bootstrap(monkeypatch):
-    """Seed TV_ADMIN_* env vars and clear the settings cache so the app
+    """Seed TS_ADMIN_* env vars and clear the settings cache so the app
     bootstraps a fresh administrator on startup. Cache is cleared again on
     teardown so later tests aren't affected by this test's env."""
-    monkeypatch.setenv("TV_ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("TV_ADMIN_PASSWORD", "bootstrap-pass-123")
+    monkeypatch.setenv("TS_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("TS_ADMIN_PASSWORD", "bootstrap-pass-123")
     get_settings.cache_clear()
     yield {"username": "admin", "password": "bootstrap-pass-123"}
     get_settings.cache_clear()

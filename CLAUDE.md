@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TraceVector is a local-first, forensic-grade log investigation platform for small security
+TraceSignal is a local-first, forensic-grade log investigation platform for small security
 teams. It ingests Timesketch-compatible timelines (Plaso CSV/JSONL, generic CSV/JSONL) at
 scale, lets analysts explore events through an ELK-like web UI, and detects anomalies by
 embedding log lines into a vector database and by running statistical detectors directly
@@ -28,9 +28,9 @@ there are multiple plans and roadmaps, which should be consulted, kept up to dat
 ### Backend (run from repo root)
 ```bash
 uv sync                          # install deps
-uv run tv-web                    # start API + serve built frontend on :8080
-uv run tv ingest <path> -c <case> -s <source>   # CLI ingestion (no embeddings)
-uv run tv embed -c <case> -s <source>           # CLI embedding job
+uv run tsig-web                    # start API + serve built frontend on :8080
+uv run tsig ingest <path> -c <case> -s <source>   # CLI ingestion (no embeddings)
+uv run tsig embed -c <case> -s <source>           # CLI embedding job
 uv run pytest                    # full test suite (coverage on by default, see pyproject.toml)
 uv run pytest tests/test_pipeline.py            # single file
 uv run pytest tests/test_pipeline.py::test_name # single test
@@ -38,29 +38,29 @@ uv run ruff check .              # lint
 uv run ruff format .             # format
 ```
 `podman compose up -d` starts the three backing services for local dev. Config is env-driven
-via `TV_*` variables (see `.env.example` and `src/tracevector/core/config.py`), loaded through
+via `TS_*` variables (see `.env.example` and `src/tracesignal/core/config.py`), loaded through
 pydantic-settings.
 
 ### Frontend (run from `frontend/`)
 ```bash
 npm install
 npm run dev                      # Vite dev server on :5173 (HMR, proxies to :8080 API)
-npm run build                    # tsc -b && vite build -> dist/, served by tv-web
+npm run build                    # tsc -b && vite build -> dist/, served by tsig-web
 npm run typecheck                # tsc -b --noEmit
 npm run lint                     # oxlint src
 npm run test                     # vitest run
 ```
-`tv-web` auto-builds `frontend/dist` on first run if it doesn't exist (see
-`src/tracevector/web/app.py::_build_frontend`). For active frontend work, run `npm run dev`
-alongside `uv run tv-web` instead of rebuilding.
+`tsig-web` auto-builds `frontend/dist` on first run if it doesn't exist (see
+`src/tracesignal/web/app.py::_build_frontend`). For active frontend work, run `npm run dev`
+alongside `uv run tsig-web` instead of rebuilding.
 
 ## Architecture
 
-### Backend layout (`src/tracevector/`)
+### Backend layout (`src/tracesignal/`)
 - `api/main.py` — FastAPI app factory; mounts routers, CORS, serves `frontend/dist` as a
   catch-all SPA route when built.
 - `api/routers/` — `cases.py`, `events.py`, `jobs.py` — thin HTTP layer over `db/` and `core/`.
-- `core/config.py` — single `Settings` object (pydantic-settings, `TV_` env prefix), cached via
+- `core/config.py` — single `Settings` object (pydantic-settings, `TS_` env prefix), cached via
   `get_settings()`. Add new tunables here, not as scattered `os.environ` reads.
 - `core/jobs.py` — in-memory, ephemeral `JobStore` for long-running background work (embedding,
   large ingests). Jobs do **not** survive a process restart — this is intentional for the
@@ -89,7 +89,7 @@ alongside `uv run tv-web` instead of rebuilding.
   (`config_hash()`) for forensic reproducibility. Changing a parser/embedding config's fields
   changes its hash and therefore its identity (new Qdrant collection, etc.) — treat these
   dataclasses as append-only where possible.
-- `cli/main.py` — Typer CLI (`tv`), mirrors what the API/UI does for scriptable/offline use.
+- `cli/main.py` — Typer CLI (`tsig`), mirrors what the API/UI does for scriptable/offline use.
 
 ### Frontend layout (`frontend/src/`)
 - `api/` — one file per resource (`cases.ts`, `events.ts`, `anomalies.ts`, ...), thin fetch
@@ -115,9 +115,9 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
 - Background jobs (`core/jobs.py::JobStore`) are intentionally ephemeral/in-memory — don't add
   persistence there without a deliberate design discussion; it changes the deployment model.
 - Forensic reproducibility/explainability is a hard requirement for basically any subsystem. 
-- Airgapped/offline-by-default is a design goal (`TV_ALLOW_ONLINE`, `docs/TECH_STACK.md` §6).
+- Airgapped/offline-by-default is a design goal (`TS_ALLOW_ONLINE`, `docs/TECH_STACK.md` §6).
   Don't add code paths that reach the network unconditionally. Exception: optional OIDC SSO
-  (`TV_OIDC_ENABLED`) is deliberately independent of `TV_ALLOW_ONLINE` — see `TECH_STACK.md` §6.
+  (`TS_OIDC_ENABLED`) is deliberately independent of `TS_ALLOW_ONLINE` — see `TECH_STACK.md` §6.
   
 ## References
 This project is inspired heavily by the existing projects https://github.com/ait-aecid/logdata-anomaly-miner and google/timesketch. Our goal is to become the perfect combination of them, evolving to the best forensic log analysis system in existence. Consult these for how they solve problems and their features and get inspiration there.
