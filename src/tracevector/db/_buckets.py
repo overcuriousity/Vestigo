@@ -16,10 +16,10 @@ caller still builds its own WHERE/parameters.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from tracevector.db._dt import ensure_utc
+from tracevector.db._dt import ensure_utc, ensure_utc_iso
 
 
 class _ChClient(Protocol):
@@ -49,3 +49,22 @@ def bucket_interval_seconds(min_ts: datetime, max_ts: datetime, bucket_count: in
     """Return the interval (seconds, floored at 1) spanning [min_ts, max_ts] in bucket_count buckets."""
     duration = (max_ts - min_ts).total_seconds()
     return max(1, int(duration / bucket_count))
+
+
+def aligned_bucket_starts(min_ts: datetime, max_ts: datetime, interval: int) -> list[str]:
+    """Return every epoch-aligned bucket start (UTC ISO) covering [min_ts, max_ts].
+
+    ClickHouse's ``toStartOfInterval(timestamp, INTERVAL n second)`` aligns
+    buckets to the Unix epoch, so zero-filling code must replicate that
+    alignment — deriving starts from the query's result rows instead would
+    drop any bucket in which no row matched. Always yields at least one
+    bucket, even when the range collapses to a point.
+    """
+    start_epoch = int(min_ts.timestamp() // interval) * interval
+    end_epoch = int(max_ts.timestamp() // interval) * interval
+    if end_epoch <= start_epoch:
+        end_epoch = start_epoch + interval
+    return [
+        ensure_utc_iso(datetime.fromtimestamp(epoch, tz=UTC))
+        for epoch in range(start_epoch, end_epoch, interval)
+    ]

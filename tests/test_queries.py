@@ -1177,4 +1177,224 @@ def test_field_value_timeseries_no_values_returns_empty_series_without_bucket_qu
     )
     assert result["series"] == []
     assert result["min"] == min_ts.isoformat()
+
+
+# ── compare aggregation tests (compare_time_histogram / compare_field_terms / compare_field_numeric) ─
+
+
+class _SeqFakeClient:
+    """Like _VizFakeClient, but each marker maps to a FIFO of results.
+
+    The compare_* methods run the *same query shape once per layer* (primary
+    then comparison), so a single canned result per marker cannot tell the
+    layers apart — a FIFO can.
+    """
+
+    def __init__(self, responses: list[tuple[str, list[FakeQueryResult]]]) -> None:
+        self._responses = responses
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def query(
+        self, query: str, parameters: dict[str, Any] | None = None, **_kwargs: Any
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        for substr, queue in self._responses:
+            if substr in query and queue:
+                return queue.pop(0)
+        raise AssertionError(f"No fake response left for query:\n{query}")
+
+
+def _seq_service(responses: list[tuple[str, list[FakeQueryResult]]]) -> EventQueryService:
+    store = FakeClickHouseStore()
+    store.client = _SeqFakeClient(responses)  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_compare_time_histogram_shared_grid_zero_fill_and_no_range_query() -> None:
+    """Explicit start/end → no range query; both layers land on identical
+    bucket starts with zero-fill, comparison layer's missing buckets = 0."""
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
+    b0 = min_ts
+    b1 = min_ts + timedelta(hours=1)
+    svc = _seq_service(
+        [
+            (
+                "toStartOfInterval",
+                [
+                    FakeQueryResult(result_rows=[[b0, 5]]),  # primary
+                    FakeQueryResult(result_rows=[[b0, 50], [b1, 40]]),  # comparison
+                ],
+            ),
+        ]
+    )
+    primary = EventQuery(case_id="c1", source_ids=["s1"], q="dos", start=min_ts, end=max_ts)
+    comparison = EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts)
+    result = svc.compare_time_histogram(primary, comparison, buckets=2)
+
+    assert not any("min(timestamp)" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+    assert result["interval_seconds"] == 3600
+    assert result["primary_total"] == 5
+    assert result["comparison_total"] == 90
+    assert len(result["buckets"]) == 2
+    # Primary has no row for b1 — zero-filled on the shared grid, not dropped.
+    assert result["buckets"][0]["primary"] == 5
+    assert result["buckets"][0]["comparison"] == 50
+    assert result["buckets"][1]["primary"] == 0
+    assert result["buckets"][1]["comparison"] == 40
+
+
+def test_compare_time_histogram_uses_union_of_layer_ranges() -> None:
+    """Without an explicit window, the grid spans the union of both layers'
+    data ranges — neither layer's buckets get truncated to the other's."""
+    p_min = datetime(2024, 1, 1, 6, tzinfo=UTC)
+    p_max = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    c_min = datetime(2024, 1, 1, 0, tzinfo=UTC)
+    c_max = datetime(2024, 1, 1, 18, tzinfo=UTC)
+    svc = _seq_service(
+        [
+            (
+                "min(timestamp)",
+                [
+                    FakeQueryResult(result_rows=[[p_min, p_max]]),
+                    FakeQueryResult(result_rows=[[c_min, c_max]]),
+                ],
+            ),
+            (
+                "toStartOfInterval",
+                [FakeQueryResult(result_rows=[]), FakeQueryResult(result_rows=[])],
+            ),
+        ]
+    )
+    result = svc.compare_time_histogram(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        buckets=18,
+    )
+    assert result["min"] == c_min.isoformat()
+    assert result["max"] == c_max.isoformat()
+    range_queries = [q for q, _ in svc.store.client.queries if "min(timestamp)" in q]  # type: ignore[union-attr]
+    assert len(range_queries) == 2
+
+
+def test_compare_time_histogram_empty_dataset() -> None:
+    svc = _seq_service(
+        [
+            (
+                "min(timestamp)",
+                [
+                    FakeQueryResult(result_rows=[[None, None]]),
+                    FakeQueryResult(result_rows=[[None, None]]),
+                ],
+            ),
+        ]
+    )
+    result = svc.compare_time_histogram(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+    )
+    assert result["buckets"] == []
+    assert result["primary_total"] == 0
+    assert result["comparison_total"] == 0
+
+
+def test_compare_field_terms_shares_primary_categories() -> None:
+    """Primary's top-N fixes the category list; comparison is counted against
+    those same values, its tail folding into comparison_other."""
+    svc = _seq_service(
+        [
+            # Primary field_terms (window-agg shape: val, c, total, n_groups).
+            (
+                "OVER ()",
+                [FakeQueryResult(result_rows=[["GET", 60, 100, 5], ["POST", 30, 100, 5]])],
+            ),
+            # Comparison layer folded onto the shared values: '' = its tail.
+            (
+                "cmp_values",
+                [FakeQueryResult(result_rows=[["GET", 600], ["", 400]])],
+            ),
+        ]
+    )
+    result = svc.compare_field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:method",
+    )
+    assert [v["value"] for v in result["values"]] == ["GET", "POST"]
+    assert result["values"][0] == {"value": "GET", "primary": 60, "comparison": 600}
+    # POST absent from comparison rows — zero, not dropped.
+    assert result["values"][1] == {"value": "POST", "primary": 30, "comparison": 0}
+    assert result["primary_total"] == 100
+    assert result["comparison_total"] == 1000
+    assert result["primary_other"] == 10
+    assert result["comparison_other"] == 400
+
+
+def test_compare_field_terms_empty_primary_skips_comparison_query() -> None:
+    svc = _seq_service([("OVER ()", [FakeQueryResult(result_rows=[])])])
+    result = svc.compare_field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:method",
+    )
+    assert result["values"] == []
+    assert result["comparison_total"] == 0
+    assert not any("cmp_values" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+
+
+def test_compare_field_numeric_shared_edges_from_union_min_max() -> None:
+    """Bin edges come from the union min/max of both layers, and both layers
+    are bucketed on those identical edges."""
+    svc = _seq_service(
+        [
+            (
+                "count(v), min(v), max(v)",
+                [
+                    FakeQueryResult(result_rows=[[10, 20.0, 60.0]]),  # primary
+                    FakeQueryResult(result_rows=[[100, 0.0, 100.0]]),  # comparison
+                ],
+            ),
+            (
+                "greatest(0, least(",
+                [
+                    FakeQueryResult(result_rows=[[0, 4], [1, 6]]),  # primary
+                    FakeQueryResult(result_rows=[[0, 50], [1, 50]]),  # comparison
+                ],
+            ),
+        ]
+    )
+    result = svc.compare_field_numeric(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:bytes",
+        bins=2,
+    )
+    assert result["min"] == 0.0
+    assert result["max"] == 100.0
+    assert result["bins"][0] == {"x0": 0.0, "x1": 50.0, "primary": 4, "comparison": 50}
+    assert result["bins"][1] == {"x0": 50.0, "x1": 100.0, "primary": 6, "comparison": 50}
+    # Both bin queries were parameterized with the same shared edges.
+    bin_params = [p for q, p in svc.store.client.queries if "greatest(0, least(" in q]  # type: ignore[union-attr]
+    assert all(p["mn"] == 0.0 and p["bw"] == 50.0 for p in bin_params)
+
+
+def test_compare_field_numeric_no_numeric_values_returns_empty() -> None:
+    svc = _seq_service(
+        [
+            (
+                "count(v), min(v), max(v)",
+                [
+                    FakeQueryResult(result_rows=[[0, None, None]]),
+                    FakeQueryResult(result_rows=[[0, None, None]]),
+                ],
+            ),
+        ]
+    )
+    result = svc.compare_field_numeric(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:user_agent",
+    )
+    assert result["bins"] == []
+    assert result["min"] is None
     assert not any("toStartOfInterval" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]

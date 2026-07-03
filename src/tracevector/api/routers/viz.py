@@ -11,11 +11,13 @@ notion of "current filters".
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
 from tracevector.api.deps import require_case_read
 from tracevector.api.routers.events import (
@@ -277,6 +279,135 @@ async def get_field_value_timeseries(
     service = _get_query_service()
     return await run_in_threadpool(
         service.field_value_timeseries, query, field, buckets, series_limit
+    )
+
+
+class CompareFilters(BaseModel):
+    """One comparison layer's filter set — field-for-field the same names and
+    string encodings as the shared viz/events filter *query params*, so the
+    frontend's ``serializeEventFilterParams`` output maps 1:1 into a body
+    object and resolution reuses ``_resolve_event_query`` unchanged.
+    """
+
+    q: str | None = None
+    artifact: str | None = None
+    artifacts: str | None = None
+    source_id: str | None = None
+    tag: str | None = None
+    exclude_tag: str | None = None
+    tags_include: str | None = None
+    tags_exclude: str | None = None
+    ids: str | None = None
+    start: datetime | None = None
+    end: datetime | None = None
+    filters: str | None = None
+    exclusions: str | None = None
+    annotated: str | None = None
+    annotation_tag_value: str | None = None
+    run_id: str | None = None
+
+
+class ComparisonSpec(BaseModel):
+    """The comparison layer: all timeline events (baseline) or a second filter set."""
+
+    mode: Literal["baseline", "custom"]
+    filters: CompareFilters | None = None
+
+
+class CompareRequest(BaseModel):
+    """Body for ``POST .../viz/compare`` — two filter sets don't fit query params."""
+
+    kind: Literal["time", "terms", "numeric"]
+    field: str | None = None
+    primary: CompareFilters = Field(default_factory=CompareFilters)
+    comparison: ComparisonSpec
+    buckets: int = Field(default=60, ge=10, le=200)
+    bins: int = Field(default=30, ge=1, le=200)
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilters):
+    return await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=body.q,
+        artifact=body.artifact,
+        artifacts=body.artifacts,
+        source_id=body.source_id,
+        tag=body.tag,
+        exclude_tag=body.exclude_tag,
+        tags_include=body.tags_include,
+        tags_exclude=body.tags_exclude,
+        ids=body.ids,
+        start=body.start,
+        end=body.end,
+        filters=body.filters,
+        exclusions=body.exclusions,
+        annotated=body.annotated,
+        annotation_tag_value=body.annotation_tag_value,
+        run_id=body.run_id,
+    )
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/viz/compare")
+async def compare_layers(
+    case_id: str,
+    timeline_id: str,
+    body: CompareRequest,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Compare a primary filter layer against a baseline or custom second layer.
+
+    Comparability is enforced server-side: both layers are evaluated against
+    one shared grid (same resolved time range, same bucket interval / bin
+    edges, same top-N category list — see ``EventQueryService.compare_*``),
+    so the returned series are comparable by construction. The response
+    carries raw counts only — derived metrics (delta / rate / % of baseline /
+    cumulative) are pure frontend transforms, keeping counts the forensic
+    ground truth.
+    """
+    if body.kind in ("terms", "numeric") and not body.field:
+        raise HTTPException(status_code=422, detail=f"kind={body.kind!r} requires 'field'")
+
+    primary = await _resolve_body_query(case_id, timeline_id, body.primary)
+
+    if body.comparison.mode == "baseline":
+        # All events of the timeline: filters dropped, timeline scope and
+        # explicit time window kept — "the whole" the primary is a part of.
+        comparison = replace(
+            primary,
+            q=None,
+            artifact=None,
+            artifacts=None,
+            source_id=None,
+            tag=None,
+            exclude_tag=None,
+            field_filters={},
+            field_exclusions={},
+            event_ids=None,
+            exclude_event_ids=None,
+            tags_include=None,
+            tags_exclude=None,
+        )
+    else:
+        if body.comparison.filters is None:
+            raise HTTPException(status_code=422, detail="mode='custom' requires 'filters'")
+        comparison = await _resolve_body_query(case_id, timeline_id, body.comparison.filters)
+        # Comparability invariant: both layers share the primary's explicit
+        # time window (the union of data ranges handles the implicit case).
+        comparison = replace(comparison, start=primary.start, end=primary.end)
+
+    service = _get_query_service()
+    if body.kind == "time":
+        return await run_in_threadpool(
+            service.compare_time_histogram, primary, comparison, body.buckets
+        )
+    if body.kind == "terms":
+        return await run_in_threadpool(
+            service.compare_field_terms, primary, comparison, body.field, body.limit
+        )
+    return await run_in_threadpool(
+        service.compare_field_numeric, primary, comparison, body.field, body.bins
     )
 
 
