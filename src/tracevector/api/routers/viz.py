@@ -19,7 +19,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from tracevector.api.deps import require_case_read
+from tracevector.api.deps import (
+    get_store,
+    require_case_contribute,
+    require_case_read,
+    require_password_current,
+)
 from tracevector.api.routers.events import (
     _get_query_service,
     _get_stat_anomaly_service,
@@ -29,7 +34,7 @@ from tracevector.api.routers.events import (
     _resolve_event_id_filters,
     _resolve_timeline_source_ids,
 )
-from tracevector.db.postgres import Case
+from tracevector.db.postgres import Case, User, generate_id
 from tracevector.db.queries import EventQuery
 
 router = APIRouter(prefix="/api/cases", tags=["viz"])
@@ -409,6 +414,87 @@ async def compare_layers(
     return await run_in_threadpool(
         service.compare_field_numeric, primary, comparison, body.field, body.bins
     )
+
+
+class SavedChartCreate(BaseModel):
+    """Body for creating a saved chart."""
+
+    name: str = Field(min_length=1, max_length=255)
+    config: dict[str, Any]
+
+
+class SavedChartRename(BaseModel):
+    """Body for renaming a saved chart."""
+
+    name: str = Field(min_length=1, max_length=255)
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/charts")
+async def list_saved_charts(
+    case_id: str,
+    timeline_id: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """List a timeline's saved charts (newest first)."""
+    store = get_store()
+    charts = await store.list_saved_charts(case_id, timeline_id)
+    return {"charts": [c.to_dict() for c in charts]}
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/viz/charts")
+async def create_saved_chart(
+    case_id: str,
+    timeline_id: str,
+    payload: SavedChartCreate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Save the current chart config under a name.
+
+    ``config`` is the frontend's versioned ``ChartConfig`` and is stored as
+    opaque JSON — the backend round-trips it without interpretation, exactly
+    like a View's filter payload.
+    """
+    store = get_store()
+    chart = await store.create_saved_chart(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        chart_id=generate_id(payload.name),
+        name=payload.name,
+        config=payload.config,
+    )
+    return {"chart": chart.to_dict()}
+
+
+@router.patch("/{case_id}/timelines/{timeline_id}/viz/charts/{chart_id}")
+async def rename_saved_chart(
+    case_id: str,
+    chart_id: str,
+    payload: SavedChartRename,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Rename a saved chart (the stored config itself is immutable)."""
+    store = get_store()
+    chart = await store.rename_saved_chart(case_id, chart_id, payload.name)
+    if chart is None:
+        raise HTTPException(status_code=404, detail="Saved chart not found")
+    return {"chart": chart.to_dict()}
+
+
+@router.delete("/{case_id}/timelines/{timeline_id}/viz/charts/{chart_id}")
+async def delete_saved_chart(
+    case_id: str,
+    chart_id: str,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Delete a saved chart."""
+    store = get_store()
+    deleted = await store.delete_saved_chart(case_id, chart_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Saved chart not found")
+    return {"deleted": True, "chart_id": chart_id}
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/fields")

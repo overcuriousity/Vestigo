@@ -593,6 +593,18 @@ export interface CompareNumericResponse {
   comparison_total: number;
 }
 
+/** A saved Visualization-page chart; `config` is a versioned ChartConfig
+ * stored as opaque JSON (validated client-side by `parseStoredChartConfig`). */
+export interface SavedChart {
+  id: string;
+  case_id: string;
+  timeline_id: string;
+  name: string;
+  config: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 /** Body for export endpoint */
 export interface ExportRequest {
   format: "csv" | "jsonl";

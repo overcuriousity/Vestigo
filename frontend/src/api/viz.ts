@@ -1,4 +1,4 @@
-import { get, post } from "./client";
+import { del, get, patch, post } from "./client";
 import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
   CompareNumericResponse,
@@ -8,6 +8,7 @@ import type {
   FieldNumericResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
+  SavedChart,
   VizFieldsResponse,
 } from "./types";
 
@@ -101,4 +102,33 @@ export const vizApi = {
       bins: body.bins,
       limit: body.limit,
     }),
+};
+
+/** Saved chart configs, scoped to a timeline (patterned on saved Views). */
+export const savedChartsApi = {
+  list: (caseId: string, timelineId: string): Promise<{ charts: SavedChart[] }> =>
+    get(`/cases/${caseId}/timelines/${timelineId}/viz/charts`),
+
+  create: (
+    caseId: string,
+    timelineId: string,
+    name: string,
+    config: Record<string, unknown>,
+  ): Promise<{ chart: SavedChart }> =>
+    post(`/cases/${caseId}/timelines/${timelineId}/viz/charts`, { name, config }),
+
+  rename: (
+    caseId: string,
+    timelineId: string,
+    chartId: string,
+    name: string,
+  ): Promise<{ chart: SavedChart }> =>
+    patch(`/cases/${caseId}/timelines/${timelineId}/viz/charts/${chartId}`, { name }),
+
+  delete: (
+    caseId: string,
+    timelineId: string,
+    chartId: string,
+  ): Promise<{ deleted: boolean }> =>
+    del(`/cases/${caseId}/timelines/${timelineId}/viz/charts/${chartId}`),
 };

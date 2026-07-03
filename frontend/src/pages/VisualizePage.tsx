@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/Select";
 import { ExportControls } from "@/components/viz/ExportControls";
 import { CompareFilterEditor } from "@/components/viz/CompareFilterEditor";
+import { SavedChartsRail } from "@/components/viz/SavedChartsRail";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
@@ -699,7 +700,15 @@ export function VisualizePage() {
           </div>
         )}
 
-        <div className="mt-auto border-t border-[var(--color-border)] pt-3">
+        <div className="mt-auto space-y-3 border-t border-[var(--color-border)] pt-3">
+          {caseId && timelineId && (
+            <SavedChartsRail
+              caseId={caseId}
+              timelineId={timelineId}
+              currentConfig={config}
+              onLoad={(loaded) => updateConfig(loaded)}
+            />
+          )}
           <ExportControls
             svgRef={svgRef}
             filename={`${dataKind === "time" ? "events_over_time" : (field ?? "visualization")}_${chartType}`}
