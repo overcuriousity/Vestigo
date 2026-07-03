@@ -48,6 +48,7 @@ from tracesignal.db._buckets import bucket_interval_seconds, query_timestamp_ran
 from tracesignal.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
 from tracesignal.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
 from tracesignal.db.clickhouse import ClickHouseStore
+from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -162,7 +163,11 @@ class NoveltyFieldInfo:
 # ---------------------------------------------------------------------------
 
 
-def _col_expr(field_token: str, params: dict[str, Any]) -> str:
+def _col_expr(
+    field_token: str,
+    params: dict[str, Any],
+    field_mappings: dict[str, list[str]] | None = None,
+) -> str:
     """Return a ClickHouse SQL expression for a field token.
 
     Top-level columns (``"artifact"``, ``"display_name"``, …) are returned as-is,
@@ -175,7 +180,14 @@ def _col_expr(field_token: str, params: dict[str, Any]) -> str:
     returned as ``attributes[{fk:String}]`` with the key injected into
     *params*. Every call site uses a fresh *params* dict for a single field
     token, so a fixed parameter name is safe — no counter needed.
+
+    ``field_mappings`` (issue #10): a token naming a canonical mapped field
+    resolves to a coalesce over its raw attribute keys (parameter names
+    ``fk_m0..fk_mN`` — same single-field-per-params-dict assumption).
     """
+    mapped_raws = resolve_mapping(field_token, field_mappings)
+    if mapped_raws:
+        return mapping_coalesce_expr(mapped_raws, params, "fk")
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         return column
@@ -311,6 +323,7 @@ class StatisticalAnomalyService:
         case_id: str,
         source_ids: list[str],
         total: int | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
     ) -> tuple[list[tuple[str, int, int]], int]:
         """Return ``((token, distinct, non_empty_count), ...), total`` for candidate fields.
 
@@ -370,8 +383,36 @@ class StatisticalAnomalyService:
         attr_res = self.ch.client.query(
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
         )
+        mapped_raws = {r for raws in (field_mappings or {}).values() for r in raws}
         for key, dist, cov_count in attr_res.result_rows:
+            if key in mapped_raws:
+                continue  # replaced by the canonical entry below
             inventory.append((f"attr:{key}", int(dist), int(cov_count)))
+
+        # Canonical mapped fields (issue #10): exact aggregates over the
+        # coalesce expression, all canonicals batched into one round-trip —
+        # summing the per-raw-key numbers would double-count events that
+        # carry several of the raw keys.
+        if field_mappings:
+            m_params: dict[str, Any] = {**params}
+            m_parts = []
+            canonicals = list(field_mappings.items())
+            for i, (_, raws) in enumerate(canonicals):
+                expr = mapping_coalesce_expr(raws, m_params, f"inv{i}")
+                m_parts.append(
+                    f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}"
+                )
+            m_sql = (
+                f"SELECT {', '.join(m_parts)}"
+                f" FROM {db}.events"
+                f" WHERE case_id = {{cid:String}}"
+                f" AND has({{src:Array(String)}}, source_id)"
+            )
+            m_res = self.ch.client.query(m_sql, parameters=m_params)
+            if m_res.result_rows:
+                row = m_res.result_rows[0]
+                for i, (canonical, _) in enumerate(canonicals):
+                    inventory.append((canonical, int(row[i * 2]), int(row[i * 2 + 1])))
 
         return inventory, total
 
@@ -380,6 +421,7 @@ class StatisticalAnomalyService:
         case_id: str,
         source_ids: list[str],
         total: int | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
     ) -> list[NoveltyFieldInfo]:
         """Return a ranked, annotated list of candidate fields for value_novelty.
 
@@ -400,7 +442,7 @@ class StatisticalAnomalyService:
         (e.g. ``find_value_novelty``'s auto-field-selection path) to avoid a
         redundant identical round-trip.
         """
-        inventory, total = self.field_inventory(case_id, source_ids, total)
+        inventory, total = self.field_inventory(case_id, source_ids, total, field_mappings)
         if total == 0:
             return []
 
@@ -459,6 +501,7 @@ class StatisticalAnomalyService:
         baseline_end: datetime | None = None,
         per_field_limit: int = 25,
         exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen values per field, ranked by surprise score.
 
@@ -485,7 +528,9 @@ class StatisticalAnomalyService:
             # Auto-discover useful fields for this specific timeseries. Pass
             # the total we already have — recommend_novelty_fields would
             # otherwise re-run the exact same count() query.
-            rec = self.recommend_novelty_fields(case_id, source_ids, total=total_events)
+            rec = self.recommend_novelty_fields(
+                case_id, source_ids, total=total_events, field_mappings=field_mappings
+            )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
             # Each field below is a separate sequential ClickHouse round-trip
             # (no cross-field batching); cap how many an auto-selected set can
@@ -518,7 +563,7 @@ class StatisticalAnomalyService:
 
         for field_token in scan_fields:
             params: dict[str, Any] = {**base_params}
-            col = _col_expr(field_token, params)
+            col = _col_expr(field_token, params, field_mappings)
 
             if baseline_end is None:
                 # Self-baseline: flag values with count ≤ rarity_floor.
@@ -673,6 +718,7 @@ class StatisticalAnomalyService:
         z_threshold: float = 2.5,
         baseline_end: datetime | None = None,
         exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
     ) -> StatAnomalyResult:
         """Return time windows with anomalous event-count frequency.
 
@@ -690,7 +736,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         field_params: dict[str, Any] = {}
-        col = _col_expr(series_field, field_params)
+        col = _col_expr(series_field, field_params, field_mappings)
 
         src_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
 

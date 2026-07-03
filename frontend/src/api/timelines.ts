@@ -1,5 +1,11 @@
-import { del, get, post } from "./client";
-import type { EmbeddingFieldsResponse, EmbeddingFieldConfig, Source, Timeline } from "./types";
+import { del, get, patch, post } from "./client";
+import type {
+  EmbeddingFieldsResponse,
+  EmbeddingFieldConfig,
+  FieldCoverageResponse,
+  Source,
+  Timeline,
+} from "./types";
 
 export const timelinesApi = {
   list: (caseId: string) =>
@@ -17,12 +23,35 @@ export const timelinesApi = {
     name: string,
     description?: string,
     sourceIds?: string[],
+    fieldMappings?: Record<string, string[]> | null,
   ) =>
     post<{ timeline: Timeline }>(`/cases/${caseId}/timelines`, {
       name,
       description,
       source_ids: sourceIds ?? [],
+      field_mappings:
+        fieldMappings && Object.keys(fieldMappings).length > 0 ? fieldMappings : null,
     }).then((r) => r.timeline),
+
+  /** Replace a timeline's field mappings (null/{} clears them). */
+  patchFieldMappings: (
+    caseId: string,
+    timelineId: string,
+    fieldMappings: Record<string, string[]> | null,
+  ) =>
+    patch<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/field-mappings`,
+      {
+        field_mappings:
+          fieldMappings && Object.keys(fieldMappings).length > 0 ? fieldMappings : null,
+      },
+    ).then((r) => r.timeline),
+
+  /** Per-raw-field coverage across sources, for the wizard's aggregation step. */
+  fieldCoverage: (caseId: string, sourceIds: string[]) =>
+    get<FieldCoverageResponse>(
+      `/cases/${caseId}/fields/coverage?source_ids=${encodeURIComponent(sourceIds.join(","))}`,
+    ),
 
   delete: (caseId: string, timelineId: string) =>
     del<{ deleted: boolean }>(`/cases/${caseId}/timelines/${timelineId}`),

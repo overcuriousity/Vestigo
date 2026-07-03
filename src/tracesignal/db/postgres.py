@@ -169,6 +169,11 @@ class Timeline(Base):
         server_default=func.now(),
     )
 
+    # Field mappings (issue #10): canonical field name → ordered raw attribute
+    # keys, applied at query time (db/field_mappings.py). Pure metadata — the
+    # ingested events are never rewritten; None/empty means no mapping.
+    field_mappings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # --- Embedding state (all nullable; None → not yet embedded) -------------
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -194,6 +199,7 @@ class Timeline(Base):
             "description": self.description,
             "is_default": self.is_default,
             "source_ids": [s.id for s in self.sources],
+            "field_mappings": self.field_mappings,
             "is_embedded": is_embedded,
             "is_stale": is_stale,
             "embedding_model": self.embedding_model,
@@ -652,6 +658,13 @@ class PostgresStore:
             ):
                 if column not in existing_columns:
                     await conn.execute(text(ddl))
+            timeline_columns = await conn.run_sync(
+                lambda sync_conn: {
+                    col["name"] for col in inspect(sync_conn).get_columns("timelines")
+                }
+            )
+            if "field_mappings" not in timeline_columns:
+                await conn.execute(text("ALTER TABLE timelines ADD COLUMN field_mappings JSON"))
             # No migration for the earlier `annotation_type="outlier"` rows
             # (renamed to "anomaly" when the statistical anomaly engine
             # landed): no releases exist yet and pre-this-branch databases
@@ -891,6 +904,7 @@ class PostgresStore:
         name: str,
         description: str | None = None,
         source_ids: list[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
     ) -> Timeline:
         """Create a new timeline within a case and optionally attach sources."""
         timeline = Timeline(
@@ -898,6 +912,7 @@ class PostgresStore:
             case_id=case_id,
             name=name,
             description=description,
+            field_mappings=field_mappings or None,
         )
         async with self.session_factory() as session:
             session.add(timeline)
@@ -1074,6 +1089,36 @@ class PostgresStore:
                 .order_by(Timeline.created_at.desc())
             )
             return list(result.scalars().all())
+
+    async def update_timeline_field_mappings(
+        self,
+        case_id: str,
+        timeline_id: str,
+        field_mappings: dict[str, list[str]] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's field mappings (None/empty clears them).
+
+        Mappings are timeline metadata, not evidence — edits are allowed and
+        audited at the API layer. Returns the updated timeline with sources
+        eagerly loaded, or None if it doesn't exist.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.field_mappings = field_mappings or None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
 
     async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
         """Delete a timeline row.

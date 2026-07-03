@@ -30,6 +30,12 @@ async def _fake_source_ids(case_id: str, timeline_id: str) -> list[str]:
     return ["s1", "s2"]
 
 
+async def _fake_scope(
+    case_id: str, timeline_id: str
+) -> tuple[list[str], dict[str, list[str]] | None]:
+    return ["s1", "s2"], None
+
+
 @pytest.mark.asyncio
 async def test_list_viz_fields_sorts_by_coverage_then_token(monkeypatch):
     svc = _FakeStatService(
@@ -96,7 +102,7 @@ async def _fake_id_filters(case_id, source_ids, **_kwargs):
 def _patch_compare(monkeypatch) -> _FakeCompareService:
     svc = _FakeCompareService()
     monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
-    monkeypatch.setattr(viz, "_resolve_timeline_source_ids", _fake_source_ids)
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
     monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
     return svc
 

@@ -120,8 +120,27 @@ export interface Timeline {
   embedding_model: string | null;
   embedded_source_ids: string[] | null;
   embedded_at: string | null;
+  /** Canonical field name -> ordered raw attribute keys (query-time merge). */
+  field_mappings: Record<string, string[]> | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Per-source presence of one raw attribute key (timeline wizard). */
+export interface FieldCoverageSource {
+  source_id: string;
+  count: number;
+  samples: string[];
+}
+
+export interface FieldCoverageEntry {
+  key: string;
+  sources: FieldCoverageSource[];
+}
+
+export interface FieldCoverageResponse {
+  fields: FieldCoverageEntry[];
+  sampled_rows_per_source: number;
 }
 
 export interface Event {

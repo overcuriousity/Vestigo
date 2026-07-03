@@ -1,6 +1,11 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 12 — issue #5: full rename TraceVector → TraceSignal
+Last updated: 2026-07-03 (session 12 — issue #10: timeline creation wizard with query-time
+field aggregation (`Timeline.field_mappings` metadata, coalesce resolution in
+`db/field_mappings.py` threaded through filters/histogram/viz/export/detectors, field
+discovery surfaces canonical names with provenance, `PATCH .../field-mappings` + audit,
+`GET /cases/{id}/fields/coverage`, 4-step wizard with name+value-shape merge suggestions);
+issue #5: full rename TraceVector → TraceSignal
 (`tsig`/`tsig-web` CLI, `TS_` env prefix, hard cutover, `docs/MIGRATION_RENAME.md`); issue #11:
 vendored self-contained 2timesketch converter scripts (`scripts/vendor_converters.py` →
 `src/tracesignal/assets/converters/` + manifest), `GET /api/converters[/{name}]` download
