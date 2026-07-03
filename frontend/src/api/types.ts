@@ -475,6 +475,8 @@ export interface FieldsResponse {
   top_level: string[];
   /** Dynamic keys aggregated from the attributes Map */
   attributes: string[];
+  /** `enrich.<field_key>` columns hydrated at query time; not filterable */
+  enrichments: string[];
 }
 
 export interface HistogramBucket {

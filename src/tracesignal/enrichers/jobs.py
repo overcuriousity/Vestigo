@@ -198,11 +198,13 @@ async def reconcile_orphaned_enrichment_jobs(store: PostgresStore) -> None:
 
     Mirrors the orphaned-ingest cleanup in ``api/main.py``: the in-memory
     JobStore is empty on a fresh boot, so any ``EnrichmentJobRun`` marker
-    still present means that job never reached its final flush. Nothing was
-    ever committed to ClickHouse for an unfinished run (flush only happens
-    after full batches are staged), so discarding the marker and its staged
-    rows is safe and idempotent — the analyst can simply re-trigger the
-    enricher (or it fires again automatically on the next ingestion).
+    still present means the process died mid-run. Note that results may
+    already have been periodically flushed to ClickHouse before the crash
+    (see ``settings.enrichment_flush_batch_count``) — this only discards the
+    remaining *unflushed* staged rows and clears the durable marker. Rows
+    already committed to ClickHouse are left as-is; hydration reads (see
+    ``db/queries.py::_hydrate_enrichments``) must tolerate the resulting
+    duplicates from a later re-run rather than assume a clean slate.
     """
     orphaned = await store.list_orphaned_enrichment_job_runs()
     for run in orphaned:

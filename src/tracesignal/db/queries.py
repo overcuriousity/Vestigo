@@ -551,15 +551,24 @@ class EventQueryService:
         ``_build_where``'s scope).
         """
         event_ids = [e["event_id"] for e in events if "event_id" in e]
-        if not event_ids:
+        source_ids = sorted({e["source_id"] for e in events if "source_id" in e})
+        if not event_ids or not source_ids:
             return
+        # A re-triggered enricher run can leave more than one row per
+        # (event_id, field_key) — the append-only table has no ReplacingMergeTree
+        # dedup. Take the value from the most recent run via argMax(), and
+        # keep event_id/source_id typed (not toString()'d) plus the source_id
+        # predicate so this stays a primary-key-pruned lookup.
         result = self.store.client.query(
             f"""
-            SELECT event_id, field_key, value
+            SELECT event_id, field_key, argMax(value, computed_at) AS value
             FROM {self.store.database}.event_enrichments
-            WHERE case_id = {{case_id:String}} AND toString(event_id) IN {{event_ids:Array(String)}}
+            WHERE case_id = {{case_id:String}}
+                AND source_id IN {{source_ids:Array(String)}}
+                AND event_id IN {{event_ids:Array(UUID)}}
+            GROUP BY event_id, field_key
             """,
-            parameters={"case_id": case_id, "event_ids": event_ids},
+            parameters={"case_id": case_id, "source_ids": source_ids, "event_ids": event_ids},
         )
         by_event: dict[str, dict[str, str]] = {}
         for event_id, field_key, value in result.result_rows:
@@ -764,10 +773,15 @@ class EventQueryService:
         enrichment_keys = [f"enrich.{row[0]}" for row in enrichment_result.result_rows]
 
         keys, provenance = apply_mappings_to_attribute_keys(sorted(raw_keys), field_mappings)
-        keys = sorted({*keys, *enrichment_keys})
         return {
             "top_level": TOP_LEVEL_DISPLAY_COLUMNS,
-            "attributes": keys,
+            "attributes": sorted(keys),
+            # Kept separate from `attributes`: enrichment fields are hydrated
+            # at query time only (see `_hydrate_enrichments`) and are not
+            # supported by `field_filters`/FilterRail, so they must not be
+            # advertised as filterable. Column-display UI (ColumnPicker) is
+            # the one consumer expected to merge this in.
+            "enrichments": sorted(enrichment_keys),
             "mapped": provenance,
         }
 

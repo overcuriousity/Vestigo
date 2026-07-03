@@ -15,8 +15,9 @@ from dataclasses import dataclass
 
 from tracesignal.db.clickhouse import ClickHouseStore
 
-# Cap on how many events are sampled per source when checking eligibility, to
-# keep the check a bounded query rather than a full scan.
+# Cap on how many attribute values (post ARRAY JOIN, so possibly several per
+# event) are sampled when checking eligibility, to keep the check a bounded
+# query rather than a full scan.
 _ELIGIBILITY_SAMPLE_LIMIT = 5000
 
 

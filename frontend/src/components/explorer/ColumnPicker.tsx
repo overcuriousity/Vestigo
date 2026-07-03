@@ -91,7 +91,12 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
       label: id,
       group: "Dynamic fields",
     }));
-    return [...top, ...attrs];
+    const enrichments = (fields?.enrichments ?? []).map((id) => ({
+      id,
+      label: id,
+      group: "Enrichments",
+    }));
+    return [...top, ...attrs, ...enrichments];
   }, [fields]);
 
   const filtered = useMemo(() => {
