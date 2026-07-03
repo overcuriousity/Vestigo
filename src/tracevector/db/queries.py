@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from tracevector.db._buckets import bucket_interval_seconds, query_timestamp_range
+from tracevector.db._buckets import (
+    aligned_bucket_starts,
+    bucket_interval_seconds,
+    query_timestamp_range,
+)
 from tracevector.db._columns import (
     EVENT_SELECT_COLUMNS,
     TOP_LEVEL_NON_STRING_COLUMNS,
@@ -1178,16 +1182,8 @@ class EventQueryService:
         # Derive bucket starts from [min_ts, max_ts] rather than from the
         # query result rows: a bucket where *none* of the top-N values had
         # any events produces no GROUP BY row at all, and would otherwise be
-        # missing from every series instead of zero-filled. `toStartOfInterval`
-        # aligns to Unix epoch, so replicate that alignment here.
-        start_epoch = int(min_ts.timestamp() // interval) * interval
-        end_epoch = int(max_ts.timestamp() // interval) * interval
-        if end_epoch <= start_epoch:
-            end_epoch = start_epoch + interval
-        all_starts = [
-            ensure_utc_iso(datetime.fromtimestamp(epoch, tz=UTC))
-            for epoch in range(start_epoch, end_epoch, interval)
-        ]
+        # missing from every series instead of zero-filled.
+        all_starts = aligned_bucket_starts(min_ts, max_ts, interval)
         series = [
             {
                 "value": value,
@@ -1205,4 +1201,259 @@ class EventQueryService:
             "min": min_ts.isoformat(),
             "max": max_ts.isoformat(),
             "series": series,
+        }
+
+    def _union_timestamp_range(
+        self, primary: EventQuery, comparison: EventQuery
+    ) -> tuple[datetime | None, datetime | None]:
+        """Return the union (min, max) timestamp range across both layers.
+
+        Explicit ``start``/``end`` on the primary win outright — comparison
+        layers are constructed to share the primary's time window (see the
+        compare endpoint), so an explicit window is already the shared grid.
+        Otherwise the union of both layers' data ranges is used, so neither
+        layer's buckets get truncated to the other's extent.
+        """
+        if primary.start is not None and primary.end is not None:
+            return ensure_utc(primary.start), ensure_utc(primary.end)
+        database = self.store.database
+        ranges = []
+        for query in (primary, comparison):
+            where, parameters = self._build_where(query)
+            ranges.append(query_timestamp_range(self.store.client, database, where, parameters))
+        mins = [r[0] for r in ranges if r[0] is not None]
+        maxs = [r[1] for r in ranges if r[1] is not None]
+        if not mins or not maxs:
+            return None, None
+        return min(mins), max(maxs)
+
+    def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
+        """Return epoch-aligned bucket-start (ISO) → event count for *query*."""
+        where, parameters = self._build_where(query)
+        result = self.store.client.query(
+            f"""
+            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                   count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND timestamp IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            parameters=parameters,
+        )
+        return {ensure_utc_iso(row[0]): row[1] for row in result.result_rows}
+
+    def compare_time_histogram(
+        self, primary: EventQuery, comparison: EventQuery, buckets: int = 60
+    ) -> dict[str, Any]:
+        """Return event counts over time for two layers on one shared bucket grid.
+
+        The comparability invariant lives here: one time range (see
+        :py:meth:`_union_timestamp_range`), one ``bucket_interval_seconds``,
+        one epoch-aligned bucket-start list — both layers are counted against
+        that grid and zero-filled onto it, so the two series are comparable
+        by construction. The response carries only raw counts; derived
+        metrics (delta/rate/ratio/cumulative) are frontend transforms.
+        """
+        self.store.init_schema()
+        min_ts, max_ts = self._union_timestamp_range(primary, comparison)
+        if min_ts is None or max_ts is None:
+            return {
+                "kind": "time",
+                "interval_seconds": 0,
+                "min": None,
+                "max": None,
+                "buckets": [],
+                "primary_total": 0,
+                "comparison_total": 0,
+            }
+
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        primary_counts = self._bucketed_counts(primary, interval)
+        comparison_counts = self._bucketed_counts(comparison, interval)
+        starts = aligned_bucket_starts(min_ts, max_ts, interval)
+        bucket_list = [
+            {
+                "start": start,
+                "primary": primary_counts.get(start, 0),
+                "comparison": comparison_counts.get(start, 0),
+            }
+            for start in starts
+        ]
+        return {
+            "kind": "time",
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "buckets": bucket_list,
+            "primary_total": sum(primary_counts.values()),
+            "comparison_total": sum(comparison_counts.values()),
+        }
+
+    def _terms_counts_for_values(
+        self, query: EventQuery, field_token: str, values: list[str]
+    ) -> tuple[dict[str, int], int]:
+        """Return per-value counts restricted to *values*, plus the layer's non-empty total."""
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        parameters["cmp_values"] = values
+        result = self.store.client.query(
+            f"""
+            SELECT if(has({{cmp_values:Array(String)}}, {col_expr}), {col_expr}, '') AS val,
+                   count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND {col_expr} != ''
+            GROUP BY val
+            """,
+            parameters=parameters,
+        )
+        counts: dict[str, int] = {}
+        total = 0
+        for val, count in result.result_rows:
+            total += count
+            if val != "":
+                counts[val] = count
+        return counts, total
+
+    def compare_field_terms(
+        self, primary: EventQuery, comparison: EventQuery, field_token: str, limit: int = 50
+    ) -> dict[str, Any]:
+        """Return top-N term counts for two layers over one shared category list.
+
+        The primary layer's :py:meth:`field_terms` fixes the top-N value
+        list; the comparison layer is then counted against those same values
+        (everything else folds into its ``other``), so both bar groups share
+        categories — the terms-kind comparability invariant.
+        """
+        self.store.init_schema()
+        terms = self.field_terms(primary, field_token, limit=limit)
+        top_values = [v["value"] for v in terms["values"]]
+        primary_by_value = {v["value"]: v["count"] for v in terms["values"]}
+
+        comparison_by_value: dict[str, int] = {}
+        comparison_total = 0
+        if top_values:
+            comparison_by_value, comparison_total = self._terms_counts_for_values(
+                comparison, field_token, top_values
+            )
+
+        values = [
+            {
+                "value": value,
+                "primary": primary_by_value.get(value, 0),
+                "comparison": comparison_by_value.get(value, 0),
+            }
+            for value in top_values
+        ]
+        return {
+            "kind": "terms",
+            "field": field_token,
+            "values": values,
+            "distinct": terms["distinct"],
+            "primary_total": terms["total"],
+            "comparison_total": comparison_total,
+            "primary_other": terms["other_count"],
+            "comparison_other": max(
+                0, comparison_total - sum(v["comparison"] for v in values)
+            ),
+        }
+
+    def _numeric_layer_stats(
+        self, query: EventQuery, field_token: str
+    ) -> tuple[int, float | None, float | None]:
+        """Return (count, min, max) of the numeric cast of *field_token* for one layer."""
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        result = self.store.client.query(
+            f"""
+            SELECT count(v), min(v), max(v)
+            FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            """,
+            parameters=parameters,
+        )
+        row = result.result_rows[0] if result.result_rows else (0, None, None)
+        return row[0] or 0, row[1], row[2]
+
+    def _numeric_bin_counts(
+        self, query: EventQuery, field_token: str, mn: float, bin_width: float, bin_count: int
+    ) -> dict[int, int]:
+        """Return bin-index → count for one layer, bucketed on explicit shared edges."""
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        result = self.store.client.query(
+            f"""
+            SELECT greatest(0, least({bin_count - 1},
+                       toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
+                   count() AS c
+            FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            GROUP BY bin_idx
+            ORDER BY bin_idx
+            """,
+            parameters={**parameters, "mn": mn, "bw": bin_width},
+        )
+        return {row[0]: row[1] for row in result.result_rows}
+
+    def compare_field_numeric(
+        self, primary: EventQuery, comparison: EventQuery, field_token: str, bins: int = 30
+    ) -> dict[str, Any]:
+        """Return fixed-width numeric histograms for two layers on shared bin edges.
+
+        Bin edges are derived from the **union** min/max of both layers, then
+        both layers are bucketed on those explicit edges — the numeric-kind
+        comparability invariant. Same fixed-width/reproducible-edges policy
+        as :py:meth:`field_numeric_stats`.
+        """
+        self.store.init_schema()
+        p_count, p_mn, p_mx = self._numeric_layer_stats(primary, field_token)
+        c_count, c_mn, c_mx = self._numeric_layer_stats(comparison, field_token)
+
+        mins = [m for m in (p_mn, c_mn) if m is not None]
+        maxs = [m for m in (p_mx, c_mx) if m is not None]
+        if not mins or not maxs:
+            return {
+                "kind": "numeric",
+                "field": field_token,
+                "min": None,
+                "max": None,
+                "bins": [],
+                "primary_total": 0,
+                "comparison_total": 0,
+            }
+        mn, mx = min(mins), max(maxs)
+
+        bin_count = max(1, int(bins))
+        span = mx - mn
+        bin_width = span / bin_count if span > 0 else 1.0
+
+        primary_bins = (
+            self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
+            if p_count
+            else {}
+        )
+        comparison_bins = (
+            self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
+            if c_count
+            else {}
+        )
+        bins_out = [
+            {
+                "x0": mn + i * bin_width,
+                "x1": mn + (i + 1) * bin_width,
+                "primary": primary_bins.get(i, 0),
+                "comparison": comparison_bins.get(i, 0),
+            }
+            for i in range(bin_count)
+        ]
+        return {
+            "kind": "numeric",
+            "field": field_token,
+            "min": mn,
+            "max": mx,
+            "bins": bins_out,
+            "primary_total": p_count,
+            "comparison_total": c_count,
         }
