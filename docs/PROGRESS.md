@@ -1,6 +1,14 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 12 — issue #10: timeline creation wizard with query-time
+Last updated: 2026-07-03 (session 13 — deployment: `docker-compose.yml` gained an `app` service
+that builds/runs TraceSignal itself via a new `Dockerfile`, after the backing services;
+`tsig-web` now always rebuilds the frontend on startup instead of skipping when `dist/` exists;
+README documents the airgapped install path (build on an online machine, carry `.venv/` +
+`frontend/dist/` over on a portable drive, backing services out of scope); archived
+`docs/PLAN_ISSUES_5_10_11.md` to `docs/archive/` now that issues #5/#10/#11 are all shipped;
+fixed a stale test asserting the old `text/x-python` converter content-type)
+
+Previous (session 12 — issue #10: timeline creation wizard with query-time
 field aggregation (`Timeline.field_mappings` metadata, coalesce resolution in
 `db/field_mappings.py` threaded through filters/histogram/viz/export/detectors, field
 discovery surfaces canonical names with provenance, `PATCH .../field-mappings` + audit,
@@ -33,8 +41,8 @@ See [`ROADMAP.md`](./ROADMAP.md) for the detailed scope breakdown and remaining 
 **Estimated MVP completion: ~97 %**
 
 Backend model, API, statistical anomaly detectors, the full frontend, and the full
-auth/RBAC/teams/audit/live-collaboration layer are implemented and tested (296 backend tests,
-105 frontend tests, both suites green; `ruff`/`tsc`/`oxlint` clean). What remains before MVP
+auth/RBAC/teams/audit/live-collaboration layer are implemented and tested (341 backend tests,
+118 frontend tests, both suites green; `ruff`/`tsc`/`oxlint` clean). What remains before MVP
 closure is **offline-mode enforcement** — `allow_online` still isn't checked at most network
 call sites (OIDC SSO is a deliberate, documented exception). GPU acceleration remains
 aspirational (no code exists for it yet).
@@ -50,7 +58,7 @@ aspirational (no code exists for it yet).
 | 5 | **Anomaly & Similarity Panel** | ✅ Done | Statistical engine (`value_novelty` + `frequency` z-score detectors, self-baseline and temporal modes) replaced the earlier embedding-distance-only approach; see `db/anomaly_stats.py`. Similarity search and semantic search remain Qdrant-backed. Detector runs persist to Postgres (`detector_runs`) instead of round-tripping live event IDs through the URL. |
 | 6 | **Remote embedding support** | ✅ Done | OpenAI-compatible remote embedding endpoint as an alternative to local sentence-transformers. |
 | 7 | **Authentication, RBAC, teams, audit trail, live collaboration** | ✅ Done | Session-cookie auth + optional OIDC, seeded one-time bootstrap admin with centrally-enforced forced rotation, case-RBAC dependency layer, teams with member/manager roles, append-only audit trail, SSE live-collaboration stream with per-tick access re-validation. Full security review completed, all findings resolved — see `docs/archive/PR7_REVIEW_FINDINGS.md`. |
-| 8 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml` (podman-compatible), `uv` workflow, environment-based config. Missing: offline-mode enforcement, GPU index selection. |
+| 8 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml` (podman-compatible) builds and runs the app itself alongside the backing services; native `uv`/`tsig-web` workflow (always rebuilds the frontend, no stale-`dist` check); documented airgapped install path (README). Missing: offline-mode enforcement, GPU index selection. |
 
 ## Completed architectural decisions
 

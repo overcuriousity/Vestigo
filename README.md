@@ -105,6 +105,52 @@ For active frontend development, run `npm install && npm run dev` in `frontend/`
 `uv run tsig-web` — see `frontend/README.md`. Configuration is env-driven (`TS_*` variables); see
 `.env.example` for the full list.
 
+### Docker/Podman Compose (app + backing services in one command)
+
+`docker compose up -d` (or `podman compose up -d`) also builds and starts the TraceSignal
+application itself, alongside PostgreSQL, ClickHouse, and Qdrant — see the `app` service in
+`docker-compose.yml`. Use this when you want one command to bring up the whole stack; use the
+native `uv run tsig-web` path above for development or when running the app directly on the
+host.
+
+### Airgapped installation
+
+TraceSignal's application layer (backend + frontend) can be installed fully offline. **The
+three backing services — PostgreSQL, ClickHouse, Qdrant — are out of scope for this
+procedure**: provision them on the airgapped network however you normally handle offline
+service deployment (e.g. `podman load` of pre-pulled images, or native packages).
+
+On a machine **with internet access**:
+
+1. Clone or copy the repository.
+2. Install and build everything, so all dependencies are resolved and cached locally:
+   ```bash
+   uv sync
+   cd frontend && npm install && npm run build && cd ..
+   ```
+   This populates `.venv/` (all Python dependencies, including the CPU PyTorch wheels) and
+   `frontend/dist/` (the built static frontend).
+3. Copy the whole repository — including `.venv/`, `uv.lock`, and `frontend/dist/` — to a
+   portable drive.
+
+On the **airgapped machine**:
+
+1. Copy the repository from the portable drive.
+2. Point `TS_POSTGRES_URL`, `TS_CLICKHOUSE_URL`, and `TS_QDRANT_URL` (in `.env`, copied from
+   `.env.example`) at the already-running backing services on the isolated network.
+3. Run the app directly from the carried-over virtualenv — no `uv sync` or `npm install`
+   needed, since both were already resolved on the online machine:
+   ```bash
+   .venv/bin/tsig-web
+   ```
+   Because `frontend/dist/` was carried over and the app is started via the `.venv` entry
+   point directly (not `uv run`, which would try to re-resolve the environment), no network
+   access is required at any point on the airgapped machine. `TS_ALLOW_ONLINE=false` (the
+   default) additionally keeps the embedding pipeline from reaching any remote endpoint.
+4. Same binary compatibility requirements apply as any offline Python deployment: build and
+   run on matching OS/architecture (e.g. build on the same Linux distribution/glibc version
+   you'll run on), since the `.venv/` carries compiled wheels (PyTorch, onnxruntime, etc.).
+
 ## Inspiration
 
 TraceSignal's design draws on two projects:

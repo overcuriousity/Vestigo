@@ -49,7 +49,7 @@ def test_list_and_download(client, admin_bootstrap) -> None:
 
     resp = client.get("/api/converters/nginx2timesketch")
     assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("text/x-python")
+    assert resp.headers["content-type"].startswith("text/plain")
     # Download must be byte-identical to the committed asset.
     assert resp.content == (ASSETS_DIR / "nginx2timesketch.py").read_bytes()
 

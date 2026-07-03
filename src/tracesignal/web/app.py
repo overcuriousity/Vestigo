@@ -8,13 +8,10 @@ import uvicorn
 from tracesignal.api.main import create_app
 
 _FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend"
-_FRONTEND_DIST = _FRONTEND_DIR / "dist"
 
 
 def _build_frontend() -> None:
-    if _FRONTEND_DIST.is_dir():
-        return
-    print("frontend/dist not found — installing dependencies and building frontend...")
+    print("Building frontend...")
     subprocess.run(["npm", "install"], cwd=_FRONTEND_DIR, check=True)
     subprocess.run(["npm", "run", "build"], cwd=_FRONTEND_DIR, check=True)
 

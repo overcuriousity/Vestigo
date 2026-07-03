@@ -1,6 +1,7 @@
-# Optional reference deployment for TraceSignal.
-# TraceSignal itself is a native Python app; this file only starts the backing services.
-# Run `uv run tsig-web` separately after starting these services.
+# Reference deployment for TraceSignal: backing services plus the app itself.
+# TraceSignal is a native Python/uv app and runs fine directly on the host (see README
+# "Quick start") — the `app` service here is for operators who prefer one `docker compose up`
+# to bring up everything, including building the app image from the local checkout.
 
 services:
   postgres:
@@ -43,6 +44,28 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      TS_ENVIRONMENT: production
+      TS_SECRET_KEY: change-me-in-production
+      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
+      TS_CLICKHOUSE_URL: http://clickhouse:8123
+      TS_CLICKHOUSE_DATABASE: tracesignal
+      TS_QDRANT_URL: http://qdrant:6333
+      TS_ALLOW_ONLINE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
 
 volumes:
   postgres_data:

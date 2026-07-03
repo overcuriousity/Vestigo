@@ -1,0 +1,10 @@
+.git
+.venv
+frontend/node_modules
+frontend/dist
+data/
+tests/
+docs/
+*.md
+!README.md
+.env

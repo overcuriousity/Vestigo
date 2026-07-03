@@ -1,7 +1,8 @@
 # Implementation Plan — Issues #5, #10, #11
 
-Status: **planned** (decisions confirmed with project owner, 2026-07-03).
-Remove this file when all three issues are closed (per repo convention on plan docs).
+Status: **done** — all three issues (#5 rename, #10 field aggregation, #11 converters) shipped;
+see `docs/ROADMAP.md` and `docs/PROGRESS.md`. Archived here per repo convention on plan docs
+rather than deleted, since it records the design rationale.
 
 Confirmed decisions:
 
