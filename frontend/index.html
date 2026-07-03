@@ -4,11 +4,11 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TraceVector</title>
+    <title>TraceSignal</title>
     <script>
       (function () {
         try {
-          var stored = JSON.parse(localStorage.getItem("tv-theme"));
+          var stored = JSON.parse(localStorage.getItem("tsig-theme"));
           var theme = stored && stored.state && stored.state.theme;
           document.documentElement.setAttribute(
             "data-theme",
@@ -20,7 +20,7 @@
       })();
       (function () {
         try {
-          var stored = JSON.parse(localStorage.getItem("tv-ui"));
+          var stored = JSON.parse(localStorage.getItem("tsig-ui"));
           var density = stored && stored.state && stored.state.density;
           document.documentElement.setAttribute(
             "data-density",

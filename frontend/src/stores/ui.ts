@@ -103,7 +103,7 @@ export const useUiStore = create<UiState>()(
         set((s) => ({ columnWidths: { ...s.columnWidths, [id]: width } })),
     }),
     {
-      name: "tv-ui",
+      name: "tsig-ui",
       version: 3,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;

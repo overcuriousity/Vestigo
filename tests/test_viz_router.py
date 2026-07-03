@@ -1,6 +1,6 @@
 """Tests for the viz router's field-inventory endpoint.
 
-Route handlers in tracevector.api.routers.viz are plain async functions
+Route handlers in tracesignal.api.routers.viz are plain async functions
 (same pattern as tests/test_events_router.py), so `list_viz_fields` is
 called directly with its collaborators monkeypatched — no FastAPI
 TestClient needed.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from tracevector.api.routers import viz
+from tracesignal.api.routers import viz
 
 
 class _FakeStatService:

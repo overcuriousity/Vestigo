@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from tracevector.db.anomaly_stats import (
+from tracesignal.db.anomaly_stats import (
     FreqFinding,
     NoveltyFieldInfo,
     StatisticalAnomalyService,
@@ -51,7 +51,7 @@ class FakeClickHouseStore:
 
     def __init__(self, client: FakeClient) -> None:
         self.client = client
-        self.database = "tracevector"
+        self.database = "tracesignal"
 
     def init_schema(self) -> None:
         pass
@@ -943,7 +943,7 @@ def test_value_novelty_auto_mode_caps_scanned_fields():
     """C11: auto-selected fields are capped at _MAX_AUTO_SCAN_FIELDS — each
     field is a separate sequential ClickHouse round-trip, so an uncapped
     recommended set could turn one panel-open into dozens of them."""
-    from tracevector.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS, NoveltyFieldInfo
+    from tracesignal.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS, NoveltyFieldInfo
 
     total = 1000
     many_fields = [
@@ -1031,7 +1031,7 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
     """
     from datetime import timedelta
 
-    from tracevector.db.anomaly_stats import _EVENT_COLUMNS, FreqFinding
+    from tracesignal.db.anomaly_stats import _EVENT_COLUMNS, FreqFinding
 
     bucket_a = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     bucket_b = datetime(2024, 1, 1, 4, 0, 0, tzinfo=UTC)
@@ -1087,7 +1087,7 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
         "c1",
         ["s1"],
         "artifact",
-        "tracevector",
+        "tracesignal",
         {},
         3600,
     )

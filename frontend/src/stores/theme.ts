@@ -24,7 +24,7 @@ export const useThemeStore = create<ThemeState>()(
         set((s) => ({ theme: s.theme === "light" ? "dark" : "light" })),
     }),
     {
-      name: "tv-theme",
+      name: "tsig-theme",
       version: 1,
     },
   ),

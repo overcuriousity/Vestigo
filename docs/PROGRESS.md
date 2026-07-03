@@ -1,4 +1,4 @@
-# TraceVector Implementation Progress
+# TraceSignal Implementation Progress
 
 Last updated: 2026-07-03 (session 11 — visualization v2: two-layer comparison with
 server-enforced shared-grid invariants (`POST .../viz/compare`, kinds time/terms/numeric),
@@ -31,7 +31,7 @@ aspirational (no code exists for it yet).
 
 | # | Feature | Status | Notes |
 |---|---------|--------|-------|
-| 1 | **Ingestion (CLI-first + web upload)** | ✅ Done | Streaming CSV/JSONL parsers; `tv ingest --source` CLI; web drag-and-drop via `POST /api/cases/{id}/sources`. |
+| 1 | **Ingestion (CLI-first + web upload)** | ✅ Done | Streaming CSV/JSONL parsers; `tsig ingest --source` CLI; web drag-and-drop via `POST /api/cases/{id}/sources`. |
 | 2 | **Source / Timeline / Artifact model** | ✅ Done | `Source` = one file; `Timeline` = grouping; `Artifact` = per-event Plaso class. Implemented across Postgres, ClickHouse, Qdrant, API, CLI, and tests. |
 | 3 | **Storage & Vector Backend** | ✅ Done | ClickHouse `events` table with `tokenbf_v1` full-text index; Qdrant collections keyed by `(case_id, embedding_config_hash)` with vector-size config-match checks. |
 | 4 | **Web UI (ELK-like investigation interface)** | ✅ Done | React 19 + Vite + TypeScript. Explorer (grid, filter rail, tag facets, histogram, export, saved views, bulk actions, column picker), light/dark theme + comfortable/compact density toggles, case/timeline/source management, job tray. |
@@ -60,7 +60,7 @@ aspirational (no code exists for it yet).
 1. **Offline-mode enforcement** — `allow_online` is a config flag
    (`core/config.py`) that is read but never checked at most network call sites.
    Airgapped-by-default is a stated design goal (`CLAUDE.md`) that isn't fully enforced in
-   code. OIDC SSO (`TV_OIDC_ENABLED`) is a deliberate, documented exception — it's
+   code. OIDC SSO (`TS_OIDC_ENABLED`) is a deliberate, documented exception — it's
    operator-opted-in and independent of `allow_online` (see `TECH_STACK.md` §6).
 2. **GPU acceleration** — no ROCm/CUDA-specific code paths exist anywhere in the codebase; this
    is still purely aspirational, unlike the other "TBD" items which have concrete partial work.

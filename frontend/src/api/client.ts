@@ -1,5 +1,5 @@
 /**
- * Typed API client for TraceVector.
+ * Typed API client for TraceSignal.
  *
  * Handles:
  * - Base URL from env (defaults to same-origin for nginx deployment)
@@ -103,7 +103,7 @@ async function request<T>(
     body: reqBody,
     signal: opts?.signal,
     // Sessions are an httpOnly cookie — this is required for it to be sent
-    // (and accepted) both same-origin (tv-web on :8080) and cross-origin
+    // (and accepted) both same-origin (tsig-web on :8080) and cross-origin
     // during dev (Vite on :5173 proxying to :8080).
     credentials: "include",
   });

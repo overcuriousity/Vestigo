@@ -1,7 +1,7 @@
 /**
  * On-screen rendering of the chart caption — the exact same lines
  * `buildCaptionLines` feeds into exports, so screen and report never drift.
- * The first line (the TraceVector/case header) is export boilerplate and
+ * The first line (the TraceSignal/case header) is export boilerplate and
  * skipped on screen, where the app chrome already says where you are.
  */
 export function ChartCaption({ lines }: { lines: string[] }) {

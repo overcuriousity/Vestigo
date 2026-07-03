@@ -1,6 +1,6 @@
 """Tests for events router helpers that don't require a full HTTP client.
 
-Route handlers in tracevector.api.routers.events are plain async functions,
+Route handlers in tracesignal.api.routers.events are plain async functions,
 so the pure logic (annotation-filter resolution, live-finding union,
 export-annotation indexing) is tested by calling them directly rather than
 spinning up a FastAPI TestClient.
@@ -15,9 +15,9 @@ import pytest_asyncio
 from fastapi import HTTPException
 
 from tests.conftest import _fake_user
-from tracevector.api import deps
-from tracevector.api.routers import events
-from tracevector.db.postgres import Case, PostgresStore
+from tracesignal.api import deps
+from tracesignal.api.routers import events
+from tracesignal.db.postgres import Case, PostgresStore
 
 
 @pytest_asyncio.fixture()
@@ -430,7 +430,7 @@ def test_get_field_encoder_does_not_eagerly_load_in_remote_mode(monkeypatch):
         def encode(self, texts):
             return [[0.0] for _ in texts]
 
-    import tracevector.models.embeddings as embeddings_module
+    import tracesignal.models.embeddings as embeddings_module
 
     monkeypatch.setattr(embeddings_module, "EmbeddingModel", ExplodingLoadModel)
 
@@ -590,7 +590,7 @@ async def test_run_stat_detector_excludes_normal_annotated_events(patched_store,
 
 
 def _make_stat_result(status="ok", event_id="evt-1"):
-    from tracevector.db.anomaly_stats import StatAnomalyResult, ValueFinding
+    from tracesignal.db.anomaly_stats import StatAnomalyResult, ValueFinding
 
     finding = ValueFinding(
         field="artifact",

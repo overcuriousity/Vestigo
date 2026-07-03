@@ -11,13 +11,13 @@ import pytest_asyncio
 from fastapi import BackgroundTasks, HTTPException
 
 from tests.conftest import _fake_user
-from tracevector.api import deps
-from tracevector.api.routers import cases
-from tracevector.api.routers.cases import upload_source
-from tracevector.core.jobs import get_job_store
-from tracevector.db.postgres import PostgresStore
-from tracevector.ingestion.files import hash_file
-from tracevector.ingestion.pipeline import IngestionResult
+from tracesignal.api import deps
+from tracesignal.api.routers import cases
+from tracesignal.api.routers.cases import upload_source
+from tracesignal.core.jobs import get_job_store
+from tracesignal.db.postgres import PostgresStore
+from tracesignal.ingestion.files import hash_file
+from tracesignal.ingestion.pipeline import IngestionResult
 
 
 class _UploadFile:

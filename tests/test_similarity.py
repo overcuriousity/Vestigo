@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tracevector.db.similarity import SimilarityService
+from tracesignal.db.similarity import SimilarityService
 
 # ---------------------------------------------------------------------------
 # Fake Qdrant store
@@ -344,7 +344,7 @@ def test_get_embedding_model_does_not_eagerly_load(monkeypatch):
     to the local/remote path on its own, and load() raises in remote mode
     (RuntimeError), which would turn every remote-mode free-text search
     into an unhandled 500 before encode() is ever reached."""
-    import tracevector.db.similarity as similarity_module
+    import tracesignal.db.similarity as similarity_module
 
     class ExplodingLoadModel:
         def __init__(self) -> None:

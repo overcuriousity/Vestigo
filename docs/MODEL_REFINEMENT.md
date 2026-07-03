@@ -1,4 +1,4 @@
-# TraceVector — Model Refinement: Case / Source / Timeline / Artifact
+# TraceSignal — Model Refinement: Case / Source / Timeline / Artifact
 
 > **Status:** Approved design, **implementation complete** (2026-06-29).
 > This supersedes the vocabulary in §5 of `CONCEPT.md` and the old "timeline = one file"
@@ -12,7 +12,7 @@ The original concept (and the Timesketch vocabulary we borrowed) defined a **Tim
 *"a single imported data source."* That created two problems that have become blocking as the
 product matures:
 
-1. **The name contradicts the vision.** TraceVector's core proposition is *"correlating and
+1. **The name contradicts the vision.** TraceSignal's core proposition is *"correlating and
    analyzing logs from different sources against each other in **one singular timeline**."*
    Naming the import unit "Timeline" means there is no word left for the unified correlated
    view — and indeed the merged view has never been built.
@@ -124,7 +124,7 @@ Key files changed: `db/postgres.py`, `db/clickhouse.py`, `db/queries.py`, `db/qd
 | 5. Query layer | ✅ Done | `EventQuery.source_ids`, `artifact` filter, `source_id` filter; Qdrant payloads/filters use `source_id`. |
 | 6. Ingestion | ✅ Done | Parsers emit `artifact`/`artifact_long`; upload creates a `Source` and auto-adds it to the default timeline. |
 | 7. Routes | ✅ Done | `/sources` namespace split from `/timelines`; query endpoints still hang off timelines but resolve to source IDs. |
-| 8. CLI | ✅ Done | `tv ingest --source` creates a Source; `tv embed --source` generates vectors. |
+| 8. CLI | ✅ Done | `tsig ingest --source` creates a Source; `tsig embed --source` generates vectors. |
 
 ---
 
@@ -161,7 +161,7 @@ FilterRail, EventGrid, EventDetailPanel, and routing.
 
 ## Reference: how Timesketch handles this
 
-| Timesketch | Meaning | TraceVector equivalent (new) |
+| Timesketch | Meaning | TraceSignal equivalent (new) |
 |---|---|---|
 | Sketch | Investigation container | Case |
 | Timeline | One import / one index | **Source** |

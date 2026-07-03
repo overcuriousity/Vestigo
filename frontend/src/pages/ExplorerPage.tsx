@@ -1,5 +1,5 @@
 /**
- * ExplorerPage — the heart of TraceVector.
+ * ExplorerPage — the heart of TraceSignal.
  *
  * Panels:
  *   Left:   FilterRail (collapsible via toolbar toggle)

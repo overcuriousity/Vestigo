@@ -156,7 +156,7 @@ def test_rotate_password_rejected_for_oidc_account(client, admin_bootstrap, stor
     # are only ever created via the OIDC callback.
     import asyncio
 
-    from tracevector.db.postgres import User as UserModel
+    from tracesignal.db.postgres import User as UserModel
 
     async def _make_oidc() -> None:
         async with store.session_factory() as session:

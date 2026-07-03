@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-from tracevector.db.postgres import PostgresStore
+from tracesignal.db.postgres import PostgresStore
 
 
 @pytest_asyncio.fixture()
