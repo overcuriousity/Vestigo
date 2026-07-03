@@ -32,7 +32,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       clickhouse:
-        image: docker.io/clickhouse/clickhouse-server:24-alpine
+        # Not the -alpine tag: its musl/jemalloc startup path calls
+        # get_mempolicy, which GitHub Actions' runner seccomp profile denies
+        # and the server dies before it ever opens the health port. The
+        # glibc build doesn't take that path.
+        image: docker.io/clickhouse/clickhouse-server:24
         ports:
           - 8123:8123
           - 9000:9000
