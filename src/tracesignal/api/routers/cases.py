@@ -45,6 +45,12 @@ class CaseCreate(BaseModel):
     team_id: str | None = Field(default=None)
 
 
+class CaseScopeUpdate(BaseModel):
+    """Payload to change a case's team scope. ``team_id: None`` releases it to personal."""
+
+    team_id: str | None = Field(default=None)
+
+
 class TimelineCreate(BaseModel):
     """Payload to create a timeline."""
 
@@ -181,6 +187,48 @@ async def create_case(
 async def get_case(case: Case = Depends(require_case_read)) -> dict[str, Any]:
     """Get a case by ID."""
     return {"case": case.to_dict()}
+
+
+@router.patch("/{case_id}/scope")
+async def update_case_scope(
+    payload: CaseScopeUpdate,
+    case: Case = Depends(require_case_manage),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Change a case's team scope: release a personal case to a team, move it to
+    a different team, or release a team case back to personal (``team_id: null``).
+
+    Requires MANAGE on the case as it stands (its owner for a personal case, or
+    a manager of its current team). Assigning to a *new* team additionally
+    requires being a manager of that target team, or an admin — mirroring the
+    rule in ``create_case``, so scope changes can't be used to hand a case to a
+    team the caller doesn't control.
+    """
+    store = get_store()
+    new_team_id = payload.team_id
+    if new_team_id:
+        if not user.is_admin:
+            membership = await store.get_membership(new_team_id, user.id)
+            if membership is None or membership.role != "manager":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only a team manager or admin can assign a case to this team",
+                )
+        if await store.get_team(new_team_id) is None:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+    updated = await store.update_case_team(case.id, new_team_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    await store.record_audit(
+        action="case.scope_change",
+        actor=user,
+        case_id=case.id,
+        target_type="case",
+        target_id=case.id,
+        detail={"old_team_id": case.team_id, "new_team_id": new_team_id},
+    )
+    return {"case": updated.to_dict()}
 
 
 @router.delete("/{case_id}")

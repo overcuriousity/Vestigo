@@ -129,6 +129,70 @@ def test_default_pool_user_sees_only_own_cases(client, admin_bootstrap, store):
     assert len(resp.json()["cases"]) == 1
 
 
+def test_owner_can_release_personal_case_to_own_managed_team(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    team = _create_team(client, "Green Team")
+    alice = _create_user(client, "alice3")
+    _add_member(client, team["id"], alice["id"], role="manager")
+
+    alice_client = client.__class__(client.app)
+    login(alice_client, "alice3", "abcdefgh12")
+    case = alice_client.post("/api/cases/", json={"name": "alice-solo"}).json()["case"]
+    assert case["team_id"] is None
+
+    resp = alice_client.patch(f"/api/cases/{case['id']}/scope", json={"team_id": team["id"]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["case"]["team_id"] == team["id"]
+
+    # Now a team case: another team manager (not this team) can't reach it,
+    # but a fellow member of Green Team should have read access.
+    member = _create_user(client, "green-member")
+    _add_member(client, team["id"], member["id"], role="member")
+    member_client = client.__class__(client.app)
+    login(member_client, "green-member", "abcdefgh12")
+    assert member_client.get(f"/api/cases/{case['id']}").status_code == 200
+
+
+def test_cannot_assign_case_to_team_you_do_not_manage(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    team_a = _create_team(client, "Owner Team")
+    team_b = _create_team(client, "Other Team")
+    alice = _create_user(client, "alice4")
+    _add_member(client, team_a["id"], alice["id"], role="manager")
+
+    alice_client = client.__class__(client.app)
+    login(alice_client, "alice4", "abcdefgh12")
+    case = alice_client.post("/api/cases/", json={"name": "alice-solo2"}).json()["case"]
+
+    resp = alice_client.patch(f"/api/cases/{case['id']}/scope", json={"team_id": team_b["id"]})
+    assert resp.status_code == 403
+
+
+def test_team_member_cannot_change_case_scope_only_manager_can(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    team = _create_team(client, "Yellow Team")
+    manager = _create_user(client, "manager2")
+    member = _create_user(client, "member3")
+    _add_member(client, team["id"], manager["id"], role="manager")
+    _add_member(client, team["id"], member["id"], role="member")
+
+    mgr_client = client.__class__(client.app)
+    login(mgr_client, "manager2", "abcdefgh12")
+    case = mgr_client.post(
+        "/api/cases/", json={"name": "yellow-case", "team_id": team["id"]}
+    ).json()["case"]
+
+    mem_client = client.__class__(client.app)
+    login(mem_client, "member3", "abcdefgh12")
+    resp = mem_client.patch(f"/api/cases/{case['id']}/scope", json={"team_id": None})
+    assert resp.status_code == 403
+
+    # Manager can release it back to personal (owner still the original creator).
+    resp = mgr_client.patch(f"/api/cases/{case['id']}/scope", json={"team_id": None})
+    assert resp.status_code == 200
+    assert resp.json()["case"]["team_id"] is None
+
+
 def test_list_cases_scoped_per_user_not_global(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     client.post("/api/cases/", json={"name": "admin-case"})

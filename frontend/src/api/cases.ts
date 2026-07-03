@@ -1,4 +1,4 @@
-import { del, get, post } from "./client";
+import { del, get, patch, post } from "./client";
 import type { Case } from "./types";
 
 export const casesApi = {
@@ -13,4 +13,10 @@ export const casesApi = {
     ),
 
   delete: (caseId: string) => del<{ deleted: boolean }>(`/cases/${caseId}`),
+
+  // teamId: undefined/null releases the case back to personal.
+  updateScope: (caseId: string, teamId: string | undefined) =>
+    patch<{ case: Case }>(`/cases/${caseId}/scope`, { team_id: teamId ?? null }).then(
+      (r) => r.case,
+    ),
 };

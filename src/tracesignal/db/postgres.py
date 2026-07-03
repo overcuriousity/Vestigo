@@ -744,6 +744,17 @@ class PostgresStore:
             result = await session.execute(select(Case).order_by(Case.created_at.desc()))
             return list(result.scalars().all())
 
+    async def update_case_team(self, case_id: str, team_id: str | None) -> Case | None:
+        """Reassign a case's team scope (None releases it back to personal). Returns the updated case, or None if not found."""
+        async with self.session_factory() as session:
+            case = await session.get(Case, case_id)
+            if case is None:
+                return None
+            case.team_id = team_id
+            await session.commit()
+            await session.refresh(case)
+            return case
+
     async def list_cases_for_user(self, user_id: str, team_ids: list[str]) -> list[Case]:
         """Return cases visible to a non-admin user: their own, plus their teams'."""
         from sqlalchemy import and_, or_, select
