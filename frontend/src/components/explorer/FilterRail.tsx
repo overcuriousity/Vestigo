@@ -7,7 +7,7 @@ import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
 import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import type { EventFilters, View } from "@/api/types";
-import { fmtRelative } from "@/lib/time";
+import { datetimeLocalToUtcIso, fmtRelative, isoToDatetimeLocalUtc } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
 
 interface Props {
@@ -196,32 +196,28 @@ export function FilterRail({
         {/* Time range */}
         <div>
           <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            <Clock size={13} /> Time Range
+            <Clock size={13} /> Time Range (UTC)
           </label>
           <div className="space-y-1.5">
             <Input
               type="datetime-local"
               placeholder="From"
-              value={filters.start ? filters.start.slice(0, 16) : ""}
+              value={isoToDatetimeLocalUtc(filters.start)}
               onChange={(e) =>
                 onChange({
                   ...filters,
-                  start: e.target.value
-                    ? new Date(e.target.value).toISOString()
-                    : undefined,
+                  start: datetimeLocalToUtcIso(e.target.value),
                 })
               }
             />
             <Input
               type="datetime-local"
               placeholder="To"
-              value={filters.end ? filters.end.slice(0, 16) : ""}
+              value={isoToDatetimeLocalUtc(filters.end)}
               onChange={(e) =>
                 onChange({
                   ...filters,
-                  end: e.target.value
-                    ? new Date(e.target.value).toISOString()
-                    : undefined,
+                  end: datetimeLocalToUtcIso(e.target.value),
                 })
               }
             />

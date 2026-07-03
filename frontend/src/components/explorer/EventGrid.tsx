@@ -421,7 +421,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             className="flex items-center gap-1 hover:text-[var(--color-fg-primary)] transition-base"
             title={sortDir === "desc" ? "Newest first — click for oldest first" : "Oldest first — click for newest first"}
           >
-            Timestamp
+            Timestamp (UTC)
             {sortDir === "desc" ? <ArrowDown size={10} /> : <ArrowUp size={10} />}
           </button>
         ),

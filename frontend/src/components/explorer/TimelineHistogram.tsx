@@ -87,7 +87,9 @@ function addSeconds(iso: string, seconds: number): string {
   return new Date(new Date(iso).getTime() + seconds * 1000).toISOString();
 }
 
-/** Short, human-readable label for a UTC ISO datetime string. */
+/** Short, human-readable label for a UTC ISO datetime string — rendered in
+ * UTC (the application-wide standard, issue #9), matching the grid and the
+ * filter panel's time-range inputs. */
 function fmtShort(iso: string): string {
   return new Date(iso).toLocaleString(undefined, {
     month: "short",
@@ -95,6 +97,7 @@ function fmtShort(iso: string): string {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    timeZone: "UTC",
   });
 }
 

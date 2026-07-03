@@ -1,12 +1,15 @@
-import { format, formatDistanceToNow, parseISO, isValid } from "date-fns";
+import { formatDistanceToNow, parseISO, isValid } from "date-fns";
 
-/** Format a timestamp string for display in the event grid. */
+/** Format a timestamp string for display in the event grid. Renders in UTC —
+ * UTC is the application-wide standard (issue #9); every timestamp an analyst
+ * reads or types anywhere in the UI means UTC, so two analysts in different
+ * timezones always see identical values. */
 export function fmtTimestamp(value: string | null | undefined): string {
   if (!value) return "—";
   try {
     const d = parseISO(value);
     if (!isValid(d)) return value;
-    return format(d, "yyyy-MM-dd HH:mm:ss");
+    return d.toISOString().slice(0, 19).replace("T", " ");
   } catch {
     return value;
   }
@@ -36,10 +39,7 @@ const MONTH_ABBR = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/** Compact UTC timestamp for anomaly-panel finding rows (e.g. "Jul 1, 14:30 UTC").
- * Always UTC, like fmtTimestampFull, for forensic reproducibility across analysts
- * in different timezones — deliberately diverges from the grid's local-time
- * fmtTimestamp. */
+/** Compact UTC timestamp for anomaly-panel finding rows (e.g. "Jul 1, 14:30 UTC"). */
 export function fmtTimestampCompactUtc(value: string | null | undefined): string {
   if (!value) return "—";
   try {
@@ -78,4 +78,27 @@ export function fromIsoParam(value: string | null): Date | null {
   if (!value) return null;
   const d = parseISO(value);
   return isValid(d) ? d : null;
+}
+
+/**
+ * Convert a `<input type="datetime-local">` value ("YYYY-MM-DDTHH:mm") to a
+ * UTC ISO string, treating the typed wall-clock time as UTC. The widget has
+ * no timezone of its own — pairing this with `isoToDatetimeLocalUtc` keeps
+ * the whole round trip in UTC (the application-wide standard, issue #9),
+ * where `new Date(value)` would have interpreted the input as browser-local
+ * and silently shifted it by the local offset.
+ */
+export function datetimeLocalToUtcIso(value: string): string | undefined {
+  if (!value) return undefined;
+  const d = new Date(`${value}:00.000Z`);
+  return isValid(d) ? d.toISOString() : undefined;
+}
+
+/** Render a UTC ISO string as a `datetime-local` widget value
+ * ("YYYY-MM-DDTHH:mm"), in UTC — inverse of `datetimeLocalToUtcIso`. */
+export function isoToDatetimeLocalUtc(value: string | null | undefined): string {
+  if (!value) return "";
+  const d = parseISO(value);
+  if (!isValid(d)) return "";
+  return d.toISOString().slice(0, 16);
 }
