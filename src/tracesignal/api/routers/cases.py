@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
@@ -25,8 +26,10 @@ from tracesignal.core.config import get_settings
 from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.core.jobs import JobStore, get_job_store
 from tracesignal.db.clickhouse import ClickHouseStore
+from tracesignal.db.field_mappings import validate_field_mappings
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
+from tracesignal.db.queries import EventQueryService
 from tracesignal.ingestion.files import hash_file
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -47,6 +50,14 @@ class TimelineCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=4096)
     source_ids: list[str] = Field(default_factory=list)
+    # Canonical field name -> ordered raw attribute keys (issue #10).
+    field_mappings: dict[str, list[str]] | None = Field(default=None)
+
+
+class TimelineFieldMappingsUpdate(BaseModel):
+    """Payload to replace a timeline's field mappings (None/{} clears them)."""
+
+    field_mappings: dict[str, list[str]] | None = Field(default=None)
 
 
 class ViewCreate(BaseModel):
@@ -523,14 +534,32 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     return {"timeline": timeline.to_dict()}
 
 
+async def _check_field_mappings(
+    case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
+) -> None:
+    """Validate mappings against the sources' actual attribute keys; 422 on problems."""
+    service = EventQueryService()
+    inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
+    problems = validate_field_mappings(mappings, set(inventory["attributes"]))
+    if problems:
+        raise HTTPException(status_code=422, detail="; ".join(problems))
+
+
 @router.post("/{case_id}/timelines")
 async def create_timeline(
     payload: TimelineCreate,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Create a new timeline (grouping of sources) within a case."""
+    """Create a new timeline (grouping of sources) within a case.
+
+    ``field_mappings`` (issue #10) merges differently-named raw attribute keys
+    into canonical fields at query time — validated against the attribute keys
+    actually present in the selected sources.
+    """
     store = get_store()
+    if payload.field_mappings:
+        await _check_field_mappings(case.id, payload.source_ids, payload.field_mappings)
     timeline_id = generate_id(payload.name)
     timeline = await store.create_timeline(
         case_id=case.id,
@@ -538,6 +567,7 @@ async def create_timeline(
         name=payload.name,
         description=payload.description,
         source_ids=payload.source_ids,
+        field_mappings=payload.field_mappings,
     )
     await store.record_audit(
         action="timeline.create",
@@ -545,8 +575,61 @@ async def create_timeline(
         case_id=case.id,
         target_type="timeline",
         target_id=timeline_id,
+        detail={"field_mappings": payload.field_mappings} if payload.field_mappings else None,
     )
     return {"timeline": timeline.to_dict()}
+
+
+@router.patch("/{case_id}/timelines/{timeline_id}/field-mappings")
+async def update_timeline_field_mappings(
+    timeline_id: str,
+    payload: TimelineFieldMappingsUpdate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Replace a timeline's field mappings (empty/None clears them).
+
+    Mappings are auditable timeline metadata; the underlying events are never
+    rewritten, which is why editing them post-creation is forensically sound.
+    Every change lands in the audit trail with the before/after mapping.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    sources = await store.list_timeline_sources(case.id, timeline_id)
+    new_mappings = payload.field_mappings or None
+    if new_mappings:
+        await _check_field_mappings(case.id, [s.id for s in sources], new_mappings)
+    previous = timeline.field_mappings
+    updated = await store.update_timeline_field_mappings(case.id, timeline_id, new_mappings)
+    await store.record_audit(
+        action="timeline.update_field_mappings",
+        actor=user,
+        case_id=case.id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"previous": previous, "new": new_mappings},
+    )
+    return {"timeline": updated.to_dict()}
+
+
+@router.get("/{case_id}/fields/coverage")
+async def get_field_coverage(
+    source_ids: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Per-attribute-key coverage across the given sources, for the timeline wizard.
+
+    ``source_ids`` is comma-separated. Returns, per raw field, which sources
+    carry it (with non-empty counts and sample values) so the wizard can show
+    merge candidates with real data next to them.
+    """
+    ids = [sid.strip() for sid in source_ids.split(",") if sid.strip()]
+    if not ids:
+        raise HTTPException(status_code=422, detail="source_ids must not be empty")
+    service = EventQueryService()
+    return await run_in_threadpool(service.field_coverage, case.id, ids)
 
 
 @router.delete("/{case_id}/timelines/{timeline_id}")

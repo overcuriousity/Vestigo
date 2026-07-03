@@ -20,6 +20,11 @@ from tracesignal.db._columns import (
 )
 from tracesignal.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
 from tracesignal.db.clickhouse import ClickHouseStore
+from tracesignal.db.field_mappings import (
+    apply_mappings_to_attribute_keys,
+    mapping_coalesce_expr,
+    resolve_mapping,
+)
 from tracesignal.db.field_recommend import (
     recommend_fields,
     recommend_fields_across_sources,
@@ -102,6 +107,10 @@ class EventQuery:
     # Both are (timestamp, event_id) tuples matching the table's sort key.
     after: tuple[datetime, str] | None = None
     before: tuple[datetime, str] | None = None
+    # Timeline field mappings (issue #10): canonical name → ordered raw
+    # attribute keys, applied at query time wherever a field token resolves
+    # to SQL. None/empty means no mapping. See db/field_mappings.py.
+    field_mappings: dict[str, list[str]] | None = None
 
 
 def _iter_attr_items(attrs: Any) -> Iterator[tuple[str, Any]]:
@@ -200,6 +209,7 @@ def _field_column_expr(
     param_name: str | Callable[[], str],
     *,
     cast_non_string: bool = True,
+    field_mappings: dict[str, list[str]] | None = None,
 ) -> str:
     """Resolve *field_token* to a SQL expression, binding an attribute key if needed.
 
@@ -218,7 +228,16 @@ def _field_column_expr(
     ``toString(...)`` so string comparisons like ``!= ''`` and ``GROUP BY``
     work; the filter builder disables it because its equality/``NOT IN``
     predicates compare against typed literals directly.
+
+    ``field_mappings`` (issue #10): a token naming a canonical mapped field
+    resolves to a coalesce over its raw attribute keys instead — checked
+    before column/attribute routing, since validation guarantees canonical
+    names never collide with core columns or existing raw keys. ``attr:``
+    tokens always bypass mappings.
     """
+    mapped_raws = resolve_mapping(field_token, field_mappings)
+    if mapped_raws:
+        return mapping_coalesce_expr(mapped_raws, parameters, param_name)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         if cast_non_string and column in TOP_LEVEL_NON_STRING_COLUMNS:
@@ -232,10 +251,11 @@ def _field_column_expr(
 class _ParameterizedQueryBuilder:
     """Build a ClickHouse WHERE clause using named parameters."""
 
-    def __init__(self) -> None:
+    def __init__(self, field_mappings: dict[str, list[str]] | None = None) -> None:
         self.conditions: list[str] = []
         self.parameters: dict[str, Any] = {}
         self._counter = 0
+        self._field_mappings = field_mappings
 
     def _param_name(self) -> str:
         name = f"p{self._counter}"
@@ -369,7 +389,13 @@ class _ParameterizedQueryBuilder:
         self.parameters[sentinel_name] = to_clickhouse_utc(_NULL_TIMESTAMP_SENTINEL, precise=True)
 
     def _column_expr(self, key: str) -> str:
-        return _field_column_expr(key, self.parameters, self._param_name, cast_non_string=False)
+        return _field_column_expr(
+            key,
+            self.parameters,
+            self._param_name,
+            cast_non_string=False,
+            field_mappings=self._field_mappings,
+        )
 
     def where_clause(self) -> str:
         return " AND ".join(self.conditions)
@@ -399,7 +425,7 @@ class EventQueryService:
         Both are consumed by :py:meth:`query` (paginated) and
         :py:meth:`iter_events` (streaming export).
         """
-        builder = _ParameterizedQueryBuilder()
+        builder = _ParameterizedQueryBuilder(field_mappings=query.field_mappings)
         builder.add_param("case_id = :name", query.case_id)
 
         if query.source_ids is not None:
@@ -629,13 +655,23 @@ class EventQueryService:
         )
         return [(row[0], row[1]) for row in result.result_rows]
 
-    def list_fields(self, case_id: str, source_ids: list[str]) -> dict[str, list[str]]:
+    def list_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        field_mappings: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
         """Return the displayable field names for a timeline.
 
         ``top_level`` contains the fixed columns common to every event.
         ``attributes`` contains the dynamic keys aggregated from the ``attributes``
         Map across a sample of up to 50 000 events.  Useful for building a column
         picker in the UI.
+
+        When the timeline defines ``field_mappings``, mapped raw keys are
+        hidden from ``attributes`` and replaced by their canonical names;
+        ``mapped`` carries the merge provenance so the UI can render
+        ``ip_address ← src_ip, ip_addr``.
         """
         self.store.init_schema()
         database = self.store.database
@@ -651,9 +687,70 @@ class EventQueryService:
             parameters=params,
         )
         raw_keys: list[str] = result.result_rows[0][0] if result.result_rows else []
+        keys, provenance = apply_mappings_to_attribute_keys(sorted(raw_keys), field_mappings)
         return {
             "top_level": TOP_LEVEL_DISPLAY_COLUMNS,
-            "attributes": sorted(raw_keys),
+            "attributes": keys,
+            "mapped": provenance,
+        }
+
+    def field_coverage(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        sample_rows_per_source: int = 20_000,
+        samples_per_field: int = 3,
+    ) -> dict[str, Any]:
+        """Return per-raw-attribute-key coverage across sources, for the timeline wizard.
+
+        For every attribute key: which of the given sources carry it, its
+        non-empty count there, and up to *samples_per_field* example values —
+        the data the field-aggregation step needs to show merge candidates
+        with real sample values. Scans up to *sample_rows_per_source* events
+        per source (``LIMIT n BY source_id``), so counts are per-sample, not
+        exact totals — coverage, not statistics.
+        """
+        self.store.init_schema()
+        database = self.store.database
+        params: dict[str, Any] = {
+            "p0": case_id,
+            "src": source_ids,
+            "per": sample_rows_per_source,
+        }
+        result = self.store.client.query(
+            f"""
+            SELECT
+                k,
+                source_id,
+                countIf(v != '') AS non_empty,
+                groupUniqArrayIf({samples_per_field})(v, v != '') AS samples
+            FROM (
+                SELECT source_id, attributes
+                FROM {database}.events
+                WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
+                LIMIT {{per:UInt32}} BY source_id
+            )
+            ARRAY JOIN mapKeys(attributes) AS k, mapValues(attributes) AS v
+            GROUP BY k, source_id
+            HAVING non_empty > 0
+            ORDER BY k, source_id
+            """,
+            parameters=params,
+        )
+        fields: dict[str, list[dict[str, Any]]] = {}
+        for key, source_id, non_empty, samples in result.result_rows:
+            fields.setdefault(key, []).append(
+                {
+                    "source_id": source_id,
+                    "count": int(non_empty),
+                    "samples": list(samples),
+                }
+            )
+        return {
+            "fields": [
+                {"key": key, "sources": per_source} for key, per_source in sorted(fields.items())
+            ],
+            "sampled_rows_per_source": sample_rows_per_source,
         }
 
     def list_distinct_artifacts(
@@ -978,7 +1075,9 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
-        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
 
         # Single scan: the window aggregates run after GROUP BY but before
         # ORDER BY/LIMIT, so every surviving row carries the pre-LIMIT event
@@ -1050,7 +1149,9 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
-        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
         cast_expr = f"toFloat64OrNull(toString({col_expr}))"
 
         quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
@@ -1168,7 +1269,9 @@ class EventQueryService:
             }
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
         parameters["series_values"] = top_values
 
         bucket_result = self.store.client.query(
@@ -1310,7 +1413,9 @@ class EventQueryService:
     ) -> tuple[dict[str, int], int]:
         """Return per-value counts restricted to *values*, plus the layer's non-empty total."""
         where, parameters = self._build_where(query)
-        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
         parameters["cmp_values"] = values
         result = self.store.client.query(
             f"""
@@ -1378,7 +1483,9 @@ class EventQueryService:
     ) -> tuple[int, float | None, float | None]:
         """Return (count, min, max) of the numeric cast of *field_token* for one layer."""
         where, parameters = self._build_where(query)
-        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
         cast_expr = f"toFloat64OrNull(toString({col_expr}))"
         result = self.store.client.query(
             f"""
@@ -1396,7 +1503,9 @@ class EventQueryService:
     ) -> dict[int, int]:
         """Return bin-index → count for one layer, bucketed on explicit shared edges."""
         where, parameters = self._build_where(query)
-        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
         cast_expr = f"toFloat64OrNull(toString({col_expr}))"
         result = self.store.client.query(
             f"""

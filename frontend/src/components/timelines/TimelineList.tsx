@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Clock, Cpu } from "lucide-react";
+import { Clock, Cpu, Merge } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
 import { sourcesApi } from "@/api/sources";
 import { fmtRelative } from "@/lib/time";
@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
 import { CreateTimelineDialog } from "./CreateTimelineDialog";
 import { DeleteTimelineDialog } from "./DeleteTimelineDialog";
+import { EditFieldMappingsDialog } from "./EditFieldMappingsDialog";
 import { EmbedWizard } from "./EmbedWizard";
 import type { Source, Timeline } from "@/api/types";
 
@@ -70,6 +71,17 @@ function TimelineRow({
             {tl.name}
           </span>
           {tl.is_default && <Badge variant="accent">default</Badge>}
+          {tl.field_mappings && Object.keys(tl.field_mappings).length > 0 && (
+            <span
+              title={Object.entries(tl.field_mappings)
+                .map(([name, raws]) => `${name} ← ${raws.join(", ")}`)
+                .join("\n")}
+            >
+              <Badge variant="muted" className="flex items-center gap-1">
+                <Merge size={9} /> {Object.keys(tl.field_mappings).length} mapped
+              </Badge>
+            </span>
+          )}
           <EmbeddingBadge tl={tl} sourcesById={sourcesById} />
         </div>
         <div className="mt-1 flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
@@ -87,6 +99,9 @@ function TimelineRow({
         </div>
       </Link>
       <div className="flex items-center gap-2 shrink-0">
+        {tl.source_ids.length > 0 && (
+          <EditFieldMappingsDialog caseId={caseId} timeline={tl} />
+        )}
         {tl.source_ids.length > 0 && (
           <EmbedWizard caseId={caseId} timeline={tl} />
         )}

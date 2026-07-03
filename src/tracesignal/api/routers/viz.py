@@ -32,6 +32,7 @@ from tracesignal.api.routers.events import (
     _parse_json_object,
     _parse_str_list,
     _resolve_event_id_filters,
+    _resolve_timeline_scope,
     _resolve_timeline_source_ids,
 )
 from tracesignal.db.postgres import Case, User, generate_id
@@ -69,7 +70,7 @@ async def _resolve_event_query(
     builds an identical ``EventQuery`` from identical inputs — one place to
     keep in sync with ``list_events``/``get_histogram`` instead of three.
     """
-    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
@@ -96,6 +97,7 @@ async def _resolve_event_query(
         event_ids=event_ids,
         tags_include=tags_include_filter,
         tags_exclude=tags_exclude_filter,
+        field_mappings=field_mappings,
     )
 
 

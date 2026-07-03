@@ -38,7 +38,9 @@ export const guidance = {
         body:
           "The default timeline always contains all sources of the case; open it to start " +
           "filtering, searching, and building histograms right away. Create additional " +
-          "timelines to recombine sources into task-specific views.",
+          "timelines to recombine sources into task-specific views — the timeline wizard " +
+          "can merge equivalent fields from differently normalized sources (src_ip vs " +
+          "ip_addr) into one canonical field.",
       },
       {
         title: "Optionally: embeddings",
