@@ -1,6 +1,6 @@
-# TraceVector Roadmap
+# TraceSignal Roadmap
 
-This document tracks the agreed scope for the TraceVector API and UI.
+This document tracks the agreed scope for the TraceSignal API and UI.
 
 > **Current model:** Case / Source / Timeline / Artifact.
 > See [`docs/MODEL_REFINEMENT.md`](./MODEL_REFINEMENT.md) for the design rationale
@@ -117,9 +117,9 @@ Qdrant-backed similarity/semantic search:
 ### 8. Authentication, RBAC, teams, audit trail, live collaboration ✅
 
 - ✅ **Session-cookie auth** for local users, with a seeded one-time bootstrap admin
-  (`TV_ADMIN_PASSWORD`) whose forced password rotation is enforced centrally in
+  (`TS_ADMIN_PASSWORD`) whose forced password rotation is enforced centrally in
   `AuthAuditMiddleware` for every mutating `/api/*` request.
-- ✅ **Optional OIDC SSO** (`TV_OIDC_ENABLED`), gated at runtime via `/api/health`'s
+- ✅ **Optional OIDC SSO** (`TS_OIDC_ENABLED`), gated at runtime via `/api/health`'s
   `oidc_enabled` flag rather than a build-time frontend env var.
 - ✅ **Teams** with member/manager roles; **case-RBAC** dependency layer
   (`api/deps.py::resolve_case_access`) wired into every case-scoped endpoint.
@@ -148,7 +148,7 @@ Qdrant-backed similarity/semantic search:
 ## Notes
 
 - All backend endpoints follow the FastAPI router pattern in
-  `src/tracevector/api/routers/` (`cases.py`, `events.py`, `jobs.py`).
+  `src/tracesignal/api/routers/` (`cases.py`, `events.py`, `jobs.py`).
 - The backend is API-first; the frontend consumes the documented REST contract
   (`/api/docs`).
 - For historical PR-review detail, see `docs/archive/PR4_REVIEW_FINDINGS.md` (moved out of

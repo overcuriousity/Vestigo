@@ -1,1 +1,0 @@
-"""TraceVector API routers."""

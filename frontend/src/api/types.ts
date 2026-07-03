@@ -1,4 +1,4 @@
-/** Typed API contract for TraceVector. Mirrors the FastAPI backend models. */
+/** Typed API contract for TraceSignal. Mirrors the FastAPI backend models. */
 
 export interface Case {
   id: string;

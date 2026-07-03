@@ -57,7 +57,7 @@ def test_admin_mutation_blocked_until_password_rotated(client, admin_bootstrap):
     """PR #7 review finding #1: admin.py never opted in to
     require_password_current, so the bootstrap admin could mint a permanent
     admin via POST /api/admin/users before ever rotating the one-time
-    TV_ADMIN_PASSWORD. The gate now lives in AuthAuditMiddleware, applied to
+    TS_ADMIN_PASSWORD. The gate now lives in AuthAuditMiddleware, applied to
     every mutating /api/* request regardless of router opt-in."""
     login(client, admin_bootstrap["username"], admin_bootstrap["password"])
     resp = client.post(

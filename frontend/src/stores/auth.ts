@@ -27,7 +27,7 @@ export const useAuthStore = create<AuthState>()(
       clear: () => set({ user: null }),
     }),
     {
-      name: "tv-auth",
+      name: "tsig-auth",
       version: 1,
       // Never persist `initialized` — every fresh page load must re-validate
       // against the server session before trusting the cached user.

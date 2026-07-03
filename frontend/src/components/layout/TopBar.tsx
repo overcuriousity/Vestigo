@@ -170,7 +170,7 @@ export function TopBar() {
         className="flex items-center gap-2 text-[var(--color-fg-primary)] hover:text-[var(--color-accent)] transition-base"
       >
         <Activity size={16} className="text-[var(--color-accent)]" />
-        <span className="font-semibold tracking-tight">TraceVector</span>
+        <span className="font-semibold tracking-tight">TraceSignal</span>
       </Link>
 
       {/* Breadcrumb */}

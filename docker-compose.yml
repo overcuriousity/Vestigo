@@ -1,20 +1,20 @@
-# Optional reference deployment for TraceVector.
-# TraceVector itself is a native Python app; this file only starts the backing services.
-# Run `uv run tv-web` separately after starting these services.
+# Optional reference deployment for TraceSignal.
+# TraceSignal itself is a native Python app; this file only starts the backing services.
+# Run `uv run tsig-web` separately after starting these services.
 
 services:
   postgres:
     image: docker.io/library/postgres:17-alpine
     environment:
-      POSTGRES_USER: tracevector
-      POSTGRES_PASSWORD: tracevector
-      POSTGRES_DB: tracevector
+      POSTGRES_USER: tracesignal
+      POSTGRES_PASSWORD: tracesignal
+      POSTGRES_DB: tracesignal
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tracevector -d tracevector"]
+      test: ["CMD-SHELL", "pg_isready -U tracesignal -d tracesignal"]
       interval: 5s
       timeout: 5s
       retries: 5
