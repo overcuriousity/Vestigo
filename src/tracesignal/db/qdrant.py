@@ -40,7 +40,7 @@ class QdrantStore:
         if settings.qdrant_path:
             self.client = QdrantClient(path=settings.qdrant_path)
         else:
-            self.client = QdrantClient(url=settings.qdrant_url)
+            self.client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
 
     def collection_name(self, case_id: str, embedding_config_hash: str) -> str:
         """Return the deterministic Qdrant collection name for a case."""

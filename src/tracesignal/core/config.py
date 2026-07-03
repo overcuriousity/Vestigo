@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # Vector store
     qdrant_url: str | None = Field(default="http://localhost:6333")
     qdrant_path: str | None = Field(default=None)
+    qdrant_api_key: str | None = Field(default=None)
     qdrant_collection_prefix: str = "tracesignal"
 
     # Embeddings

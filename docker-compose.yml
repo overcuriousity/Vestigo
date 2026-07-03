@@ -39,6 +39,9 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    # Uncomment to require an API key (must match TS_QDRANT_API_KEY on `app`):
+    # environment:
+    #   QDRANT__SERVICE__API_KEY: change-me
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
       interval: 5s
@@ -58,6 +61,7 @@ services:
       TS_CLICKHOUSE_URL: http://clickhouse:8123
       TS_CLICKHOUSE_DATABASE: tracesignal
       TS_QDRANT_URL: http://qdrant:6333
+      # TS_QDRANT_API_KEY: change-me
       TS_ALLOW_ONLINE: "false"
     depends_on:
       postgres:
