@@ -20,34 +20,49 @@ from tracesignal.models.event import Event, ParserConfig, content_hash
 
 
 class _RecordTrackingIterator:
-    """Track the start index and raw lines of each CSV record.
+    """Track the byte offset, line number, and raw lines of each CSV record.
 
     ``csv.DictReader`` consumes one or more physical lines per logical record
-    (e.g. for quoted fields containing newlines). This wrapper records which
-    lines belong to each record so the caller can reconstruct the exact source
-    bytes and byte offset.
+    (e.g. for quoted fields containing newlines). This wrapper reads lines
+    lazily from the underlying file and buffers only the lines of the record
+    currently being consumed, so the caller can reconstruct the exact source
+    bytes and byte offset without loading the whole file into memory —
+    multi-GB CSV timelines are the target workload.
+
+    ``csv.reader`` consumes exactly the lines of one logical record before
+    yielding it (no read-ahead), so at ``finish_record`` time the buffer holds
+    precisely that record's physical lines. Blank lines that ``DictReader``
+    skips internally end up prepended to the next record's buffer — identical
+    to the previous list-index-based implementation's behaviour.
     """
 
-    def __init__(self, lines: list[str]) -> None:
-        self.lines = lines
-        self.index = 0
-        self.record_start_index = 0
+    def __init__(self, fh: Iterator[str], start_offset: int, start_line: int) -> None:
+        self._fh = fh
+        self._buffer: list[str] = []
+        self._next_offset = start_offset
+        self._record_offset = start_offset
+        self._next_line = start_line
+        self._record_line = start_line
 
     def __iter__(self) -> _RecordTrackingIterator:
         return self
 
     def __next__(self) -> str:
-        if self.index >= len(self.lines):
-            raise StopIteration
-        line = self.lines[self.index]
-        self.index += 1
+        line = next(self._fh)
+        self._buffer.append(line)
+        self._next_offset += len(line.encode("utf-8"))
+        self._next_line += 1
         return line
 
-    def finish_record(self) -> tuple[int, int]:
-        """Return the line indices of the record just completed."""
-        start = self.record_start_index
-        self.record_start_index = self.index
-        return start, self.index
+    def finish_record(self) -> tuple[int, int, str]:
+        """Return ``(byte_offset, line_number, raw_text)`` of the record just completed."""
+        offset = self._record_offset
+        line_number = self._record_line
+        raw = "".join(self._buffer)
+        self._buffer.clear()
+        self._record_offset = self._next_offset
+        self._record_line = self._next_line
+        return offset, line_number, raw
 
 
 def _normalise_tag_field(value: str) -> list[str]:
@@ -185,27 +200,20 @@ class TimesketchCsvParser(Parser):
             headers = [h.strip() if h else h for h in headers]
             header_bytes = len(header_line.encode("utf-8"))
 
-            # Read all physical lines up front. csv.DictReader will correctly
-            # group them into logical records (including quoted multi-line
-            # fields), and we can compute byte offsets from the line list.
-            lines = list(fh)
-            line_byte_offsets = [0]
-            for line in lines:
-                line_byte_offsets.append(line_byte_offsets[-1] + len(line.encode("utf-8")))
-
-            wrapper = _RecordTrackingIterator(lines)
+            # Stream the remaining lines through the tracking wrapper —
+            # csv.DictReader groups them into logical records (including
+            # quoted multi-line fields) while the wrapper tracks byte
+            # offsets and line numbers incrementally.
+            wrapper = _RecordTrackingIterator(fh, start_offset=header_bytes, start_line=2)
             row_reader = csv.DictReader(
                 wrapper,
                 fieldnames=headers,
                 dialect=dialect,
             )
             for row in row_reader:
-                start_idx, end_idx = wrapper.finish_record()
-                raw_line = "".join(lines[start_idx:end_idx])
+                byte_offset, line_number, raw_line = wrapper.finish_record()
                 if not raw_line.strip():
                     continue
-                byte_offset = header_bytes + line_byte_offsets[start_idx]
-                line_number = 2 + start_idx  # header is line 1, first data row line 2
                 yield self._event_from_row(
                     source_file,
                     byte_offset,

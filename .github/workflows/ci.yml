@@ -14,8 +14,51 @@ jobs:
   backend:
     name: Backend (lint + test)
     runs-on: ubuntu-latest
+    # Mirror docker-compose.yml's backing services — the test suite talks to
+    # real Postgres/ClickHouse/Qdrant (see core/config.py's localhost defaults),
+    # there is no mocked/in-memory mode.
+    services:
+      postgres:
+        image: docker.io/library/postgres:17-alpine
+        env:
+          POSTGRES_USER: tracesignal
+          POSTGRES_PASSWORD: tracesignal
+          POSTGRES_DB: tracesignal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tracesignal -d tracesignal"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      clickhouse:
+        # Not the -alpine tag: its musl/jemalloc startup path calls
+        # get_mempolicy, which GitHub Actions' runner seccomp profile denies
+        # and the server dies before it ever opens the health port. The
+        # glibc build doesn't take that path.
+        image: docker.io/clickhouse/clickhouse-server:24
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:8123/ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      qdrant:
+        # No --health-cmd: the image has neither curl nor wget, so an
+        # in-container healthcheck command always errors and the container
+        # never reports "healthy", which makes Actions kill the whole
+        # services group even though qdrant itself started fine. Wait for
+        # it from the runner (which has curl) as a step instead.
+        image: docker.io/qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for qdrant
+        run: timeout 30 sh -c 'until curl -sf http://localhost:6333/healthz; do sleep 1; done'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3

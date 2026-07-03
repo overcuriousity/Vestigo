@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -60,13 +61,44 @@ class EmbeddingModel:
         return self.config.config_hash()
 
     def load(self) -> SentenceTransformer:
-        """Lazy-load the local sentence-transformer model."""
+        """Lazy-load the local sentence-transformer model.
+
+        Unless ``TS_ALLOW_ONLINE`` is set, the HuggingFace hub is forced into
+        offline mode before the model is constructed — SentenceTransformer
+        otherwise downloads uncached weights from the network by default,
+        which violates the airgapped/offline-by-default design goal
+        (docs/TECH_STACK.md §6). Operators must pre-cache the model weights
+        (see the airgapped install docs); a missing cache fails loudly here
+        instead of silently reaching out.
+        """
         if self.is_remote:
             raise RuntimeError("load() is not available when using a remote embedding endpoint")
         if self._model is None:
-            # In airgapped mode, SentenceTransformer will not download weights.
-            # We rely on the operator to have cached the model offline.
-            self._model = SentenceTransformer(self.model_name, device=self.device)
+            offline = not get_settings().allow_online
+            offline_vars = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+            # Scoped to this call (save/restore) rather than setdefault(), which
+            # would leave the process permanently forced offline even after a
+            # later call with allow_online=True — e.g. across cache_clear() in
+            # tests, or a hypothetical settings hot-reload.
+            previous = {var: os.environ.get(var) for var in offline_vars}
+            try:
+                if offline:
+                    for var in offline_vars:
+                        os.environ[var] = "1"
+                try:
+                    self._model = SentenceTransformer(self.model_name, device=self.device)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Embedding model {self.model_name!r} is not available locally and "
+                        "TS_ALLOW_ONLINE is disabled. Pre-cache the model weights on this "
+                        "machine (see the airgapped install docs) or set TS_ALLOW_ONLINE=true."
+                    ) from exc
+            finally:
+                for var, value in previous.items():
+                    if value is None:
+                        os.environ.pop(var, None)
+                    else:
+                        os.environ[var] = value
         return self._model
 
     def _get_client(self) -> httpx.Client:

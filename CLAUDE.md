@@ -50,9 +50,10 @@ npm run typecheck                # tsc -b --noEmit
 npm run lint                     # oxlint src
 npm run test                     # vitest run
 ```
-`tsig-web` auto-builds `frontend/dist` on first run if it doesn't exist (see
-`src/tracesignal/web/app.py::_build_frontend`). For active frontend work, run `npm run dev`
-alongside `uv run tsig-web` instead of rebuilding.
+`tsig-web` auto-builds `frontend/dist` only when it doesn't exist (see
+`src/tracesignal/web/app.py::_build_frontend`); set `TS_FRONTEND_REBUILD=1` to force a rebuild
+after frontend changes. For active frontend work, run `npm run dev` alongside `uv run tsig-web`
+instead of rebuilding.
 
 ## Architecture
 

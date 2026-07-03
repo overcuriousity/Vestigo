@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import tempfile
 from pathlib import Path
@@ -30,7 +31,7 @@ from tracesignal.db.field_mappings import validate_field_mappings
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
 from tracesignal.db.queries import EventQueryService
-from tracesignal.ingestion.files import hash_file
+from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -90,8 +91,15 @@ class SourceUploadResponse(BaseModel):
     events_inserted: int
     parser: str
     duplicate: bool
+    # Ingest lifecycle of source_id at response time. For a duplicate hitting
+    # the create_source race (another concurrent upload of the same bytes won
+    # and is still ingesting), this lets the client show real progress
+    # instead of claiming the file is already fully ingested.
+    status: str = "ready"
     job_id: str | None = None
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
 
@@ -227,6 +235,46 @@ async def get_source(source_id: str, case: Case = Depends(require_case_read)) ->
     return {"source": source.to_dict()}
 
 
+async def _revalidate_stale_field_mappings(
+    store: PostgresStore, case_id: str, source_id: str
+) -> None:
+    """Re-check a timeline's ``field_mappings`` once one of its sources becomes ready.
+
+    ``create_timeline``/``update_timeline_field_mappings`` skip the
+    inventory-dependent checks in ``validate_field_mappings`` when every
+    selected source is still "ingesting" (there's no attribute inventory yet
+    to check against) — so a mapping with a typo'd raw key can be saved
+    unnoticed. There is no blocking re-validation once ingestion finishes
+    (rejecting already-persisted timeline metadata post hoc would be a worse
+    surprise than a stale mapping); instead this records an audit-log warning
+    so the gap is forensically visible rather than silent.
+    """
+    timelines = await store.list_timelines_for_source(case_id, source_id)
+    for timeline in timelines:
+        if not timeline.field_mappings:
+            continue
+        sources = await store.list_timeline_sources(case_id, timeline.id)
+        ready_ids = [s.id for s in sources if s.is_ready]
+        if not ready_ids:
+            continue
+        service = EventQueryService()
+        inventory = await run_in_threadpool(service.list_fields, case_id, ready_ids)
+        problems = validate_field_mappings(timeline.field_mappings, set(inventory["attributes"]))
+        if problems:
+            logger.warning(
+                "Timeline %r field_mappings are invalid against its now-ready sources: %s",
+                timeline.id,
+                "; ".join(problems),
+            )
+            await store.record_audit(
+                action="timeline.field_mappings_stale",
+                case_id=case_id,
+                target_type="timeline",
+                target_id=timeline.id,
+                detail={"problems": problems, "source_id": source_id},
+            )
+
+
 async def _run_ingestion_job(
     job_id: str,
     case_id: str,
@@ -277,6 +325,10 @@ async def _run_ingestion_job(
             source_id=source_id,
             event_count=result.events_inserted,
         )
+        # Only now does the source become visible to timeline queries,
+        # detectors, and embedding (see events._resolve_timeline_scope).
+        await store.set_source_status(case_id, source_id, "ready")
+        await _revalidate_stale_field_mappings(store, case_id, source_id)
         await store.record_audit(
             action="source.upload",
             actor=user,
@@ -300,6 +352,8 @@ async def _run_ingestion_job(
         try:
             await asyncio.to_thread(clickhouse.delete_source_events, case_id, source_id)
             await store.delete_source(case_id, source_id)
+            if not await store.source_hash_in_use(file_hash, exclude_source_id=source_id):
+                _retention_path(file_hash).unlink(missing_ok=True)
         except Exception:  # noqa: BLE001, S110 — best-effort cleanup
             pass
         job_store.update(job_id, status="failed", error=str(exc))
@@ -337,30 +391,39 @@ async def upload_source(
     store = get_store()
     case_id = case.id
 
-    file_hash = hash_file(file.file)
+    # Copy to a temp file and hash in one pass, in a worker thread so a
+    # multi-GB upload doesn't block the event loop, and capped by
+    # TS_MAX_UPLOAD_BYTES so a single request can't fill the disk. Hashing
+    # during the copy means the duplicate check now happens after the copy —
+    # a duplicate upload costs one temp write, but the common (new file) path
+    # reads the stream once instead of twice.
+    max_bytes = get_settings().max_upload_bytes or None
+    suffix = Path(file.filename or "upload").suffix or ".tmp"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)  # noqa: SIM115
+    tmp_path = Path(tmp.name)
     try:
-        file.file.seek(0)
-    except (OSError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file stream is not seekable; cannot ingest",
-        ) from exc
+        with tmp:
+            file_hash, size_bytes = await asyncio.to_thread(
+                copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
+            )
+    except UploadTooLargeError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     existing_source = await store.get_source_by_hash(case_id, file_hash)
     if existing_source is not None:
+        tmp_path.unlink(missing_ok=True)
         return SourceUploadResponse(
             source_id=existing_source.id,
             events_parsed=existing_source.event_count,
             events_inserted=0,
             parser=parser or existing_source.parser or "auto",
             duplicate=True,
+            status=existing_source.status,
         )
-
-    suffix = Path(file.filename or "upload").suffix or ".tmp"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = Path(tmp.name)
-        size_bytes = tmp_path.stat().st_size
 
     source_created = False
     try:
@@ -400,6 +463,9 @@ async def upload_source(
                 parser=fmt,
                 event_count=0,
                 created_by=user.id,
+                # Excluded from timeline queries/detectors/embedding until
+                # the background job flips it to "ready".
+                status="ingesting",
             )
             source_created = True
         except IntegrityError:
@@ -415,6 +481,7 @@ async def upload_source(
                 events_inserted=0,
                 parser=parser or existing_source.parser or "auto",
                 duplicate=True,
+                status=existing_source.status,
             )
 
         # Auto-add the new source to the case's default timeline.
@@ -454,6 +521,7 @@ async def upload_source(
         events_inserted=0,
         parser=fmt,
         duplicate=False,
+        status="ingesting",
         job_id=job.id,
     )
 
@@ -537,10 +605,21 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
 async def _check_field_mappings(
     case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
 ) -> None:
-    """Validate mappings against the sources' actual attribute keys; 422 on problems."""
-    service = EventQueryService()
-    inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
-    problems = validate_field_mappings(mappings, set(inventory["attributes"]))
+    """Validate mappings against the sources' actual attribute keys; 422 on problems.
+
+    ``source_ids`` should contain only *ready* sources — a half-ingested
+    source's attribute inventory is incomplete and would reject mappings that
+    are valid once ingestion finishes. With zero ready sources the structural
+    rules still apply but the inventory-dependent checks are skipped (see
+    ``validate_field_mappings``).
+    """
+    if source_ids:
+        service = EventQueryService()
+        inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
+        keys: set[str] | None = set(inventory["attributes"])
+    else:
+        keys = None
+    problems = validate_field_mappings(mappings, keys)
     if problems:
         raise HTTPException(status_code=422, detail="; ".join(problems))
 
@@ -559,7 +638,13 @@ async def create_timeline(
     """
     store = get_store()
     if payload.field_mappings:
-        await _check_field_mappings(case.id, payload.source_ids, payload.field_mappings)
+        # Ingesting sources can still be timeline *members* — they're only
+        # excluded from the inventory validation (and from queries) until
+        # ready.
+        sources = await store.list_sources(case.id)
+        ready_ids = {s.id for s in sources if s.is_ready}
+        validate_ids = [sid for sid in payload.source_ids if sid in ready_ids]
+        await _check_field_mappings(case.id, validate_ids, payload.field_mappings)
     timeline_id = generate_id(payload.name)
     timeline = await store.create_timeline(
         case_id=case.id,
@@ -600,7 +685,8 @@ async def update_timeline_field_mappings(
     sources = await store.list_timeline_sources(case.id, timeline_id)
     new_mappings = payload.field_mappings or None
     if new_mappings:
-        await _check_field_mappings(case.id, [s.id for s in sources], new_mappings)
+        ready_ids = [s.id for s in sources if s.is_ready]
+        await _check_field_mappings(case.id, ready_ids, new_mappings)
     previous = timeline.field_mappings
     updated = await store.update_timeline_field_mappings(case.id, timeline_id, new_mappings)
     if updated is None:
@@ -1039,6 +1125,20 @@ async def start_timeline_embedding(
         raise HTTPException(
             status_code=422,
             detail="Timeline has no sources — add at least one source before embedding.",
+        )
+    ingesting = [s.name for s in sources if not s.is_ready]
+    if ingesting:
+        # Embedding a half-ingested source would persist vectors over an
+        # incomplete event set — refuse outright rather than silently
+        # embedding a partial timeline (the run is expensive and its
+        # source-set snapshot would immediately go stale anyway).
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Source(s) still ingesting: "
+                + ", ".join(ingesting)
+                + ". Wait for ingestion to finish before embedding."
+            ),
         )
     source_ids = [s.id for s in sources]
 

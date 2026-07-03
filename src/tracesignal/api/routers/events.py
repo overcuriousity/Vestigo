@@ -144,19 +144,26 @@ def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
 async def _resolve_timeline_scope(
     case_id: str, timeline_id: str
 ) -> tuple[list[str], dict[str, list[str]] | None]:
-    """Return a timeline's source IDs plus its field mappings (issue #10).
+    """Return a timeline's *ready* source IDs plus its field mappings (issue #10).
 
     Every endpoint whose parameters carry field tokens (filters, group-bys,
     detector fields, exports) must resolve through this so canonical mapped
     fields work uniformly; endpoints that never see a field token can keep
     using :func:`_resolve_timeline_source_ids`.
+
+    Sources still being ingested (``status != "ready"``) are excluded here —
+    this is the single choke point that keeps half-ingested files out of the
+    explorer, histogram, export, detectors, and the field/embedding wizards,
+    where partial data would silently produce wrong counts and wrong
+    statistical baselines. The sources API still lists them (with their
+    status) so the UI can show ingest progress.
     """
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
     sources = await store.list_timeline_sources(case_id, timeline_id)
-    return [s.id for s in sources], timeline.field_mappings or None
+    return [s.id for s in sources if s.is_ready], timeline.field_mappings or None
 
 
 async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[str]:
@@ -446,7 +453,12 @@ async def list_events(
         )
 
     service = _get_query_service()
-    page = service.query(
+    # EventQueryService is synchronous (blocking ClickHouse scans) — run it in
+    # the threadpool so a slow scan doesn't stall the event loop for every
+    # other request (the ClickHouse client is built for concurrent threadpool
+    # use, see ClickHouseStore's autogenerate_session_id note).
+    page = await run_in_threadpool(
+        service.query,
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
@@ -469,7 +481,7 @@ async def list_events(
             after=after_cursor,
             before=before_cursor,
             field_mappings=field_mappings,
-        )
+        ),
     )
     return {
         "total": page.total,
@@ -557,7 +569,9 @@ async def bulk_annotate_by_filter(
     )
 
     service = _get_query_service()
-    refs = service.query_event_refs(
+    # Blocking ClickHouse scan — threadpool, same as list_events.
+    refs = await run_in_threadpool(
+        service.query_event_refs,
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
@@ -575,7 +589,7 @@ async def bulk_annotate_by_filter(
             tags_include=tags_include_filter,
             tags_exclude=tags_exclude_filter,
             field_mappings=field_mappings,
-        )
+        ),
     )
 
     if not refs:
@@ -616,7 +630,7 @@ async def list_fields(
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     service = _get_query_service()
-    return service.list_fields(case_id, source_ids, field_mappings)
+    return await run_in_threadpool(service.list_fields, case_id, source_ids, field_mappings)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/artifacts")
@@ -629,7 +643,8 @@ async def list_artifacts(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
-    return {"artifacts": service.list_distinct_artifacts(case_id, source_ids)}
+    artifacts = await run_in_threadpool(service.list_distinct_artifacts, case_id, source_ids)
+    return {"artifacts": artifacts}
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/tags/merged")
@@ -648,7 +663,7 @@ async def list_merged_tags(
     store = get_store()
     service = _get_query_service()
     ann_tags = await store.list_distinct_tag_contents(case_id, source_ids)
-    parser_tags = service.list_distinct_parser_tags(case_id, source_ids)
+    parser_tags = await run_in_threadpool(service.list_distinct_parser_tags, case_id, source_ids)
     return {"tags": sorted(set(ann_tags) | set(parser_tags))}
 
 
@@ -667,7 +682,9 @@ async def list_embedding_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
-    return service.list_fields_by_artifact(case_id, source_ids, encode=_get_field_encoder())
+    return await run_in_threadpool(
+        service.list_fields_by_artifact, case_id, source_ids, encode=_get_field_encoder()
+    )
 
 
 @router.get("/{case_id}/sources/{source_id}/embedding-fields")
@@ -683,7 +700,9 @@ async def list_source_embedding_fields(
     recommender; field pairing degrades to heuristic-only if the model can't load.
     """
     service = _get_query_service()
-    return service.list_fields_by_artifact(case_id, [source_id], encode=_get_field_encoder())
+    return await run_in_threadpool(
+        service.list_fields_by_artifact, case_id, [source_id], encode=_get_field_encoder()
+    )
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/histogram")
@@ -732,7 +751,9 @@ async def get_histogram(
         ids=ids,
     )
     service = _get_query_service()
-    return service.histogram(
+    # Blocking ClickHouse scan — threadpool, same as list_events.
+    return await run_in_threadpool(
+        service.histogram,
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
@@ -1034,7 +1055,9 @@ async def _resolve_similarity_source_ids(case_id: str, timeline_id: str | None) 
         return await _resolve_timeline_source_ids(case_id, timeline_id)
     store = get_store()
     sources = await store.list_sources(case_id)
-    return [s.id for s in sources]
+    # Same readiness rule as _resolve_timeline_scope: never search
+    # half-ingested sources.
+    return [s.id for s in sources if s.is_ready]
 
 
 @router.get("/{case_id}/events/{event_id}/similar")

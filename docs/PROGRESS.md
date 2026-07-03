@@ -1,6 +1,33 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 13 — deployment: `docker-compose.yml` gained an `app` service
+Last updated: 2026-07-03 (session 14, continued — source ingest-status lifecycle:
+`Source.status` (`ingesting`/`ready`, additive migration backfills `ready`); uploads create
+the row as `ingesting` and the background job flips it to `ready`; `_resolve_timeline_scope`
+(the single scope choke point) excludes non-ready sources so the explorer, histogram,
+export, detectors, and wizards never see half-ingested data; timeline embedding refuses
+409 while a member source is ingesting; field-mapping validation runs inventory checks only
+against ready sources (structural rules always apply — `validate_field_mappings` now takes
+`None` inventory to mean "unknown, skip inventory checks"); startup reconciliation removes
+sources orphaned mid-ingest by a restart (partial events + row, audited as
+`source.ingest_interrupted`) so re-upload isn't blocked by the file-hash duplicate check;
+frontend shows an "Ingesting" badge in the source list and an Explorer banner with
+poll-until-ready + auto-refetch when the source becomes visible)
+
+Previous (session 14 — full repository audit; fixed all Critical/High
+findings on `fix/audit-critical-high`: Dockerfile CMD now uses `--factory
+tracesignal.api.main:create_app` (the shipped image previously pointed at a nonexistent
+`app` attribute and could not start); CSV parser streams instead of `list(fh)`-ing the whole
+file (incremental byte-offset/line tracking in `_RecordTrackingIterator`); `tsig-web` builds
+the frontend only when `dist/` is missing (`TS_FRONTEND_REBUILD=1` forces) and enables the
+uvicorn reloader only in development; embedding model load enforces `HF_HUB_OFFLINE` unless
+`TS_ALLOW_ONLINE` and fails with an actionable message; all remaining blocking
+`EventQueryService` calls in async handlers threadpool-wrapped; uploads single-pass
+copy+hash off the event loop with a `TS_MAX_UPLOAD_BYTES` cap (413 mid-stream). Remaining
+Medium/Low findings consolidated into a new phase-2 `docs/ROADMAP.md`; the fully-shipped
+phase-1 roadmap archived to `docs/archive/ROADMAP_PHASE1.md`; CLAUDE.md frontend-build note
+un-drifted)
+
+Previous (session 13 — deployment: `docker-compose.yml` gained an `app` service
 that builds/runs TraceSignal itself via a new `Dockerfile`, after the backing services;
 `tsig-web` now always rebuilds the frontend on startup instead of skipping when `dist/` exists;
 README documents the airgapped install path (build on an online machine, carry `.venv/` +

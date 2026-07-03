@@ -58,6 +58,12 @@ CONVERTERS = {
         "nginx access/error/redirect logs (plain or .gz) to Timesketch timeline.",
         ["access.log*", "error.log*"],
     ),
+    "suricata2timesketch": (
+        "suricata",
+        "suricata2timesketch.py",
+        "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
+        ["eve.json", "fast.log", "OPNsense suricata syslog export"],
+    ),
 }
 
 _FUTURE_RE = re.compile(r"^from __future__ import.*\n", re.MULTILINE)
@@ -124,6 +130,10 @@ def vendor(upstream: Path) -> None:
     version = _upstream_version(upstream)
     license_text = (upstream / "LICENSE").read_text(encoding="utf-8").splitlines()[0].strip()
 
+    # `terminal.py` (stdlib-only UI helpers) is imported by common.py, every
+    # converter module, and every entry script — inline it first so the
+    # stripped package imports resolve against the inlined definitions.
+    terminal_body = _strip((upstream / "timesketch_converters" / "terminal.py").read_text("utf-8"))
     common_body = _strip((upstream / "timesketch_converters" / "common.py").read_text("utf-8"))
 
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -136,7 +146,9 @@ def vendor(upstream: Path) -> None:
     }
 
     for name, (module, entry, description, inputs) in CONVERTERS.items():
-        module_body = _strip((upstream / "timesketch_converters" / f"{module}.py").read_text("utf-8"))
+        module_body = _strip(
+            (upstream / "timesketch_converters" / f"{module}.py").read_text("utf-8")
+        )
         if module == "browser":
             module_body = _rewrite_browser(module_body)
         entry_body = _strip((upstream / entry).read_text("utf-8"))
@@ -156,7 +168,7 @@ def vendor(upstream: Path) -> None:
             "\n"
             f'__version__ = "{version}+vendored.{commit[:12]}"\n'
         )
-        content = "\n".join([header, common_body, module_body, entry_body])
+        content = "\n".join([header, terminal_body, common_body, module_body, entry_body])
         out = ASSETS_DIR / f"{name}.py"
         out.write_text(content, encoding="utf-8")
 

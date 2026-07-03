@@ -94,6 +94,27 @@ class Source(Base):
     parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event_count: Mapped[int] = mapped_column(default=0)
     vector_count: Mapped[int] = mapped_column(default=0)
+    # Ingest lifecycle: "ingesting" while the background upload job is still
+    # writing events to ClickHouse, "ready" once complete. Timeline scope
+    # resolution (events/_resolve_timeline_scope) excludes non-ready sources
+    # so analysts never query — and detectors never baseline on — a
+    # half-ingested file. There is no persisted "failed" state: a failed
+    # ingest deletes its partial events and this row so the upload can be
+    # retried (the duplicate check is keyed on file_hash), and startup
+    # reconciliation does the same for rows orphaned by a mid-ingest restart.
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ready", server_default="ready"
+    )
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether this source has finished ingestion and is queryable.
+
+        The single predicate every caller must use instead of comparing
+        ``status`` inline — see ``events._resolve_timeline_scope``.
+        """
+        return self.status == "ready"
+
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Per-source field selection chosen by the analyst in the embedding wizard.
     # Shape: {"version": 1, "artifacts": {"<artifact>": ["message", "attr:key", ...]}}
@@ -129,6 +150,7 @@ class Source(Base):
             "parser_version": self.parser_version,
             "event_count": self.event_count,
             "vector_count": self.vector_count,
+            "status": self.status,
             "embedding_model": self.embedding_model,
             "embedding_config": self.embedding_config,
             "created_by": self.created_by,
@@ -665,6 +687,17 @@ class PostgresStore:
             )
             if "field_mappings" not in timeline_columns:
                 await conn.execute(text("ALTER TABLE timelines ADD COLUMN field_mappings JSON"))
+            source_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("sources")}
+            )
+            if "status" not in source_columns:
+                # Existing rows predate the ingest-status lifecycle and are by
+                # definition fully ingested, so they backfill to 'ready'.
+                await conn.execute(
+                    text(
+                        "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
+                    )
+                )
             # No migration for the earlier `annotation_type="outlier"` rows
             # (renamed to "anomaly" when the statistical anomaly engine
             # landed): no releases exist yet and pre-this-branch databases
@@ -781,8 +814,14 @@ class PostgresStore:
         parser_version: str | None = None,
         event_count: int = 0,
         created_by: str | None = None,
+        status: str = "ready",
     ) -> Source:
-        """Create a new source record within a case."""
+        """Create a new source record within a case.
+
+        ``status`` defaults to "ready" (synchronous callers like the CLI
+        create the row after ingestion completed); the upload endpoint passes
+        "ingesting" and flips it to "ready" when its background job finishes.
+        """
         source = Source(
             id=source_id,
             case_id=case_id,
@@ -794,6 +833,7 @@ class PostgresStore:
             parser_version=parser_version,
             event_count=event_count,
             created_by=created_by,
+            status=status,
         )
         async with self.session_factory() as session:
             session.add(source)
@@ -834,6 +874,44 @@ class PostgresStore:
                     .values(**values)
                 )
             await session.commit()
+
+    async def set_source_status(self, case_id: str, source_id: str, status: str) -> None:
+        """Set a source's ingest-lifecycle status ("ingesting" or "ready")."""
+        async with self.session_factory() as session:
+            await session.execute(
+                update(Source)
+                .where(Source.id == source_id, Source.case_id == case_id)
+                .values(status=status, updated_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def source_hash_in_use(self, file_hash: str, *, exclude_source_id: str) -> bool:
+        """Whether any *other* source row (in any case) still has this file hash.
+
+        Retention storage is content-addressed by hash alone (not per-case),
+        so a file uploaded into multiple cases shares one retained copy —
+        callers must check this before deleting a retained file for a source
+        being removed, or they'd delete a copy another case still needs.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source.id).where(
+                    Source.file_hash == file_hash, Source.id != exclude_source_id
+                )
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def list_ingesting_sources(self) -> list[Source]:
+        """Return every source still marked "ingesting", across all cases.
+
+        Used by startup reconciliation: ingestion jobs live in the in-memory
+        JobStore, so a source found in this state on a fresh boot was
+        orphaned by a mid-ingest restart — its partial events and row are
+        removed the same way a failed ingest cleans up after itself.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(Source).where(Source.status == "ingesting"))
+            return list(result.scalars().all())
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:
         """Delete a source row.
@@ -1040,6 +1118,21 @@ class PostgresStore:
                     Timeline.id == timeline_id,
                 )
                 .order_by(Source.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def list_timelines_for_source(self, case_id: str, source_id: str) -> list[Timeline]:
+        """Return timelines in a case that include the given source."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .join(TimelineSource)
+                .where(
+                    Timeline.case_id == case_id,
+                    TimelineSource.source_id == source_id,
+                )
             )
             return list(result.scalars().all())
 

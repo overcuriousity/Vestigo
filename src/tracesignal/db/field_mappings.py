@@ -71,9 +71,15 @@ def resolve_mapping(field_token: str, field_mappings: FieldMappings | None) -> l
 
 def validate_field_mappings(
     mappings: FieldMappings,
-    available_attribute_keys: set[str],
+    available_attribute_keys: set[str] | None,
 ) -> list[str]:
     """Validate a mapping dict against the timeline's actual attribute keys.
+
+    ``available_attribute_keys=None`` means the inventory is unknown (e.g.
+    every member source is still ingesting) — the structural rules below are
+    still enforced, but the two inventory-dependent checks (raw key must
+    exist; canonical name must not shadow a raw key) are skipped rather than
+    failing against an incomplete key set.
 
     Returns a list of human-readable problems (empty = valid). Enforced rules:
 
@@ -109,7 +115,7 @@ def validate_field_mappings(
             problems.append(f"'{name}': canonical names must not use the 'attr:' prefix.")
         if name.lower() in core_lower:
             problems.append(f"'{name}' collides with a core event column.")
-        if name in available_attribute_keys:
+        if available_attribute_keys is not None and name in available_attribute_keys:
             problems.append(
                 f"'{name}' collides with an existing raw attribute key in the "
                 "timeline's sources — it would shadow that field."
@@ -128,7 +134,7 @@ def validate_field_mappings(
                     "each raw field may be mapped only once."
                 )
             seen_raw[raw] = name
-            if raw not in available_attribute_keys:
+            if available_attribute_keys is not None and raw not in available_attribute_keys:
                 problems.append(
                     f"'{name}': raw field '{raw}' does not exist in any of the "
                     "timeline's sources. Check the field coverage list for the exact key."

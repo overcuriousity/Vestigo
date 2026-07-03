@@ -25,6 +25,8 @@ COPY --from=frontend-build /frontend/dist ./frontend/dist
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8080
 # Run uvicorn against the app factory directly (not the `tsig-web` entry point) —
-# that entry point always rebuilds the frontend from source on startup, which this
+# that entry point rebuilds the frontend from source on startup, which this
 # image doesn't carry (only the pre-built `frontend/dist`) or have node/npm for.
-CMD ["uvicorn", "tracesignal.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# `api.main` exposes only the `create_app()` factory (no module-level `app`),
+# so uvicorn needs `--factory`.
+CMD ["uvicorn", "--factory", "tracesignal.api.main:create_app", "--host", "0.0.0.0", "--port", "8080"]
