@@ -71,6 +71,34 @@
   --color-anomaly: #8a4bbf;
   --color-anomaly-dim: rgba(138, 75, 191, 0.1);
 
+  /* Visualization: fixed-order categorical series palette (8 slots, CVD-
+     validated — see `node scripts/validate_palette.js` in the dataviz skill).
+     Assign by index in this order; never reassign/cycle when a filter changes
+     the series count. Slots below 3:1 contrast (aqua/yellow/magenta) rely on
+     the chart's direct labels/legend/tooltip as the relief channel. */
+  --viz-series-1: #2a78d6; /* blue */
+  --viz-series-2: #1baf7a; /* aqua */
+  --viz-series-3: #eda100; /* yellow */
+  --viz-series-4: #008300; /* green */
+  --viz-series-5: #4a3aa7; /* violet */
+  --viz-series-6: #e34948; /* red */
+  --viz-series-7: #e87ba4; /* magenta */
+  --viz-series-8: #eb6834; /* orange */
+
+  /* Sequential ramp (one hue, light -> dark) for numeric magnitude — value
+     histograms, heatmap cell fill. */
+  --viz-sequential-100: #cde2fb;
+  --viz-sequential-300: #6da7ec;
+  --viz-sequential-500: #256abf;
+  --viz-sequential-700: #0d366b;
+
+  /* Chart chrome */
+  --viz-grid: var(--color-border-subtle);
+  --viz-axis: var(--color-border-strong);
+  --viz-ink-primary: var(--color-fg-primary);
+  --viz-ink-secondary: var(--color-fg-secondary);
+  --viz-ink-muted: var(--color-fg-muted);
+
   /* Shadows */
   --shadow-sm: 0 1px 2px rgba(45, 45, 45, 0.08);
   --shadow-md: 0 4px 12px rgba(45, 45, 45, 0.1);
@@ -118,6 +146,28 @@
   /* Anomaly highlight color */
   --color-anomaly: #c97fff;
   --color-anomaly-dim: rgba(201, 127, 255, 0.15);
+
+  /* Visualization: same 8 hue families, stepped for the dark surface —
+     see the light block above for the assignment rule. */
+  --viz-series-1: #3987e5;
+  --viz-series-2: #199e70;
+  --viz-series-3: #c98500;
+  --viz-series-4: #008300;
+  --viz-series-5: #9085e9;
+  --viz-series-6: #e66767;
+  --viz-series-7: #d55181;
+  --viz-series-8: #d95926;
+
+  --viz-sequential-100: #184f95;
+  --viz-sequential-300: #256abf;
+  --viz-sequential-500: #5598e7;
+  --viz-sequential-700: #cde2fb;
+
+  --viz-grid: var(--color-border-subtle);
+  --viz-axis: var(--color-border-strong);
+  --viz-ink-primary: var(--color-fg-primary);
+  --viz-ink-secondary: var(--color-fg-secondary);
+  --viz-ink-muted: var(--color-fg-muted);
 
   /* Shadows */
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);

@@ -254,6 +254,49 @@ class View(Base):
         }
 
 
+class SavedChart(Base):
+    """A saved Visualization-page chart, scoped to a timeline.
+
+    ``config`` holds the full versioned frontend ``ChartConfig`` (chart type,
+    field, scale, metric, comparison layer, per-chart options) as opaque
+    JSON — the backend never interprets it, it only round-trips it, exactly
+    like ``View.view_filter``. The ``v`` version key inside lets a future
+    frontend detect configs saved by an older shape instead of misreading
+    them.
+    """
+
+    __tablename__ = "saved_charts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the SavedChart API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "name": self.name,
+            "config": self.config or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class DetectorRun(Base):
     """A persisted statistical-anomaly-detector scan result.
 
@@ -1141,6 +1184,89 @@ class PostgresStore:
             if view is None:
                 return False
             await session.delete(view)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Saved charts
+    # ------------------------------------------------------------------
+
+    async def list_saved_charts(self, case_id: str, timeline_id: str) -> list[SavedChart]:
+        """Return a timeline's saved charts ordered by creation time (newest first)."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SavedChart)
+                .where(SavedChart.case_id == case_id, SavedChart.timeline_id == timeline_id)
+                .order_by(SavedChart.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def create_saved_chart(
+        self,
+        case_id: str,
+        timeline_id: str,
+        chart_id: str,
+        name: str,
+        config: dict,
+    ) -> SavedChart:
+        """Create a new saved chart within a timeline."""
+        chart = SavedChart(
+            id=chart_id,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            name=name,
+            config=config,
+        )
+        async with self.session_factory() as session:
+            session.add(chart)
+            await session.commit()
+            await session.refresh(chart)
+            return chart
+
+    async def rename_saved_chart(
+        self, case_id: str, timeline_id: str, chart_id: str, name: str
+    ) -> SavedChart | None:
+        """Rename a saved chart; returns the updated row or None if missing.
+
+        Only the name is mutable — the stored ``config`` is immutable like a
+        View's filter payload; changing the chart means saving a new one.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SavedChart).where(
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
+                )
+            )
+            chart = result.scalar_one_or_none()
+            if chart is None:
+                return None
+            chart.name = name
+            await session.commit()
+            await session.refresh(chart)
+            return chart
+
+    async def delete_saved_chart(self, case_id: str, timeline_id: str, chart_id: str) -> bool:
+        """Delete a saved chart row. Returns True if it existed."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SavedChart).where(
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
+                )
+            )
+            chart = result.scalar_one_or_none()
+            if chart is None:
+                return False
+            await session.delete(chart)
             await session.commit()
             return True
 

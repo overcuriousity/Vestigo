@@ -1,4 +1,5 @@
-"""Tests for source upload idempotency and forensic hashing."""
+"""Tests for source upload idempotency, forensic hashing, and the background
+ingestion job (upload returns a job id; events land when the job runs)."""
 
 from __future__ import annotations
 
@@ -7,12 +8,13 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 from tests.conftest import _fake_user
 from tracevector.api import deps
 from tracevector.api.routers import cases
 from tracevector.api.routers.cases import upload_source
+from tracevector.core.jobs import get_job_store
 from tracevector.db.postgres import PostgresStore
 from tracevector.ingestion.files import hash_file
 from tracevector.ingestion.pipeline import IngestionResult
@@ -33,17 +35,23 @@ class FakeIngestionPipeline:
         self,
         case_id: str,
         source_id: str,
+        clickhouse=None,
         batch_size: int | None = None,
         file_hash: str | None = None,
         source_name: str | None = None,
+        progress_callback=None,
     ) -> None:
         self.case_id = case_id
         self.source_id = source_id
+        self.clickhouse = clickhouse
         self.file_hash = file_hash
         self.source_name = source_name
+        self.progress_callback = progress_callback
 
     def run(self, path: Path, format_name: str | None = None) -> IngestionResult:
         data = path.read_bytes()
+        if self.progress_callback is not None:
+            self.progress_callback(total=len(data), processed=len(data))
         lines = [line for line in data.split(b"\n") if line.strip()]
         return IngestionResult(
             case_id=self.case_id,
@@ -52,6 +60,29 @@ class FakeIngestionPipeline:
             events_parsed=len(lines),
             events_inserted=len(lines),
         )
+
+
+class FailingIngestionPipeline(FakeIngestionPipeline):
+    """Ingestion pipeline that always fails, to exercise job cleanup."""
+
+    def run(self, path: Path, format_name: str | None = None) -> IngestionResult:
+        raise RuntimeError("parse exploded")
+
+
+async def _upload(case_obj, filename: str, content: bytes, parser: str | None = None):
+    """Call upload_source with a fresh BackgroundTasks, run the scheduled
+    ingestion job (as the server would after the response), and return the
+    response."""
+    background_tasks = BackgroundTasks()
+    response = await upload_source(
+        background_tasks=background_tasks,
+        file=_UploadFile(filename, content),
+        parser=parser,
+        case=case_obj,
+        user=_fake_user(),
+    )
+    await background_tasks()
+    return response
 
 
 @pytest_asyncio.fixture()
@@ -80,18 +111,22 @@ async def test_duplicate_upload_is_idempotent(
     case: str,
 ) -> None:
     content = b'{"message":"login","timestamp":"2024-01-01T00:00:00+00:00"}\n'
-    upload_file = _UploadFile("events.jsonl", content)
     expected_hash = hash_file(BytesIO(content))
     case_obj = await store.get_case(case)
 
-    first = await upload_source(
-        file=upload_file,
-        parser=None,
-        case=case_obj,
-        user=_fake_user(),
-    )
-    assert first.events_inserted == 1
+    first = await _upload(case_obj, "events.jsonl", content)
     assert first.duplicate is False
+    assert first.job_id is not None
+
+    job = get_job_store().get(first.job_id)
+    assert job is not None
+    assert job.status == "completed"
+    assert job.result == {
+        "source_id": first.source_id,
+        "events_parsed": 1,
+        "events_inserted": 1,
+        "parser": job.result["parser"],
+    }
 
     source = await store.get_source_by_hash(case, expected_hash)
     assert source is not None
@@ -99,14 +134,10 @@ async def test_duplicate_upload_is_idempotent(
     assert source.event_count == 1
 
     # Second upload of the same bytes must be a no-op.
-    second = await upload_source(
-        file=_UploadFile("events.jsonl", content),
-        parser=None,
-        case=case_obj,
-        user=_fake_user(),
-    )
+    second = await _upload(case_obj, "events.jsonl", content)
     assert second.events_inserted == 0
     assert second.duplicate is True
+    assert second.job_id is None
     assert second.events_parsed == 1
 
     assert len(await store.list_sources(case)) == 1
@@ -121,22 +152,12 @@ async def test_uploading_different_file_adds_events(
     second_content = b'{"message":"logout","timestamp":"2024-01-01T00:01:00+00:00"}\n'
     case_obj = await store.get_case(case)
 
-    first = await upload_source(
-        file=_UploadFile("first.jsonl", first_content),
-        parser=None,
-        case=case_obj,
-        user=_fake_user(),
-    )
-    assert first.events_inserted == 1
+    first = await _upload(case_obj, "first.jsonl", first_content)
+    assert get_job_store().get(first.job_id).result["events_inserted"] == 1
 
-    second = await upload_source(
-        file=_UploadFile("second.jsonl", second_content),
-        parser=None,
-        case=case_obj,
-        user=_fake_user(),
-    )
-    assert second.events_inserted == 1
+    second = await _upload(case_obj, "second.jsonl", second_content)
     assert second.duplicate is False
+    assert get_job_store().get(second.job_id).result["events_inserted"] == 1
 
     sources = await store.list_sources(case)
     assert len(sources) == 2
@@ -159,13 +180,40 @@ async def test_source_added_to_default_timeline(
     case: str,
 ) -> None:
     case_obj = await store.get_case(case)
-    await upload_source(
-        file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
-        parser=None,
-        case=case_obj,
-        user=_fake_user(),
-    )
+    await _upload(case_obj, "events.jsonl", b'{"message":"x"}\n')
     default_timeline = await store.get_default_timeline(case)
     assert default_timeline is not None
     sources = await store.list_timeline_sources(case, default_timeline.id)
     assert len(sources) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_ingestion_marks_job_failed_and_removes_source(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashing ingest must not leave the up-front source row behind, and a
+    re-upload of the same bytes must work (not be treated as a duplicate)."""
+    monkeypatch.setattr(cases, "IngestionPipeline", FailingIngestionPipeline)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    case_obj = await store.get_case(case)
+    content = b'{"message":"boom"}\n'
+
+    response = await _upload(case_obj, "bad.jsonl", content)
+    assert response.duplicate is False
+
+    job = get_job_store().get(response.job_id)
+    assert job.status == "failed"
+    assert "parse exploded" in job.error
+    assert await store.list_sources(case) == []
+
+    # A retry of the same file is a fresh upload, not a duplicate.
+    monkeypatch.setattr(cases, "IngestionPipeline", FakeIngestionPipeline)
+    retry = await _upload(case_obj, "bad.jsonl", content)
+    assert retry.duplicate is False
+    assert get_job_store().get(retry.job_id).status == "completed"

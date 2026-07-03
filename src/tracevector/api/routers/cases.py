@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 
 from tracevector.api.deps import (
     get_current_user,
@@ -64,13 +65,21 @@ class AnnotationCreate(BaseModel):
 
 
 class SourceUploadResponse(BaseModel):
-    """Response shape for a source upload."""
+    """Response shape for a source upload.
+
+    For a new (non-duplicate) upload, ingestion runs as a background job:
+    ``job_id`` identifies it in ``GET /api/jobs/{job_id}`` and the event
+    counts are 0 until the job completes (the job result carries the final
+    counts). Duplicate uploads return the existing source's counts and no
+    job.
+    """
 
     source_id: str
     events_parsed: int
     events_inserted: int
     parser: str
     duplicate: bool
+    job_id: str | None = None
 
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
@@ -207,8 +216,89 @@ async def get_source(source_id: str, case: Case = Depends(require_case_read)) ->
     return {"source": source.to_dict()}
 
 
+async def _run_ingestion_job(
+    job_id: str,
+    case_id: str,
+    source_id: str,
+    tmp_path: Path,
+    fmt: str,
+    file_hash: str,
+    source_name: str,
+    filename: str | None,
+    size_bytes: int,
+    user: User,
+    job_store: JobStore,
+) -> None:
+    """Ingest an uploaded file in the background, updating the job store.
+
+    The source row already exists (with ``event_count=0``, created before the
+    job was scheduled so duplicate uploads are rejected immediately); this job
+    streams the events into ClickHouse, bumps the stored count, and records
+    the audit row. On failure it removes the partial events and the source
+    row again so a failed upload leaves no half-populated source behind.
+    """
+    store = get_store()
+    clickhouse = ClickHouseStore()
+
+    def progress_callback(total: int, processed: int) -> None:
+        job_store.update(
+            job_id,
+            status="running",
+            progress={"total": total, "processed": processed},
+        )
+
+    try:
+        pipeline = IngestionPipeline(
+            case_id=case_id,
+            source_id=source_id,
+            clickhouse=clickhouse,
+            batch_size=get_settings().embedding_batch_size,
+            file_hash=file_hash,
+            source_name=source_name,
+            progress_callback=progress_callback,
+        )
+        # The pipeline is synchronous (parsing + ClickHouse inserts) — run it
+        # in a worker thread so a large ingest doesn't block the event loop.
+        result = await asyncio.to_thread(pipeline.run, tmp_path, fmt)
+
+        await store.update_source_counts(
+            case_id=case_id,
+            source_id=source_id,
+            event_count=result.events_inserted,
+        )
+        await store.record_audit(
+            action="source.upload",
+            actor=user,
+            case_id=case_id,
+            target_type="source",
+            target_id=source_id,
+            detail={"filename": filename, "events_inserted": result.events_inserted},
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            progress={"total": size_bytes, "processed": size_bytes},
+            result={
+                "source_id": source_id,
+                "events_parsed": result.events_parsed,
+                "events_inserted": result.events_inserted,
+                "parser": fmt,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await asyncio.to_thread(clickhouse.delete_source_events, case_id, source_id)
+            await store.delete_source(case_id, source_id)
+        except Exception:  # noqa: BLE001, S110 — best-effort cleanup
+            pass
+        job_store.update(job_id, status="failed", error=str(exc))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 @router.post("/{case_id}/sources")
 async def upload_source(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),  # noqa: B008
     parser: str | None = Form(default=None),
     name: str | None = Form(default=None),
@@ -219,6 +309,10 @@ async def upload_source(
 
     ``name`` is supplied as a form field, but the function may also be called
     directly from tests with a plain ``str`` or ``None`` value.
+
+    Ingestion runs as a background job (see ``SourceUploadResponse.job_id``)
+    so the UI can show live progress; the source row itself is created
+    immediately with ``event_count=0``.
 
     Embeddings are *not* generated here; use the timeline embed endpoint
     (``POST /{case_id}/timelines/{timeline_id}/embed``) for that.
@@ -257,9 +351,23 @@ async def upload_source(
         tmp_path = Path(tmp.name)
         size_bytes = tmp_path.stat().st_size
 
+    source_created = False
     try:
         fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
-        fmt = fmt or detect_format(tmp_path)
+        if fmt is None:
+            try:
+                fmt = detect_format(tmp_path)
+            except ValueError as exc:
+                # Unknown extension is a client problem, not a server crash.
+                # detect_format's own message names the server-side temp file,
+                # which is useless (and mildly leaky) for the client.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot detect parser format for {file.filename!r}; "
+                        "pass an explicit parser (e.g. jsonl, timesketch_csv)."
+                    ),
+                ) from exc
         source_id = generate_id(f"{case_id}:{file_hash}")
         source_name = name or file.filename or tmp_path.name
 
@@ -268,50 +376,75 @@ async def upload_source(
         retention_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(tmp_path, retention_path)
 
-        pipeline = IngestionPipeline(
-            case_id=case_id,
-            source_id=source_id,
-            batch_size=get_settings().embedding_batch_size,
-            file_hash=file_hash,
-            source_name=file.filename or tmp_path.name,
-        )
-        result = pipeline.run(tmp_path, format_name=fmt)
-
-        await store.create_source(
-            case_id=case_id,
-            source_id=source_id,
-            name=source_name,
-            file_hash=file_hash,
-            size_bytes=size_bytes,
-            filename=file.filename,
-            parser=fmt,
-            event_count=result.events_inserted,
-            created_by=user.id,
-        )
+        # Create the source row up front (event_count=0) so a re-upload of
+        # the same bytes is rejected as a duplicate while ingestion runs.
+        try:
+            await store.create_source(
+                case_id=case_id,
+                source_id=source_id,
+                name=source_name,
+                file_hash=file_hash,
+                size_bytes=size_bytes,
+                filename=file.filename,
+                parser=fmt,
+                event_count=0,
+                created_by=user.id,
+            )
+            source_created = True
+        except IntegrityError:
+            # Lost a race against a concurrent upload of the same bytes:
+            # treat it the same as the pre-check duplicate response.
+            existing_source = await store.get_source_by_hash(case_id, file_hash)
+            if existing_source is None:
+                raise
+            tmp_path.unlink(missing_ok=True)
+            return SourceUploadResponse(
+                source_id=existing_source.id,
+                events_parsed=existing_source.event_count,
+                events_inserted=0,
+                parser=parser or existing_source.parser or "auto",
+                duplicate=True,
+            )
 
         # Auto-add the new source to the case's default timeline.
         default_timeline = await store.get_default_timeline(case_id)
         if default_timeline is not None:
             await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
 
-        await store.record_audit(
-            action="source.upload",
-            actor=user,
-            case_id=case_id,
-            target_type="source",
-            target_id=source_id,
-            detail={"filename": file.filename, "events_inserted": result.events_inserted},
+        job_store = get_job_store()
+        job = job_store.create(
+            kind="ingest",
+            progress={"total": size_bytes, "processed": 0},
+            created_by=user.id,
         )
-
-        return SourceUploadResponse(
-            source_id=source_id,
-            events_parsed=result.events_parsed,
-            events_inserted=result.events_inserted,
-            parser=fmt,
-            duplicate=False,
+        background_tasks.add_task(
+            _run_ingestion_job,
+            job.id,
+            case_id,
+            source_id,
+            tmp_path,
+            fmt,
+            file_hash,
+            file.filename or tmp_path.name,
+            file.filename,
+            size_bytes,
+            user,
+            job_store,
         )
-    finally:
+    except Exception:
+        if source_created:
+            await store.delete_source(case_id, source_id)
         tmp_path.unlink(missing_ok=True)
+        raise
+
+    return SourceUploadResponse(
+        source_id=source_id,
+        events_parsed=0,
+        events_inserted=0,
+        parser=fmt,
+        duplicate=False,
+        job_id=job.id,
+    )
 
 
 @router.get("/{case_id}/sources/{source_id}/download")
@@ -685,15 +818,26 @@ def _run_embedding_job(
         )
         result = pipeline.run()
 
-        # Use a fresh PostgresStore inside the worker thread.
+        # Use a fresh PostgresStore inside the worker thread, and run all of
+        # its awaits in a single asyncio.run() loop: pooled asyncpg
+        # connections are bound to the loop they were created on, so a second
+        # asyncio.run() against the same store would check out a connection
+        # whose futures belong to a closed loop ("attached to a different
+        # loop"). Dispose the engine before the loop closes so no pooled
+        # connection outlives it.
         store = PostgresStore()
-        asyncio.run(
-            store.update_source_counts(
-                case_id=case_id,
-                source_id=source_id,
-                vector_count=result.vectors_inserted,
-            )
-        )
+
+        async def _finalize() -> None:
+            try:
+                await store.update_source_counts(
+                    case_id=case_id,
+                    source_id=source_id,
+                    vector_count=result.vectors_inserted,
+                )
+            finally:
+                await store.engine.dispose()
+
+        asyncio.run(_finalize())
         job_store.update(
             job_id,
             status="completed",
@@ -731,31 +875,40 @@ def _run_timeline_embedding_job(
         )
         result = pipeline.run()
 
+        # One asyncio.run() for every await against this store — a pooled
+        # asyncpg connection is bound to the loop it was created on, so
+        # calling asyncio.run() per statement hands loop-A connections to
+        # loop B ("attached to a different loop"). Dispose the engine before
+        # the loop closes so no pooled connection outlives it.
         store = PostgresStore()
         embedding_model = get_settings().embedding_model
-        asyncio.run(
-            store.set_timeline_embedding(
-                case_id=case_id,
-                timeline_id=timeline_id,
-                model=embedding_model,
-                config=field_config or {},
-                config_hash=result.config_hash,
-                embedded_source_ids=source_ids,
-            )
-        )
-        # Update vector counts on each source.
-        # EmbeddingPipeline processes all sources in one collection so we set
-        # an approximate per-source count (total / n sources) as a best effort;
-        # the authoritative vector count is queryable from Qdrant directly.
-        per_source = result.vectors_inserted // max(len(source_ids), 1)
-        for sid in source_ids:
-            asyncio.run(
-                store.update_source_counts(
+
+        async def _finalize() -> None:
+            try:
+                await store.set_timeline_embedding(
                     case_id=case_id,
-                    source_id=sid,
-                    vector_count=per_source,
+                    timeline_id=timeline_id,
+                    model=embedding_model,
+                    config=field_config or {},
+                    config_hash=result.config_hash,
+                    embedded_source_ids=source_ids,
                 )
-            )
+                # Update vector counts on each source.
+                # EmbeddingPipeline processes all sources in one collection so
+                # we set an approximate per-source count (total / n sources)
+                # as a best effort; the authoritative vector count is
+                # queryable from Qdrant directly.
+                per_source = result.vectors_inserted // max(len(source_ids), 1)
+                for sid in source_ids:
+                    await store.update_source_counts(
+                        case_id=case_id,
+                        source_id=sid,
+                        vector_count=per_source,
+                    )
+            finally:
+                await store.engine.dispose()
+
+        asyncio.run(_finalize())
         job_store.update(
             job_id,
             status="completed",

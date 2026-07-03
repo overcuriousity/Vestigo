@@ -21,15 +21,23 @@ function JobRow({ job }: { job: TrackedJob }) {
     queryFn: async () => {
       const j = await jobsApi.get(job.id);
       updateJob(j);
-      if (j.status === "completed" && job.timelineKey) {
-        const [caseId, timelineId] = job.timelineKey.split("/");
-        qc.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      if (j.status === "completed") {
+        for (const key of job.invalidate ?? []) {
+          qc.invalidateQueries({ queryKey: key });
+        }
       }
       return j;
     },
     enabled: !isTerminal && !job.dismissed,
-    refetchInterval: 1200,
-    refetchIntervalInBackground: true,
+    // Poll briskly at first (progress moving fast), then back off — a job
+    // that's been running for minutes doesn't need sub-second-scale polling.
+    refetchInterval: (query) => {
+      const polls = query.state.dataUpdateCount;
+      if (polls < 10) return 1200;
+      if (polls < 30) return 3000;
+      return 8000;
+    },
+    refetchIntervalInBackground: false,
   });
 
   const pct =

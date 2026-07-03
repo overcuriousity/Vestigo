@@ -8,13 +8,15 @@ import type { Job } from "@/api/types";
 export interface TrackedJob extends Job {
   label: string;
   dismissed: boolean;
-  /** "caseId/timelineId" for embed jobs — used to invalidate the timeline query on completion. */
-  timelineKey?: string;
+  /** TanStack Query keys to invalidate when the job completes — e.g.
+   * `[["sources", caseId]]` for an ingest job so the source list refreshes
+   * with the final event count. */
+  invalidate?: unknown[][];
 }
 
 interface JobsState {
   jobs: Record<string, TrackedJob>;
-  addJob: (id: string, label: string, timelineKey?: string) => void;
+  addJob: (id: string, label: string, invalidate?: unknown[][]) => void;
   updateJob: (job: Job) => void;
   dismiss: (id: string) => void;
 }
@@ -22,7 +24,7 @@ interface JobsState {
 export const useJobsStore = create<JobsState>((set) => ({
   jobs: {},
 
-  addJob: (id, label, timelineKey) =>
+  addJob: (id, label, invalidate) =>
     set((s) => ({
       jobs: {
         ...s.jobs,
@@ -35,7 +37,7 @@ export const useJobsStore = create<JobsState>((set) => ({
           error: null,
           label,
           dismissed: false,
-          timelineKey,
+          invalidate,
         },
       },
     })),

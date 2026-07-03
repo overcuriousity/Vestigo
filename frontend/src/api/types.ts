@@ -382,6 +382,8 @@ export interface UploadResult {
   events_inserted: number;
   parser: string;
   duplicate?: boolean;
+  /** Background ingestion job to poll for progress; null for duplicates. */
+  job_id?: string | null;
 }
 
 export interface HealthResponse {
@@ -453,6 +455,154 @@ export interface HistogramResponse {
   min: string | null;
   max: string | null;
   buckets: HistogramBucket[];
+}
+
+/** One chartable field from `viz/fields` — no anomaly heuristics applied. */
+export interface VizFieldInfo {
+  token: string;
+  /** Number of distinct non-empty values. */
+  distinct: number;
+  /** Fraction of events with a non-empty value (0-1). */
+  coverage: number;
+}
+
+/** All chartable fields for the Visualization page's field picker, sorted by coverage descending. */
+export interface VizFieldsResponse {
+  fields: VizFieldInfo[];
+}
+
+/** One value's count from a `viz/field-terms` terms aggregation. */
+export interface FieldTermCount {
+  value: string;
+  count: number;
+}
+
+/** Top-N value/count terms aggregation for a field, honoring the active filters. */
+export interface FieldTermsResponse {
+  field: string;
+  /** Total non-empty matching rows (across all values, not just the top-N returned). */
+  total: number;
+  /** Number of distinct non-empty values. */
+  distinct: number;
+  values: FieldTermCount[];
+  /** Count of non-empty values outside the returned top-N — render as an "Other" slice. */
+  other_count: number;
+}
+
+/** One fixed-width bin of a numeric field's value distribution. */
+export interface FieldNumericBin {
+  x0: number;
+  x1: number;
+  count: number;
+}
+
+/**
+ * Summary statistics + fixed-width histogram for a numeric field.
+ * `count === 0` means the field has no numeric values in the current filter
+ * set — callers should fall back to treating it as categorical.
+ */
+export interface FieldNumericResponse {
+  field: string;
+  count: number;
+  min: number | null;
+  max: number | null;
+  mean: number | null;
+  stddev: number | null;
+  /** Keyed by quantile, e.g. "0.5" (median), "0.25", "0.95", ... */
+  quantiles: Record<string, number>;
+  bins: FieldNumericBin[];
+}
+
+/** One time-bucketed series (a single field value's counts over time). */
+export interface FieldTimeseriesSeries {
+  value: string;
+  buckets: HistogramBucket[];
+}
+
+/**
+ * Per-value event counts bucketed over time, restricted to the top
+ * `series_limit` values by overall count (see `vizApi.fieldTimeseries`).
+ */
+export interface FieldTimeseriesResponse {
+  field: string;
+  interval_seconds: number;
+  min: string | null;
+  max: string | null;
+  series: FieldTimeseriesSeries[];
+}
+
+/** One shared-grid time bucket carrying both compare layers' raw counts. */
+export interface CompareTimeBucket {
+  start: string;
+  primary: number;
+  comparison: number;
+}
+
+/**
+ * Two-layer event-count histogram from `viz/compare` (kind=time). Both
+ * layers are evaluated against one shared bucket grid server-side, so the
+ * series are comparable by construction.
+ */
+export interface CompareTimeResponse {
+  kind: "time";
+  interval_seconds: number;
+  min: string | null;
+  max: string | null;
+  buckets: CompareTimeBucket[];
+  primary_total: number;
+  comparison_total: number;
+}
+
+/** One shared category carrying both compare layers' counts. */
+export interface CompareTermValue {
+  value: string;
+  primary: number;
+  comparison: number;
+}
+
+/** Two-layer terms aggregation from `viz/compare` (kind=terms) — the
+ * primary's top-N fixes the category list for both layers. */
+export interface CompareTermsResponse {
+  kind: "terms";
+  field: string;
+  values: CompareTermValue[];
+  distinct: number;
+  primary_total: number;
+  comparison_total: number;
+  primary_other: number;
+  comparison_other: number;
+}
+
+/** One shared-edge numeric bin carrying both compare layers' counts. */
+export interface CompareNumericBin {
+  x0: number;
+  x1: number;
+  primary: number;
+  comparison: number;
+}
+
+/** Two-layer numeric histogram from `viz/compare` (kind=numeric) — bin
+ * edges derive from the union min/max of both layers. */
+export interface CompareNumericResponse {
+  kind: "numeric";
+  field: string;
+  min: number | null;
+  max: number | null;
+  bins: CompareNumericBin[];
+  primary_total: number;
+  comparison_total: number;
+}
+
+/** A saved Visualization-page chart; `config` is a versioned ChartConfig
+ * stored as opaque JSON (validated client-side by `parseStoredChartConfig`). */
+export interface SavedChart {
+  id: string;
+  case_id: string;
+  timeline_id: string;
+  name: string;
+  config: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 /** Body for export endpoint */

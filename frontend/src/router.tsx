@@ -9,6 +9,7 @@ import { RequireAuth } from "@/components/auth/RequireAuth";
 import { CasesPage } from "@/pages/CasesPage";
 import { CaseOverviewPage } from "@/pages/CaseOverviewPage";
 import { ExplorerPage } from "@/pages/ExplorerPage";
+import { VisualizePage } from "@/pages/VisualizePage";
 import { LoginPage } from "@/pages/LoginPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { SettingsPage } from "@/pages/SettingsPage";
@@ -29,6 +30,10 @@ export const router = createBrowserRouter(
           <Route
             path="cases/:caseId/timelines/:timelineId"
             element={<ExplorerPage />}
+          />
+          <Route
+            path="cases/:caseId/timelines/:timelineId/visualize"
+            element={<VisualizePage />}
           />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="admin" element={<RequireAdmin />}>

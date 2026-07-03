@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Upload, FileText } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
+import { useJobsStore } from "@/stores/jobs";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -18,6 +19,7 @@ export function UploadDialog({ caseId }: Props) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const qc = useQueryClient();
+  const addJob = useJobsStore((s) => s.addJob);
 
   const { mutate, isPending, error, data } = useMutation({
     mutationFn: () =>
@@ -30,16 +32,18 @@ export function UploadDialog({ caseId }: Props) {
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
-      console.info("Upload result", result);
-      // Auto-close on successful new uploads after a short delay so the user
-      // cannot immediately click Upload again on the same selection. Keep the
-      // dialog open for duplicates so the message is visible.
-      if (!result.duplicate) {
-        window.setTimeout(() => {
-          setOpen(false);
-          setFile(null);
-          setParser("");
-        }, 1200);
+      // Ingestion continues as a background job — hand it to the job tray
+      // (which polls progress and refreshes the source list with the final
+      // event count) and close the dialog. Keep the dialog open for
+      // duplicates so the message is visible.
+      if (!result.duplicate && result.job_id) {
+        addJob(result.job_id, `Ingesting "${file?.name ?? "upload"}"`, [
+          ["sources", caseId],
+          ["timelines", caseId],
+        ]);
+        setOpen(false);
+        setFile(null);
+        setParser("");
       }
     },
   });
@@ -139,15 +143,6 @@ export function UploadDialog({ caseId }: Props) {
               This file has already been ingested ({data.events_parsed.toLocaleString()} events).
             </div>
           )}
-          {data && !data.duplicate && (
-            <div className="rounded border border-[var(--color-success)]/40 bg-[var(--color-success-dim)] px-3 py-2 text-xs text-[var(--color-success)]">
-              Ingested {data.events_inserted.toLocaleString()} events via{" "}
-              <span className="font-mono">{data.parser}</span>
-              {data.events_parsed !== data.events_inserted &&
-                ` (${data.events_parsed.toLocaleString()} parsed)`}
-            </div>
-          )}
-
           {error && (
             <p className="text-xs text-[var(--color-danger)]">
               {(error as Error).message}

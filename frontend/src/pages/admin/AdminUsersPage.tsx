@@ -20,6 +20,7 @@ import {
   TableRow,
 } from "@/components/ui/Table";
 import { useAuthStore } from "@/stores/auth";
+import { fmtTimestampFull } from "@/lib/time";
 
 export function AdminUsersPage() {
   const qc = useQueryClient();
@@ -91,7 +92,7 @@ export function AdminUsersPage() {
                 />
               </TableCell>
               <TableCell className="text-xs text-[var(--color-fg-muted)]">
-                {u.last_login_at ? new Date(u.last_login_at).toLocaleString() : "never"}
+                {u.last_login_at ? fmtTimestampFull(u.last_login_at) : "never"}
               </TableCell>
               <TableCell>
                 <div className="flex justify-end gap-1">

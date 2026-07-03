@@ -1,8 +1,16 @@
 # TraceVector Implementation Progress
 
-Last updated: 2026-07-02 (session 8 — authentication, RBAC, teams, audit trail, and live
-collaboration implemented and hardened through a full security review; see
-`docs/archive/PR7_REVIEW_FINDINGS.md`)
+Last updated: 2026-07-03 (session 11 — visualization v2: two-layer comparison with
+server-enforced shared-grid invariants (`POST .../viz/compare`, kinds time/terms/numeric),
+derived metrics as pure client-side transforms (Δ / rate / % of baseline / cumulative, nulls
+for undefined bins), first-class time-histogram chart type, bar orientation + grouped compare
+bars, numeric-histogram comparison overlay, per-chart options panel, unified on-screen/export
+captions with truthfulness warnings, five task presets, saved charts (`SavedChart` Postgres
+model + CRUD), URL-serialized `ChartConfig` (`c_*` params), and the Explorer histogram
+tooltip anchor/clamping fix)
+
+**Open follow-up:** none for PR #8 — every finding from its review (7 correctness bugs +
+9 cleanup/design items) is resolved; see `docs/archive/PR8_REVIEW_FINDINGS.md`.
 
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in [`TECH_STACK.md`](./TECH_STACK.md).
@@ -13,8 +21,8 @@ See [`ROADMAP.md`](./ROADMAP.md) for the detailed scope breakdown and remaining 
 **Estimated MVP completion: ~97 %**
 
 Backend model, API, statistical anomaly detectors, the full frontend, and the full
-auth/RBAC/teams/audit/live-collaboration layer are implemented and tested (261 backend tests,
-23 frontend tests, both suites green; `ruff`/`tsc`/`oxlint` clean). What remains before MVP
+auth/RBAC/teams/audit/live-collaboration layer are implemented and tested (296 backend tests,
+105 frontend tests, both suites green; `ruff`/`tsc`/`oxlint` clean). What remains before MVP
 closure is **offline-mode enforcement** — `allow_online` still isn't checked at most network
 call sites (OIDC SSO is a deliberate, documented exception). GPU acceleration remains
 aspirational (no code exists for it yet).

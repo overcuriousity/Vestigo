@@ -1,6 +1,6 @@
 import { get } from "./client";
 import type { EmbeddingFieldsResponse, Event, EventCursor, EventFilters, EventPage, FieldsResponse, HistogramResponse } from "./types";
-import { serializeEventFilterFields } from "@/lib/queryParams";
+import { serializeEventFilterParams } from "@/lib/queryParams";
 
 export const eventsApi = {
   list: (
@@ -12,19 +12,13 @@ export const eventsApi = {
   ): Promise<EventPage> => {
     const params: Record<string, string | number | boolean | undefined | null> =
       {
-        ...serializeEventFilterFields(filters),
+        ...serializeEventFilterParams(filters),
         limit: filters.limit ?? 100,
         offset: filters.offset ?? 0,
         order: filters.order ?? "desc",
         after: cursor?.after,
         before: cursor?.before,
       };
-    if (filters.filters && Object.keys(filters.filters).length > 0) {
-      params.filters = JSON.stringify(filters.filters);
-    }
-    if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
-      params.exclusions = JSON.stringify(filters.exclusions);
-    }
     return get<EventPage>(
       `/cases/${caseId}/timelines/${timelineId}/events`,
       params,
@@ -65,15 +59,9 @@ export const eventsApi = {
     buckets = 60,
   ): Promise<HistogramResponse> => {
     const params: Record<string, string | number | undefined | null> = {
-      ...serializeEventFilterFields(filters),
+      ...serializeEventFilterParams(filters),
       buckets,
     };
-    if (filters.filters && Object.keys(filters.filters).length > 0) {
-      params.filters = JSON.stringify(filters.filters);
-    }
-    if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
-      params.exclusions = JSON.stringify(filters.exclusions);
-    }
     return get<HistogramResponse>(
       `/cases/${caseId}/timelines/${timelineId}/histogram`,
       params,

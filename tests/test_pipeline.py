@@ -163,6 +163,29 @@ def test_pipeline_ingests_events_without_vectors(sample_jsonl: Path) -> None:
     assert clickhouse.schema_initialized is True
 
 
+def test_pipeline_reports_monotonic_byte_progress(sample_jsonl: Path) -> None:
+    clickhouse = FakeClickHouseStore()
+    calls: list[tuple[int, int]] = []
+
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        source_id="source1",
+        clickhouse=clickhouse,
+        batch_size=2,
+        source_name="events.jsonl",
+        file_hash="abc",
+        progress_callback=lambda total, processed: calls.append((total, processed)),
+    )
+    pipeline.run(sample_jsonl)
+
+    size = sample_jsonl.stat().st_size
+    assert calls[0] == (size, 0)
+    assert calls[-1] == (size, size)
+    assert all(total == size for total, _ in calls)
+    processed_values = [processed for _, processed in calls]
+    assert processed_values == sorted(processed_values)
+
+
 def test_embedding_pipeline_generates_vectors(sample_jsonl: Path) -> None:
     embedding_model = FakeEmbeddingModel(vector_dimension=8)
     clickhouse = FakeClickHouseStore()

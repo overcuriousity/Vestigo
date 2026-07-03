@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from tracevector.db._buckets import bucket_interval_seconds, query_timestamp_range
-from tracevector.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
+from tracevector.db._buckets import (
+    aligned_bucket_starts,
+    bucket_interval_seconds,
+    query_timestamp_range,
+)
+from tracevector.db._columns import (
+    EVENT_SELECT_COLUMNS,
+    TOP_LEVEL_NON_STRING_COLUMNS,
+    resolve_column_token,
+)
 from tracevector.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.field_recommend import (
@@ -185,6 +194,41 @@ def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
 _EVENT_SELECT_COLUMNS = ",\n    ".join(EVENT_SELECT_COLUMNS)
 
 
+def _field_column_expr(
+    field_token: str,
+    parameters: dict[str, Any],
+    param_name: str | Callable[[], str],
+    *,
+    cast_non_string: bool = True,
+) -> str:
+    """Resolve *field_token* to a SQL expression, binding an attribute key if needed.
+
+    The single column-resolution implementation, shared by two call styles:
+
+    - The viz aggregations pass an explicit, caller-chosen *param_name*
+      string — they build their WHERE clause via ``_build_where`` first
+      (which already claims ``p0..pN``) and then need one more parameter for
+      the field-under-analysis without risking a name collision with those.
+    - ``_ParameterizedQueryBuilder._column_expr`` passes its bound
+      ``_param_name`` method so a fresh ``pN`` is minted lazily — only when
+      the token actually resolves to an attribute key; an eager mint would
+      shift the numbering of every subsequent parameter.
+
+    ``cast_non_string`` wraps non-string top-level columns (``timestamp``) in
+    ``toString(...)`` so string comparisons like ``!= ''`` and ``GROUP BY``
+    work; the filter builder disables it because its equality/``NOT IN``
+    predicates compare against typed literals directly.
+    """
+    column, attr_key = resolve_column_token(field_token)
+    if column is not None:
+        if cast_non_string and column in TOP_LEVEL_NON_STRING_COLUMNS:
+            return f"toString({column})"
+        return column
+    name = param_name() if callable(param_name) else param_name
+    parameters[name] = attr_key
+    return f"attributes[{{{name}:String}}]"
+
+
 class _ParameterizedQueryBuilder:
     """Build a ClickHouse WHERE clause using named parameters."""
 
@@ -325,13 +369,7 @@ class _ParameterizedQueryBuilder:
         self.parameters[sentinel_name] = to_clickhouse_utc(_NULL_TIMESTAMP_SENTINEL, precise=True)
 
     def _column_expr(self, key: str) -> str:
-        column, attr_key = resolve_column_token(key)
-        if column is not None:
-            return column
-        # Map lookup; parameterize the key as well to stay defensive.
-        key_param = self._param_name()
-        self.parameters[key_param] = attr_key
-        return f"attributes[{{{key_param}:String}}]"
+        return _field_column_expr(key, self.parameters, self._param_name, cast_non_string=False)
 
     def where_clause(self) -> str:
         return " AND ".join(self.conditions)
@@ -342,6 +380,17 @@ class EventQueryService:
 
     def __init__(self, store: ClickHouseStore | None = None) -> None:
         self.store = store or ClickHouseStore()
+
+    def _run_parallel(self, *fns: Callable[[], Any]) -> list[Any]:
+        """Run independent ClickHouse scans concurrently in threads.
+
+        Used for Compare-mode queries, where the primary/comparison layers
+        are separate scans with no data dependency between them — running
+        them in threads halves wall-clock latency over doing them serially.
+        """
+        with ThreadPoolExecutor(max_workers=len(fns)) as pool:
+            futures = [pool.submit(fn) for fn in fns]
+            return [f.result() for f in futures]
 
     def _build_where(self, query: EventQuery) -> tuple[str, dict[str, Any]]:
         """Build the parameterized WHERE clause for *query*.
@@ -912,4 +961,514 @@ class EventQueryService:
             "min": min_ts.isoformat(),
             "max": max_ts.isoformat(),
             "buckets": bucket_list,
+        }
+
+    def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
+        """Return a top-N terms aggregation (value → count) for *field_token*.
+
+        Honors all query filters (same ``_build_where`` as every other
+        aggregation here), so the result always matches the currently
+        filtered Explorer view. Powers both the per-value histogram modal's
+        top-list and the Visualization page's nominal/ordinal chart types.
+
+        ``other_count`` is the count of non-empty values that fall outside
+        the top *limit* — present so a bar/pie chart can render a truthful
+        "Other" slice instead of silently dropping the tail.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+
+        # Single scan: the window aggregates run after GROUP BY but before
+        # ORDER BY/LIMIT, so every surviving row carries the pre-LIMIT event
+        # total and group count (= distinct non-empty values, since the
+        # grouping key is the value itself).
+        result = self.store.client.query(
+            f"""
+            SELECT {col_expr} AS val,
+                   count() AS c,
+                   sum(count()) OVER () AS total,
+                   count() OVER () AS n_groups
+            FROM {database}.events
+            WHERE {where} AND {col_expr} != ''
+            GROUP BY val
+            ORDER BY c DESC, val ASC
+            LIMIT {int(limit)}
+            """,
+            parameters=parameters,
+        )
+        rows = result.result_rows
+        if not rows:
+            return {
+                "field": field_token,
+                "total": 0,
+                "distinct": 0,
+                "values": [],
+                "other_count": 0,
+            }
+
+        total, distinct = rows[0][2], rows[0][3]
+        values = [{"value": row[0], "count": row[1]} for row in rows]
+        other_count = total - sum(v["count"] for v in values)
+        return {
+            "field": field_token,
+            "total": total,
+            "distinct": distinct,
+            "values": values,
+            "other_count": max(0, other_count),
+        }
+
+    # Quantiles reported for every numeric field — chosen to cover both the
+    # box-plot five-number summary (0.25/0.5/0.75, whiskers approximated from
+    # the data range) and tail behavior an analyst investigating a DoS or
+    # outlier burst cares about (0.01/0.05/0.95/0.99).
+    _NUMERIC_QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+
+    def field_numeric_stats(
+        self, query: EventQuery, field_token: str, bins: int = 30
+    ) -> dict[str, Any]:
+        """Return summary statistics and a fixed-width histogram for a numeric field.
+
+        Values are cast with ``toFloat64OrNull(toString(...))`` since dynamic
+        attributes are stored as strings; non-numeric values are silently
+        dropped from the cast (become NULL) rather than erroring. ``count ==
+        0`` is the signal callers use to fall back to treating the field as
+        categorical instead.
+
+        Bins are **fixed-width** (evenly spaced across ``[min, max]``), not
+        ClickHouse's adaptive ``histogram()`` function — reproducibility (the
+        same filters always produce the same bin edges) matters more here
+        than adaptive bin placement.
+
+        The two scans are deliberate: bin edges are a function of the first
+        scan's min/max, and the single-scan alternatives (adaptive
+        ``histogram()``, or frameless window ``min/max OVER ()`` forcing
+        ClickHouse to buffer every row) are worse than a second
+        aggregate-only pass.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+
+        quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
+        stats_result = self.store.client.query(
+            f"""
+            SELECT count(v) AS n, min(v) AS mn, max(v) AS mx, avg(v) AS mean,
+                   stddevPop(v) AS sd, {quantile_exprs}
+            FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            """,
+            parameters=parameters,
+        )
+        row = stats_result.result_rows[0] if stats_result.result_rows else None
+        count = row[0] if row else 0
+
+        empty: dict[str, Any] = {
+            "field": field_token,
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "stddev": None,
+            "quantiles": {},
+            "bins": [],
+        }
+        if not count:
+            return empty
+
+        mn, mx, mean, sd, *quantile_values = row[1:]
+        quantiles = dict(
+            zip((str(q) for q in self._NUMERIC_QUANTILES), quantile_values, strict=True)
+        )
+
+        bin_count = max(1, int(bins))
+        span = mx - mn
+        bin_width = span / bin_count if span > 0 else 1.0
+
+        hist_result = self.store.client.query(
+            f"""
+            SELECT greatest(0, least({bin_count - 1},
+                   toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
+                   count() AS c
+            FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            GROUP BY bin_idx
+            ORDER BY bin_idx
+            """,
+            parameters={**parameters, "mn": mn, "bw": bin_width},
+        )
+        counts_by_bin = {row[0]: row[1] for row in hist_result.result_rows}
+        bins_out = [
+            {
+                "x0": mn + i * bin_width,
+                "x1": mn + (i + 1) * bin_width,
+                "count": counts_by_bin.get(i, 0),
+            }
+            for i in range(bin_count)
+        ]
+
+        return {
+            "field": field_token,
+            "count": count,
+            "min": mn,
+            "max": mx,
+            "mean": mean,
+            "stddev": sd,
+            "quantiles": quantiles,
+            "bins": bins_out,
+        }
+
+    def field_value_timeseries(
+        self,
+        query: EventQuery,
+        field_token: str,
+        buckets: int = 60,
+        series_limit: int = 12,
+    ) -> dict[str, Any]:
+        """Return per-value event counts bucketed over time for *field_token*.
+
+        Restricts to the top *series_limit* values by overall count (via
+        :py:meth:`field_terms`) so a high-cardinality field doesn't explode
+        into hundreds of series — the Visualization page surfaces
+        ``field_terms``' ``other_count``/``distinct`` alongside this so the
+        analyst knows series were capped. Powers the multi-series line chart
+        and the value×time heatmap.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+
+        if query.start is not None and query.end is not None:
+            min_ts: datetime | None = ensure_utc(query.start)
+            max_ts: datetime | None = ensure_utc(query.end)
+        else:
+            min_ts, max_ts = query_timestamp_range(self.store.client, database, where, parameters)
+
+        empty: dict[str, Any] = {
+            "field": field_token,
+            "interval_seconds": 0,
+            "min": None,
+            "max": None,
+            "series": [],
+        }
+        if min_ts is None or max_ts is None:
+            return empty
+
+        terms = self.field_terms(query, field_token, limit=series_limit)
+        top_values = [v["value"] for v in terms["values"]]
+        if not top_values:
+            return {
+                **empty,
+                "interval_seconds": 0,
+                "min": min_ts.isoformat(),
+                "max": max_ts.isoformat(),
+            }
+
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        parameters["series_values"] = top_values
+
+        bucket_result = self.store.client.query(
+            f"""
+            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                   {col_expr} AS val,
+                   count() AS c
+            FROM {database}.events
+            WHERE {where} AND timestamp IS NOT NULL
+                AND has({{series_values:Array(String)}}, {col_expr})
+            GROUP BY bucket, val
+            ORDER BY bucket
+            """,
+            parameters=parameters,
+        )
+
+        # Pivot into one bucket-list per value, in the same top-N order as
+        # `terms`, filling buckets with zero rows so every series has an
+        # entry for every bucket the chart draws.
+        by_value: dict[str, dict[str, int]] = {v: {} for v in top_values}
+        for bucket_ts, val, count in bucket_result.result_rows:
+            by_value.setdefault(val, {})[ensure_utc_iso(bucket_ts)] = count
+
+        # Derive bucket starts from [min_ts, max_ts] rather than from the
+        # query result rows: a bucket where *none* of the top-N values had
+        # any events produces no GROUP BY row at all, and would otherwise be
+        # missing from every series instead of zero-filled.
+        all_starts = aligned_bucket_starts(min_ts, max_ts, interval)
+        series = [
+            {
+                "value": value,
+                "buckets": [
+                    {"start": start, "count": by_value.get(value, {}).get(start, 0)}
+                    for start in all_starts
+                ],
+            }
+            for value in top_values
+        ]
+
+        return {
+            "field": field_token,
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "series": series,
+        }
+
+    def _union_timestamp_range(
+        self, primary: EventQuery, comparison: EventQuery
+    ) -> tuple[datetime | None, datetime | None]:
+        """Return the union (min, max) timestamp range across both layers.
+
+        Explicit ``start``/``end`` on the primary win outright — comparison
+        layers are constructed to share the primary's time window (see the
+        compare endpoint), so an explicit window is already the shared grid.
+        Otherwise the union of both layers' data ranges is used, so neither
+        layer's buckets get truncated to the other's extent.
+        """
+        if primary.start is not None and primary.end is not None:
+            return ensure_utc(primary.start), ensure_utc(primary.end)
+        database = self.store.database
+        ranges = []
+        for query in (primary, comparison):
+            where, parameters = self._build_where(query)
+            ranges.append(query_timestamp_range(self.store.client, database, where, parameters))
+        mins = [r[0] for r in ranges if r[0] is not None]
+        maxs = [r[1] for r in ranges if r[1] is not None]
+        if not mins or not maxs:
+            return None, None
+        return min(mins), max(maxs)
+
+    def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
+        """Return epoch-aligned bucket-start (ISO) → event count for *query*."""
+        where, parameters = self._build_where(query)
+        result = self.store.client.query(
+            f"""
+            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                   count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND timestamp IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            parameters=parameters,
+        )
+        return {ensure_utc_iso(row[0]): row[1] for row in result.result_rows}
+
+    def compare_time_histogram(
+        self, primary: EventQuery, comparison: EventQuery, buckets: int = 60
+    ) -> dict[str, Any]:
+        """Return event counts over time for two layers on one shared bucket grid.
+
+        The comparability invariant lives here: one time range (see
+        :py:meth:`_union_timestamp_range`), one ``bucket_interval_seconds``,
+        one epoch-aligned bucket-start list — both layers are counted against
+        that grid and zero-filled onto it, so the two series are comparable
+        by construction. The response carries only raw counts; derived
+        metrics (delta/rate/ratio/cumulative) are frontend transforms.
+        """
+        self.store.init_schema()
+        min_ts, max_ts = self._union_timestamp_range(primary, comparison)
+        if min_ts is None or max_ts is None:
+            return {
+                "kind": "time",
+                "interval_seconds": 0,
+                "min": None,
+                "max": None,
+                "buckets": [],
+                "primary_total": 0,
+                "comparison_total": 0,
+            }
+
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        primary_counts, comparison_counts = self._run_parallel(
+            lambda: self._bucketed_counts(primary, interval),
+            lambda: self._bucketed_counts(comparison, interval),
+        )
+        starts = aligned_bucket_starts(min_ts, max_ts, interval)
+        bucket_list = [
+            {
+                "start": start,
+                "primary": primary_counts.get(start, 0),
+                "comparison": comparison_counts.get(start, 0),
+            }
+            for start in starts
+        ]
+        return {
+            "kind": "time",
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "buckets": bucket_list,
+            "primary_total": sum(primary_counts.values()),
+            "comparison_total": sum(comparison_counts.values()),
+        }
+
+    def _terms_counts_for_values(
+        self, query: EventQuery, field_token: str, values: list[str]
+    ) -> tuple[dict[str, int], int]:
+        """Return per-value counts restricted to *values*, plus the layer's non-empty total."""
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        parameters["cmp_values"] = values
+        result = self.store.client.query(
+            f"""
+            SELECT if(has({{cmp_values:Array(String)}}, {col_expr}), {col_expr}, '') AS val,
+                   count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND {col_expr} != ''
+            GROUP BY val
+            """,
+            parameters=parameters,
+        )
+        counts: dict[str, int] = {}
+        total = 0
+        for val, count in result.result_rows:
+            total += count
+            if val != "":
+                counts[val] = count
+        return counts, total
+
+    def compare_field_terms(
+        self, primary: EventQuery, comparison: EventQuery, field_token: str, limit: int = 50
+    ) -> dict[str, Any]:
+        """Return top-N term counts for two layers over one shared category list.
+
+        The primary layer's :py:meth:`field_terms` fixes the top-N value
+        list; the comparison layer is then counted against those same values
+        (everything else folds into its ``other``), so both bar groups share
+        categories — the terms-kind comparability invariant.
+        """
+        self.store.init_schema()
+        terms = self.field_terms(primary, field_token, limit=limit)
+        top_values = [v["value"] for v in terms["values"]]
+        primary_by_value = {v["value"]: v["count"] for v in terms["values"]}
+
+        comparison_by_value: dict[str, int] = {}
+        comparison_total = 0
+        if top_values:
+            comparison_by_value, comparison_total = self._terms_counts_for_values(
+                comparison, field_token, top_values
+            )
+
+        values = [
+            {
+                "value": value,
+                "primary": primary_by_value.get(value, 0),
+                "comparison": comparison_by_value.get(value, 0),
+            }
+            for value in top_values
+        ]
+        return {
+            "kind": "terms",
+            "field": field_token,
+            "values": values,
+            "distinct": terms["distinct"],
+            "primary_total": terms["total"],
+            "comparison_total": comparison_total,
+            "primary_other": terms["other_count"],
+            "comparison_other": max(
+                0, comparison_total - sum(v["comparison"] for v in values)
+            ),
+        }
+
+    def _numeric_layer_stats(
+        self, query: EventQuery, field_token: str
+    ) -> tuple[int, float | None, float | None]:
+        """Return (count, min, max) of the numeric cast of *field_token* for one layer."""
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        result = self.store.client.query(
+            f"""
+            SELECT count(v), min(v), max(v)
+            FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            """,
+            parameters=parameters,
+        )
+        row = result.result_rows[0] if result.result_rows else (0, None, None)
+        return row[0] or 0, row[1], row[2]
+
+    def _numeric_bin_counts(
+        self, query: EventQuery, field_token: str, mn: float, bin_width: float, bin_count: int
+    ) -> dict[int, int]:
+        """Return bin-index → count for one layer, bucketed on explicit shared edges."""
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(field_token, parameters, "field_key")
+        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        result = self.store.client.query(
+            f"""
+            SELECT greatest(0, least({bin_count - 1},
+                       toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
+                   count() AS c
+            FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
+            WHERE v IS NOT NULL
+            GROUP BY bin_idx
+            ORDER BY bin_idx
+            """,
+            parameters={**parameters, "mn": mn, "bw": bin_width},
+        )
+        return {row[0]: row[1] for row in result.result_rows}
+
+    def compare_field_numeric(
+        self, primary: EventQuery, comparison: EventQuery, field_token: str, bins: int = 30
+    ) -> dict[str, Any]:
+        """Return fixed-width numeric histograms for two layers on shared bin edges.
+
+        Bin edges are derived from the **union** min/max of both layers, then
+        both layers are bucketed on those explicit edges — the numeric-kind
+        comparability invariant. Same fixed-width/reproducible-edges policy
+        as :py:meth:`field_numeric_stats`.
+        """
+        self.store.init_schema()
+        (p_count, p_mn, p_mx), (c_count, c_mn, c_mx) = self._run_parallel(
+            lambda: self._numeric_layer_stats(primary, field_token),
+            lambda: self._numeric_layer_stats(comparison, field_token),
+        )
+
+        mins = [m for m in (p_mn, c_mn) if m is not None]
+        maxs = [m for m in (p_mx, c_mx) if m is not None]
+        if not mins or not maxs:
+            return {
+                "kind": "numeric",
+                "field": field_token,
+                "min": None,
+                "max": None,
+                "bins": [],
+                "primary_total": 0,
+                "comparison_total": 0,
+            }
+        mn, mx = min(mins), max(maxs)
+
+        bin_count = max(1, int(bins))
+        span = mx - mn
+        bin_width = span / bin_count if span > 0 else 1.0
+
+        primary_bins, comparison_bins = self._run_parallel(
+            lambda: self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
+            if p_count
+            else {},
+            lambda: self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
+            if c_count
+            else {},
+        )
+        bins_out = [
+            {
+                "x0": mn + i * bin_width,
+                "x1": mn + (i + 1) * bin_width,
+                "primary": primary_bins.get(i, 0),
+                "comparison": comparison_bins.get(i, 0),
+            }
+            for i in range(bin_count)
+        ]
+        return {
+            "kind": "numeric",
+            "field": field_token,
+            "min": mn,
+            "max": mx,
+            "bins": bins_out,
+            "primary_total": p_count,
+            "comparison_total": c_count,
         }

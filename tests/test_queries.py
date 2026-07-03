@@ -897,3 +897,504 @@ def test_histogram_empty_dataset_returns_empty_buckets() -> None:
     result = svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]))
     assert result["buckets"] == []
     assert result["min"] is None
+
+
+# ── viz aggregation tests (field_terms / field_numeric_stats / field_value_timeseries) ─────
+
+
+class _VizFakeClient:
+    """Dispatches canned results by matching a substring in the query text.
+
+    *responses* is tried in order — put more specific substrings first so a
+    query matching several markers gets the intended canned result.
+    """
+
+    def __init__(self, responses: list[tuple[str, FakeQueryResult]]) -> None:
+        self._responses = responses
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def query(
+        self, query: str, parameters: dict[str, Any] | None = None, **_kwargs: Any
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        for substr, result in self._responses:
+            if substr in query:
+                return result
+        raise AssertionError(f"No fake response configured for query:\n{query}")
+
+
+def _viz_service(responses: list[tuple[str, FakeQueryResult]]) -> EventQueryService:
+    store = FakeClickHouseStore()
+    store.client = _VizFakeClient(responses)  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_field_terms_returns_top_values_and_other_count() -> None:
+    svc = _viz_service(
+        [
+            (
+                "GROUP BY val",
+                FakeQueryResult(result_rows=[["GET", 60, 100, 5], ["POST", 30, 100, 5]]),
+            ),
+        ]
+    )
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    assert result["total"] == 100
+    assert result["distinct"] == 5
+    assert result["values"] == [{"value": "GET", "count": 60}, {"value": "POST", "count": 30}]
+    assert result["other_count"] == 10
+
+
+def test_field_terms_on_timestamp_column_casts_to_string() -> None:
+    """`timestamp` is a `DateTime64` top-level column, not `String` — the
+    generated SQL must cast it before comparing/grouping, or ClickHouse
+    raises a type error on `col != ''`."""
+    svc = _viz_service(
+        [
+            ("GROUP BY val", FakeQueryResult(result_rows=[["2024-01-01 00:00:00.000", 1, 10, 10]])),
+        ]
+    )
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "timestamp")
+    assert result["total"] == 10
+    queries = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert any("toString(timestamp)" in q for q in queries)
+    assert not any("AND timestamp != ''" in q for q in queries)
+
+
+def test_field_terms_empty_dataset_returns_zero_totals() -> None:
+    svc = _viz_service([("GROUP BY val", FakeQueryResult(result_rows=[]))])
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    assert result == {
+        "field": "artifact",
+        "total": 0,
+        "distinct": 0,
+        "values": [],
+        "other_count": 0,
+    }
+    # Fused single-scan design: an empty dataset still costs exactly one query.
+    assert len(svc.store.client.queries) == 1  # type: ignore[union-attr]
+
+
+def test_field_terms_top_level_column_uses_bare_column() -> None:
+    svc = _viz_service(
+        [
+            ("GROUP BY val", FakeQueryResult(result_rows=[["auth", 1, 1, 1]])),
+        ]
+    )
+    svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    query, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "artifact AS val" in query
+    assert "attributes[" not in query
+
+
+def test_field_terms_attribute_field_uses_map_lookup() -> None:
+    svc = _viz_service(
+        [
+            ("GROUP BY val", FakeQueryResult(result_rows=[["200", 1, 1, 1]])),
+        ]
+    )
+    svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code")
+    query, params = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "attributes[{field_key:String}]" in query
+    assert params is not None
+    assert params.get("field_key") == "status_code"
+
+
+def test_field_terms_honors_field_filters() -> None:
+    """field_terms must reuse _build_where so it respects the same filters as the grid."""
+    svc = _viz_service(
+        [
+            ("GROUP BY val", FakeQueryResult(result_rows=[["ok", 1, 1, 1]])),
+        ]
+    )
+    svc.field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"], field_filters={"artifact": "auth"}),
+        "artifact",
+    )
+    query, params = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "artifact = {p2:String}" in query
+    assert params is not None
+    assert params.get("p2") == "auth"
+
+
+def test_field_numeric_stats_returns_stats_and_fixed_width_bins() -> None:
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[
+                        [10, 0.0, 100.0, 50.0, 10.0, 1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+                    ]
+                ),
+            ),
+            (
+                "toInt64(floor(",
+                FakeQueryResult(result_rows=[[0, 5], [1, 5]]),
+            ),
+        ]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:bytes_sent", bins=2
+    )
+    assert result["count"] == 10
+    assert result["min"] == 0.0
+    assert result["max"] == 100.0
+    assert result["mean"] == 50.0
+    assert result["stddev"] == 10.0
+    assert result["quantiles"]["0.5"] == 50.0
+    assert result["quantiles"]["0.99"] == 99.0
+    assert len(result["bins"]) == 2
+    assert result["bins"][0] == {"x0": 0.0, "x1": 50.0, "count": 5}
+    assert result["bins"][1] == {"x0": 50.0, "x1": 100.0, "count": 5}
+
+
+def test_field_numeric_stats_fills_empty_bins_with_zero() -> None:
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[[4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]]
+                ),
+            ),
+            # Only bin 0 has data — bins 1-3 must still appear, count 0.
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 4]])),
+        ]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:latency_ms", bins=4
+    )
+    assert [b["count"] for b in result["bins"]] == [4, 0, 0, 0]
+
+
+def test_field_numeric_stats_non_numeric_field_returns_zero_count() -> None:
+    """count == 0 signals the caller to fall back to categorical treatment."""
+    svc = _viz_service(
+        [("stddevPop(v)", FakeQueryResult(result_rows=[[0, None, None, None, None]]))]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:user_agent", bins=10
+    )
+    assert result == {
+        "field": "attr:user_agent",
+        "count": 0,
+        "min": None,
+        "max": None,
+        "mean": None,
+        "stddev": None,
+        "quantiles": {},
+        "bins": [],
+    }
+    # No histogram bin query should have been attempted for a non-numeric field.
+    assert not any("toInt64(floor(" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+
+
+def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    bucket1 = min_ts
+    bucket2 = min_ts + timedelta(hours=12)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2, 3, 2], ["b", 1, 3, 2]])),
+            (
+                "toStartOfInterval",
+                FakeQueryResult(
+                    result_rows=[
+                        [bucket1, "a", 2],
+                        [bucket1, "b", 1],
+                        [bucket2, "a", 1],
+                    ]
+                ),
+            ),
+        ]
+    )
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code", buckets=2, series_limit=12
+    )
+    assert result["interval_seconds"] > 0
+    series_by_value = {s["value"]: s for s in result["series"]}
+    assert set(series_by_value) == {"a", "b"}
+    # "b" has no row for bucket2 — must be zero-filled, not omitted.
+    b_counts = {b["start"]: b["count"] for b in series_by_value["b"]["buckets"]}
+    assert len(b_counts) == 2
+    assert sum(b_counts.values()) == 1
+
+
+def test_field_value_timeseries_zero_fills_buckets_with_no_top_value_events() -> None:
+    """A bucket where *none* of the top-N values fired must still appear,
+    zero-filled — not be silently dropped from every series."""
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    bucket1 = min_ts
+    bucket4 = min_ts + timedelta(hours=18)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2, 2, 1]])),
+            (
+                "toStartOfInterval",
+                # Only bucket1 and bucket4 have rows — bucket2 (06:00) and
+                # bucket3 (12:00) had zero matching events entirely and are
+                # absent from the GROUP BY result.
+                FakeQueryResult(result_rows=[[bucket1, "a", 1], [bucket4, "a", 1]]),
+            ),
+        ]
+    )
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code", buckets=4, series_limit=12
+    )
+    series_a = next(s for s in result["series"] if s["value"] == "a")
+    starts = [b["start"] for b in series_a["buckets"]]
+    assert len(starts) == 4
+    counts = {b["start"]: b["count"] for b in series_a["buckets"]}
+    assert sum(counts.values()) == 2
+    assert sorted(counts.values()) == [0, 0, 1, 1]
+
+
+def test_field_value_timeseries_empty_range_returns_empty_series() -> None:
+    svc = _viz_service([("min(timestamp)", FakeQueryResult(result_rows=[[None, None]]))])
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "artifact", buckets=60
+    )
+    assert result["series"] == []
+    assert result["min"] is None
+
+
+def test_field_value_timeseries_no_values_returns_empty_series_without_bucket_query() -> None:
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[])),
+        ]
+    )
+    result = svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "artifact", buckets=60
+    )
+    assert result["series"] == []
+    assert result["min"] == min_ts.isoformat()
+
+
+# ── compare aggregation tests (compare_time_histogram / compare_field_terms / compare_field_numeric) ─
+
+
+class _SeqFakeClient:
+    """Like _VizFakeClient, but each marker maps to a FIFO of results.
+
+    The compare_* methods run the *same query shape once per layer* (primary
+    then comparison), so a single canned result per marker cannot tell the
+    layers apart — a FIFO can.
+    """
+
+    def __init__(self, responses: list[tuple[str, list[FakeQueryResult]]]) -> None:
+        self._responses = responses
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def query(
+        self, query: str, parameters: dict[str, Any] | None = None, **_kwargs: Any
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        for substr, queue in self._responses:
+            if substr in query and queue:
+                return queue.pop(0)
+        raise AssertionError(f"No fake response left for query:\n{query}")
+
+
+def _seq_service(responses: list[tuple[str, list[FakeQueryResult]]]) -> EventQueryService:
+    store = FakeClickHouseStore()
+    store.client = _SeqFakeClient(responses)  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_compare_time_histogram_shared_grid_zero_fill_and_no_range_query() -> None:
+    """Explicit start/end → no range query; both layers land on identical
+    bucket starts with zero-fill, comparison layer's missing buckets = 0."""
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
+    b0 = min_ts
+    b1 = min_ts + timedelta(hours=1)
+    svc = _seq_service(
+        [
+            (
+                "toStartOfInterval",
+                [
+                    FakeQueryResult(result_rows=[[b0, 5]]),  # primary
+                    FakeQueryResult(result_rows=[[b0, 50], [b1, 40]]),  # comparison
+                ],
+            ),
+        ]
+    )
+    primary = EventQuery(case_id="c1", source_ids=["s1"], q="dos", start=min_ts, end=max_ts)
+    comparison = EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts)
+    result = svc.compare_time_histogram(primary, comparison, buckets=2)
+
+    assert not any("min(timestamp)" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+    assert result["interval_seconds"] == 3600
+    assert result["primary_total"] == 5
+    assert result["comparison_total"] == 90
+    assert len(result["buckets"]) == 2
+    # Primary has no row for b1 — zero-filled on the shared grid, not dropped.
+    assert result["buckets"][0]["primary"] == 5
+    assert result["buckets"][0]["comparison"] == 50
+    assert result["buckets"][1]["primary"] == 0
+    assert result["buckets"][1]["comparison"] == 40
+
+
+def test_compare_time_histogram_uses_union_of_layer_ranges() -> None:
+    """Without an explicit window, the grid spans the union of both layers'
+    data ranges — neither layer's buckets get truncated to the other's."""
+    p_min = datetime(2024, 1, 1, 6, tzinfo=UTC)
+    p_max = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    c_min = datetime(2024, 1, 1, 0, tzinfo=UTC)
+    c_max = datetime(2024, 1, 1, 18, tzinfo=UTC)
+    svc = _seq_service(
+        [
+            (
+                "min(timestamp)",
+                [
+                    FakeQueryResult(result_rows=[[p_min, p_max]]),
+                    FakeQueryResult(result_rows=[[c_min, c_max]]),
+                ],
+            ),
+            (
+                "toStartOfInterval",
+                [FakeQueryResult(result_rows=[]), FakeQueryResult(result_rows=[])],
+            ),
+        ]
+    )
+    result = svc.compare_time_histogram(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        buckets=18,
+    )
+    assert result["min"] == c_min.isoformat()
+    assert result["max"] == c_max.isoformat()
+    range_queries = [q for q, _ in svc.store.client.queries if "min(timestamp)" in q]  # type: ignore[union-attr]
+    assert len(range_queries) == 2
+
+
+def test_compare_time_histogram_empty_dataset() -> None:
+    svc = _seq_service(
+        [
+            (
+                "min(timestamp)",
+                [
+                    FakeQueryResult(result_rows=[[None, None]]),
+                    FakeQueryResult(result_rows=[[None, None]]),
+                ],
+            ),
+        ]
+    )
+    result = svc.compare_time_histogram(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+    )
+    assert result["buckets"] == []
+    assert result["primary_total"] == 0
+    assert result["comparison_total"] == 0
+
+
+def test_compare_field_terms_shares_primary_categories() -> None:
+    """Primary's top-N fixes the category list; comparison is counted against
+    those same values, its tail folding into comparison_other."""
+    svc = _seq_service(
+        [
+            # Primary field_terms (window-agg shape: val, c, total, n_groups).
+            (
+                "OVER ()",
+                [FakeQueryResult(result_rows=[["GET", 60, 100, 5], ["POST", 30, 100, 5]])],
+            ),
+            # Comparison layer folded onto the shared values: '' = its tail.
+            (
+                "cmp_values",
+                [FakeQueryResult(result_rows=[["GET", 600], ["", 400]])],
+            ),
+        ]
+    )
+    result = svc.compare_field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:method",
+    )
+    assert [v["value"] for v in result["values"]] == ["GET", "POST"]
+    assert result["values"][0] == {"value": "GET", "primary": 60, "comparison": 600}
+    # POST absent from comparison rows — zero, not dropped.
+    assert result["values"][1] == {"value": "POST", "primary": 30, "comparison": 0}
+    assert result["primary_total"] == 100
+    assert result["comparison_total"] == 1000
+    assert result["primary_other"] == 10
+    assert result["comparison_other"] == 400
+
+
+def test_compare_field_terms_empty_primary_skips_comparison_query() -> None:
+    svc = _seq_service([("OVER ()", [FakeQueryResult(result_rows=[])])])
+    result = svc.compare_field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:method",
+    )
+    assert result["values"] == []
+    assert result["comparison_total"] == 0
+    assert not any("cmp_values" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+
+
+def test_compare_field_numeric_shared_edges_from_union_min_max() -> None:
+    """Bin edges come from the union min/max of both layers, and both layers
+    are bucketed on those identical edges."""
+    svc = _seq_service(
+        [
+            (
+                "count(v), min(v), max(v)",
+                [
+                    FakeQueryResult(result_rows=[[10, 20.0, 60.0]]),  # primary
+                    FakeQueryResult(result_rows=[[100, 0.0, 100.0]]),  # comparison
+                ],
+            ),
+            (
+                "greatest(0, least(",
+                [
+                    FakeQueryResult(result_rows=[[0, 4], [1, 6]]),  # primary
+                    FakeQueryResult(result_rows=[[0, 50], [1, 50]]),  # comparison
+                ],
+            ),
+        ]
+    )
+    result = svc.compare_field_numeric(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:bytes",
+        bins=2,
+    )
+    assert result["min"] == 0.0
+    assert result["max"] == 100.0
+    assert result["bins"][0] == {"x0": 0.0, "x1": 50.0, "primary": 4, "comparison": 50}
+    assert result["bins"][1] == {"x0": 50.0, "x1": 100.0, "primary": 6, "comparison": 50}
+    # Both bin queries were parameterized with the same shared edges.
+    bin_params = [p for q, p in svc.store.client.queries if "greatest(0, least(" in q]  # type: ignore[union-attr]
+    assert all(p["mn"] == 0.0 and p["bw"] == 50.0 for p in bin_params)
+
+
+def test_compare_field_numeric_no_numeric_values_returns_empty() -> None:
+    svc = _seq_service(
+        [
+            (
+                "count(v), min(v), max(v)",
+                [
+                    FakeQueryResult(result_rows=[[0, None, None]]),
+                    FakeQueryResult(result_rows=[[0, None, None]]),
+                ],
+            ),
+        ]
+    )
+    result = svc.compare_field_numeric(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:user_agent",
+    )
+    assert result["bins"] == []
+    assert result["min"] is None
+    assert not any("toStartOfInterval" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]

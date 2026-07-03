@@ -1,6 +1,7 @@
 import { fetchBlob } from "./client";
 import type { ExportRequest, EventFilters } from "./types";
 import { serializeEventFilterFields } from "@/lib/queryParams";
+import { triggerDownload } from "@/lib/download";
 
 export async function downloadExport(
   caseId: string,
@@ -25,10 +26,5 @@ export async function downloadExport(
     body,
   );
 
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${caseId}-${timelineId}-events.${format}`;
-  a.click();
-  URL.revokeObjectURL(url);
+  triggerDownload(blob, `${caseId}-${timelineId}-events.${format}`);
 }

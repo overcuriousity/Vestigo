@@ -80,6 +80,7 @@ class IngestionPipeline:
         batch_size: int | None = None,
         file_hash: str | None = None,
         source_name: str | None = None,
+        progress_callback: Any | None = None,
     ) -> None:
         self.case_id = case_id
         self.source_id = source_id
@@ -87,6 +88,10 @@ class IngestionPipeline:
         self.batch_size = batch_size or get_settings().embedding_batch_size
         self.file_hash = file_hash
         self.source_name = source_name
+        # Called as progress_callback(total=..., processed=...) with *bytes*
+        # (event totals are unknown until parsing finishes) — same keyword
+        # shape as EmbeddingPipeline's callback.
+        self.progress_callback = progress_callback
 
     def run(
         self,
@@ -109,6 +114,10 @@ class IngestionPipeline:
 
         self.clickhouse.init_schema()
 
+        total_bytes = sum(f.stat().st_size for f in files)
+        bytes_done = 0
+        self._report_progress(total=total_bytes, processed=0)
+
         first_exception: BaseException | None = None
         single_file = len(files) == 1
         for file_path in files:
@@ -130,11 +139,13 @@ class IngestionPipeline:
                 source_name=source_name or file_path.name,
             )
             try:
-                self._ingest_file(file_path, parser, result)
+                self._ingest_file(file_path, parser, result, total_bytes, bytes_done)
             except Exception as exc:  # noqa: BLE001
                 if first_exception is None:
                     first_exception = exc
                 result.errors.append(f"{file_path}: {exc}\n{traceback.format_exc()}")
+            bytes_done += file_path.stat().st_size
+            self._report_progress(total=total_bytes, processed=bytes_done)
 
         if result.errors:
             message = "Ingestion failed:\n" + "\n".join(result.errors)
@@ -155,8 +166,15 @@ class IngestionPipeline:
         file_path: Path,
         parser: Parser,
         result: IngestionResult,
+        total_bytes: int = 0,
+        bytes_before_file: int = 0,
     ) -> None:
-        """Stream a single file into ClickHouse in batches."""
+        """Stream a single file into ClickHouse in batches.
+
+        Progress is reported per flushed batch as bytes consumed, using the
+        last event's ``byte_offset`` within the current file on top of the
+        bytes of already-completed files.
+        """
         batch: list[Event] = []
 
         for event in parser.parse(file_path):
@@ -166,11 +184,23 @@ class IngestionPipeline:
             if len(batch) >= self.batch_size:
                 inserted = self.clickhouse.insert_events(batch)
                 result.events_inserted += inserted
+                self._report_progress(
+                    total=total_bytes,
+                    processed=bytes_before_file + batch[-1].byte_offset,
+                )
                 batch = []
 
         if batch:
             inserted = self.clickhouse.insert_events(batch)
             result.events_inserted += inserted
+            self._report_progress(
+                total=total_bytes,
+                processed=bytes_before_file + batch[-1].byte_offset,
+            )
+
+    def _report_progress(self, total: int, processed: int) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(total=total, processed=processed)
 
 
 class EmbeddingPipeline:

@@ -12,6 +12,7 @@ import {
   TableRow,
 } from "@/components/ui/Table";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { fmtTimestampFull } from "@/lib/time";
 
 export function AdminAuditPage() {
   const [action, setAction] = useState("");
@@ -71,7 +72,7 @@ export function AdminAuditPage() {
             {rows?.map((r) => (
               <TableRow key={r.id}>
                 <TableCell className="whitespace-nowrap text-xs text-[var(--color-fg-muted)]">
-                  {new Date(r.timestamp).toLocaleString()}
+                  {fmtTimestampFull(r.timestamp)}
                 </TableCell>
                 <TableCell className="text-xs">{r.username ?? "anonymous"}</TableCell>
                 <TableCell className="font-mono text-xs">{r.action}</TableCell>

@@ -273,7 +273,10 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
       return timelinesApi.embed(caseId, timeline.id, { version: 1, artifacts });
     },
     onSuccess: (result) => {
-      addJob(result.job_id, `Embedding "${timeline.name}"`);
+      addJob(result.job_id, `Embedding "${timeline.name}"`, [
+        ["timelines", caseId],
+        ["timeline", caseId, timeline.id],
+      ]);
       onJobStarted?.(result.job_id);
       // Invalidate timelines so is_embedded / is_stale update.
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });

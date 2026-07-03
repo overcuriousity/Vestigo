@@ -10,7 +10,7 @@
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
  */
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FlaskConical,
@@ -18,6 +18,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   BarChart2,
+  AreaChart,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -39,6 +40,7 @@ import { ExportDialog } from "@/components/explorer/ExportDialog";
 import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
+import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { AnalysisPanel } from "@/components/analysis/AnalysisPanel";
 import { TriageMeter } from "@/components/triage/TriageMeter";
 import { Button } from "@/components/ui/Button";
@@ -194,6 +196,14 @@ export function ExplorerPage() {
     },
     [filters, setFilters, applyFieldFilter],
   );
+
+  /** Wired to the detail panel's per-field histogram button. */
+  const [fieldHistogram, setFieldHistogram] = useState<{ fieldKey: string; value: string } | null>(
+    null,
+  );
+  const handleShowFieldHistogram = useCallback((fieldKey: string, value: string) => {
+    setFieldHistogram({ fieldKey, value });
+  }, []);
 
   /** Maps an anomaly-finding field token to a filter-rail filterKey. */
   const mapAnomalyField = useCallback((field: string): string => {
@@ -748,6 +758,15 @@ export function ExplorerPage() {
 
             <ColumnPicker caseId={caseId!} timelineId={timelineId!} />
 
+            <Tooltip content="Open the full visualization page">
+              <Button variant="outline" size="sm" asChild>
+                <Link to={`visualize?${searchParams.toString()}`}>
+                  <AreaChart size={13} />
+                  Visualize
+                </Link>
+              </Button>
+            </Tooltip>
+
             <Tooltip content={analysisPanelOpen ? "Close analysis panel" : "Open analysis panel"}>
               <Button
                 variant={analysisPanelOpen ? "accent" : "outline"}
@@ -855,8 +874,22 @@ export function ExplorerPage() {
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
+                    onShowFieldHistogram={handleShowFieldHistogram}
                     onJumpToTime={handleJumpToTime}
                     tagSuggestions={tagSuggestions}
+                  />
+                )}
+
+                {fieldHistogram && caseId && timelineId && (
+                  <FieldHistogramModal
+                    open
+                    onOpenChange={(o) => !o && setFieldHistogram(null)}
+                    caseId={caseId}
+                    timelineId={timelineId}
+                    filters={effectiveFilters}
+                    fieldKey={fieldHistogram.fieldKey}
+                    value={fieldHistogram.value}
+                    onAddFilter={handleAddFilter}
                   />
                 )}
 

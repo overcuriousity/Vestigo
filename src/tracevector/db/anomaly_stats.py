@@ -306,31 +306,25 @@ class StatisticalAnomalyService:
         )
         return int(total_res.result_rows[0][0]) if total_res.result_rows else 0
 
-    def recommend_novelty_fields(
+    def field_inventory(
         self,
         case_id: str,
         source_ids: list[str],
         total: int | None = None,
-    ) -> list[NoveltyFieldInfo]:
-        """Return a ranked, annotated list of candidate fields for value_novelty.
+    ) -> tuple[list[tuple[str, int, int]], int]:
+        """Return ``((token, distinct, non_empty_count), ...), total`` for candidate fields.
 
-        Fields are classified by cardinality *without* any content heuristics so
-        the result is valid for any timeseries type (nginx, Windows events, …):
-
-        * ``constant``   — distinct ≤ 1 value; no signal.
-        * ``identifier`` — near-unique (distinct / non-empty ≥ 0.9); hashes, IDs,
-          free-text messages.  Not useful for grouping.
-        * ``sparse``     — non-empty coverage < 5 % of events.  Low signal.
-        * ``categorical``— recommended; moderate cardinality with decent coverage.
-
-        Candidate set = a curated list of categorical top-level columns
+        The raw, unclassified field enumeration shared by
+        :py:meth:`recommend_novelty_fields` and the Visualization page's
+        field picker: a curated list of categorical top-level columns
         (``artifact``, ``timestamp_desc``, ``display_name``, ``parser_name``)
-        plus every attribute key found in the events table.
+        plus every attribute key found in the events table (as ``attr:<key>``
+        tokens). Order: top-level columns in candidate order, then attribute
+        keys by non-empty count descending — callers apply their own ranking.
 
-        *total*, the event count used as the coverage denominator, is queried
-        internally when omitted — pass it when the caller already has it
-        (e.g. ``find_value_novelty``'s auto-field-selection path) to avoid a
-        redundant identical round-trip.
+        *total*, the event count callers use as the coverage denominator, is
+        queried internally when omitted — pass it when the caller already has
+        it to avoid a redundant identical round-trip.
         """
         self.ch.init_schema()
         db = self.ch.database
@@ -339,9 +333,9 @@ class StatisticalAnomalyService:
         if total is None:
             total = self._count_events(case_id, source_ids)
         if total == 0:
-            return []
+            return [], 0
 
-        findings: list[NoveltyFieldInfo] = []
+        inventory: list[tuple[str, int, int]] = []
 
         # -- Top-level columns (batched in a single aggregation) ---------------
         agg_parts = []
@@ -357,19 +351,7 @@ class StatisticalAnomalyService:
         if top_res.result_rows:
             row = top_res.result_rows[0]
             for i, col in enumerate(_NOVELTY_CANDIDATE_TOP_LEVEL):
-                dist = int(row[i * 2])
-                cov_count = int(row[i * 2 + 1])
-                coverage = cov_count / total if total else 0.0
-                kind, recommended = _classify_field(dist, cov_count, total)
-                findings.append(
-                    NoveltyFieldInfo(
-                        token=col,
-                        distinct=dist,
-                        coverage=round(coverage, 4),
-                        kind=kind,
-                        recommended=recommended,
-                    )
-                )
+                inventory.append((col, int(row[i * 2]), int(row[i * 2 + 1])))
 
         # -- Attribute keys (ARRAY JOIN to enumerate + aggregate in one pass) --
         attr_sql = f"""
@@ -389,13 +371,47 @@ class StatisticalAnomalyService:
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
         )
         for key, dist, cov_count in attr_res.result_rows:
-            coverage = int(cov_count) / total if total else 0.0
-            kind, recommended = _classify_field(int(dist), int(cov_count), total)
+            inventory.append((f"attr:{key}", int(dist), int(cov_count)))
+
+        return inventory, total
+
+    def recommend_novelty_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        total: int | None = None,
+    ) -> list[NoveltyFieldInfo]:
+        """Return a ranked, annotated list of candidate fields for value_novelty.
+
+        Fields are classified by cardinality *without* any content heuristics so
+        the result is valid for any timeseries type (nginx, Windows events, …):
+
+        * ``constant``   — distinct ≤ 1 value; no signal.
+        * ``identifier`` — near-unique (distinct / non-empty ≥ 0.9); hashes, IDs,
+          free-text messages.  Not useful for grouping.
+        * ``sparse``     — non-empty coverage < 5 % of events.  Low signal.
+        * ``categorical``— recommended; moderate cardinality with decent coverage.
+
+        The candidate set comes from :py:meth:`field_inventory`; this method
+        only layers the novelty classification and ranking on top.
+
+        *total*, the event count used as the coverage denominator, is queried
+        internally when omitted — pass it when the caller already has it
+        (e.g. ``find_value_novelty``'s auto-field-selection path) to avoid a
+        redundant identical round-trip.
+        """
+        inventory, total = self.field_inventory(case_id, source_ids, total)
+        if total == 0:
+            return []
+
+        findings: list[NoveltyFieldInfo] = []
+        for token, dist, cov_count in inventory:
+            kind, recommended = _classify_field(dist, cov_count, total)
             findings.append(
                 NoveltyFieldInfo(
-                    token=f"attr:{key}",
-                    distinct=int(dist),
-                    coverage=round(coverage, 4),
+                    token=token,
+                    distinct=dist,
+                    coverage=round(cov_count / total, 4),
                     kind=kind,
                     recommended=recommended,
                 )

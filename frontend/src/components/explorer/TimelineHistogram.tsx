@@ -14,6 +14,7 @@ import { useState, useRef, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { eventsApi } from "@/api/events";
 import { Spinner } from "@/components/ui/Spinner";
+import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import type { AnomalyMarker, EventFilters, HistogramBucket } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
@@ -87,7 +88,9 @@ function addSeconds(iso: string, seconds: number): string {
   return new Date(new Date(iso).getTime() + seconds * 1000).toISOString();
 }
 
-/** Short, human-readable label for a UTC ISO datetime string. */
+/** Short, human-readable label for a UTC ISO datetime string — rendered in
+ * UTC (the application-wide standard, issue #9), matching the grid and the
+ * filter panel's time-range inputs. */
 function fmtShort(iso: string): string {
   return new Date(iso).toLocaleString(undefined, {
     month: "short",
@@ -95,6 +98,7 @@ function fmtShort(iso: string): string {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    timeZone: "UTC",
   });
 }
 
@@ -126,6 +130,10 @@ export function TimelineHistogram({
     x: number;
     text: string;
   } | null>(null);
+  // Positioning anchor for bar hovers — `closest(".relative")` would match
+  // the hovered bar wrapper itself (it also carries `relative`), pinning
+  // every tooltip at the container's left edge.
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   const buckets = useMemo(() => data?.buckets ?? [], [data]);
   const maxCount = Math.max(1, ...buckets.map((b: HistogramBucket) => b.count));
@@ -236,6 +244,7 @@ export function TimelineHistogram({
 
   return (
     <div
+      ref={containerRef}
       className="relative shrink-0 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)] select-none"
       onMouseUp={handleMouseUp}
       onMouseLeave={handleContainerMouseLeave}
@@ -260,8 +269,8 @@ export function TimelineHistogram({
               style={{ height: "100%", display: "flex", alignItems: "flex-end" }}
               onMouseDown={() => handleMouseDown(idx)}
               onMouseEnter={(e) => {
-                const containerEl = e.currentTarget.closest<HTMLElement>(".relative");
-                const containerLeft = containerEl?.getBoundingClientRect().left ?? 0;
+                const containerLeft =
+                  containerRef.current?.getBoundingClientRect().left ?? 0;
                 const rect = e.currentTarget.getBoundingClientRect();
                 const xOffset = rect.left - containerLeft + rect.width / 2;
                 handleMouseEnter(idx, xOffset, bucket);
@@ -375,14 +384,9 @@ export function TimelineHistogram({
       </div>
 
       {/* Tooltip */}
-      {tooltip && (
-        <div
-          className="pointer-events-none absolute bottom-full mb-1 -translate-x-1/2 rounded bg-[var(--color-bg-elevated)] border border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-fg-primary)] whitespace-nowrap shadow"
-          style={{ left: tooltip.x + 8 }}
-        >
-          {tooltip.text}
-        </div>
-      )}
+      <ChartTooltip x={tooltip?.x ?? 0} y={8} visible={!!tooltip}>
+        {tooltip?.text}
+      </ChartTooltip>
     </div>
   );
 }

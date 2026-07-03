@@ -842,6 +842,58 @@ def test_recommend_novelty_fields_recommended_first():
         assert last_rec_idx < first_not_rec_idx
 
 
+def test_field_inventory_empty_on_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    inventory, total = svc.field_inventory("c1", ["s1"])
+    assert inventory == []
+    assert total == 0
+
+
+def test_field_inventory_returns_unclassified_counts():
+    """Every candidate field appears with raw distinct/non-empty counts —
+    no novelty classification, no constant/identifier filtering."""
+    top_row = (
+        5,
+        1000,  # artifact
+        20,
+        950,  # timestamp_desc
+        1,
+        900,  # display_name — constant, but still listed
+        1000,
+        1000,  # parser_name — identifier, but still listed
+    )
+    attr_rows = [
+        ("status_code", 6, 1000),
+        ("session_id", 980, 980),
+    ]
+    svc = _svc_with_recommend_responses(top_row, attr_rows)
+    inventory, total = svc.field_inventory("c1", ["s1"])
+
+    assert total == 1000
+    assert inventory == [
+        ("artifact", 5, 1000),
+        ("timestamp_desc", 20, 950),
+        ("display_name", 1, 900),
+        ("parser_name", 1000, 1000),
+        ("attr:status_code", 6, 1000),
+        ("attr:session_id", 980, 980),
+    ]
+
+
+def test_field_inventory_skips_count_query_when_total_supplied():
+    top_row = (5, 100, 2, 90, 1, 80, 100, 100)
+    responses = [
+        FakeQueryResult(result_rows=[top_row], column_names=["c"] * 8),
+        FakeQueryResult(result_rows=[], column_names=["key", "dist", "cov_count"]),
+    ]
+    svc = _svc(responses)
+    inventory, total = svc.field_inventory("c1", ["s1"], total=100)
+    assert total == 100
+    assert len(inventory) == 4
+    # No count() round-trip: only the two enumeration queries ran.
+    assert len(svc.ch.client._calls) == 2
+
+
 # ---------------------------------------------------------------------------
 # find_value_novelty — smart default via recommender
 # ---------------------------------------------------------------------------

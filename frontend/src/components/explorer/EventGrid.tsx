@@ -325,7 +325,7 @@ function AnnotationCell(props: AnnotationCellProps) {
           </span>
         </Tooltip>
       ) : (
-        <span className="p-1 w-[29px]" /> /* placeholder to keep layout stable */
+        <span className="p-1 w-[13px]" /> /* placeholder matching the icon's own box, to keep layout stable */
       )}
       <NormalToggle {...props} />
       <TagPopover {...props} />
@@ -397,7 +397,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       // Annotation column — outlier indicator + tag/comment popovers
       {
         id: "_annotations",
-        size: 88,
+        size: 104,
         enableResizing: false,
         header: () => null,
         cell: ({ row }) => (
@@ -421,7 +421,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             className="flex items-center gap-1 hover:text-[var(--color-fg-primary)] transition-base"
             title={sortDir === "desc" ? "Newest first — click for oldest first" : "Oldest first — click for newest first"}
           >
-            Timestamp
+            Timestamp (UTC)
             {sortDir === "desc" ? <ArrowDown size={10} /> : <ArrowUp size={10} />}
           </button>
         ),
@@ -740,7 +740,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
               className="relative px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
-                flex: h.column.id === "message" ? "1 1 0" : undefined,
+                flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
               }}
             >
               {flexRender(h.column.columnDef.header, h.getContext())}
@@ -826,7 +826,14 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                         cell.column.id === "message"
                           ? undefined
                           : cell.column.getSize(),
-                      flex: cell.column.id === "message" ? "1 1 0" : undefined,
+                      // Fixed-width columns must never shrink below their set size —
+                      // flex's default flex-shrink:1 would otherwise squeeze icon
+                      // buttons into each other on a narrow viewport instead of the
+                      // row simply overflowing (handled by the container's scroll).
+                      flex:
+                        cell.column.id === "message"
+                          ? "1 1 0"
+                          : `0 0 ${cell.column.getSize()}px`,
                       minWidth: 0,
                       // allow message column to overflow for flex layout
                       overflow: cell.column.id === "message" ? "hidden" : undefined,
