@@ -42,6 +42,6 @@ async def download_converter(name: str, user: User = Depends(get_current_user)) 
         raise HTTPException(status_code=404, detail="Converter not found")
     return FileResponse(
         ASSETS_DIR / entry["filename"],
-        media_type="text/x-python",
+        media_type="text/plain",
         filename=entry["filename"],
     )
