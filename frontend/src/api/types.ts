@@ -403,6 +403,8 @@ export interface UploadResult {
   events_inserted: number;
   parser: string;
   duplicate?: boolean;
+  /** Ingest lifecycle of source_id at response time — "ingesting" | "ready". */
+  status?: string;
   /** Background ingestion job to poll for progress; null for duplicates. */
   job_id?: string | null;
 }

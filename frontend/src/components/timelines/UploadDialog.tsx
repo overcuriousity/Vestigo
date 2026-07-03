@@ -47,6 +47,9 @@ export function UploadDialog({ caseId }: Props) {
         setFile(null);
         setParser("");
       }
+      // A duplicate can point at a source that lost a concurrent-upload race
+      // and is still ingesting (status !== "ready") — the source list panel
+      // shows its live "Ingesting" badge/progress, so don't claim it's done.
     },
   });
 
@@ -160,7 +163,9 @@ export function UploadDialog({ caseId }: Props) {
           {/* Result */}
           {data && data.duplicate && (
             <div className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning-dim)] px-3 py-2 text-xs text-[var(--color-warning)]">
-              This file has already been ingested ({data.events_parsed.toLocaleString()} events).
+              {data.status === "ready"
+                ? `This file has already been ingested (${data.events_parsed.toLocaleString()} events).`
+                : "This file is already being ingested by another upload — check the source list for progress."}
             </div>
           )}
           {error && (

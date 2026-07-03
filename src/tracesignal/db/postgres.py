@@ -105,6 +105,16 @@ class Source(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ready", server_default="ready"
     )
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether this source has finished ingestion and is queryable.
+
+        The single predicate every caller must use instead of comparing
+        ``status`` inline — see ``events._resolve_timeline_scope``.
+        """
+        return self.status == "ready"
+
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Per-source field selection chosen by the analyst in the embedding wizard.
     # Shape: {"version": 1, "artifacts": {"<artifact>": ["message", "attr:key", ...]}}
@@ -875,6 +885,22 @@ class PostgresStore:
             )
             await session.commit()
 
+    async def source_hash_in_use(self, file_hash: str, *, exclude_source_id: str) -> bool:
+        """Whether any *other* source row (in any case) still has this file hash.
+
+        Retention storage is content-addressed by hash alone (not per-case),
+        so a file uploaded into multiple cases shares one retained copy —
+        callers must check this before deleting a retained file for a source
+        being removed, or they'd delete a copy another case still needs.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source.id).where(
+                    Source.file_hash == file_hash, Source.id != exclude_source_id
+                )
+            )
+            return result.scalar_one_or_none() is not None
+
     async def list_ingesting_sources(self) -> list[Source]:
         """Return every source still marked "ingesting", across all cases.
 
@@ -1092,6 +1118,21 @@ class PostgresStore:
                     Timeline.id == timeline_id,
                 )
                 .order_by(Source.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def list_timelines_for_source(self, case_id: str, source_id: str) -> list[Timeline]:
+        """Return timelines in a case that include the given source."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .join(TimelineSource)
+                .where(
+                    Timeline.case_id == case_id,
+                    TimelineSource.source_id == source_id,
+                )
             )
             return list(result.scalars().all())
 

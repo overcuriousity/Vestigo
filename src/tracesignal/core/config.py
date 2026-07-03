@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # Default 10 GiB — generous for single timeline exports while still
     # bounding how much disk one request can consume (uploads are copied to a
     # temp file plus a retained content-addressed copy).
-    max_upload_bytes: int = 10 * 1024**3
+    max_upload_bytes: int = Field(default=10 * 1024**3, ge=0)
 
     # Authentication: local admin bootstrap
     # Seeds the first administrator on startup if no users exist yet. The

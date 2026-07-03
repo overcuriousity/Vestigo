@@ -105,13 +105,28 @@ async def _reconcile_orphaned_ingests() -> None:
     orphans = await store.list_ingesting_sources()
     if not orphans:
         return
+    from tracesignal.api.routers.cases import _retention_path
     from tracesignal.db.clickhouse import ClickHouseStore
 
     try:
         clickhouse = ClickHouseStore()
-        for source in orphans:
+    except Exception:
+        logger.exception(
+            "Failed to reach ClickHouse while reconciling %d orphaned ingesting source(s); "
+            "retrying on next restart.",
+            len(orphans),
+        )
+        return
+
+    # Each orphan is cleaned up independently — a failure on one (e.g. a
+    # transient ClickHouse error on its partition) must not stop the rest
+    # of the batch from being reconciled this boot.
+    for source in orphans:
+        try:
             await asyncio.to_thread(clickhouse.delete_source_events, source.case_id, source.id)
             await store.delete_source(source.case_id, source.id)
+            if not await store.source_hash_in_use(source.file_hash, exclude_source_id=source.id):
+                _retention_path(source.file_hash).unlink(missing_ok=True)
             await store.record_audit(
                 action="source.ingest_interrupted",
                 case_id=source.case_id,
@@ -125,8 +140,13 @@ async def _reconcile_orphaned_ingests() -> None:
                 source.name,
                 source.case_id,
             )
-    except Exception:
-        logger.exception("Failed to reconcile %d orphaned ingesting source(s).", len(orphans))
+        except Exception:
+            logger.exception(
+                "Failed to reconcile orphaned source %r (case %s); it stays 'ingesting' and "
+                "will be retried on the next restart.",
+                source.name,
+                source.case_id,
+            )
 
 
 @asynccontextmanager

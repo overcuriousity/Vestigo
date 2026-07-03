@@ -163,7 +163,7 @@ async def _resolve_timeline_scope(
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
     sources = await store.list_timeline_sources(case_id, timeline_id)
-    return [s.id for s in sources if s.status == "ready"], timeline.field_mappings or None
+    return [s.id for s in sources if s.is_ready], timeline.field_mappings or None
 
 
 async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[str]:
@@ -1057,7 +1057,7 @@ async def _resolve_similarity_source_ids(case_id: str, timeline_id: str | None) 
     sources = await store.list_sources(case_id)
     # Same readiness rule as _resolve_timeline_scope: never search
     # half-ingested sources.
-    return [s.id for s in sources if s.status == "ready"]
+    return [s.id for s in sources if s.is_ready]
 
 
 @router.get("/{case_id}/events/{event_id}/similar")
