@@ -50,7 +50,7 @@ export function ConverterPanel() {
         </p>
       )}
       {data && (
-        <div className="space-y-1.5">
+        <div className="max-h-64 space-y-1.5 overflow-y-auto pr-1">
           {data.converters.map((c) => (
             <div
               key={c.name}
