@@ -1007,9 +1007,7 @@ async def export_events(
         # so a pattern that passes _validate_regex's re.compile pre-check but
         # is rejected by ClickHouse's RE2 driver still surfaces as a clean 400
         # instead of breaking the response mid-stream.
-        await _run_regex_guarded(
-            True, _get_query_service().query, replace(eq, limit=1, offset=0)
-        )
+        await _run_regex_guarded(True, _get_query_service().query, replace(eq, limit=1, offset=0))
 
     if body.format == "jsonl":
         media_type = "application/x-ndjson"

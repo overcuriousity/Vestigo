@@ -239,9 +239,7 @@ async def get_field_numeric_stats(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await _run_regex_guarded(
-        query.q_regex, service.field_numeric_stats, query, field, bins
-    )
+    return await _run_regex_guarded(query.q_regex, service.field_numeric_stats, query, field, bins)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-timeseries")
