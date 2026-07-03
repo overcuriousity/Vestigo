@@ -84,6 +84,45 @@ def hash_file(
     return hasher.hexdigest()
 
 
+class UploadTooLargeError(Exception):
+    """Raised when a streamed upload exceeds the configured size limit."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"Upload exceeds the configured limit of {max_bytes} bytes")
+        self.max_bytes = max_bytes
+
+
+def copy_and_hash(
+    src: BinaryIO,
+    dst: BinaryIO,
+    algorithm: str = DEFAULT_HASH_ALGORITHM,
+    chunk_size: int = CHUNK_SIZE,
+    max_bytes: int | None = None,
+) -> tuple[str, int]:
+    """Copy ``src`` into ``dst`` in a single pass, hashing along the way.
+
+    Replaces the hash-then-rewind-then-copy two-pass upload pattern with one
+    read of the stream. When ``max_bytes`` is set, raises
+    :py:class:`UploadTooLargeError` as soon as the stream exceeds it, so an
+    oversized upload is rejected mid-stream instead of after filling the disk.
+
+    Returns:
+        ``(hex_digest, size_bytes)`` of the copied content.
+    """
+    hasher = _hash_algorithm(algorithm)
+    size = 0
+    while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+            break
+        size += len(chunk)
+        if max_bytes is not None and size > max_bytes:
+            raise UploadTooLargeError(max_bytes)
+        hasher.update(chunk)
+        dst.write(chunk)
+    return hasher.hexdigest(), size
+
+
 def hash_string(content: str, algorithm: str = DEFAULT_HASH_ALGORITHM) -> str:
     """Return a hex digest of ``content``.
 

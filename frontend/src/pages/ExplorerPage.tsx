@@ -287,9 +287,17 @@ export function ExplorerPage() {
     queryKey: ["timeline-sources", caseId, timelineId],
     queryFn: () => timelinesApi.listSources(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
+    // Poll while any source is still ingesting so the banner clears (and the
+    // grid picks the source up) without a manual refresh.
+    refetchInterval: (query) =>
+      query.state.data?.some((s) => s.status !== "ready") ? 4000 : false,
   });
 
   const hasVectors = timelineSources?.some((s) => s.vector_count > 0) ?? false;
+  // Sources still ingesting are excluded from every query by the backend
+  // (events._resolve_timeline_scope) — surface that so partial results are
+  // never mistaken for complete ones.
+  const ingestingSources = timelineSources?.filter((s) => s.status !== "ready") ?? [];
 
   // The filter rail's search box runs semantic search in the background once
   // embeddings exist for this timeline, so a free-text query narrows the grid
@@ -328,6 +336,19 @@ export function ExplorerPage() {
 
   const queryClient = useQueryClient();
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
+
+  // When the last ingesting source flips to ready the backend starts
+  // including it in query scope — refetch the grid and histogram so the new
+  // events appear without a manual refresh.
+  const ingestingCount = ingestingSources.length;
+  const prevIngestingCount = useRef(ingestingCount);
+  useEffect(() => {
+    if (prevIngestingCount.current > 0 && ingestingCount === 0) {
+      queryClient.invalidateQueries({ queryKey: ["events", caseId, timelineId] });
+      queryClient.invalidateQueries({ queryKey: ["histogram", caseId, timelineId] });
+    }
+    prevIngestingCount.current = ingestingCount;
+  }, [ingestingCount, caseId, timelineId, queryClient]);
 
   const {
     data: eventsData,
@@ -802,6 +823,19 @@ export function ExplorerPage() {
             >
               Back to filtered view
             </button>
+          </div>
+        )}
+
+        {/* Sources still ingesting — excluded from results until ready */}
+        {ingestingSources.length > 0 && (
+          <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
+            <Spinner size={11} />
+            <span>
+              {ingestingSources.length === 1
+                ? `Source "${ingestingSources[0].name}" is still ingesting`
+                : `${ingestingSources.length} sources are still ingesting`}{" "}
+              — excluded from results until complete.
+            </span>
           </div>
         )}
 

@@ -1,6 +1,6 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "bf2af7006bc6d732083c25745c2d8e8790efa434",
+  "commit": "00eee4b82a445400f3ea7e33fefded55f11ebb77",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
@@ -12,8 +12,8 @@
         "places.sqlite",
         "History (Chromium SQLite)"
       ],
-      "size_bytes": 85121,
-      "sha256": "cd58a3b826d3be1895497fbc6e54e56aae2d837220d098f21b5ad97b074e69d9"
+      "size_bytes": 98831,
+      "sha256": "ca991ea60607e518ee2cafa749aa2797110ce2ae0aac98ec1ca8fe93d305a01e"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -22,8 +22,8 @@
       "inputs": [
         "CloudTrail .json / .json.gz"
       ],
-      "size_bytes": 26060,
-      "sha256": "889e8bdaa45f420a7f241adcd6e8533585481aab2f357f7a7c577fa4324d7698"
+      "size_bytes": 40280,
+      "sha256": "264a4b7ff3aa5947c01f2f0ccca15506ebd3c35984561ebdf224d822c6b84297"
     },
     {
       "name": "filterlog2timesketch",
@@ -32,8 +32,8 @@
       "inputs": [
         "filter.log (syslog filterlog lines)"
       ],
-      "size_bytes": 34672,
-      "sha256": "1e081bff46bcf6dd9163c50c15ea45beff788b27eb253b8f9cf3b074c2ee2125"
+      "size_bytes": 48783,
+      "sha256": "2c1baa50cd38d8a0bf6d5aa1800ed20000db7bcdcdb2e2b2fa083499e7b9589b"
     },
     {
       "name": "journal2timesketch",
@@ -42,8 +42,8 @@
       "inputs": [
         "journal directory / journalctl -o json"
       ],
-      "size_bytes": 22537,
-      "sha256": "8fc220fa42e49247d661334ac78b214a940b3ca636e8f8386c626b871ffa9a21"
+      "size_bytes": 36572,
+      "sha256": "6511548de8ea45ddbe0ce740f89387342658659617e7e2553f413074efbca93d"
     },
     {
       "name": "nginx2timesketch",
@@ -53,8 +53,20 @@
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 27007,
-      "sha256": "a8a7e4790310654674f9497ec93f2360a524adc76dad40c6d86fd3a4e0d3c82a"
+      "size_bytes": 41334,
+      "sha256": "add71c56d15ce91a9174c1180ae5feb011d87d75222fe437a7225b8faa231359"
+    },
+    {
+      "name": "suricata2timesketch",
+      "filename": "suricata2timesketch.py",
+      "description": "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
+      "inputs": [
+        "eve.json",
+        "fast.log",
+        "OPNsense suricata syslog export"
+      ],
+      "size_bytes": 51186,
+      "sha256": "d34176fdc6c28a7119698d03d51fba3f7b9ab5032e296c21587f41a59c114da9"
     }
   ]
 }

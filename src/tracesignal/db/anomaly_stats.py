@@ -399,9 +399,7 @@ class StatisticalAnomalyService:
             canonicals = list(field_mappings.items())
             for i, (_, raws) in enumerate(canonicals):
                 expr = mapping_coalesce_expr(raws, m_params, f"inv{i}")
-                m_parts.append(
-                    f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}"
-                )
+                m_parts.append(f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}")
             m_sql = (
                 f"SELECT {', '.join(m_parts)}"
                 f" FROM {db}.events"

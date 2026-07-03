@@ -60,15 +60,35 @@ def test_create_timeline_rejects_core_column_collision(client, admin_bootstrap, 
     assert "core event column" in resp.json()["detail"]
 
 
-def test_create_timeline_rejects_unknown_raw_field(client, admin_bootstrap, fake_inventory):
+async def test_create_timeline_rejects_unknown_raw_field(
+    client, admin_bootstrap, fake_inventory, store
+):
+    as_admin(client, admin_bootstrap)
+    case_id = _create_case(client)
+    # The unknown-raw-key check only runs against ready sources — a case with
+    # no (ready) sources has no inventory to validate against.
+    await store.create_source(case_id, "s1", "source one", file_hash="h1", size_bytes=10)
+    resp = client.post(
+        f"/api/cases/{case_id}/timelines",
+        json={"name": "bad", "source_ids": ["s1"], "field_mappings": {"ip": ["nope"]}},
+    )
+    assert resp.status_code == 422
+    assert "does not exist" in resp.json()["detail"]
+
+
+def test_create_timeline_skips_inventory_check_without_ready_sources(
+    client, admin_bootstrap, fake_inventory
+):
+    """With zero ready sources there is no attribute inventory yet — the
+    inventory-dependent checks are skipped (structural rules still apply,
+    see test_create_timeline_rejects_core_column_collision)."""
     as_admin(client, admin_bootstrap)
     case_id = _create_case(client)
     resp = client.post(
         f"/api/cases/{case_id}/timelines",
-        json={"name": "bad", "field_mappings": {"ip": ["nope"]}},
+        json={"name": "ok", "field_mappings": {"ip": ["nope"]}},
     )
-    assert resp.status_code == 422
-    assert "does not exist" in resp.json()["detail"]
+    assert resp.status_code == 200, resp.text
 
 
 def test_patch_replaces_and_clears_mappings(client, admin_bootstrap, fake_inventory):
@@ -93,12 +113,15 @@ def test_patch_replaces_and_clears_mappings(client, admin_bootstrap, fake_invent
     assert resp.json()["timeline"]["field_mappings"] is None
 
 
-def test_patch_validates_against_timeline_sources(client, admin_bootstrap, fake_inventory):
+async def test_patch_validates_against_timeline_sources(
+    client, admin_bootstrap, fake_inventory, store
+):
     as_admin(client, admin_bootstrap)
     case_id = _create_case(client)
-    tid = client.post(f"/api/cases/{case_id}/timelines", json={"name": "t"}).json()["timeline"][
-        "id"
-    ]
+    await store.create_source(case_id, "s1", "source one", file_hash="h1", size_bytes=10)
+    tid = client.post(
+        f"/api/cases/{case_id}/timelines", json={"name": "t", "source_ids": ["s1"]}
+    ).json()["timeline"]["id"]
     resp = client.patch(
         f"/api/cases/{case_id}/timelines/{tid}/field-mappings",
         json={"field_mappings": {"ip": ["missing_key"]}},

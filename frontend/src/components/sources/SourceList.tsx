@@ -25,6 +25,13 @@ function SourceRow({ caseId, source }: { caseId: string; source: Source }) {
           {source.parser && (
             <Badge variant="muted">{fmtParserName(source.parser)}</Badge>
           )}
+          {source.status !== "ready" && (
+            <Badge variant="accent">
+              <span className="flex items-center gap-1">
+                <Spinner size={10} /> Ingesting
+              </span>
+            </Badge>
+          )}
         </div>
         <div className="mt-1 flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
           <span className="flex items-center gap-1">

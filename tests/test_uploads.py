@@ -14,9 +14,10 @@ from tests.conftest import _fake_user
 from tracesignal.api import deps
 from tracesignal.api.routers import cases
 from tracesignal.api.routers.cases import upload_source
+from tracesignal.core.config import get_settings
 from tracesignal.core.jobs import get_job_store
 from tracesignal.db.postgres import PostgresStore
-from tracesignal.ingestion.files import hash_file
+from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash, hash_file
 from tracesignal.ingestion.pipeline import IngestionResult
 
 
@@ -217,3 +218,144 @@ async def test_failed_ingestion_marks_job_failed_and_removes_source(
     retry = await _upload(case_obj, "bad.jsonl", content)
     assert retry.duplicate is False
     assert get_job_store().get(retry.job_id).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_oversized_upload_rejected_with_413(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upload larger than TS_MAX_UPLOAD_BYTES is rejected mid-stream and
+    creates neither a source row nor a job."""
+    monkeypatch.setenv("TS_MAX_UPLOAD_BYTES", "8")
+    get_settings.cache_clear()
+    try:
+        case_obj = await store.get_case(case)
+        with pytest.raises(HTTPException) as exc_info:
+            await _upload(case_obj, "big.jsonl", b'{"message":"way too large"}\n')
+        assert exc_info.value.status_code == 413
+        assert await store.list_sources(case) == []
+    finally:
+        get_settings.cache_clear()
+
+
+def test_copy_and_hash_matches_hash_file_and_caps(tmp_path: Path) -> None:
+    """copy_and_hash produces the same digest as hash_file and enforces max_bytes."""
+    content = b"line one\nline two\n"
+    src_path = tmp_path / "src.log"
+    src_path.write_bytes(content)
+
+    dst = BytesIO()
+    digest, size = copy_and_hash(BytesIO(content), dst)
+    assert size == len(content)
+    assert dst.getvalue() == content
+    assert digest == hash_file(src_path)
+
+    with pytest.raises(UploadTooLargeError):
+        copy_and_hash(BytesIO(content), BytesIO(), max_bytes=len(content) - 1)
+
+
+@pytest.mark.asyncio
+async def test_source_status_lifecycle(
+    store: PostgresStore,
+    case: str,
+) -> None:
+    """A source is created "ingesting" and flips to "ready" when the job
+    completes — only then does it become visible to timeline queries."""
+    case_obj = await store.get_case(case)
+
+    # Call upload_source without running the scheduled background job yet, so
+    # the mid-ingest state is observable.
+    background_tasks = BackgroundTasks()
+    response = await upload_source(
+        background_tasks=background_tasks,
+        file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
+        parser=None,
+        case=case_obj,
+        user=_fake_user(),
+    )
+    source = await store.get_source(case, response.source_id)
+    assert source.status == "ingesting"
+
+    await background_tasks()
+    source = await store.get_source(case, response.source_id)
+    assert source.status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_ingesting_source_excluded_from_timeline_scope(
+    store: PostgresStore,
+    case: str,
+) -> None:
+    """_resolve_timeline_scope must never return a half-ingested source."""
+    from tracesignal.api.routers.events import _resolve_timeline_scope
+
+    await store.create_source(case, "s_ready", "ready one", file_hash="h1", size_bytes=1)
+    await store.create_source(
+        case, "s_pending", "pending one", file_hash="h2", size_bytes=1, status="ingesting"
+    )
+    default_timeline = await store.get_default_timeline(case)
+    await store.add_source_to_timeline(case, default_timeline.id, "s_ready")
+    await store.add_source_to_timeline(case, default_timeline.id, "s_pending")
+
+    source_ids, _ = await _resolve_timeline_scope(case, default_timeline.id)
+    assert source_ids == ["s_ready"]
+
+
+@pytest.mark.asyncio
+async def test_embed_refuses_ingesting_sources(
+    store: PostgresStore,
+    case: str,
+) -> None:
+    """Embedding persists vectors — it must refuse a timeline with a
+    half-ingested member instead of silently embedding partial data."""
+    from tracesignal.api.routers.cases import start_timeline_embedding
+
+    await store.create_source(
+        case, "s_pending", "pending one", file_hash="h2", size_bytes=1, status="ingesting"
+    )
+    default_timeline = await store.get_default_timeline(case)
+    await store.add_source_to_timeline(case, default_timeline.id, "s_pending")
+
+    case_obj = await store.get_case(case)
+    with pytest.raises(HTTPException) as exc_info:
+        await start_timeline_embedding(
+            timeline_id=default_timeline.id,
+            background_tasks=BackgroundTasks(),
+            body=None,
+            case=case_obj,
+            user=_fake_user(),
+        )
+    assert exc_info.value.status_code == 409
+    assert "still ingesting" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_removes_orphaned_ingests(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source stuck in "ingesting" on boot (in-memory job lost to a restart)
+    is cleaned up like a failed ingest, so the file can be re-uploaded."""
+    from tracesignal.api import main as api_main
+
+    await store.create_source(
+        case, "s_orphan", "orphan", file_hash="h9", size_bytes=1, status="ingesting"
+    )
+
+    deleted: list[tuple[str, str]] = []
+
+    class FakeClickHouse:
+        def delete_source_events(self, case_id: str, source_id: str) -> None:
+            deleted.append((case_id, source_id))
+
+    monkeypatch.setattr(api_main, "ClickHouseStore", FakeClickHouse, raising=False)
+    monkeypatch.setattr("tracesignal.db.clickhouse.ClickHouseStore", FakeClickHouse)
+
+    await api_main._reconcile_orphaned_ingests()
+
+    assert deleted == [(case, "s_orphan")]
+    assert await store.get_source(case, "s_orphan") is None
+    assert await store.list_ingesting_sources() == []
