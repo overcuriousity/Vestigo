@@ -1,15 +1,13 @@
 # TraceVector Implementation Progress
 
-Last updated: 2026-07-03 (session 9 — resolved the remaining PR #8 review items: all 7
-correctness bugs are fixed plus 4 of the 9 cleanup items; web ingestion now runs as a
-background job with a live progress bar in the job tray)
+Last updated: 2026-07-03 (session 10 — closed out the last PR #8 review items #9/#11/#14/
+#15/#16: fused the field_terms double scan into one window-aggregate query, unified the
+column-token SQL resolution helper, extracted shared chart boilerplate primitives, moved the
+chartType clamp out of an effect, and gave the Visualization field picker its own unfiltered
+`GET .../viz/fields` inventory endpoint)
 
-**Open follow-up:** PR #8 (per-value histograms + visualization page,
-`feat/viz-histograms-and-visualization-page`): all 7 confirmed correctness bugs from the
-review are fixed. Of the 9 cleanup/design items, #8/#10/#12/#13 are done; #9 (backend
-double scans), #11 (`_field_column_expr` duplication), #14 (chart boilerplate hooks),
-#15 (chartType/scale effect coupling), and #16 (field picker reusing the anomaly-fields
-endpoint) remain deliberate follow-ups — see `docs/archive/PR8_REVIEW_FINDINGS.md`.
+**Open follow-up:** none for PR #8 — every finding from its review (7 correctness bugs +
+9 cleanup/design items) is resolved; see `docs/archive/PR8_REVIEW_FINDINGS.md`.
 
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in [`TECH_STACK.md`](./TECH_STACK.md).

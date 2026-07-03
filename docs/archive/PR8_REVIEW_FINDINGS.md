@@ -12,9 +12,9 @@ existing behavior, tests, or CSS rules were removed, and no CLAUDE.md rule viola
 found. Verification did surface real correctness bugs, mostly at the edges of the new
 aggregation queries and the D3 scale/color logic, plus a set of cleanup opportunities.
 
-**Status: correctness bugs fully resolved.** 5 of 7 fixed 2026-07-02; bugs 6–7 plus design
-items 8/10/12/13 fixed 2026-07-03. Design items 9/11/14/15/16 remain open as deliberate
-lower-priority refactors. This file is a fix-it reference for whoever picks those up next.
+**Status: fully resolved.** 5 of 7 correctness bugs fixed 2026-07-02; bugs 6–7 plus design
+items 8/10/12/13 fixed 2026-07-03; the remaining design items 9/11/14/15/16 fixed later on
+2026-07-03. Nothing from this review is open.
 
 ## Resolution summary
 
@@ -33,14 +33,14 @@ lower-priority refactors. This file is a fix-it reference for whoever picks thos
 | # | Status | What happened |
 |---|--------|----------------|
 | 8 | ✅ Fixed | The numeric probe query is now gated: it runs once per field change (scale auto-suggestion, tracked via `autoProbedField` state) and while a numeric chart is displayed — no longer on every bins change on a terms chart. |
-| 9 | ⬜ Open | Backend double scans in `field_terms`/`field_numeric_stats`/`field_value_timeseries`. |
+| 9 | ✅ Fixed | `field_terms` fused into one scan — the GROUP BY now carries pre-LIMIT totals via window aggregates (`sum(count()) OVER ()` for the event total, `count() OVER ()` for distinct-values-as-group-count). Pre-LIMIT semantics verified against live ClickHouse (LIMIT 2 over 3 groups returns the full total/distinct on every row). This also removes the wasted totals scan inside `field_value_timeseries`'s `field_terms` call (3 scans → 2). `field_numeric_stats` deliberately keeps two scans — bin edges depend on the first scan's min/max; documented in its docstring. |
 | 10 | ✅ Fixed | `VisualizePage` clamps the shared `topN` via `effectiveTopN = min(topN, maxTopN)` per data kind — request, slider position, and label always agree after a chart-type switch. |
-| 11 | ⬜ Open | `_field_column_expr` duplication of `_ParameterizedQueryBuilder._column_expr`. |
+| 11 | ✅ Fixed | `_field_column_expr` is now the single implementation (grew a lazy `param_name: str \| Callable` and a `cast_non_string` flag); `_ParameterizedQueryBuilder._column_expr` is a one-line delegate passing its bound `_param_name`, so `pN` numbering is unchanged. |
 | 12 | ✅ Fixed | Folded into bug 7 (shared `lib/download.ts`). |
 | 13 | ✅ Fixed | New `serializeEventFilterParams` in `lib/queryParams.ts` (scalar fields + JSON-stringified `filters`/`exclusions`); `api/viz.ts` (3×) and `api/events.ts` (2×) now use it instead of hand-rolled stringify blocks. |
-| 14 | ⬜ Open | Shared chart hooks (`useChartRef`/`ChartEmptyState`/`useChartHover`). |
-| 15 | ⬜ Open | `chartType`/`scale` sync via two `useEffect`s. |
-| 16 | ⬜ Open | Field picker reuses `/anomalies/fields`. |
+| 14 | ✅ Fixed | New `primitives/useChartRef` + `primitives/ChartEmptyState` replace the identical ref-fallback and empty-state markup in all 9 charts; `lib/pointer.ts::svgLocalPoint` extracts the `getBoundingClientRect`+margin math from the 3 hover-strip charts. Deliberately no `useChartHover` — it would wrap a bare `useState`, and `LineChart`'s index-based hover state genuinely differs. |
+| 15 | ✅ Fixed | The chartType-validity sync effect (with its exhaustive-deps suppression) is gone — the clamp happens in the scale radio's change handler, sharing one module-level `chartTypesFor(scale)` helper with `availableChartTypes`. |
+| 16 | ✅ Fixed | New unfiltered `GET .../viz/fields` endpoint (`{fields:[{token,distinct,coverage}]}`, coverage-desc/token-asc) backed by `StatisticalAnomalyService.field_inventory` — the raw enumeration extracted out of `recommend_novelty_fields`, which now just layers classification on top (output unchanged). `VisualizePage` switched to it; default field is now the highest-coverage one. `AnomalyFieldPicker`/`FrequencyView` keep the anomaly endpoint. |
 
 Verified after each fix: backend `uv run pytest` (274 passed) and `uv run ruff check .` clean;
 frontend `npm run test` (59 passed), `npm run typecheck`, and `npm run lint` clean (lint's 3
@@ -51,6 +51,11 @@ and the new ingestion progress bar were additionally verified end-to-end against
 app (real ClickHouse/Postgres/Qdrant, Playwright-driven UI): the heatmap axis now renders
 distinct, unclipped, thinned UTC tick labels, and a 300k-event upload shows live byte-based
 progress in the job tray, completing with the source list auto-refreshing to the final count.
+
+2026-07-03 later session (items 9/11/14/15/16): backend 281 passed, frontend 72 passed,
+ruff/tsc/oxlint clean (lint's 3 warnings still the pre-existing ones). The fused
+`field_terms` SQL was additionally validated against the live ClickHouse instance — window
+aggregate totals match the old two-scan reference exactly, including under LIMIT.
 
 ## Correctness bugs (verified against the code)
 
