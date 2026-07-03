@@ -11,6 +11,15 @@ Confirmed decisions:
 | #10 field aggregation | **Hybrid**: query-time field mapping now; optional physical materialization later |
 | #11 converters | **Commit snapshot in-repo**, vendored from `overcuriousity/2timesketch` |
 
+Additional decisions (session 2026-07-03):
+
+- #5 env vars: **hard cutover** `TV_` → `TS_`, no fallback shim; `docs/MIGRATION_RENAME.md`
+  covers existing deployments. Frontend `localStorage` keys renamed `tv-*` → `tsig-*`.
+- #10 merge suggestions: **name similarity + value-shape heuristics** (extend
+  `db/field_recommend.py`). No embedding-based semantic proximity — embeddings are optional
+  and usually absent at timeline-creation time; possible future enhancement. Sample values
+  of actual data are always visible in the mapping table.
+
 Recommended implementation order — three separate PRs:
 
 1. **#5 rename** first. It is mechanical but touches ~71 files; doing it before the
@@ -23,7 +32,7 @@ Recommended implementation order — three separate PRs:
 
 ---
 
-## Issue #5 — Rename TraceVector → TraceSignal
+## Issue #5 — Rename TraceSignal → TraceSignal
 
 Rationale (from the issue): anomaly detection is primarily statistical, not
 vector-based; "Signal" describes the actual value proposition (traces → actionable
@@ -32,36 +41,36 @@ signals) while keeping the "Trace" root.
 ### Scope of the full rename
 
 **Backend**
-- `src/tracevector/` → `src/tracesignal/`; update every `from tracevector...` import
+- `src/tracesignal/` → `src/tracesignal/`; update every `from tracesignal...` import
   (mechanical, `git mv` + search/replace, verified by the test suite).
 - `pyproject.toml`: `name = "tracesignal"`, authors unchanged.
-- CLI entry points: `tv` → `tsig`, `tv-web` → `tsig-web`
+- CLI entry points: `tsig` → `tsig`, `tsig-web` → `tsig-web`
   (`ts` is avoided — too generic and collides with Timesketch tooling mentally;
   `tsig` stays short and unambiguous).
-- Env prefix: `TV_` → `TS_` (`core/config.py::env_prefix`), plus `.env.example`,
-  `docker-compose.yml`, and every doc that mentions a `TV_*` variable.
+- Env prefix: `TS_` → `TS_` (`core/config.py::env_prefix`), plus `.env.example`,
+  `docker-compose.yml`, and every doc that mentions a `TS_*` variable.
 - Default service credentials/names in `.env.example` and `docker-compose.yml`:
-  `tracevector` Postgres user/db → `tracesignal`, ClickHouse database
-  `tracevector` → `tracesignal`, Qdrant collection prefix `tracevector` → `tracesignal`.
+  `tracesignal` Postgres user/db → `tracesignal`, ClickHouse database
+  `tracesignal` → `tracesignal`, Qdrant collection prefix `tracesignal` → `tracesignal`.
 
 **Frontend**
 - `frontend/package.json` name, `index.html` title, top-bar branding string,
-  any UI copy mentioning TraceVector.
+  any UI copy mentioning TraceSignal.
 
 **Docs & meta**
 - `README.md`, `CLAUDE.md`, `docs/CONCEPT.md`, `docs/TECH_STACK.md`,
   `docs/MODEL_REFINEMENT.md`, `docs/ROADMAP.md`, `docs/PROGRESS.md`.
 - `docs/archive/*` stays untouched — historical record.
-- GitHub repo rename `ScalarForensic/TraceVector` → `ScalarForensic/TraceSignal`
+- GitHub repo rename `ScalarForensic/TraceSignal` → `ScalarForensic/TraceSignal`
   is a **manual owner action** (GitHub redirects the old URL automatically).
   Local remotes keep working; update them at leisure.
 
 **Migration note** — add a short `docs/MIGRATION_RENAME.md`:
-- Existing deployments must rename `TV_*` env vars to `TS_*`.
+- Existing deployments must rename `TS_*` env vars to `TS_*`.
 - Existing databases do **not** need renaming: set `TS_POSTGRES_URL`,
   `TS_CLICKHOUSE_DATABASE`, `TS_QDRANT_COLLECTION_PREFIX` explicitly to the old
   values. Only the *defaults* change.
-- `uv run tv ...` becomes `uv run tsig ...`.
+- `uv run tsig ...` becomes `uv run tsig ...`.
 
 **Verification**: `uv run pytest`, `uv run ruff check .`, `npm run build`,
 `npm run test`, and a manual `tsig-web` smoke run against the dev compose stack.

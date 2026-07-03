@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from tracevector.db.queries import EventQuery, EventQueryService, TagFilter
+from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
 
 
 @dataclass
@@ -69,7 +69,7 @@ class FakeClickHouseStore:
     """Minimal ClickHouseStore stand-in."""
 
     def __init__(self, event_rows: list[list[Any]] | None = None) -> None:
-        self.database = "tracevector"
+        self.database = "tracesignal"
         self.client = FakeClickHouseClient(event_rows)
         self.schema_initialized = False
 
@@ -796,7 +796,7 @@ def test_list_fields_returns_sorted_attribute_keys() -> None:
 
 
 def test_list_fields_returns_top_level_columns() -> None:
-    from tracevector.db.queries import TOP_LEVEL_DISPLAY_COLUMNS
+    from tracesignal.db.queries import TOP_LEVEL_DISPLAY_COLUMNS
 
     svc = _fields_service([])
     result = svc.list_fields("c1", ["s1"])

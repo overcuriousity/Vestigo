@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from tracevector.db.field_recommend import (
+from tracesignal.db.field_recommend import (
     classify_field,
     cross_source_cohesion,
     recommend_fields,
@@ -316,7 +316,7 @@ def test_single_source_fallback_no_cohesion_penalty():
 
 
 def test_cohesion_summary_strong():
-    from tracevector.db.field_recommend import TimelineFieldVerdict
+    from tracesignal.db.field_recommend import TimelineFieldVerdict
 
     verdicts = [
         TimelineFieldVerdict("message", True, "text", "primary", 2, 0.9),
@@ -328,7 +328,7 @@ def test_cohesion_summary_strong():
 
 
 def test_cohesion_summary_weak():
-    from tracevector.db.field_recommend import TimelineFieldVerdict
+    from tracesignal.db.field_recommend import TimelineFieldVerdict
 
     verdicts = [
         TimelineFieldVerdict("message", True, "text", "primary", 2, 0.3),

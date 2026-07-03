@@ -1,8 +1,8 @@
-# TraceVector
+# TraceSignal
 
 A local-first, forensic-grade log investigation platform for small security teams.
 
-TraceVector ingests Timesketch-compatible timelines at scale, lets analysts explore events
+TraceSignal ingests Timesketch-compatible timelines at scale, lets analysts explore events
 through an ELK-like web interface, and surfaces anomalies both statistically and by embedding
 every log line into a vector database. It's built to run entirely on a team's own hardware —
 airgapped if needed — with reproducible, auditable processing at every step.
@@ -13,7 +13,7 @@ Incident responders and forensic analysts work with massive timeline-shaped data
 output, Windows Event Logs, endpoint telemetry, cloud audit trails). The usual options force a
 tradeoff: a full SIEM is expensive, noisy, and not timeline-native; notebook scripts are
 flexible but not reproducible or team-friendly; [Timesketch](https://github.com/google/timesketch)
-is powerful but operationally heavy. TraceVector aims to be the focused middle ground — ingest
+is powerful but operationally heavy. TraceSignal aims to be the focused middle ground — ingest
 huge logs, explore them like an ELK stack, and let both classic statistical detectors and local
 embeddings surface the needles in the haystack, without needing a cluster to run it.
 
@@ -24,8 +24,8 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   loading everything into memory.
 - Every ingested file (**Source**) is SHA-256 hashed and retained content-addressed for
   re-download — forensic provenance and immutability by construction.
-- CLI-first (`tv ingest`), so ingestion is scriptable and reproducible outside the web UI.
-- A separate, user-triggered embedding job (`tv embed` / the embed wizard) computes vectors
+- CLI-first (`tsig ingest`), so ingestion is scriptable and reproducible outside the web UI.
+- A separate, user-triggered embedding job (`tsig embed` / the embed wizard) computes vectors
   after ingestion — ingestion itself stays fast and embedding-free until you ask for it.
 
 ### Explorer
@@ -79,7 +79,7 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   Qdrant (vectors). None of them run inside the app itself.
 - **Frontend**: React 19 + Vite + TypeScript, served as a static build directly from Uvicorn
   (no separate web server required).
-- **CLI**: a Typer-based `tv` command mirrors the API/UI for scriptable, offline-friendly use.
+- **CLI**: a Typer-based `tsig` command mirrors the API/UI for scriptable, offline-friendly use.
 
 ## Quick start
 
@@ -95,27 +95,27 @@ docker compose up -d
 
 ```bash
 uv sync
-uv run tv-web
+uv run tsig-web
 ```
 
 The API is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`), serving the
 built frontend from `frontend/dist` (auto-built on first run).
 
 For active frontend development, run `npm install && npm run dev` in `frontend/` alongside
-`uv run tv-web` — see `frontend/README.md`. Configuration is env-driven (`TV_*` variables); see
+`uv run tsig-web` — see `frontend/README.md`. Configuration is env-driven (`TS_*` variables); see
 `.env.example` for the full list.
 
 ## Inspiration
 
-TraceVector's design draws on two projects:
+TraceSignal's design draws on two projects:
 
 - **[Timesketch](https://github.com/google/timesketch)** — for the timeline-centric
   investigation model (Plaso-compatible ingestion, ELK-like exploration, saved views,
-  collaborative annotation) that TraceVector aims to make lighter-weight and easier to
+  collaborative annotation) that TraceSignal aims to make lighter-weight and easier to
   self-host.
 - **[ait-aecid/logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner)** —
   for the statistical, non-ML approach to log anomaly detection (rare-value and frequency
-  detectors) that TraceVector's `db/anomaly_stats.py` engine adapts to run directly over
+  detectors) that TraceSignal's `db/anomaly_stats.py` engine adapts to run directly over
   ClickHouse alongside the vector-backed similarity search.
 
 The goal is to land somewhere between the two: Timesketch's investigative UX combined with

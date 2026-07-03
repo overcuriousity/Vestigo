@@ -1,4 +1,4 @@
-# TraceVector — Tech Stack Decision Record
+# TraceSignal — Tech Stack Decision Record
 
 ## 1. Guiding Principles
 - **Local-first / airgap-friendly**: No mandatory cloud services; models download once and run offline.
@@ -12,7 +12,7 @@
 |-------|--------|-----------------|
 | **Language & packaging** | Python | 3.13, managed with `uv` (3.14 support planned as deps mature) |
 | **Web backend** | FastAPI + Uvicorn | Async API server; same stack as ScalarForensic web UI |
-| **CLI ingestion** | Typer + Python stdlib | `tv ingest ...` command, streaming parser |
+| **CLI ingestion** | Typer + Python stdlib | `tsig ingest ...` command, streaming parser |
 | **Frontend** | React 19 + Vite 8 + TypeScript | Zustand (client state) + TanStack Query/Table/Virtual (server state, grid); served as a static build from `frontend/dist`, API-first backend |
 | **Metadata store** | PostgreSQL | Cases, sources, timelines, timeline-source membership, views, annotations, users |
 | **Event store** | ClickHouse | Columnar log store for 80 GiB+ filtering and aggregation |
@@ -32,7 +32,7 @@
   `uv sync` works out of the box on any machine with no GPU-specific setup — this is the
   right choice for evaluation and for deployments that don't run the embedding pipeline.
   GPU acceleration is opt-in and is the recommended path for **production use of the
-  embedding features** (`tv embed`, semantic search, similarity) — embedding large
+  embedding features** (`tsig embed`, semantic search, similarity) — embedding large
   timelines on CPU is significantly slower:
   - **AMD ROCm 6.4** is the primary GPU target (mirrors ScalarForensic).
   - **NVIDIA CUDA 12.8** is also supported.
@@ -46,7 +46,7 @@
 Resolved. The backend exposes a complete REST API (`/api/docs`); the frontend (`frontend/`)
 is a React 19 + Vite 8 + TypeScript SPA, using Zustand for client state, TanStack Query for
 server state, and TanStack Table/Virtual for the event grid. It builds to `frontend/dist`,
-which `tv-web` serves directly (auto-built on first run if missing).
+which `tsig-web` serves directly (auto-built on first run if missing).
 
 ### 3.3 Metadata Store — PostgreSQL
 - External service, provided by the operator.
@@ -57,7 +57,7 @@ which `tv-web` serves directly (auto-built on first run if missing).
 ### 3.4 Event Store — ClickHouse
 - Chosen for its strength with log-shaped data: columnar compression, fast time-range scans, and built-in full-text indexing (`tokenbf_v1`).
 - An 80 GiB source compresses well and filters quickly on modest hardware.
-- **Deployment note**: ClickHouse is an external service. TraceVector connects to it over HTTP/TCP; it is never inside the application package or container.
+- **Deployment note**: ClickHouse is an external service. TraceSignal connects to it over HTTP/TCP; it is never inside the application package or container.
 
 ### 3.5 Vector Store — Qdrant
 - Already proven in ScalarForensic for forensic vector search.
@@ -72,11 +72,11 @@ which `tv-web` serves directly (auto-built on first run if missing).
 
 ## 4. Deployment Model — Application vs. Services
 
-TraceVector itself is **only the Python application**. The databases are external services that the operator provides, exactly like ScalarForensic expects an external Qdrant.
+TraceSignal itself is **only the Python application**. The databases are external services that the operator provides, exactly like ScalarForensic expects an external Qdrant.
 
 ```
 ┌─────────────────────────────────────────┐
-│         TraceVector application         │
+│         TraceSignal application         │
 │     (FastAPI + CLI tools + frontend)    │
 │             runs via `uv`               │
 └─────────────────────────────────────────┘
@@ -94,10 +94,10 @@ The operator starts PostgreSQL, ClickHouse, and Qdrant however they prefer:
 - Managed database services
 - Existing infrastructure
 
-TraceVector only needs connection strings.
+TraceSignal only needs connection strings.
 
 ### 4.2 Optional reference Docker Compose
-For convenience, a `docker-compose.yml` is provided that launches all three backing services. The TraceVector app itself still runs via `uv run tv-web` against those services. This is a reference deployment, not a requirement.
+For convenience, a `docker-compose.yml` is provided that launches all three backing services. The TraceSignal app itself still runs via `uv run tsig-web` against those services. This is a reference deployment, not a requirement.
 
 ### 4.3 Single-user / airgapped shortcut
 For a lone analyst on one machine, Qdrant can run in **local mode** through the Python client (no separate Qdrant process). PostgreSQL and ClickHouse still need a server, but this removes one dependency for simple deployments.
@@ -121,13 +121,13 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 - Model weights can be pre-bundled for fully offline deployment.
 - Docker images can also be pre-bundled, but Docker is not required for airgapped use.
 - Telemetry and cloud APIs are disabled by default and not required.
-- `allow_online`/`TV_ALLOW_ONLINE` is not yet checked at any network call site.
-- Exception: optional OIDC SSO (`TV_OIDC_ENABLED`) is intentionally independent of
-  `TV_ALLOW_ONLINE`. It is operator-opted-in (off by default) and talks to an
+- `allow_online`/`TS_ALLOW_ONLINE` is not yet checked at any network call site.
+- Exception: optional OIDC SSO (`TS_OIDC_ENABLED`) is intentionally independent of
+  `TS_ALLOW_ONLINE`. It is operator-opted-in (off by default) and talks to an
   operator-configured IdP the analyst chose to trust — commonly reachable on the same LAN as
   an otherwise airgapped deployment — rather than an unconditional external call. An operator
-  relying on `TV_ALLOW_ONLINE=false` as the single offline switch should be aware OIDC egress
-  is a separate toggle (`TV_OIDC_ENABLED`).
+  relying on `TS_ALLOW_ONLINE=false` as the single offline switch should be aware OIDC egress
+  is a separate toggle (`TS_OIDC_ENABLED`).
 
 ## 7. Out of Scope for This Stack
 
