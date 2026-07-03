@@ -147,7 +147,11 @@ export function suggestGroups(fields: SuggestInput[]): SuggestedGroup[] {
   };
   const union = (a: string, b: string) => parent.set(find(a), find(b));
 
-  const pairShared = new Map<string, string[]>();
+  // Pair-level records, not keyed by an intermediate union-find root: a
+  // later union can reparent an earlier pair's root, so a map keyed by
+  // "root at union time" can silently lose that pair's shared tokens once
+  // the group is looked up by its *final* root.
+  const pairRecords: { a: string; b: string; shared: string[] }[] = [];
   for (let i = 0; i < meta.length; i++) {
     for (let j = i + 1; j < meta.length; j++) {
       const a = meta[i];
@@ -159,7 +163,7 @@ export function suggestGroups(fields: SuggestInput[]): SuggestedGroup[] {
       const shared = sharedMeaningfulTokens(a.tokens, b.tokens);
       if (shared.length === 0) continue;
       union(a.key, b.key);
-      pairShared.set(find(a.key), shared);
+      pairRecords.push({ a: a.key, b: b.key, shared });
     }
   }
 
@@ -170,9 +174,16 @@ export function suggestGroups(fields: SuggestInput[]): SuggestedGroup[] {
   }
 
   const suggestions: SuggestedGroup[] = [];
-  for (const [root, members] of groups) {
+  for (const [, members] of groups) {
     if (members.length < 2) continue;
-    const shared = pairShared.get(root) ?? [];
+    const memberSet = new Set(members);
+    const shared = [
+      ...new Set(
+        pairRecords
+          .filter((r) => memberSet.has(r.a) && memberSet.has(r.b))
+          .flatMap((r) => r.shared),
+      ),
+    ];
     const shapes = new Set(
       members
         .map((k) => meta.find((m) => m.key === k)!.shape)

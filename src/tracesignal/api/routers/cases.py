@@ -603,6 +603,8 @@ async def update_timeline_field_mappings(
         await _check_field_mappings(case.id, [s.id for s in sources], new_mappings)
     previous = timeline.field_mappings
     updated = await store.update_timeline_field_mappings(case.id, timeline_id, new_mappings)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
     await store.record_audit(
         action="timeline.update_field_mappings",
         actor=user,
