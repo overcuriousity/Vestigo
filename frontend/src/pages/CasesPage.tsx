@@ -1,5 +1,7 @@
 import { CaseList } from "@/components/cases/CaseList";
 import { CreateCaseDialog } from "@/components/cases/CreateCaseDialog";
+import { GuidancePanel } from "@/components/ui/GuidancePanel";
+import { guidance } from "@/lib/guidance";
 import { ShieldAlert } from "lucide-react";
 
 export function CasesPage() {
@@ -25,6 +27,12 @@ export function CasesPage() {
         </div>
 
         <CaseList />
+
+        <div className="mt-8">
+          <GuidancePanel id="cases-page" title={guidance.casesPage.title}>
+            <p>{guidance.casesPage.body}</p>
+          </GuidancePanel>
+        </div>
       </div>
     </div>
   );

@@ -1,0 +1,60 @@
+{
+  "upstream": "https://github.com/overcuriousity/2timesketch",
+  "commit": "bf2af7006bc6d732083c25745c2d8e8790efa434",
+  "version": "1.0.0",
+  "license": "MIT License",
+  "converters": [
+    {
+      "name": "browser2timesketch",
+      "filename": "browser2timesketch.py",
+      "description": "Browser history (Firefox/Chrome/Chromium/Edge SQLite databases) to Timesketch timeline.",
+      "inputs": [
+        "places.sqlite",
+        "History (Chromium SQLite)"
+      ],
+      "size_bytes": 85121,
+      "sha256": "cd58a3b826d3be1895497fbc6e54e56aae2d837220d098f21b5ad97b074e69d9"
+    },
+    {
+      "name": "cloudtrail2timesketch",
+      "filename": "cloudtrail2timesketch.py",
+      "description": "AWS CloudTrail JSON/JSON.gz exports to Timesketch timeline.",
+      "inputs": [
+        "CloudTrail .json / .json.gz"
+      ],
+      "size_bytes": 26060,
+      "sha256": "889e8bdaa45f420a7f241adcd6e8533585481aab2f357f7a7c577fa4324d7698"
+    },
+    {
+      "name": "filterlog2timesketch",
+      "filename": "filterlog2timesketch.py",
+      "description": "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",
+      "inputs": [
+        "filter.log (syslog filterlog lines)"
+      ],
+      "size_bytes": 34672,
+      "sha256": "1e081bff46bcf6dd9163c50c15ea45beff788b27eb253b8f9cf3b074c2ee2125"
+    },
+    {
+      "name": "journal2timesketch",
+      "filename": "journal2timesketch.py",
+      "description": "systemd journal (via journalctl JSON export) to Timesketch timeline.",
+      "inputs": [
+        "journal directory / journalctl -o json"
+      ],
+      "size_bytes": 22537,
+      "sha256": "8fc220fa42e49247d661334ac78b214a940b3ca636e8f8386c626b871ffa9a21"
+    },
+    {
+      "name": "nginx2timesketch",
+      "filename": "nginx2timesketch.py",
+      "description": "nginx access/error/redirect logs (plain or .gz) to Timesketch timeline.",
+      "inputs": [
+        "access.log*",
+        "error.log*"
+      ],
+      "size_bytes": 27007,
+      "sha256": "a8a7e4790310654674f9497ec93f2360a524adc76dad40c6d86fd3a4e0d3c82a"
+    }
+  ]
+}

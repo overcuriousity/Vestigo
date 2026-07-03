@@ -6,6 +6,8 @@ import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
 import { Spinner } from "@/components/ui/Spinner";
 import { Badge } from "@/components/ui/Badge";
+import { GuidancePanel } from "@/components/ui/GuidancePanel";
+import { guidance } from "@/lib/guidance";
 import { fmtRelative } from "@/lib/time";
 import { FolderOpen, Cpu } from "lucide-react";
 
@@ -84,6 +86,22 @@ export function CaseOverviewPage() {
         <div className="space-y-8">
           <SourceList caseId={caseId!} />
           <TimelineList caseId={caseId!} />
+
+          <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
+            <ol className="space-y-2">
+              {guidance.caseOverview.steps.map((step, i) => (
+                <li key={step.title} className="flex gap-2">
+                  <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
+                  <span>
+                    <span className="font-medium text-[var(--color-fg-secondary)]">
+                      {step.title}.
+                    </span>{" "}
+                    {step.body}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </GuidancePanel>
         </div>
       </div>
     </div>

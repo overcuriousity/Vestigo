@@ -14,7 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tracesignal import __version__
 from tracesignal.api.deps import get_store, resolve_user_optional
-from tracesignal.api.routers import admin, auth, cases, events, jobs, stream, viz
+from tracesignal.api.routers import admin, auth, cases, converters, events, jobs, stream, viz
 from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
 from tracesignal.db.postgres import generate_id
@@ -259,6 +259,7 @@ def create_app() -> FastAPI:
     app.include_router(viz.router)
     app.include_router(jobs.router)
     app.include_router(stream.router)
+    app.include_router(converters.router)
 
     # Serve the built frontend when frontend/dist exists.
     # Run `npm run build` inside frontend/ once; tsig-web then serves everything.

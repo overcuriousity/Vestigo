@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Upload, FileText } from "lucide-react";
+import { Upload, FileText, ChevronDown, ChevronRight } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
+import { ConverterPanel } from "@/components/sources/ConverterPanel";
 import { useJobsStore } from "@/stores/jobs";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
@@ -17,6 +18,7 @@ export function UploadDialog({ caseId }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [parser, setParser] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [showConverters, setShowConverters] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
@@ -135,6 +137,24 @@ export function UploadDialog({ caseId }: Props) {
               value={parser}
               onChange={(e) => setParser(e.target.value)}
             />
+          </div>
+
+          {/* Converter downloads for raw (non-Timesketch) logs */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowConverters((s) => !s)}
+              aria-expanded={showConverters}
+              className="flex w-full items-center gap-1.5 text-left text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)] transition-base"
+            >
+              {showConverters ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+              Raw logs (nginx, firewall, CloudTrail, browser, journal)? Get a converter script
+            </button>
+            {showConverters && (
+              <div className="mt-2">
+                <ConverterPanel />
+              </div>
+            )}
           </div>
 
           {/* Result */}

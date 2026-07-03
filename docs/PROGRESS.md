@@ -1,6 +1,13 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 11 — visualization v2: two-layer comparison with
+Last updated: 2026-07-03 (session 12 — issue #5: full rename TraceVector → TraceSignal
+(`tsig`/`tsig-web` CLI, `TS_` env prefix, hard cutover, `docs/MIGRATION_RENAME.md`); issue #11:
+vendored self-contained 2timesketch converter scripts (`scripts/vendor_converters.py` →
+`src/tracesignal/assets/converters/` + manifest), `GET /api/converters[/{name}]` download
+endpoints, converter panel + static LLM-converter prompt in the upload dialog, and subtle
+collapsible `GuidancePanel` guidance on the cases page and case overview)
+
+Previous (session 11 — visualization v2: two-layer comparison with
 server-enforced shared-grid invariants (`POST .../viz/compare`, kinds time/terms/numeric),
 derived metrics as pure client-side transforms (Δ / rate / % of baseline / cumulative, nulls
 for undefined bins), first-class time-histogram chart type, bar orientation + grouped compare
