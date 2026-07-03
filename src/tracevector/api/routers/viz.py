@@ -379,20 +379,29 @@ async def compare_layers(
     if body.comparison.mode == "baseline":
         # All events of the timeline: filters dropped, timeline scope and
         # explicit time window kept — "the whole" the primary is a part of.
-        comparison = replace(
-            primary,
+        # Built via the same all-keyword _resolve_event_query used for every
+        # other filter resolution (rather than a hand-listed `replace(...)` of
+        # EventQuery fields) so a filter field added there without a matching
+        # `None` here is a TypeError, not a silently leaked baseline filter.
+        comparison = await _resolve_event_query(
+            case_id,
+            timeline_id,
             q=None,
             artifact=None,
             artifacts=None,
             source_id=None,
             tag=None,
             exclude_tag=None,
-            field_filters={},
-            field_exclusions={},
-            event_ids=None,
-            exclude_event_ids=None,
             tags_include=None,
             tags_exclude=None,
+            ids=None,
+            start=primary.start,
+            end=primary.end,
+            filters=None,
+            exclusions=None,
+            annotated=None,
+            annotation_tag_value=None,
+            run_id=None,
         )
     else:
         if body.comparison.filters is None:
@@ -469,6 +478,7 @@ async def create_saved_chart(
 @router.patch("/{case_id}/timelines/{timeline_id}/viz/charts/{chart_id}")
 async def rename_saved_chart(
     case_id: str,
+    timeline_id: str,
     chart_id: str,
     payload: SavedChartRename,
     case: Case = Depends(require_case_contribute),
@@ -476,7 +486,7 @@ async def rename_saved_chart(
 ) -> dict[str, Any]:
     """Rename a saved chart (the stored config itself is immutable)."""
     store = get_store()
-    chart = await store.rename_saved_chart(case_id, chart_id, payload.name)
+    chart = await store.rename_saved_chart(case_id, timeline_id, chart_id, payload.name)
     if chart is None:
         raise HTTPException(status_code=404, detail="Saved chart not found")
     return {"chart": chart.to_dict()}
@@ -485,13 +495,14 @@ async def rename_saved_chart(
 @router.delete("/{case_id}/timelines/{timeline_id}/viz/charts/{chart_id}")
 async def delete_saved_chart(
     case_id: str,
+    timeline_id: str,
     chart_id: str,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Delete a saved chart."""
     store = get_store()
-    deleted = await store.delete_saved_chart(case_id, chart_id)
+    deleted = await store.delete_saved_chart(case_id, timeline_id, chart_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Saved chart not found")
     return {"deleted": True, "chart_id": chart_id}

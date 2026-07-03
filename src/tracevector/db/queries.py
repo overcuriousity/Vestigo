@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -379,6 +380,17 @@ class EventQueryService:
 
     def __init__(self, store: ClickHouseStore | None = None) -> None:
         self.store = store or ClickHouseStore()
+
+    def _run_parallel(self, *fns: Callable[[], Any]) -> list[Any]:
+        """Run independent ClickHouse scans concurrently in threads.
+
+        Used for Compare-mode queries, where the primary/comparison layers
+        are separate scans with no data dependency between them — running
+        them in threads halves wall-clock latency over doing them serially.
+        """
+        with ThreadPoolExecutor(max_workers=len(fns)) as pool:
+            futures = [pool.submit(fn) for fn in fns]
+            return [f.result() for f in futures]
 
     def _build_where(self, query: EventQuery) -> tuple[str, dict[str, Any]]:
         """Build the parameterized WHERE clause for *query*.
@@ -1078,7 +1090,8 @@ class EventQueryService:
 
         hist_result = self.store.client.query(
             f"""
-            SELECT least({bin_count - 1}, toUInt32(floor((v - {{mn:Float64}}) / {{bw:Float64}}))) AS bin_idx,
+            SELECT greatest(0, least({bin_count - 1},
+                   toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
                    count() AS c
             FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
@@ -1269,8 +1282,10 @@ class EventQueryService:
             }
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        primary_counts = self._bucketed_counts(primary, interval)
-        comparison_counts = self._bucketed_counts(comparison, interval)
+        primary_counts, comparison_counts = self._run_parallel(
+            lambda: self._bucketed_counts(primary, interval),
+            lambda: self._bucketed_counts(comparison, interval),
+        )
         starts = aligned_bucket_starts(min_ts, max_ts, interval)
         bucket_list = [
             {
@@ -1408,8 +1423,10 @@ class EventQueryService:
         as :py:meth:`field_numeric_stats`.
         """
         self.store.init_schema()
-        p_count, p_mn, p_mx = self._numeric_layer_stats(primary, field_token)
-        c_count, c_mn, c_mx = self._numeric_layer_stats(comparison, field_token)
+        (p_count, p_mn, p_mx), (c_count, c_mn, c_mx) = self._run_parallel(
+            lambda: self._numeric_layer_stats(primary, field_token),
+            lambda: self._numeric_layer_stats(comparison, field_token),
+        )
 
         mins = [m for m in (p_mn, c_mn) if m is not None]
         maxs = [m for m in (p_mx, c_mx) if m is not None]
@@ -1429,15 +1446,13 @@ class EventQueryService:
         span = mx - mn
         bin_width = span / bin_count if span > 0 else 1.0
 
-        primary_bins = (
-            self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
+        primary_bins, comparison_bins = self._run_parallel(
+            lambda: self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
             if p_count
-            else {}
-        )
-        comparison_bins = (
-            self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
+            else {},
+            lambda: self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
             if c_count
-            else {}
+            else {},
         )
         bins_out = [
             {

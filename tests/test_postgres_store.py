@@ -146,11 +146,11 @@ async def test_saved_chart_rename_only_changes_name(store):
     await store.create_case("c1", "Case One")
     config = {"v": 1, "chartType": "bar"}
     await store.create_saved_chart("c1", "t1", "chart1", "Old", config)
-    renamed = await store.rename_saved_chart("c1", "chart1", "New")
+    renamed = await store.rename_saved_chart("c1", "t1", "chart1", "New")
     assert renamed is not None
     assert renamed.name == "New"
     assert renamed.config == config
-    assert await store.rename_saved_chart("c1", "missing", "X") is None
+    assert await store.rename_saved_chart("c1", "t1", "missing", "X") is None
 
 
 @pytest.mark.asyncio
@@ -159,6 +159,16 @@ async def test_saved_chart_delete_and_case_scoping(store):
     await store.create_case("c2", "Case Two")
     await store.create_saved_chart("c1", "t1", "chart1", "A", {"v": 1})
     # A chart_id from another case must not resolve or delete cross-case.
-    assert await store.delete_saved_chart("c2", "chart1") is False
-    assert await store.delete_saved_chart("c1", "chart1") is True
+    assert await store.delete_saved_chart("c2", "t1", "chart1") is False
+    assert await store.delete_saved_chart("c1", "t1", "chart1") is True
     assert await store.list_saved_charts("c1", "t1") == []
+
+
+@pytest.mark.asyncio
+async def test_saved_chart_rename_and_delete_scoped_by_timeline(store):
+    await store.create_case("c1", "Case One")
+    await store.create_saved_chart("c1", "t1", "chart1", "A", {"v": 1})
+    # Same case, wrong timeline: must not resolve or mutate the chart.
+    assert await store.rename_saved_chart("c1", "t2", "chart1", "New") is None
+    assert await store.delete_saved_chart("c1", "t2", "chart1") is False
+    assert await store.list_saved_charts("c1", "t1") != []

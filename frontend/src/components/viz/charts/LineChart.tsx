@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
 import { line as d3line, area as d3area, curveMonotoneX } from "d3-shape";
 import { max as d3max, bisector } from "d3-array";
@@ -46,32 +46,45 @@ export function LineChart({
 }: LineChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const ref = useChartRef(svgRef);
-
-  if (data.series.length === 0 || data.series[0].buckets.length === 0) {
-    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
-  }
-
-  const dates = data.series[0].buckets.map((b) => new Date(b.start));
+  const isEmpty = data.series.length === 0 || data.series[0].buckets.length === 0;
   const stacked = seriesMode === "stacked";
+
+  const dates = useMemo(
+    () => (isEmpty ? [] : data.series[0].buckets.map((b) => new Date(b.start))),
+    [isEmpty, data.series],
+  );
   // Stacked offsets: series i's band sits on the sum of series 0..i-1 —
   // same order as the legend so bands and labels read top-down consistently.
-  const stackBase: number[][] = [];
-  if (stacked) {
+  const stackBase = useMemo(() => {
+    if (!stacked) return [];
+    const base: number[][] = [];
     let running = dates.map(() => 0);
     for (const s of data.series) {
-      stackBase.push(running);
+      base.push(running);
       running = running.map((v, i) => v + (s.buckets[i]?.count ?? 0));
     }
+    return base;
+  }, [stacked, dates, data.series]);
+  const maxCount = useMemo(
+    () =>
+      stacked
+        ? Math.max(
+            1,
+            ...dates.map((_, i) =>
+              data.series.reduce((sum, s) => sum + (s.buckets[i]?.count ?? 0), 0),
+            ),
+          )
+        : Math.max(1, d3max(data.series, (s) => d3max(s.buckets, (b) => b.count) ?? 0) ?? 0),
+    [stacked, dates, data.series],
+  );
+  const colorMap = useMemo(
+    () => buildSeriesColorMap(data.series.map((s) => s.value)),
+    [data.series],
+  );
+
+  if (isEmpty) {
+    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
   }
-  const maxCount = stacked
-    ? Math.max(
-        1,
-        ...dates.map((_, i) =>
-          data.series.reduce((sum, s) => sum + (s.buckets[i]?.count ?? 0), 0),
-        ),
-      )
-    : Math.max(1, d3max(data.series, (s) => d3max(s.buckets, (b) => b.count) ?? 0) ?? 0);
-  const colorMap = buildSeriesColorMap(data.series.map((s) => s.value));
 
   return (
     <div className="relative flex flex-col gap-2">
@@ -158,7 +171,7 @@ export function LineChart({
                   ) {
                     idx -= 1;
                   }
-                  setHoverIdx(idx);
+                  setHoverIdx((prev) => (prev === idx ? prev : idx));
                 }}
                 onMouseLeave={() => setHoverIdx(null)}
               />

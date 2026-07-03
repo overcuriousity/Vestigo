@@ -118,10 +118,7 @@ export function VisualizePage() {
   const { field, scale, chartType, metric } = config;
   const dataKind = CHART_META[chartType].dataKind;
   const compareOn = config.compare.mode !== "off";
-  // Chart types that can render a comparison layer — pie/box/violin/ecdf
-  // have no honest two-layer encoding, so the rail hides Compare for them.
-  const compareSupported =
-    chartType === "time" || chartType === "bar" || chartType === "histogram";
+  const compareSupported = !!CHART_META[chartType].supportsCompare;
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
       ? { mode: "baseline" }
@@ -203,16 +200,18 @@ export function VisualizePage() {
   // Metric gating: % of baseline needs a comparison layer; delta/rate/
   // cumulative need time-bucketed bins. Clamp the active metric the same way
   // so a chart-type/compare change never leaves an impossible combination.
-  const metricAvailable = (m: Metric): boolean => {
-    const info = METRIC_INFO[m];
-    if (info.requiresCompare && !compareOn) return false;
-    if (info.timeBucketedOnly && dataKind !== "time") return false;
-    return m === "count" || dataKind === "time";
-  };
+  const metricAvailable = useCallback(
+    (m: Metric): boolean => {
+      const info = METRIC_INFO[m];
+      if (info.requiresCompare && !compareOn) return false;
+      if (info.timeBucketedOnly && dataKind !== "time") return false;
+      return m === "count" || dataKind === "time";
+    },
+    [compareOn, dataKind],
+  );
   useEffect(() => {
     if (!metricAvailable(metric)) updateConfig({ metric: "count" });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [metric, compareOn, dataKind]);
+  }, [metric, metricAvailable, updateConfig]);
 
   const compareTermsOn = compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({

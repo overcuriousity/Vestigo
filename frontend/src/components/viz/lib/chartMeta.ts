@@ -9,7 +9,7 @@ export type DataKind = "time" | "terms" | "numeric" | "timeseries";
 
 export const CHART_META: Record<
   ChartType,
-  { label: string; scales: Scale[]; dataKind: DataKind }
+  { label: string; scales: Scale[]; dataKind: DataKind; supportsCompare?: boolean }
 > = {
   // Event count over time needs no field, so it is meaningful whatever scale
   // the currently-picked field has — available under every scale.
@@ -17,8 +17,16 @@ export const CHART_META: Record<
     label: "Time histogram (events over time)",
     scales: ["nominal", "ordinal", "interval", "ratio"],
     dataKind: "time",
+    supportsCompare: true,
   },
-  bar: { label: "Bar", scales: ["nominal", "ordinal"], dataKind: "terms" },
+  bar: {
+    label: "Bar",
+    scales: ["nominal", "ordinal"],
+    dataKind: "terms",
+    supportsCompare: true,
+  },
+  // pie/box/violin/ecdf have no honest two-layer encoding, so they're left
+  // without supportsCompare — the rail hides Compare for them.
   pie: { label: "Pie / Donut", scales: ["nominal"], dataKind: "terms" },
   heatmap: {
     label: "Heatmap (value × time)",
@@ -30,7 +38,12 @@ export const CHART_META: Record<
     scales: ["interval", "ratio"],
     dataKind: "timeseries",
   },
-  histogram: { label: "Histogram", scales: ["interval", "ratio"], dataKind: "numeric" },
+  histogram: {
+    label: "Histogram",
+    scales: ["interval", "ratio"],
+    dataKind: "numeric",
+    supportsCompare: true,
+  },
   box: { label: "Box plot", scales: ["ratio"], dataKind: "numeric" },
   violin: { label: "Violin plot", scales: ["ratio"], dataKind: "numeric" },
   ecdf: { label: "ECDF", scales: ["ratio"], dataKind: "numeric" },

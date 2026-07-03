@@ -15,6 +15,7 @@ import { eventsApi } from "@/api/events";
 import { vizApi } from "@/api/viz";
 import { TimeHistogram } from "@/components/viz/charts/TimeHistogram";
 import { ExportControls } from "@/components/viz/ExportControls";
+import { buildCaptionLines } from "@/components/viz/lib/caption";
 import type { EventFilters } from "@/api/types";
 
 const BUCKET_OPTIONS = [30, 60, 100, 150] as const;
@@ -105,12 +106,26 @@ export function FieldHistogramModal({
   });
 
   const maxTermCount = Math.max(1, ...(termsQuery.data?.values.map((v) => v.count) ?? [1]));
-  const captionLines = [
-    `TraceVector — field histogram — case ${caseId} / timeline ${timelineId}`,
-    `field: ${fieldKey} = ${activeValue}`,
-    filters.q ? `search: ${filters.q}` : undefined,
-    filters.start || filters.end ? `range: ${filters.start ?? "…"} to ${filters.end ?? "…"}` : undefined,
-  ].filter((l): l is string => !!l);
+  const captionLines = buildCaptionLines({
+    caseId,
+    timelineId,
+    chartLabel: "Field histogram",
+    headerLabel: "field histogram",
+    config: {
+      v: 1,
+      field: fieldKey,
+      scale: "nominal",
+      chartType: "time",
+      metric: "count",
+      compare: { mode: "off" },
+      options: {},
+    },
+    filters,
+    facts: {
+      focusedValue: activeValue,
+      intervalSeconds: histogramQuery.data?.interval_seconds,
+    },
+  });
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

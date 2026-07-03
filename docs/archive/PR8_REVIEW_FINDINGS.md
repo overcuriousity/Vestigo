@@ -173,3 +173,137 @@ aggregate totals match the old two-scan reference exactly, including under LIMIT
 
 No CLAUDE.md rule violations, no removed/broken existing behavior (PR is purely additive), and
 no cross-file (frontend↔backend) param/shape mismatches beyond what's listed above.
+
+## Second-pass review (2026-07-03), GitHub PR #8 as pushed
+
+*8 finder angles (3 correctness, 3 cleanup, 1 altitude, 1 CLAUDE.md conventions) re-run against
+the PR as opened on GitHub (`gh pr diff 8`, +8415/-230, 79 files) — by this point the branch also
+carries web-upload background jobs, UTC timezone unification (closes #9), admin team-scoping, and
+an asyncio event-loop fix, on top of the viz work above. 29 candidates surfaced, 20 survived a
+1-vote verify pass. Tracked here as a checklist — mark done + note what changed as each is fixed.
+
+**Second pass: fully resolved 2026-07-03.** All 17 items below fixed; backend 297 passed
+(`uv run pytest`), ruff clean; frontend 105 passed (`npm run test`), `npm run typecheck`,
+`npm run build` clean, `npm run lint` unchanged pre-existing 3 warnings.
+
+### Correctness
+
+- [x] 1. **`src/tracevector/api/routers/cases.py:377-416`** (`upload_source`) — CONFIRMED.
+  `create_source` commits a zero-event Source row before `add_source_to_timeline`/
+  `job_store.create`/`background_tasks.add_task`. The wrapping `except` only unlinks the temp
+  file, never calls `store.delete_source`. Any failure in that window orphans the row;
+  `get_source_by_hash` matches on `(case_id, file_hash)` alone, so every future re-upload of
+  that file returns `duplicate=True, events_parsed=0` forever — no UI path to recover without
+  manual DB surgery. **Fixed**: `except Exception` now deletes the just-created source row
+  (tracked via a `source_created` flag) before re-raising.
+- [x] 2. **Same function, TOCTOU race** — CONFIRMED. Unique index on `(case_id, file_hash)`
+  exists; duplicate-check and `create_source` aren't atomic. Two concurrent uploads of the same
+  file both pass the check, loser hits `IntegrityError`. No `IntegrityError`/exception-handler
+  anywhere in `api/`, so it propagates as an uncaught 500 instead of an idempotent duplicate
+  response. **Fixed**: `create_source` wrapped in `try/except IntegrityError`, re-querying
+  `get_source_by_hash` and returning the same idempotent duplicate response as the pre-check.
+- [x] 3. **`src/tracevector/api/routers/viz.py:470-497`** (`rename_saved_chart`/
+  `delete_saved_chart`) — CONFIRMED. Route declares `{timeline_id}` in path but handlers don't
+  accept it as a param (FastAPI silently drops it); `PostgresStore.rename_saved_chart`/
+  `delete_saved_chart` filter only by `case_id`+`chart_id`. A chart can be renamed/deleted via
+  any `timeline_id` in the URL regardless of actual ownership. **Fixed**: both router handlers
+  and the two `PostgresStore` methods now take/filter on `timeline_id` too; frontend already
+  sent it in the URL. Added `test_saved_chart_rename_and_delete_scoped_by_timeline`.
+- [x] 4. **`src/tracevector/db/queries.py` `field_numeric_stats`** — PLAUSIBLE. Bin-index SQL
+  lacks the `greatest(0, ...)` clamp that the near-identical `_numeric_bin_counts` (added same
+  PR) has. Structurally `v == mn` exactly for the min-value row, so trigger requires float
+  precision loss in the Python→ClickHouse parameter round-trip — real inconsistency between two
+  sibling functions, worth a defensive fix even if not provably live today. **Fixed**: added the
+  same `greatest(0, least(...))` clamp with `toInt64` (matching `_numeric_bin_counts` exactly).
+- [x] 5. **`src/tracevector/ingestion/pipeline.py::_ingest_file`** — CONFIRMED, low severity.
+  Final partial-batch flush (`if batch:`) skips `_report_progress`; per-file progress can
+  visibly stall just before 100% until the next file's first batch (or file-end correction)
+  catches it up. **Fixed**: final flush now reports progress too.
+- [x] 6. **`src/tracevector/api/routers/viz.py::compare_layers`** — PLAUSIBLE, latent. Baseline
+  filter-reset list is exhaustive against `EventQuery`'s current fields, but nothing enforces
+  that it stays in sync — the next filter field added to `EventQuery` and not added here
+  silently leaks into the "unfiltered baseline" layer. **Fixed**: the baseline layer is now
+  built via the same all-keyword `_resolve_event_query` every other filter resolution uses,
+  instead of a hand-listed `replace(...)` of `EventQuery` fields — a new required parameter
+  there is a `TypeError` at this call site, not a silent leak.
+
+### Forensic/UTC-unification gap
+
+- [x] 7. **`frontend/src/pages/admin/AdminAuditPage.tsx:73`, `AdminUsersPage.tsx:94`** —
+  CONFIRMED. Both use raw `new Date(...).toLocaleString()` (browser-local time) instead of
+  `lib/time.ts`'s UTC formatters this PR introduced to close #9. The audit trail — a forensic
+  artifact — renders in local time; two analysts in different zones see different timestamps
+  for the same event. **Fixed**: both switched to `fmtTimestampFull`.
+
+### Efficiency
+
+- [x] 8. **`src/tracevector/db/queries.py`** `compare_field_numeric`/`compare_time_histogram`/
+  `compare_field_terms` — CONFIRMED. All run primary/comparison ClickHouse round trips fully
+  sequentially (2-4 blocking calls each), no threading/async concurrency. Doubles latency on
+  every Compare-mode chart. **Fixed**: added `EventQueryService._run_parallel` (thread pool);
+  `compare_time_histogram`'s two `_bucketed_counts` calls and `compare_field_numeric`'s two
+  `_numeric_layer_stats`/`_numeric_bin_counts` pairs now run concurrently.
+  `compare_field_terms`'s second scan genuinely depends on the first's top-values list, so it's
+  left sequential.
+- [x] 9. **`frontend/src/components/viz/charts/LineChart.tsx`** — CONFIRMED. `dates`/
+  `stackBase`/`maxCount`/`colorMap` unmemoized, recomputed on every render; `onMouseMove` fires
+  `setHoverIdx` on every pixel of movement over a continuous hover rect → visible jank on hover
+  with many series/buckets. (`Heatmap`/`CompareHistogram` share the unmemoized-derived-values
+  pattern but use discrete `onMouseEnter`, so less severe there.) **Fixed**: all four wrapped in
+  `useMemo`; `setHoverIdx` uses a functional update that bails out when the bucket index hasn't
+  changed, so React skips the re-render on sub-bucket pixel movement.
+- [x] 10. **`frontend/src/components/layout/JobTray.tsx:31-34`** — CONFIRMED.
+  `refetchInterval: 1200` + `refetchIntervalInBackground: true`, no backoff — polls every 1.2s
+  for a job's entire lifetime even with the tab backgrounded. **Fixed**: `refetchInterval` steps
+  1.2s → 3s → 8s by poll count; `refetchIntervalInBackground` now `false`.
+- [x] 11. **`src/tracevector/api/routers/cases.py` `_run_ingestion_job` exception path** —
+  CONFIRMED. Constructs a fresh `ClickHouseStore()` for cleanup instead of reusing
+  `pipeline.clickhouse`, which already holds a store instance in scope. **Fixed**: a single
+  `ClickHouseStore()` is now constructed once and passed into `IngestionPipeline(clickhouse=...)`,
+  reused for the exception-path cleanup instead of a second instance.
+
+### Reuse / simplification / altitude
+
+- [x] 12. **`frontend/src/components/explorer/TimelineHistogram.tsx:135-153`** — CONFIRMED
+  duplicate of the shared `ChartTooltip.tsx` clamp primitive this same PR introduced; never
+  imported here. **Fixed**: the hand-rolled `tooltipRef`/`tooltipLeft`/clamp `useLayoutEffect`
+  is gone; the tooltip now renders via `<ChartTooltip>`.
+- [x] 13. **`frontend/src/pages/VisualizePage.tsx:123-124`** — CONFIRMED. `compareSupported` is
+  a hardcoded inline chart-type allowlist while everything else is table-driven via
+  `CHART_META`/`chartTypesFor`; no `supportsCompare` field exists, so the next compare-capable
+  chart type needs this line remembered by hand. **Fixed**: added `supportsCompare?: boolean` to
+  `CHART_META` (set on `time`/`bar`/`histogram`); `compareSupported` now reads it directly.
+- [x] 14. **`frontend/src/components/viz/FieldHistogramModal.tsx:108-113`** — CONFIRMED.
+  Hand-builds `captionLines` instead of reusing `buildCaptionLines`, which a prior commit on
+  this branch specifically introduced to unify on-screen/export captions. **Fixed**:
+  `buildCaptionLines` grew an optional `headerLabel` and a `facts.focusedValue` field (for the
+  "field = value" drill-down line); the modal now builds a minimal synthetic `ChartConfig` and
+  calls the shared function.
+- [x] 15. **`frontend/src/pages/VisualizePage.tsx:206-215`** — CONFIRMED. Non-memoized
+  `metricAvailable` referenced in a `useEffect` with
+  `eslint-disable-next-line react-hooks/exhaustive-deps` — latent staleness if the closure's
+  body changes. **Fixed**: `metricAvailable` wrapped in `useCallback` keyed on `compareOn`/
+  `dataKind`; the effect now lists it (plus `updateConfig`) as a real dependency and the
+  disable comment is gone.
+- [x] 16. **`frontend/src/lib/time.ts`** — CONFIRMED. Three independent hand-written
+  UTC-formatting code paths (`fmtTimestamp`, `fmtTimestampFull`, `fmtTimestampCompactUtc`) with
+  no shared helper. **Fixed**: factored into a shared `formatUtc(value, fmt)` core (parse +
+  validity + fallback), each formatter now only supplies its own `Date -> string` closure.
+- [x] 17. **`frontend/src/components/viz/charts/BoxPlot.tsx` / `ViolinPlot.tsx`** — CONFIRMED.
+  Identical hover-state/margin/scale/formatter boilerplate duplicated verbatim, no shared
+  wrapper despite same data shape. **Fixed**: new shared `primitives/NumericPlotFrame.tsx`
+  (ref, margin, y-scale via `numericDomain`, hover state, `ChartTooltip`) — both charts now only
+  supply their own marks via its render prop.
+
+### Refuted / out of scope
+
+- Datetime-local seconds-parsing concern in `lib/time.ts::datetimeLocalToUtcIso` — REFUTED, no
+  `<input type="datetime-local">` in `FilterRail.tsx` sets `step`, so seconds can't appear.
+- `UploadDialog.tsx` toast condition (`!result.duplicate && result.job_id`) — REFUTED, `job_id`
+  is always set on the only non-duplicate success path.
+- `src/tracevector/db/clickhouse.py::_normalize_event_datetimes` duplicating `_dt.py::
+  ensure_utc_iso` — REFUTED as an in-scope finding: the duplication is real but pre-existing
+  from an earlier PR (`_dt.py` landed in `7aa3e7f`), not introduced by this PR's diff.
+- Asyncio-loop-fix copy-paste across `_run_embedding_job`/`_run_timeline_embedding_job`, and the
+  CLAUDE.md conventions angle, both came back clean — no violation, and the duplication is
+  small/contained enough not to warrant its own item.

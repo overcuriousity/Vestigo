@@ -1029,7 +1029,7 @@ def test_field_numeric_stats_returns_stats_and_fixed_width_bins() -> None:
                 ),
             ),
             (
-                "toUInt32(floor(",
+                "toInt64(floor(",
                 FakeQueryResult(result_rows=[[0, 5], [1, 5]]),
             ),
         ]
@@ -1059,7 +1059,7 @@ def test_field_numeric_stats_fills_empty_bins_with_zero() -> None:
                 ),
             ),
             # Only bin 0 has data — bins 1-3 must still appear, count 0.
-            ("toUInt32(floor(", FakeQueryResult(result_rows=[[0, 4]])),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 4]])),
         ]
     )
     result = svc.field_numeric_stats(
@@ -1087,7 +1087,7 @@ def test_field_numeric_stats_non_numeric_field_returns_zero_count() -> None:
         "bins": [],
     }
     # No histogram bin query should have been attempted for a non-numeric field.
-    assert not any("toUInt32(floor(" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+    assert not any("toInt64(floor(" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
 
 
 def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:

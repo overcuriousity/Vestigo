@@ -35,6 +35,7 @@ class FakeIngestionPipeline:
         self,
         case_id: str,
         source_id: str,
+        clickhouse=None,
         batch_size: int | None = None,
         file_hash: str | None = None,
         source_name: str | None = None,
@@ -42,6 +43,7 @@ class FakeIngestionPipeline:
     ) -> None:
         self.case_id = case_id
         self.source_id = source_id
+        self.clickhouse = clickhouse
         self.file_hash = file_hash
         self.source_name = source_name
         self.progress_callback = progress_callback

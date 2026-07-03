@@ -1226,7 +1226,7 @@ class PostgresStore:
             return chart
 
     async def rename_saved_chart(
-        self, case_id: str, chart_id: str, name: str
+        self, case_id: str, timeline_id: str, chart_id: str, name: str
     ) -> SavedChart | None:
         """Rename a saved chart; returns the updated row or None if missing.
 
@@ -1238,7 +1238,9 @@ class PostgresStore:
         async with self.session_factory() as session:
             result = await session.execute(
                 select(SavedChart).where(
-                    SavedChart.case_id == case_id, SavedChart.id == chart_id
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
                 )
             )
             chart = result.scalar_one_or_none()
@@ -1249,14 +1251,16 @@ class PostgresStore:
             await session.refresh(chart)
             return chart
 
-    async def delete_saved_chart(self, case_id: str, chart_id: str) -> bool:
+    async def delete_saved_chart(self, case_id: str, timeline_id: str, chart_id: str) -> bool:
         """Delete a saved chart row. Returns True if it existed."""
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
                 select(SavedChart).where(
-                    SavedChart.case_id == case_id, SavedChart.id == chart_id
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
                 )
             )
             chart = result.scalar_one_or_none()

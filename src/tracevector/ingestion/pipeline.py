@@ -193,6 +193,10 @@ class IngestionPipeline:
         if batch:
             inserted = self.clickhouse.insert_events(batch)
             result.events_inserted += inserted
+            self._report_progress(
+                total=total_bytes,
+                processed=bytes_before_file + batch[-1].byte_offset,
+            )
 
     def _report_progress(self, total: int, processed: int) -> None:
         if self.progress_callback is not None:

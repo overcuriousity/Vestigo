@@ -23,6 +23,10 @@ export interface CaptionFacts {
   binCount?: number;
   valueMin?: number | null;
   valueMax?: number | null;
+  /** Single focused value (e.g. the field-histogram modal's `field = value`
+   * drill-down) — takes over the kind=time field line instead of the
+   * generic "event count over time" phrasing. */
+  focusedValue?: string;
 }
 
 const fmtInt = (n: number) => n.toLocaleString("en-US");
@@ -60,18 +64,25 @@ export function buildCaptionLines(args: {
   config: ChartConfig;
   filters: EventFilters;
   facts: CaptionFacts;
+  /** Overrides the "visualization" word in the header line (e.g. "field
+   * histogram" for the per-value drill-down modal). */
+  headerLabel?: string;
 }): string[] {
-  const { caseId, timelineId, chartLabel, config, filters, facts } = args;
+  const { caseId, timelineId, chartLabel, config, filters, facts, headerLabel } = args;
   const { field, scale, chartType, metric, compare } = config;
   const lines: (string | undefined)[] = [];
 
-  lines.push(`TraceVector — visualization — case ${caseId} / timeline ${timelineId ?? ""}`);
   lines.push(
-    chartType === "time"
-      ? `event count over time — ${chartLabel}`
-      : field
-        ? `field: ${field} (${scale}) — ${chartLabel}`
-        : undefined,
+    `TraceVector — ${headerLabel ?? "visualization"} — case ${caseId} / timeline ${timelineId ?? ""}`,
+  );
+  lines.push(
+    facts.focusedValue != null && field
+      ? `field: ${field} = ${facts.focusedValue}`
+      : chartType === "time"
+        ? `event count over time — ${chartLabel}`
+        : field
+          ? `field: ${field} (${scale}) — ${chartLabel}`
+          : undefined,
   );
 
   // Layer summaries: what each series is, with its total.

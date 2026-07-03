@@ -29,8 +29,15 @@ function JobRow({ job }: { job: TrackedJob }) {
       return j;
     },
     enabled: !isTerminal && !job.dismissed,
-    refetchInterval: 1200,
-    refetchIntervalInBackground: true,
+    // Poll briskly at first (progress moving fast), then back off — a job
+    // that's been running for minutes doesn't need sub-second-scale polling.
+    refetchInterval: (query) => {
+      const polls = query.state.dataUpdateCount;
+      if (polls < 10) return 1200;
+      if (polls < 30) return 3000;
+      return 8000;
+    },
+    refetchIntervalInBackground: false,
   });
 
   const pct =

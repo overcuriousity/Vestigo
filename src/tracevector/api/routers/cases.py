@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 
 from tracevector.api.deps import (
     get_current_user,
@@ -237,6 +238,7 @@ async def _run_ingestion_job(
     row again so a failed upload leaves no half-populated source behind.
     """
     store = get_store()
+    clickhouse = ClickHouseStore()
 
     def progress_callback(total: int, processed: int) -> None:
         job_store.update(
@@ -249,6 +251,7 @@ async def _run_ingestion_job(
         pipeline = IngestionPipeline(
             case_id=case_id,
             source_id=source_id,
+            clickhouse=clickhouse,
             batch_size=get_settings().embedding_batch_size,
             file_hash=file_hash,
             source_name=source_name,
@@ -284,7 +287,7 @@ async def _run_ingestion_job(
         )
     except Exception as exc:  # noqa: BLE001
         try:
-            await asyncio.to_thread(ClickHouseStore().delete_source_events, case_id, source_id)
+            await asyncio.to_thread(clickhouse.delete_source_events, case_id, source_id)
             await store.delete_source(case_id, source_id)
         except Exception:  # noqa: BLE001, S110 — best-effort cleanup
             pass
@@ -348,6 +351,7 @@ async def upload_source(
         tmp_path = Path(tmp.name)
         size_bytes = tmp_path.stat().st_size
 
+    source_created = False
     try:
         fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
         if fmt is None:
@@ -374,17 +378,33 @@ async def upload_source(
 
         # Create the source row up front (event_count=0) so a re-upload of
         # the same bytes is rejected as a duplicate while ingestion runs.
-        await store.create_source(
-            case_id=case_id,
-            source_id=source_id,
-            name=source_name,
-            file_hash=file_hash,
-            size_bytes=size_bytes,
-            filename=file.filename,
-            parser=fmt,
-            event_count=0,
-            created_by=user.id,
-        )
+        try:
+            await store.create_source(
+                case_id=case_id,
+                source_id=source_id,
+                name=source_name,
+                file_hash=file_hash,
+                size_bytes=size_bytes,
+                filename=file.filename,
+                parser=fmt,
+                event_count=0,
+                created_by=user.id,
+            )
+            source_created = True
+        except IntegrityError:
+            # Lost a race against a concurrent upload of the same bytes:
+            # treat it the same as the pre-check duplicate response.
+            existing_source = await store.get_source_by_hash(case_id, file_hash)
+            if existing_source is None:
+                raise
+            tmp_path.unlink(missing_ok=True)
+            return SourceUploadResponse(
+                source_id=existing_source.id,
+                events_parsed=existing_source.event_count,
+                events_inserted=0,
+                parser=parser or existing_source.parser or "auto",
+                duplicate=True,
+            )
 
         # Auto-add the new source to the case's default timeline.
         default_timeline = await store.get_default_timeline(case_id)
@@ -412,6 +432,8 @@ async def upload_source(
             job_store,
         )
     except Exception:
+        if source_created:
+            await store.delete_source(case_id, source_id)
         tmp_path.unlink(missing_ok=True)
         raise
 
