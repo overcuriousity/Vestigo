@@ -22,7 +22,13 @@ def test_non_admin_cannot_upload_geoip_database(client, admin_bootstrap, store):
     login(plain_client, "plain", "abcdefgh12")
     resp = plain_client.post(
         "/api/admin/enrichers/geoip/database",
-        files={"file": ("GeoLite2-City.mmdb", io.BytesIO(b"not a real database"), "application/octet-stream")},
+        files={
+            "file": (
+                "GeoLite2-City.mmdb",
+                io.BytesIO(b"not a real database"),
+                "application/octet-stream",
+            )
+        },
     )
     assert resp.status_code == 403
 
@@ -31,12 +37,20 @@ def test_invalid_geoip_database_rejected(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     resp = client.post(
         "/api/admin/enrichers/geoip/database",
-        files={"file": ("GeoLite2-City.mmdb", io.BytesIO(b"not a real database"), "application/octet-stream")},
+        files={
+            "file": (
+                "GeoLite2-City.mmdb",
+                io.BytesIO(b"not a real database"),
+                "application/octet-stream",
+            )
+        },
     )
     assert resp.status_code == 400
 
 
-def test_geoip_status_reports_unavailable_before_upload(client, admin_bootstrap, store, tmp_path, monkeypatch):
+def test_geoip_status_reports_unavailable_before_upload(
+    client, admin_bootstrap, store, tmp_path, monkeypatch
+):
     from tracesignal.enrichers import registry
     from tracesignal.enrichers.geoip import GeoIPEnricher
 

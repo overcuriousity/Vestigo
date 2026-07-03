@@ -19,7 +19,9 @@ from tracesignal.core.config import get_settings
 from tracesignal.enrichers.base import AvailabilityResult, Enricher
 
 # IPv4 only for v1; IPv6 support is a documented follow-up.
-IPV4_REGEX = r"^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$"
+IPV4_REGEX = (
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$"
+)
 
 
 def geoip_database_path() -> Path:

@@ -196,7 +196,9 @@ class ClickHouseStore:
         """
         if not rows:
             return 0
-        rows = [{**row, "enricher_config_hash": row.get("enricher_config_hash", "")} for row in rows]
+        rows = [
+            {**row, "enricher_config_hash": row.get("enricher_config_hash", "")} for row in rows
+        ]
         data = [[row[column] for column in _ENRICHMENT_COLUMNS] for row in rows]
         response = self.client.insert(
             table=f"{self.database}.event_enrichments",

@@ -113,19 +113,29 @@ async def test_upsert_timeline_enricher_creates_then_updates(store):
 async def test_list_automatic_enrichers_for_source_filters_mode_and_enabled(store):
     await store.create_case("c1", "Case One")
     timeline = await store.create_timeline("c1", "t1", "Timeline One")
-    source = await store.create_source(
-        "c1", "s1", "source-one", file_hash="a" * 64, size_bytes=10
-    )
+    source = await store.create_source("c1", "s1", "source-one", file_hash="a" * 64, size_bytes=10)
     await store.add_source_to_timeline("c1", timeline.id, source.id)
 
     await store.upsert_timeline_enricher(
-        timeline_id=timeline.id, enricher_key="geoip", mode="automatic", enabled=True, updated_by=None
+        timeline_id=timeline.id,
+        enricher_key="geoip",
+        mode="automatic",
+        enabled=True,
+        updated_by=None,
     )
     await store.upsert_timeline_enricher(
-        timeline_id=timeline.id, enricher_key="manual-only", mode="manual", enabled=True, updated_by=None
+        timeline_id=timeline.id,
+        enricher_key="manual-only",
+        mode="manual",
+        enabled=True,
+        updated_by=None,
     )
     await store.upsert_timeline_enricher(
-        timeline_id=timeline.id, enricher_key="disabled", mode="automatic", enabled=False, updated_by=None
+        timeline_id=timeline.id,
+        enricher_key="disabled",
+        mode="automatic",
+        enabled=False,
+        updated_by=None,
     )
 
     configs = await store.list_automatic_enrichers_for_source(source.id)
@@ -215,7 +225,9 @@ async def test_delete_staged_rows_for_job_discards_only_that_job(store):
 
 @pytest.mark.asyncio
 async def test_orphaned_enrichment_job_run_lifecycle(store):
-    await store.start_enrichment_job_run("job1", timeline_id="t1", case_id="c1", enricher_key="geoip")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
 
     orphans = await store.list_orphaned_enrichment_job_runs()
     assert [o.job_id for o in orphans] == ["job1"]
@@ -229,7 +241,9 @@ async def test_reconcile_orphaned_enrichment_jobs_discards_marker_and_staged_row
     from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
 
     await store.create_case("c1", "Case One")
-    await store.start_enrichment_job_run("job1", timeline_id="t1", case_id="c1", enricher_key="geoip")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
     await store.stage_enrichment_results(
         [
             {
