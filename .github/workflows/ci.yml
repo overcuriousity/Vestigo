@@ -46,16 +46,19 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       qdrant:
+        # No --health-cmd: the image has neither curl nor wget, so an
+        # in-container healthcheck command always errors and the container
+        # never reports "healthy", which makes Actions kill the whole
+        # services group even though qdrant itself started fine. Wait for
+        # it from the runner (which has curl) as a step instead.
         image: docker.io/qdrant/qdrant:v1.18.2
         ports:
           - 6333:6333
-        options: >-
-          --health-cmd "curl -f http://localhost:6333/healthz"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for qdrant
+        run: timeout 30 sh -c 'until curl -sf http://localhost:6333/healthz; do sleep 1; done'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
