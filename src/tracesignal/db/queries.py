@@ -1473,9 +1473,7 @@ class EventQueryService:
             "primary_total": terms["total"],
             "comparison_total": comparison_total,
             "primary_other": terms["other_count"],
-            "comparison_other": max(
-                0, comparison_total - sum(v["comparison"] for v in values)
-            ),
+            "comparison_other": max(0, comparison_total - sum(v["comparison"] for v in values)),
         }
 
     def _numeric_layer_stats(
@@ -1556,12 +1554,16 @@ class EventQueryService:
         bin_width = span / bin_count if span > 0 else 1.0
 
         primary_bins, comparison_bins = self._run_parallel(
-            lambda: self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
-            if p_count
-            else {},
-            lambda: self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
-            if c_count
-            else {},
+            lambda: (
+                self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
+                if p_count
+                else {}
+            ),
+            lambda: (
+                self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
+                if c_count
+                else {}
+            ),
         )
         bins_out = [
             {

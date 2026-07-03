@@ -70,9 +70,7 @@ def test_existing_raw_key_collision_rejected():
 
 
 def test_duplicate_raw_key_across_mappings_rejected():
-    problems = validate_field_mappings(
-        {"ip_a": ["src_ip"], "ip_b": ["src_ip"]}, AVAILABLE
-    )
+    problems = validate_field_mappings({"ip_a": ["src_ip"], "ip_b": ["src_ip"]}, AVAILABLE)
     assert any("mapped only once" in p for p in problems)
 
 

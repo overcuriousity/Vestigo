@@ -112,9 +112,7 @@ async def test_compare_terms_without_field_is_422(monkeypatch):
     from fastapi import HTTPException
 
     _patch_compare(monkeypatch)
-    body = viz.CompareRequest(
-        kind="terms", comparison=viz.ComparisonSpec(mode="baseline")
-    )
+    body = viz.CompareRequest(kind="terms", comparison=viz.ComparisonSpec(mode="baseline"))
     with pytest.raises(HTTPException) as exc:
         await viz.compare_layers("c1", "t1", body, case=None)
     assert exc.value.status_code == 422

@@ -136,7 +136,9 @@ def vendor(upstream: Path) -> None:
     }
 
     for name, (module, entry, description, inputs) in CONVERTERS.items():
-        module_body = _strip((upstream / "timesketch_converters" / f"{module}.py").read_text("utf-8"))
+        module_body = _strip(
+            (upstream / "timesketch_converters" / f"{module}.py").read_text("utf-8")
+        )
         if module == "browser":
             module_body = _rewrite_browser(module_body)
         entry_body = _strip((upstream / entry).read_text("utf-8"))
