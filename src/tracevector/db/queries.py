@@ -189,23 +189,39 @@ def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
 _EVENT_SELECT_COLUMNS = ",\n    ".join(EVENT_SELECT_COLUMNS)
 
 
-def _field_column_expr(field_token: str, parameters: dict[str, Any], param_name: str) -> str:
+def _field_column_expr(
+    field_token: str,
+    parameters: dict[str, Any],
+    param_name: str | Callable[[], str],
+    *,
+    cast_non_string: bool = True,
+) -> str:
     """Resolve *field_token* to a SQL expression, binding an attribute key if needed.
 
-    Mirrors ``_ParameterizedQueryBuilder._column_expr`` but is deliberately a
-    free function taking an explicit, caller-chosen *param_name* rather than
-    an auto-incrementing ``pN`` — the viz aggregations below build their WHERE
-    clause via ``_build_where`` first (which already claims ``p0..pN``) and
-    then need one more parameter for the field-under-analysis without risking
-    a name collision with those.
+    The single column-resolution implementation, shared by two call styles:
+
+    - The viz aggregations pass an explicit, caller-chosen *param_name*
+      string — they build their WHERE clause via ``_build_where`` first
+      (which already claims ``p0..pN``) and then need one more parameter for
+      the field-under-analysis without risking a name collision with those.
+    - ``_ParameterizedQueryBuilder._column_expr`` passes its bound
+      ``_param_name`` method so a fresh ``pN`` is minted lazily — only when
+      the token actually resolves to an attribute key; an eager mint would
+      shift the numbering of every subsequent parameter.
+
+    ``cast_non_string`` wraps non-string top-level columns (``timestamp``) in
+    ``toString(...)`` so string comparisons like ``!= ''`` and ``GROUP BY``
+    work; the filter builder disables it because its equality/``NOT IN``
+    predicates compare against typed literals directly.
     """
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
-        if column in TOP_LEVEL_NON_STRING_COLUMNS:
+        if cast_non_string and column in TOP_LEVEL_NON_STRING_COLUMNS:
             return f"toString({column})"
         return column
-    parameters[param_name] = attr_key
-    return f"attributes[{{{param_name}:String}}]"
+    name = param_name() if callable(param_name) else param_name
+    parameters[name] = attr_key
+    return f"attributes[{{{name}:String}}]"
 
 
 class _ParameterizedQueryBuilder:
@@ -348,13 +364,7 @@ class _ParameterizedQueryBuilder:
         self.parameters[sentinel_name] = to_clickhouse_utc(_NULL_TIMESTAMP_SENTINEL, precise=True)
 
     def _column_expr(self, key: str) -> str:
-        column, attr_key = resolve_column_token(key)
-        if column is not None:
-            return column
-        # Map lookup; parameterize the key as well to stay defensive.
-        key_param = self._param_name()
-        self.parameters[key_param] = attr_key
-        return f"attributes[{{{key_param}:String}}]"
+        return _field_column_expr(key, self.parameters, self._param_name, cast_non_string=False)
 
     def where_clause(self) -> str:
         return " AND ".join(self.conditions)
