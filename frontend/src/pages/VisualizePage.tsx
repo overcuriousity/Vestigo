@@ -76,6 +76,9 @@ const CHART_META: Record<ChartType, { label: string; scales: Scale[]; dataKind: 
 
 const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 
+const chartTypesFor = (s: Scale): ChartType[] =>
+  (Object.keys(CHART_META) as ChartType[]).filter((c) => CHART_META[c].scales.includes(s));
+
 export function VisualizePage() {
   const { caseId, timelineId } = useParams<{ caseId: string; timelineId: string }>();
   const [searchParams] = useSearchParams();
@@ -135,16 +138,14 @@ export function VisualizePage() {
     setChartType(isNumeric ? "histogram" : "bar");
   }, [field, autoProbedField, numericQuery.data]);
 
-  // Keep chartType valid whenever scale changes.
-  useEffect(() => {
-    if (!CHART_META[chartType].scales.includes(scale)) {
-      const firstValid = (Object.keys(CHART_META) as ChartType[]).find((c) =>
-        CHART_META[c].scales.includes(scale),
-      );
-      if (firstValid) setChartType(firstValid);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scale]);
+  // Keep chartType valid when the analyst switches scale — clamped at event
+  // time rather than in an effect, so there is never a render with an
+  // inconsistent scale/chartType pair. (Every scale has at least one chart
+  // type in CHART_META.)
+  const handleScaleChange = (s: Scale) => {
+    setScale(s);
+    if (!CHART_META[chartType].scales.includes(s)) setChartType(chartTypesFor(s)[0]);
+  };
 
   // The slider's valid range differs by data kind (terms charts allow up to
   // 50 values, timeseries up to 20 series); clamp the shared state on
@@ -164,9 +165,7 @@ export function VisualizePage() {
     enabled: !!(caseId && timelineId && field) && dataKind === "timeseries",
   });
 
-  const availableChartTypes = (Object.keys(CHART_META) as ChartType[]).filter((c) =>
-    CHART_META[c].scales.includes(scale),
-  );
+  const availableChartTypes = chartTypesFor(scale);
 
   const captionLines = [
     `TraceVector — visualization — case ${caseId} / timeline ${timelineId ?? ""}`,
@@ -237,7 +236,7 @@ export function VisualizePage() {
                   type="radio"
                   name="scale"
                   checked={scale === s}
-                  onChange={() => setScale(s)}
+                  onChange={() => handleScaleChange(s)}
                   className="accent-[var(--color-accent)]"
                 />
                 {SCALE_INFO[s].label}
