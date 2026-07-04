@@ -94,3 +94,38 @@ class TestCountEventsBinds:
     def test_empty_source_ids_short_circuits(self, store):
         assert store.count_events(source_ids=[]) == 0
         assert store.client.queries == []
+
+
+class _FailingClient(_RecordingClient):
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
+
+    def command(self, cmd):
+        super().command(cmd)
+        raise RuntimeError(self.message)
+
+
+class TestDeleteSourceEventsErrors:
+    def test_generic_failure_raises(self, store):
+        store.client = _FailingClient("Code: 210. Connection refused")
+        with pytest.raises(RuntimeError, match="Connection refused"):
+            store.delete_source_events("case-1", "src-1")
+
+    def test_missing_table_is_benign_noop(self, store):
+        store.client = _FailingClient("Code: 60. DB::Exception: UNKNOWN_TABLE")
+        store.delete_source_events("case-1", "src-1")  # must not raise
+
+    def test_timeline_delete_attempts_all_and_aggregates(self, store):
+        attempted: list[str] = []
+
+        def flaky_command(cmd):
+            source_id = cmd.split("'")[3]
+            attempted.append(source_id)
+            if source_id in ("bad-1", "bad-2"):
+                raise RuntimeError("boom")
+
+        store.client = type("C", (), {"command": staticmethod(flaky_command)})()
+        with pytest.raises(RuntimeError, match="bad-1, bad-2"):
+            store.delete_timeline_events("case-1", ["ok-1", "bad-1", "ok-2", "bad-2"])
+        assert attempted == ["ok-1", "bad-1", "ok-2", "bad-2"]

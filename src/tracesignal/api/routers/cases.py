@@ -244,10 +244,29 @@ async def delete_case(
     ch = ClickHouseStore()
 
     sources = await store.list_sources(case_id)
-    for source in sources:
-        qdrant.delete_source_points(case_id, source.id)
-        ch.delete_source_events(case_id, source.id)
-    qdrant.delete_case_collections(case_id)
+    # The Postgres case row is the authoritative record that this evidence
+    # exists — it is only removed after every event/vector cascade succeeded.
+    # A failed cascade aborts with 502 so the delete stays visible and
+    # retryable instead of leaving orphan events behind a "successful" delete.
+    try:
+        for source in sources:
+            qdrant.delete_source_points(case_id, source.id)
+            await asyncio.to_thread(ch.delete_source_events, case_id, source.id)
+        qdrant.delete_case_collections(case_id)
+    except Exception as exc:
+        await store.record_audit(
+            action="case.delete_failed",
+            actor=user,
+            case_id=case_id,
+            target_type="case",
+            target_id=case_id,
+            detail={"error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to delete case events from the event store; case was not deleted. "
+            "Retry once the event store is reachable.",
+        ) from exc
     await store.delete_case(case_id)
 
     await store.record_audit(
@@ -464,14 +483,34 @@ async def _run_ingestion_job(
             },
         )
     except Exception as exc:  # noqa: BLE001
+        # Best-effort rollback (the job is already failing; raising here helps
+        # nobody) — but never silent: each failed step is logged and flagged on
+        # the job so the orphaned partition/row is visible in the UI.
+        cleanup_errors: list[str] = []
         try:
             await asyncio.to_thread(clickhouse.delete_source_events, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Ingest rollback: failed to delete events for source %s (case %s)",
+                source_id,
+                case_id,
+            )
+            cleanup_errors.append("event deletion failed")
+        try:
             await store.delete_source(case_id, source_id)
             if not await store.source_hash_in_use(file_hash, exclude_source_id=source_id):
                 _retention_path(file_hash).unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001, S110 — best-effort cleanup
-            pass
-        job_store.update(job_id, status="failed", error=str(exc))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Ingest rollback: failed to remove source row %s (case %s)",
+                source_id,
+                case_id,
+            )
+            cleanup_errors.append("source-row removal failed")
+        error = str(exc)
+        if cleanup_errors:
+            error += f" (cleanup incomplete: {'; '.join(cleanup_errors)})"
+        job_store.update(job_id, status="failed", error=error)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -680,8 +719,27 @@ async def delete_source(
 
     qdrant = QdrantStore()
     ch = ClickHouseStore()
-    qdrant.delete_source_points(case_id, source_id)
-    ch.delete_source_events(case_id, source_id)
+    # The Postgres source row is the authoritative record that this evidence
+    # exists — it is only removed after the event/vector cascades succeeded.
+    # A failed cascade aborts with 502 so the delete stays visible and
+    # retryable instead of leaving orphan events behind a "successful" delete.
+    try:
+        qdrant.delete_source_points(case_id, source_id)
+        await asyncio.to_thread(ch.delete_source_events, case_id, source_id)
+    except Exception as exc:
+        await store.record_audit(
+            action="source.delete_failed",
+            actor=user,
+            case_id=case_id,
+            target_type="source",
+            target_id=source_id,
+            detail={"error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to delete source events from the event store; source was not "
+            "deleted. Retry once the event store is reachable.",
+        ) from exc
     await store.delete_source(case_id, source_id)
 
     await store.record_audit(

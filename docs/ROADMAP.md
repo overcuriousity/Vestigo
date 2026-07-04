@@ -28,11 +28,6 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 1 — correctness & forensic integrity (Medium severity)
 
-- [ ] **M1 — No silent failures on evidence mutation.** `ClickHouseStore.delete_source_events`
-  swallows all exceptions (`db/clickhouse.py`, bare `except: pass` around DROP PARTITION);
-  `cases.py` ingest-failure cleanup likewise. A failed delete must log loudly and surface to
-  the caller — orphan events reappearing after a "successful" source delete is a forensic
-  integrity bug. Distinguish "partition doesn't exist" (fine, no-op) from real errors.
 - [ ] **M3 — Login backoff.** No rate limiting on `POST /api/auth/login`; argon2 slows one
   attempt, not a loop. In-memory per-username+IP failure counter with exponential delay fits
   the single-process design.

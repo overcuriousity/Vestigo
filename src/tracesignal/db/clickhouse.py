@@ -20,6 +20,7 @@ verification against the original file is unaffected.
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections.abc import Iterable
 from datetime import UTC
@@ -29,6 +30,8 @@ import clickhouse_connect
 
 from tracesignal.core.config import get_settings
 from tracesignal.models.event import Event
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
@@ -430,18 +433,48 @@ class ClickHouseStore:
 
         The ``events`` table is partitioned by ``(case_id, source_id)`` so
         ``DROP PARTITION`` is instant and does not require a full-table scan.
-        If the partition does not exist the call is a silent no-op.
+        A missing partition is a server-side no-op; a missing ``events``
+        table (fresh install, schema never initialized) is treated as a
+        benign no-op too. Any other failure is logged and re-raised — a
+        silently failed evidence delete would leave orphan events behind a
+        "successful" delete, which is a forensic-integrity violation.
         """
         partition_expr = _partition_expr(case_id, source_id)
-        with contextlib.suppress(Exception):
+        try:
             self.client.command(
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
             )
+        except Exception as exc:
+            if "UNKNOWN_TABLE" in str(exc):
+                logger.debug(
+                    "events table missing while deleting source %s (case %s); nothing to drop",
+                    source_id,
+                    case_id,
+                )
+                return
+            logger.exception(
+                "Failed to drop events partition for source %s (case %s)", source_id, case_id
+            )
+            raise
 
     def delete_timeline_events(self, case_id: str, source_ids: list[str]) -> None:
-        """Remove all events for a timeline by dropping partitions for its sources."""
+        """Remove all events for a timeline by dropping partitions for its sources.
+
+        Attempts every source even if some fail, then raises a single
+        ``RuntimeError`` naming the failed sources so one bad partition
+        doesn't silently skip the rest.
+        """
+        failed: list[str] = []
         for source_id in source_ids:
-            self.delete_source_events(case_id, source_id)
+            try:
+                self.delete_source_events(case_id, source_id)
+            except Exception:
+                failed.append(source_id)
+        if failed:
+            raise RuntimeError(
+                f"failed to delete events for {len(failed)} source(s) "
+                f"in case {case_id}: {', '.join(failed)}"
+            )
 
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the ClickHouse connection."""
