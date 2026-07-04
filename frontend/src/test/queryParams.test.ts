@@ -5,6 +5,7 @@ import {
   filtersToViewPayload,
   viewPayloadToFilters,
   serializeEventFilterFields,
+  serializeEventFilterParams,
 } from "@/lib/queryParams";
 import type { EventFilters } from "@/api/types";
 
@@ -41,6 +42,33 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
     const out = paramsToFilters(p);
     expect(out.filters).toEqual({ ip_address_city: "Falkenstein", status_code: "200" });
     expect(out.exclusions).toEqual({ user_agent: ["bot"] });
+  });
+
+  it("round-trips field match modes", () => {
+    const f: EventFilters = {
+      filters: { src_ip: "10.0.*" },
+      filterModes: { src_ip: "wildcard" },
+      exclusions: { msg: ["^error"] },
+      exclusionModes: { msg: "regex" },
+    };
+    const out = paramsToFilters(filtersToParams(f));
+    expect(out.filterModes).toEqual({ src_ip: "wildcard" });
+    expect(out.exclusionModes).toEqual({ msg: "regex" });
+  });
+
+  it("legacy URL without mode params yields no mode maps", () => {
+    const p = filtersToParams({ filters: { a: "b" }, exclusions: { c: ["d"] } });
+    const out = paramsToFilters(p);
+    expect(out.filterModes).toBeUndefined();
+    expect(out.exclusionModes).toBeUndefined();
+  });
+
+  it("drops invalid and explicit-exact mode values from the URL", () => {
+    const p = new URLSearchParams();
+    p.set("filters", JSON.stringify({ a: "x", b: "y", c: "z" }));
+    p.set("filterModes", JSON.stringify({ a: "glob", b: "exact", c: "regex" }));
+    const out = paramsToFilters(p);
+    expect(out.filterModes).toEqual({ c: "regex" });
   });
 
   it("round-trips the merged tag filter and multi-select artifacts", () => {
@@ -118,6 +146,42 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
     const out = viewPayloadToFilters({ q: "old view" });
     expect(out.qMode).toBeUndefined();
     expect(out.qRegex).toBeUndefined();
+  });
+
+  it("round-trips match modes so a saved view reproduces match semantics", () => {
+    const f: EventFilters = {
+      filters: { src_ip: "10.0.*" },
+      filterModes: { src_ip: "wildcard" },
+      exclusions: { msg: ["^err"] },
+      exclusionModes: { msg: "regex" },
+    };
+    const out = viewPayloadToFilters(filtersToViewPayload(f));
+    expect(out.filterModes).toEqual({ src_ip: "wildcard" });
+    expect(out.exclusionModes).toEqual({ msg: "regex" });
+  });
+
+  it("treats legacy payloads without mode keys as exact and drops invalid modes", () => {
+    const out = viewPayloadToFilters({ filters: { a: "b" } });
+    expect(out.filterModes).toBeUndefined();
+    const bad = viewPayloadToFilters({
+      filters: { a: "b" },
+      filterModes: { a: "glob", b: "exact" },
+    });
+    expect(bad.filterModes).toBeUndefined();
+  });
+});
+
+describe("serializeEventFilterParams match modes", () => {
+  it("emits filter_modes/exclusion_modes JSON only when non-empty", () => {
+    expect(serializeEventFilterParams({ filters: { a: "b" } }).filter_modes).toBeUndefined();
+    const out = serializeEventFilterParams({
+      filters: { src_ip: "10.0.*" },
+      filterModes: { src_ip: "wildcard" },
+      exclusions: { msg: ["x"] },
+      exclusionModes: { msg: "regex" },
+    });
+    expect(out.filter_modes).toBe(JSON.stringify({ src_ip: "wildcard" }));
+    expect(out.exclusion_modes).toBe(JSON.stringify({ msg: "regex" }));
   });
 });
 

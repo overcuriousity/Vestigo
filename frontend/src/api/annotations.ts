@@ -58,6 +58,8 @@ export const annotationsApi = {
         ...serializeEventFilterFields(filters),
         filters: filters.filters ? JSON.stringify(filters.filters) : null,
         exclusions: filters.exclusions ? JSON.stringify(filters.exclusions) : null,
+        filter_modes: filters.filterModes ? JSON.stringify(filters.filterModes) : null,
+        exclusion_modes: filters.exclusionModes ? JSON.stringify(filters.exclusionModes) : null,
       },
     );
   },

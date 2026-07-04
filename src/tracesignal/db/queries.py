@@ -91,6 +91,13 @@ class EventQuery:
     end: datetime | None = None
     field_filters: dict[str, str] = field(default_factory=dict)
     field_exclusions: dict[str, list[str]] = field(default_factory=dict)
+    # Match mode per field key ("exact" when absent): exact | wildcard | regex.
+    # Wildcard: */? glob translated to ILIKE (case-insensitive, consistent
+    # with the broad text search). Regex: RE2 via match(), case-sensitive
+    # with `(?i)` opt-in — same semantics as q_regex. One mode per key; for
+    # exclusions it applies to every value under that key.
+    filter_modes: dict[str, str] = field(default_factory=dict)
+    exclusion_modes: dict[str, str] = field(default_factory=dict)
     # Optional event_id allowlist (e.g. resolved from an annotation filter).
     # None means "no restriction"; an empty list matches zero events.
     event_ids: list[str] | None = None
@@ -172,6 +179,22 @@ def _escape_like(value: str) -> str:
     substring they typed.
     """
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# Match modes accepted for field filters/exclusions. "exact" is the implied
+# default everywhere a mode map has no entry for a field key.
+VALID_MATCH_MODES = ("exact", "wildcard", "regex")
+
+
+def _glob_to_like(value: str) -> str:
+    """Translate an analyst glob (``*`` any-run, ``?`` single char) to a LIKE pattern.
+
+    LIKE metacharacters are escaped FIRST (so a literal ``%``/``_``/``\\`` in
+    the value stays literal), then the glob characters are mapped — ``*`` and
+    ``?`` are not LIKE metacharacters, so they survive ``_escape_like``
+    untouched.
+    """
+    return _escape_like(value).replace("*", "%").replace("?", "_")
 
 
 def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -319,20 +342,67 @@ class _ParameterizedQueryBuilder:
         self.parameters[tags_name] = filt.tag_values
         self.parameters[ids_name] = filt.postgres_event_ids
 
-    def add_field_filter(self, key: str, value: str) -> None:
-        """Add an equality filter on a top-level column or attribute."""
-        column = self._column_expr(key)
-        self.add_param(f"{column} = :name", value)
+    def _match_column_expr(self, key: str, mode: str) -> str:
+        """Column expression for a field predicate under *mode*.
 
-    def add_field_exclusion(self, key: str, values: list[str]) -> None:
-        """Add a NOT IN exclusion on a top-level column or attribute."""
-        column = self._column_expr(key)
-        if len(values) == 1:
-            self.add_param(f"{column} != :name", values[0])
+        Exact keeps typed comparison (no toString) so `=`/`NOT IN` compare
+        against typed literals; wildcard/regex are string operations and need
+        non-string top-level columns cast.
+        """
+        if mode == "exact":
+            return self._column_expr(key)
+        return _field_column_expr(
+            key,
+            self.parameters,
+            self._param_name,
+            cast_non_string=True,
+            field_mappings=self._field_mappings,
+        )
+
+    def add_field_filter(self, key: str, value: str, mode: str = "exact") -> None:
+        """Add a filter on a top-level column or attribute.
+
+        Mode: exact equality, wildcard (*/? glob via ILIKE, case-insensitive),
+        or regex (RE2 match(), case-sensitive). Routers validate mode strings
+        up front; the ValueError here is a defense-in-depth backstop.
+        """
+        column = self._match_column_expr(key, mode)
+        if mode == "exact":
+            self.add_param(f"{column} = :name", value)
+        elif mode == "wildcard":
+            self.add_param(f"{column} ILIKE :name", _glob_to_like(value))
+        elif mode == "regex":
+            self.add_param(f"match({column}, :name)", value)
         else:
-            name = self._param_name()
-            self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
-            self.parameters[name] = values
+            raise ValueError(f"invalid match mode: {mode!r}")
+
+    def add_field_exclusion(self, key: str, values: list[str], mode: str = "exact") -> None:
+        """Add an exclusion on a top-level column or attribute.
+
+        Exact uses `!=`/`NOT IN`; wildcard/regex OR one predicate per value
+        and negate the whole, so "matches none of the patterns".
+        """
+        column = self._match_column_expr(key, mode)
+        if mode == "exact":
+            if len(values) == 1:
+                self.add_param(f"{column} != :name", values[0])
+            else:
+                name = self._param_name()
+                self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
+                self.parameters[name] = values
+        elif mode in ("wildcard", "regex"):
+            clauses = []
+            for value in values:
+                name = self._param_name()
+                if mode == "wildcard":
+                    clauses.append(f"{column} ILIKE {{{name}:String}}")
+                    self.parameters[name] = _glob_to_like(value)
+                else:
+                    clauses.append(f"match({column}, {{{name}:String}})")
+                    self.parameters[name] = value
+            self.conditions.append("NOT (" + " OR ".join(clauses) + ")")
+        else:
+            raise ValueError(f"invalid match mode: {mode!r}")
 
     def add_tag_exclusion(self, value: str) -> None:
         """Exclude events that have *value* in their tags array."""
@@ -531,10 +601,12 @@ class EventQueryService:
             builder.add_cursor(op, ts, event_id)
 
         for key, value in (query.field_filters or {}).items():
-            builder.add_field_filter(key, value)
+            builder.add_field_filter(key, value, mode=(query.filter_modes or {}).get(key, "exact"))
 
         for key, values in (query.field_exclusions or {}).items():
-            builder.add_field_exclusion(key, values)
+            builder.add_field_exclusion(
+                key, values, mode=(query.exclusion_modes or {}).get(key, "exact")
+            )
 
         return builder.where_clause(), builder.parameters
 

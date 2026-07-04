@@ -2,7 +2,21 @@
  * URL search-param serialization for filter state.
  * All filter state lives in the URL so investigation links are shareable.
  */
-import type { EventFilters } from "@/api/types";
+import type { EventFilters, FieldMatchMode } from "@/api/types";
+
+/** Sanitize an untrusted parsed object into a match-mode map.
+ *
+ * Drops anything that isn't "wildcard"/"regex" — including explicit "exact"
+ * (absence already means exact) and unknown strings from hand-edited URLs
+ * or legacy payloads, so downstream code never sees an invalid mode. */
+function sanitizeModes(raw: unknown): Record<string, FieldMatchMode> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, FieldMatchMode> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === "wildcard" || v === "regex") out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 /** Scalar/comma-joined API fields shared by every request that carries
  * `EventFilters` — GET query params (events list, histogram) and JSON POST
@@ -81,8 +95,13 @@ export function serializeEventFilterFields(
  */
 export function serializeEventFilterParams(
   filters: EventFilters,
-): SerializedEventFilterFields & { filters?: string; exclusions?: string } {
-  const out: SerializedEventFilterFields & { filters?: string; exclusions?: string } = {
+): SerializedEventFilterFields & {
+  filters?: string;
+  exclusions?: string;
+  filter_modes?: string;
+  exclusion_modes?: string;
+} {
+  const out: ReturnType<typeof serializeEventFilterParams> = {
     ...serializeEventFilterFields(filters),
   };
   if (filters.filters && Object.keys(filters.filters).length > 0) {
@@ -90,6 +109,12 @@ export function serializeEventFilterParams(
   }
   if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
     out.exclusions = JSON.stringify(filters.exclusions);
+  }
+  if (filters.filterModes && Object.keys(filters.filterModes).length > 0) {
+    out.filter_modes = JSON.stringify(filters.filterModes);
+  }
+  if (filters.exclusionModes && Object.keys(filters.exclusionModes).length > 0) {
+    out.exclusion_modes = JSON.stringify(filters.exclusionModes);
   }
   return out;
 }
@@ -119,6 +144,12 @@ export function filtersToParams(filters: EventFilters): URLSearchParams {
   }
   if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
     p.set("exclusions", JSON.stringify(filters.exclusions));
+  }
+  if (filters.filterModes && Object.keys(filters.filterModes).length > 0) {
+    p.set("filterModes", JSON.stringify(filters.filterModes));
+  }
+  if (filters.exclusionModes && Object.keys(filters.exclusionModes).length > 0) {
+    p.set("exclusionModes", JSON.stringify(filters.exclusionModes));
   }
   if (filters.annotated && filters.annotated.length > 0) {
     p.set("annotated", filters.annotated.join(","));
@@ -178,6 +209,22 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
       // ignore malformed
     }
   }
+  const rawFilterModes = params.get("filterModes");
+  if (rawFilterModes) {
+    try {
+      filters.filterModes = sanitizeModes(JSON.parse(rawFilterModes));
+    } catch {
+      // ignore malformed
+    }
+  }
+  const rawExclusionModes = params.get("exclusionModes");
+  if (rawExclusionModes) {
+    try {
+      filters.exclusionModes = sanitizeModes(JSON.parse(rawExclusionModes));
+    } catch {
+      // ignore malformed
+    }
+  }
   if (annotated) {
     filters.annotated = annotated
       .split(",")
@@ -211,6 +258,10 @@ export function filtersToViewPayload(
     end: filters.end ?? null,
     filters: filters.filters ?? {},
     exclusions: filters.exclusions ?? {},
+    // Match modes are part of the payload for the same reason as qRegex:
+    // a saved view must reproduce the exact match semantics.
+    filterModes: filters.filterModes ?? {},
+    exclusionModes: filters.exclusionModes ?? {},
     annotated: filters.annotated ?? [],
     annotationTagValue: filters.annotationTagValue ?? null,
   };
@@ -263,6 +314,11 @@ export function viewPayloadToFilters(
   ) {
     f.exclusions = payload.exclusions as Record<string, string[]>;
   }
+  // Legacy payloads predate match modes — absent means exact for every field.
+  const viewFilterModes = sanitizeModes(payload.filterModes);
+  if (viewFilterModes) f.filterModes = viewFilterModes;
+  const viewExclusionModes = sanitizeModes(payload.exclusionModes);
+  if (viewExclusionModes) f.exclusionModes = viewExclusionModes;
   if (Array.isArray(payload.annotated) && payload.annotated.length > 0) {
     f.annotated = (payload.annotated as string[]).filter(
       (t): t is "tag" | "anomaly" => t === "tag" || t === "anomaly",

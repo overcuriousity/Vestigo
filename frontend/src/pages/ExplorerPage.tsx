@@ -47,7 +47,17 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation, FieldMatchMode } from "@/api/types";
+
+/** Remove `key`'s match-mode entry; collapse to undefined when the map empties. */
+function dropMode(
+  modes: Record<string, FieldMatchMode> | undefined,
+  key: string,
+): Record<string, FieldMatchMode> | undefined {
+  if (!modes || !(key in modes)) return modes;
+  const { [key]: _removed, ...rest } = modes;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
 
 const PAGE_SIZE = 100;
 
@@ -97,18 +107,21 @@ export function ExplorerPage() {
       if (key === "filters" && fieldKey) {
         const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
         f.filters = rest;
+        f.filterModes = dropMode(f.filterModes, fieldKey);
       } else if (key === "exclusions" && fieldKey) {
         if (value !== undefined) {
           const remaining = (f.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
           if (remaining.length === 0) {
             const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
             f.exclusions = rest;
+            f.exclusionModes = dropMode(f.exclusionModes, fieldKey);
           } else {
             f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: remaining };
           }
         } else {
           const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
           f.exclusions = rest;
+          f.exclusionModes = dropMode(f.exclusionModes, fieldKey);
         }
       } else if (key === "artifacts") {
         const remaining = value !== undefined
@@ -177,10 +190,17 @@ export function ExplorerPage() {
         }
       } else if (include) {
         next.filters = { ...(next.filters ?? {}), [fieldKey]: value };
+        // Grid-cell values are literal — reset any pattern mode on the key,
+        // otherwise the cell text would be reinterpreted as glob/regex.
+        next.filterModes = dropMode(next.filterModes, fieldKey);
       } else {
         const prev = next.exclusions?.[fieldKey] ?? [];
         if (!prev.includes(value)) {
           next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
+          // Same literal-value rule; mode is per key, so this also flips any
+          // pre-existing pattern-mode values of the key back to exact —
+          // visible via the chips' badge disappearing.
+          next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
         }
       }
 

@@ -10,7 +10,7 @@ import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import { vizApi } from "@/api/viz";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/cn";
-import type { EventFilters, View } from "@/api/types";
+import type { EventFilters, FieldMatchMode, View } from "@/api/types";
 import { datetimeLocalToUtcIso, fmtRelative, isoToDatetimeLocalUtc } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
 
@@ -31,6 +31,76 @@ function useFieldValueSuggestions(
     staleTime: 60_000,
   });
   return useMemo(() => (data?.values ?? []).map((v) => v.value).filter(Boolean), [data]);
+}
+
+type RowMatchMode = "exact" | FieldMatchMode;
+
+const MATCH_MODE_OPTIONS: { mode: RowMatchMode; label: string; tooltip: string }[] = [
+  { mode: "exact", label: "=", tooltip: "Exact value match (case-sensitive)" },
+  {
+    mode: "wildcard",
+    label: "*",
+    tooltip: "Wildcard: * = any run, ? = one char — case-insensitive. e.g. 10.0.*",
+  },
+  {
+    mode: "regex",
+    label: ".*",
+    tooltip: "RE2 regular expression — case-sensitive, prefix (?i) for case-insensitive",
+  },
+];
+
+const MODE_PLACEHOLDER: Record<RowMatchMode, string> = {
+  exact: "value",
+  wildcard: "e.g. 10.0.*",
+  regex: "RE2 pattern — (?i) for case-insensitive",
+};
+
+/** 3-state exact/wildcard/regex selector for one field-filter entry row. */
+function MatchModeControl({
+  mode,
+  onChange,
+}: {
+  mode: RowMatchMode;
+  onChange: (m: RowMatchMode) => void;
+}) {
+  return (
+    <div className="flex overflow-hidden rounded border border-[var(--color-border-strong)] text-xs">
+      {MATCH_MODE_OPTIONS.map((opt) => (
+        <Tooltip key={opt.mode} content={opt.tooltip}>
+          <button
+            type="button"
+            onClick={() => onChange(opt.mode)}
+            className={cn(
+              "px-2 py-0.5 font-mono transition-base",
+              mode === opt.mode
+                ? "bg-[var(--color-accent)] text-white"
+                : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]",
+            )}
+          >
+            {opt.label}
+          </button>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+/** Per-row hints: the exact-mode glob trap, and regex pre-validation.
+ * Both non-authoritative — the server-side 400 stays the source of truth. */
+function matchModeHint(mode: RowMatchMode, value: string): string | undefined {
+  const v = value.trim();
+  if (!v) return undefined;
+  if (mode === "exact" && /[*?]/.test(v)) {
+    return "* matched literally in Exact mode — switch to * (Wildcard) for pattern matching";
+  }
+  if (mode === "regex") {
+    try {
+      new RegExp(v);
+    } catch (e) {
+      return e instanceof Error ? e.message : "invalid regular expression";
+    }
+  }
+  return undefined;
 }
 
 interface Props {
@@ -84,8 +154,10 @@ export function FilterRail({
   const [artifactInput, setArtifactInput] = useState("");
   const [fieldKey, setFieldKey] = useState("");
   const [fieldVal, setFieldVal] = useState("");
+  const [fieldMode, setFieldMode] = useState<RowMatchMode>("exact");
   const [excludeKey, setExcludeKey] = useState("");
   const [excludeVal, setExcludeVal] = useState("");
+  const [excludeMode, setExcludeMode] = useState<RowMatchMode>("exact");
 
   const fieldValueSuggestions = useFieldValueSuggestions(caseId, timelineId, fieldKey);
   const excludeValueSuggestions = useFieldValueSuggestions(caseId, timelineId, excludeKey);
@@ -122,27 +194,43 @@ export function FilterRail({
 
   const addFilter = (value?: string) => {
     const v = (value ?? fieldVal).trim();
-    if (!fieldKey.trim() || !v) return;
+    const key = fieldKey.trim();
+    if (!key || !v) return;
+    // "exact" is never stored — absence means exact (legacy compatibility).
+    const modes = { ...(filters.filterModes ?? {}) };
+    if (fieldMode === "exact") delete modes[key];
+    else modes[key] = fieldMode;
     onChange({
       ...filters,
-      filters: { ...(filters.filters ?? {}), [fieldKey.trim()]: v },
+      filters: { ...(filters.filters ?? {}), [key]: v },
+      filterModes: Object.keys(modes).length > 0 ? modes : undefined,
     });
     setFieldKey("");
     setFieldVal("");
+    setFieldMode("exact");
   };
 
   const addExclusion = (value?: string) => {
     const v = (value ?? excludeVal).trim();
-    if (!excludeKey.trim() || !v) return;
+    const key = excludeKey.trim();
+    if (!key || !v) return;
+    // Mode-per-key: the mode chosen here becomes the key's mode for ALL its
+    // excluded values — every chip of the key shows the (updated) badge, so
+    // a semantics change is visible, never silent.
+    const modes = { ...(filters.exclusionModes ?? {}) };
+    if (excludeMode === "exact") delete modes[key];
+    else modes[key] = excludeMode;
     onChange({
       ...filters,
       exclusions: {
         ...(filters.exclusions ?? {}) as Record<string, string[]>,
-        [excludeKey.trim()]: [...(filters.exclusions?.[excludeKey.trim()] ?? []), v],
+        [key]: [...(filters.exclusions?.[key] ?? []), v],
       },
+      exclusionModes: Object.keys(modes).length > 0 ? modes : undefined,
     });
     setExcludeKey("");
     setExcludeVal("");
+    setExcludeMode("exact");
   };
 
   const addArtifact = (value: string) => {
@@ -476,7 +564,7 @@ export function FilterRail({
               className="w-24"
             />
             <TagInput
-              placeholder="value"
+              placeholder={MODE_PLACEHOLDER[fieldMode]}
               openOnFocus
               value={fieldVal}
               onChange={setFieldVal}
@@ -489,6 +577,14 @@ export function FilterRail({
               <PlusCircle size={13} />
             </Button>
           </div>
+          <div className="mt-1.5">
+            <MatchModeControl mode={fieldMode} onChange={setFieldMode} />
+          </div>
+          {matchModeHint(fieldMode, fieldVal) && (
+            <div className="mt-1 text-xs text-[var(--color-warning)]">
+              {matchModeHint(fieldMode, fieldVal)}
+            </div>
+          )}
         </div>
 
         {/* Field exclude */}
@@ -508,7 +604,7 @@ export function FilterRail({
               className="w-24"
             />
             <TagInput
-              placeholder="value"
+              placeholder={MODE_PLACEHOLDER[excludeMode]}
               openOnFocus
               value={excludeVal}
               onChange={setExcludeVal}
@@ -521,6 +617,14 @@ export function FilterRail({
               <MinusCircle size={13} />
             </Button>
           </div>
+          <div className="mt-1.5">
+            <MatchModeControl mode={excludeMode} onChange={setExcludeMode} />
+          </div>
+          {matchModeHint(excludeMode, excludeVal) && (
+            <div className="mt-1 text-xs text-[var(--color-warning)]">
+              {matchModeHint(excludeMode, excludeVal)}
+            </div>
+          )}
         </div>
 
         {/* Saved views */}

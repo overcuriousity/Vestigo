@@ -180,6 +180,55 @@ def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
     return result
 
 
+_VALID_FILTER_MODES = {"exact", "wildcard", "regex"}
+
+
+def _parse_modes_object(value: str | None) -> dict[str, str]:
+    """Parse a ``{"field": "exact"|"wildcard"|"regex"}`` match-mode map.
+
+    Absent keys mean exact everywhere downstream; explicit ``"exact"``
+    entries are accepted and harmless. Unknown mode strings are a client
+    error — silently coercing them to exact would make a filter match
+    something other than what the analyst asked for.
+    """
+    parsed = _parse_json_object(value)
+    for k, v in parsed.items():
+        if v not in _VALID_FILTER_MODES:
+            raise HTTPException(status_code=400, detail=f"invalid match mode {v!r} for field {k!r}")
+    return parsed
+
+
+def _validate_field_regexes(
+    field_map: dict[str, str] | dict[str, list[str]], modes: dict[str, str]
+) -> None:
+    """Pre-check every regex-mode field pattern with ``re.compile`` → 400.
+
+    Same non-authoritative cheap check as :func:`_validate_regex` — RE2
+    inside ClickHouse is the final arbiter, guarded by
+    :func:`_run_regex_guarded`.
+    """
+    for key, mode in modes.items():
+        if mode != "regex":
+            continue
+        raw = field_map.get(key)
+        if raw is None:
+            continue
+        values = raw if isinstance(raw, list) else [raw]
+        for pattern in values:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid regular expression for field {key!r}: {exc}",
+                ) from exc
+
+
+def _uses_regex(q_regex: bool, *mode_maps: dict[str, str]) -> bool:
+    """Whether any part of the query runs an RE2 pattern in ClickHouse."""
+    return q_regex or any("regex" in m.values() for m in mode_maps)
+
+
 async def _resolve_timeline_scope(
     case_id: str, timeline_id: str
 ) -> tuple[list[str], dict[str, list[str]] | None]:
@@ -429,6 +478,21 @@ async def list_events(
         default=None,
         description='JSON object of field exclusion filters, e.g. {"status_code":"200"}',
     ),
+    filter_modes: str | None = Query(
+        default=None,
+        description=(
+            "JSON object mapping a `filters` field to its match mode "
+            '("exact"|"wildcard"|"regex"), e.g. {"src_ip":"wildcard"}. '
+            "Absent fields match exact."
+        ),
+    ),
+    exclusion_modes: str | None = Query(
+        default=None,
+        description=(
+            "JSON object mapping an `exclusions` field to its match mode — "
+            "applies to every excluded value under that field."
+        ),
+    ),
     annotated: str | None = Query(
         default=None,
         description='Comma-separated annotation types to filter to, e.g. "tag,anomaly".',
@@ -470,6 +534,12 @@ async def list_events(
     if order not in ("asc", "desc"):
         order = "desc"
     _validate_regex(q, q_regex)
+    parsed_filters = _parse_json_object(filters)
+    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filter_modes = _parse_modes_object(filter_modes)
+    parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
+    _validate_field_regexes(parsed_filters, parsed_filter_modes)
+    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
 
     after_cursor = _parse_cursor(after, param_name="after")
     before_cursor = _parse_cursor(before, param_name="before")
@@ -505,7 +575,7 @@ async def list_events(
     # other request (the ClickHouse client is built for concurrent threadpool
     # use, see ClickHouseStore's autogenerate_session_id note).
     page = await _run_regex_guarded(
-        q_regex,
+        _uses_regex(q_regex, parsed_filter_modes, parsed_exclusion_modes),
         service.query,
         EventQuery(
             case_id=case_id,
@@ -519,8 +589,10 @@ async def list_events(
             exclude_tag=exclude_tag,
             start=start,
             end=end,
-            field_filters=_parse_json_object(filters),
-            field_exclusions=_parse_exclusions_object(exclusions),
+            field_filters=parsed_filters,
+            field_exclusions=parsed_exclusions,
+            filter_modes=parsed_filter_modes,
+            exclusion_modes=parsed_exclusion_modes,
             event_ids=event_ids,
             tags_include=tags_include_filter,
             tags_exclude=tags_exclude_filter,
@@ -567,6 +639,14 @@ class BulkAnnotateByFilterRequest(BaseModel):
         default=None,
         description='JSON field-exclusion filters, e.g. {"status_code":["200"]}',
     )
+    filter_modes: str | None = Field(
+        default=None,
+        description='JSON match-mode map for `filters`, e.g. {"src_ip":"wildcard"}.',
+    )
+    exclusion_modes: str | None = Field(
+        default=None,
+        description="JSON match-mode map for `exclusions` (mode applies to all values per field).",
+    )
     annotated: str | None = Field(
         default=None,
         description='Comma-separated annotation types to restrict to, e.g. "tag,anomaly".',
@@ -606,6 +686,12 @@ async def bulk_annotate_by_filter(
             detail=f"annotation_type must be one of {sorted(allowed_types)}",
         )
     _validate_regex(body.q, body.q_regex)
+    parsed_filters = _parse_json_object(body.filters)
+    parsed_exclusions = _parse_exclusions_object(body.exclusions)
+    parsed_filter_modes = _parse_modes_object(body.filter_modes)
+    parsed_exclusion_modes = _parse_modes_object(body.exclusion_modes)
+    _validate_field_regexes(parsed_filters, parsed_filter_modes)
+    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
 
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
@@ -622,7 +708,7 @@ async def bulk_annotate_by_filter(
     service = _get_query_service()
     # Blocking ClickHouse scan — threadpool, same as list_events.
     refs = await _run_regex_guarded(
-        body.q_regex,
+        _uses_regex(body.q_regex, parsed_filter_modes, parsed_exclusion_modes),
         service.query_event_refs,
         EventQuery(
             case_id=case_id,
@@ -636,8 +722,10 @@ async def bulk_annotate_by_filter(
             exclude_tag=body.exclude_tag,
             start=body.start,
             end=body.end,
-            field_filters=_parse_json_object(body.filters),
-            field_exclusions=_parse_exclusions_object(body.exclusions),
+            field_filters=parsed_filters,
+            field_exclusions=parsed_exclusions,
+            filter_modes=parsed_filter_modes,
+            exclusion_modes=parsed_exclusion_modes,
             event_ids=event_ids,
             tags_include=tags_include_filter,
             tags_exclude=tags_exclude_filter,
@@ -780,6 +868,8 @@ async def get_histogram(
     end: datetime | None = Query(default=None),  # noqa: B008
     filters: str | None = Query(default=None),
     exclusions: str | None = Query(default=None),
+    filter_modes: str | None = Query(default=None),
+    exclusion_modes: str | None = Query(default=None),
     annotated: str | None = Query(default=None),
     annotation_tag_value: str | None = Query(default=None),
     run_id: str | None = Query(default=None),
@@ -794,6 +884,12 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     _validate_regex(q, q_regex)
+    parsed_filters = _parse_json_object(filters)
+    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filter_modes = _parse_modes_object(filter_modes)
+    parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
+    _validate_field_regexes(parsed_filters, parsed_filter_modes)
+    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -808,7 +904,7 @@ async def get_histogram(
     service = _get_query_service()
     # Blocking ClickHouse scan — threadpool, same as list_events.
     return await _run_regex_guarded(
-        q_regex,
+        _uses_regex(q_regex, parsed_filter_modes, parsed_exclusion_modes),
         service.histogram,
         EventQuery(
             case_id=case_id,
@@ -822,8 +918,10 @@ async def get_histogram(
             exclude_tag=exclude_tag,
             start=start,
             end=end,
-            field_filters=_parse_json_object(filters),
-            field_exclusions=_parse_exclusions_object(exclusions),
+            field_filters=parsed_filters,
+            field_exclusions=parsed_exclusions,
+            filter_modes=parsed_filter_modes,
+            exclusion_modes=parsed_exclusion_modes,
             event_ids=event_ids,
             tags_include=tags_include_filter,
             tags_exclude=tags_exclude_filter,
@@ -854,6 +952,10 @@ class ExportFilter(BaseModel):
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
     fields: dict[str, str] = Field(default_factory=dict)
     exclude: dict[str, list[str]] = Field(default_factory=dict)
+    # Match-mode maps for fields/exclude ("exact" when absent) — structured
+    # dicts like their siblings, unlike the JSON-string query params.
+    field_modes: dict[str, str] = Field(default_factory=dict)
+    exclude_modes: dict[str, str] = Field(default_factory=dict)
     annotated: str | None = None
     annotation_tag_value: str | None = None
     run_id: str | None = None
@@ -965,6 +1067,14 @@ async def export_events(
     tagging a finding is what makes it show up here.
     """
     _validate_regex(body.filter.q, body.filter.q_regex)
+    for modes in (body.filter.field_modes, body.filter.exclude_modes):
+        for k, v in modes.items():
+            if v not in _VALID_FILTER_MODES:
+                raise HTTPException(
+                    status_code=400, detail=f"invalid match mode {v!r} for field {k!r}"
+                )
+    _validate_field_regexes(body.filter.fields, body.filter.field_modes)
+    _validate_field_regexes(body.filter.exclude, body.filter.exclude_modes)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -996,13 +1106,15 @@ async def export_events(
         end=body.filter.end,
         field_filters=body.filter.fields,
         field_exclusions=body.filter.exclude,
+        filter_modes=body.filter.field_modes,
+        exclusion_modes=body.filter.exclude_modes,
         event_ids=event_ids,
         tags_include=tags_include_filter,
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
     )
 
-    if eq.q_regex and eq.q:
+    if _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes):
         # Force RE2 compilation on a cheap 1-row scan before streaming starts,
         # so a pattern that passes _validate_regex's re.compile pre-check but
         # is rejected by ClickHouse's RE2 driver still surfaces as a clean 400

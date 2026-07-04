@@ -251,6 +251,121 @@ def test_field_exclusion_uses_not_equals(service: EventQueryService) -> None:
     assert params.get("p1") == "auth.log"
 
 
+def test_field_filter_wildcard_translates_glob(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"src_ip": "10.0.*"},
+            filter_modes={"src_ip": "wildcard"},
+        )
+    )
+    query, params = _last_query(service)
+    assert "attributes[{p1:String}] ILIKE {p2:String}" in query
+    assert params.get("p2") == "10.0.%"
+    assert "10.0.*" not in query
+
+
+def test_field_filter_wildcard_escapes_like_metachars(service: EventQueryService) -> None:
+    """Literal % and _ in the value stay literal; * and ? become LIKE wildcards."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"msg": "100%_a?*"},
+            filter_modes={"msg": "wildcard"},
+        )
+    )
+    _, params = _last_query(service)
+    assert params.get("p2") == "100\\%\\_a_%"
+
+
+def test_field_filter_regex_uses_match(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"src_ip": r"^10\.0\."},
+            filter_modes={"src_ip": "regex"},
+        )
+    )
+    query, params = _last_query(service)
+    assert "match(attributes[{p1:String}], {p2:String})" in query
+    assert params.get("p2") == r"^10\.0\."
+
+
+def test_field_filter_wildcard_casts_non_string_column(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"timestamp": "2024*"},
+            filter_modes={"timestamp": "wildcard"},
+        )
+    )
+    query, _ = _last_query(service)
+    assert "toString(timestamp) ILIKE {p1:String}" in query
+
+
+def test_field_exclusion_wildcard_negates_or_of_patterns(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_exclusions={"src_ip": ["10.0.*", "192.168.*"]},
+            exclusion_modes={"src_ip": "wildcard"},
+        )
+    )
+    query, params = _last_query(service)
+    assert (
+        "NOT (attributes[{p1:String}] ILIKE {p2:String} "
+        "OR attributes[{p1:String}] ILIKE {p3:String})" in query
+    )
+    assert params.get("p2") == "10.0.%"
+    assert params.get("p3") == "192.168.%"
+
+
+def test_field_exclusion_regex_negates_or_of_patterns(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_exclusions={"src_ip": [r"^10\."]},
+            exclusion_modes={"src_ip": "regex"},
+        )
+    )
+    query, params = _last_query(service)
+    assert "NOT (match(attributes[{p1:String}], {p2:String}))" in query
+    assert params.get("p2") == r"^10\."
+
+
+def test_field_filter_pattern_modes_are_not_interpolated(service: EventQueryService) -> None:
+    injection = "'; DROP TABLE events; --"
+    for mode in ("wildcard", "regex"):
+        service.query(
+            EventQuery(
+                case_id="case-1",
+                field_filters={"msg": injection},
+                filter_modes={"msg": mode},
+            )
+        )
+        query, _ = _last_query(service)
+        assert "DROP TABLE" not in query
+
+
+def test_invalid_match_mode_raises(service: EventQueryService) -> None:
+    with pytest.raises(ValueError, match="invalid match mode"):
+        service.query(
+            EventQuery(
+                case_id="case-1",
+                field_filters={"msg": "x"},
+                filter_modes={"msg": "glob"},
+            )
+        )
+    with pytest.raises(ValueError, match="invalid match mode"):
+        service.query(
+            EventQuery(
+                case_id="case-1",
+                field_exclusions={"msg": ["x"]},
+                exclusion_modes={"msg": "like"},
+            )
+        )
+
+
 def test_malicious_input_is_not_interpolated(service: EventQueryService) -> None:
     injection = "'; DROP TABLE events; --"
     service.query(EventQuery(case_id="case-1", q=injection))

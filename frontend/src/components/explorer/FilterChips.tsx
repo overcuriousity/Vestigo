@@ -1,5 +1,6 @@
 import { X } from "lucide-react";
-import type { EventFilters } from "@/api/types";
+import { Tooltip } from "@/components/ui/Tooltip";
+import type { EventFilters, FieldMatchMode } from "@/api/types";
 
 interface Props {
   filters: EventFilters;
@@ -11,7 +12,14 @@ interface Chip {
   value: string;
   onRemove: () => void;
   variant?: "include" | "exclude" | "neutral";
+  /** Non-exact match mode of a field filter/exclusion — rendered as a badge. */
+  mode?: FieldMatchMode;
 }
+
+const MODE_BADGE: Record<FieldMatchMode, { label: string; tooltip: string }> = {
+  wildcard: { label: "*", tooltip: "Wildcard match: * = any run, ? = one char (case-insensitive)" },
+  regex: { label: ".*", tooltip: "RE2 regular expression (case-sensitive)" },
+};
 
 export function FilterChips({ filters, onRemove }: Props) {
   const chips: Chip[] = [];
@@ -97,6 +105,7 @@ export function FilterChips({ filters, onRemove }: Props) {
       value: v,
       onRemove: () => onRemove("filters", k),
       variant: "include",
+      mode: filters.filterModes?.[k],
     });
   }
   for (const [k, vs] of Object.entries(filters.exclusions ?? {})) {
@@ -106,6 +115,7 @@ export function FilterChips({ filters, onRemove }: Props) {
         value: v,
         onRemove: () => onRemove("exclusions", k, v),
         variant: "exclude",
+        mode: filters.exclusionModes?.[k],
       });
     }
   }
@@ -125,7 +135,16 @@ export function FilterChips({ filters, onRemove }: Props) {
                 : "bg-[var(--color-bg-active)] text-[var(--color-fg-secondary)] border-[var(--color-border)]"
           }`}
         >
-          <span className="opacity-60">{chip.label}=</span>
+          {/* `~` separator + badge when a non-exact match mode is set, so the
+              chip's semantics are visible at a glance. */}
+          <span className="opacity-60">{chip.label}{chip.mode ? "~" : "="}</span>
+          {chip.mode && (
+            <Tooltip content={MODE_BADGE[chip.mode].tooltip}>
+              <span className="rounded bg-current/15 px-1 font-bold">
+                {MODE_BADGE[chip.mode].label}
+              </span>
+            </Tooltip>
+          )}
           <span className="max-w-[160px] truncate">{chip.value}</span>
           <button
             onClick={chip.onRemove}

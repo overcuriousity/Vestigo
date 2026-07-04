@@ -81,6 +81,60 @@ describe("FilterRail search mode control", () => {
   });
 });
 
+describe("FilterRail field match modes", () => {
+  it("switches the value placeholder when a match mode is picked", () => {
+    renderRail();
+    // First `*` segment button belongs to the Field=Value row.
+    fireEvent.click(screen.getAllByRole("button", { name: "*" })[0]);
+    expect(screen.getByPlaceholderText("e.g. 10.0.*")).toBeInTheDocument();
+  });
+
+  it("adds a wildcard filter with its mode in filterModes", () => {
+    const { onChange } = renderRail();
+    fireEvent.click(screen.getAllByRole("button", { name: "*" })[0]);
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[0], { target: { value: "src_ip" } });
+    fireEvent.change(screen.getByPlaceholderText("e.g. 10.0.*"), {
+      target: { value: "10.0.*" },
+    });
+    fireEvent.keyDown(screen.getByPlaceholderText("e.g. 10.0.*"), { key: "Enter" });
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filters: { src_ip: "10.0.*" },
+        filterModes: { src_ip: "wildcard" },
+      }),
+    );
+  });
+
+  it("adds an exact filter without a filterModes entry", () => {
+    const { onChange } = renderRail();
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[0], { target: { value: "src_ip" } });
+    const valInput = screen.getAllByPlaceholderText("value")[0];
+    fireEvent.change(valInput, { target: { value: "10.0.1.1" } });
+    fireEvent.keyDown(valInput, { key: "Enter" });
+    const arg = onChange.mock.calls[0][0];
+    expect(arg.filters).toEqual({ src_ip: "10.0.1.1" });
+    expect(arg.filterModes).toBeUndefined();
+  });
+
+  it("shows the literal-glob trap hint when an exact value contains *", () => {
+    renderRail();
+    const valInput = screen.getAllByPlaceholderText("value")[0];
+    fireEvent.change(valInput, { target: { value: "10.0.*" } });
+    expect(screen.getByText(/matched literally in Exact mode/i)).toBeInTheDocument();
+  });
+
+  it("shows a regex hint for an invalid field pattern", () => {
+    renderRail();
+    // First `.*` segment button = Field=Value row's regex mode.
+    fireEvent.click(screen.getAllByRole("button", { name: ".*" })[0]);
+    const valInput = screen.getAllByPlaceholderText(/RE2 pattern/i)[0];
+    fireEvent.change(valInput, { target: { value: "([" } });
+    expect(screen.getByText(/invalid regular expression/i)).toBeInTheDocument();
+  });
+});
+
 describe("FilterRail field autocomplete", () => {
   it("suggests timeline field names in the Field=Value key input", () => {
     renderRail({}, { fieldSuggestions: ["message", "status_code", "username"] });

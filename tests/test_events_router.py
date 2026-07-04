@@ -429,6 +429,45 @@ def test_validate_regex_rejects_invalid_pattern_with_400():
     assert "invalid regular expression" in exc_info.value.detail
 
 
+def test_parse_modes_object_accepts_valid_modes():
+    assert events._parse_modes_object(None) == {}
+    assert events._parse_modes_object('{"src_ip": "wildcard", "msg": "regex", "a": "exact"}') == {
+        "src_ip": "wildcard",
+        "msg": "regex",
+        "a": "exact",
+    }
+
+
+def test_parse_modes_object_rejects_unknown_mode_with_400():
+    with pytest.raises(HTTPException) as exc_info:
+        events._parse_modes_object('{"src_ip": "glob"}')
+    assert exc_info.value.status_code == 400
+    assert "invalid match mode" in exc_info.value.detail
+
+
+def test_validate_field_regexes_rejects_invalid_pattern_with_400():
+    with pytest.raises(HTTPException) as exc_info:
+        events._validate_field_regexes({"msg": "(["}, {"msg": "regex"})
+    assert exc_info.value.status_code == 400
+    assert "invalid regular expression" in exc_info.value.detail
+    # Exclusion-shaped (list) values are checked per value.
+    with pytest.raises(HTTPException):
+        events._validate_field_regexes({"msg": ["ok", "(["]}, {"msg": "regex"})
+
+
+def test_validate_field_regexes_ignores_non_regex_modes():
+    # "([" is an invalid regex but valid literal/wildcard — must not raise.
+    events._validate_field_regexes({"msg": "(["}, {"msg": "wildcard"})
+    events._validate_field_regexes({"msg": "(["}, {})
+
+
+def test_uses_regex_detects_field_modes():
+    assert events._uses_regex(False) is False
+    assert events._uses_regex(True) is True
+    assert events._uses_regex(False, {"a": "wildcard"}) is False
+    assert events._uses_regex(False, {"a": "wildcard"}, {"b": "regex"}) is True
+
+
 @pytest.mark.asyncio
 async def test_run_regex_guarded_maps_re2_failure_to_400():
     from clickhouse_connect.driver.exceptions import DatabaseError

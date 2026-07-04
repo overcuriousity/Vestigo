@@ -18,6 +18,8 @@ export async function downloadExport(
       // (list/histogram/bulk-annotate) that stringify these.
       fields: filters.filters ?? {},
       exclude: filters.exclusions ?? {},
+      field_modes: filters.filterModes ?? {},
+      exclude_modes: filters.exclusionModes ?? {},
     },
   };
 

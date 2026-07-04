@@ -30,11 +30,14 @@ from tracesignal.api.routers.events import (
     _get_stat_anomaly_service,
     _parse_exclusions_object,
     _parse_json_object,
+    _parse_modes_object,
     _parse_str_list,
     _resolve_event_id_filters,
     _resolve_timeline_scope,
     _resolve_timeline_source_ids,
     _run_regex_guarded,
+    _uses_regex,
+    _validate_field_regexes,
     _validate_regex,
 )
 from tracesignal.db.postgres import Case, User, generate_id
@@ -64,6 +67,8 @@ async def _resolve_event_query(
     annotated: str | None,
     annotation_tag_value: str | None,
     run_id: str | None,
+    filter_modes: str | None,
+    exclusion_modes: str | None,
 ) -> EventQuery:
     """Resolve the shared filter query params into an :class:`EventQuery`.
 
@@ -74,6 +79,12 @@ async def _resolve_event_query(
     keep in sync with ``list_events``/``get_histogram`` instead of three.
     """
     _validate_regex(q, q_regex)
+    parsed_filters = _parse_json_object(filters)
+    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filter_modes = _parse_modes_object(filter_modes)
+    parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
+    _validate_field_regexes(parsed_filters, parsed_filter_modes)
+    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -97,8 +108,10 @@ async def _resolve_event_query(
         exclude_tag=exclude_tag,
         start=start,
         end=end,
-        field_filters=_parse_json_object(filters),
-        field_exclusions=_parse_exclusions_object(exclusions),
+        field_filters=parsed_filters,
+        field_exclusions=parsed_exclusions,
+        filter_modes=parsed_filter_modes,
+        exclusion_modes=parsed_exclusion_modes,
         event_ids=event_ids,
         tags_include=tags_include_filter,
         tags_exclude=tags_exclude_filter,
@@ -126,6 +139,8 @@ _START = Query(default=None)
 _END = Query(default=None)
 _FILTERS = Query(default=None)
 _EXCLUSIONS = Query(default=None)
+_FILTER_MODES = Query(default=None, description="JSON match-mode map for `filters`.")
+_EXCLUSION_MODES = Query(default=None, description="JSON match-mode map for `exclusions`.")
 _ANNOTATED = Query(default=None)
 _ANNOTATION_TAG_VALUE = Query(default=None)
 _RUN_ID = Query(default=None)
@@ -151,6 +166,8 @@ async def get_field_terms(
     end: datetime | None = _END,  # noqa: B008
     filters: str | None = _FILTERS,
     exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
@@ -181,9 +198,17 @@ async def get_field_terms(
         annotated=annotated,
         annotation_tag_value=annotation_tag_value,
         run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
     )
     service = _get_query_service()
-    return await _run_regex_guarded(query.q_regex, service.field_terms, query, field, limit)
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_terms,
+        query,
+        field,
+        limit,
+    )
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-numeric")
@@ -206,6 +231,8 @@ async def get_field_numeric_stats(
     end: datetime | None = _END,  # noqa: B008
     filters: str | None = _FILTERS,
     exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
@@ -237,9 +264,17 @@ async def get_field_numeric_stats(
         annotated=annotated,
         annotation_tag_value=annotation_tag_value,
         run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
     )
     service = _get_query_service()
-    return await _run_regex_guarded(query.q_regex, service.field_numeric_stats, query, field, bins)
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_numeric_stats,
+        query,
+        field,
+        bins,
+    )
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-timeseries")
@@ -263,6 +298,8 @@ async def get_field_value_timeseries(
     end: datetime | None = _END,  # noqa: B008
     filters: str | None = _FILTERS,
     exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
@@ -294,10 +331,17 @@ async def get_field_value_timeseries(
         annotated=annotated,
         annotation_tag_value=annotation_tag_value,
         run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
     )
     service = _get_query_service()
     return await _run_regex_guarded(
-        query.q_regex, service.field_value_timeseries, query, field, buckets, series_limit
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_value_timeseries,
+        query,
+        field,
+        buckets,
+        series_limit,
     )
 
 
@@ -322,6 +366,8 @@ class CompareFilters(BaseModel):
     end: datetime | None = None
     filters: str | None = None
     exclusions: str | None = None
+    filter_modes: str | None = None
+    exclusion_modes: str | None = None
     annotated: str | None = None
     annotation_tag_value: str | None = None
     run_id: str | None = None
@@ -367,6 +413,8 @@ async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilte
         annotated=body.annotated,
         annotation_tag_value=body.annotation_tag_value,
         run_id=body.run_id,
+        filter_modes=body.filter_modes,
+        exclusion_modes=body.exclusion_modes,
     )
 
 
@@ -419,6 +467,8 @@ async def compare_layers(
             annotated=None,
             annotation_tag_value=None,
             run_id=None,
+            filter_modes=None,
+            exclusion_modes=None,
         )
     else:
         if body.comparison.filters is None:
@@ -429,7 +479,13 @@ async def compare_layers(
         comparison = replace(comparison, start=primary.start, end=primary.end)
 
     service = _get_query_service()
-    q_regex = primary.q_regex or comparison.q_regex
+    q_regex = _uses_regex(
+        primary.q_regex or comparison.q_regex,
+        primary.filter_modes,
+        primary.exclusion_modes,
+        comparison.filter_modes,
+        comparison.exclusion_modes,
+    )
     if body.kind == "time":
         return await _run_regex_guarded(
             q_regex, service.compare_time_histogram, primary, comparison, body.buckets

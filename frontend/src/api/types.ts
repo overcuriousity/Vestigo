@@ -415,6 +415,9 @@ export interface HealthResponse {
   oidc_enabled: boolean;
 }
 
+/** Non-default field-filter match modes; "exact" is implied by absence. */
+export type FieldMatchMode = "wildcard" | "regex";
+
 /** Filter params for the events query */
 export interface EventFilters {
   q?: string;
@@ -446,6 +449,14 @@ export interface EventFilters {
   filters?: Record<string, string>;
   /** key=[values] field exclusion filters — multiple values per field are OR'd (NOT IN) */
   exclusions?: Record<string, string[]>;
+  /**
+   * Per-field match mode for `filters`; absence means exact ("exact" is
+   * never serialized, keeping legacy URLs/views byte-identical). Wildcard:
+   * `*`/`?` glob, case-insensitive. Regex: RE2, case-sensitive, `(?i)` opt-in.
+   */
+  filterModes?: Record<string, FieldMatchMode>;
+  /** Per-field match mode for `exclusions` — one mode per key, applies to all its values. */
+  exclusionModes?: Record<string, FieldMatchMode>;
   /** Annotation types to filter to ("tag" and/or "anomaly"), OR'd together */
   annotated?: ("tag" | "anomaly")[];
   /** Narrows the "tag" annotation type to a specific tag value */
@@ -657,6 +668,8 @@ export interface ExportRequest {
     end?: string;
     fields?: Record<string, string>;
     exclude?: Record<string, string[]>;
+    field_modes?: Record<string, FieldMatchMode>;
+    exclude_modes?: Record<string, FieldMatchMode>;
     annotated?: string;
     annotation_tag_value?: string;
     run_id?: string;
