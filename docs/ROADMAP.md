@@ -41,8 +41,6 @@ resolved — this file holds only the condensed, still-open action items.
   `sentence-transformers` to an optional `embeddings` extra with graceful capability
   degradation (health endpoint flag, clear error on embed endpoints) so the base install
   drops ~2 GB.
-- [ ] **M7 — JobStore cap.** `core/jobs.py` never prunes; long-lived server leaks job dicts.
-  Retain last N (e.g. 200) terminal jobs, evict oldest. Stays ephemeral/in-memory by design.
 - [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
   `/api/health`. Would have caught C1 before it shipped.
 - [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+_TERMINAL_STATUSES = {"completed", "failed"}
+
+# How many finished jobs to keep around for status polling before the oldest
+# are evicted. Sizing detail, not an operator tunable.
+_DEFAULT_MAX_TERMINAL_JOBS = 200
 
 
 @dataclass
@@ -35,14 +42,23 @@ class Job:
 
 
 class JobStore:
-    """Thread-safe-ish in-memory store for background jobs.
+    """Thread-safe in-memory store for background jobs.
 
     Jobs are intentionally ephemeral: they are lost when the server process
     restarts. This is sufficient for the current single-process deployment.
+
+    Terminal (completed/failed) jobs are retained for status polling but
+    capped at ``max_terminal``; the oldest-finished are evicted first.
+    Queued/running jobs are never evicted.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_terminal: int = _DEFAULT_MAX_TERMINAL_JOBS) -> None:
         self._jobs: dict[str, Job] = {}
+        self._max_terminal = max_terminal
+        # Job IDs in completion order (dict insertion order is creation order,
+        # which is not the same thing).
+        self._terminal_order: list[str] = []
+        self._lock = threading.Lock()
 
     def create(
         self, kind: str, progress: dict[str, Any] | None = None, created_by: str | None = None
@@ -50,7 +66,8 @@ class JobStore:
         """Create a new job and return it."""
         job_id = uuid.uuid4().hex[:16]
         job = Job(id=job_id, kind=kind, progress=progress or {}, created_by=created_by)
-        self._jobs[job_id] = job
+        with self._lock:
+            self._jobs[job_id] = job
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -66,18 +83,29 @@ class JobStore:
         error: str | None = None,
     ) -> Job | None:
         """Update a job's status/progress/result/error."""
-        job = self._jobs.get(job_id)
-        if job is None:
-            return None
-        if status is not None:
-            job.status = status
-        if progress is not None:
-            job.progress.update(progress)
-        if result is not None:
-            job.result = result
-        if error is not None:
-            job.error = error
-        return job
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            if status is not None:
+                was_terminal = job.status in _TERMINAL_STATUSES
+                job.status = status
+                if status in _TERMINAL_STATUSES and not was_terminal:
+                    self._terminal_order.append(job_id)
+                    self._evict_locked()
+            if progress is not None:
+                job.progress.update(progress)
+            if result is not None:
+                job.result = result
+            if error is not None:
+                job.error = error
+            return job
+
+    def _evict_locked(self) -> None:
+        """Drop the oldest-finished jobs beyond the cap (caller holds the lock)."""
+        while len(self._terminal_order) > self._max_terminal:
+            old_id = self._terminal_order.pop(0)
+            self._jobs.pop(old_id, None)
 
 
 # Global singleton used by the web app. In-memory is fine for the current
