@@ -33,11 +33,6 @@ resolved — this file holds only the condensed, still-open action items.
   `cases.py` ingest-failure cleanup likewise. A failed delete must log loudly and surface to
   the caller — orphan events reappearing after a "successful" source delete is a forensic
   integrity bug. Distinguish "partition doesn't exist" (fine, no-op) from real errors.
-- [ ] **M2 — One SQL escaping regime.** `db/clickhouse.py::count_events` interpolates with
-  `{value!r}`; `delete_source_events` f-strings IDs into the partition expression. Everything
-  else in `db/` uses `{name:String}` binds. Parameterize both (or validate ID charset
-  explicitly where DROP PARTITION can't bind). Low exploitability today (IDs are
-  server-generated and RBAC-validated) but two regimes is how injection ships later.
 - [ ] **M3 — Login backoff.** No rate limiting on `POST /api/auth/login`; argon2 slows one
   attempt, not a loop. In-memory per-username+IP failure counter with exponential delay fits
   the single-process design.

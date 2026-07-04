@@ -51,6 +51,30 @@ def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _validate_partition_id(value: str, label: str) -> str:
+    """Fail closed on any ID that can't be safely interpolated into a partition expression.
+
+    ``ALTER TABLE ... DROP/REPLACE PARTITION`` expressions cannot be
+    query-parameterized, so IDs are string-interpolated there. All case and
+    source IDs are server-generated via ``postgres.generate_id``, which only
+    emits alphanumeric characters (Unicode-aware, matching ``str.isalnum``)
+    plus ``-``/``_`` — the same predicate is enforced here, so quotes,
+    whitespace, and control characters can never reach the DDL string.
+    Anything else is a bug or tampering.
+    """
+    if not value or not all(c.isalnum() or c in "-_" for c in value):
+        raise ValueError(f"unsafe {label} for partition expression: {value!r}")
+    return value
+
+
+def _partition_expr(case_id: str, source_id: str) -> str:
+    """Build a validated ``(case_id, source_id)`` partition tuple expression."""
+    return (
+        f"tuple('{_validate_partition_id(case_id, 'case_id')}', "
+        f"'{_validate_partition_id(source_id, 'source_id')}')"
+    )
+
+
 _EVENT_COLUMNS = [
     "event_id",
     "case_id",
@@ -205,9 +229,7 @@ class ClickHouseStore:
         suffix = re.sub(r"[^a-zA-Z0-9_]", "", scratch_suffix)
         rows_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}rows_{suffix}"
         events_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}events_{suffix}"
-        # ALTER ... PARTITION expressions cannot be query-parameterized; IDs
-        # are server-generated (same style as delete_source_events).
-        partition_expr = f"tuple('{case_id}', '{source_id}')"
+        partition_expr = _partition_expr(case_id, source_id)
         select_columns = ",\n            ".join(
             "mapUpdate(e.attributes, m.enr) AS attributes"
             if column == "attributes"
@@ -290,16 +312,23 @@ class ClickHouseStore:
         """Return the number of events, optionally filtered by case/source."""
         query = f"SELECT count() FROM {self.database}.events"
         conditions: list[str] = []
+        parameters: dict[str, str] = {}
         if case_id is not None:
-            conditions.append(f"case_id = {case_id!r}")
+            conditions.append("case_id = {case_id:String}")
+            parameters["case_id"] = case_id
         if source_id is not None:
-            conditions.append(f"source_id = {source_id!r}")
+            conditions.append("source_id = {source_id:String}")
+            parameters["source_id"] = source_id
         if source_ids is not None:
-            ids = ", ".join(f"{s!r}" for s in source_ids)
-            conditions.append(f"source_id IN ({ids})")
+            if not source_ids:
+                return 0
+            source_params = [f"s{i}" for i in range(len(source_ids))]
+            source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
+            conditions.append(f"source_id IN ({source_in})")
+            parameters.update(zip(source_params, source_ids, strict=False))
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        result = self.client.query(query)
+        result = self.client.query(query, parameters=parameters)
         return result.result_rows[0][0] if result.result_rows else 0
 
     def list_events(
@@ -403,7 +432,7 @@ class ClickHouseStore:
         ``DROP PARTITION`` is instant and does not require a full-table scan.
         If the partition does not exist the call is a silent no-op.
         """
-        partition_expr = f"tuple('{case_id}', '{source_id}')"
+        partition_expr = _partition_expr(case_id, source_id)
         with contextlib.suppress(Exception):
             self.client.command(
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
