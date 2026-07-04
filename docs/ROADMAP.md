@@ -63,6 +63,11 @@ resolved — this file holds only the condensed, still-open action items.
     datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
     design in the ColumnPicker.
 
+- [ ] **M20 — Ingest-throughput follow-ups (only if needed).** `TS_INGEST_BATCH_SIZE`
+  (default 20k, one HTTP insert per batch) should carry a 100 GiB ingest fine (~5k inserts
+  for ~100M rows). Revisit only if measured insufficient: ClickHouse native protocol
+  (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
+  feeding an insert thread).
 - [ ] **M17 — Job authorization via case RBAC.** PR #7 review #9 follow-up (guard itself was
   fixed): jobs are only guarded by `created_by == user.id or is_admin`; a `Job.case_id` +
   `resolve_case_access` check would let case members see each other's jobs and align job

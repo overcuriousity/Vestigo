@@ -41,11 +41,11 @@ def ingest(
         "-f",
         help="Parser format (timesketch_csv, jsonl). Inferred from extension if omitted.",
     ),
-    batch_size: int = typer.Option(
-        64,
+    batch_size: int | None = typer.Option(
+        None,
         "--batch-size",
         "-b",
-        help="Number of events to insert per batch.",
+        help="Number of events to insert per batch (default: TS_INGEST_BATCH_SIZE).",
     ),
 ) -> None:
     """Ingest a source file into TraceSignal (no embeddings)."""

@@ -85,7 +85,7 @@ class IngestionPipeline:
         self.case_id = case_id
         self.source_id = source_id
         self.clickhouse = clickhouse or ClickHouseStore()
-        self.batch_size = batch_size or get_settings().embedding_batch_size
+        self.batch_size = batch_size or get_settings().ingest_batch_size
         self.file_hash = file_hash
         self.source_name = source_name
         # Called as progress_callback(total=..., processed=...) with *bytes*

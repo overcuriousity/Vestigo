@@ -16,6 +16,7 @@ class FakeClickHouseStore:
 
     def __init__(self) -> None:
         self.events: list[Event] = []
+        self.insert_batch_sizes: list[int] = []
         self.schema_initialized = False
 
     def init_schema(self) -> None:
@@ -23,6 +24,7 @@ class FakeClickHouseStore:
 
     def insert_events(self, events: list[Event]) -> int:
         self.events.extend(events)
+        self.insert_batch_sizes.append(len(events))
         return len(events)
 
     def count_events(self, case_id: str | None = None, source_id: str | None = None) -> int:
@@ -165,6 +167,43 @@ def test_pipeline_ingests_events_without_vectors(sample_jsonl: Path) -> None:
     assert result.events_inserted == 3
     assert len(clickhouse.events) == 3
     assert clickhouse.schema_initialized is True
+
+
+def test_pipeline_batches_inserts(sample_jsonl: Path) -> None:
+    clickhouse = FakeClickHouseStore()
+
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        source_id="source1",
+        clickhouse=clickhouse,
+        batch_size=2,
+        source_name="events.jsonl",
+        file_hash="abc",
+    )
+    pipeline.run(sample_jsonl)
+
+    # 3 events at batch_size=2: one full batch + one remainder flush.
+    assert clickhouse.insert_batch_sizes == [2, 1]
+
+
+def test_pipeline_default_batch_size_from_settings(
+    sample_jsonl: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tracesignal.core.config import get_settings
+
+    monkeypatch.setenv("TS_INGEST_BATCH_SIZE", "2")
+    get_settings.cache_clear()
+    try:
+        pipeline = IngestionPipeline(
+            case_id="case1",
+            source_id="source1",
+            clickhouse=FakeClickHouseStore(),
+            source_name="events.jsonl",
+            file_hash="abc",
+        )
+        assert pipeline.batch_size == 2
+    finally:
+        get_settings.cache_clear()
 
 
 def test_pipeline_reports_monotonic_byte_progress(sample_jsonl: Path) -> None:

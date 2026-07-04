@@ -38,7 +38,14 @@ async def receive_upload_to_tmp(
             )
     except UploadTooLargeError as exc:
         tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{exc}. Raise TS_MAX_UPLOAD_BYTES (0 disables the limit) or ingest "
+                "the file server-side with 'tsig ingest', which avoids the HTTP "
+                "upload and its temp copy entirely."
+            ),
+        ) from exc
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise

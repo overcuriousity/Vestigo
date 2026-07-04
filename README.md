@@ -25,6 +25,10 @@ embeddings surface the needles in the haystack, without needing a cluster to run
 - Every ingested file (**Source**) is SHA-256 hashed and retained content-addressed for
   re-download — forensic provenance and immutability by construction.
 - CLI-first (`tsig ingest`), so ingestion is scriptable and reproducible outside the web UI.
+  For very large files (tens of GiB and up), prefer `tsig ingest` over the web upload: it
+  streams straight from disk with no HTTP upload, no temp copy, and no `TS_MAX_UPLOAD_BYTES`
+  cap (web uploads default to 10 GiB). Insert batching is tuned via `TS_INGEST_BATCH_SIZE`
+  (default 20 000 events per ClickHouse round-trip).
 - A separate, user-triggered embedding job (`tsig embed` / the embed wizard) computes vectors
   after ingestion — ingestion itself stays fast and embedding-free until you ask for it.
 

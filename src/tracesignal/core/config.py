@@ -62,6 +62,16 @@ class Settings(BaseSettings):
     # Default per-field limit when scanning for rare values.
     stat_per_field_limit: int = 25
 
+    # Ingestion
+    # Events per ClickHouse insert during ingestion. Each batch is one HTTP
+    # round-trip, so larger batches amortize LAN latency and ClickHouse's
+    # per-insert part-creation cost (official guidance: 10k-100k rows per
+    # insert). Memory trade-off: a batch is held as parsed Event objects plus
+    # a column-oriented copy at insert time — at ~2-4 KB per event, 20k rows
+    # peak around 50-150 MB transiently. Raise for fast networks and wide
+    # memory headroom, lower for constrained hosts.
+    ingest_batch_size: int = Field(default=20_000, ge=1)
+
     # Source file retention
     source_retention_path: str = "data/sources"
 

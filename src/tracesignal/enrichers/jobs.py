@@ -287,7 +287,7 @@ async def run_enrichment_job(
     Works on a fresh per-run enricher instance (``Enricher.spawn()``) so
     concurrent runs never share mutable state such as an open database
     reader. Batches are paginated via the same ``list_events`` primitive the
-    embedding pipeline uses, at ``settings.embedding_batch_size``. All
+    embedding pipeline uses. All
     results are staged in Postgres and merged into ``events.attributes`` in
     one atomic per-source partition rewrite at job end
     (``_apply_staged_rows``).
@@ -304,7 +304,10 @@ async def run_enrichment_job(
     enricher = await asyncio.to_thread(prototype.spawn)
 
     settings = get_settings()
-    batch_size = settings.embedding_batch_size
+    # Read paging over ClickHouse — enrichment is regex + lookup work per
+    # value, not model-bound like embedding, so page at least 1000 events per
+    # round-trip to keep HTTP overhead low on large sources.
+    batch_size = max(settings.embedding_batch_size, 1000)
 
     await store.start_enrichment_job_run(job_id, timeline_id, case_id, enricher_key)
     job_store.update(job_id, status="running", progress={"processed": 0, "total": 0})

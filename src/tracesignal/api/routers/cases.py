@@ -443,7 +443,6 @@ async def _run_ingestion_job(
             case_id=case_id,
             source_id=source_id,
             clickhouse=clickhouse,
-            batch_size=get_settings().embedding_batch_size,
             file_hash=file_hash,
             source_name=source_name,
             progress_callback=progress_callback,
