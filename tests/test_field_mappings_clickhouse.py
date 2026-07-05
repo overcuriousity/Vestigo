@@ -45,8 +45,11 @@ def _event(source_id: str, i: int, attrs: dict[str, str]) -> Event:
 
 @pytest.fixture(scope="module")
 def ch_store():
-    store = ClickHouseStore()
+    # Constructing the store already opens a connection — keep it inside the
+    # guard so an unreachable ClickHouse skips the module instead of erroring
+    # every test at fixture setup.
     try:
+        store = ClickHouseStore()
         store.init_schema()
     except Exception:
         pytest.skip("ClickHouse not reachable — start the dev compose stack")
