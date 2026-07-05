@@ -1506,29 +1506,48 @@ class PostgresStore:
         events_total: int,
         payload: dict,
     ) -> SourceFieldStats:
-        """Insert or replace the cached field stats for one source."""
-        from sqlalchemy import select
+        """Insert or replace the cached field stats for one source.
 
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(SourceFieldStats).where(SourceFieldStats.source_id == source_id)
-            )
-            row = result.scalar_one_or_none()
-            if row is None:
-                row = SourceFieldStats(
-                    id=generate_id(f"fieldstats_{source_id}"),
-                    case_id=case_id,
-                    source_id=source_id,
+        Concurrency-safe: the read path is self-healing, so several requests
+        can miss the cache for the same source at once (e.g. ColumnPicker,
+        viz, and anomaly field listings all firing on one page load) and race
+        to insert. ``source_id`` is uniquely indexed, so the losing insert
+        raises ``IntegrityError``; we roll back and retry, on which pass the
+        now-present row is updated instead.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.exc import IntegrityError
+
+        for attempt in range(2):
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(SourceFieldStats).where(SourceFieldStats.source_id == source_id)
                 )
-                session.add(row)
-            row.case_id = case_id
-            row.stats_version = stats_version
-            row.events_total = events_total
-            row.payload = payload
-            row.computed_at = datetime.now(UTC)
-            await session.commit()
-            await session.refresh(row)
-            return row
+                row = result.scalar_one_or_none()
+                if row is None:
+                    row = SourceFieldStats(
+                        id=generate_id(f"fieldstats_{source_id}"),
+                        case_id=case_id,
+                        source_id=source_id,
+                    )
+                    session.add(row)
+                row.case_id = case_id
+                row.stats_version = stats_version
+                row.events_total = events_total
+                row.payload = payload
+                row.computed_at = datetime.now(UTC)
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    # A concurrent insert won the race; retry so this call
+                    # updates the row it just observed as missing.
+                    await session.rollback()
+                    if attempt == 0:
+                        continue
+                    raise
+                await session.refresh(row)
+                return row
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def delete_source_field_stats(self, source_id: str) -> None:
         """Drop one source's cached stats so the next read recomputes them."""
