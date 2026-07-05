@@ -46,6 +46,17 @@ resolved — this file holds only the condensed, still-open action items.
   (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
   feeding an insert thread).
 
+- [ ] **M21 — Storage redundancy cleanup (from 2026-07-05 data-model audit,
+  `docs/MODEL_REFINEMENT.md#storage-placement-audit-2026-07-05`).** Three items:
+  1. Drop `Event.vector_id` (ClickHouse column) — always identical to `event_id`, use
+     `event_id` directly as the Qdrant point ID.
+  2. Drop `Source.embedding_model`/`Source.embedding_config` (Postgres) — dead fields, never
+     written; live config is Timeline-scoped.
+  3. Trim the Qdrant payload to filter-relevant fields only (`case_id`, `source_id`, `artifact`,
+     `timestamp`, `tags`); resolve full event detail via a ClickHouse `event_id IN (...)` lookup
+     post-search instead of mirroring the whole row. Also fixes the `tags` staleness gap
+     (annotation tags added after embed never reach the Qdrant payload).
+
 ## Milestone 3 — polish
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly
