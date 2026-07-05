@@ -80,6 +80,79 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  container-smoke:
+    # Build the reference image and boot it against real backing services —
+    # asserts the CMD/import path works (would have caught audit finding C1,
+    # where the Dockerfile pointed at a nonexistent api.main:app) and that
+    # the built frontend is packaged and served.
+    name: Container smoke test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: docker.io/library/postgres:17-alpine
+        env:
+          POSTGRES_USER: tracesignal
+          POSTGRES_PASSWORD: tracesignal
+          POSTGRES_DB: tracesignal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tracesignal -d tracesignal"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      clickhouse:
+        # glibc tag, not -alpine — see the backend job's comment (musl
+        # startup path trips the Actions seccomp profile and never boots).
+        image: docker.io/clickhouse/clickhouse-server:24
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:8123/ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      qdrant:
+        # No --health-cmd — see the backend job's comment.
+        image: docker.io/qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for qdrant
+        run: timeout 30 sh -c 'until curl -sf http://localhost:6333/healthz; do sleep 1; done'
+
+      - name: Build image
+        run: docker build -t tracesignal:smoke .
+
+      - name: Run app container
+        # --network host so the container reaches the service containers'
+        # host-published localhost ports — the same topology the backend
+        # test job's suite relies on.
+        run: >-
+          docker run -d --name tracesignal-smoke --network host
+          -e TS_POSTGRES_URL=postgresql+asyncpg://tracesignal:tracesignal@localhost:5432/tracesignal
+          -e TS_CLICKHOUSE_URL=http://localhost:8123
+          -e TS_QDRANT_URL=http://localhost:6333
+          -e TS_ADMIN_PASSWORD=smoke-test-boot-pass
+          tracesignal:smoke
+
+      - name: Health endpoint responds
+        # Generous window: the lifespan runs schema init + startup
+        # reconciliation against all three services before serving.
+        run: |
+          timeout 90 sh -c 'until curl -sf http://localhost:8080/api/health; do sleep 2; done'
+          curl -sf http://localhost:8080/api/health | grep -q '"status":"ok"'
+
+      - name: SPA root serves HTML
+        # Catches frontend-dist packaging regressions in the 2-stage build.
+        run: curl -sf http://localhost:8080/ | grep -qi '<!doctype html'
+
+      - name: App logs on failure
+        if: failure()
+        run: docker logs tracesignal-smoke || true
+
   frontend:
     name: Frontend (typecheck + lint + build)
     runs-on: ubuntu-latest

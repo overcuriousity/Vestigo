@@ -1,6 +1,15 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 4/7: CI container smoke test.
+New `container-smoke` job: builds the reference image, boots it with `--network host`
+against the same pg/clickhouse(glibc)/qdrant service containers the backend job uses,
+asserts `/api/health` returns `status:"ok"` (would have caught C1's broken CMD import)
+and that `/` serves the packaged frontend HTML; dumps container logs on failure.
+Dockerfile gains `ARG INSTALL_EMBEDDINGS` (default 0) so the image skips the ~2 GB local
+embedding stack once M5's `embeddings` extra lands — the smoke test then doubles as the
+"boots without the extra" regression test.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,

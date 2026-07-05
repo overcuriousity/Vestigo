@@ -18,7 +18,13 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
 COPY README.md LICENSE ./
-RUN uv sync --frozen --no-dev
+# INSTALL_EMBEDDINGS=1 adds the optional local-embedding stack (torch +
+# sentence-transformers, ~2 GB) once it is an extra. Default off: without it
+# the app serves everything except local embedding; point
+# TS_EMBEDDING_API_BASE_URL at a remote endpoint for embedding features
+# without the heavy install.
+ARG INSTALL_EMBEDDINGS=0
+RUN uv sync --frozen --no-dev $(test "$INSTALL_EMBEDDINGS" = "1" && echo "--extra embeddings")
 
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 

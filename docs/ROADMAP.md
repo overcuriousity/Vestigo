@@ -37,8 +37,6 @@ resolved — this file holds only the condensed, still-open action items.
   `sentence-transformers` to an optional `embeddings` extra with graceful capability
   degradation (health endpoint flag, clear error on embed endpoints) so the base install
   drops ~2 GB.
-- [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
-  `/api/health`. Would have caught C1 before it shipped.
 - [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live
   full-scan ClickHouse aggregation over `events` on every read — `db/anomaly_stats.py`'s
   `field_inventory` (backs both the Visualize page's field dropdown and the anomaly wizard's
