@@ -108,12 +108,23 @@ export function ExplorerPage() {
 
   const setFilters = useCallback(
     (f: EventFilters) => {
+      // Any new filter change invalidates a previously pending soft-anchor
+      // scroll — otherwise it can fire against an unrelated later `events`
+      // update (e.g. a subsequent range change or jump-to-time).
+      pendingSoftAnchorRef.current = null;
       const rangeUnchanged = f.start === filters.start && f.end === filters.end;
       const anchorTs = useScrollPositionStore.getState().currentPositionTs;
       // A bare `{}` is handleJumpToTime's own clear-and-seek call — it seeds
       // the same query key itself, so skip here to avoid both racing on it.
       const isJumpClear = Object.keys(f).length === 0;
-      if (rangeUnchanged && !isJumpClear && anchorTs && caseId && timelineId) {
+      const shouldAnchor = rangeUnchanged && !isJumpClear && anchorTs && caseId && timelineId;
+
+      // Commit the URL/filter change first — matches handleJumpToTime's
+      // ordering, so the seed below races the hook's own auto-fetch the same
+      // (already-accepted) way a jump-to-time seed does.
+      setSearchParams(filtersToParams(f));
+
+      if (shouldAnchor) {
         const seq = ++softAnchorSeqRef.current;
         let nextEffective = f;
         if (f.annotated?.includes("anomaly") && anomalyRunIdRef.current) {
@@ -133,6 +144,11 @@ export function ExplorerPage() {
             { before: `${anchorTs},` },
           );
           if (softAnchorSeqRef.current !== seq) return;
+          // Cancel again — the URL change above may have let the hook's own
+          // auto-fetch (initialPageParam {}) start in the interim, and this
+          // seed must be the last write to `targetKey`, not that one.
+          await queryClient.cancelQueries({ queryKey: targetKey });
+          if (softAnchorSeqRef.current !== seq) return;
           const anchorPageParam: EventsPageParam = { before: cursorParam(anchorPage.prev_cursor) };
           queryClient.setQueryData(targetKey, {
             pages: [anchorPage],
@@ -142,7 +158,6 @@ export function ExplorerPage() {
           softAnchorSeededSeqRef.current = seq;
         });
       }
-      setSearchParams(filtersToParams(f));
     },
     [setSearchParams, filters, caseId, timelineId, queryClient, sortDir],
   );

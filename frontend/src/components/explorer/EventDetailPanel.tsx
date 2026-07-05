@@ -277,7 +277,9 @@ function Section({
   return (
     <div className="mb-3">
       <button
+        type="button"
         onClick={onToggle}
+        aria-expanded={!collapsed}
         className="mb-2 flex w-full items-center gap-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)] transition-base"
       >
         {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
