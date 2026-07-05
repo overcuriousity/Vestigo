@@ -1,6 +1,39 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 7/7: M16b ColumnPicker
+Last updated: 2026-07-05 (session 20 — PR #65 review fixes. `Source.created_by` for CLI
+ingests now stores `resolved_user.id` instead of `resolved_user.username`, matching every web
+call site (`api/routers/cases.py`) — the mismatch would have silently broken any future
+id-based creator lookup. `tsig embed` gained the `--user` attribution + `cli.embed.source`
+audit-log row it was missing (PROGRESS.md previously claimed embed got "the same validation for
+consistency" — it hadn't gotten audit parity). `tsig ingest`'s pre-scan `total_size` walk
+(a second full directory `rglob`/`stat` pass, redundant with `IngestionPipeline`'s own byte
+count and racy against directories that change between the two scans) is removed; the banner
+no longer prints a size, the progress box reports it once ingestion starts. `tsig ingest`'s
+three separate `asyncio.run()` calls collapsed into one. `SimilarityService.find_similar_by_text`
+(`db/similarity.py`) now catches encoder failures and raises `EncoderUnavailableError`, mapped
+to a 503 in `api/routers/events.py::semantic_search_events` — previously a flaky remote
+encoder crashed semantic search with an unhandled 500, the exact failure mode the sibling
+`_guard_encoder` fix (session 19) addressed only for the field wizard. Frontend `fmtDuration`
+(`JobTray.tsx`) fixed to include seconds in its hour branch, matching `cli/progress.py`'s
+`_fmt_duration` — they'd drifted, so web ETAs over 1h read differently from the CLI's.
+
+Previous (session 19 — CLI ingestion promoted to a real feature. `tsig ingest
+--case` previously accepted a case *name* and passed it straight through as the case ID with
+no validation (`get_case` was never called), silently writing Sources against a
+possibly-nonexistent case; it also never set `Source.created_by` and printed nothing during
+multi-hour large-file runs. Now: new `tsig cases list` (unscoped, admin/CLI use — resolves
+`owner_id`/`team_id` to usernames/team names via `list_users`/`list_teams`); `tsig ingest`
+validates `--case` via `store.get_case()` before touching the file and rejects unknown IDs;
+adds optional `--user` attribution (defaults to the sole active admin if unambiguous, else
+errors) written to `Source.created_by` plus a `cli.ingest.source` audit-log row
+(`record_audit`); and a new `src/tracesignal/cli/progress.py` ported near-verbatim from
+ScalarForensic (`_ETATracker` Kalman throughput/ETA estimator, block-element progress bar,
+duration formatter) driven by bytes off the existing `IngestionPipeline.progress_callback`
+(same signal the web upload job already uses — no new plumbing in `pipeline.py`). New
+`tests/test_cli.py` (11 tests: case listing, case/user validation, Kalman tracker math).
+`tsig embed` also gained the same case-ID validation for consistency.)
+
+Previous (session 18 — Milestone 2 batch, PR 7/7: M16b ColumnPicker
 derived-key grouping (PR #54 finding #34). New `splitDerivedKey` in
 `frontend/src/lib/enrichment.ts` (last-separator split, keeps the key contract mirrored
 in one file). ColumnPicker's Dynamic fields group now collapses enrichment-derived keys

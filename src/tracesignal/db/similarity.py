@@ -41,6 +41,14 @@ class SimilaritySearchResult:
     results: list[SimilarResult] = field(default_factory=list)
 
 
+class EncoderUnavailableError(RuntimeError):
+    """Raised by :py:meth:`SimilarityService.find_similar_by_text` when the
+    embedding encoder fails at call time (remote endpoint down, 401, dropped
+    connection). Callers should surface this as a clean 503 rather than let
+    it propagate as an unhandled 500.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -201,7 +209,10 @@ class SimilarityService:
         if collection is None:
             return SimilaritySearchResult(status="not_embedded")
 
-        query_vector = self._get_embedding_model().encode([query])[0]
+        try:
+            query_vector = self._get_embedding_model().encode([query])[0]
+        except Exception as exc:
+            raise EncoderUnavailableError(str(exc)) from exc
         return self._search_and_hydrate(case_id, collection, query_vector, source_ids, limit)
 
     def _search_and_hydrate(

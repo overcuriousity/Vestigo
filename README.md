@@ -28,7 +28,12 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   For very large files (tens of GiB and up), prefer `tsig ingest` over the web upload: it
   streams straight from disk with no HTTP upload, no temp copy, and no `TS_MAX_UPLOAD_BYTES`
   cap (web uploads default to 10 GiB). Insert batching is tuned via `TS_INGEST_BATCH_SIZE`
-  (default 20 000 events per ClickHouse round-trip).
+  (default 20 000 events per ClickHouse round-trip). Run `tsig cases list` first to find the
+  target case's ID (with its owner and team) — `tsig ingest` requires a real case ID, not a
+  name, and validates it before touching the file. Ingestion shows a live progress box
+  (Kalman-filtered throughput/ETA) so multi-hour large-file runs aren't silent, and attributes
+  the resulting Source to a user (`--user`, or the sole admin if unambiguous) for forensic
+  chain-of-custody.
 - A separate, user-triggered embedding job (`tsig embed` / the embed wizard) computes vectors
   after ingestion — ingestion itself stays fast and embedding-free until you ask for it.
 

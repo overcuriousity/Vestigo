@@ -221,7 +221,19 @@ export interface Job {
   id: string;
   kind: string;
   status: "queued" | "running" | "completed" | "failed";
-  progress: { total: number; processed: number } | null;
+  progress:
+    | {
+        total: number;
+        processed: number;
+        /** Kalman-filtered throughput/ETA (bytes ingest jobs only; see
+         * core/eta.py). Absent for embed jobs and before the second batch. */
+        rate_bps?: number | null;
+        rate_std_bps?: number | null;
+        kalman_gain?: number | null;
+        eta_s?: number | null;
+        eta_sigma_s?: number | null;
+      }
+    | null;
   result: unknown;
   error: string | null;
 }

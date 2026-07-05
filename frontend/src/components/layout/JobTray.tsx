@@ -10,6 +10,18 @@ import { useJobsStore, type TrackedJob } from "@/stores/jobs";
 import { Progress } from "@/components/ui/Progress";
 import { cn } from "@/lib/cn";
 
+/** Mirrors cli/progress.py's `_fmt_duration` so web ETAs read like the CLI. */
+function fmtDuration(seconds: number): string {
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return `${m}m ${String(rs).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}h ${String(rm).padStart(2, "0")}m ${String(rs).padStart(2, "0")}s`;
+}
+
 function JobRow({ job }: { job: TrackedJob }) {
   const { updateJob, dismiss } = useJobsStore();
   const qc = useQueryClient();
@@ -45,6 +57,20 @@ function JobRow({ job }: { job: TrackedJob }) {
       ? Math.round((job.progress.processed / job.progress.total) * 100)
       : null;
 
+  // Kalman-filtered rate/ETA, computed server-side (core/eta.py) and shown only
+  // while the job is actively running — the same estimate the CLI prints.
+  const rate = job.progress?.rate_bps;
+  const etaS = job.progress?.eta_s;
+  const showEta = job.status === "running" && rate != null && rate > 0;
+  const etaLine = showEta
+    ? [
+        `${(rate / 1e6).toFixed(1)} MB/s`,
+        etaS != null ? `~${fmtDuration(etaS)} left` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : null;
+
   const icon =
     job.status === "completed" ? (
       <CheckCircle size={14} className="text-[var(--color-success)] shrink-0" />
@@ -75,6 +101,11 @@ function JobRow({ job }: { job: TrackedJob }) {
         </div>
         {pct != null && job.status !== "failed" && (
           <Progress value={pct} className="mt-1.5" />
+        )}
+        {etaLine && (
+          <div className="mt-1 font-mono text-[10px] text-[var(--color-fg-muted)] tabular-nums">
+            {etaLine}
+          </div>
         )}
         {job.error && (
           <div className="mt-1 text-[var(--color-danger)] line-clamp-2 break-all">{job.error}</div>

@@ -38,7 +38,7 @@ from tracesignal.db.field_stats import (
 )
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
-from tracesignal.db.similarity import SimilarityService
+from tracesignal.db.similarity import EncoderUnavailableError, SimilarityService
 from tracesignal.models.embeddings import embeddings_available
 
 _EMBEDDINGS_UNAVAILABLE_DETAIL = (
@@ -784,7 +784,7 @@ async def list_fields(
     raw vendor key that happens to contain a colon, instead of guessing from
     the key name alone. Useful for building a column picker in the UI.
     """
-    from tracesignal.enrichers.registry import list_enrichers
+    from tracesignal.enrichers.registry import all_enrichers
 
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     stats = await ensure_source_field_stats(
@@ -792,7 +792,7 @@ async def list_fields(
     )
     result = merged_list_fields(stats, field_mappings)
     result["derived_suffixes"] = sorted(
-        {field for enricher in list_enrichers() for field in enricher.output_fields}
+        {field for enricher in all_enrichers() for field in enricher.output_fields}
     )
     return result
 
@@ -1309,7 +1309,12 @@ async def semantic_search_events(
         raise HTTPException(status_code=503, detail=_EMBEDDINGS_UNAVAILABLE_DETAIL)
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
-    result = await run_in_threadpool(svc.find_similar_by_text, case_id, source_ids, q, limit=limit)
+    try:
+        result = await run_in_threadpool(
+            svc.find_similar_by_text, case_id, source_ids, q, limit=limit
+        )
+    except EncoderUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "status": result.status,
         "results": [

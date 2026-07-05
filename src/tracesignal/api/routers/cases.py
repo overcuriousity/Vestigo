@@ -24,6 +24,7 @@ from tracesignal.api.deps import (
 )
 from tracesignal.api.uploads import receive_upload_to_tmp
 from tracesignal.core.config import get_settings
+from tracesignal.core.eta import ThroughputMeter
 from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.core.jobs import JobStore, get_job_store
 from tracesignal.db.clickhouse import ClickHouseStore
@@ -438,11 +439,19 @@ async def _run_ingestion_job(
     store = get_store()
     clickhouse = ClickHouseStore()
 
+    # One meter per ingest run: feeds the byte-based progress stream through the
+    # same Kalman throughput/ETA filter the CLI uses (see core/eta.py) so the
+    # web job tray shows identical rate/ETA figures. Computed server-side, where
+    # the callback sees every batch, rather than reconstructed from the UI's
+    # sparse polling.
+    meter = ThroughputMeter()
+
     def progress_callback(total: int, processed: int) -> None:
+        metrics = meter.observe(total, processed)
         job_store.update(
             job_id,
             status="running",
-            progress={"total": total, "processed": processed},
+            progress={"total": total, "processed": processed, **metrics.to_dict()},
         )
 
     try:
