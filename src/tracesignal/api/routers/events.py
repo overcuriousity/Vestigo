@@ -31,6 +31,11 @@ from tracesignal.db.anomaly_stats import (
     StatisticalAnomalyService,
     ValueFinding,
 )
+from tracesignal.db.field_stats import (
+    ensure_source_field_stats,
+    merged_inventory,
+    merged_list_fields,
+)
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
 from tracesignal.db.similarity import SimilarityService
@@ -777,8 +782,10 @@ async def list_fields(
     picker in the UI.
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
-    service = _get_query_service()
-    return await run_in_threadpool(service.list_fields, case_id, source_ids, field_mappings)
+    stats = await ensure_source_field_stats(
+        get_store(), _get_query_service().store, case_id, source_ids
+    )
+    return merged_list_fields(stats, field_mappings)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/artifacts")
@@ -1350,8 +1357,16 @@ async def list_anomaly_fields(
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
+    # Candidate inventory from the per-source stats cache; only the exact
+    # canonical-mapping aggregates stay a live query (see db/field_stats.py).
+    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    inventory, total = merged_inventory(stats, field_mappings)
+    if field_mappings and total:
+        inventory = inventory + await run_in_threadpool(
+            svc.canonical_inventory, case_id, source_ids, field_mappings
+        )
     fields: list[NoveltyFieldInfo] = await run_in_threadpool(
-        svc.recommend_novelty_fields, case_id, source_ids, None, field_mappings
+        svc.recommend_novelty_fields, case_id, source_ids, total, field_mappings, inventory
     )
     return {
         "fields": [

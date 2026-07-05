@@ -34,6 +34,7 @@ from typing import Any
 from tracesignal.core.config import get_settings
 from tracesignal.core.jobs import JobStore
 from tracesignal.db.clickhouse import ClickHouseStore
+from tracesignal.db.field_stats import refresh_source_field_stats
 from tracesignal.db.postgres import EnrichmentJobRun, PostgresStore
 from tracesignal.enrichers.base import FIELD_KEY_SEPARATOR, Enricher, derived_field_key
 from tracesignal.enrichers.registry import get_cached_availability, get_enricher
@@ -256,6 +257,23 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
                 rows_applied=applied,
             )
             await store.delete_staged_rows_for_source(job_id, source_id)
+            # Enrichment just added/stripped derived keys in events.attributes
+            # — the only mutation path for an ingested source — so refresh the
+            # per-source field-stats cache (M15). On failure the now-stale row
+            # is dropped instead: a missing row is a cache miss the read path
+            # heals, whereas a stale current-version row would be trusted.
+            try:
+                await refresh_source_field_stats(store, ch_store, case_id, source_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Field-stats refresh failed after enrichment apply for source %s; "
+                    "dropping the stale cache row",
+                    source_id,
+                )
+                try:
+                    await store.delete_source_field_stats(source_id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Could not drop stale field-stats row for %s", source_id)
             await store.record_audit(
                 action="enricher.applied",
                 case_id=case_id,

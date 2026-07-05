@@ -13,17 +13,19 @@ MAPPINGS = {"ip_address": ["src_ip", "ip_addr"]}
 
 @pytest.fixture()
 def fake_inventory(monkeypatch):
-    """Stub the ClickHouse field inventory used by mapping validation."""
+    """Stub the field-stats cache used by mapping validation (M15)."""
 
-    class FakeService:
-        def list_fields(self, case_id, source_ids, field_mappings=None):
-            return {
-                "top_level": [],
-                "attributes": ["src_ip", "ip_addr", "status"],
-                "mapped": [],
-            }
+    async def fake_ensure(store, clickhouse, case_id, source_ids):
+        payload = {
+            "top_level": {},
+            "attributes": {
+                key: {"distinct": 1, "coverage": 1, "samples": []}
+                for key in ("src_ip", "ip_addr", "status")
+            },
+        }
+        return dict.fromkeys(source_ids, (3, payload))
 
-    monkeypatch.setattr(cases_router, "EventQueryService", FakeService)
+    monkeypatch.setattr(cases_router, "ensure_source_field_stats", fake_ensure)
 
 
 def _create_case(client) -> str:

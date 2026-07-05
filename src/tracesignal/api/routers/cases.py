@@ -28,9 +28,14 @@ from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.core.jobs import JobStore, get_job_store
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import validate_field_mappings
+from tracesignal.db.field_stats import (
+    ensure_source_field_stats,
+    merged_field_coverage,
+    merged_list_fields,
+    refresh_source_field_stats,
+)
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
-from tracesignal.db.queries import EventQueryService
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 from tracesignal.models.embeddings import embeddings_available
@@ -324,8 +329,8 @@ async def _revalidate_stale_field_mappings(
         ready_ids = [s.id for s in sources if s.is_ready]
         if not ready_ids:
             continue
-        service = EventQueryService()
-        inventory = await run_in_threadpool(service.list_fields, case_id, ready_ids)
+        stats = await ensure_source_field_stats(store, ClickHouseStore(), case_id, ready_ids)
+        inventory = merged_list_fields(stats)
         problems = validate_field_mappings(timeline.field_mappings, set(inventory["attributes"]))
         if problems:
             logger.warning(
@@ -460,6 +465,18 @@ async def _run_ingestion_job(
         # Only now does the source become visible to timeline queries,
         # detectors, and embedding (see events._resolve_timeline_scope).
         await store.set_source_status(case_id, source_id, "ready")
+        # Precompute the per-source field-stats cache (M15). Isolated like the
+        # auto-enrichment trigger below: a failure must never roll back a
+        # successful ingest, and the read path self-heals on a cache miss.
+        try:
+            await refresh_source_field_stats(store, clickhouse, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Field-stats precompute failed for source %s (case %s); "
+                "reads fall back to compute-on-demand",
+                source_id,
+                case_id,
+            )
         await _revalidate_stale_field_mappings(store, case_id, source_id)
         # Auto-enrichment scheduling runs *after* the source is committed
         # "ready"; a failure here must never fall through to the ingest
@@ -790,8 +807,10 @@ async def _check_field_mappings(
     ``validate_field_mappings``).
     """
     if source_ids:
-        service = EventQueryService()
-        inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
+        stats = await ensure_source_field_stats(
+            get_store(), ClickHouseStore(), case_id, source_ids
+        )
+        inventory = merged_list_fields(stats)
         keys: set[str] | None = set(inventory["attributes"])
     else:
         keys = None
@@ -887,13 +906,15 @@ async def get_field_coverage(
 
     ``source_ids`` is comma-separated. Returns, per raw field, which sources
     carry it (with non-empty counts and sample values) so the wizard can show
-    merge candidates with real data next to them.
+    merge candidates with real data next to them. Served from the per-source
+    field-stats cache (M15) — counts are exact full-source totals, no longer
+    a 20k-rows-per-source sample.
     """
     ids = [sid.strip() for sid in source_ids.split(",") if sid.strip()]
     if not ids:
         raise HTTPException(status_code=422, detail="source_ids must not be empty")
-    service = EventQueryService()
-    return await run_in_threadpool(service.field_coverage, case.id, ids)
+    stats = await ensure_source_field_stats(get_store(), ClickHouseStore(), case.id, ids)
+    return merged_field_coverage(stats)
 
 
 @router.delete("/{case_id}/timelines/{timeline_id}")

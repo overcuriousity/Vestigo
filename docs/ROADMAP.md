@@ -31,19 +31,14 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 2 — high-leverage improvements
 
-- [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live
-  full-scan ClickHouse aggregation over `events` on every read — `db/anomaly_stats.py`'s
-  `field_inventory` (backs both the Visualize page's field dropdown and the anomaly wizard's
-  field recommender), `db/queries.py::list_fields` (Explorer ColumnPicker),
-  `db/queries.py::field_coverage` (timeline-creation wizard, scans up to 20k rows/source with
-  sample values every time the wizard opens), and `db/queries.py::list_fields_by_artifact`.
-  Since sources are immutable once ingested, none of this needs to be live: compute once per
-  source right after ingestion (same trigger point `_trigger_automatic_enrichments` uses),
-  cache in Postgres keyed by `source_id`, and merge cheaply per timeline. `coverage` merges
-  exactly via addition; exact `distinct` needs a sketch (HyperLogLog) or a cheap approximation
-  (e.g. max-across-sources) since it only feeds a UI hint. Short-term mitigation already
-  shipped: `VisualizePage` shows a "can take a while" hint under the spinner and the field
-  dropdown scrolls instead of overflowing (`ui/Select.tsx`).
+- [ ] **M15 residue — `list_fields_by_artifact` stays live (deliberate).** The per-source
+  field-stats cache (`db/field_stats.py`, shipped) converted `field_inventory`,
+  `list_fields`, and `field_coverage`; the embedding wizard's `list_fields_by_artifact`
+  keeps its live scan because its cost is the randomized per-artifact value sampling that
+  feeds content-aware cohesion scoring — caching only its inventory would save little.
+  Revisit only if the wizard's latency becomes a complaint. HyperLogLog sketches for exact
+  merged `distinct` likewise deferred (max-across-sources approximation documented in the
+  module).
 - [ ] **M16 — Enricher follow-ups (fresh branch after PR #54 merges).** The 2026-07-04
   cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
   (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26

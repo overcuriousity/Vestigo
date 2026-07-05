@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from tracesignal.api.deps import (
@@ -40,6 +39,7 @@ from tracesignal.api.routers.events import (
     _validate_field_regexes,
     _validate_regex,
 )
+from tracesignal.db.field_stats import ensure_source_field_stats, merged_inventory
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery
 
@@ -604,7 +604,8 @@ async def list_viz_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
-    inventory, total = await run_in_threadpool(svc.field_inventory, case_id, source_ids)
+    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    inventory, total = merged_inventory(stats)
     if total == 0:
         return {"fields": []}
     fields = [

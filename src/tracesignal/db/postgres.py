@@ -437,6 +437,32 @@ class SourceEnrichment(Base):
         }
 
 
+class SourceFieldStats(Base):
+    """Cached per-source field statistics (roadmap M15).
+
+    Derived, recomputable data — computed from the immutable ClickHouse
+    events of one source after ingestion and refreshed after each enrichment
+    apply (the only mutation path for ``events.attributes``). ``payload``
+    shape is versioned via ``stats_version``: a mismatch is treated as a
+    cache miss and recomputed, never migrated. See ``db/field_stats.py``.
+    """
+
+    __tablename__ = "source_field_stats"
+    __table_args__ = (Index("ix_source_field_stats_source", "source_id", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    stats_version: Mapped[int] = mapped_column(nullable=False, default=1)
+    events_total: Mapped[int] = mapped_column(nullable=False, default=0)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+
 class View(Base):
     """A saved filter view within a case."""
 
@@ -1459,9 +1485,74 @@ class PostgresStore:
                     EnrichmentResultStaging.source_id == source_id,
                 )
             )
+            await session.execute(
+                delete(SourceFieldStats).where(
+                    SourceFieldStats.case_id == case_id,
+                    SourceFieldStats.source_id == source_id,
+                )
+            )
             await session.delete(source)
             await session.commit()
             return True
+
+    # ------------------------------------------------------------------
+    # Source field stats (M15 cache — see db/field_stats.py)
+    # ------------------------------------------------------------------
+
+    async def upsert_source_field_stats(
+        self,
+        *,
+        case_id: str,
+        source_id: str,
+        stats_version: int,
+        events_total: int,
+        payload: dict,
+    ) -> SourceFieldStats:
+        """Insert or replace the cached field stats for one source."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SourceFieldStats).where(SourceFieldStats.source_id == source_id)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = SourceFieldStats(
+                    id=generate_id(f"fieldstats_{source_id}"),
+                    case_id=case_id,
+                    source_id=source_id,
+                )
+                session.add(row)
+            row.case_id = case_id
+            row.stats_version = stats_version
+            row.events_total = events_total
+            row.payload = payload
+            row.computed_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def delete_source_field_stats(self, source_id: str) -> None:
+        """Drop one source's cached stats so the next read recomputes them."""
+        from sqlalchemy import delete
+
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(SourceFieldStats).where(SourceFieldStats.source_id == source_id)
+            )
+            await session.commit()
+
+    async def get_source_field_stats(self, source_ids: list[str]) -> list[SourceFieldStats]:
+        """Return cached field-stats rows for the given sources (missing ones absent)."""
+        from sqlalchemy import select
+
+        if not source_ids:
+            return []
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SourceFieldStats).where(SourceFieldStats.source_id.in_(source_ids))
+            )
+            return list(result.scalars().all())
 
     # ------------------------------------------------------------------
     # Timelines

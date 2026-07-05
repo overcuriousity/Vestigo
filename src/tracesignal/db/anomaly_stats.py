@@ -389,30 +389,47 @@ class StatisticalAnomalyService:
                 continue  # replaced by the canonical entry below
             inventory.append((f"attr:{key}", int(dist), int(cov_count)))
 
-        # Canonical mapped fields (issue #10): exact aggregates over the
-        # coalesce expression, all canonicals batched into one round-trip —
-        # summing the per-raw-key numbers would double-count events that
-        # carry several of the raw keys.
         if field_mappings:
-            m_params: dict[str, Any] = {**params}
-            m_parts = []
-            canonicals = list(field_mappings.items())
-            for i, (_, raws) in enumerate(canonicals):
-                expr = mapping_coalesce_expr(raws, m_params, f"inv{i}")
-                m_parts.append(f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}")
-            m_sql = (
-                f"SELECT {', '.join(m_parts)}"
-                f" FROM {db}.events"
-                f" WHERE case_id = {{cid:String}}"
-                f" AND has({{src:Array(String)}}, source_id)"
-            )
-            m_res = self.ch.client.query(m_sql, parameters=m_params)
-            if m_res.result_rows:
-                row = m_res.result_rows[0]
-                for i, (canonical, _) in enumerate(canonicals):
-                    inventory.append((canonical, int(row[i * 2]), int(row[i * 2 + 1])))
+            inventory.extend(self.canonical_inventory(case_id, source_ids, field_mappings))
 
         return inventory, total
+
+    def canonical_inventory(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        field_mappings: dict[str, list[str]],
+    ) -> list[tuple[str, int, int]]:
+        """Exact ``(canonical, distinct, coverage)`` aggregates for mapped fields.
+
+        Canonical mapped fields (issue #10) aggregate over the coalesce
+        expression, all canonicals batched into one round-trip — summing the
+        per-raw-key numbers would double-count events that carry several of
+        the raw keys. This is the one inventory piece that stays a live query
+        even when the rest comes from the per-source stats cache
+        (``db/field_stats.py``): per-source counts cannot dedupe those events.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        m_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        m_parts = []
+        canonicals = list(field_mappings.items())
+        for i, (_, raws) in enumerate(canonicals):
+            expr = mapping_coalesce_expr(raws, m_params, f"inv{i}")
+            m_parts.append(f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}")
+        m_sql = (
+            f"SELECT {', '.join(m_parts)}"
+            f" FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+        )
+        m_res = self.ch.client.query(m_sql, parameters=m_params)
+        out: list[tuple[str, int, int]] = []
+        if m_res.result_rows:
+            row = m_res.result_rows[0]
+            for i, (canonical, _) in enumerate(canonicals):
+                out.append((canonical, int(row[i * 2]), int(row[i * 2 + 1])))
+        return out
 
     def recommend_novelty_fields(
         self,
@@ -420,6 +437,7 @@ class StatisticalAnomalyService:
         source_ids: list[str],
         total: int | None = None,
         field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
     ) -> list[NoveltyFieldInfo]:
         """Return a ranked, annotated list of candidate fields for value_novelty.
 
@@ -439,8 +457,15 @@ class StatisticalAnomalyService:
         internally when omitted — pass it when the caller already has it
         (e.g. ``find_value_novelty``'s auto-field-selection path) to avoid a
         redundant identical round-trip.
+
+        *inventory* lets callers supply a pre-merged candidate list (the
+        per-source stats cache, ``db/field_stats.py``) instead of the live
+        :py:meth:`field_inventory` scan; *total* must be passed with it.
         """
-        inventory, total = self.field_inventory(case_id, source_ids, total, field_mappings)
+        if inventory is None:
+            inventory, total = self.field_inventory(case_id, source_ids, total, field_mappings)
+        elif total is None:
+            raise ValueError("total is required when inventory is supplied")
         if total == 0:
             return []
 

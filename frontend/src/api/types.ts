@@ -142,7 +142,6 @@ export interface FieldCoverageEntry {
 
 export interface FieldCoverageResponse {
   fields: FieldCoverageEntry[];
-  sampled_rows_per_source: number;
 }
 
 export interface Event {
