@@ -889,11 +889,12 @@ class PostgresStore:
             # as the `event_enrichments` drop on the ClickHouse side), and a
             # re-run of the enricher regenerates the data.
             legacy_staging = await conn.run_sync(
-                lambda sync_conn: "enrichment_results_staging"
-                in inspect(sync_conn).get_table_names()
-                and any(
-                    col["name"] == "field_key"
-                    for col in inspect(sync_conn).get_columns("enrichment_results_staging")
+                lambda sync_conn: (
+                    "enrichment_results_staging" in inspect(sync_conn).get_table_names()
+                    and any(
+                        col["name"] == "field_key"
+                        for col in inspect(sync_conn).get_columns("enrichment_results_staging")
+                    )
                 )
             )
             if legacy_staging:

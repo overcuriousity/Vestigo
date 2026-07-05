@@ -807,9 +807,7 @@ async def _check_field_mappings(
     ``validate_field_mappings``).
     """
     if source_ids:
-        stats = await ensure_source_field_stats(
-            get_store(), ClickHouseStore(), case_id, source_ids
-        )
+        stats = await ensure_source_field_stats(get_store(), ClickHouseStore(), case_id, source_ids)
         inventory = merged_list_fields(stats)
         keys: set[str] | None = set(inventory["attributes"])
     else:

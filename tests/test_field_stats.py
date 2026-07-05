@@ -80,10 +80,7 @@ async def pg_store(tmp_path):
 
 
 def _stats_for(ch_store) -> dict:
-    return {
-        sid: compute_source_field_stats(ch_store, CASE_ID, sid)
-        for sid in (SRC_A, SRC_B)
-    }
+    return {sid: compute_source_field_stats(ch_store, CASE_ID, sid) for sid in (SRC_A, SRC_B)}
 
 
 def test_compute_single_source_payload(ch_store):
