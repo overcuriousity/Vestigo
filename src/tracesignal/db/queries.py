@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -52,6 +53,42 @@ _NULL_TIMESTAMP_SENTINEL_ISO = _NULL_TIMESTAMP_SENTINEL.isoformat()
 # events.py). `toString(event_id) > ""` served the same purpose before the
 # cursor predicate compared native UUIDs instead of strings.
 _MIN_EVENT_ID = "00000000-0000-0000-0000-000000000000"
+
+_logger = logging.getLogger(__name__)
+
+
+def _guard_encoder(
+    encode: Callable[[list[str]], list[list[float]]] | None,
+) -> Callable[[list[str]], list[list[float]]] | None:
+    """Wrap an embedding encoder so a runtime failure degrades to heuristic-only.
+
+    The field wizard treats ``encode is None`` as "no embedding substrate" and
+    falls back to pure-heuristic recommendations. A *remote* encoder, however,
+    only fails when actually called (401, endpoint down, dropped connection),
+    which would otherwise propagate a 500 out of an advisory endpoint. This
+    guard catches the first failure, logs it once, and thereafter returns empty
+    vectors — which the downstream centroid/cohesion code already treats as
+    "unusable" — so the whole request quietly completes heuristic-only.
+    """
+    if encode is None:
+        return None
+    failed = False
+
+    def guarded(texts: list[str]) -> list[list[float]]:
+        nonlocal failed
+        if failed:
+            return []
+        try:
+            return encode(texts)
+        except Exception:  # noqa: BLE001 - any encoder failure degrades gracefully
+            failed = True
+            _logger.warning(
+                "Embedding encoder failed; field wizard degrading to heuristic-only",
+                exc_info=True,
+            )
+            return []
+
+    return guarded
 
 
 @dataclass
@@ -944,7 +981,12 @@ class EventQueryService:
         when the multi-source path is used.
 
         ``encode`` is the embedding callable; pass ``None`` for heuristic-only.
+        If ``encode`` is supplied but fails at call time (remote endpoint down,
+        401, dropped connection), the wizard degrades to heuristic-only for the
+        rest of the request instead of surfacing a 500 — a flaky embedder must
+        not break field recommendation.
         """
+        encode = _guard_encoder(encode)
         self.store.init_schema()
         database = self.store.database
 

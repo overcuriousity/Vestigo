@@ -1540,3 +1540,33 @@ def test_compare_field_numeric_no_numeric_values_returns_empty() -> None:
     assert result["bins"] == []
     assert result["min"] is None
     assert not any("toStartOfInterval" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+
+
+def test_guard_encoder_degrades_on_failure() -> None:
+    """A failing encoder is caught, disabled after first error, returns []."""
+    from tracesignal.db.queries import _guard_encoder
+
+    calls = {"n": 0}
+
+    def boom(_texts: list[str]) -> list[list[float]]:
+        calls["n"] += 1
+        raise RuntimeError("401 Unauthorized")
+
+    guarded = _guard_encoder(boom)
+    assert guarded is not None
+    assert guarded(["a"]) == []  # first call fails, swallowed
+    assert guarded(["b"]) == []  # short-circuits, no second remote call
+    assert calls["n"] == 1
+
+
+def test_guard_encoder_passes_through_success_and_none() -> None:
+    from tracesignal.db.queries import _guard_encoder
+
+    assert _guard_encoder(None) is None
+
+    def ok(texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _ in texts]
+
+    guarded = _guard_encoder(ok)
+    assert guarded is not None
+    assert guarded(["a", "b"]) == [[1.0, 0.0], [1.0, 0.0]]
