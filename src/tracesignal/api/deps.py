@@ -141,6 +141,19 @@ async def resolve_case_access(user: User, case: Case) -> AccessLevel:
     return AccessLevel.NONE
 
 
+async def has_case_access(user: User, case: Case | None, level: AccessLevel) -> bool:
+    """Return whether *user* has at least *level* access to *case*.
+
+    For callers that need a boolean check outside the ``Depends`` chain (e.g.
+    a fallback path after another check, or a re-check mid-generator) instead
+    of raising 403/404 — those should prefer ``require_case``/
+    ``require_case_read`` etc.
+    """
+    if case is None:
+        return False
+    return await resolve_case_access(user, case) >= level
+
+
 def require_case(level: AccessLevel):
     """Return a FastAPI dependency requiring at least ``level`` access to ``case_id``.
 

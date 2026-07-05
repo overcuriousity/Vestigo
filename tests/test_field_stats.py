@@ -16,7 +16,7 @@ from tracesignal.db import field_stats
 from tracesignal.db.anomaly_stats import StatisticalAnomalyService
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_stats import (
-    STATS_VERSION,
+    EFFECTIVE_STATS_VERSION,
     compute_source_field_stats,
     ensure_source_field_stats,
     merged_field_coverage,
@@ -136,7 +136,7 @@ async def test_ensure_self_heals_and_caches(ch_store, pg_store, monkeypatch):
     stats = await ensure_source_field_stats(pg_store, ch_store, CASE_ID, [SRC_A])
     assert stats[SRC_A][0] == 3
     rows = await pg_store.get_source_field_stats([SRC_A])
-    assert len(rows) == 1 and rows[0].stats_version == STATS_VERSION
+    assert len(rows) == 1 and rows[0].stats_version == EFFECTIVE_STATS_VERSION
 
     # Second read must come from the cache: computing again would blow up.
     def _boom(*a, **kw):
@@ -152,14 +152,14 @@ async def test_stats_version_mismatch_recomputes(ch_store, pg_store):
     await pg_store.upsert_source_field_stats(
         case_id=CASE_ID,
         source_id=SRC_A,
-        stats_version=STATS_VERSION - 1,
+        stats_version=EFFECTIVE_STATS_VERSION - 1,
         events_total=999,
         payload={"top_level": {}, "attributes": {"stale": {}}},
     )
     stats = await ensure_source_field_stats(pg_store, ch_store, CASE_ID, [SRC_A])
     assert stats[SRC_A][0] == 3
     rows = await pg_store.get_source_field_stats([SRC_A])
-    assert rows[0].stats_version == STATS_VERSION
+    assert rows[0].stats_version == EFFECTIVE_STATS_VERSION
 
 
 @pytest.mark.asyncio
@@ -172,8 +172,11 @@ async def test_refresh_after_enrichment_apply_sees_derived_keys(ch_store, pg_sto
         rows = await pg_store.get_source_field_stats([src])
         assert "src_ip:geo_country" not in rows[0].payload["attributes"]
 
-        chunks = [[(str(e.event_id), "src_ip:geo_country", "Germany") for e in events]]
-        ch_store.apply_enrichments(CASE_ID, src, "job-fs", iter(chunks), ["geo_country"])
+        chunk = [(str(e.event_id), "src_ip:geo_country", "Germany") for e in events]
+        ch_store.create_enrichment_scratch("job-fs")
+        ch_store.stage_enrichment_rows("job-fs", chunk)
+        ch_store.finalize_enrichment_apply(CASE_ID, src, "job-fs", ["geo_country"])
+        ch_store.drop_enrichment_scratch("job-fs")
 
         await refresh_source_field_stats(pg_store, ch_store, CASE_ID, src)
         rows = await pg_store.get_source_field_stats([src])
@@ -189,7 +192,7 @@ async def test_delete_source_field_stats(pg_store):
     await pg_store.upsert_source_field_stats(
         case_id=CASE_ID,
         source_id="gone",
-        stats_version=STATS_VERSION,
+        stats_version=EFFECTIVE_STATS_VERSION,
         events_total=1,
         payload={},
     )

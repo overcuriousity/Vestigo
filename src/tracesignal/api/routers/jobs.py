@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from tracesignal.api.deps import AccessLevel, get_current_user, get_store, resolve_case_access
+from tracesignal.api.deps import AccessLevel, get_current_user, get_store, has_case_access
 from tracesignal.core.jobs import get_job_store
 from tracesignal.db.postgres import User
 
@@ -32,6 +32,6 @@ async def get_job(job_id: str, user: User = Depends(get_current_user)) -> dict[s
         return {"job": job.to_dict()}
     if job.case_id is not None:
         case = await get_store().get_case(job.case_id)
-        if case is not None and await resolve_case_access(user, case) >= AccessLevel.READ:
+        if await has_case_access(user, case, AccessLevel.READ):
             return {"job": job.to_dict()}
     raise HTTPException(status_code=404, detail="Job not found")

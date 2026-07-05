@@ -140,11 +140,12 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
   const { baseAttrs, derivedByParent, orphanDerived } = useMemo(() => {
     const attrs = fields?.attributes ?? [];
     const attrSet = new Set(attrs);
+    const knownSuffixes = new Set(fields?.derived_suffixes ?? []);
     const bases: string[] = [];
     const byParent = new Map<string, string[]>();
     const orphans: string[] = [];
     for (const key of attrs) {
-      const parts = splitDerivedKey(key);
+      const parts = splitDerivedKey(key, knownSuffixes);
       if (parts && attrSet.has(parts.parent)) {
         const children = byParent.get(parts.parent) ?? [];
         children.push(key);

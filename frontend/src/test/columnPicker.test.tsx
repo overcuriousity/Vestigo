@@ -20,6 +20,7 @@ vi.mock("@/api/events", () => ({
         "src_ip:geo_country",
         "zulu:geo_country",
       ],
+      derived_suffixes: ["geo_city", "geo_country"],
       mapped: [],
     }),
   },
@@ -89,5 +90,30 @@ describe("ColumnPicker derived-key grouping", () => {
     expect(useUiStore.getState().visibleColumnsByTimeline["c1/t1"]).toContain(
       "src_ip:geo_country",
     );
+  });
+
+  it("does not misclassify a raw vendor key whose colon suffix isn't a registered enricher output", async () => {
+    // Regression: splitDerivedKey used to split on any colon, so a raw key
+    // like "event_data:AccountName" (Windows Event Log/Sysmon-style) was
+    // wrongly treated as enrichment-derived. It must only group under a
+    // parent when the suffix is a known enricher output field.
+    const { eventsApi } = await import("@/api/events");
+    vi.mocked(eventsApi.fields).mockResolvedValueOnce({
+      top_level: ["timestamp", "message"],
+      attributes: ["event_data", "event_data:AccountName"],
+      derived_suffixes: ["geo_city", "geo_country"],
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <ColumnPicker caseId="c1" timelineId="t1" />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /columns/i }));
+    await waitFor(() => expect(screen.getByText("event_data")).toBeInTheDocument());
+
+    expect(screen.getByText("event_data:AccountName")).toBeInTheDocument();
+    expect(screen.queryByText(/^Derived \(/)).not.toBeInTheDocument();
   });
 });

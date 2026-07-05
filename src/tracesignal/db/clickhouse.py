@@ -13,8 +13,9 @@ member source IDs and use ``source_id IN (...)`` filtering.
 Immutability contract: the *original evidence files* are hashed and immutable;
 this table is a normalized derivative of them. Enrichers amend the
 ``attributes`` map after ingest via an atomic per-source partition rewrite
-(``apply_enrichments``) — the provenance columns are never touched, so hash
-verification against the original file is unaffected.
+(``stage_enrichment_rows`` / ``finalize_enrichment_apply``) — the provenance
+columns are never touched, so hash verification against the original file is
+unaffected.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from datetime import UTC
 from typing import Any
 
@@ -136,8 +137,9 @@ PARTITION BY (case_id, source_id)
 SETTINGS index_granularity = 8192, allow_nullable_key = 1
 """.strip()
 
-# Prefix for the transient tables apply_enrichments works through; stale ones
-# (crash mid-apply) are swept at startup by drop_stale_enrichment_scratch_tables.
+# Prefix for the transient tables the enrichment-apply stage/finalize step
+# works through; stale ones (crash mid-apply) are swept at startup by
+# drop_stale_enrichment_scratch_tables.
 _ENRICH_SCRATCH_PREFIX = "tmp_enrich_"
 
 
@@ -190,7 +192,7 @@ class ClickHouseStore:
         """Create the target database and events table if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
-        # Enrichment output moved into events.attributes (apply_enrichments);
+        # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
         # databases are documented as deprecated and the data is derived —
         # re-running the enricher regenerates it.
@@ -217,23 +219,97 @@ class ClickHouseStore:
         )
         return response.written_rows
 
-    def apply_enrichments(
+    def attribute_keys_present(
+        self, case_id: str, source_ids: list[str], keys: list[str]
+    ) -> set[str]:
+        """Return which of *keys* actually occur as attribute map keys.
+
+        Targeted existence check (bounded by ``len(keys)`` map lookups per
+        row, no key-enumeration ``ARRAY JOIN``) for raw keys that field-mapping
+        validation didn't find in the per-source field-stats cache — that
+        cache caps attribute keys per source (``_MAX_ATTR_KEYS_PER_SOURCE`` in
+        ``field_stats.py``) to bound its payload, so a real but low-coverage
+        key can rank outside the cap and needs this live fallback instead of
+        being rejected as nonexistent.
+        """
+        if not keys or not source_ids:
+            return set()
+        self.init_schema()
+        db = self.database
+        params: dict[str, Any] = {"cid": case_id, "sids": source_ids}
+        select_parts = []
+        for i, key in enumerate(keys):
+            pname = f"k{i}"
+            params[pname] = key
+            select_parts.append(f"countIf(mapContains(attributes, {{{pname}:String}})) AS c{i}")
+        result = self.client.query(
+            f"SELECT {', '.join(select_parts)} FROM {db}.events "
+            "WHERE case_id = {cid:String} AND source_id IN {sids:Array(String)}",
+            parameters=params,
+        )
+        if not result.result_rows:
+            return set()
+        row = result.result_rows[0]
+        return {key for i, key in enumerate(keys) if int(row[i]) > 0}
+
+    def _enrichment_scratch_tables(self, scratch_suffix: str) -> tuple[str, str]:
+        # Suffix comes from the in-process job id (uuid4 hex); defensive
+        # strip anyway since it lands in DDL identifiers.
+        suffix = re.sub(r"[^a-zA-Z0-9_]", "", scratch_suffix)
+        return (
+            f"{self.database}.{_ENRICH_SCRATCH_PREFIX}rows_{suffix}",
+            f"{self.database}.{_ENRICH_SCRATCH_PREFIX}events_{suffix}",
+        )
+
+    def create_enrichment_scratch(self, scratch_suffix: str) -> None:
+        """(Re)create the scratch rows table one source's apply stages into.
+
+        Call once before any ``stage_enrichment_rows`` calls for this
+        ``scratch_suffix`` (typically the job id).
+        """
+        rows_table, _ = self._enrichment_scratch_tables(scratch_suffix)
+        self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
+        self.client.command(
+            f"CREATE TABLE {rows_table} "
+            "(event_id UUID, field_key String, value String) "
+            "ENGINE = MergeTree ORDER BY event_id"
+        )
+
+    def stage_enrichment_rows(self, scratch_suffix: str, chunk: list[tuple[str, str, str]]) -> int:
+        """Insert one page of ``(event_id, field_key, value)`` triples into the scratch table.
+
+        Callers can stream pages in one at a time (each discarded from Python
+        memory after this returns) instead of materializing the whole
+        source's triples before staging any of them — ``finalize_enrichment_apply``
+        does the actual (expensive, one-shot) partition rewrite once every
+        page has been staged.
+        """
+        if not chunk:
+            return 0
+        rows_table, _ = self._enrichment_scratch_tables(scratch_suffix)
+        self.client.insert(
+            table=rows_table,
+            data=chunk,
+            column_names=["event_id", "field_key", "value"],
+        )
+        return len(chunk)
+
+    def finalize_enrichment_apply(
         self,
         case_id: str,
         source_id: str,
         scratch_suffix: str,
-        row_chunks: Iterable[list[tuple[str, str, str]]],
         owned_suffixes: list[str] | None = None,
-    ) -> int:
-        """Merge enrichment key/value pairs into one source's ``events.attributes``.
+    ) -> None:
+        """Atomically merge the staged scratch rows into one source's ``events.attributes``.
 
-        Atomic per-source partition rewrite: the ``(event_id, field_key,
-        value)`` triples are inserted into a scratch rows table, an enriched
-        copy of the source's partition is built into a scratch events table
-        via ``mapUpdate`` over a LEFT JOIN, and the live partition is swapped
-        in one ``ALTER TABLE ... REPLACE PARTITION``. Idempotent — re-applying
-        the same rows overwrites the same map keys with the same values — so
-        a crashed apply can simply be re-run from the Postgres staging rows.
+        An enriched copy of the source's partition is built into a scratch
+        events table via ``mapUpdate`` over a LEFT JOIN against the rows
+        staged by ``stage_enrichment_rows``, and the live partition is
+        swapped in one ``ALTER TABLE ... REPLACE PARTITION``. Idempotent —
+        re-applying the same rows overwrites the same map keys with the same
+        values — so a crashed apply can simply be re-run from the Postgres
+        staging rows.
 
         ``owned_suffixes`` is the enricher's ``output_fields`` (the ``<field>``
         half of each derived ``<attr_key>:<field>`` key). Before merging, every
@@ -249,14 +325,8 @@ class ClickHouseStore:
         Transiently doubles the partition's disk footprint (scratch copy).
         Caller must serialize applies per ``(case_id, source_id)`` — two
         concurrent REPLACEs would silently discard one side's keys.
-
-        Returns the number of enrichment pairs applied.
         """
-        # Suffix comes from the in-process job id (uuid4 hex); defensive
-        # strip anyway since it lands in DDL identifiers.
-        suffix = re.sub(r"[^a-zA-Z0-9_]", "", scratch_suffix)
-        rows_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}rows_{suffix}"
-        events_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}events_{suffix}"
+        rows_table, events_table = self._enrichment_scratch_tables(scratch_suffix)
         partition_expr = _partition_expr(case_id, source_id)
         # Strip this enricher's previously-derived keys (last ':'-segment in
         # owned_suffixes) before merging the fresh output, so stale values are
@@ -272,64 +342,47 @@ class ClickHouseStore:
             else f"e.{column}"
             for column in _EVENT_COLUMNS
         )
-        try:
-            self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
-            self.client.command(
-                f"CREATE TABLE {rows_table} "
-                "(event_id UUID, field_key String, value String) "
-                "ENGINE = MergeTree ORDER BY event_id"
-            )
-            applied = 0
-            for chunk in row_chunks:
-                if not chunk:
-                    continue
-                self.client.insert(
-                    table=rows_table,
-                    data=chunk,
-                    column_names=["event_id", "field_key", "value"],
-                )
-                applied += len(chunk)
-            if applied == 0:
-                return 0
-            self.client.command(f"DROP TABLE IF EXISTS {events_table}")
-            # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
-            # indexes, settings) — required for REPLACE PARTITION.
-            self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
-            self.client.query(
-                f"""
-                INSERT INTO {events_table} ({", ".join(_EVENT_COLUMNS)})
+        self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+        # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
+        # indexes, settings) — required for REPLACE PARTITION.
+        self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
+        self.client.query(
+            f"""
+            INSERT INTO {events_table} ({", ".join(_EVENT_COLUMNS)})
+            SELECT
+                {select_columns}
+            FROM {self.database}.events AS e
+            LEFT JOIN (
                 SELECT
-                    {select_columns}
-                FROM {self.database}.events AS e
-                LEFT JOIN (
-                    SELECT
-                        event_id,
-                        CAST(
-                            (groupArray(field_key), groupArray(value)),
-                            'Map(String, String)'
-                        ) AS enr
-                    FROM {rows_table}
-                    GROUP BY event_id
-                ) AS m ON e.event_id = m.event_id
-                WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
-                SETTINGS join_use_nulls = 0
-                """,
-                parameters={
-                    "case_id": case_id,
-                    "source_id": source_id,
-                    "owned_suffixes": owned_suffixes or [],
-                },
-            )
-            self.client.command(
-                f"ALTER TABLE {self.database}.events "
-                f"REPLACE PARTITION {partition_expr} FROM {events_table}"
-            )
-            return applied
-        finally:
-            with contextlib.suppress(Exception):
-                self.client.command(f"DROP TABLE IF EXISTS {events_table}")
-            with contextlib.suppress(Exception):
-                self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
+                    event_id,
+                    CAST(
+                        (groupArray(field_key), groupArray(value)),
+                        'Map(String, String)'
+                    ) AS enr
+                FROM {rows_table}
+                GROUP BY event_id
+            ) AS m ON e.event_id = m.event_id
+            WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
+            SETTINGS join_use_nulls = 0
+            """,
+            parameters={
+                "case_id": case_id,
+                "source_id": source_id,
+                "owned_suffixes": owned_suffixes or [],
+            },
+        )
+        self.client.command(
+            f"ALTER TABLE {self.database}.events "
+            f"REPLACE PARTITION {partition_expr} FROM {events_table}"
+        )
+
+    def drop_enrichment_scratch(self, scratch_suffix: str) -> None:
+        """Drop both scratch tables for ``scratch_suffix``, ignoring errors."""
+        rows_table, events_table = self._enrichment_scratch_tables(scratch_suffix)
+        with contextlib.suppress(Exception):
+            self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+        with contextlib.suppress(Exception):
+            self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
 
     def drop_stale_enrichment_scratch_tables(self) -> int:
         """Drop scratch tables orphaned by a crash mid-apply. Returns how many were dropped."""

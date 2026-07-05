@@ -329,9 +329,10 @@ async def _revalidate_stale_field_mappings(
         ready_ids = [s.id for s in sources if s.is_ready]
         if not ready_ids:
             continue
-        stats = await ensure_source_field_stats(store, ClickHouseStore(), case_id, ready_ids)
-        inventory = merged_list_fields(stats)
-        problems = validate_field_mappings(timeline.field_mappings, set(inventory["attributes"]))
+        keys = await _resolve_mapping_validation_keys(
+            ClickHouseStore(), case_id, ready_ids, timeline.field_mappings
+        )
+        problems = validate_field_mappings(timeline.field_mappings, keys)
         if problems:
             logger.warning(
                 "Timeline %r field_mappings are invalid against its now-ready sources: %s",
@@ -795,6 +796,30 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     return {"timeline": timeline.to_dict()}
 
 
+async def _resolve_mapping_validation_keys(
+    clickhouse: ClickHouseStore, case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
+) -> set[str]:
+    """Return the attribute keys to validate *mappings* against.
+
+    Starts from the cached, per-source-capped inventory (cheap, the common
+    case) and only falls back to a live existence check for the mapping's raw
+    keys that aren't in it — the cache caps attribute keys per source
+    (``_MAX_ATTR_KEYS_PER_SOURCE`` in ``field_stats.py``) to bound its
+    payload, so a real but low-coverage raw key can rank outside the cap and
+    would otherwise be rejected as nonexistent.
+    """
+    stats = await ensure_source_field_stats(get_store(), clickhouse, case_id, source_ids)
+    inventory = merged_list_fields(stats)
+    keys = set(inventory["attributes"])
+    missing_raw = {r for raws in mappings.values() for r in raws} - keys
+    if missing_raw:
+        present = await asyncio.to_thread(
+            clickhouse.attribute_keys_present, case_id, source_ids, sorted(missing_raw)
+        )
+        keys |= present
+    return keys
+
+
 async def _check_field_mappings(
     case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
 ) -> None:
@@ -807,9 +832,9 @@ async def _check_field_mappings(
     ``validate_field_mappings``).
     """
     if source_ids:
-        stats = await ensure_source_field_stats(get_store(), ClickHouseStore(), case_id, source_ids)
-        inventory = merged_list_fields(stats)
-        keys: set[str] | None = set(inventory["attributes"])
+        keys: set[str] | None = await _resolve_mapping_validation_keys(
+            ClickHouseStore(), case_id, source_ids, mappings
+        )
     else:
         keys = None
     problems = validate_field_mappings(mappings, keys)

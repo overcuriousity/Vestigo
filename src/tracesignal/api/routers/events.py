@@ -777,15 +777,24 @@ async def list_fields(
     """Return the displayable field names for a timeline.
 
     ``top_level`` contains the fixed columns common to every event.
-    ``attributes`` contains the dynamic keys aggregated from the ``attributes``
-    Map across a sample of up to 50 000 events.  Useful for building a column
-    picker in the UI.
+    ``attributes`` contains the dynamic keys aggregated from the per-source
+    field-stats cache (see ``db/field_stats.py``). ``derived_suffixes`` lists
+    the registered enrichers' output-field names — the UI uses it to tell a
+    real ``<attr_key>:<output_field>`` enrichment-derived key apart from a
+    raw vendor key that happens to contain a colon, instead of guessing from
+    the key name alone. Useful for building a column picker in the UI.
     """
+    from tracesignal.enrichers.registry import list_enrichers
+
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     stats = await ensure_source_field_stats(
         get_store(), _get_query_service().store, case_id, source_ids
     )
-    return merged_list_fields(stats, field_mappings)
+    result = merged_list_fields(stats, field_mappings)
+    result["derived_suffixes"] = sorted(
+        {field for enricher in list_enrichers() for field in enricher.output_fields}
+    )
+    return result
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/artifacts")

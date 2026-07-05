@@ -328,7 +328,7 @@ class EnrichmentResultStaging(Base):
 
     Rows accumulate here as an enrichment job processes batches; at job end
     they are merged into the ClickHouse ``events.attributes`` map via an
-    atomic per-source partition rewrite (``ClickHouseStore.apply_enrichments``)
+    atomic per-source partition rewrite (``ClickHouseStore.finalize_enrichment_apply``)
     and deleted only after the swap succeeds. If the process dies mid-run,
     rows survive here (Postgres is transactional) even though the in-memory
     JobStore does not — see ``list_orphaned_enrichment_job_runs``, which
@@ -339,7 +339,7 @@ class EnrichmentResultStaging(Base):
     already attr-prefixed via ``derived_field_key``). Replaces the original
     row-per-(event, attr, output_field) grain — ~3-6x fewer rows for
     multi-output enrichers, and the apply loop expands the map back into
-    triples for ``apply_enrichments`` without any ClickHouse-side change.
+    triples for ``stage_enrichment_rows`` without any ClickHouse-side change.
     """
 
     __tablename__ = "enrichment_results_staging"

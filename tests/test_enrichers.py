@@ -416,24 +416,38 @@ async def test_orphaned_enrichment_job_run_lifecycle(store):
 
 
 class _RecordingClickHouse:
-    """Fake ClickHouseStore capturing apply_enrichments calls."""
+    """Fake ClickHouseStore capturing the stage/finalize enrichment-apply calls."""
 
     def __init__(self) -> None:
+        self._staged_by_suffix: dict[str, list[list]] = {}
         self.applied: list[tuple[str, str, str, list]] = []
 
-    def apply_enrichments(
-        self, case_id, source_id, scratch_suffix, row_chunks, owned_suffixes=None
-    ) -> int:
-        chunks = [list(chunk) for chunk in row_chunks]
+    def create_enrichment_scratch(self, scratch_suffix) -> None:
+        self._staged_by_suffix[scratch_suffix] = []
+
+    def stage_enrichment_rows(self, scratch_suffix, chunk) -> int:
+        self._staged_by_suffix.setdefault(scratch_suffix, []).append(list(chunk))
+        return len(chunk)
+
+    def finalize_enrichment_apply(
+        self, case_id, source_id, scratch_suffix, owned_suffixes=None
+    ) -> None:
+        chunks = self._staged_by_suffix.get(scratch_suffix, [])
         self.applied.append((case_id, source_id, scratch_suffix, chunks))
-        return sum(len(chunk) for chunk in chunks)
+
+    def drop_enrichment_scratch(self, scratch_suffix) -> None:
+        self._staged_by_suffix.pop(scratch_suffix, None)
 
 
 class _BrokenClickHouse:
-    def apply_enrichments(
-        self, case_id, source_id, scratch_suffix, row_chunks, owned_suffixes=None
-    ) -> int:
+    def create_enrichment_scratch(self, scratch_suffix) -> None:
+        pass
+
+    def stage_enrichment_rows(self, scratch_suffix, chunk) -> int:
         raise ConnectionError("clickhouse down")
+
+    def drop_enrichment_scratch(self, scratch_suffix) -> None:
+        pass
 
 
 async def _stage_one_row(store, job_id="job1", value="DE", config_hash="hash1"):
@@ -556,10 +570,13 @@ def _fake_ch_store():
 
 def test_apply_enrichments_runs_atomic_partition_rewrite():
     store = _fake_ch_store()
-    applied = store.apply_enrichments(
-        "c1", "s1", "job1", [[("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")]]
+    store.create_enrichment_scratch("job1")
+    applied = store.stage_enrichment_rows(
+        "job1", [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")]
     )
     assert applied == 2
+    store.finalize_enrichment_apply("c1", "s1", "job1")
+    store.drop_enrichment_scratch("job1")
 
     client = store.client
     # Triples inserted into the scratch rows table.
@@ -589,7 +606,9 @@ def test_apply_enrichments_runs_atomic_partition_rewrite():
 
 def test_apply_enrichments_no_rows_is_a_noop_swap():
     store = _fake_ch_store()
-    assert store.apply_enrichments("c1", "s1", "job1", [[]]) == 0
+    store.create_enrichment_scratch("job1")
+    assert store.stage_enrichment_rows("job1", []) == 0
+    store.drop_enrichment_scratch("job1")
     assert not any("REPLACE PARTITION" in c for c in store.client.commands)
 
 

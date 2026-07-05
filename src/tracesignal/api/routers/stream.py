@@ -18,8 +18,8 @@ from fastapi.responses import StreamingResponse
 
 from tracesignal.api.deps import (
     AccessLevel,
+    has_case_access,
     require_case_read,
-    resolve_case_access,
     resolve_user_optional,
 )
 from tracesignal.core.events_bus import get_event_bus
@@ -48,7 +48,7 @@ async def _event_stream(request: Request, case: Case) -> AsyncGenerator[str]:
                 # removal actually stops the stream instead of leaking
                 # activity metadata to a subscriber who's lost access.
                 user = await resolve_user_optional(request)
-                if user is None or await resolve_case_access(user, case) < AccessLevel.READ:
+                if user is None or not await has_case_access(user, case, AccessLevel.READ):
                     break
                 yield ": keepalive\n\n"
     finally:

@@ -26,6 +26,7 @@ the miss path costs exactly what the previous always-live scan did.
 from __future__ import annotations
 
 import asyncio
+import zlib
 from typing import TYPE_CHECKING, Any
 
 # Top-level categorical columns tracked in the payload — single-sourced from
@@ -40,6 +41,25 @@ if TYPE_CHECKING:
 # Bump whenever the payload shape below changes — mismatched rows are treated
 # as cache misses and recomputed, so no migration is ever needed.
 STATS_VERSION = 1
+
+
+def _effective_stats_version() -> int:
+    """``STATS_VERSION`` folded with a fingerprint of ``_NOVELTY_CANDIDATE_TOP_LEVEL``.
+
+    The cached payload's ``top_level`` keys come directly from that list, but
+    it lives in ``anomaly_stats.py`` with no direct reference back to
+    ``STATS_VERSION`` here — a maintainer adding/removing/reordering a column
+    there could easily forget to bump ``STATS_VERSION``, leaving every
+    already-cached source silently missing the new column until it happens to
+    be re-ingested or re-enriched. Folding a fingerprint of the list into the
+    version used for the cache-hit check makes that class of change
+    self-invalidating instead of relying on the manual bump.
+    """
+    fingerprint = zlib.crc32("|".join(_NOVELTY_CANDIDATE_TOP_LEVEL).encode()) % 10_000_000
+    return STATS_VERSION * 10_000_000 + fingerprint
+
+
+EFFECTIVE_STATS_VERSION = _effective_stats_version()
 
 # Per-source attribute-key cap, ordered by coverage descending. Bounds the
 # payload on pathological datasets; must stay far above the read-side caps
@@ -131,7 +151,7 @@ async def refresh_source_field_stats(
     await store.upsert_source_field_stats(
         case_id=case_id,
         source_id=source_id,
-        stats_version=STATS_VERSION,
+        stats_version=EFFECTIVE_STATS_VERSION,
         events_total=total,
         payload=payload,
     )
@@ -151,22 +171,25 @@ async def ensure_source_field_stats(
     """
     stats: dict[str, tuple[int, dict[str, Any]]] = {}
     for row in await store.get_source_field_stats(source_ids):
-        if row.stats_version == STATS_VERSION:
+        if row.stats_version == EFFECTIVE_STATS_VERSION:
             stats[row.source_id] = (row.events_total, row.payload)
-    for source_id in source_ids:
-        if source_id in stats:
-            continue
+
+    async def _fill_miss(source_id: str) -> None:
         total, payload = await asyncio.to_thread(
             compute_source_field_stats, clickhouse, case_id, source_id
         )
         await store.upsert_source_field_stats(
             case_id=case_id,
             source_id=source_id,
-            stats_version=STATS_VERSION,
+            stats_version=EFFECTIVE_STATS_VERSION,
             events_total=total,
             payload=payload,
         )
         stats[source_id] = (total, payload)
+
+    misses = [source_id for source_id in source_ids if source_id not in stats]
+    if misses:
+        await asyncio.gather(*(_fill_miss(source_id) for source_id in misses))
     return stats
 
 
