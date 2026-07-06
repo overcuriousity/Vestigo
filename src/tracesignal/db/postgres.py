@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -91,7 +92,7 @@ class Source(Base):
     description: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    size_bytes: Mapped[int] = mapped_column(default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     parser: Mapped[str | None] = mapped_column(String(64), nullable=True)
     parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event_count: Mapped[int] = mapped_column(default=0)
@@ -941,6 +942,21 @@ class PostgresStore:
                         "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
                     )
                 )
+            if conn.dialect.name == "postgresql":
+                size_bytes_type = await conn.run_sync(
+                    lambda sync_conn: next(
+                        col["type"]
+                        for col in inspect(sync_conn).get_columns("sources")
+                        if col["name"] == "size_bytes"
+                    )
+                )
+                if str(size_bytes_type) == "INTEGER":
+                    # Files bigger than 2 GiB (int4 max) overflowed this column
+                    # on insert. Existing databases created before this fix
+                    # need the column widened to int8 in place.
+                    await conn.execute(
+                        text("ALTER TABLE sources ALTER COLUMN size_bytes TYPE BIGINT")
+                    )
             # (The former enricher_config_hash ADD COLUMN for the staging
             # table is gone: the M16 drop-and-recreate above guarantees the
             # current shape.)
