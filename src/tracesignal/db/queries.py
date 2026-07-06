@@ -336,28 +336,37 @@ class _ParameterizedQueryBuilder:
         self.conditions.append(sql_fragment.replace(":name", f"{{{name}:String}}"))
         self.parameters[name] = value
 
-    def add_in_list(self, column: str, values: list[str]) -> None:
+    def add_in_list(self, column: str, values: list[str], *, cast_to_string: bool = False) -> None:
         """Add a membership condition for a list of string values.
 
-        Uses ``has({arr:Array(String)}, toString(column))`` rather than
-        ``column IN ({p0}, {p1}, ...)`` because ClickHouse 24.x requires the
-        second argument of ``IN`` to be a constant or table expression — a list
-        of individual parameterized strings does not qualify.
+        Default form is ``column IN {arr:Array(String)}`` — a typed IN keeps
+        ClickHouse able to use the primary index and partition pruning on
+        String columns (``source_id``, ``artifact``), which
+        ``has(..., toString(column))`` defeats.
 
-        The column is wrapped in ``toString()`` because this is also used for
-        ``event_id``, a native ``UUID`` column — ``has()`` requires a common
-        type between the array and the column, and there is no implicit
-        common type between ``Array(String)`` and ``UUID`` (this fails with
-        ClickHouse error 386 NO_COMMON_TYPE), even when the array is empty.
+        ``cast_to_string=True`` emits ``has({arr:Array(String)},
+        toString(column))`` instead — required for ``event_id``, a native
+        ``UUID`` column: comparing it against ``Array(String)`` has no
+        implicit common type (ClickHouse error 386 NO_COMMON_TYPE), even
+        when the array is empty. Neither form prunes on ``event_id`` anyway
+        (not in the primary key), so nothing is lost there.
         """
         name = self._param_name()
-        self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
+        if cast_to_string:
+            self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
+        else:
+            self.conditions.append(f"{column} IN {{{name}:Array(String)}}")
         self.parameters[name] = values
 
-    def add_not_in_list(self, column: str, values: list[str]) -> None:
+    def add_not_in_list(
+        self, column: str, values: list[str], *, cast_to_string: bool = False
+    ) -> None:
         """Add a negated membership condition — the inverse of :py:meth:`add_in_list`."""
         name = self._param_name()
-        self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
+        if cast_to_string:
+            self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
+        else:
+            self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
         self.parameters[name] = values
 
     def add_tag_filter(self, filt: TagFilter, negate: bool) -> None:
@@ -616,10 +625,10 @@ class EventQueryService:
             )
 
         if query.event_ids is not None:
-            builder.add_in_list("event_id", query.event_ids)
+            builder.add_in_list("event_id", query.event_ids, cast_to_string=True)
 
         if query.exclude_event_ids:
-            builder.add_not_in_list("event_id", query.exclude_event_ids)
+            builder.add_not_in_list("event_id", query.exclude_event_ids, cast_to_string=True)
 
         if query.tags_include is not None:
             builder.add_tag_filter(query.tags_include, negate=False)

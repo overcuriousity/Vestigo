@@ -101,15 +101,26 @@ def test_basic_query_parameterizes_case_id(service: EventQueryService) -> None:
 
 
 def test_source_ids_filter_is_parameterized(service: EventQueryService) -> None:
-    """Multiple source_ids use has(Array(String), toString(col)) — not IN(...) —
-    because ClickHouse 24.x requires the second IN argument to be a constant
-    or table expression, and source_id/event_id may be non-String columns
-    (event_id is UUID), so the column is cast via toString() for a common type.
+    """Multiple source_ids use a typed `IN {p:Array(String)}` — source_id is a
+    String column, and the bare-column IN form keeps ClickHouse able to use
+    the primary index and partition pruning, which wrapping the column in
+    toString() defeats (M22a). Only the UUID event_id column needs the
+    has(..., toString(col)) cast form.
     """
     service.query(EventQuery(case_id="case-1", source_ids=["s1", "s2"]))
     query, params = _last_query(service)
-    assert "has({p1:Array(String)}, toString(source_id))" in query
+    assert "source_id IN {p1:Array(String)}" in query
+    assert "toString(source_id)" not in query
     assert params.get("p1") == ["s1", "s2"]
+
+
+def test_empty_source_ids_filter_matches_nothing(service: EventQueryService) -> None:
+    """An explicit empty source_ids list must produce a valid always-false
+    predicate (`source_id IN []`), not stale syntax or a dropped filter."""
+    service.query(EventQuery(case_id="case-1", source_ids=[]))
+    query, params = _last_query(service)
+    assert "source_id IN {p1:Array(String)}" in query
+    assert params.get("p1") == []
 
 
 def test_single_source_id_filter_is_parameterized(service: EventQueryService) -> None:
@@ -174,8 +185,8 @@ def test_artifact_and_artifacts_together_merge_not_and(
     (U3). They must merge into one effective filter instead."""
     service.query(EventQuery(case_id="case-1", artifact="a", artifacts=["b"]))
     query, params = _last_query(service)
-    assert query.count("artifact = ") + query.count("toString(artifact)") == 1
-    assert "has({p1:Array(String)}, toString(artifact))" in query
+    assert query.count("artifact = ") + query.count("artifact IN ") == 1
+    assert "artifact IN {p1:Array(String)}" in query
     assert sorted(params["p1"]) == ["a", "b"]
 
 
@@ -388,7 +399,7 @@ def test_combined_query_builds_single_where_clause(
     )
     count_query, count_params = _find_query(service, "SELECT count()")
     assert "case_id = {p0:String}" in count_query
-    assert "has({p1:Array(String)}, toString(source_id))" in count_query
+    assert "source_id IN {p1:Array(String)}" in count_query
     assert "message ILIKE {p2:String}" in count_query
     assert "artifact = {p3:String}" in count_query
     assert "attributes[{p4:String}] = {p5:String}" in count_query
