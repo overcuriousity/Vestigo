@@ -80,6 +80,53 @@ resolved — this file holds only the condensed, still-open action items.
   keys but not histogram/anomaly-view keys — bulk anomaly-tagging by a teammate leaves those
   panels stale. Read the views' actual query-key names before extending the prefix list.
 
+## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
+
+Detectors adapted from [ait-aecid/logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner),
+constrained to be **field-agnostic**: they operate on value identity, syntax, and statistics —
+never on what a field value *means*. All follow the existing baseline/detect-window pattern in
+`db/anomaly_stats.py` (self-baseline + temporal `baseline_end` modes) and must stay
+SQL-explainable per the forensic-reproducibility requirement. Update `docs/ANOMALY_DETECTION.md`
+in the same commit as each detector.
+
+High value first:
+
+- [ ] **D1 — Value-combo novelty** (AMiner `NewMatchPathValueComboDetector`): extend
+  `value_novelty` from single fields to field *tuples* (e.g. any two selected fields) — flag
+  combinations first seen in the detect window. ClickHouse `GROUP BY tuple(...)`; exact-match,
+  fully explainable.
+- [ ] **D2 — Timestamp-order violations** (AMiner `TimestampsUnsortedDetector`): flag
+  out-of-order timestamps within a source relative to ingest/record order. Log-tampering and
+  clock-manipulation indicator; near-free via window functions over `(source_id, record order)`.
+- [ ] **D3 — Charset novelty** (AMiner `CharsetDetector`): per field, learn the baseline
+  character set of values; flag values in the detect window containing never-seen characters
+  (null bytes, unicode homoglyphs, injection metacharacters — detected syntactically, not by
+  meaning).
+- [ ] **D4 — Numeric range violations** (AMiner `ValueRangeDetector`): for fields whose values
+  parse as numeric (syntactic type detection only), learn baseline min/max or quantile band;
+  flag detect-window values outside it. Trivial SQL, trivially explainable.
+- [ ] **D5 — Value entropy outliers** (AMiner `EntropyDetector`): per field, Shannon
+  character-entropy of each value vs. the field's baseline entropy distribution; flags
+  random-looking strings (DGA domains, encoded payloads) without interpreting them.
+- [ ] **D6 — Per-value silence** (AMiner `MissingMatchPathValueDetector`): a value that
+  appeared regularly in the baseline stops appearing in the detect window (agent killed,
+  log source suppressed). Complements the existing `frequency` detector's global silences.
+- [ ] **D7 — Interval-periodicity violations** (AMiner `PathValueTimeIntervalDetector`): learn
+  the inter-arrival interval distribution per field value in the baseline; flag deviation
+  (missed/shifted periodic events) and, inversely, newly *regular* intervals (beaconing).
+- [ ] **D8 — Event-sequence novelty** (AMiner `EventSequenceDetector`): n-grams of artifact
+  types (or values of one user-chosen grouping field) ordered by time; flag n-grams absent
+  from the baseline. `groupArray` + window functions.
+- [ ] **D9 — Value-distribution drift** (AMiner `VariableTypeDetector`, simplified): per
+  field, compare baseline vs. detect-window value distributions with ClickHouse's built-in
+  `kolmogorovSmirnovTest()` (numeric) or frequency-vector comparison (categorical).
+- [ ] **D10 — Event correlation rules** (AMiner `EventCorrelationDetector`): mine baseline
+  implication rules "value A is followed by value B within Δt", flag violations in the detect
+  window. Highest analytical payoff, heaviest lift (rule mining + hypothesis testing) — last.
+
+Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — z-score `frequency` detector
+covers most of it and stays explainable).
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
