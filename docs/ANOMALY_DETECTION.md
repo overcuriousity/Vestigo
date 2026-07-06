@@ -9,19 +9,20 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are four independent analysis tools in TraceSignal:
+There are five independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
 3. [Timestamp order](#3-timestamp-order-out-of-order-records) — timestamps running backwards in record order (ClickHouse, no ML)
-4. [Semantic similarity search](#4-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+4. [Numeric range](#4-numeric-range-out-of-band-values) — numeric values outside a learned band (ClickHouse, no ML)
+5. [Semantic similarity search](#5-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first three are **statistical detectors**: pure counting and arithmetic over
+The first four are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The fourth needs an explicit embedding step first.
+instant ingestion finishes. The fifth needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–3),
-`src/tracesignal/db/similarity.py` (detector 4). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–4),
+`src/tracesignal/db/similarity.py` (detector 5). UI: `frontend/src/components/analysis/`.
 
 ---
 
@@ -363,7 +364,77 @@ The **score** is the skew in seconds — larger backwards jumps rank first.
 
 ---
 
-## 4. Semantic similarity search
+## 4. Numeric range (out-of-band values)
+
+**What it answers:** "For fields that hold numbers, is any value far outside the
+range the field normally takes?" A `response_bytes` of 5 GB when the field
+normally sits in the kilobytes, a negative `duration`, a port number where one
+never appeared before.
+
+Adapted from AMiner's `ValueRangeDetector`.
+
+**Why it's useful:** Numeric fields have a natural notion of "too big" / "too
+small" that categorical novelty can't express — 9,999 is not "a rare value" the
+way a new username is, it's *out of range*. Data exfiltration (huge byte
+counts), malformed records (negative or absurd values), and scanning (ports
+outside the usual set) all show up here.
+
+**Field selection is syntactic, never semantic.** A field qualifies if at least
+90% of its non-empty values parse as numbers (`toFloat64OrNull`). The detector
+never interprets what the number *means* — a field of HTTP status codes
+qualifies exactly like a field of byte counts. That's a strength (works on any
+log) and a caveat (see below).
+
+### Two modes
+
+| | Self-baseline (`iqr`) | Temporal (`temporal-range`) |
+|---|---|---|
+| Baseline | the whole corpus | values before `baseline_end` |
+| Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | exact `[min, max]` of the baseline |
+| Flags | statistical outliers | anything outside the historical range |
+
+**Why self-baseline needs the IQR fence.** An exact min/max over the whole
+corpus flags nothing by construction — every value is within [min, max] because
+min and max *are* corpus values. So self-baseline mode instead uses the Tukey
+fence: the interquartile range (IQR = q3 − q1, the spread of the middle 50% of
+values) extended 1.5× past each quartile. This is the standard boxplot-outlier
+rule, and it's fully explainable ("the middle 50% of `bytes` sat between 100 and
+300; this value of 9,000 is far past the q3 + 1.5·IQR fence of 426").
+
+**Why temporal uses exact min/max.** With a real baseline/detect split, the
+AMiner-faithful behaviour is exactly right: learn the range the field took
+*before* the incident window, flag anything outside it *after*. "The largest
+`bytes` value in the 300-event baseline was 500; this detect-window value is
+9,999."
+
+### The score
+
+```
+score = distance outside the band ÷ band width
+```
+
+A value one band-width past the edge scores 1.0; ten band-widths past scores
+10.0. It normalises severity across fields with very different scales, so a
+`bytes` outlier and a `duration` outlier rank comparably. Findings group by
+distinct violating value.
+
+### Caveats
+
+- **Numeric-looking identifiers.** Ports, status codes, PIDs, and error codes
+  all parse as numbers but have no meaningful "range" — an IQR fence over status
+  codes is nonsense (404 is not an outlier of 200). For these, prefer **temporal
+  mode** (did a code appear that was never seen in the baseline?) or just don't
+  select them. The picker shows each field's numeric parse ratio to help you
+  judge.
+- **Baseline size floor.** A field with fewer than 20 numeric baseline samples
+  is skipped — quartiles and min/max over a handful of points are too noisy to
+  trust. If every scanned field is skipped, the status is `insufficient_data`.
+- Rare ≠ malicious, as everywhere: a legitimate large file transfer and an
+  exfiltration both produce a large `bytes` value.
+
+---
+
+## 5. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

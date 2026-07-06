@@ -1,8 +1,14 @@
 import { get, post } from "./client";
-import type { AnomaliesResponse, Annotation, NoveltyFieldsResponse, TagAnomaliesResponse } from "./types";
+import type {
+  AnomaliesResponse,
+  Annotation,
+  NoveltyFieldsResponse,
+  NumericFieldsResponse,
+  TagAnomaliesResponse,
+} from "./types";
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series by */
@@ -44,6 +50,12 @@ export const anomaliesApi = {
       `/cases/${caseId}/timelines/${timelineId}/anomalies/fields`,
     ),
 
+  /** Return numeric-parseable candidate fields for the numeric-range detector. */
+  numericFields: (caseId: string, timelineId: string) =>
+    get<NumericFieldsResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/anomalies/numeric-fields`,
+    ),
+
   /**
    * Persist a single live (not-yet-tagged) finding as a system annotation,
    * without re-running the detector or touching any other tagged finding —
@@ -54,7 +66,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range";
       content: string;
       details: Record<string, unknown>;
     },

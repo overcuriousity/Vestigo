@@ -44,6 +44,17 @@ already-ingested data.
     surprise score as ``value_novelty``; auto mode picks a single tuple from
     the two highest-coverage recommended fields (no pair enumeration).
 
+**numeric_range** (``detector="numeric_range"``)
+    For fields whose values parse as numbers (syntactic type detection via
+    ``toFloat64OrNull`` — never by field meaning), learn a baseline band and
+    flag detect-window values outside it. AMiner ``ValueRangeDetector``. Two
+    modes: *self-baseline* (``method="iqr"``) uses a Tukey fence
+    ``[q1 − 1.5·IQR, q3 + 1.5·IQR]`` over the whole corpus — an exact min/max
+    over the corpus flags nothing by construction; *temporal*
+    (``method="temporal-range"``) learns exact min/max from the baseline
+    window and flags detect-window values outside it. Findings group by
+    distinct violating value; score = distance outside the band ÷ band width.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -101,6 +112,14 @@ _RECOMMENDER_MAX_ATTR_KEYS = 50
 # sorts by (recommended, -coverage).
 _MAX_AUTO_SCAN_FIELDS = 15
 
+# Minimum baseline numeric samples before the range detector trusts a field's
+# learned band — below this, the min/max or quartiles are too noisy to score.
+_MIN_RANGE_BASELINE = 20
+
+# Fraction of a field's non-empty values that must parse as numbers for it to
+# be offered as a range-detector candidate (syntactic type detection only).
+_MIN_NUMERIC_RATIO = 0.9
+
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
 
@@ -154,6 +173,36 @@ class FreqFinding:
 
 
 @dataclass
+class RangeFinding:
+    """One out-of-range numeric value from the numeric-range detector."""
+
+    field: str
+    value: float
+    count: int
+    # excess distance beyond the band, normalized by band width.
+    score: float
+    direction: str  # "below" | "above"
+    lower: float
+    upper: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
+class NumericFieldInfo:
+    """A numeric-parseable field candidate for the range detector."""
+
+    token: str
+    distinct: int
+    coverage: float
+    # fraction of non-empty values that parse as a number (0–1).
+    numeric_ratio: float
+    recommended: bool
+
+
+@dataclass
 class ComboFinding:
     """One rare/novel field *combination* from the value-combo detector."""
 
@@ -193,10 +242,13 @@ class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
     status: str  # "ok" | "no_data" | "insufficient_data"
-    detector: str  # "value_novelty" | "value_combo" | "frequency" | "timestamp_order"
-    method: str  # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
+    # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
+    detector: str
+    # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
+    #  | "iqr" | "temporal-range"
+    method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
-    results: list[ValueFinding | FreqFinding | OrderFinding | ComboFinding] = field(
+    results: list[ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding] = field(
         default_factory=list
     )
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
@@ -1049,6 +1101,298 @@ class StatisticalAnomalyService:
             detector="value_combo",
             method=method,
             baseline_size=baseline_size,
+            results=all_findings[:limit],
+        )
+
+    # ------------------------------------------------------------------
+    # Numeric range violations
+    # ------------------------------------------------------------------
+
+    def recommend_numeric_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        total: int | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        min_ratio: float = _MIN_NUMERIC_RATIO,
+    ) -> list[NumericFieldInfo]:
+        """Return fields whose values parse as numbers, for the range detector.
+
+        Candidates come from the field inventory (top-level columns + attribute
+        keys, or a supplied *inventory* — the per-source stats cache); the ones
+        with non-trivial coverage and cardinality are probed with a single
+        batched query computing, per field, the fraction of non-empty values
+        that ``toFloat64OrNull`` parses. Fields at or above *min_ratio* are
+        marked recommended. Type detection is purely syntactic — a field of
+        HTTP status codes qualifies, but so would any numeric-looking id, which
+        is why the UI leans on temporal mode for those.
+        """
+        if inventory is None:
+            inventory, total = self.field_inventory(case_id, source_ids, total, field_mappings)
+        elif total is None:
+            raise ValueError("total is required when inventory is supplied")
+        if not total:
+            return []
+
+        # Keep fields with ≥5% coverage and more than one distinct value, cap 15.
+        candidates = [
+            (tok, dist, cov)
+            for tok, dist, cov in inventory
+            if cov / total >= 0.05 and dist > 1
+        ][:_MAX_AUTO_SCAN_FIELDS]
+        if not candidates:
+            return []
+
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        parts = []
+        exprs = []
+        for i, (tok, _, _) in enumerate(candidates):
+            expr = _col_expr(tok, params, field_mappings, prefix=f"nf{i}")
+            exprs.append(expr)
+            parts.append(
+                f"countIf(toFloat64OrNull({expr}) IS NOT NULL) AS num{i}, "
+                f"countIf({expr} != '') AS ne{i}"
+            )
+        probe_sql = (
+            f"SELECT {', '.join(parts)}"
+            f" FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+        )
+        row = self.ch.client.query(probe_sql, parameters=params).result_rows
+        out: list[NumericFieldInfo] = []
+        if row:
+            r = row[0]
+            for i, (tok, dist, cov) in enumerate(candidates):
+                num = int(r[i * 2])
+                ne = int(r[i * 2 + 1])
+                ratio = num / ne if ne else 0.0
+                out.append(
+                    NumericFieldInfo(
+                        token=tok,
+                        distinct=dist,
+                        coverage=round(cov / total, 4),
+                        numeric_ratio=round(ratio, 4),
+                        recommended=ratio >= min_ratio,
+                    )
+                )
+        out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage))
+        return out
+
+    def find_range_violations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        per_field_limit: int = 25,
+        baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+    ) -> StatAnomalyResult:
+        """Return numeric values falling outside a field's learned range.
+
+        For each numeric field, learn a baseline band and flag values outside
+        it. *self-baseline* (``method="iqr"``) uses the Tukey fence
+        ``[q1 − 1.5·IQR, q3 + 1.5·IQR]`` over the whole corpus; *temporal*
+        (``method="temporal-range"``) learns exact min/max from the baseline
+        window (``timestamp < baseline_end``) and flags detect-window values
+        outside it.
+
+        When *fields* is ``None`` the numeric-field recommender selects
+        candidates automatically. A field with fewer than ``_MIN_RANGE_BASELINE``
+        numeric baseline samples is skipped; when every scanned field is skipped
+        the status is ``insufficient_data``.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "iqr" if baseline_end is None else "temporal-range"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="numeric_range",
+                method=method,
+                baseline_size=0,
+            )
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            rec = self.recommend_numeric_fields(
+                case_id, source_ids, total=total_events, field_mappings=field_mappings
+            )
+            scan_fields = [f.token for f in rec if f.recommended][:_MAX_AUTO_SCAN_FIELDS]
+
+        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
+        all_findings: list[RangeFinding] = []
+        evaluated_fields = 0
+
+        for field_token in scan_fields:
+            # --- Learn the band from the baseline. ---
+            stat_params: dict[str, Any] = {**base_params}
+            col = _col_expr(field_token, stat_params, field_mappings)
+            num_src = (
+                f"SELECT toFloat64OrNull({col}) AS num, timestamp"
+                f" FROM {db}.events"
+                f" WHERE case_id = {{cid:String}}"
+                f" AND has({{src:Array(String)}}, source_id)"
+                f" AND {col} != ''"
+            )
+            if baseline_end is None:
+                stat_sql = (
+                    f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL"
+                )
+            else:
+                stat_params["bl"] = bl_str
+                stat_sql = (
+                    f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL AND timestamp < {{bl:String}}"
+                )
+            srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
+            if not srows or srows[0][2] is None:
+                continue
+            a, b, n = srows[0]
+            if int(n) < _MIN_RANGE_BASELINE or a is None or b is None:
+                continue
+
+            if baseline_end is None:
+                q1, q3 = float(a), float(b)
+                iqr = q3 - q1
+                lower = q1 - 1.5 * iqr
+                upper = q3 + 1.5 * iqr
+                band_extra: dict[str, Any] = {"q1": round(q1, 4), "q3": round(q3, 4),
+                                              "iqr": round(iqr, 4)}
+            else:
+                lower, upper = float(a), float(b)
+                band_extra = {"baseline_min": round(lower, 4), "baseline_max": round(upper, 4)}
+
+            # A degenerate (zero-width) band would divide the score by zero and
+            # flag every off-band value with infinite severity — floor the width.
+            width = max(upper - lower, 1e-9)
+            evaluated_fields += 1
+
+            # --- Flag values outside the band. ---
+            viol_params: dict[str, Any] = {**base_params}
+            vcol = _col_expr(field_token, viol_params, field_mappings)
+            viol_params["lo"] = lower
+            viol_params["hi"] = upper
+            viol_params["plim"] = per_field_limit
+            detect_clause = ""
+            if baseline_end is not None:
+                viol_params["bl"] = bl_str
+                detect_clause = " AND timestamp >= {bl:String}"
+            viol_sql = f"""
+                SELECT
+                    num AS val,
+                    count() AS cnt,
+                    min(timestamp) AS first_seen,
+                    toString(argMin(event_id, timestamp)) AS evt_id,
+                    argMin(source_id, timestamp) AS src_id,
+                    argMin(message, timestamp) AS msg
+                FROM (
+                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id, source_id, message
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {vcol} != ''
+                )
+                WHERE num IS NOT NULL AND (num < {{lo:Float64}} OR num > {{hi:Float64}}){detect_clause}
+                GROUP BY val
+                ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
+                LIMIT {{plim:UInt32}}
+            """
+            vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+
+            for vrow in vrows:
+                val, cnt, first_seen, evt_id, src_id, msg = vrow
+                if val is None:
+                    continue
+                val_f = float(val)
+                direction = "below" if val_f < lower else "above"
+                excess = (lower - val_f) if val_f < lower else (val_f - upper)
+                score = round(excess / width, 4)
+                first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
+                evt_id_str = str(evt_id) if evt_id else None
+                mini_event: dict[str, Any] | None = None
+                if evt_id:
+                    mini_event = {
+                        "event_id": evt_id_str,
+                        "case_id": case_id,
+                        "source_id": str(src_id) if src_id else "",
+                        "message": str(msg) if msg else "",
+                        "timestamp": first_seen_str,
+                        "timestamp_desc": None,
+                        "artifact": None,
+                        "artifact_long": None,
+                        "display_name": None,
+                        "tags": [],
+                        "attributes": {},
+                        "content_hash": "",
+                        "file_hash": "",
+                        "parser_name": "",
+                        "parser_version": "",
+                        "source_file": "",
+                        "byte_offset": None,
+                        "line_number": None,
+                        "embedding_model": None,
+                        "embedding_config_hash": None,
+                        "ingest_time": None,
+                    }
+
+                details: dict[str, Any] = {
+                    "detector": "numeric_range",
+                    "method": method,
+                    "field": field_token,
+                    "value": val_f,
+                    "count": int(cnt),
+                    "lower": round(lower, 4),
+                    "upper": round(upper, 4),
+                    "direction": direction,
+                    "excess": round(excess, 4),
+                    "baseline_n": int(n),
+                    **band_extra,
+                }
+                all_findings.append(
+                    RangeFinding(
+                        field=field_token,
+                        value=val_f,
+                        count=int(cnt),
+                        score=score,
+                        direction=direction,
+                        lower=round(lower, 4),
+                        upper=round(upper, 4),
+                        first_seen=first_seen_str,
+                        event_id=evt_id_str,
+                        event=mini_event,
+                        details=details,
+                    )
+                )
+
+        if evaluated_fields == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="numeric_range",
+                method=method,
+                baseline_size=total_events,
+            )
+
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        all_findings.sort(key=lambda f: f.score, reverse=True)
+        return StatAnomalyResult(
+            status="ok",
+            detector="numeric_range",
+            method=method,
+            baseline_size=total_events,
             results=all_findings[:limit],
         )
 

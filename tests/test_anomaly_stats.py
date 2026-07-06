@@ -1473,3 +1473,119 @@ def test_value_combo_excludes_normal_marked_events():
         "c1", ["s1"], fields=["attr:x", "attr:y"], exclude_event_ids={"evt-drop"}
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
+
+
+# ---------------------------------------------------------------------------
+# find_range_violations — numeric-range detector (D4)
+# ---------------------------------------------------------------------------
+
+
+def test_range_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes"])
+    assert result.status == "no_data"
+    assert result.detector == "numeric_range"
+
+
+def test_range_insufficient_when_baseline_too_small():
+    """A field with < _MIN_RANGE_BASELINE numeric samples is skipped."""
+    responses = [
+        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+        # stats: only 5 numeric samples → below the floor
+        FakeQueryResult(result_rows=[(10.0, 20.0, 5)], column_names=["q1", "q3", "n"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes"])
+    assert result.status == "insufficient_data"
+
+
+def test_range_self_baseline_iqr_flags_outliers():
+    """Self-baseline uses a Tukey fence; values outside [q1-1.5IQR, q3+1.5IQR] flag."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    # q1=100, q3=200 → IQR=100 → band [-50, 350]. Value 9000 is far above.
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
+        FakeQueryResult(
+            result_rows=[(9000.0, 2, fs, "evt-hi", "s1", "huge")],
+            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes"])
+    assert result.status == "ok"
+    assert result.method == "iqr"
+    f = result.results[0]
+    assert f.value == 9000.0
+    assert f.direction == "above"
+    assert f.lower == -50.0
+    assert f.upper == 350.0
+    # excess = 9000 - 350 = 8650; width = 400 → score = 21.625
+    assert f.score == round(8650.0 / 400.0, 4)
+    assert f.details["q1"] == 100.0
+    assert f.details["baseline_n"] == 500
+
+
+def test_range_temporal_uses_baseline_minmax():
+    """Temporal mode learns exact min/max from the baseline window."""
+    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        # baseline min=10, max=500, n=300
+        FakeQueryResult(result_rows=[(10.0, 500.0, 300)], column_names=["lo", "hi", "n"]),
+        FakeQueryResult(
+            result_rows=[(9999.0, 1, fs, "evt-x", "s1", "spike")],
+            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes"], baseline_end=bl)
+    assert result.method == "temporal-range"
+    f = result.results[0]
+    assert f.lower == 10.0
+    assert f.upper == 500.0
+    assert f.direction == "above"
+    assert f.details["baseline_min"] == 10.0
+    assert f.details["baseline_max"] == 500.0
+
+
+def test_range_excludes_normal_marked_events():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
+        FakeQueryResult(
+            result_rows=[
+                (9000.0, 1, fs, "evt-drop", "s1", "m"),
+                (8000.0, 1, fs, "evt-keep", "s1", "m"),
+            ],
+            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_range_violations(
+        "c1", ["s1"], fields=["attr:bytes"], exclude_event_ids={"evt-drop"}
+    )
+    assert [f.event_id for f in result.results] == ["evt-keep"]
+
+
+def test_recommend_numeric_fields_filters_by_ratio():
+    """Only fields whose values mostly parse as numbers are recommended."""
+    # inventory: (token, distinct, non_empty_count); total passed explicitly.
+    inventory = [("attr:bytes", 50, 100), ("attr:user", 40, 100)]
+    responses = [
+        # probe: bytes 98/100 numeric, user 3/100 numeric
+        FakeQueryResult(
+            result_rows=[(98, 100, 3, 100)],
+            column_names=["num0", "ne0", "num1", "ne1"],
+        ),
+    ]
+    svc = _svc(responses)
+    fields = svc.recommend_numeric_fields(
+        "c1", ["s1"], total=100, inventory=inventory
+    )
+    by_token = {f.token: f for f in fields}
+    assert by_token["attr:bytes"].recommended is True
+    assert by_token["attr:bytes"].numeric_ratio == 0.98
+    assert by_token["attr:user"].recommended is False

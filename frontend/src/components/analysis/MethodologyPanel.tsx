@@ -16,6 +16,7 @@ import {
   Cpu,
   Activity,
   Rewind,
+  Ruler,
   ShieldCheck,
   BarChart2,
 } from "lucide-react";
@@ -185,6 +186,33 @@ export function MethodologyPanel({
             <Row label="Backend">
               ClickHouse window function over (source_id, byte_offset). NULL
               timestamps are excluded.
+            </Row>
+          </div>
+        </div>
+
+        {/* Numeric range */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Ruler size={11} /> Numeric range (numeric_range)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Self-baseline uses a Tukey IQR fence [q1−1.5·IQR, q3+1.5·IQR] over
+              the whole corpus; temporal learns the exact min/max of the
+              baseline window. Fields are selected by parsing values as numbers
+              (toFloat64OrNull ≥ 90% parse rate) — never by field meaning.
+            </Row>
+            <Row label="Signal">
+              Numeric values falling outside the learned band. Findings group by
+              distinct value, ranked by how far outside they fall.
+            </Row>
+            <Row label="Score">
+              Distance outside the band ÷ band width. Carried with the band
+              bounds in <code className="font-mono text-xs">details</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse quantile()/min()/max() over toFloat64OrNull — no ML.
+              Fields with fewer than 20 numeric baseline samples are skipped.
             </Row>
           </div>
         </div>

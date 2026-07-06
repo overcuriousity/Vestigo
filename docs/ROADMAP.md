@@ -82,7 +82,8 @@ each detector.
 Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
 a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
-multi-field queries. **D1 (value-combo) and D2 (timestamp-order) shipped.**
+multi-field queries. **D1 (value-combo), D2 (timestamp-order), and D4 (numeric-range)
+shipped.**
 
 High value first:
 
@@ -90,9 +91,6 @@ High value first:
   character set of values; flag values in the detect window containing never-seen characters
   (null bytes, unicode homoglyphs, injection metacharacters — detected syntactically, not by
   meaning).
-- [ ] **D4 — Numeric range violations** (AMiner `ValueRangeDetector`): for fields whose values
-  parse as numeric (syntactic type detection only), learn baseline min/max or quantile band;
-  flag detect-window values outside it. Trivial SQL, trivially explainable.
 - [ ] **D5 — Value entropy outliers** (AMiner `EntropyDetector`): per field, Shannon
   character-entropy of each value vs. the field's baseline entropy distribution; flags
   random-looking strings (DGA domains, encoded payloads) without interpreting them.

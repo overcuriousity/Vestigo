@@ -1,7 +1,24 @@
 # TraceSignal Implementation Progress
 
 Last updated: 2026-07-06 (session 26 — Milestone 4: detector-expansion prep + D1 value-combo +
-D2 timestamp-order detectors.
+D2 timestamp-order + D4 numeric-range detectors.
+
+D4 (`find_range_violations`, AMiner `ValueRangeDetector`): for fields whose values parse as
+numbers (syntactic `toFloat64OrNull`, never by meaning), learn a baseline band and flag values
+outside it. Self-baseline (`method="iqr"`) uses the Tukey fence `[q1−1.5·IQR, q3+1.5·IQR]` over
+the corpus — exact corpus min/max flags nothing by construction; temporal (`method=
+"temporal-range"`) learns exact baseline-window min/max (AMiner-faithful). Findings group by
+distinct violating value; score = distance outside band ÷ band width (normalizes severity
+across fields of different scales); degenerate zero-width band floored to 1e-9. Fields with <20
+numeric baseline samples skipped; all-skipped → insufficient_data. New `recommend_numeric_fields`
+probes candidate coverage/cardinality then one batched `countIf(toFloat64OrNull(...) IS NOT NULL)`
+query for the ≥90% numeric-ratio filter, exposed via new `GET /anomalies/numeric-fields`
+(cache inventory + live probe, mirroring /anomalies/fields). Verified live: 100 events with
+`resp_bytes` in [100,300] plus outliers 50000/60000 flagged both above the IQR band [-1.5,426.5]
+ranked by excess, recommender detected resp_bytes as 100% numeric. New `NumericRangeView.tsx`
+(band rendered inline as the explainability shot; AnomalyFieldPicker gained a `numeric` mode
+fetching numeric-fields and showing parse ratios). Docs: ANOMALY_DETECTION.md §4 (5 tools now,
+semantic → §5); MethodologyPanel block. Tests: 6 detector-unit + 1 router-dispatch.
 
 D1 (`find_value_combos`, AMiner `NewMatchPathValueComboDetector`): the multi-field extension
 of value_novelty. Groups by two or more field expressions together (`GROUP BY v0, v1, …`) and

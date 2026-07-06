@@ -549,6 +549,7 @@ class _FakeStatAnomalyService:
         self.value_novelty_calls: list[dict] = []
         self.combo_calls: list[dict] = []
         self.order_calls: list[dict] = []
+        self.range_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
@@ -568,6 +569,10 @@ class _FakeStatAnomalyService:
     def find_order_violations(self, **kwargs):
         self.order_calls.append(kwargs)
         return "order-result"
+
+    def find_range_violations(self, **kwargs):
+        self.range_calls.append(kwargs)
+        return "range-result"
 
 
 @pytest.fixture()
@@ -700,6 +705,27 @@ async def test_run_stat_detector_value_combo_rejects_single_field(patched_store,
         )
     assert exc.value.status_code == 422
     assert not fake_svc.combo_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_numeric_range(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="numeric_range",
+        fields="attr:bytes",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "range-result"
+    assert fake_svc.range_calls[0]["fields"] == ["attr:bytes"]
+    assert not fake_svc.value_novelty_calls
 
 
 @pytest.mark.asyncio

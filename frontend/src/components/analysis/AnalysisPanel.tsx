@@ -1,5 +1,15 @@
 import { useState, useEffect } from "react";
-import { X, AlertTriangle, Search, BookOpen, Hash, Activity, Rewind, Layers } from "lucide-react";
+import {
+  X,
+  AlertTriangle,
+  Search,
+  BookOpen,
+  Hash,
+  Activity,
+  Rewind,
+  Layers,
+  Ruler,
+} from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
 import {
@@ -13,6 +23,7 @@ import { ValueNoveltyView } from "./ValueNoveltyView";
 import { ComboNoveltyView } from "./ComboNoveltyView";
 import { FrequencyView } from "./FrequencyView";
 import { OrderViolationsView } from "./OrderViolationsView";
+import { NumericRangeView } from "./NumericRangeView";
 import { SimilarEvents } from "./SimilarEvents";
 import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
@@ -22,7 +33,7 @@ import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
-type AnomalySubTab = "novelty" | "combo" | "frequency" | "order";
+type AnomalySubTab = "novelty" | "combo" | "frequency" | "order" | "range";
 
 /**
  * Detector registry for the anomaly dropdown. Flat sub-tab buttons stopped
@@ -58,6 +69,12 @@ const DETECTORS: {
     icon: Rewind,
     label: "Timestamp order",
     description: "Timestamps running backwards in record order",
+  },
+  {
+    id: "range",
+    icon: Ruler,
+    label: "Numeric range",
+    description: "Numeric values outside a learned band",
   },
 ];
 
@@ -237,6 +254,18 @@ export function AnalysisPanel({
             caseId={caseId}
             timelineId={timelineId}
             onSelectEvent={onSelectEvent}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
+          />
+        )}
+
+        {tab === "anomalies" && anomalySubTab === "range" && (
+          <NumericRangeView
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelectEvent={onSelectEvent}
+            onDrillField={onDrillField}
             onFindingsChange={onAnomalyMarkers}
             onRunIdChange={onAnomalyRunId}
             onJumpToTime={onJumpToTime}

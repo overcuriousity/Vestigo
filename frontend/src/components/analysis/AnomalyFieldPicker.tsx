@@ -24,7 +24,11 @@ import {
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
 import { anomalyFieldLabel as tokenLabel } from "@/lib/format";
-import type { NoveltyFieldInfo } from "@/api/types";
+import type {
+  NoveltyFieldInfo,
+  NoveltyFieldsResponse,
+  NumericFieldsResponse,
+} from "@/api/types";
 
 interface Props {
   caseId: string;
@@ -41,6 +45,12 @@ interface Props {
   maxSelected?: number;
   /** Label for the "reset to backend default" action ("auto" by default). */
   autoLabel?: string;
+  /**
+   * Numeric mode — fetch numeric-parseable candidates (`/anomalies/numeric-fields`)
+   * instead of the cardinality inventory. Chips show each field's numeric parse
+   * ratio; the numeric-range detector uses this.
+   */
+  numeric?: boolean;
 }
 
 const KIND_HINT: Record<string, string> = {
@@ -54,13 +64,23 @@ function FieldChip({
   checked,
   onToggle,
   disabled = false,
+  numericRatio,
 }: {
   info: NoveltyFieldInfo;
   checked: boolean;
   onToggle: () => void;
   disabled?: boolean;
+  /** When set (numeric mode), overrides the classification hint with the parse ratio. */
+  numericRatio?: number;
 }) {
-  const skippedHint = !info.recommended ? KIND_HINT[info.kind] : null;
+  const skippedHint =
+    numericRatio !== undefined
+      ? !info.recommended
+        ? `${Math.round(numericRatio * 100)}% numeric`
+        : null
+      : !info.recommended
+        ? KIND_HINT[info.kind]
+        : null;
 
   const chip = (
     <button
@@ -84,9 +104,11 @@ function FieldChip({
     </button>
   );
 
+  const ratioText =
+    numericRatio !== undefined ? ` · ${Math.round(numericRatio * 100)}% numeric` : "";
   const hint = skippedHint
-    ? `${info.kind} — ${(info.coverage * 100).toFixed(0)}% coverage, ${info.distinct} distinct values`
-    : `${(info.coverage * 100).toFixed(0)}% coverage · ${info.distinct} distinct values`;
+    ? `${skippedHint} — ${(info.coverage * 100).toFixed(0)}% coverage, ${info.distinct} distinct values`
+    : `${(info.coverage * 100).toFixed(0)}% coverage · ${info.distinct} distinct values${ratioText}`;
 
   return <Tooltip content={hint}>{chip}</Tooltip>;
 }
@@ -99,14 +121,43 @@ export function AnomalyFieldPicker({
   minSelected,
   maxSelected,
   autoLabel = "auto",
+  numeric = false,
 }: Props) {
   const { data, isLoading } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "fields"],
-    queryFn: () => anomaliesApi.fields(caseId, timelineId),
+    queryKey: ["anomalies", caseId, timelineId, numeric ? "numeric-fields" : "fields"],
+    queryFn: (): Promise<NoveltyFieldsResponse | NumericFieldsResponse> =>
+      numeric
+        ? anomaliesApi.numericFields(caseId, timelineId)
+        : anomaliesApi.fields(caseId, timelineId),
     staleTime: 5 * 60 * 1000,
   });
 
-  const allFields = useMemo(() => data?.fields ?? [], [data]);
+  // Numeric candidates lack a cardinality `kind`; synthesise one so the chip
+  // list can share a single NoveltyFieldInfo shape, and keep the parse ratio
+  // aside for the chip hint.
+  const numericRatios = useMemo(() => {
+    const m = new Map<string, number>();
+    if (numeric && data) {
+      for (const f of data.fields as { token: string; numeric_ratio?: number }[]) {
+        if (f.numeric_ratio !== undefined) m.set(f.token, f.numeric_ratio);
+      }
+    }
+    return m;
+  }, [numeric, data]);
+
+  const allFields: NoveltyFieldInfo[] = useMemo(() => {
+    if (!data) return [];
+    if (!numeric) return data.fields as NoveltyFieldInfo[];
+    return (data.fields as { token: string; distinct: number; coverage: number; recommended: boolean }[]).map(
+      (f) => ({
+        token: f.token,
+        distinct: f.distinct,
+        coverage: f.coverage,
+        kind: f.recommended ? "categorical" : "identifier",
+        recommended: f.recommended,
+      }),
+    );
+  }, [data, numeric]);
 
   // Standard fields = top-level columns (no "attr:" prefix).
   // Dynamic fields = attribute keys.
@@ -190,6 +241,7 @@ export function AnomalyFieldPicker({
                         info={f}
                         checked={effectiveSelected.has(f.token)}
                         disabled={atMax && !effectiveSelected.has(f.token)}
+                        numericRatio={numericRatios.get(f.token)}
                         onToggle={() => toggle(f.token)}
                       />
                     ))}
@@ -208,6 +260,7 @@ export function AnomalyFieldPicker({
                         info={f}
                         checked={effectiveSelected.has(f.token)}
                         disabled={atMax && !effectiveSelected.has(f.token)}
+                        numericRatio={numericRatios.get(f.token)}
                         onToggle={() => toggle(f.token)}
                       />
                     ))}

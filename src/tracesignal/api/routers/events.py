@@ -31,6 +31,7 @@ from tracesignal.db.anomaly_stats import (
     FreqFinding,
     NoveltyFieldInfo,
     OrderFinding,
+    RangeFinding,
     StatisticalAnomalyService,
     ValueFinding,
 )
@@ -1276,6 +1277,19 @@ async def _run_stat_detector(
         )
     parsed_fields = _parse_novelty_fields(fields)
 
+    if detector == "numeric_range":
+        return await run_in_threadpool(
+            svc.find_range_violations,
+            case_id=case_id,
+            source_ids=source_ids,
+            fields=parsed_fields,
+            limit=limit,
+            per_field_limit=cfg.stat_per_field_limit,
+            baseline_end=effective_baseline_end,
+            exclude_event_ids=exclude_ids,
+            field_mappings=field_mappings,
+        )
+
     if detector == "value_combo":
         if parsed_fields is not None and len(parsed_fields) < 2:
             raise HTTPException(
@@ -1403,9 +1417,9 @@ async def semantic_search_events(
 
 
 def _serialize_finding(
-    r: ValueFinding | FreqFinding | OrderFinding | ComboFinding,
+    r: ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo finding to a JSON-safe dict."""
+    """Serialise a Value/Freq/Order/Combo/Range finding to a JSON-safe dict."""
     if isinstance(r, ValueFinding):
         return {
             "type": "value_novelty",
@@ -1413,6 +1427,21 @@ def _serialize_finding(
             "value": r.value,
             "count": r.count,
             "score": r.score,
+            "first_seen": r.first_seen,
+            "event_id": r.event_id,
+            "event": r.event,
+            "details": r.details,
+        }
+    if isinstance(r, RangeFinding):
+        return {
+            "type": "numeric_range",
+            "field": r.field,
+            "value": r.value,
+            "count": r.count,
+            "score": r.score,
+            "direction": r.direction,
+            "lower": r.lower,
+            "upper": r.upper,
             "first_seen": r.first_seen,
             "event_id": r.event_id,
             "event": r.event,
@@ -1498,6 +1527,43 @@ async def list_anomaly_fields(
     }
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/anomalies/numeric-fields")
+async def list_numeric_anomaly_fields(
+    case_id: str,
+    timeline_id: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return numeric-parseable candidate fields for the numeric-range detector.
+
+    Same shape as ``/anomalies/fields`` plus ``numeric_ratio`` (fraction of a
+    field's non-empty values that parse as a number). Candidate inventory comes
+    from the per-source stats cache; the numeric probe is a single live query.
+    """
+    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    svc = _get_stat_anomaly_service()
+    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    inventory, total = merged_inventory(stats, field_mappings)
+    if field_mappings and total:
+        inventory = inventory + await run_in_threadpool(
+            svc.canonical_inventory, case_id, source_ids, field_mappings
+        )
+    fields = await run_in_threadpool(
+        svc.recommend_numeric_fields, case_id, source_ids, total, field_mappings, inventory
+    )
+    return {
+        "fields": [
+            {
+                "token": f.token,
+                "distinct": f.distinct,
+                "coverage": f.coverage,
+                "numeric_ratio": f.numeric_ratio,
+                "recommended": f.recommended,
+            }
+            for f in fields
+        ]
+    }
+
+
 def _serialize_stat_result(result: Any) -> dict[str, Any]:
     """Serialize a StatAnomalyResult to the shape shared by list_anomalies/tag_anomalies."""
     return {
@@ -1568,7 +1634,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', or 'timestamp_order'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', or 'numeric_range'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1633,6 +1699,9 @@ async def list_anomalies(
 
     **timestamp_order**: flags events whose timestamp runs backwards relative
     to record order within a source (log-tampering / clock-manipulation).
+
+    **numeric_range**: for numeric-parseable fields, learns a baseline band
+    (IQR fence self-baseline, or min/max temporal) and flags values outside it.
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     result = await _run_stat_detector(
@@ -1674,7 +1743,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', or 'timestamp_order'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', or 'numeric_range'.",
     )
     fields: str | None = Field(
         default=None,
@@ -1791,6 +1860,16 @@ async def tag_anomalies(
                     f"time(s) of {result.baseline_size:,} events in the "
                     f"corpus (surprise {r.score:.2f})"
                 )
+        elif isinstance(r, RangeFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            band_desc = (
+                "baseline min/max" if result.method == "temporal-range" else "IQR fence"
+            )
+            content = (
+                f"Out-of-range value — {r.field}={r.value:g}: {r.direction} the "
+                f"learned band [{r.lower:g}, {r.upper:g}] ({band_desc})"
+            )
         elif isinstance(r, ComboFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
