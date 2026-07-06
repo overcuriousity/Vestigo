@@ -46,19 +46,12 @@ resolved — this file holds only the condensed, still-open action items.
   (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
   feeding an insert thread).
 
-- [ ] **M22 — Explorer query-path follow-ups (post large-source fix).** Session-23 fixes
-  (empty-attribute drop at ingest, memory-safe field inventory, parallel first-page
-  COUNT+fetch, cached `init_schema`) resolved the 5.5 GiB-source unresponsiveness; still
-  open, in impact order: (a) `_ParameterizedQueryBuilder.add_in_list` wraps the column in
-  `toString()`, which defeats primary-index/partition pruning for `source_id` — use a typed
-  `IN {p:Array(String)}` for String columns (keep `has(...)` only for the UUID `event_id`);
-  (b) broad text search is still a full scan per query (~0.4 s/2.8M rows after cleanup) ×
-  histogram+count+page per interaction — consider a `tokenbf_v1`-indexed fast path via
-  `hasTokenCaseInsensitive` when `q` is a plain token; (c) `histogram` runs its min/max
-  range scan and bucket scan serially with the same WHERE; (d) `find_value_novelty`'s
-  auto-field-selection calls `field_inventory` live instead of the per-source field-stats
-  cache (`db/field_stats.py`) — the cache converted the `/anomalies/fields` endpoint but
-  not the detector's internal path.
+- [ ] **M22 residue — tokenbf text-search fast path.** Items (a) typed `IN` for String
+  columns, (c) single-round-trip histogram, and (d) novelty auto-field selection via the
+  field-stats cache landed 2026-07-06 (session 24). Remaining: broad text search is still
+  a full scan per query (~0.4 s/2.8M rows after cleanup) × histogram+count+page per
+  interaction — consider a `tokenbf_v1`-indexed fast path via `hasTokenCaseInsensitive`
+  when `q` is a plain token (needs index DDL on existing tables).
 
 ## Milestone 3 — polish
 
@@ -75,10 +68,6 @@ resolved — this file holds only the condensed, still-open action items.
   backend already computes the level per request. Needs a bulk access-resolution path in
   `list_cases_for_user` first to avoid introducing an N+1 (`docs/archive/PR7_REVIEW_FINDINGS.md`
   cleanup 9).
-- [ ] **M19 — SSE invalidation misses histogram/anomaly panels.** PR #7 follow-up:
-  `frontend/src/hooks/useCaseStream.ts`'s `INVALIDATE_PREFIXES` covers annotation/tag query
-  keys but not histogram/anomaly-view keys — bulk anomaly-tagging by a teammate leaves those
-  panels stale. Read the views' actual query-key names before extending the prefix list.
 
 ## Explicitly out of scope (decided during the audit)
 
