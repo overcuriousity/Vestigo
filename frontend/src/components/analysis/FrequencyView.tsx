@@ -227,6 +227,9 @@ export function FrequencyView({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
+      qc.invalidateQueries({ queryKey: ["tags", caseId] });
+      qc.invalidateQueries({ queryKey: ["tags-merged", caseId] });
+      qc.invalidateQueries({ queryKey: ["anomalies-frequency", caseId] });
     },
   });
 

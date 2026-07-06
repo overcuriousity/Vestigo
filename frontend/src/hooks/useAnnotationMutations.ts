@@ -15,8 +15,9 @@ export function useAnnotationMutations(caseId: string, sourceId: string) {
     // Invalidate by prefix so all timeline- and source-scoped annotation
     // queries for this case are refreshed regardless of how consumers key them.
     qc.invalidateQueries({ queryKey: ["annotations", caseId] });
-    // Marking an event Normal changes which anomaly algorithm is active.
-    qc.invalidateQueries({ queryKey: ["anomalies", caseId] });
+    // Marking an event Normal suppresses it from anomaly results.
+    qc.invalidateQueries({ queryKey: ["anomalies-novelty", caseId] });
+    qc.invalidateQueries({ queryKey: ["anomalies-frequency", caseId] });
     // Refresh tag autocomplete suggestions when a new tag is created.
     qc.invalidateQueries({ queryKey: ["tags", caseId] });
   };

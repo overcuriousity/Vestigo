@@ -4,8 +4,28 @@ import { BASE } from "@/api/client";
 
 /** Query key prefixes that reflect annotation/tag state and should be
  * refetched the moment any team member changes them. Kept in one place so
- * the invalidation logic mirrors ExplorerPage's actual query keys. */
-const INVALIDATE_PREFIXES = ["annotations", "tags", "tags-merged"];
+ * the invalidation logic mirrors the panels' actual query keys. Histogram,
+ * anomaly-view, and viz keys are included because their queries honor tag
+ * filters and render per-event tag state; `anomaly-fields` (cardinality
+ * inventory), `semantic-search`/`similar` (user-input driven), and `events`
+ * (merges annotation state from the `annotations` query) are deliberately
+ * excluded. All these keys carry the caseId at index 1. */
+export const INVALIDATE_PREFIXES = [
+  "annotations",
+  "tags",
+  "tags-merged",
+  "histogram",
+  "anomalies-novelty",
+  "anomalies-frequency",
+  "field-histogram",
+  "field-histogram-total",
+  "field-terms",
+];
+
+/** True when an annotation/tag change in *caseId* makes the query stale. */
+export function shouldInvalidate(queryKey: readonly unknown[], caseId: string): boolean {
+  return INVALIDATE_PREFIXES.includes(queryKey[0] as string) && queryKey[1] === caseId;
+}
 
 /**
  * Subscribes to the case's live-collaboration SSE stream and invalidates the
@@ -33,9 +53,7 @@ export function useCaseStream(caseId: string | undefined) {
         const payload = JSON.parse(event.data) as { type?: string };
         if (payload.type === "annotation.changed") {
           queryClient.invalidateQueries({
-            predicate: (query) =>
-              INVALIDATE_PREFIXES.includes(query.queryKey[0] as string) &&
-              query.queryKey[1] === caseId,
+            predicate: (query) => shouldInvalidate(query.queryKey, caseId),
           });
         }
       } catch {

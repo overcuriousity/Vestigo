@@ -47,7 +47,8 @@ export function BulkActionBar({
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["annotations", caseId] });
-    qc.invalidateQueries({ queryKey: ["anomalies", caseId] });
+    qc.invalidateQueries({ queryKey: ["anomalies-novelty", caseId] });
+    qc.invalidateQueries({ queryKey: ["anomalies-frequency", caseId] });
     qc.invalidateQueries({ queryKey: ["tags", caseId] });
   };
 

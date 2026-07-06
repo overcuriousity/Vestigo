@@ -231,6 +231,9 @@ export function ValueNoveltyView({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
+      qc.invalidateQueries({ queryKey: ["tags", caseId] });
+      qc.invalidateQueries({ queryKey: ["tags-merged", caseId] });
+      qc.invalidateQueries({ queryKey: ["anomalies-novelty", caseId] });
     },
   });
 
