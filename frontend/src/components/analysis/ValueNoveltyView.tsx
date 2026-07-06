@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { eventsApi } from "@/api/events";
+import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -230,10 +231,7 @@ export function ValueNoveltyView({
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["annotations"] });
-      qc.invalidateQueries({ queryKey: ["tags", caseId] });
-      qc.invalidateQueries({ queryKey: ["tags-merged", caseId] });
-      qc.invalidateQueries({ queryKey: ["anomalies-novelty", caseId] });
+      qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
     },
   });
 

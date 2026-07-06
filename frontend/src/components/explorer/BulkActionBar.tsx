@@ -8,6 +8,7 @@ import { Dialog, DialogContent } from "@/components/ui/Dialog";
 import { TagInput } from "@/components/explorer/TagInput";
 import { annotationsApi } from "@/api/annotations";
 import type { Event, EventFilters } from "@/api/types";
+import { shouldInvalidate } from "@/hooks/useCaseStream";
 
 interface Props {
   selectedEvents: Event[];
@@ -46,10 +47,7 @@ export function BulkActionBar({
   } | null>(null);
 
   const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ["annotations", caseId] });
-    qc.invalidateQueries({ queryKey: ["anomalies-novelty", caseId] });
-    qc.invalidateQueries({ queryKey: ["anomalies-frequency", caseId] });
-    qc.invalidateQueries({ queryKey: ["tags", caseId] });
+    qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
   };
 
   /** Execute the actual write — called either directly (ids mode) or after confirm (all mode). */

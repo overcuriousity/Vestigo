@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, FrequencyFinding } from "@/api/types";
@@ -226,10 +227,7 @@ export function FrequencyView({
         limit: 30,
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["annotations"] });
-      qc.invalidateQueries({ queryKey: ["tags", caseId] });
-      qc.invalidateQueries({ queryKey: ["tags-merged", caseId] });
-      qc.invalidateQueries({ queryKey: ["anomalies-frequency", caseId] });
+      qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
     },
   });
 

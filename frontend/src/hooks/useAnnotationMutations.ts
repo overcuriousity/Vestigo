@@ -1,25 +1,21 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { annotationsApi } from "@/api/annotations";
 import type { AnnotationType } from "@/api/types";
+import { shouldInvalidate } from "@/hooks/useCaseStream";
 
 /**
  * Shared hook for creating and deleting annotations on events within a source.
- * Invalidates both the timeline annotations query and the anomalies query on
- * success so all consumers (EventGrid chips, EventDetailPanel, TriageMeter,
- * ValueNoveltyView, FrequencyView) refresh automatically.
+ * Invalidates every annotation/tag-sensitive panel query on success — the
+ * same prefix list `useCaseStream` uses for SSE-driven invalidation, so a
+ * teammate's live update and the analyst's own edit refresh the same set of
+ * panels (EventGrid chips, EventDetailPanel, TriageMeter, ValueNoveltyView,
+ * FrequencyView, histogram, viz modals).
  */
 export function useAnnotationMutations(caseId: string, sourceId: string) {
   const qc = useQueryClient();
 
   const invalidate = () => {
-    // Invalidate by prefix so all timeline- and source-scoped annotation
-    // queries for this case are refreshed regardless of how consumers key them.
-    qc.invalidateQueries({ queryKey: ["annotations", caseId] });
-    // Marking an event Normal suppresses it from anomaly results.
-    qc.invalidateQueries({ queryKey: ["anomalies-novelty", caseId] });
-    qc.invalidateQueries({ queryKey: ["anomalies-frequency", caseId] });
-    // Refresh tag autocomplete suggestions when a new tag is created.
-    qc.invalidateQueries({ queryKey: ["tags", caseId] });
+    qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
   };
 
   const add = useMutation({

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -36,7 +37,7 @@ from tracesignal.db.field_stats import (
     merged_inventory,
     merged_list_fields,
 )
-from tracesignal.db.postgres import Case, User, generate_id
+from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
 from tracesignal.db.similarity import EncoderUnavailableError, SimilarityService
 from tracesignal.models.embeddings import embeddings_available
@@ -1183,6 +1184,29 @@ def _get_stat_anomaly_service() -> StatisticalAnomalyService:
     return _stat_anomaly_service
 
 
+async def _resolve_field_inventory(
+    svc: StatisticalAnomalyService,
+    store: PostgresStore,
+    case_id: str,
+    source_ids: list[str],
+    field_mappings: dict[str, list[str]] | None,
+) -> tuple[list[tuple[str, int, int]], int]:
+    """Candidate field inventory from the per-source stats cache.
+
+    Only the exact canonical-mapping aggregates stay a live query (see
+    ``db/field_stats.py``). Shared by ``_run_stat_detector``'s auto-field
+    novelty path and ``list_anomaly_fields`` so both endpoints agree on which
+    fields are candidates.
+    """
+    stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
+    inventory, total = merged_inventory(stats, field_mappings)
+    if field_mappings and total:
+        inventory = inventory + await run_in_threadpool(
+            svc.canonical_inventory, case_id, source_ids, field_mappings
+        )
+    return inventory, total
+
+
 async def _run_stat_detector(
     case_id: str,
     source_ids: list[str],
@@ -1208,14 +1232,15 @@ async def _run_stat_detector(
     store = get_store()
     svc = _get_stat_anomaly_service()
 
-    effective_baseline_end = baseline_end
-    if temporal and effective_baseline_end is None:
-        effective_baseline_end = await run_in_threadpool(
-            svc.get_timeline_midpoint, case_id, source_ids
-        )
-
-    # Fetch events marked "normal" by the analyst for suppression.
-    normal_ids = await store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
+    # Timeline-midpoint lookup and the normal-annotation fetch are independent
+    # of each other's result — run them concurrently instead of back-to-back.
+    normal_ids_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
+    if temporal and baseline_end is None:
+        midpoint_task = run_in_threadpool(svc.get_timeline_midpoint, case_id, source_ids)
+        effective_baseline_end, normal_ids = await asyncio.gather(midpoint_task, normal_ids_task)
+    else:
+        effective_baseline_end = baseline_end
+        normal_ids = await normal_ids_task
     exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
 
     if detector == "frequency":
@@ -1236,17 +1261,14 @@ async def _run_stat_detector(
     # Auto-field selection (no explicit fields): resolve the candidate
     # inventory from the per-source field-stats cache here — the detector
     # runs sync in a worker thread and can't await the cache itself. This
-    # mirrors list_anomaly_fields and keeps find_value_novelty off the live
-    # map-scanning field_inventory query, which is expensive on wide sources.
+    # keeps find_value_novelty off the live map-scanning field_inventory
+    # query, which is expensive on wide sources.
     inventory: list[tuple[str, int, int]] | None = None
     inventory_total: int | None = None
     if parsed_fields is None:
-        stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
-        inventory, inventory_total = merged_inventory(stats, field_mappings)
-        if field_mappings and inventory_total:
-            inventory = inventory + await run_in_threadpool(
-                svc.canonical_inventory, case_id, source_ids, field_mappings
-            )
+        inventory, inventory_total = await _resolve_field_inventory(
+            svc, store, case_id, source_ids, field_mappings
+        )
 
     return await run_in_threadpool(
         svc.find_value_novelty,
@@ -1389,14 +1411,9 @@ async def list_anomaly_fields(
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
-    # Candidate inventory from the per-source stats cache; only the exact
-    # canonical-mapping aggregates stay a live query (see db/field_stats.py).
-    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
-    inventory, total = merged_inventory(stats, field_mappings)
-    if field_mappings and total:
-        inventory = inventory + await run_in_threadpool(
-            svc.canonical_inventory, case_id, source_ids, field_mappings
-        )
+    inventory, total = await _resolve_field_inventory(
+        svc, get_store(), case_id, source_ids, field_mappings
+    )
     fields: list[NoveltyFieldInfo] = await run_in_threadpool(
         svc.recommend_novelty_fields, case_id, source_ids, total, field_mappings, inventory
     )

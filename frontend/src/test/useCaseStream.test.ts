@@ -14,6 +14,7 @@ const ANNOTATION_SENSITIVE_KEYS: unknown[][] = [
   ["field-histogram", CASE, "t1", {}, 60], // FieldHistogramModal
   ["field-histogram-total", CASE, "t1", {}, 60],
   ["field-terms", CASE, "t1", "attr:user", {}],
+  ["viz-field-terms", CASE, "t1", "attr:user", {}, 10], // VisualizePage
 ];
 
 const UNAFFECTED_KEYS: unknown[][] = [

@@ -1,6 +1,22 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 24 — Phase-2 batch: M22 (a)(c)(d) + M19, four commits.
+Last updated: 2026-07-06 (session 25 — PR #72 review fixes, five items: (1) SSE
+invalidation now covers VisualizePage's `viz-field-terms` query key (was silently missing
+from `INVALIDATE_PREFIXES`, so a teammate's tag edit never refreshed that chart);
+(2) `_run_stat_detector`'s timeline-midpoint lookup and normal-annotation fetch now run
+concurrently via `asyncio.gather` instead of sequentially awaited; (3) the duplicated
+field-stats-cache inventory resolution in `_run_stat_detector` and `list_anomaly_fields`
+is now one shared `_resolve_field_inventory` helper; (4) `find_value_novelty`'s two
+near-identical `recommend_novelty_fields` call sites collapsed to one; (5)
+`docs/ANOMALY_DETECTION.md` updated to describe the cache-backed inventory path added in
+session 24; (6) the four frontend mutation sites (BulkActionBar, useAnnotationMutations,
+FrequencyView, ValueNoveltyView) that hand-rolled their own `invalidateQueries` key lists
+now reuse `useCaseStream`'s `shouldInvalidate` predicate, so SSE-driven and
+mutation-driven invalidation can't drift apart again. `uv run pytest` (489 passed, same
+4 pre-existing environment-dependent failures as session 24), `ruff check` clean, `npm run
+typecheck`/`lint`/`test` clean (173 passed).)
+
+Previous (session 24 — Phase-2 batch: M22 (a)(c)(d) + M19, four commits.
 (a) `_ParameterizedQueryBuilder.add_in_list`/`add_not_in_list` gained a `cast_to_string`
 flag: String columns (`source_id`, `artifact`) now emit `column IN {p:Array(String)}` so
 ClickHouse can use primary-index/partition pruning, which the previous unconditional

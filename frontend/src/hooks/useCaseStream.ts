@@ -20,6 +20,7 @@ export const INVALIDATE_PREFIXES = [
   "field-histogram",
   "field-histogram-total",
   "field-terms",
+  "viz-field-terms",
 ];
 
 /** True when an annotation/tag change in *caseId* makes the query stale. */

@@ -593,18 +593,13 @@ class StatisticalAnomalyService:
             # otherwise re-run the exact same count() query. A supplied cache
             # inventory keeps its own total: coverage counts in it were
             # computed against the cache's event totals, not _count_events.
-            if inventory is not None:
-                rec = self.recommend_novelty_fields(
-                    case_id,
-                    source_ids,
-                    total=inventory_total,
-                    field_mappings=field_mappings,
-                    inventory=inventory,
-                )
-            else:
-                rec = self.recommend_novelty_fields(
-                    case_id, source_ids, total=total_events, field_mappings=field_mappings
-                )
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
             # Each field below is a separate sequential ClickHouse round-trip
             # (no cross-field batching); cap how many an auto-selected set can

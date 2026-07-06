@@ -119,6 +119,16 @@ memory blowup. The scan also ignores empty attribute values entirely (they
 are treated as "field absent", matching the coverage semantics everywhere
 else).
 
+When no explicit fields are given, both the `/anomalies/fields` endpoint and
+the value-novelty detector itself resolve this inventory from the per-source
+field-stats cache (`db/field_stats.py`) instead of running the live `uniq()`
+scan on every request — the cache is computed once per source (at ingest and
+after each enrichment apply) and merged across a timeline's sources at read
+time, `distinct` approximated as max-across-sources. Only the exact
+canonical-mapping aggregates (`field_mappings`) still require a small live
+query, since deduping raw keys mapped to one canonical field isn't derivable
+from per-source counts.
+
 This is a real, useful filter: scanning an `identifier`-classified field like
 a raw message string for "rare values" would flag almost every row (each
 message is close to unique) and bury real signal in noise. Restricting to
