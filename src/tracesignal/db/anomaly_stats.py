@@ -242,12 +242,25 @@ def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
     offset) is ambiguous to JS's `Date` parser, which treats it as local time
     and silently shifts the displayed/compared timestamp by the browser's
     UTC offset.
+
+    `content_hash`/`file_hash`/`embedding_config_hash` are `FixedString(64)`,
+    which clickhouse-connect returns as raw `bytes`, NUL-padded to the fixed
+    width. Left as-is they crash the router's JSON serialization ("Object of
+    type bytes is not JSON serializable") — a 500 that only the frequency
+    detector hits, because it's the one path that serializes a fully-hydrated
+    event dict (value_novelty builds its stub with string literals). Decode
+    and strip the NUL padding here, otherwise an empty `embedding_config_hash`
+    becomes a non-empty string of "\x00" chars — truthy and wrong.
     """
     d: dict[str, Any] = dict(zip(columns, row, strict=False))
     for key in ("timestamp", "ingest_time"):
         v = d.get(key)
         if v is not None and not isinstance(v, str):
             d[key] = ensure_utc_iso(v)
+    for key in ("content_hash", "file_hash", "embedding_config_hash"):
+        v = d.get(key)
+        if isinstance(v, bytes):
+            d[key] = v.decode("utf-8", "replace").rstrip("\x00")
     if "event_id" in d:
         d["event_id"] = str(d["event_id"])
     return d
@@ -977,9 +990,12 @@ class StatisticalAnomalyService:
             return findings
 
         series_values = sorted({f.series_value for f in findings})
-        buckets = sorted(
-            {datetime.fromisoformat(f.window_start).replace(tzinfo=None) for f in findings}
-        )
+        # Keep bucket bounds timezone-aware UTC: clickhouse_connect binds a
+        # *naive* DateTime param in the client process's local timezone, so
+        # stripping tzinfo here made every `IN {buckets}` comparison miss by
+        # the client's UTC offset (representative events silently never
+        # hydrated on any non-UTC host). Events are stored/compared in UTC.
+        buckets = sorted({ensure_utc(datetime.fromisoformat(f.window_start)) for f in findings})
         params: dict[str, Any] = {
             **field_params,
             "cid": case_id,
@@ -996,16 +1012,25 @@ class StatisticalAnomalyService:
         # positional (_row_to_event), so the alias names themselves are
         # otherwise unused.
         agg_cols_sql = ", ".join(f"argMin({c}, timestamp) AS agg_{c}" for c in _EVENT_COLUMNS)
+        # `timestamp` is DateTime64(3), and toStartOfInterval over a DateTime64
+        # returns DateTime64 on ClickHouse builds that preserve the argument's
+        # precision — comparing that against an Array(DateTime) literal then
+        # raises TYPE_MISMATCH (code 53), 500-ing the whole frequency detector
+        # (value_novelty is unaffected — it never runs this hydration query,
+        # which is why only frequency broke). Bucket boundaries are always
+        # whole seconds (interval >= 1s), so wrapping in toDateTime() is
+        # lossless and pins both sides to DateTime regardless of CH version.
+        bucket_expr = "toDateTime(toStartOfInterval(timestamp, INTERVAL {iv:UInt32} second))"
         sql = f"""
             SELECT
-                toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
+                {bucket_expr} AS bucket,
                 {col} AS series_val,
                 {agg_cols_sql}
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
               AND {col} IN {{vals:Array(String)}}
-              AND toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) IN {{buckets:Array(DateTime)}}
+              AND {bucket_expr} IN {{buckets:Array(DateTime)}}
             GROUP BY bucket, series_val
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows

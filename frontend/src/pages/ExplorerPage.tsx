@@ -149,6 +149,19 @@ export function ExplorerPage() {
           // seed must be the last write to `targetKey`, not that one.
           await queryClient.cancelQueries({ queryKey: targetKey });
           if (softAnchorSeqRef.current !== seq) return;
+          // A restrictive filter change (e.g. drilling to a rare artifact from
+          // the analysis panel) can have zero matching events before the old
+          // scroll timestamp. Seeding that empty `before`-page would strand the
+          // grid: it renders nothing, and a before-mode page reports
+          // has_more_after=false with a null next_cursor, so "load more" is
+          // dead too — the analyst is stuck until a jump/histogram click
+          // reseeds. Skip the seed and let the hook fetch its default first
+          // page (top of the filtered result set) instead — invalidate to
+          // re-trigger the fetch we cancelled above.
+          if (anchorPage.events.length === 0) {
+            queryClient.invalidateQueries({ queryKey: targetKey });
+            return;
+          }
           const anchorPageParam: EventsPageParam = { before: cursorParam(anchorPage.prev_cursor) };
           queryClient.setQueryData(targetKey, {
             pages: [anchorPage],
@@ -1095,7 +1108,13 @@ export function ExplorerPage() {
                 selectionMode={selection.mode}
                 caseId={caseId!}
                 timelineId={timelineId!}
-                filters={filters}
+                // effectiveFilters (not raw filters) so "select all matching"
+                // annotates exactly the displayed result set: in semantic mode
+                // it carries the result `ids` (raw filters would fall back to
+                // the broadened keyword `q`), and in anomaly mode the run_id
+                // narrowing — otherwise mode="all" writes to a wider set than
+                // what the grid shows.
+                filters={effectiveFilters}
                 onClear={() => setSelection({ mode: "ids", ids: new Set() })}
                 tagSuggestions={tagSuggestions}
               />
