@@ -129,6 +129,46 @@ def _field_centroid(
     return centroid / norm if norm > 0 else centroid
 
 
+def _batched_centroids[K](
+    groups: dict[K, Sequence[Any]],
+    encode: Callable[[list[str]], list[list[float]]],
+    max_values: int,
+) -> dict[K, np.ndarray | None]:
+    """Compute one L2-normalised centroid per group with a single ``encode()`` call.
+
+    Equivalent to calling :func:`_field_centroid` once per group, but flattens
+    every group's (capped) value sample into one text list first so the whole
+    batch costs one ``encode()`` round trip instead of ``len(groups)`` of them.
+    This is safe to do unconditionally — which groups need centroids is decided
+    entirely from the raw sample values (already known before encoding), never
+    from a prior centroid's value, so no branch is skipped or added by batching.
+    """
+    flat: list[str] = []
+    spans: dict[K, tuple[int, int]] = {}
+    for key, values in groups.items():
+        vals = _clean(values)[:max_values]
+        start = len(flat)
+        flat.extend(vals)
+        spans[key] = (start, len(flat))
+
+    if not flat:
+        return dict.fromkeys(groups)
+
+    vecs = np.asarray(encode(flat), dtype=np.float32)
+    if vecs.ndim != 2 or vecs.shape[0] != len(flat):
+        return dict.fromkeys(groups)
+
+    out: dict[K, np.ndarray | None] = {}
+    for key, (start, end) in spans.items():
+        if end <= start:
+            out[key] = None
+            continue
+        centroid = vecs[start:end].mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        out[key] = centroid / norm if norm > 0 else centroid
+    return out
+
+
 def _group_related_fields(
     samples: dict[str, Sequence[Any]],
     *,
@@ -143,7 +183,7 @@ def _group_related_fields(
     token order for stable output.
     """
     tokens = list(samples.keys())
-    centroids = {t: _field_centroid(samples[t], encode, max_values) for t in tokens}
+    centroids = _batched_centroids({t: samples[t] for t in tokens}, encode, max_values)
     usable = [t for t in tokens if centroids[t] is not None]
     if len(usable) < 2:
         return []
@@ -268,11 +308,8 @@ def cross_source_cohesion(
     ``values_by_source`` maps source_id → list of sampled values for one field.
     Returns ``None`` when fewer than 2 sources have usable values.
     """
-    centroids = []
-    for values in values_by_source.values():
-        c = _field_centroid(values, encode, max_values)
-        if c is not None:
-            centroids.append(c)
+    by_source = _batched_centroids(values_by_source, encode, max_values)
+    centroids = [c for c in by_source.values() if c is not None]
     if len(centroids) < 2:
         return None
     # Mean pairwise cosine — centroids are already L2-normalised.

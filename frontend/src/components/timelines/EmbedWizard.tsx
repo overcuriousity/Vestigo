@@ -12,7 +12,7 @@
  * A cohesion banner at the top explains the quality of the merged embedding
  * substrate and warns when cross-source outlier detection may be unreliable.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Cpu, Check, Link2, Info, AlertTriangle, ShieldCheck } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
@@ -243,11 +243,30 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
   // first step.
   const label = isEmbedded ? "Re-embed" : "Improve search quality";
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, fetchStatus } = useQuery({
     queryKey: ["timeline-embedding-fields", caseId, timeline.id],
     queryFn: () => timelinesApi.embeddingFields(caseId, timeline.id),
     enabled: open,
   });
+
+  // Backend has a fixed execution order — sampling always precedes cohesion
+  // scoring — so an elapsed-time-driven label gives an honest sense of
+  // progress without needing a second round trip or a real percentage.
+  const [loadingLabel, setLoadingLabel] = useState("Sampling events…");
+  useEffect(() => {
+    if (fetchStatus !== "fetching") return;
+    const startedAt = Date.now();
+    setLoadingLabel("Sampling events…");
+    const interval = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > 6000) {
+        setLoadingLabel("Still scoring — larger timelines with more sources take longer…");
+      } else if (elapsed > 1500) {
+        setLoadingLabel("Scoring field cohesion…");
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [fetchStatus]);
 
   // Initialise selection once data arrives: stored timeline config if
   // re-embedding, otherwise the backend's cross-source recommendation.
@@ -344,8 +363,15 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
         className="max-w-2xl"
       >
         {isLoading || !data ? (
-          <div className="flex justify-center py-12">
+          <div className="flex flex-col items-center justify-center gap-2 py-12">
             <Spinner />
+            <span
+              role="status"
+              aria-live="polite"
+              className="text-[11px] text-[var(--color-fg-muted)]"
+            >
+              {loadingLabel}
+            </span>
           </div>
         ) : data.artifacts.length === 0 ? (
           <p className="py-8 text-center text-xs text-[var(--color-fg-muted)]">

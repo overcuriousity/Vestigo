@@ -456,3 +456,81 @@ def test_universal_cohesion_disjoint_artifacts_gives_honest_banner():
     )
     assert summary.mean_cohesion is not None
     assert summary.shared_field_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Batched encode() calls (performance fix for the embedding wizard)
+# ---------------------------------------------------------------------------
+
+
+def _counting_encoder(fake_encode):
+    """Wrap a fake encode fn to count real invocations."""
+    calls = {"n": 0}
+
+    def encode(texts: list[str]) -> list[list[float]]:
+        calls["n"] += 1
+        return fake_encode(texts)
+
+    return encode, calls
+
+
+def test_cross_source_cohesion_uses_one_encode_call_regardless_of_source_count():
+    """Regression test: cross_source_cohesion used to call encode() once per
+    source; it must now issue exactly one batched call no matter how many
+    sources are present."""
+    values_by_source = {f"src_{i}": [f"ip 10.0.0.{i}", f"addr 10.0.0.{i + 1}"] for i in range(8)}
+    encode, calls = _counting_encoder(_fake_encode_factory())
+
+    c = cross_source_cohesion(values_by_source, encode=encode)
+
+    assert calls["n"] == 1
+    assert c is not None and c > 0.9
+
+
+def test_group_related_fields_uses_one_encode_call_regardless_of_field_count():
+    """Regression test: the grouping stage used to call encode() once per
+    candidate field; it must now issue exactly one batched call."""
+    samples = {
+        "message": ["user login succeeded", "logon from console"],
+        "attr:src_ip": ["ip 10.0.0.1", "addr 10.0.0.2"],
+        "attr:dst_ip": ["ip 192.168.0.5", "addr 192.168.0.9"],
+        "attr:event": ["login event", "logon attempt"],
+        "attr:note1": ["random note one"],
+        "attr:note2": ["random note two"],
+    }
+    encode, calls = _counting_encoder(_fake_encode_factory())
+
+    rec = recommend_fields(samples, encode=encode, sim_threshold=0.9)
+
+    assert calls["n"] == 1
+    # Same grouping outcome as the unbatched behaviour verified elsewhere.
+    ip_group = next((g for g in rec.related_groups if "attr:src_ip" in g), None)
+    assert ip_group is not None and "attr:dst_ip" in ip_group
+
+
+def test_recommend_fields_across_sources_uses_one_encode_call_per_call_site():
+    """The full timeline pipeline (cohesion pass + grouping pass) should make
+    at most two batched encode() calls total for many sources/fields, not one
+    per (field, source) combination."""
+    field_samples_by_source = {
+        f"src_{i}": {
+            "message": [f"user login succeeded {i}", f"logon from console {i}"],
+            "attr:src_ip": [f"ip 10.0.0.{i}", f"addr 10.0.0.{i + 1}"],
+            "attr:dst_ip": [f"ip 192.168.0.{i}", f"addr 192.168.0.{i + 1}"],
+        }
+        for i in range(8)
+    }
+    encode, calls = _counting_encoder(_fake_encode_factory())
+
+    rec = recommend_fields_across_sources(
+        field_samples_by_source,
+        source_count=8,
+        encode=encode,
+    )
+
+    # One batched call per field for cohesion (3 fields) + one batched call
+    # for grouping — not 3 fields * 8 sources = 24+ calls as before.
+    assert calls["n"] <= 4
+    assert "message" in rec.recommended
+    assert "attr:src_ip" in rec.recommended
+    assert "attr:dst_ip" in rec.recommended
