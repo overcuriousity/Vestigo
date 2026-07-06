@@ -124,8 +124,11 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "columns",
     routePattern: EXPLORER,
-    selector: '[data-tour="column-picker"]',
-    side: "bottom",
+    // Once the picker is open, spotlight the dropdown itself and put the card
+    // to its left (over the grid) — a bottom-anchored card would sit right on
+    // top of the `align="end"` popover that opens below the button.
+    selector: ['[data-tour="column-picker-content"]', '[data-tour="column-picker"]'],
+    side: "left",
     title: "Adjust visible columns",
     body: "This is the Explorer — every event in the timeline. Use the Columns picker to choose which fields are shown in the grid, including any dynamic attributes your logs carry.",
     advance: { type: "next" },

@@ -206,7 +206,7 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
         </Button>
       </PopoverTrigger>
 
-      <PopoverContent className="w-64 p-0" align="end">
+      <PopoverContent className="w-64 p-0" align="end" data-tour="column-picker-content">
         {/* Search */}
         <div className="border-b border-[var(--color-border)] p-2">
           <div className="relative">
