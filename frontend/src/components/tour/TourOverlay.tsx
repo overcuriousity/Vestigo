@@ -150,11 +150,13 @@ export function TourOverlay() {
   const z = step.aboveDialog ? 70 : 60;
   const isLast = stepIndex === TOUR_STEPS.length - 1;
   const showNext = step.advance.type === "next" || step.alsoNext;
-  // Back only where it can't strand the user: previous step is on the same
-  // page and was itself a manual step.
+  // Back only where it can't strand the user: previous step must be on the
+  // same page, so Back never leaves the user on a target that no longer
+  // exists. Event-advanced steps are fine to go back to as well — their
+  // triggering action (click a button, open a dialog) is always safe to
+  // repeat and re-fires the same event, letting the tour move forward again.
   const prev = TOUR_STEPS[stepIndex - 1];
-  const showBack =
-    !!prev && prev.routePattern === step.routePattern && prev.advance.type === "next";
+  const showBack = !!prev && prev.routePattern === step.routePattern;
   const spotlight = onRoute && rect;
 
   const card = (

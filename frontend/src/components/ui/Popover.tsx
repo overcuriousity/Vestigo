@@ -4,9 +4,7 @@ import { cn } from "@/lib/cn";
 export const Popover = RadixPopover.Root;
 export const PopoverTrigger = RadixPopover.Trigger;
 
-interface PopoverContentProps {
-  children: React.ReactNode;
-  className?: string;
+interface PopoverContentProps extends React.ComponentPropsWithoutRef<typeof RadixPopover.Content> {
   side?: "top" | "right" | "bottom" | "left";
   align?: "start" | "center" | "end";
   sideOffset?: number;
@@ -18,6 +16,7 @@ export function PopoverContent({
   side = "bottom",
   align = "start",
   sideOffset = 6,
+  ...props
 }: PopoverContentProps) {
   return (
     <RadixPopover.Portal>
@@ -25,6 +24,7 @@ export function PopoverContent({
         side={side}
         align={align}
         sideOffset={sideOffset}
+        {...props}
         className={cn(
           "z-50 rounded-md border border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] shadow-lg",
           "data-[state=open]:animate-in data-[state=closed]:animate-out",

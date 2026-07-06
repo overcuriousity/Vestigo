@@ -838,10 +838,10 @@ export function ExplorerPage() {
     const ready = pending.eventId ? !!foundEvent : events.length > 0;
     if (ready) {
       gridRef.current?.scrollToTimestamp(pending.ts, pending.eventId);
-      if (foundEvent) setExpandedEvent(foundEvent);
+      if (foundEvent) handleExpandEvent(foundEvent);
       pendingJumpRef.current = null;
     }
-  }, [events]);
+  }, [events, handleExpandEvent]);
 
   // Once the soft-anchor page seeded in setFilters lands in `events`, scroll
   // the grid back to where the analyst was — otherwise the grid renders at
@@ -1096,7 +1096,7 @@ export function ExplorerPage() {
                       setAnalysisPanelOpen(false);
                       setSimilarAnchor(null);
                     }}
-                    onSelectEvent={(ev) => setExpandedEvent(ev)}
+                    onSelectEvent={(ev) => handleExpandEvent(ev)}
                     onSimilarClose={() => setSimilarAnchor(null)}
                     onDrillField={handleDrillField}
                     onFrequencyDrill={handleFrequencyDrill}

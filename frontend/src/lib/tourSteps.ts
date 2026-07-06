@@ -80,6 +80,7 @@ export const TOUR_STEPS: TourStep[] = [
     title: "Ingest a log file",
     body: "Click Upload Log File to add your first source. TraceSignal ingests Timesketch-compatible CSV and JSONL files.",
     advance: { type: "event", name: "upload-dialog-opened" },
+    hideWhileTriggerOpen: true,
   },
   {
     id: "converter-hint",

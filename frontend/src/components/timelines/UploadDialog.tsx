@@ -35,19 +35,30 @@ export function UploadDialog({ caseId }: Props) {
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
+      // The upload action happened either way — tell the tour so a duplicate
+      // response doesn't strand it on this step.
+      tourEvent("source-uploaded");
       // Ingestion continues as a background job — hand it to the job tray
       // (which polls progress and refreshes the source list with the final
       // event count) and close the dialog. Keep the dialog open for
       // duplicates so the message is visible.
       if (!result.duplicate && result.job_id) {
-        addJob(result.job_id, `Ingesting "${file?.name ?? "upload"}"`, [
-          ["sources", caseId],
-          ["timelines", caseId],
-        ]);
-        tourEvent("source-uploaded");
+        addJob(
+          result.job_id,
+          `Ingesting "${file?.name ?? "upload"}"`,
+          [
+            ["sources", caseId],
+            ["timelines", caseId],
+          ],
+          true,
+        );
         setOpen(false);
         setFile(null);
         setParser("");
+      } else if (result.duplicate) {
+        // Duplicates never get a job_id, so the tour's "ingesting" step
+        // would otherwise wait forever on an event that can never fire.
+        tourEvent("ingest-complete");
       }
       // A duplicate can point at a source that lost a concurrent-upload race
       // and is still ingesting (status !== "ready") — the source list panel
