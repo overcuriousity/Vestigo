@@ -16,7 +16,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Cpu, Check, Link2, Info, AlertTriangle, ShieldCheck } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
-import { healthApi } from "@/api/health";
+import { useHealth } from "@/api/health";
 import { useJobsStore } from "@/stores/jobs";
 import {
   Dialog,
@@ -246,14 +246,10 @@ export function EmbedWizard({ caseId, timeline, onJobStarted, iconTrigger }: Pro
   const addJob = useJobsStore((s) => s.addJob);
   const qc = useQueryClient();
 
-  // Shared with the TopBar's health poll (same query key) — reflects whether
-  // this installation can embed at all (local deps or remote endpoint).
-  const { data: health } = useQuery({
-    queryKey: ["health"],
-    queryFn: () => healthApi.check(),
-    staleTime: 30_000,
-    retry: false,
-  });
+  // Shared health poll (reflects whether this installation can embed at all —
+  // local deps or a remote endpoint). The 15s refetch in useHealth lets the
+  // gate recover after a transient health failure instead of staying open.
+  const { data: health } = useHealth();
   // Optimistic until the health response arrives, so the button doesn't
   // flicker in on installations where embeddings work (the common case).
   const embeddingsAvailable = health?.embeddings_available ?? true;
@@ -361,49 +357,54 @@ export function EmbedWizard({ caseId, timeline, onJobStarted, iconTrigger }: Pro
     [data],
   );
 
+  // Single trigger element, reused for the enabled (DialogTrigger) and the
+  // disabled (embeddings-unavailable) cases so the two icon/outline variants
+  // aren't spelled out four times. Stale styling only shows when enabled.
+  const staleWhenEnabled = embeddingsAvailable && isStale;
+  const trigger = iconTrigger ? (
+    <Button
+      variant="ghost"
+      size="icon"
+      disabled={!embeddingsAvailable}
+      aria-label={label}
+      title={
+        !embeddingsAvailable
+          ? undefined
+          : isStale
+            ? `${label} — new sources aren't embedded yet`
+            : label
+      }
+      className={staleWhenEnabled ? "text-[var(--color-warning)]" : ""}
+    >
+      <Cpu size={14} />
+    </Button>
+  ) : (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={!embeddingsAvailable}
+      className={
+        staleWhenEnabled ? "border-[var(--color-warning)] text-[var(--color-warning)]" : ""
+      }
+    >
+      <Cpu size={13} /> {label}
+      {staleWhenEnabled && <span className="ml-1 text-[9px] opacity-80">· stale</span>}
+    </Button>
+  );
+
   // After all hooks (rules-of-hooks): embeddings can't run on this server —
   // show the same-sized trigger, disabled, with an explanatory tooltip.
   if (!embeddingsAvailable) {
     return (
       <span title={EMBEDDINGS_UNAVAILABLE_HINT} className="inline-flex cursor-not-allowed">
-        {iconTrigger ? (
-          <Button variant="ghost" size="icon" disabled aria-label={label}>
-            <Cpu size={14} />
-          </Button>
-        ) : (
-          <Button variant="outline" size="sm" disabled>
-            <Cpu size={13} /> {label}
-          </Button>
-        )}
+        {trigger}
       </span>
     );
   }
 
   return (
     <Dialog open={open} onOpenChange={handleOpen}>
-      <DialogTrigger asChild>
-        {iconTrigger ? (
-          <Button
-            variant="ghost"
-            size="icon"
-            title={isStale ? `${label} — new sources aren't embedded yet` : label}
-            className={isStale ? "text-[var(--color-warning)]" : ""}
-          >
-            <Cpu size={14} />
-          </Button>
-        ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            className={isStale ? "border-[var(--color-warning)] text-[var(--color-warning)]" : ""}
-          >
-            <Cpu size={13} /> {label}
-            {isStale && (
-              <span className="ml-1 text-[9px] opacity-80">· stale</span>
-            )}
-          </Button>
-        )}
-      </DialogTrigger>
+      <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent
         title="Embedding wizard"
         description={

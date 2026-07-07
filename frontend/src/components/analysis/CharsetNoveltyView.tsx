@@ -10,23 +10,25 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ChevronsRight, Clock, Info } from "lucide-react";
+import { AlertTriangle, Info } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
-import { eventsApi } from "@/api/events";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   FindingShell,
   ModeToggle,
   RefreshButton,
   TagFindingsBar,
+  fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
+  useOpenEvent,
   type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, CharsetFinding, Event } from "@/api/types";
-import { anomalyFieldLabel as fieldLabel } from "@/lib/format";
+import { anomalyFieldLabel as fieldLabel, truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
@@ -55,11 +57,6 @@ function charLabel(c: string): string {
   return printable ? c : codepointLabel(c);
 }
 
-/** Truncate long values for the row body; full value stays in details. */
-function fmtValue(v: string): string {
-  return v.length > 120 ? `${v.slice(0, 120)}…` : v;
-}
-
 function CharsetRow({
   caseId,
   timelineId,
@@ -75,12 +72,7 @@ function CharsetRow({
   onDrillField?: (field: string, value: string) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }) {
-  const openEvent = useMutation({
-    mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id!),
-    onSuccess: (event) => {
-      if (event) onSelectEvent(event);
-    },
-  });
+  const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
 
   return (
     <FindingShell
@@ -89,33 +81,14 @@ function CharsetRow({
         if (finding.event_id) openEvent.mutate();
       }}
       actions={
-        <>
-          {onDrillField && (
-            <button
-              title={`Filter to ${finding.field}=${finding.value}`}
-              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDrillField(finding.field, finding.value);
-              }}
-            >
-              <ChevronsRight size={12} />
-            </button>
-          )}
-          {onJumpToTime && (
-            <button
-              title="Jump to this event's time — clears active filters"
-              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-              onClick={(e) => {
-                e.stopPropagation();
-                const ts = finding.event?.timestamp ?? finding.first_seen;
-                if (ts) onJumpToTime(ts, finding.event_id ?? undefined);
-              }}
-            >
-              <Clock size={12} />
-            </button>
-          )}
-        </>
+        <FindingRowActions
+          field={finding.field}
+          value={finding.value}
+          ts={finding.event?.timestamp ?? finding.first_seen}
+          eventId={finding.event_id}
+          onDrillField={onDrillField}
+          onJumpToTime={onJumpToTime}
+        />
       }
     >
       {/* Field + value */}
@@ -124,7 +97,7 @@ function CharsetRow({
           {fieldLabel(finding.field)}
         </span>
         <span className="min-w-0 break-all font-mono text-xs font-medium text-[var(--color-fg-primary)]">
-          {fmtValue(finding.value)}
+          {truncate(finding.value)}
         </span>
       </div>
 
@@ -170,12 +143,7 @@ export function CharsetNoveltyView({
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
-  const fieldsParam =
-    selectedFields === null
-      ? undefined
-      : selectedFields.length > 0
-        ? selectedFields.join(",")
-        : "__none__";
+  const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["anomalies", caseId, timelineId, "charset", mode, fieldsParam ?? "__auto__"],
@@ -212,7 +180,7 @@ export function CharsetNoveltyView({
     (f) => {
       const ts = f.event?.timestamp ?? f.first_seen;
       if (!ts) return null;
-      const label = `${fieldLabel(f.field)}=${fmtValue(f.value)}`;
+      const label = `${fieldLabel(f.field)}=${truncate(f.value)}`;
       const chars = f.novel_chars.map((c) => `${charLabel(c)} (${codepointLabel(c)})`).join(", ");
       const originDesc =
         data?.method === "temporal-charset"
@@ -248,7 +216,7 @@ export function CharsetNoveltyView({
           timelineId={timelineId}
           selected={selectedFields}
           onChange={setSelectedFields}
-          autoCount={15}
+          autoIncludesIdentifiers
         />
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>

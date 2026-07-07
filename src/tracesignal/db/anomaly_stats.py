@@ -151,6 +151,13 @@ _RECOMMENDER_MAX_ATTR_KEYS = 50
 # sorts by (recommended, -coverage).
 _MAX_AUTO_SCAN_FIELDS = 15
 
+# Of the auto-scan cap, the number of slots reserved for identifier-kind fields
+# (URLs, hashes, user agents) in the charset/entropy detectors so a source with
+# many categorical columns can't crowd them out — they are those detectors'
+# primary target. Categoricals take the rest; each kind backfills the other's
+# unused slots. Kept in sync with the frontend picker (detector-shared.tsx).
+_AUTO_IDENTIFIER_RESERVE = 5
+
 # Minimum baseline numeric samples before the range detector trusts a field's
 # learned band — below this, the min/max or quartiles are too noisy to score.
 _MIN_RANGE_BASELINE = 20
@@ -443,11 +450,6 @@ def _freq_finding(
     )
 
 
-# Shared guardrails for every whole-corpus detector scan — see db/_scan.py
-# (single home, also used by the embedding-wizard inventory scan).
-_HEAVY_SCAN_SETTINGS = HEAVY_SCAN_SETTINGS
-
-
 def _stub_event(evt_id: str | None, case_id: str, first_seen: str | None) -> dict[str, Any] | None:
     """Minimal full-shape event stub for a finding's representative event.
 
@@ -532,6 +534,27 @@ def _classify_field(distinct: int, non_empty_count: int, total: int = 0) -> tupl
     return "categorical", True
 
 
+def _select_auto_scan_tokens(cats: list[str], ids: list[str]) -> list[str]:
+    """Blend categorical and identifier field tokens under the auto-scan cap.
+
+    ``cats`` and ``ids`` are each already ordered best-first. Identifier fields
+    get up to ``_AUTO_IDENTIFIER_RESERVE`` reserved slots so they can't be
+    crowded out by a wide categorical set; categoricals fill the remainder, and
+    each kind backfills any slots the other leaves unused. Result length is at
+    most ``_MAX_AUTO_SCAN_FIELDS``. Mirrored by the frontend picker's
+    ``selectAutoScanTokens`` (detector-shared.tsx) so the "auto" preview matches
+    what actually runs.
+    """
+    reserve = min(len(ids), _AUTO_IDENTIFIER_RESERVE)
+    picked = cats[: _MAX_AUTO_SCAN_FIELDS - reserve]
+    picked += ids[: _MAX_AUTO_SCAN_FIELDS - len(picked)]
+    if len(picked) < _MAX_AUTO_SCAN_FIELDS:
+        # Identifiers left slack (fewer than reserved) — backfill with any
+        # remaining categoricals.
+        picked += [t for t in cats if t not in picked][: _MAX_AUTO_SCAN_FIELDS - len(picked)]
+    return picked
+
+
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
@@ -584,6 +607,49 @@ class StatisticalAnomalyService:
             if f.event_id and f.event_id in by_id:
                 f.event = by_id[f.event_id]
 
+    def _finalize_findings(
+        self,
+        findings: list[Any],
+        *,
+        detector: str,
+        method: str,
+        total_events: int,
+        evaluated_fields: int,
+        exclude_event_ids: set[str] | None,
+        limit: int,
+        case_id: str,
+        source_ids: list[str],
+    ) -> StatAnomalyResult:
+        """Rank, suppress, cap and hydrate a per-field detector's findings.
+
+        Shared tail for the field-scanning detectors: when no field yielded a
+        usable baseline the status is ``insufficient_data``; otherwise excluded
+        (user-marked-normal) events are dropped, findings are sorted by score
+        descending, capped to ``limit``, and their representative events are
+        hydrated in one batch before returning an ``ok`` result.
+        """
+        if evaluated_fields == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=total_events,
+            )
+        if exclude_event_ids:
+            findings = [
+                f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+        findings.sort(key=lambda f: f.score, reverse=True)
+        results = findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
+        return StatAnomalyResult(
+            status="ok",
+            detector=detector,
+            method=method,
+            baseline_size=total_events,
+            results=results,
+        )
+
     def field_inventory(
         self,
         case_id: str,
@@ -625,7 +691,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
-            f" {_HEAVY_SCAN_SETTINGS}"
+            f" {HEAVY_SCAN_SETTINGS}"
         )
         top_res = self.ch.client.query(top_sql, parameters=params)
         if top_res.result_rows:
@@ -644,7 +710,7 @@ class StatisticalAnomalyService:
         # ``uniq`` (approximate, ~1% error) replaces ``uniqExact`` — the
         # cardinality classification thresholds don't need exactness, and
         # exact per-key hash sets over near-unique values are the other
-        # memory blowup. _HEAVY_SCAN_SETTINGS (external GROUP BY spill + a
+        # memory blowup. HEAVY_SCAN_SETTINGS (external GROUP BY spill + a
         # query memory cap) bounds the worst case instead of trusting the
         # server-wide limit.
         attr_sql = f"""
@@ -660,7 +726,7 @@ class StatisticalAnomalyService:
             GROUP BY key
             ORDER BY cov_count DESC
             LIMIT {{max_keys:UInt32}}
-            {_HEAVY_SCAN_SETTINGS}
+            {HEAVY_SCAN_SETTINGS}
         """
         attr_res = self.ch.client.query(
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
@@ -704,7 +770,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
-            f" {_HEAVY_SCAN_SETTINGS}"
+            f" {HEAVY_SCAN_SETTINGS}"
         )
         m_res = self.ch.client.query(m_sql, parameters=m_params)
         out: list[tuple[str, int, int]] = []
@@ -907,7 +973,7 @@ class StatisticalAnomalyService:
                     HAVING cnt <= {{floor:UInt32}}
                     ORDER BY cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
-                    {_HEAVY_SCAN_SETTINGS}
+                    {HEAVY_SCAN_SETTINGS}
                 """
             else:
                 # Temporal: flag values seen in detect window but not in baseline.
@@ -929,7 +995,7 @@ class StatisticalAnomalyService:
                     HAVING baseline_cnt = 0 AND detect_cnt > 0
                     ORDER BY detect_cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
-                    {_HEAVY_SCAN_SETTINGS}
+                    {HEAVY_SCAN_SETTINGS}
                 """
 
             rows = self.ch.client.query(sql, parameters=params).result_rows
@@ -1111,7 +1177,7 @@ class StatisticalAnomalyService:
                 HAVING cnt <= {{floor:UInt32}}
                 ORDER BY cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}}
-                {_HEAVY_SCAN_SETTINGS}
+                {HEAVY_SCAN_SETTINGS}
             """
         else:
             params["bl"] = to_clickhouse_utc(baseline_end)
@@ -1132,7 +1198,7 @@ class StatisticalAnomalyService:
                 HAVING baseline_cnt = 0 AND detect_cnt > 0
                 ORDER BY detect_cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}}
-                {_HEAVY_SCAN_SETTINGS}
+                {HEAVY_SCAN_SETTINGS}
             """
 
         rows = self.ch.client.query(sql, parameters=params).result_rows
@@ -1251,7 +1317,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
-            f" {_HEAVY_SCAN_SETTINGS}"
+            f" {HEAVY_SCAN_SETTINGS}"
         )
         row = self.ch.client.query(probe_sql, parameters=params).result_rows
         out: list[NumericFieldInfo] = []
@@ -1338,14 +1404,14 @@ class StatisticalAnomalyService:
             if baseline_end is None:
                 stat_sql = (
                     f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
-                    f" FROM ({num_src}) WHERE num IS NOT NULL {_HEAVY_SCAN_SETTINGS}"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL {HEAVY_SCAN_SETTINGS}"
                 )
             else:
                 stat_params["bl"] = bl_str
                 stat_sql = (
                     f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL AND timestamp < {{bl:String}}"
-                    f" {_HEAVY_SCAN_SETTINGS}"
+                    f" {HEAVY_SCAN_SETTINGS}"
                 )
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
             if not srows or srows[0][2] is None:
@@ -1404,7 +1470,7 @@ class StatisticalAnomalyService:
                 GROUP BY val
                 ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
-                {_HEAVY_SCAN_SETTINGS}
+                {HEAVY_SCAN_SETTINGS}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
@@ -1493,6 +1559,15 @@ class StatisticalAnomalyService:
         hashes) are exactly where injected metacharacters and random-looking
         strings appear. Constant and sparse fields stay excluded, as do
         pipeline-synthesized fields.
+
+        ``recommend_novelty_fields`` sorts categorical (recommended) fields
+        ahead of identifier fields, so a naive ``[:N]`` slice would starve the
+        identifier fields — the detectors' *primary* target — on wide sources
+        with many categorical columns. A quota reserves up to
+        ``_AUTO_IDENTIFIER_RESERVE`` of the cap for identifier fields; the rest
+        goes to categoricals, and either kind backfills any slack the other
+        leaves. The frontend picker mirrors this rule (see selectAutoScanTokens
+        in detector-shared.tsx) so its "auto" preview matches what runs.
         """
         rec = self.recommend_novelty_fields(
             case_id,
@@ -1501,12 +1576,11 @@ class StatisticalAnomalyService:
             field_mappings=field_mappings,
             inventory=inventory,
         )
-        tokens = [
-            f.token
-            for f in rec
-            if f.kind in ("categorical", "identifier") and f.token not in _SYNTHETIC_FIELDS
+        cats = [
+            f.token for f in rec if f.kind == "categorical" and f.token not in _SYNTHETIC_FIELDS
         ]
-        return tokens[:_MAX_AUTO_SCAN_FIELDS]
+        ids = [f.token for f in rec if f.kind == "identifier" and f.token not in _SYNTHETIC_FIELDS]
+        return _select_auto_scan_tokens(cats, ids)
 
     def find_charset_novelty(
         self,
@@ -1582,37 +1656,43 @@ class StatisticalAnomalyService:
             # --- Learn the reference charset. ---
             char_counts: dict[str, int] = {}
             if baseline_end is None:
-                # Per-character distinct-value counts over the whole corpus.
+                # Per-character distinct-value counts over the whole corpus,
+                # plus the total distinct-value count in the same scan: a window
+                # `count() OVER ()` over the DISTINCT subquery yields n_vals on
+                # every row, so we avoid a second whole-corpus uniqExact scan of
+                # the identical column/predicate.
                 cc_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, cc_params, field_mappings)
                 cc_sql = f"""
-                    SELECT c, count() AS n_vals_with_c
+                    SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
                     FROM (
-                        SELECT DISTINCT {col} AS val
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {col} != ''
+                        SELECT
+                            count() OVER () AS total,
+                            arrayDistinct(extractAll(val, '(?s).')) AS chars
+                        FROM (
+                            SELECT DISTINCT {col} AS val
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {col} != ''
+                        )
                     )
-                    ARRAY JOIN arrayDistinct(extractAll(val, '(?s).')) AS c
+                    ARRAY JOIN chars AS c
                     GROUP BY c
-                    {_HEAVY_SCAN_SETTINGS}
+                    {HEAVY_SCAN_SETTINGS}
                 """
                 cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
-                char_counts = {str(c): int(nv) for c, nv in cc_rows}
-
-                nv_params: dict[str, Any] = {**base_params}
-                nv_col = _col_expr(field_token, nv_params, field_mappings)
-                nv_rows = self.ch.client.query(
-                    f"SELECT uniqExact({nv_col}) FROM {db}.events"
-                    f" WHERE case_id = {{cid:String}}"
-                    f" AND has({{src:Array(String)}}, source_id)"
-                    f" AND {nv_col} != ''"
-                    f" {_HEAVY_SCAN_SETTINGS}",
-                    parameters=nv_params,
-                ).result_rows
-                n_vals = int(nv_rows[0][0]) if nv_rows else 0
+                char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
+                n_vals = int(cc_rows[0][2]) if cc_rows else 0
                 reference = [c for c, nv in char_counts.items() if nv > rarity_floor]
+                # Skip decision is about the field's *whole* alphabet, not just
+                # its non-rare subset: on a huge-alphabet field (CJK prose,
+                # base64 blobs) most characters are rare, so `reference` stays
+                # small while the real alphabet is enormous — "novel character"
+                # is meaningless there. Measure `char_counts`, which holds every
+                # character seen (temporal mode's `reference` already is the
+                # full baseline alphabet).
+                alphabet_size = len(char_counts)
             else:
                 # Charset of the baseline window (sentinel rows sort after
                 # baseline_end, so `timestamp <` already excludes them).
@@ -1630,7 +1710,7 @@ class StatisticalAnomalyService:
                           AND {col} != ''
                           AND timestamp < {{bl:String}}
                     )
-                    {_HEAVY_SCAN_SETTINGS}
+                    {HEAVY_SCAN_SETTINGS}
                 """
                 bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
                 if not bs_rows:
@@ -1638,8 +1718,9 @@ class StatisticalAnomalyService:
                 charset_arr, n_vals = bs_rows[0]
                 n_vals = int(n_vals)
                 reference = [str(c) for c in (charset_arr or [])]
+                alphabet_size = len(reference)
 
-            if n_vals < _MIN_CHARSET_BASELINE or len(reference) > _MAX_CHARSET_SIZE:
+            if n_vals < _MIN_CHARSET_BASELINE or alphabet_size > _MAX_CHARSET_SIZE:
                 continue
             evaluated_fields += 1
 
@@ -1680,7 +1761,7 @@ class StatisticalAnomalyService:
                 WHERE length(novel) > 0
                 ORDER BY length(novel) DESC, cnt ASC
                 LIMIT {{plim:UInt32}}
-                {_HEAVY_SCAN_SETTINGS}
+                {HEAVY_SCAN_SETTINGS}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
@@ -1728,28 +1809,16 @@ class StatisticalAnomalyService:
                     )
                 )
 
-        if evaluated_fields == 0:
-            return StatAnomalyResult(
-                status="insufficient_data",
-                detector="charset",
-                method=method,
-                baseline_size=total_events,
-            )
-
-        if exclude_event_ids:
-            all_findings = [
-                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
-            ]
-
-        all_findings.sort(key=lambda f: f.score, reverse=True)
-        results = all_findings[:limit]
-        self._hydrate_finding_events(case_id, source_ids, results)
-        return StatAnomalyResult(
-            status="ok",
+        return self._finalize_findings(
+            all_findings,
             detector="charset",
             method=method,
-            baseline_size=total_events,
-            results=results,
+            total_events=total_events,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
         )
 
     # ------------------------------------------------------------------
@@ -1813,13 +1882,11 @@ class StatisticalAnomalyService:
                 case_id, source_ids, total_events, field_mappings, inventory, inventory_total
             )
 
-        # Shannon character entropy in bits, computed from a `chars` array
-        # column produced by extractAll(val, '(?s).') one subquery below.
-        ent_expr = (
-            "arraySum(k -> -(k / length(chars)) * log2(k / length(chars)),"
-            " arrayMap(c -> countEqual(chars, c), arrayDistinct(chars)))"
-        )
-
+        # Shannon character entropy in bits (log2) per distinct value, via
+        # ClickHouse's built-in `entropy` aggregate over the value's characters
+        # ARRAY JOIN-ed out one row each. This is linear in the value length;
+        # the earlier `arrayMap(c -> countEqual(chars, c), ...)` form rescanned
+        # the whole char array once per distinct character (quadratic).
         bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
         all_findings: list[EntropyFinding] = []
         evaluated_fields = 0
@@ -1837,9 +1904,9 @@ class StatisticalAnomalyService:
             stat_sql = f"""
                 SELECT quantile(0.25)(ent) AS q1, quantile(0.75)(ent) AS q3, count() AS n
                 FROM (
-                    SELECT {ent_expr} AS ent
+                    SELECT entropy(c) AS ent
                     FROM (
-                        SELECT extractAll(val, '(?s).') AS chars
+                        SELECT val, arrayJoin(extractAll(val, '(?s).')) AS c
                         FROM (
                             SELECT DISTINCT {col} AS val
                             FROM {db}.events
@@ -1849,8 +1916,9 @@ class StatisticalAnomalyService:
                               AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
                         )
                     )
+                    GROUP BY val
                 )
-                {_HEAVY_SCAN_SETTINGS}
+                {HEAVY_SCAN_SETTINGS}
             """
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
             if not srows or srows[0][2] is None:
@@ -1882,9 +1950,14 @@ class StatisticalAnomalyService:
             viol_sql = f"""
                 SELECT val, ent, cnt, first_seen, evt_id
                 FROM (
-                    SELECT val, {ent_expr} AS ent, cnt, first_seen, evt_id
+                    SELECT
+                        val,
+                        entropy(c) AS ent,
+                        any(cnt) AS cnt,
+                        any(first_seen) AS first_seen,
+                        any(evt_id) AS evt_id
                     FROM (
-                        SELECT val, extractAll(val, '(?s).') AS chars, cnt, first_seen, evt_id
+                        SELECT val, cnt, first_seen, evt_id, arrayJoin(extractAll(val, '(?s).')) AS c
                         FROM (
                             SELECT
                                 {vcol} AS val,
@@ -1899,11 +1972,12 @@ class StatisticalAnomalyService:
                             GROUP BY val
                         )
                     )
+                    GROUP BY val
                 )
                 WHERE ent < {{lo:Float64}} OR ent > {{hi:Float64}}
                 ORDER BY greatest({{lo:Float64}} - ent, ent - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
-                {_HEAVY_SCAN_SETTINGS}
+                {HEAVY_SCAN_SETTINGS}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
@@ -1952,28 +2026,16 @@ class StatisticalAnomalyService:
                     )
                 )
 
-        if evaluated_fields == 0:
-            return StatAnomalyResult(
-                status="insufficient_data",
-                detector="entropy",
-                method=method,
-                baseline_size=total_events,
-            )
-
-        if exclude_event_ids:
-            all_findings = [
-                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
-            ]
-
-        all_findings.sort(key=lambda f: f.score, reverse=True)
-        results = all_findings[:limit]
-        self._hydrate_finding_events(case_id, source_ids, results)
-        return StatAnomalyResult(
-            status="ok",
+        return self._finalize_findings(
+            all_findings,
             detector="entropy",
             method=method,
-            baseline_size=total_events,
-            results=results,
+            total_events=total_events,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
         )
 
     # ------------------------------------------------------------------
@@ -2044,7 +2106,7 @@ class StatisticalAnomalyService:
               AND {col} != ''
             GROUP BY bucket, series_val
             ORDER BY bucket
-            {_HEAVY_SCAN_SETTINGS}
+            {HEAVY_SCAN_SETTINGS}
         """
         brows = self.ch.client.query(bucket_sql, parameters=params).result_rows
 
@@ -2265,7 +2327,7 @@ class StatisticalAnomalyService:
               AND {col} IN {{vals:Array(String)}}
               AND {bucket_expr} IN {{buckets:Array(DateTime)}}
             GROUP BY bucket, series_val
-            {_HEAVY_SCAN_SETTINGS}
+            {HEAVY_SCAN_SETTINGS}
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows
 
@@ -2370,7 +2432,7 @@ class StatisticalAnomalyService:
                 maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
             FROM ({inner})
             GROUP BY source_id
-            {_HEAVY_SCAN_SETTINGS}
+            {HEAVY_SCAN_SETTINGS}
         """
         summary_rows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
         source_summary: dict[str, tuple[int, float]] = {
@@ -2395,7 +2457,7 @@ class StatisticalAnomalyService:
             WHERE skew >= {{skew:Float64}}
             ORDER BY skew DESC, source_id, byte_offset
             LIMIT {{lim:UInt32}}
-            {_HEAVY_SCAN_SETTINGS}
+            {HEAVY_SCAN_SETTINGS}
         """
         rows = self.ch.client.query(detail_sql, parameters=detail_params).result_rows
 

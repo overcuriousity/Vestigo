@@ -8,7 +8,7 @@ import io
 import json
 import re
 from collections.abc import Generator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any, Literal
 
@@ -1353,7 +1353,7 @@ async def _run_stat_detector(
             fields=parsed_fields,
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
-            rarity_floor=cfg.stat_rarity_floor,
+            rarity_floor=cfg.stat_charset_rarity_floor,
             baseline_end=effective_baseline_end,
             exclude_event_ids=exclude_ids,
             field_mappings=field_mappings,
@@ -1479,35 +1479,13 @@ def _serialize_finding(
     | EntropyFinding,
 ) -> dict[str, Any]:
     """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy finding to a JSON-safe dict."""
+    # Charset/Entropy finding dataclass fields are exactly the wire keys, so
+    # asdict() avoids a hand-maintained field-by-field transcription that would
+    # silently drop any newly added field.
     if isinstance(r, EntropyFinding):
-        return {
-            "type": "entropy",
-            "field": r.field,
-            "value": r.value,
-            "entropy": r.entropy,
-            "count": r.count,
-            "score": r.score,
-            "direction": r.direction,
-            "lower": r.lower,
-            "upper": r.upper,
-            "first_seen": r.first_seen,
-            "event_id": r.event_id,
-            "event": r.event,
-            "details": r.details,
-        }
+        return {"type": "entropy", **asdict(r)}
     if isinstance(r, CharsetFinding):
-        return {
-            "type": "charset",
-            "field": r.field,
-            "value": r.value,
-            "novel_chars": r.novel_chars,
-            "count": r.count,
-            "score": r.score,
-            "first_seen": r.first_seen,
-            "event_id": r.event_id,
-            "event": r.event,
-            "details": r.details,
-        }
+        return {"type": "charset", **asdict(r)}
     if isinstance(r, ValueFinding):
         return {
             "type": "value_novelty",

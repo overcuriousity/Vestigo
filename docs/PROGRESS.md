@@ -1,6 +1,34 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-07 (session 28 — D3 charset + D5 entropy detectors, M1 enricher fix).
+Last updated: 2026-07-07 (session 29 — PR #75 review fixes).
+
+## Session 29 — 2026-07-07: PR #75 review fixes (D3/D5 + embed-wizard)
+
+Addressed the review findings on the D3/D5 + embed-wizard branch. Correctness/altitude:
+
+- **Charset huge-alphabet guard**: self-baseline mode measured `len(reference)` (non-rare
+  chars only), so a CJK/base64 field where most chars are rare never tripped the
+  `_MAX_CHARSET_SIZE` skip and flooded findings. Now measures the full alphabet
+  (`len(char_counts)`); temporal mode already used the full baseline alphabet.
+- **Charset double scan**: self-baseline ran a second whole-corpus `uniqExact` scan per field
+  just for `n_vals`; folded into the char-counts query via `count() OVER ()`.
+- **Entropy quadratic expression**: per-value `arrayMap(c -> countEqual(chars, c), …)` rescanned
+  the char array per distinct char. Replaced with ClickHouse's linear `entropy()` aggregate over
+  `arrayJoin`-ed characters.
+- **Identifier crowd-out**: `_auto_string_fields` sliced a recommended(categorical)-first list to
+  15, starving identifier fields (the detectors' primary target) on wide sources. Added a reserved
+  identifier quota (`_select_auto_scan_tokens`); the frontend picker mirrors it
+  (`selectAutoScanTokens`) so the "auto" preview matches what runs — previously the picker showed
+  categorical-only and silently dropped identifiers on toggle.
+- **nginx**: `location /api/cases/` captured the multi-GB source-upload endpoint, dropping the
+  300s body/send timeouts to nginx's 60s defaults. Scoped the SSE block to a regex on the exact
+  `/stream` path; reconciled the `client_max_body_size` doc/conf mismatch (2G vs 200G).
+
+Cleanup: dedicated `stat_charset_rarity_floor` config knob; `HEAVY_SCAN_SETTINGS` derived from
+`TS_*` settings (dropped the `_HEAVY_SCAN_SETTINGS` alias); shared `_finalize_findings` tail and
+`_serialize_finding` via `dataclasses.asdict` for the new detectors; frontend `useHealth` hook,
+`fieldsParamOf`/`FindingRowActions`/`useOpenEvent`/`truncate` de-duplication across detector views,
+single reused embed-wizard trigger element, hoisted `RecordingClient` test double.
 
 ## Session 28 — 2026-07-07: charset + entropy detectors (D3/D5), enricher client fix (M1)
 

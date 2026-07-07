@@ -1,10 +1,10 @@
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ShieldAlert } from "lucide-react";
 import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
-import { healthApi } from "@/api/health";
+import { useHealth } from "@/api/health";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { useAuthStore } from "@/stores/auth";
@@ -21,11 +21,7 @@ export function LoginPage() {
   // The health endpoint is unauthenticated and reflects the server's live
   // TS_OIDC_ENABLED setting, unlike a build-time Vite env var, which
   // tsig-web's auto-build never sets — see docs/reviews/PR7-auth-rbac-audit-review.md #6.
-  const { data: health } = useQuery({
-    queryKey: ["health"],
-    queryFn: healthApi.check,
-    staleTime: 60_000,
-  });
+  const { data: health } = useHealth();
   const oidcEnabled = health?.oidc_enabled ?? false;
 
   const { mutate, isPending, error } = useMutation({

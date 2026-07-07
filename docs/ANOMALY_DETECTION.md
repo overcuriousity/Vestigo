@@ -537,7 +537,15 @@ invisible characters are visible in the report.
 - **Auto field selection differs from value novelty:** identifier-kind fields
   (URLs, filenames, user agents — near-unique values) are *included*, since
   that's exactly where injected metacharacters live. Constant and sparse
-  fields stay excluded.
+  fields stay excluded. Within the 15-field auto cap, up to 5 slots are
+  reserved for identifier fields so a source with many categorical columns
+  can't crowd them out (categoricals otherwise sort first); the Fields picker's
+  "auto" preview mirrors this selection.
+- **Tuning:** the rare-character floor is its own setting,
+  `stat_charset_rarity_floor` (`TS_STAT_CHARSET_RARITY_FLOOR`, default 3),
+  separate from value novelty's `stat_rarity_floor` so the two detectors can be
+  tuned independently — they count different things (distinct-values-per-char
+  vs. value occurrences).
 - Rare ≠ malicious, as everywhere: a legitimately imported UTF-8 name and a
   homoglyph attack look identical to this detector. It ranks for triage.
 

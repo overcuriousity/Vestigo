@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # Statistical anomaly detection
     # Maximum occurrence count below which a value is flagged as rare (value_novelty).
     stat_rarity_floor: int = 3
+    # Charset detector's own rarity floor: a character appearing in this many or
+    # fewer *distinct values* is treated as rare (self-baseline mode). Distinct
+    # from stat_rarity_floor (which counts value *occurrences*, not chars) so the
+    # two detectors can be tuned independently; defaults to the same value.
+    stat_charset_rarity_floor: int = 3
     # Z-score threshold for flagging a frequency window as anomalous.
     stat_z_threshold: float = 2.5
     # Number of time buckets for frequency analysis (same math as histogram).
@@ -64,6 +69,12 @@ class Settings(BaseSettings):
     # Minimum backwards jump (seconds) before the timestamp-order detector
     # flags a record — suppresses sub-second logger jitter. 0 = AMiner-strict.
     stat_order_min_skew: float = 1.0
+    # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
+    # clause every heavy GROUP BY carries). Defaults sized for the session-27
+    # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.
+    stat_scan_max_threads: int = 8
+    stat_scan_external_group_by_bytes: int = 4_000_000_000
+    stat_scan_max_memory_bytes: int = 12_000_000_000
 
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP

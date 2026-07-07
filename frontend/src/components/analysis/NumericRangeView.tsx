@@ -8,18 +8,20 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ChevronsRight, Clock, Info, MoveUp, MoveDown } from "lucide-react";
+import { AlertTriangle, Info, MoveUp, MoveDown } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
-import { eventsApi } from "@/api/events";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   FindingShell,
   ModeToggle,
   RefreshButton,
   TagFindingsBar,
+  fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
+  useOpenEvent,
   type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
@@ -58,12 +60,7 @@ function RangeRow({
   onDrillField?: (field: string, value: string) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }) {
-  const openEvent = useMutation({
-    mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id!),
-    onSuccess: (event) => {
-      if (event) onSelectEvent(event);
-    },
-  });
+  const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
 
   const above = finding.direction === "above";
 
@@ -74,33 +71,14 @@ function RangeRow({
         if (finding.event_id) openEvent.mutate();
       }}
       actions={
-        <>
-          {onDrillField && (
-            <button
-              title={`Filter to ${finding.field}=${finding.value}`}
-              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDrillField(finding.field, String(finding.value));
-              }}
-            >
-              <ChevronsRight size={12} />
-            </button>
-          )}
-          {onJumpToTime && (
-            <button
-              title="Jump to this event's time — clears active filters"
-              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-              onClick={(e) => {
-                e.stopPropagation();
-                const ts = finding.event?.timestamp ?? finding.first_seen;
-                if (ts) onJumpToTime(ts, finding.event_id ?? undefined);
-              }}
-            >
-              <Clock size={12} />
-            </button>
-          )}
-        </>
+        <FindingRowActions
+          field={finding.field}
+          value={String(finding.value)}
+          ts={finding.event?.timestamp ?? finding.first_seen}
+          eventId={finding.event_id}
+          onDrillField={onDrillField}
+          onJumpToTime={onJumpToTime}
+        />
       }
     >
       {/* Field + value */}
@@ -154,12 +132,7 @@ export function NumericRangeView({
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
-  const fieldsParam =
-    selectedFields === null
-      ? undefined
-      : selectedFields.length > 0
-        ? selectedFields.join(",")
-        : "__none__";
+  const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["anomalies", caseId, timelineId, "range", mode, fieldsParam ?? "__auto__"],

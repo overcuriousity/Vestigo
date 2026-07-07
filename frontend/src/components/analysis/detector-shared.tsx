@@ -8,15 +8,59 @@
  * drift apart.
  */
 import { useEffect, useState } from "react";
-import type { UseMutationResult } from "@tanstack/react-query";
-import { ChevronDown, ChevronUp, RefreshCw, Tag } from "lucide-react";
+import { useMutation, type UseMutationResult } from "@tanstack/react-query";
+import { ChevronDown, ChevronsRight, ChevronUp, Clock, RefreshCw, Tag } from "lucide-react";
+import { eventsApi } from "@/api/events";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
-import type { AnomaliesResponse, AnomalyMarker, TagAnomaliesResponse } from "@/api/types";
+import type {
+  AnomaliesResponse,
+  AnomalyMarker,
+  Event,
+  TagAnomaliesResponse,
+} from "@/api/types";
 import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
 
 export type DetectorMode = "self" | "temporal";
+
+// Auto-scan field selection for the string detectors (charset/entropy). Mirrors
+// _select_auto_scan_tokens / _MAX_AUTO_SCAN_FIELDS / _AUTO_IDENTIFIER_RESERVE in
+// db/anomaly_stats.py so the picker's "auto" preview matches what the backend
+// actually scans (categorical + identifier fields, with reserved identifier
+// slots) — the two must stay in sync.
+export const AUTO_SCAN_MAX_FIELDS = 15;
+const AUTO_IDENTIFIER_RESERVE = 5;
+
+/**
+ * Blend categorical and identifier field tokens under the auto-scan cap, each
+ * list already best-first. Identifier fields get up to AUTO_IDENTIFIER_RESERVE
+ * reserved slots so a wide categorical set can't crowd them out; each kind
+ * backfills the other's unused slots.
+ */
+export function selectAutoScanTokens(cats: string[], ids: string[]): string[] {
+  const reserve = Math.min(ids.length, AUTO_IDENTIFIER_RESERVE);
+  const picked = cats.slice(0, AUTO_SCAN_MAX_FIELDS - reserve);
+  picked.push(...ids.slice(0, AUTO_SCAN_MAX_FIELDS - picked.length));
+  if (picked.length < AUTO_SCAN_MAX_FIELDS) {
+    for (const t of cats) {
+      if (picked.length >= AUTO_SCAN_MAX_FIELDS) break;
+      if (!picked.includes(t)) picked.push(t);
+    }
+  }
+  return picked;
+}
+
+/**
+ * Encode a field selection for the anomalies API: null → auto (omit the param),
+ * a non-empty set → comma-joined tokens, an empty set → the "__none__" sentinel
+ * the backend recognises as "explicitly scan nothing". Returns undefined for
+ * the auto case so callers can spread it conditionally.
+ */
+export function fieldsParamOf(selectedFields: string[] | null): string | undefined {
+  if (selectedFields === null) return undefined;
+  return selectedFields.length > 0 ? selectedFields.join(",") : "__none__";
+}
 
 /** Self-baseline / temporal pill pair, as used by the rare-values toolbar. */
 export function ModeToggle({
@@ -226,6 +270,72 @@ export function useAnomalyMarkers<T>(
     // avoids a re-fire loop on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [findings]);
+}
+
+/**
+ * Hover-revealed row actions shared by every finding row: drill-to-filter and
+ * jump-to-time. Both are omitted when their handler is absent. `ts` falls back
+ * across the caller (event timestamp, then first_seen).
+ */
+export function FindingRowActions({
+  field,
+  value,
+  ts,
+  eventId,
+  onDrillField,
+  onJumpToTime,
+}: {
+  /** Field/value for the drill button; omit for detectors without one (order). */
+  field?: string;
+  value?: string;
+  ts?: string | null;
+  eventId?: string | null;
+  onDrillField?: (field: string, value: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string) => void;
+}) {
+  return (
+    <>
+      {onDrillField && field !== undefined && value !== undefined && (
+        <button
+          title={`Filter to ${field}=${value}`}
+          className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDrillField(field, value);
+          }}
+        >
+          <ChevronsRight size={12} />
+        </button>
+      )}
+      {onJumpToTime && (
+        <button
+          title="Jump to this event's time — clears active filters"
+          className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (ts) onJumpToTime(ts, eventId ?? undefined);
+          }}
+        >
+          <Clock size={12} />
+        </button>
+      )}
+    </>
+  );
+}
+
+/** Mutation that fetches a finding's full event by id and surfaces it. */
+export function useOpenEvent(
+  caseId: string,
+  timelineId: string,
+  eventId: string | null | undefined,
+  onSelectEvent: (event: Event) => void,
+) {
+  return useMutation({
+    mutationFn: () => eventsApi.getById(caseId, timelineId, eventId!),
+    onSuccess: (event) => {
+      if (event) onSelectEvent(event);
+    },
+  });
 }
 
 /** Publish the active view's persisted run_id, clearing it on unmount. */

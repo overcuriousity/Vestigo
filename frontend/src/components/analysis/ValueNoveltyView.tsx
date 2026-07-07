@@ -7,19 +7,21 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ChevronsRight, Clock, Info } from "lucide-react";
+import { AlertTriangle, Info } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
-import { eventsApi } from "@/api/events";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   FindingShell,
   ModeToggle,
   RefreshButton,
   TagFindingsBar,
+  fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
+  useOpenEvent,
   type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
@@ -64,12 +66,7 @@ function FindingRow({
   // The detector's finding only carries a lightweight, partial "event" stub
   // (missing artifact/tags/attributes/etc.) for bookkeeping — fetch the full
   // event record before handing it to the Event Detail panel.
-  const openEvent = useMutation({
-    mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id!),
-    onSuccess: (event) => {
-      if (event) onSelectEvent(event);
-    },
-  });
+  const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
 
   return (
     <FindingShell
@@ -81,33 +78,14 @@ function FindingRow({
         }
       }}
       actions={
-        <>
-          {onDrillField && (
-            <button
-              title={`Filter to ${finding.field}=${finding.value}`}
-              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDrillField(finding.field, finding.value);
-              }}
-            >
-              <ChevronsRight size={12} />
-            </button>
-          )}
-          {onJumpToTime && (
-            <button
-              title="Jump to this event's time — clears active filters"
-              className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-              onClick={(e) => {
-                e.stopPropagation();
-                const ts = finding.event?.timestamp ?? finding.first_seen;
-                if (ts) onJumpToTime(ts, finding.event_id ?? undefined);
-              }}
-            >
-              <Clock size={12} />
-            </button>
-          )}
-        </>
+        <FindingRowActions
+          field={finding.field}
+          value={finding.value}
+          ts={finding.event?.timestamp ?? finding.first_seen}
+          eventId={finding.event_id}
+          onDrillField={onDrillField}
+          onJumpToTime={onJumpToTime}
+        />
       }
     >
       {/* Field badge + value */}
@@ -164,12 +142,7 @@ export function ValueNoveltyView({
   // auto-selects. [] (explicitly deselected every field) can't be sent as an
   // empty string — the API client drops empty-string params — so it's sent as
   // the reserved "__none__" token, which the backend maps to "scan nothing".
-  const fieldsParam =
-    selectedFields === null
-      ? undefined
-      : selectedFields.length > 0
-        ? selectedFields.join(",")
-        : "__none__";
+  const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["anomalies", caseId, timelineId, "novelty", mode, fieldsParam ?? "__auto__"],

@@ -46,6 +46,21 @@ class FakeClient:
         return FakeQueryResult(result_rows=[], column_names=[])
 
 
+class RecordingClient(FakeClient):
+    """FakeClient that also captures the full SQL text of every query.
+
+    Used by the temporal-mode tests to assert on the baseline/detect clauses.
+    """
+
+    def __init__(self, responses: list[FakeQueryResult]) -> None:
+        super().__init__(responses)
+        self.full_queries: list[str] = []
+
+    def query(self, sql: str, parameters: dict | None = None) -> FakeQueryResult:
+        self.full_queries.append(sql)
+        return super().query(sql, parameters)
+
+
 class FakeClickHouseStore:
     """Minimal ClickHouseStore wrapper using FakeClient."""
 
@@ -1603,7 +1618,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     (external GROUP BY spill + per-query memory cap + thread cap) — a scan
     without it trusts the server-wide limit and can take the box down on a
     300M-row case."""
-    from tracesignal.db.anomaly_stats import _HEAVY_SCAN_SETTINGS
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
 
     class _RecordingClient(FakeClient):
         def __init__(self) -> None:
@@ -1635,7 +1650,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     ]
     assert scans
     for sql in scans:
-        assert _HEAVY_SCAN_SETTINGS in sql, sql[:120]
+        assert HEAVY_SCAN_SETTINGS in sql, sql[:120]
 
 
 # ---------------------------------------------------------------------------
@@ -1654,10 +1669,9 @@ def test_charset_insufficient_when_baseline_too_small():
     """A field with < _MIN_CHARSET_BASELINE distinct values is skipped."""
     responses = [
         FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-        # per-char distinct-value counts
-        FakeQueryResult(result_rows=[("a", 5), ("b", 5)], column_names=["c", "n"]),
-        # uniqExact: only 5 distinct values → below the floor of 20
-        FakeQueryResult(result_rows=[(5,)], column_names=["u"]),
+        # per-char distinct-value counts + the total distinct-value count folded
+        # into the same scan (3rd column). Only 5 distinct values → below floor.
+        FakeQueryResult(result_rows=[("a", 5, 5), ("b", 5, 5)], column_names=["c", "n", "n_vals"]),
     ]
     svc = _svc(responses)
     result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"])
@@ -1667,11 +1681,10 @@ def test_charset_insufficient_when_baseline_too_small():
 def test_charset_skips_huge_alphabet():
     """A reference charset larger than _MAX_CHARSET_SIZE (free text in large
     scripts) is skipped — "novel character" is meaningless there."""
-    big = [(chr(0x4E00 + i), 50) for i in range(5001)]
+    big = [(chr(0x4E00 + i), 50, 80) for i in range(5001)]
     responses = [
         FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-        FakeQueryResult(result_rows=big, column_names=["c", "n"]),
-        FakeQueryResult(result_rows=[(80,)], column_names=["u"]),
+        FakeQueryResult(result_rows=big, column_names=["c", "n", "n_vals"]),
     ]
     svc = _svc(responses)
     result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:msg"])
@@ -1686,9 +1699,12 @@ def test_charset_self_baseline_flags_rare_char():
     fs = datetime(2024, 1, 1, tzinfo=UTC)
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
-        # 'a'/'b' common (90 distinct values each), NUL byte rare (1 value)
-        FakeQueryResult(result_rows=[("a", 90), ("b", 85), ("\x00", 1)], column_names=["c", "n"]),
-        FakeQueryResult(result_rows=[(100,)], column_names=["u"]),
+        # 'a'/'b' common (90/85 distinct values), NUL byte rare (1 value); the
+        # total distinct-value count (100) is folded in as the 3rd column.
+        FakeQueryResult(
+            result_rows=[("a", 90, 100), ("b", 85, 100), ("\x00", 1, 100)],
+            column_names=["c", "n", "n_vals"],
+        ),
         FakeQueryResult(
             result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul")],
             column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
@@ -1718,15 +1734,6 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
 
     from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
 
-    class _RecordingClient(FakeClient):
-        def __init__(self, responses):
-            super().__init__(responses)
-            self.full_queries: list[str] = []
-
-        def query(self, sql, parameters=None):
-            self.full_queries.append(sql)
-            return super().query(sql, parameters)
-
     bl = datetime(2024, 1, 2, tzinfo=UTC)
     fs = datetime(2024, 1, 3, tzinfo=UTC)
     responses = [
@@ -1739,7 +1746,7 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
-    client = _RecordingClient(responses)
+    client = RecordingClient(responses)
     svc.ch = FakeClickHouseStore(FakeClient([]))
     svc.ch.client = client
     result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], baseline_end=bl)
@@ -1760,8 +1767,10 @@ def test_charset_excludes_normal_marked_events_and_limits():
     fs = datetime(2024, 1, 1, tzinfo=UTC)
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
-        FakeQueryResult(result_rows=[("a", 90), ("$", 1), ("%", 1)], column_names=["c", "n"]),
-        FakeQueryResult(result_rows=[(100,)], column_names=["u"]),
+        FakeQueryResult(
+            result_rows=[("a", 90, 100), ("$", 1, 100), ("%", 1, 100)],
+            column_names=["c", "n", "n_vals"],
+        ),
         FakeQueryResult(
             result_rows=[
                 ("x$", ["$"], 1, fs, "evt-drop"),
@@ -1842,15 +1851,6 @@ def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
 
     from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
 
-    class _RecordingClient(FakeClient):
-        def __init__(self, responses):
-            super().__init__(responses)
-            self.full_queries: list[str] = []
-
-        def query(self, sql, parameters=None):
-            self.full_queries.append(sql)
-            return super().query(sql, parameters)
-
     bl = datetime(2024, 1, 2, tzinfo=UTC)
     fs = datetime(2024, 1, 3, tzinfo=UTC)
     responses = [
@@ -1862,7 +1862,7 @@ def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
-    client = _RecordingClient(responses)
+    client = RecordingClient(responses)
     svc.ch = FakeClickHouseStore(FakeClient([]))
     svc.ch.client = client
     result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], baseline_end=bl)

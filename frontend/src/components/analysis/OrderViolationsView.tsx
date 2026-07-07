@@ -8,17 +8,18 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Clock, Info, Rewind } from "lucide-react";
+import { AlertTriangle, Info, Rewind } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
-import { eventsApi } from "@/api/events";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   FindingShell,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
   useDetectorRunId,
+  useOpenEvent,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, TimestampOrderFinding } from "@/api/types";
@@ -62,12 +63,7 @@ function ViolationRow({
   onSelectEvent: (event: Event) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }) {
-  const openEvent = useMutation({
-    mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id),
-    onSuccess: (event) => {
-      if (event) onSelectEvent(event);
-    },
-  });
+  const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
 
   return (
     <FindingShell
@@ -75,18 +71,11 @@ function ViolationRow({
       onClick={() => openEvent.mutate()}
       title={`Event at ${fmtTs(finding.timestamp)} follows a record dated ${fmtTs(finding.prev_timestamp)}`}
       actions={
-        onJumpToTime && (
-          <button
-            title="Jump to this event's time — clears active filters"
-            className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-            onClick={(e) => {
-              e.stopPropagation();
-              onJumpToTime(finding.timestamp, finding.event_id);
-            }}
-          >
-            <Clock size={12} />
-          </button>
-        )
+        <FindingRowActions
+          ts={finding.timestamp}
+          eventId={finding.event_id}
+          onJumpToTime={onJumpToTime}
+        />
       }
     >
       {/* Skew headline */}

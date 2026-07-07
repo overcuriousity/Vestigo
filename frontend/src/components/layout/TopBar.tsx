@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Wifi,
   WifiOff,
@@ -13,7 +13,7 @@ import {
   ShieldCheck,
   LogOut,
 } from "lucide-react";
-import { healthApi } from "@/api/health";
+import { useHealth } from "@/api/health";
 import { authApi } from "@/api/auth";
 import { JobTray } from "./JobTray";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -69,12 +69,7 @@ function DensityToggle() {
 }
 
 function HealthIndicator() {
-  const { data, isError } = useQuery({
-    queryKey: ["health"],
-    queryFn: () => healthApi.check(),
-    refetchInterval: 15_000,
-    retry: false,
-  });
+  const { data, isError } = useHealth();
 
   const connected = !!data && !isError;
 

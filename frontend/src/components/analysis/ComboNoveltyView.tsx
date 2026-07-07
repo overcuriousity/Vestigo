@@ -10,7 +10,6 @@ import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ChevronsRight, Clock, Info } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
-import { eventsApi } from "@/api/events";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
@@ -20,6 +19,7 @@ import {
   TagFindingsBar,
   useAnomalyMarkers,
   useDetectorRunId,
+  useOpenEvent,
   type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
@@ -63,12 +63,7 @@ function ComboRow({
   onJumpToTime?: (ts: string, eventId?: string) => void;
   isFirstSeen: boolean;
 }) {
-  const openEvent = useMutation({
-    mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id!),
-    onSuccess: (event) => {
-      if (event) onSelectEvent(event);
-    },
-  });
+  const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
 
   const pairs = finding.fields.map((fld, i) => [fld, finding.values[i]] as [string, string]);
 

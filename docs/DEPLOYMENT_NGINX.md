@@ -52,13 +52,15 @@ not `http://localhost:8080`.
 
 ## Notes on the proxy config
 
-- `client_max_body_size 2G` — raised from nginx's 1 MiB default; Plaso CSV/JSONL source
-  uploads can be large.
-- The `/api/cases/` location has `proxy_buffering off` — that path serves the SSE live-update
-  stream (`api/routers/stream.py`); buffering would delay/batch events until nginx's buffer
-  fills, defeating the point of a live feed. A 20s server-side keepalive is already built in
-  (`_KEEPALIVE_SECONDS`), so `proxy_read_timeout 3600s` just needs to outlive several
-  keepalives, not be infinite.
+- `client_max_body_size 200G` — raised from nginx's 1 MiB default; Plaso CSV/JSONL source
+  uploads can be large. Lower it to whatever ceiling your largest expected source needs.
+- The SSE live-update stream (`api/routers/stream.py`, `GET /api/cases/{id}/stream`) gets a
+  dedicated regex location with `proxy_buffering off` — buffering would delay/batch events
+  until nginx's buffer fills, defeating the point of a live feed. The location is scoped to
+  the exact `/stream` path (not all of `/api/cases/`) so the large source-upload endpoint
+  keeps the 300s body/send timeouts from `location /` instead of nginx's 60s defaults. A 20s
+  server-side keepalive is already built in (`_KEEPALIVE_SECONDS`), so `proxy_read_timeout
+  3600s` just needs to outlive several keepalives, not be infinite.
 - `X-Forwarded-For` is forwarded for logging only — TraceSignal deliberately does **not**
   trust it for access-control decisions (see comment in `api/routers/auth.py`), since this
   is meant to run on a LAN where the header would otherwise be attacker-controlled.

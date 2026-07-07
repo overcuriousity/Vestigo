@@ -23,6 +23,7 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from "@/components/ui/Popover";
+import { selectAutoScanTokens } from "./detector-shared";
 import { cn } from "@/lib/cn";
 import { anomalyFieldLabel as tokenLabel } from "@/lib/format";
 import type {
@@ -50,6 +51,13 @@ interface Props {
    * many fields as checked so the picker mirrors what really runs.
    */
   autoCount?: number;
+  /**
+   * Auto mode also scans identifier-kind fields, not just recommended
+   * (categorical) ones — the charset/entropy detectors' target. When set, the
+   * auto preview mirrors the backend's categorical+identifier selection
+   * (selectAutoScanTokens) so the checked set matches what actually runs.
+   */
+  autoIncludesIdentifiers?: boolean;
   /** Label for the "reset to backend default" action ("auto" by default). */
   autoLabel?: string;
   /**
@@ -139,6 +147,7 @@ export function AnomalyFieldPicker({
   minSelected,
   maxSelected,
   autoCount,
+  autoIncludesIdentifiers = false,
   autoLabel = "auto",
   numeric = false,
 }: Props) {
@@ -210,8 +219,12 @@ export function AnomalyFieldPicker({
   const effectiveSelected = useMemo(() => {
     if (selected !== null) return new Set(selected);
     const rec = allFields.filter((f) => f.recommended).map((f) => f.token);
+    if (autoIncludesIdentifiers) {
+      const ids = allFields.filter((f) => f.kind === "identifier").map((f) => f.token);
+      return new Set(selectAutoScanTokens(rec, ids));
+    }
     return new Set(autoCount !== undefined ? rec.slice(0, autoCount) : rec);
-  }, [selected, allFields, autoCount]);
+  }, [selected, allFields, autoCount, autoIncludesIdentifiers]);
 
   const toggle = (token: string) => {
     // Materialise the current effective set and toggle one token. Dropping
