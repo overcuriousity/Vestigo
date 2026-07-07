@@ -1,0 +1,16 @@
+<!-- ClickHouse server images >= ~25.x ship a users.d/default-user.xml that
+     restricts the `default` user to localhost, which blocks the app container
+     connecting over the compose bridge network (REQUIRED_PASSWORD/194).
+     This override restores the pre-25 reference-deployment behavior: the
+     `default` user is reachable from the compose network. Host exposure is
+     still limited by the compose port bindings (127.0.0.1 only). Replace with
+     a dedicated user + password for any shared deployment. -->
+<clickhouse>
+  <users>
+    <default>
+      <networks replace="replace">
+        <ip>::/0</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>

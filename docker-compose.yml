@@ -36,6 +36,10 @@ services:
       - "127.0.0.1:9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      # >= 25.x images restrict the `default` user to localhost — see the
+      # comment in the mounted file.
+      # (`z` = SELinux relabel for rootless podman on Fedora; harmless on Docker)
+      - ./deploy/clickhouse/allow-default-network.xml:/etc/clickhouse-server/users.d/zz-allow-default-network.xml:ro,z
     healthcheck:
       # clickhouse-client is bundled in the image and always present, unlike
       # wget/curl which vary across the alpine base and gave false negatives.
