@@ -1214,3 +1214,71 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
     assert "boom" in job_store.get(job2.id).error
     assert await store.list_orphaned_enrichment_job_runs() == []
     assert get_active_enricher_run("t1", "stub-broken") is None
+
+
+@pytest.mark.asyncio
+async def test_eligibility_fanout_builds_one_clickhouse_store_per_check(store, monkeypatch):
+    # clickhouse_connect clients are not thread-safe — the enrichers-list
+    # endpoint must construct a fresh ClickHouseStore inside each threadpool
+    # eligibility check instead of sharing one client across the gather fan-out.
+    from tracesignal.api import deps
+    from tracesignal.api.routers.cases import list_timeline_enrichers
+    from tracesignal.enrichers import registry
+    from tracesignal.enrichers.base import EligibilityResult, Enricher
+
+    seen_stores: list[object] = []
+
+    class _CountingStub(Enricher):
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = ".*"
+        output_fields = ("x",)
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def check_eligibility(self, ch_store, case_id, source_ids):
+            seen_stores.append(ch_store)
+            return EligibilityResult(eligible=True, sample_checked=1, sample_matched=1)
+
+        def enrich_value(self, raw_value):
+            return None
+
+    class StubA(_CountingStub):
+        key = "stub-fanout-a"
+
+    class StubB(_CountingStub):
+        key = "stub-fanout-b"
+
+    # Isolate the module-global registry: stubs registered by other tests would
+    # otherwise join the fan-out and hit the fake store with real queries.
+    monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.setattr(registry, "_AVAILABILITY_CACHE", {})
+    registry.register(StubA())
+    registry.register(StubB())
+    registry.refresh_availability()
+    monkeypatch.setattr(deps, "_store", store)
+
+    created = 0
+
+    class _FakeStore:
+        pass
+
+    def _make_store():
+        nonlocal created
+        created += 1
+        return _FakeStore()
+
+    monkeypatch.setattr("tracesignal.api.routers.cases.ClickHouseStore", _make_store)
+
+    case = await store.create_case("cf", "Fanout Case")
+    timeline = await store.create_timeline("cf", "tf", "Fanout Timeline")
+
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+
+    keys = {e["key"] for e in res["enrichers"]}
+    assert {"stub-fanout-a", "stub-fanout-b"} <= keys
+    # One store per registered available enricher's check, none shared.
+    assert created == 2
+    assert len(seen_stores) == 2
+    assert seen_stores[0] is not seen_stores[1]

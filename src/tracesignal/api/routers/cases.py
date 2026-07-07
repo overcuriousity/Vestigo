@@ -1386,20 +1386,23 @@ async def list_timeline_enrichers(
         c.enricher_key: c.auto_run_default for c in await store.list_enricher_global_configs()
     }
 
-    clickhouse = ClickHouseStore()
     available = [
         enricher
         for enricher in all_enrichers()
         if (availability := get_cached_availability(enricher.key)) is not None
         and availability.available
     ]
+
     # Each eligibility check is a ClickHouse scan; run them concurrently so
     # dialog latency stays flat as more enrichers get registered.
+    # clickhouse_connect clients are not thread-safe, so each check builds its
+    # own ClickHouseStore inside its worker thread instead of sharing one
+    # client across the fan-out.
+    def _check_one(enricher):
+        return enricher.check_eligibility(ClickHouseStore(), case_id, ready_source_ids)
+
     eligibilities = await asyncio.gather(
-        *(
-            run_in_threadpool(enricher.check_eligibility, clickhouse, case_id, ready_source_ids)
-            for enricher in available
-        )
+        *(run_in_threadpool(_check_one, enricher) for enricher in available)
     )
     result = []
     for enricher, eligibility in zip(available, eligibilities, strict=True):
