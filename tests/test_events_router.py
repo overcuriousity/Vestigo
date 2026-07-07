@@ -1073,3 +1073,24 @@ async def test_get_detector_run_endpoint_404s_for_unknown_id(timeline_setup):
     with pytest.raises(HTTPException) as exc_info:
         await events.get_detector_run("c1", "no-such-run", case=Case(id="c1"))
     assert exc_info.value.status_code == 404
+
+
+def test_field_encoder_caches_load_failure(monkeypatch):
+    """A failed model load is cached — a broken/missing local model must not
+    re-attempt a multi-second load (or a network download) on every wizard
+    open."""
+    import tracesignal.models.embeddings as emb_mod
+
+    attempts: list[int] = []
+
+    class _BrokenModel:
+        def __init__(self):
+            attempts.append(1)
+            raise RuntimeError("weights not cached")
+
+    monkeypatch.setattr(emb_mod, "EmbeddingModel", _BrokenModel)
+    monkeypatch.setattr(events, "_embedding_model", None)
+
+    assert events._get_field_encoder() is None
+    assert events._get_field_encoder() is None
+    assert len(attempts) == 1

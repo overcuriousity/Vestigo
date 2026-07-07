@@ -113,6 +113,7 @@ from tracesignal.db._dt import (
     is_null_ts_sentinel,
     to_clickhouse_utc,
 )
+from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 
@@ -442,17 +443,9 @@ def _freq_finding(
     )
 
 
-# Shared guardrails for every whole-corpus detector scan (GROUP BY over up to
-# hundreds of millions of rows): spill large aggregation states to disk
-# instead of ballooning RAM, cap the query's memory hard (fail one query, not
-# the server), and bound thread fan-out so several concurrent detector scans
-# don't oversubscribe the box. Values match the field-inventory scan that
-# first needed them.
-_HEAVY_SCAN_SETTINGS = (
-    "SETTINGS max_threads = 8, "
-    "max_bytes_before_external_group_by = 4000000000, "
-    "max_memory_usage = 12000000000"
-)
+# Shared guardrails for every whole-corpus detector scan — see db/_scan.py
+# (single home, also used by the embedding-wizard inventory scan).
+_HEAVY_SCAN_SETTINGS = HEAVY_SCAN_SETTINGS
 
 
 def _stub_event(evt_id: str | None, case_id: str, first_seen: str | None) -> dict[str, Any] | None:

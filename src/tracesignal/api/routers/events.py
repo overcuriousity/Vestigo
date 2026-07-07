@@ -63,15 +63,23 @@ def _get_query_service() -> EventQueryService:
     return _query_service
 
 
+# None = never tried, False = load failed (cached — a broken/missing local
+# model must not re-attempt a multi-second load, or worse a network download,
+# on every wizard open), EmbeddingModel = loaded.
 _embedding_model: Any = None
 
 
 def _get_field_encoder() -> Any:
     """Return the embedding ``encode`` callable for wizard field pairing.
 
-    Cached across calls so the model loads at most once.  Returns ``None`` when
-    the model cannot be loaded (e.g. airgapped without cached weights), which
-    degrades the wizard gracefully to heuristic-only recommendations.
+    Cached across calls — success *and* failure — so the model loads at most
+    once per process. Returns ``None`` when the model cannot be loaded (e.g.
+    airgapped without cached weights), which degrades the wizard gracefully to
+    heuristic-only recommendations.
+
+    Loading a local sentence-transformer takes seconds (or attempts a network
+    download when ``TS_ALLOW_ONLINE`` is set and weights are uncached) — this
+    must only ever be called from a worker thread, never on the event loop.
     """
     global _embedding_model  # noqa: PLW0603
     if _embedding_model is None:
@@ -88,7 +96,9 @@ def _get_field_encoder() -> Any:
                 model.load()
             _embedding_model = model
         except Exception:  # noqa: BLE001
-            return None
+            _embedding_model = False
+    if _embedding_model is False:
+        return None
     return _embedding_model.encode
 
 
@@ -852,8 +862,11 @@ async def list_embedding_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
+    # _get_field_encoder() may load the local embedding model (seconds, or a
+    # network fetch on a misconfigured install) — resolve it inside the worker
+    # thread, not on the event loop as an argument expression would.
     return await run_in_threadpool(
-        service.list_fields_by_artifact, case_id, source_ids, encode=_get_field_encoder()
+        lambda: service.list_fields_by_artifact(case_id, source_ids, encode=_get_field_encoder())
     )
 
 
@@ -870,8 +883,10 @@ async def list_source_embedding_fields(
     recommender; field pairing degrades to heuristic-only if the model can't load.
     """
     service = _get_query_service()
+    # Same event-loop rule as the timeline-scoped endpoint above: the encoder
+    # is resolved inside the worker thread.
     return await run_in_threadpool(
-        service.list_fields_by_artifact, case_id, [source_id], encode=_get_field_encoder()
+        lambda: service.list_fields_by_artifact(case_id, [source_id], encode=_get_field_encoder())
     )
 
 

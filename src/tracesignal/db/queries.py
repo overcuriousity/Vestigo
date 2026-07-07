@@ -28,6 +28,7 @@ from tracesignal.db._dt import (
     is_null_ts_sentinel,
     to_clickhouse_utc,
 )
+from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import (
     apply_mappings_to_attribute_keys,
@@ -1107,6 +1108,7 @@ class EventQueryService:
             WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
             GROUP BY artifact
             ORDER BY n DESC
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=params,
         )
@@ -1133,6 +1135,7 @@ class EventQueryService:
                 )
             )
             WHERE _rn <= {{per:UInt32}}
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=params,
         )

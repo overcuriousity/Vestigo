@@ -1713,3 +1713,17 @@ def test_guard_encoder_passes_through_success_and_none() -> None:
     guarded = _guard_encoder(ok)
     assert guarded is not None
     assert guarded(["a", "b"]) == [[1.0, 0.0], [1.0, 0.0]]
+
+
+def test_embedding_wizard_scans_carry_memory_settings(service):
+    """Both wizard scans (artifact inventory reading the attributes map, and
+    the randomized sample) are whole-corpus queries and must carry the shared
+    heavy-scan SETTINGS clause (see db/_scan.py)."""
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
+    service.list_fields_by_artifact("case", ["s1"], encode=None)
+    queries = [q for q, _ in service.store.client.queries]
+    scans = [q for q in queries if "GROUP BY artifact" in q or "_rn" in q]
+    assert len(scans) == 2
+    for q in scans:
+        assert HEAVY_SCAN_SETTINGS in q
