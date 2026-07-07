@@ -111,6 +111,61 @@ High value first:
 Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — z-score `frequency` detector
 covers most of it and stays explainable).
 
+## Milestone 5 — post-mortem workflow parity (Timesketch-inspired, 2026-07-07 gap review)
+
+Gap analysis vs. Timesketch's researcher-loved features and generic forensic-platform
+expectations. Ordered: easy+high value first, then easy+low value, then hard+high value.
+
+Easy, high value:
+
+- [ ] **W1 — Context query ("neighbors").** Button on an event (detail panel / grid row) that
+  pivots to all events across the timeline within ±N minutes of that event's timestamp,
+  regardless of source. One endpoint reusing the existing events-view filter path (time-window
+  filter around anchor timestamp) + UI affordance in `EventDetailPanel`. The single most
+  common analyst move after finding a hit.
+- [ ] **W2 — Per-source clock-skew correction.** Compromised/misconfigured hosts drift; master
+  timeline lies without correction. Add `time_offset_seconds` to Source (Postgres), applied at
+  **query time** (never mutate ingested events — evidence stays raw; offset is analyst-declared
+  metadata and must appear in the audit trail and any export manifest). Applies to explorer,
+  histogram, detectors, exports uniformly — route through the shared filter/query path.
+- [ ] **W3 — Audit coverage for analyst actions.** `record_audit` currently fires only in
+  auth/admin/cases routers. Extend to the actions that matter for "who discovered/extracted
+  what": event **exports** (with filter set + row count), **bulk annotation** operations, and
+  **anomaly run** launches (detector + params). Deliberately not per-page `list_events` calls —
+  query-level logging at browsing granularity is noise, not custody.
+
+Easy, low value (deferred, revisit on demand):
+
+- [ ] **W4 — Python client library.** REST API + `tsig` CLI exist; a thin typed client for
+  Jupyter/pandas workflows is cheap but no user has asked yet.
+
+Hard, high value:
+
+- [ ] **W5 — Sigma rule runner.** Background job evaluating Sigma rules (offline YAML,
+  airgap-friendly) over ClickHouse, writing hits as `Annotation(origin=system)` with the rule
+  id/title as tag — lands in the existing annotation/tag filter UI for free. Canonical field
+  mappings are the natural hook for Sigma's field taxonomy. Needs a Sigma-to-ClickHouse-SQL
+  backend (pySigma has a generic backend model). Strongest single DFIR-adoption lever.
+- [ ] **W6 — Log template clustering (Drain-style).** Collapse structurally identical lines
+  into templates so 50M repeats of one error can be muted and the one odd line surfaces.
+  Deterministic and SQL-explainable beats embeddings here: start with a ClickHouse-side
+  normalization pass (digits/hex/UUID masked, group by normalized message), evaluate Drain3
+  (offline, pure Python) if that proves too coarse. Complements, not replaces, the embedding
+  pipeline.
+- [ ] **W8 — Query-time field extraction (schema-on-read, read half).** Define a virtual
+  field as a regex capture over a raw attribute (usually `message`), then facet, histogram,
+  and run detectors on it without re-ingest — Splunk `rex` / ES runtime fields, but forensically
+  cleaner: the extraction pattern is declared, auditable metadata and raw events stay
+  untouched. Natural extension of the field-mappings path (canonical field = regex extraction
+  instead of only key rename) via ClickHouse `extractGroups()`; detectors consume it through
+  the existing `_col_expr` field-expression mechanism. Prerequisite for making bespoke
+  unstructured logs first-class; a raw-line ingestion mode (timestamp-only parsing) would be
+  the companion write half, deliberately not scheduled yet.
+- [ ] **W7 — Stories (investigative notebook).** Markdown document per case embedding live
+  references to saved Views, charts, and tagged events — the report writes itself during the
+  investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is
+  mostly a new Postgres model + frontend editor. Timesketch's most-loved feature.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
