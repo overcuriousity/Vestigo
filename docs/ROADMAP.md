@@ -97,6 +97,17 @@ High value first:
   implication rules "value A is followed by value B within Δt", flag violations in the detect
   window. Highest analytical payoff, heaviest lift (rule mining + hypothesis testing) — last.
 
+- [ ] **D11 — Value-level allowlist ("mark value as normal")** (AMiner whitelist rules): the
+  existing "normal" annotation suppresses one representative *event*'s finding but never
+  teaches the detector — the same rare value on another event is re-flagged, so noisy-but-known
+  values need finding-by-finding suppression. Add per-timeline (or per-case) allowlist entries
+  keyed `(detector, field, value)` — created from a finding's "not an anomaly, ever" action —
+  consumed as an exclusion in the detectors' finding assembly (post-detection filter like
+  `exclude_event_ids`, or SQL `NOT IN` pre-limit). Entries are analyst-declared metadata:
+  Postgres rows with `created_by`, surfaced in the methodology panel and audited, so a
+  suppressed detection stays explainable. Baselines stay untouched — this filters findings,
+  never re-weights evidence.
+
 Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — z-score `frequency` detector
 covers most of it and stays explainable).
 
