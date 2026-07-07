@@ -951,15 +951,6 @@ class StatisticalAnomalyService:
         method = "self-baseline" if baseline_end is None else "temporal"
 
         total_events = self._count_events(case_id, source_ids)
-
-        if fields is not None:
-            combo_fields = fields
-        else:
-            rec = self.recommend_novelty_fields(
-                case_id, source_ids, total=total_events, field_mappings=field_mappings
-            )
-            combo_fields = [f.token for f in rec if f.recommended][:2]
-
         if total_events == 0:
             return StatAnomalyResult(
                 status="no_data",
@@ -967,6 +958,16 @@ class StatisticalAnomalyService:
                 method=method,
                 baseline_size=0,
             )
+
+        # Field resolution (auto mode) issues live queries — only after the
+        # empty-corpus short-circuit above.
+        if fields is not None:
+            combo_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id, source_ids, total=total_events, field_mappings=field_mappings
+            )
+            combo_fields = [f.token for f in rec if f.recommended][:2]
 
         if len(combo_fields) < 2:
             if fields is not None:
@@ -1291,7 +1292,11 @@ class StatisticalAnomalyService:
             detect_clause = ""
             if baseline_end is not None:
                 viol_params["bl"] = bl_str
-                detect_clause = " AND timestamp >= {bl:String}"
+                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
+                # sentinel) and would otherwise attribute an undated event's
+                # numeric value to the detect window. Matches the sentinel guard
+                # value_combo/frequency apply.
+                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
             viol_sql = f"""
                 SELECT
                     num AS val,
@@ -1772,6 +1777,7 @@ class StatisticalAnomalyService:
                 maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
             FROM ({inner})
             GROUP BY source_id
+            {_HEAVY_SCAN_SETTINGS}
         """
         summary_rows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
         source_summary: dict[str, tuple[int, float]] = {
@@ -1796,6 +1802,7 @@ class StatisticalAnomalyService:
             WHERE skew >= {{skew:Float64}}
             ORDER BY skew DESC, source_id, byte_offset
             LIMIT {{lim:UInt32}}
+            {_HEAVY_SCAN_SETTINGS}
         """
         rows = self.ch.client.query(detail_sql, parameters=detail_params).result_rows
 

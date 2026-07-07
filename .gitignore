@@ -20,6 +20,10 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 
+# Claude Code local config + temp files
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*
+
 # IDE
 .vscode/
 .idea/
