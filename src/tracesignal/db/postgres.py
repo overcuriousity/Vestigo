@@ -6,6 +6,7 @@ import logging
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
@@ -856,6 +857,65 @@ class AuditLog(Base):
         }
 
 
+def _pre_alembic_fixups(sync_conn: Any) -> None:
+    """One-time schema normalization for databases that predate Alembic.
+
+    Runs exactly once per database, immediately before it is stamped at
+    revision ``0001`` (see :py:meth:`PostgresStore.init_schema`). These are
+    the additive fixups the old ``init_schema`` applied on every startup;
+    they bring a pre-Alembic database to the shape revision ``0001``
+    describes. A pre-Alembic database is assumed to have been running a
+    recent build (all tables present — true for the production deployment);
+    older pre-release databases were already documented as deprecated.
+
+    Never add to this function — new schema changes are Alembic revisions.
+    """
+    insp = inspect(sync_conn)
+    tables = set(insp.get_table_names())
+    # Destructive staging-format migration (roadmap M16): the legacy
+    # row-per-(event, attr, output_field) staging table (recognized by its
+    # `field_key` column) is replaced by row-per-(job, event); staged rows
+    # are transient in-flight state, safe to discard.
+    if "enrichment_results_staging" in tables and any(
+        col["name"] == "field_key" for col in insp.get_columns("enrichment_results_staging")
+    ):
+        sync_conn.execute(text("DROP TABLE enrichment_results_staging"))
+        # Recreate in the current shape immediately (the old path relied on a
+        # subsequent create_all; revision 0001 is skipped on stamped databases).
+        Base.metadata.tables["enrichment_results_staging"].create(sync_conn)
+    annotation_columns = {col["name"] for col in insp.get_columns("annotations")}
+    for column, ddl in (
+        ("pinned", "ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false"),
+        ("detector", "ALTER TABLE annotations ADD COLUMN detector VARCHAR(32)"),
+    ):
+        if column not in annotation_columns:
+            sync_conn.execute(text(ddl))
+    timeline_columns = {col["name"] for col in insp.get_columns("timelines")}
+    if "field_mappings" not in timeline_columns:
+        sync_conn.execute(text("ALTER TABLE timelines ADD COLUMN field_mappings JSON"))
+    user_columns = {col["name"] for col in insp.get_columns("users")}
+    if "onboarding_completed" not in user_columns:
+        sync_conn.execute(
+            text(
+                "ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT false"
+            )
+        )
+    source_columns = {col["name"] for col in insp.get_columns("sources")}
+    if "status" not in source_columns:
+        # Existing rows predate the ingest-status lifecycle and are by
+        # definition fully ingested, so they backfill to 'ready'.
+        sync_conn.execute(
+            text("ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'")
+        )
+    if sync_conn.dialect.name == "postgresql":
+        size_bytes_type = next(
+            col["type"] for col in insp.get_columns("sources") if col["name"] == "size_bytes"
+        )
+        if str(size_bytes_type) == "INTEGER":
+            # Files bigger than 2 GiB (int4 max) overflowed this column.
+            sync_conn.execute(text("ALTER TABLE sources ALTER COLUMN size_bytes TYPE BIGINT"))
+
+
 class PostgresStore:
     """Async PostgreSQL store for metadata."""
 
@@ -869,103 +929,38 @@ class PostgresStore:
         )
 
     async def init_schema(self) -> None:
-        """Create metadata tables if they do not exist, then apply additive migrations.
+        """Bring the metadata schema to the current Alembic head.
 
-        ``create_all`` only creates missing tables — it never adds columns to
-        a table that already exists, so any model field added after a
-        table's first creation must be migrated explicitly below. Column
-        presence is checked via the dialect-agnostic inspector rather than
-        ``ADD COLUMN IF NOT EXISTS``, since SQLite (used in tests) doesn't
-        support that clause.
+        Schema management is Alembic-driven (``src/tracesignal/db/migrations``);
+        this replaces the former ``create_all`` + hand-rolled inspector-ALTER
+        approach. Two paths:
+
+        - **Fresh database** (no tables): ``upgrade head`` creates everything.
+        - **Pre-Alembic database** (tables exist, no ``alembic_version``):
+          the legacy inspector-based fixups run one last time to normalize
+          the schema to what revision ``0001`` describes, the database is
+          stamped at ``0001``, then upgraded to head. No manual deploy step.
+
+        New schema changes must be Alembic revisions
+        (``uv run alembic revision --autogenerate``), never inspector ALTERs.
         """
+
+        def _upgrade(sync_conn: Any) -> None:
+            from alembic import command
+            from alembic.config import Config
+
+            script_location = str(Path(__file__).parent / "migrations")
+            cfg = Config()
+            cfg.set_main_option("script_location", script_location)
+            cfg.attributes["connection"] = sync_conn
+            tables = set(inspect(sync_conn).get_table_names())
+            if "cases" in tables and "alembic_version" not in tables:
+                _pre_alembic_fixups(sync_conn)
+                command.stamp(cfg, "0001")
+            command.upgrade(cfg, "head")
+
         async with self.engine.begin() as conn:
-            # Destructive staging-format migration (roadmap M16): the legacy
-            # row-per-(event, attr, output_field) staging table (recognized by
-            # its `field_key` column) is replaced by row-per-(job, event) with
-            # a `fields` JSON map. Staged rows are transient in-flight state;
-            # any orphaned rows from a crashed pre-upgrade run are discarded —
-            # pre-release databases are documented as deprecated (same stance
-            # as the `event_enrichments` drop on the ClickHouse side), and a
-            # re-run of the enricher regenerates the data.
-            legacy_staging = await conn.run_sync(
-                lambda sync_conn: (
-                    "enrichment_results_staging" in inspect(sync_conn).get_table_names()
-                    and any(
-                        col["name"] == "field_key"
-                        for col in inspect(sync_conn).get_columns("enrichment_results_staging")
-                    )
-                )
-            )
-            if legacy_staging:
-                await conn.execute(text("DROP TABLE enrichment_results_staging"))
-            await conn.run_sync(Base.metadata.create_all)
-            existing_columns = await conn.run_sync(
-                lambda sync_conn: {
-                    col["name"] for col in inspect(sync_conn).get_columns("annotations")
-                }
-            )
-            for column, ddl in (
-                (
-                    "pinned",
-                    "ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false",
-                ),
-                ("detector", "ALTER TABLE annotations ADD COLUMN detector VARCHAR(32)"),
-            ):
-                if column not in existing_columns:
-                    await conn.execute(text(ddl))
-            timeline_columns = await conn.run_sync(
-                lambda sync_conn: {
-                    col["name"] for col in inspect(sync_conn).get_columns("timelines")
-                }
-            )
-            if "field_mappings" not in timeline_columns:
-                await conn.execute(text("ALTER TABLE timelines ADD COLUMN field_mappings JSON"))
-            source_columns = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("sources")}
-            )
-            user_columns = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("users")}
-            )
-            if "onboarding_completed" not in user_columns:
-                # Existing users backfill to false: everyone sees the (skippable)
-                # onboarding tour once after this feature lands.
-                await conn.execute(
-                    text(
-                        "ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT false"
-                    )
-                )
-            if "status" not in source_columns:
-                # Existing rows predate the ingest-status lifecycle and are by
-                # definition fully ingested, so they backfill to 'ready'.
-                await conn.execute(
-                    text(
-                        "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
-                    )
-                )
-            if conn.dialect.name == "postgresql":
-                size_bytes_type = await conn.run_sync(
-                    lambda sync_conn: next(
-                        col["type"]
-                        for col in inspect(sync_conn).get_columns("sources")
-                        if col["name"] == "size_bytes"
-                    )
-                )
-                if str(size_bytes_type) == "INTEGER":
-                    # Files bigger than 2 GiB (int4 max) overflowed this column
-                    # on insert. Existing databases created before this fix
-                    # need the column widened to int8 in place.
-                    await conn.execute(
-                        text("ALTER TABLE sources ALTER COLUMN size_bytes TYPE BIGINT")
-                    )
-            # (The former enricher_config_hash ADD COLUMN for the staging
-            # table is gone: the M16 drop-and-recreate above guarantees the
-            # current shape.)
-            # No migration for the earlier `annotation_type="outlier"` rows
-            # (renamed to "anomaly" when the statistical anomaly engine
-            # landed): no releases exist yet and pre-this-branch databases
-            # are already documented as deprecated, so a stale-value UPDATE
-            # isn't worth carrying. Revisit if in-place upgrades from a
-            # pre-anomaly-engine database ever need to be supported.
+            await conn.run_sync(_upgrade)
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""

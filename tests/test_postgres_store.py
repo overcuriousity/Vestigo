@@ -172,3 +172,54 @@ async def test_saved_chart_rename_and_delete_scoped_by_timeline(store):
     assert await store.rename_saved_chart("c1", "t2", "chart1", "New") is None
     assert await store.delete_saved_chart("c1", "t2", "chart1") is False
     assert await store.list_saved_charts("c1", "t1") != []
+
+
+# ---------------------------------------------------------------------------
+# Alembic schema management (init_schema paths)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_init_schema_fresh_db_reaches_alembic_head(tmp_path):
+    """A fresh database is created entirely by `alembic upgrade head`."""
+    from sqlalchemy import inspect, text
+
+    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/fresh.db")
+    await s.init_schema()
+    async with s.engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+    assert "cases" in tables and "detector_runs" in tables and "annotations" in tables
+    assert version is not None
+    # Idempotent: a second startup is a no-op.
+    await s.init_schema()
+    await s.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_schema_adopts_pre_alembic_db(tmp_path):
+    """A database created by the old create_all path (no alembic_version) is
+    normalized by the legacy fixups, stamped at 0001, then upgraded."""
+    from sqlalchemy import inspect, text
+
+    from tracesignal.db.postgres import Base
+
+    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/legacy.db")
+    async with s.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Simulate a database from before two of the hand-rolled ALTERs.
+        await conn.execute(text("ALTER TABLE annotations DROP COLUMN pinned"))
+        await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
+    await s.init_schema()
+    async with s.engine.begin() as conn:
+        version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+        ann_cols = await conn.run_sync(
+            lambda c: {col["name"] for col in inspect(c).get_columns("annotations")}
+        )
+        user_cols = await conn.run_sync(
+            lambda c: {col["name"] for col in inspect(c).get_columns("users")}
+        )
+    assert version is not None
+    assert "pinned" in ann_cols
+    assert "onboarding_completed" in user_cols
+    await s.engine.dispose()

@@ -352,12 +352,20 @@ def test_process_batch_emits_one_row_per_event_with_field_map():
 async def test_init_schema_drops_legacy_staging_table(tmp_path):
     """M16 destructive migration: a legacy row-per-field staging table
     (recognized by its field_key column) is dropped and recreated in the
-    row-per-(job, event) shape; orphaned pre-upgrade rows are discarded."""
+    row-per-(job, event) shape; orphaned pre-upgrade rows are discarded.
+
+    Simulates a realistic pre-Alembic database: full create_all schema (so
+    init_schema takes the adoption path) with the staging table swapped for
+    its legacy row-per-field shape."""
     from sqlalchemy import text
+
+    from tracesignal.db.postgres import Base
 
     db_path = tmp_path / "legacy_staging.db"
     s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
     async with s.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(
                 "CREATE TABLE enrichment_results_staging ("
