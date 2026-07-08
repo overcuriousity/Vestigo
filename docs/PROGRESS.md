@@ -1,6 +1,17 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 33 — UX polish sweep, issue #74).
+Last updated: 2026-07-08 (session 34 — fast nginx ingestion plan).
+
+## Session 34 — 2026-07-08: Fast end-to-end ingestion plan (nginx access logs)
+
+Planning only, no code changed. A 50GiB nginx access log currently has to be pre-converted with
+the vendored `nginx2timesketch.py` into a 150GiB+ CSV before it can even be uploaded, then
+re-parsed single-threaded and inserted row-by-row into ClickHouse. Wrote a full design for
+removing that bottleneck: bulk Arrow-based ClickHouse inserts (`insert_events`/
+`insert_events_arrow`), a native parallel (multiprocess) nginx parser that ingests the raw log
+directly — fixing `Source.file_hash`/`byte_offset` to point at the real evidence file instead of
+a converted derivative — and a fix for the upload-receive double file-copy. Full design in
+`docs/archive/PLAN_FAST_NGINX_INGESTION.md`; condensed pointers added to `docs/ROADMAP.md` M20/W8.
 
 ## Session 33 — 2026-07-08: UX polish sweep (issue #74 "fantastic UX")
 
