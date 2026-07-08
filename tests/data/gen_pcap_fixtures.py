@@ -36,7 +36,9 @@ def ipv4(src_ip: bytes, dst_ip: bytes, protocol: int, payload: bytes, ip_id: int
     return header + payload
 
 
-def tcp(src_port: int, dst_port: int, seq: int, ack: int, flags: int, payload: bytes = b"") -> bytes:
+def tcp(
+    src_port: int, dst_port: int, seq: int, ack: int, flags: int, payload: bytes = b""
+) -> bytes:
     data_offset = 5 << 4
     header = struct.pack(
         ">HHIIBBHHH",
@@ -119,9 +121,7 @@ def write_pcapng(path: Path, frames: list[bytes]) -> None:
         this_ts = ts_us + i * 1_000_000
         ts_high = this_ts >> 32
         ts_low = this_ts & 0xFFFFFFFF
-        epb_body = struct.pack(
-            "<IIIII", 0, ts_high, ts_low, len(frame), len(frame)
-        ) + frame
+        epb_body = struct.pack("<IIIII", 0, ts_high, ts_low, len(frame), len(frame)) + frame
         pad = (-len(epb_body)) % 4
         epb_body += b"\x00" * pad
         packets += block(6, epb_body)

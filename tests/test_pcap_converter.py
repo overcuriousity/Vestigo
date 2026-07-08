@@ -96,7 +96,9 @@ class TestClassicPcap:
         pf = _convert(converter, DATA / "sample.pcap", tmp_path / "out.parquet")
         for row in pf.read().to_pylist():
             offset = row["byte_offset"]
-            _ts_sec, _ts_frac, incl_len, _orig_len = struct.unpack("<IIII", raw[offset : offset + 16])
+            _ts_sec, _ts_frac, incl_len, _orig_len = struct.unpack(
+                "<IIII", raw[offset : offset + 16]
+            )
             record_bytes = raw[offset : offset + 16 + incl_len]
             assert hashlib.sha256(record_bytes).hexdigest() == row["content_hash"]
 
