@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { BarChart2, Filter } from "lucide-react";
+import { BarChart2, Filter, FilterX } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -236,14 +236,24 @@ export function FieldHistogramModal({
                         </button>
                       </Tooltip>
                       {onAddFilter && (
-                        <Tooltip content={`Filter IN: ${fieldKey} = ${v.value}`} side="top">
-                          <button
-                            className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-info)] hover:bg-[var(--color-info-dim)]"
-                            onClick={() => onAddFilter(fieldKey, v.value, true)}
-                          >
-                            <Filter size={11} />
-                          </button>
-                        </Tooltip>
+                        <>
+                          <Tooltip content={`Filter IN: ${fieldKey} = ${v.value}`} side="top">
+                            <button
+                              className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-info)] hover:bg-[var(--color-info-dim)]"
+                              onClick={() => onAddFilter(fieldKey, v.value, true)}
+                            >
+                              <Filter size={11} />
+                            </button>
+                          </Tooltip>
+                          <Tooltip content={`Filter OUT: ${fieldKey} ≠ ${v.value}`} side="top">
+                            <button
+                              className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)]"
+                              onClick={() => onAddFilter(fieldKey, v.value, false)}
+                            >
+                              <FilterX size={11} />
+                            </button>
+                          </Tooltip>
+                        </>
                       )}
                     </li>
                   ))}

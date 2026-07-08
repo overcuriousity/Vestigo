@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     # Enrichers: where admin-uploaded enricher assets (e.g. the MaxMind
     # GeoLite2 database) are stored.
     enricher_data_path: str = "data/enrichers"
+    # Events read per ClickHouse round-trip while an enrichment job scans a
+    # source. Enrichment is I/O/round-trip bound, not model-bound like
+    # embedding — every event must be scanned and matched regardless of how
+    # many carry an enrichable value — so this pages far larger than the
+    # embedding batch (default matches ingest_batch_size). On a 180M-event
+    # timeline the difference is ~9k vs ~180k HTTP round-trips. Kept separate
+    # from embedding_batch_size (memory-bound by the model) on purpose.
+    enrichment_batch_size: int = Field(default=20_000, ge=1)
 
     # Authentication: local admin bootstrap
     # Seeds the first administrator on startup if no users exist yet. The

@@ -335,7 +335,7 @@ def test_process_batch_emits_one_row_per_event_with_field_map():
         # Derived keys from a previous run must not be re-enriched.
         {"event_id": "e3", "attributes": {"src_ip:geo_country": "10.9.9.9"}},
     ]
-    rows = _process_batch(StubEnricher(), batch, "c1", "s1", "t1", "job1", "stub", "hash1")
+    rows = _process_batch(StubEnricher(), batch, "c1", "s1", "t1", "job1", "stub", "hash1", {})
 
     assert len(rows) == 1
     row = rows[0]
@@ -346,6 +346,41 @@ def test_process_batch_emits_one_row_per_event_with_field_map():
         "dst_ip:geo_country": "DE",
         "dst_ip:geo_city": "Berlin",
     }
+
+
+def test_process_batch_dedups_lookups_per_distinct_value():
+    """A repeated raw value is looked up once, then served from the shared
+    value cache — the per-distinct-value dedup that keeps GeoIP runs fast."""
+    from tracesignal.enrichers.base import Enricher
+    from tracesignal.enrichers.jobs import _process_batch
+
+    class CountingEnricher(Enricher):
+        key = "count"
+        display_name = "Count"
+        description = ""
+        eligibility_regex = r"^10\..*"
+        output_fields = ("geo_country",)
+        calls = 0
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            type(self).calls += 1
+            return {"geo_country": "DE"}
+
+    enricher = CountingEnricher()
+    cache: dict = {}
+    batch1 = [{"event_id": f"e{i}", "attributes": {"src_ip": "10.0.0.1"}} for i in range(5)]
+    batch2 = [{"event_id": "e9", "attributes": {"src_ip": "10.0.0.1", "dst_ip": "10.0.0.2"}}]
+
+    rows1 = _process_batch(enricher, batch1, "c", "s", "t", "j", "count", "h", cache)
+    rows2 = _process_batch(enricher, batch2, "c", "s", "t", "j", "count", "h", cache)
+
+    # 5 events + 1 reuse all share "10.0.0.1" -> one lookup; "10.0.0.2" -> one more.
+    assert CountingEnricher.calls == 2
+    assert len(rows1) == 5
+    assert len(rows2) == 1
 
 
 @pytest.mark.asyncio
