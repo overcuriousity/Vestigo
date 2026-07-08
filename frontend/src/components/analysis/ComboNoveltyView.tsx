@@ -15,6 +15,7 @@ import {
   DetectorStatusLine,
   FindingShell,
   ModeToggle,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
@@ -155,6 +156,7 @@ export function ComboNoveltyView({
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey } = useBaselineRequest(mode);
   // null = auto (top-2 recommended); string[] = explicit selection (≥ 2 to run).
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -163,12 +165,12 @@ export function ComboNoveltyView({
   const fieldsParam = selectedFields !== null ? selectedFields.join(",") : undefined;
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "combo", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "combo", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_combo",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     // Don't fire while the explicit selection is below the two-field minimum.
@@ -181,7 +183,7 @@ export function ComboNoveltyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_combo",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {

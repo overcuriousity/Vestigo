@@ -12,10 +12,16 @@
  */
 import { useState, useRef, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Crosshair, Flag } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { Spinner } from "@/components/ui/Spinner";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
-import type { AnomalyMarker, EventFilters, HistogramBucket } from "@/api/types";
+import type {
+  AnalysisWindowsPayload,
+  AnomalyMarker,
+  EventFilters,
+  HistogramBucket,
+} from "@/api/types";
 import { cn } from "@/lib/cn";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 
@@ -28,6 +34,14 @@ interface Props {
   markers?: AnomalyMarker[];
   /** Persistent time-window overlay (e.g. a Frequency finding's anomalous window). */
   highlightRange?: { start: string; end: string } | null;
+  /** Active baseline definition's ranges, rendered as persistent shaded bands. */
+  baselineWindows?: AnalysisWindowsPayload | null;
+  /** When true, brush-commit marks a range (via onMarkRange) instead of zooming. */
+  markMode?: boolean;
+  /** Toggle between zoom and mark cursor modes (shows the toolbar when provided). */
+  onMarkModeChange?: (markMode: boolean) => void;
+  /** Called with a brushed [start, end) when marking is active. */
+  onMarkRange?: (start: string, end: string) => void;
 }
 
 /** Where a marker's timestamp falls relative to the rendered bars. */
@@ -109,6 +123,10 @@ export function TimelineHistogram({
   onRangeSelect,
   markers,
   highlightRange,
+  baselineWindows,
+  markMode = false,
+  onMarkModeChange,
+  onMarkRange,
 }: Props) {
   const currentPositionTs = useScrollPositionStore((s) => s.currentPositionTs);
   const { data, isLoading, isFetching } = useQuery({
@@ -138,6 +156,20 @@ export function TimelineHistogram({
   const buckets = useMemo(() => data?.buckets ?? [], [data]);
   const maxCount = Math.max(1, ...buckets.map((b: HistogramBucket) => b.count));
 
+  /** Left%/width% of a [start, end) range in bucket-index coordinates, or null. */
+  const bandGeometry = useCallback(
+    (start: string, end: string): { left: number; width: number } | null => {
+      if (!data) return null;
+      const a = plotMarker(start, buckets, data.interval_seconds);
+      const b = plotMarker(end, buckets, data.interval_seconds);
+      if (!a || !b) return null;
+      const left = Math.min(a.pct, b.pct);
+      const width = Math.max(0.5, Math.abs(b.pct - a.pct));
+      return { left, width };
+    },
+    [buckets, data],
+  );
+
   const applyBrush = useCallback(
     (startIdx: number, endIdx: number) => {
       if (!data || buckets.length === 0) return;
@@ -148,9 +180,12 @@ export function TimelineHistogram({
       if (!startBucket || !endBucket) return;
       const start = startBucket.start;
       const end = addSeconds(endBucket.start, data.interval_seconds);
-      onRangeSelect(start, end);
+      // In mark mode a committed brush becomes a baseline/suspect range instead
+      // of a zoom — the parent opens a "set as baseline / add suspect" popover.
+      if (markMode && onMarkRange) onMarkRange(start, end);
+      else onRangeSelect(start, end);
     },
-    [buckets, data, onRangeSelect],
+    [buckets, data, onRangeSelect, markMode, onMarkRange],
   );
 
   /** Zoom to a window centered on a marker's timestamp — the click target for anomaly flags. */
@@ -249,6 +284,75 @@ export function TimelineHistogram({
       onMouseUp={handleMouseUp}
       onMouseLeave={handleContainerMouseLeave}
     >
+      {/* Cursor-mode toggle (zoom | mark) — only when the parent wires marking. */}
+      {onMarkModeChange && (
+        <div className="absolute right-2 top-1 z-10 flex items-center gap-0.5 rounded bg-[var(--color-bg-elevated)] p-0.5">
+          <button
+            type="button"
+            title="Zoom / select"
+            onClick={() => onMarkModeChange(false)}
+            className={cn(
+              "rounded p-0.5",
+              !markMode
+                ? "bg-[var(--color-accent)] text-white"
+                : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
+            )}
+          >
+            <Crosshair size={12} />
+          </button>
+          <button
+            type="button"
+            title="Mark baseline / suspect window"
+            onClick={() => onMarkModeChange(true)}
+            className={cn(
+              "rounded p-0.5",
+              markMode
+                ? "bg-[var(--color-warning)] text-white"
+                : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
+            )}
+          >
+            <Flag size={12} />
+          </button>
+        </div>
+      )}
+
+      {/* Persistent baseline (blue, solid) + suspect (amber, dashed + chip) bands. */}
+      {baselineWindows && (
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-16 px-2">
+          <div className="relative h-full w-full">
+            {(() => {
+              const bl = bandGeometry(
+                baselineWindows.baseline.start,
+                baselineWindows.baseline.end,
+              );
+              return bl ? (
+                <div
+                  className="absolute top-0 bottom-0 border-x-2 border-[var(--color-info)] bg-[var(--color-info)]/10"
+                  style={{ left: `${bl.left}%`, width: `${bl.width}%` }}
+                  title="Baseline window"
+                />
+              ) : null;
+            })()}
+            {baselineWindows.suspect_windows.map((w, i) => {
+              const g = bandGeometry(w.start, w.end);
+              if (!g) return null;
+              return (
+                <div
+                  key={w.id ?? i}
+                  className="absolute top-0 bottom-0 border-x border-dashed border-[var(--color-warning)] bg-[var(--color-warning)]/10"
+                  style={{ left: `${g.left}%`, width: `${g.width}%` }}
+                  title={`Suspect window: ${w.label}`}
+                >
+                  <span className="absolute -top-0 left-0 max-w-full truncate rounded-br bg-[var(--color-warning)] px-1 text-[9px] leading-tight text-white">
+                    {w.label}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Bars — dimmed and non-interactive while a zoom refetch is in flight,
           so clicks can never land against stale placeholder bucket data. */}
       <div

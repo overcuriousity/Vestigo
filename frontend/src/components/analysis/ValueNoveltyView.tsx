@@ -16,6 +16,7 @@ import {
   FindingRowActions,
   FindingShell,
   ModeToggle,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
@@ -134,6 +135,7 @@ export function ValueNoveltyView({
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey } = useBaselineRequest(mode);
   // null = use backend smart default; string[] = explicit analyst selection.
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -145,12 +147,12 @@ export function ValueNoveltyView({
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "novelty", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "novelty", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_novelty",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
@@ -161,7 +163,7 @@ export function ValueNoveltyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_novelty",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
@@ -279,9 +281,8 @@ export function ValueNoveltyView({
         <span>
           Rare ≠ malicious.{" "}
           {mode === "temporal"
-            ? "Temporal mode ignores the rarity floor — it flags any value absent from the baseline window but present in the detect window."
-            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus."}{" "}
-          Score = −log(count/total); higher is rarer.
+            ? "Temporal mode flags any value absent from the baseline window but present in a suspect window (select a baseline definition, or it falls back to the timeline midpoint). Score = −log(count / suspect-window events)."
+            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus. Score = −log(count/total); higher is rarer."}
         </span>
       </div>
     </div>

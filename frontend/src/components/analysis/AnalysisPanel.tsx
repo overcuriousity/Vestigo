@@ -32,6 +32,7 @@ import { SimilarEvents } from "./SimilarEvents";
 import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
+import { DetectorSummaryStrip } from "./DetectorSummaryStrip";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
@@ -265,6 +266,14 @@ export function AnalysisPanel({
               caseId={caseId}
             />
           </div>
+        )}
+
+        {tab === "anomalies" && (
+          <DetectorSummaryStrip
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelect={setAnomalySubTab}
+          />
         )}
 
         {tab === "anomalies" && anomalySubTab === "novelty" && (

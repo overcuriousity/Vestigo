@@ -16,6 +16,7 @@ import {
   FindingRowActions,
   FindingShell,
   ModeToggle,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
@@ -129,18 +130,19 @@ export function NumericRangeView({
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey } = useBaselineRequest(mode);
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "range", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "range", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "numeric_range",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
@@ -151,7 +153,7 @@ export function NumericRangeView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "numeric_range",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {

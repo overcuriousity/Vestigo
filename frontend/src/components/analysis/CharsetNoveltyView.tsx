@@ -18,6 +18,7 @@ import {
   FindingRowActions,
   FindingShell,
   ModeToggle,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
@@ -140,18 +141,19 @@ export function CharsetNoveltyView({
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey } = useBaselineRequest(mode);
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "charset", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "charset", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "charset",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
@@ -162,7 +164,7 @@ export function CharsetNoveltyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "charset",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {

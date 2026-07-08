@@ -9,6 +9,7 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useBaselineStore } from "@/stores/baseline";
 import {
   AlertTriangle,
   Info,
@@ -180,6 +181,12 @@ export function FrequencyView({
   const [seriesField, setSeriesField] = useState("artifact");
   const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
+  // Frequency has no self/temporal toggle: it runs self-baseline unless a
+  // baseline definition is active, in which case it scores suspect windows
+  // against that baseline. The active id both selects the mode and re-keys.
+  const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
+  const blParams = activeBaselineId ? { baseline_id: activeBaselineId } : {};
+  const blKey = activeBaselineId ?? "self";
 
   // Debounce so a full detector scan doesn't fire on every keystroke
   // (including transient invalid states like a bare "-" or "").
@@ -210,13 +217,14 @@ export function FrequencyView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
         series_field: seriesField,
         z_threshold: zThresholdParam,
         limit: 30,
+        ...blParams,
       }),
     staleTime: 60_000,
   });
@@ -228,6 +236,7 @@ export function FrequencyView({
         series_field: seriesField,
         z_threshold: zThresholdParam,
         limit: 30,
+        ...blParams,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });

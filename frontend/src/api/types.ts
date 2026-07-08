@@ -397,6 +397,64 @@ export interface AnomaliesResponse {
    * this scan's findings instead of re-uploading event IDs.
    */
   run_id: string | null;
+  /** Non-fatal caveats about the run (tiny/unscoreable suspect windows, …). */
+  warnings?: string[];
+  /** Serialized window snapshot for temporal runs driven by a baseline definition. */
+  windows?: AnalysisWindowsPayload | null;
+}
+
+/** One suspect window in a baseline definition (half-open [start, end)). */
+export interface SuspectWindow {
+  id?: string;
+  label: string;
+  start: string;
+  end: string;
+}
+
+/** The window snapshot echoed on a temporal AnomaliesResponse / stored in a run. */
+export interface AnalysisWindowsPayload {
+  baseline: { start: string; end: string };
+  suspect_windows: SuspectWindow[];
+}
+
+/** A saved baseline definition (baseline range + suspect windows) for a timeline. */
+export interface BaselineDefinition {
+  id: string;
+  case_id: string;
+  timeline_id: string;
+  name: string;
+  baseline: { start: string; end: string };
+  suspect_windows: SuspectWindow[];
+  config_hash: string;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface BaselineListResponse {
+  baselines: BaselineDefinition[];
+}
+
+export interface BaselineMutationResponse {
+  baseline: BaselineDefinition;
+  warnings: string[];
+}
+
+/** A value-level "this is normal" declaration consumed by the detectors. */
+export interface AllowlistEntry {
+  id: string;
+  case_id: string;
+  timeline_id: string;
+  detector: string;
+  field: string;
+  value: string;
+  note: string | null;
+  created_by: string | null;
+  created_at: string | null;
+}
+
+export interface AllowlistListResponse {
+  entries: AllowlistEntry[];
 }
 
 /** One active finding fed to the histogram overlay / event grid highlighting. */

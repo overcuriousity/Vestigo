@@ -9,10 +9,11 @@
  */
 import { useEffect, useState } from "react";
 import { useMutation, type UseMutationResult } from "@tanstack/react-query";
-import { ChevronDown, ChevronsRight, ChevronUp, Clock, RefreshCw, Tag } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, Clock, RefreshCw, Tag } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
+import { useBaselineStore } from "@/stores/baseline";
 import type {
   AnomaliesResponse,
   AnomalyMarker,
@@ -23,6 +24,24 @@ import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
 
 export type DetectorMode = "self" | "temporal";
+
+/**
+ * Resolve the request params + queryKey fragment for a detector's temporal
+ * mode, honoring the active saved baseline definition (from the baseline
+ * store) over the legacy midpoint split. Every detector view calls this
+ * instead of hard-coding `temporal: mode === "temporal"` so a change to the
+ * active baseline re-runs the scan and all seven views stay consistent.
+ */
+export function useBaselineRequest(mode: DetectorMode): {
+  params: { temporal?: boolean; baseline_id?: string };
+  key: string;
+} {
+  const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
+  if (mode !== "temporal") return { params: { temporal: false }, key: "self" };
+  if (activeBaselineId)
+    return { params: { baseline_id: activeBaselineId }, key: `bl:${activeBaselineId}` };
+  return { params: { temporal: true }, key: "temporal" };
+}
 
 // Auto-scan field selection for the string detectors (charset/entropy). Mirrors
 // _select_auto_scan_tokens / _MAX_AUTO_SCAN_FIELDS / _AUTO_IDENTIFIER_RESERVE in
@@ -128,20 +147,35 @@ export function DetectorStatusLine({
 }) {
   if (!data) return null;
   return (
-    <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
-      <span className="capitalize">{data.method}</span>
-      {extra && (
-        <>
-          <span>·</span>
-          {extra}
-        </>
-      )}
-      <span>·</span>
-      <span>
-        {data.baseline_size.toLocaleString()} {baselineLabel}
-      </span>
-      {data.status !== "ok" && (
-        <span className="text-[var(--color-warning)]">· {data.status.replace(/_/g, " ")}</span>
+    <div className="space-y-1">
+      <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
+        <span className="capitalize">{data.method}</span>
+        {extra && (
+          <>
+            <span>·</span>
+            {extra}
+          </>
+        )}
+        <span>·</span>
+        <span>
+          {data.baseline_size.toLocaleString()} {baselineLabel}
+        </span>
+        {data.status !== "ok" && (
+          <span className="text-[var(--color-warning)]">· {data.status.replace(/_/g, " ")}</span>
+        )}
+      </div>
+      {data.warnings && data.warnings.length > 0 && (
+        <ul className="space-y-0.5">
+          {data.warnings.map((w, i) => (
+            <li
+              key={i}
+              className="flex items-start gap-1 text-[11px] text-[var(--color-warning)]"
+            >
+              <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+              <span>{w}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );

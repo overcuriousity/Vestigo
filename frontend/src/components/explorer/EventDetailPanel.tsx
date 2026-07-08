@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, ShieldCheck, AlertTriangle, Save, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
+import { baselinesApi } from "@/api/baselines";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -26,6 +27,7 @@ interface Props {
   event: Event;
   annotations: Annotation[];
   caseId: string;
+  timelineId: string;
   sourceId: string;
   onClose: () => void;
   onFindSimilar: (event: Event) => void;
@@ -170,51 +172,6 @@ function FieldRow({
   );
 }
 
-/** Button to toggle "normal operation" annotation on an event. */
-function NormalToggleButton({
-  event,
-  annotations,
-  add,
-  remove,
-}: {
-  event: Event;
-  annotations: Annotation[];
-  add: ReturnType<typeof useAnnotationMutations>["add"];
-  remove: ReturnType<typeof useAnnotationMutations>["remove"];
-}) {
-  const normalAnn = annotations.find(
-    (a) => a.annotation_type === "normal" && a.origin === "user",
-  );
-  const isNormal = !!normalAnn;
-
-  const handleClick = () => {
-    if (isNormal && normalAnn) {
-      remove.mutate({ eventId: event.event_id, annotationId: normalAnn.id });
-    } else {
-      add.mutate({ eventId: event.event_id, type: "normal", content: "normal operation" });
-    }
-  };
-
-  return (
-    <Tooltip
-      content={
-        isNormal
-          ? "Unmark — event will re-appear in anomaly results"
-          : "Excludes this event from anomaly detection results"
-      }
-    >
-      <Button
-        variant={isNormal ? "accent" : "outline"}
-        size="sm"
-        onClick={handleClick}
-        disabled={add.isPending || remove.isPending}
-      >
-        <ShieldCheck size={11} />
-        {isNormal ? "Normal ✓" : "Mark Normal"}
-      </Button>
-    </Tooltip>
-  );
-}
 
 /** Inline add-annotation form (tag or comment). */
 function AddAnnotationForm({
@@ -315,6 +272,7 @@ export function EventDetailPanel({
   event,
   annotations,
   caseId,
+  timelineId,
   sourceId,
   onClose,
   onFindSimilar,
@@ -346,6 +304,37 @@ export function EventDetailPanel({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
+    },
+  });
+
+  // "Mark normal" on a finding = value-level normality: the detector will never
+  // flag this (detector, field, value) again on any event (unified with the
+  // baseline-window model, replacing the old per-event normal annotation — see
+  // docs/ANOMALY_DETECTION.md). timestamp_order findings are positional, not
+  // value-shaped, so they keep the per-event normal annotation instead.
+  const markNormalMutation = useMutation({
+    mutationFn: async (finding: AnomalyMarker): Promise<void> => {
+      const d = finding.rawDetails as Record<string, unknown>;
+      const field = d.allowlist_field as string | undefined;
+      const value = d.allowlist_value as string | undefined;
+      if (finding.detector === "timestamp_order" || field === undefined || value === undefined) {
+        await add.mutateAsync({
+          eventId: event.event_id,
+          type: "normal",
+          content: "normal operation",
+        });
+        return;
+      }
+      await baselinesApi.addAllowlist(caseId, timelineId, {
+        detector: finding.detector,
+        field,
+        value,
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["annotations"] });
+      qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] });
+      qc.invalidateQueries({ queryKey: ["anomalies"] });
     },
   });
 
@@ -701,16 +690,35 @@ export function EventDetailPanel({
                 {finding.detail}
                 <span className="ml-1 text-xs text-[var(--color-fg-muted)]">(not yet tagged)</span>
               </span>
-              <Tooltip content="Persist this finding as a system annotation" side="top">
-                <button
-                  onClick={() => persistMutation.mutate(finding)}
-                  disabled={persistMutation.isPending}
-                  className="shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
+              <div className="shrink-0 flex items-center gap-1">
+                <Tooltip content="Persist this finding as a system annotation" side="top">
+                  <button
+                    onClick={() => persistMutation.mutate(finding)}
+                    disabled={persistMutation.isPending}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
+                  >
+                    {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
+                    Persist
+                  </button>
+                </Tooltip>
+                <Tooltip
+                  content={
+                    finding.detector === "timestamp_order"
+                      ? "Mark this event as normal"
+                      : "Never flag this value again for this detector"
+                  }
+                  side="top"
                 >
-                  {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
-                  Persist
-                </button>
-              </Tooltip>
+                  <button
+                    onClick={() => markNormalMutation.mutate(finding)}
+                    disabled={markNormalMutation.isPending}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)] transition-base"
+                  >
+                    {markNormalMutation.isPending ? <Spinner size={10} /> : <CircleCheck size={10} />}
+                    Normal
+                  </button>
+                </Tooltip>
+              </div>
             </div>
           ))}
 
@@ -743,12 +751,6 @@ export function EventDetailPanel({
                 <MessageSquare size={11} />
                 Comment
               </Button>
-              <NormalToggleButton
-                event={event}
-                annotations={annotations}
-                add={add}
-                remove={remove}
-              />
             </div>
           )}
         </Section>

@@ -267,42 +267,27 @@ function CommentPopover({
   );
 }
 
-/** Mark-normal toggle button: adds/removes a "normal" user annotation. */
-function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) {
-  const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const normalAnn = anns.find((a) => a.annotation_type === "normal" && a.origin === "user");
-  const isNormal = !!normalAnn;
-
-  const handleClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (isNormal && normalAnn) {
-      remove.mutate({ eventId, annotationId: normalAnn.id });
-    } else {
-      add.mutate({ eventId, type: "normal", content: "normal operation" });
-    }
-  };
-
+/** Read-only "normal" indicator for a legacy per-event normal annotation.
+ *
+ * Normality is now declared value-level (from a finding's "Mark normal" →
+ * detector allowlist) or time-based (baseline windows), not by an ad-hoc
+ * per-event toggle here — see docs/ANOMALY_DETECTION.md. Existing/legacy
+ * `normal` annotations are still shown and honored, just no longer created or
+ * cleared from the grid.
+ */
+function NormalIndicator({ anns }: AnnotationCellProps) {
+  const isNormal = anns.some((a) => a.annotation_type === "normal" && a.origin === "user");
+  if (!isNormal) return null;
   return (
-    <Tooltip
-      content={isNormal ? "Marked Normal — click to unmark" : "Mark as Normal operation"}
-      side="top"
-    >
-      <button
-        onClick={handleClick}
-        className={cn(
-          "rounded p-1 transition-base",
-          isNormal
-            ? "text-[var(--color-success)]"
-            : "text-[var(--color-fg-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--color-success)]",
-        )}
-      >
+    <Tooltip content="Marked normal (legacy per-event annotation)" side="top">
+      <span className="p-1 text-[var(--color-success)]">
         <ShieldCheck size={13} />
-      </button>
+      </span>
     </Tooltip>
   );
 }
 
-/** Combined annotation column: anomaly indicator + normal toggle + tag popover + comment popover. */
+/** Combined annotation column: anomaly indicator + normal indicator + tag popover + comment popover. */
 function AnnotationCell(props: AnnotationCellProps) {
   const persistedAnomalies = props.anns.filter((a) => a.annotation_type === "anomaly");
   // Once tagged, the persisted annotation is the durable record — suppress
@@ -328,7 +313,7 @@ function AnnotationCell(props: AnnotationCellProps) {
       ) : (
         <span className="p-1 w-[13px]" /> /* placeholder matching the icon's own box, to keep layout stable */
       )}
-      <NormalToggle {...props} />
+      <NormalIndicator {...props} />
       <TagPopover {...props} />
       <CommentPopover {...props} />
     </div>

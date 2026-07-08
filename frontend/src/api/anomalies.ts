@@ -17,10 +17,12 @@ export interface AnomalyParams {
   z_threshold?: number;
   /** Minimum backwards jump (seconds) for the timestamp_order detector. */
   min_skew_seconds?: number;
-  /** Explicit temporal baseline end timestamp */
+  /** Explicit temporal baseline end timestamp (legacy split; prefer baseline_id) */
   baseline_end?: string;
-  /** Enable temporal mode (backend uses timeline midpoint when baseline_end is absent) */
+  /** Enable legacy temporal mode (backend uses timeline midpoint when baseline_end is absent) */
   temporal?: boolean;
+  /** ID of a saved baseline definition (baseline range + suspect windows). */
+  baseline_id?: string;
   limit?: number;
   /** Persist this scan as a DetectorRun and return its run_id (default: true). */
   persist?: boolean;

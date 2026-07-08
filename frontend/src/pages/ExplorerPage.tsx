@@ -19,6 +19,7 @@ import {
   PanelLeftOpen,
   BarChart2,
   AreaChart,
+  CalendarRange,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -29,6 +30,8 @@ import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
+import { useBaselineStore } from "@/stores/baseline";
+import { baselinesApi } from "@/api/baselines";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 import { contextWindow } from "@/lib/time";
 import { useCaseStream } from "@/hooks/useCaseStream";
@@ -42,6 +45,7 @@ import { ExportDialog } from "@/components/explorer/ExportDialog";
 import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
+import { BaselineManager } from "@/components/explorer/BaselineManager";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { AnalysisPanel } from "@/components/analysis/AnalysisPanel";
 import { TriageMeter } from "@/components/triage/TriageMeter";
@@ -383,10 +387,29 @@ export function ExplorerPage() {
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
+  const [baselineManagerOpen, setBaselineManagerOpen] = useState(false);
+  const {
+    activeBaselineId,
+    markMode: baselineMarkMode,
+    setMarkMode: setBaselineMarkMode,
+    setPendingRange: setBaselinePendingRange,
+  } = useBaselineStore();
   // Scroll position feeds TimelineHistogram only, via a store subscribed
   // solely by that component (C15) — not page state, so scrolling doesn't
   // re-render EventGrid/FilterRail/AnalysisPanel on every row crossed.
   const setCurrentPositionTs = useScrollPositionStore((s) => s.setCurrentPositionTs);
+  // Active baseline definition → histogram bands + detector windows. Fetched
+  // here (once) so the histogram and detector views share one source of truth.
+  const { data: baselinesData } = useQuery({
+    queryKey: ["baselines", caseId, timelineId],
+    queryFn: () => baselinesApi.list(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+  const activeBaselineWindows = useMemo(() => {
+    const def = baselinesData?.baselines.find((b) => b.id === activeBaselineId);
+    if (!def) return null;
+    return { baseline: def.baseline, suspect_windows: def.suspect_windows };
+  }, [baselinesData, activeBaselineId]);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const gridRef = useRef<EventGridHandle>(null);
@@ -1011,6 +1034,17 @@ export function ExplorerPage() {
                 Analysis
               </Button>
             </Tooltip>
+
+            <Tooltip content="Baseline & suspect windows">
+              <Button
+                variant={baselineManagerOpen || activeBaselineId ? "accent" : "outline"}
+                size="sm"
+                onClick={() => setBaselineManagerOpen((v) => !v)}
+              >
+                <CalendarRange size={13} />
+                Baselines
+              </Button>
+            </Tooltip>
           </div>
         </div>
 
@@ -1023,6 +1057,13 @@ export function ExplorerPage() {
             onRangeSelect={handleHistogramRange}
             markers={analysisPanelOpen ? anomalyMarkers : []}
             highlightRange={rangeHighlight}
+            baselineWindows={activeBaselineWindows}
+            markMode={baselineMarkMode}
+            onMarkModeChange={setBaselineMarkMode}
+            onMarkRange={(start, end) => {
+              setBaselinePendingRange({ start, end });
+              setBaselineManagerOpen(true);
+            }}
           />
         )}
 
@@ -1117,6 +1158,7 @@ export function ExplorerPage() {
                     annotations={annotationMap.get(expandedEvent.event_id) ?? []}
                     liveFindings={liveAnomaliesByEvent.get(expandedEvent.event_id) ?? []}
                     caseId={caseId!}
+                    timelineId={timelineId!}
                     sourceId={expandedEvent.source_id}
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
@@ -1160,6 +1202,18 @@ export function ExplorerPage() {
                     onAnomalyMarkers={setAnomalyMarkers}
                     onAnomalyRunId={setAnomalyRunId}
                     onJumpToTime={handleJumpToTime}
+                  />
+                )}
+
+                {/* Baseline definition manager (baseline + suspect windows, allowlist) */}
+                {baselineManagerOpen && caseId && timelineId && (
+                  <BaselineManager
+                    caseId={caseId}
+                    timelineId={timelineId}
+                    onClose={() => {
+                      setBaselineManagerOpen(false);
+                      setBaselineMarkMode(false);
+                    }}
                   />
                 )}
               </div>
