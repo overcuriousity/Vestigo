@@ -1,56 +1,37 @@
 /**
  * InvestigatePanel — the single right-hand investigation surface, replacing the
- * old sibling AnalysisPanel + BaselineManager. It reads top-to-bottom as one
- * workflow:
+ * old sibling AnalysisPanel + BaselineManager. The Anomalies tab reads
+ * top-to-bottom as one workflow:
  *
- *   1. Frame bar   — pick the global scope (scan all events / compare baseline).
- *   2. Detectors   — run-all summary + a per-detector findings view; every
- *                    detector obeys the frame (no per-view mode toggle).
- *   3. Windows &   — build/select baseline definitions (typed or dragged) and
- *      normality     manage the value allowlist ("Normal values").
+ *   1. Scope     — FrameBar picks the global frame (scan all / compare baseline).
+ *                  In the baseline frame the BaselineSection (build/select
+ *                  definitions) is inline right here, where the frame needs it.
+ *   2. Detectors — DetectorAccordion: every detector with a live count; expand
+ *                  one to drill its ranked findings. (No dropdown, no separate
+ *                  run-all — the overview is both.)
+ *   3. Normal    — the value allowlist, collapsible at the bottom.
  *
  * Similarity and Method stay as sibling top tabs.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Activity,
   AlertTriangle,
   BookOpen,
   ChevronDown,
   ChevronRight,
-  Hash,
-  Layers,
-  Rewind,
-  Ruler,
   Search,
-  Shuffle,
-  SlidersHorizontal,
-  Type,
+  ShieldCheck,
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/Select";
-import { ValueNoveltyView } from "./ValueNoveltyView";
-import { ComboNoveltyView } from "./ComboNoveltyView";
-import { FrequencyView } from "./FrequencyView";
-import { OrderViolationsView } from "./OrderViolationsView";
-import { NumericRangeView } from "./NumericRangeView";
-import { CharsetNoveltyView } from "./CharsetNoveltyView";
-import { EntropyView } from "./EntropyView";
 import { SimilarEvents } from "./SimilarEvents";
 import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
-import { DetectorSummaryStrip } from "./DetectorSummaryStrip";
 import { FrameBar } from "./FrameBar";
-import { WindowsNormality } from "./WindowsNormality";
+import { DetectorAccordion } from "./DetectorAccordion";
+import { BaselineSection, NormalValuesList } from "./WindowsNormality";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore } from "@/stores/ui";
 import { useBaselineStore } from "@/stores/baseline";
@@ -58,17 +39,6 @@ import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
-type AnomalySubTab = "novelty" | "combo" | "frequency" | "order" | "range" | "charset" | "entropy";
-
-const DETECTORS: { id: AnomalySubTab; icon: React.ElementType; label: string; description: string }[] = [
-  { id: "novelty", icon: Hash, label: "Rare values", description: "Rare or first-seen field values" },
-  { id: "combo", icon: Layers, label: "Value combos", description: "Rare combinations of two or more fields" },
-  { id: "frequency", icon: Activity, label: "Frequency", description: "Event-count spikes and silences per series" },
-  { id: "order", icon: Rewind, label: "Timestamp order", description: "Timestamps running backwards in record order" },
-  { id: "range", icon: Ruler, label: "Numeric range", description: "Numeric values outside a learned band" },
-  { id: "charset", icon: Type, label: "Charset novelty", description: "Values containing never-seen characters" },
-  { id: "entropy", icon: Shuffle, label: "Entropy outliers", description: "Random-looking or degenerate strings" },
-];
 
 interface Props {
   caseId: string;
@@ -102,22 +72,24 @@ export function InvestigatePanel({
   onJumpToTime,
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
-  const [anomalySubTab, setAnomalySubTab] = useState<AnomalySubTab>("novelty");
-  const [windowsOpen, setWindowsOpen] = useState(false);
+  const [normalOpen, setNormalOpen] = useState(false);
+
+  const frame = useBaselineStore((s) => s.frame);
+  const setFrame = useBaselineStore((s) => s.setFrame);
+  const markMode = useBaselineStore((s) => s.markMode);
 
   useEffect(() => {
     if (similarAnchor) setTab("similar");
   }, [similarAnchor]);
 
-  // Marking on the histogram (arming a window row, or the histogram's own mark
-  // cursor) should reveal the editor so the brushed range has somewhere to land.
-  const markMode = useBaselineStore((s) => s.markMode);
+  // Marking on the histogram is only meaningful for building a baseline — pull
+  // the user to the Scope area (baseline frame) so the brushed range can land.
   useEffect(() => {
     if (markMode) {
       setTab("anomalies");
-      setWindowsOpen(true);
+      setFrame("baseline");
     }
-  }, [markMode]);
+  }, [markMode, setFrame]);
 
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
@@ -157,15 +129,6 @@ export function InvestigatePanel({
       window.removeEventListener("mouseup", onMouseUp);
     };
   }, [setAnalysisPanelWidth]);
-
-  const detectorViewProps = {
-    caseId,
-    timelineId,
-    onSelectEvent,
-    onFindingsChange: onAnomalyMarkers,
-    onRunIdChange: onAnomalyRunId,
-    onJumpToTime,
-  };
 
   return (
     <div
@@ -211,72 +174,41 @@ export function InvestigatePanel({
         ))}
       </div>
 
-      {/* Detector selector (anomalies tab only) */}
-      {tab === "anomalies" && (
-        <div className="border-b border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5">
-          <Select value={anomalySubTab} onValueChange={(v) => setAnomalySubTab(v as AnomalySubTab)}>
-            <SelectTrigger className="h-7 px-2 text-xs" aria-label="Detector">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {DETECTORS.map((d) => (
-                <SelectItem key={d.id} value={d.id} className="h-auto py-1.5">
-                  <span className="flex items-center gap-1.5">
-                    <d.icon size={11} className="shrink-0 text-[var(--color-fg-muted)]" />
-                    <span className="flex flex-col items-start leading-tight">
-                      <span className="text-xs font-medium">{d.label}</span>
-                      <span className="text-[10px] text-[var(--color-fg-muted)]">{d.description}</span>
-                    </span>
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      )}
-
       <div className="flex-1 overflow-y-auto p-4">
         {tab === "anomalies" && (
           <>
-            <FrameBar
+            {/* 1. Scope */}
+            <FrameBar caseId={caseId} timelineId={timelineId} />
+            {frame === "baseline" && (
+              <div className="mb-3">
+                <BaselineSection caseId={caseId} timelineId={timelineId} />
+              </div>
+            )}
+
+            {/* 2. Detectors */}
+            <DetectorAccordion
               caseId={caseId}
               timelineId={timelineId}
-              onBuildBaseline={() => setWindowsOpen(true)}
+              onSelectEvent={onSelectEvent}
+              onDrillField={onDrillField}
+              onComboDrill={onComboDrill}
+              onFrequencyDrill={onFrequencyDrill}
+              onAnomalyMarkers={onAnomalyMarkers}
+              onAnomalyRunId={onAnomalyRunId}
+              onJumpToTime={onJumpToTime}
             />
 
-            <DetectorSummaryStrip caseId={caseId} timelineId={timelineId} onSelect={setAnomalySubTab} />
-
-            {anomalySubTab === "novelty" && (
-              <ValueNoveltyView {...detectorViewProps} onDrillField={onDrillField} />
-            )}
-            {anomalySubTab === "combo" && (
-              <ComboNoveltyView {...detectorViewProps} onComboDrill={onComboDrill} />
-            )}
-            {anomalySubTab === "frequency" && (
-              <FrequencyView {...detectorViewProps} onDrillField={onFrequencyDrill} />
-            )}
-            {anomalySubTab === "order" && <OrderViolationsView {...detectorViewProps} />}
-            {anomalySubTab === "range" && (
-              <NumericRangeView {...detectorViewProps} onDrillField={onDrillField} />
-            )}
-            {anomalySubTab === "charset" && (
-              <CharsetNoveltyView {...detectorViewProps} onDrillField={onDrillField} />
-            )}
-            {anomalySubTab === "entropy" && (
-              <EntropyView {...detectorViewProps} onDrillField={onDrillField} />
-            )}
-
-            {/* Windows & normality */}
-            <div className="mt-5 border-t border-[var(--color-border)] pt-3">
+            {/* 3. Normal values */}
+            <div className="mt-4 border-t border-[var(--color-border)] pt-3">
               <button
-                onClick={() => setWindowsOpen((v) => !v)}
+                onClick={() => setNormalOpen((v) => !v)}
                 className="mb-2 flex w-full items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
               >
-                {windowsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                <SlidersHorizontal size={12} />
-                Windows &amp; normality
+                {normalOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                <ShieldCheck size={12} />
+                Normal values
               </button>
-              {windowsOpen && <WindowsNormality caseId={caseId} timelineId={timelineId} />}
+              {normalOpen && <NormalValuesList caseId={caseId} timelineId={timelineId} />}
             </div>
           </>
         )}

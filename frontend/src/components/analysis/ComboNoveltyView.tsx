@@ -15,6 +15,8 @@ import {
   DetectorStatusLine,
   FindingShell,
   NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
   useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
@@ -225,6 +227,8 @@ export function ComboNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
   if (needsBaseline) return <NeedsBaselinePrompt />;
 
   return (
@@ -276,7 +280,8 @@ export function ComboNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <ComboRow
               key={`${f.values.join("|")}:${i}`}
               caseId={caseId}

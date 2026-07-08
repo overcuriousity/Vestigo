@@ -16,7 +16,9 @@ import {
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
+  ResultsBar,
   useBaselineRequest,
+  useCappedFindings,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
@@ -221,6 +223,8 @@ export function ValueNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
   if (needsBaseline) return <NeedsBaselinePrompt />;
 
   const isTemporal = data?.method === "temporal";
@@ -264,7 +268,8 @@ export function ValueNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <FindingRow
               key={`${f.field}:${f.value}:${i}`}
               caseId={caseId}

@@ -102,6 +102,53 @@ export function NeedsBaselinePrompt() {
   );
 }
 
+/**
+ * Cap a ranked findings list to the top `initial` (the backend already returns
+ * them severity-first), with a toggle to reveal the rest. Keeps a long scan
+ * from rendering as an undifferentiated wall — the worst are on top, the tail
+ * is one click away.
+ */
+export function useCappedFindings<T>(findings: T[], initial = 20) {
+  const [expanded, setExpanded] = useState(false);
+  const shown = expanded ? findings : findings.slice(0, initial);
+  return {
+    shown,
+    total: findings.length,
+    hasMore: findings.length > initial,
+    expanded,
+    toggle: () => setExpanded((v) => !v),
+  };
+}
+
+/** "N findings · showing M" header + show-all/less toggle for a capped list. */
+export function ResultsBar({
+  total,
+  shownCount,
+  hasMore,
+  expanded,
+  onToggle,
+}: {
+  total: number;
+  shownCount: number;
+  hasMore: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
+      <span>
+        {total} finding{total === 1 ? "" : "s"}
+        {hasMore ? ` · showing ${shownCount}` : ""}
+      </span>
+      {hasMore && (
+        <button className="text-[var(--color-accent)] hover:underline" onClick={onToggle}>
+          {expanded ? "Show fewer" : `Show all ${total}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Small refresh icon-button with fetching spinner, right end of every toolbar. */
 export function RefreshButton({
   isFetching,

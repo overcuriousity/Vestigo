@@ -1,15 +1,14 @@
 /**
- * WindowsNormality — the "Windows & normality" section of the Investigate
- * panel. Two persistent-normality primitives live here (see
- * docs/ANOMALY_DETECTION.md):
+ * The two persistent-normality primitives (see docs/ANOMALY_DETECTION.md),
+ * split into the pieces the Investigate panel places where they're needed:
  *
- *  - Baseline definitions: one baseline window + N suspect windows. Windows are
- *    set by typing UTC start/end datetimes *or* by arming a row and dragging on
- *    the histogram (both always available). A saved definition drives the
- *    `baseline` frame for every detector.
- *  - Normal values: the value-level allowlist. Each entry is shown with its
- *    scope — `*` = all detectors, else the single detector it was marked from.
- *    Populated by the Normal action on findings / field rows.
+ *  - `BaselineSection` — baseline definitions (one baseline window + N suspect
+ *    windows). Rendered inline in the Scope area so building/selecting the thing
+ *    the `baseline` frame depends on is right where you pick that frame. Windows
+ *    are set by typing UTC datetimes *or* arming a row and dragging the histogram.
+ *  - `NormalValuesList` — the value-level allowlist, rendered at the bottom. Each
+ *    entry shows its scope (`*` = all detectors, else the single detector it was
+ *    marked from). Populated by the Normal action on findings / field rows.
  */
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -85,7 +84,7 @@ function draftFromDefinition(d: BaselineDefinition): Draft {
   };
 }
 
-export function WindowsNormality({ caseId, timelineId }: Props) {
+export function BaselineSection({ caseId, timelineId }: Props) {
   const qc = useQueryClient();
   const { activeBaselineId, setActiveBaselineId, markMode, setMarkMode, pendingRange, setPendingRange } =
     useBaselineStore();
@@ -99,12 +98,6 @@ export function WindowsNormality({ caseId, timelineId }: Props) {
     queryFn: () => baselinesApi.list(caseId, timelineId),
   });
   const definitions = data?.baselines ?? [];
-
-  const { data: allowData } = useQuery({
-    queryKey: ["allowlist", caseId, timelineId],
-    queryFn: () => baselinesApi.listAllowlist(caseId, timelineId),
-  });
-  const allowlist = allowData?.entries ?? [];
 
   // A histogram brush lands in `pendingRange`; drop it into the armed row.
   useEffect(() => {
@@ -147,11 +140,6 @@ export function WindowsNormality({ caseId, timelineId }: Props) {
       if (editingId === id) resetDraft();
       invalidate();
     },
-  });
-
-  const removeAllowMut = useMutation({
-    mutationFn: (id: string) => baselinesApi.removeAllowlist(caseId, timelineId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] }),
   });
 
   const errors = useMemo(() => validate(draft), [draft]);
@@ -315,41 +303,53 @@ export function WindowsNormality({ caseId, timelineId }: Props) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
 
-      {/* ── Normal values (allowlist) ─────────────────────────────────── */}
-      <div className="space-y-1">
-        <div className="text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
-          Normal values
+/** The value-level allowlist ("Normal values"), rendered at the panel bottom. */
+export function NormalValuesList({ caseId, timelineId }: Props) {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["allowlist", caseId, timelineId],
+    queryFn: () => baselinesApi.listAllowlist(caseId, timelineId),
+  });
+  const allowlist = data?.entries ?? [];
+  const removeMut = useMutation({
+    mutationFn: (id: string) => baselinesApi.removeAllowlist(caseId, timelineId, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] }),
+  });
+
+  return (
+    <div className="space-y-1 text-sm">
+      <p className="text-[10px] text-[var(--color-fg-muted)]">
+        Values marked normal are hidden from future scans — the manual extension of your baseline.
+      </p>
+      {allowlist.length === 0 && (
+        <div className="text-xs text-[var(--color-fg-muted)]">
+          None yet. Use <strong>Normal</strong> on a finding or a field value.
         </div>
-        <p className="text-[10px] text-[var(--color-fg-muted)]">
-          Values marked normal are hidden from future scans — the manual extension of your baseline.
-        </p>
-        {allowlist.length === 0 && (
-          <div className="text-xs text-[var(--color-fg-muted)]">
-            None yet. Use <strong>Normal</strong> on a finding or a field value.
-          </div>
-        )}
-        {allowlist.map((e) => (
-          <div
-            key={e.id}
-            className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-1 text-xs"
+      )}
+      {allowlist.map((e) => (
+        <div
+          key={e.id}
+          className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-1 text-xs"
+        >
+          <span className="min-w-0 flex-1 truncate">
+            <span className="text-[var(--color-fg-muted)]">
+              {e.detector === "*" ? "all detectors" : e.detector} · {e.field}:
+            </span>{" "}
+            <span className="text-[var(--color-fg-primary)]">{e.value}</span>
+          </span>
+          <button
+            className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+            onClick={() => removeMut.mutate(e.id)}
+            title="Remove — value becomes flaggable again"
           >
-            <span className="min-w-0 flex-1 truncate">
-              <span className="text-[var(--color-fg-muted)]">
-                {e.detector === "*" ? "all detectors" : e.detector} · {e.field}:
-              </span>{" "}
-              <span className="text-[var(--color-fg-primary)]">{e.value}</span>
-            </span>
-            <button
-              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
-              onClick={() => removeAllowMut.mutate(e.id)}
-              title="Remove — value becomes flaggable again"
-            >
-              <Trash2 size={11} />
-            </button>
-          </div>
-        ))}
-      </div>
+            <Trash2 size={11} />
+          </button>
+        </div>
+      ))}
     </div>
   );
 }

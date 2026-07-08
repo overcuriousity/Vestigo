@@ -22,6 +22,8 @@ import { shouldInvalidate } from "@/hooks/useCaseStream";
 import {
   DetectorStatusLine,
   NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
@@ -288,6 +290,8 @@ export function FrequencyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
   if (needsBaseline) return <NeedsBaselinePrompt />;
 
   return (
@@ -364,7 +368,8 @@ export function FrequencyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}
               finding={f}
