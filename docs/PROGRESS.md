@@ -1,6 +1,49 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-07 (session 30 — W1 context query, W3 audit coverage, M3 polish).
+Last updated: 2026-07-08 (session 31 — explicit baseline + suspect windows, Alembic, D11 allowlist).
+
+## Session 31 — 2026-07-08: explicit baseline + suspect windows for temporal anomaly detection
+
+Replaced the single-`baseline_end` split point (which the UI never even exposed — it
+silently used the timeline midpoint) with explicit, persistent **baseline definitions**:
+a named baseline window plus 1..N labeled suspect windows per timeline. This is the USP
+detailed-investigation workflow — "mark what was normal, mark what's suspicious, tell me
+what diverges and why."
+
+- **Alembic adopted** (`src/tracesignal/db/migrations`). Schema was previously
+  `create_all` + hand-rolled inspector ALTERs; prod now has real data, so revision `0001`
+  snapshots the full existing schema and `init_schema` stamps-then-upgrades (pre-Alembic
+  databases get the legacy fixups one last time, then `stamp 0001`, then `upgrade head` —
+  zero manual deploy steps). Revision `0002` adds `baseline_definitions` +
+  `detector_allowlist`. Future schema changes are revisions, never inspector ALTERs.
+- **New entities** (`db/postgres.py`, router `api/routers/baselines.py`): `BaselineDefinition`
+  (baseline range + suspect windows JSON, derived `config_hash`, freely editable) and
+  `DetectorAllowlistEntry` (`(detector, field, value)` never-anomalous). RBAC + audit;
+  window-geometry validation (baseline/suspect overlap = 422, suspect/suspect = warning,
+  ≤10 windows). Timeline/case deletes cascade both (and `SavedChart`, previously orphaned).
+- **All six temporal detectors reworked** (`db/anomaly_stats.py`) onto a frozen
+  `AnalysisWindows` contract; `windows_from_split` preserves the legacy split at the API
+  edge so old runs/clients keep working. Statistics fixed: surprise denominators are the
+  suspect window's own event count (per window); frequency derives its interval from the
+  baseline window, zero-fills baseline buckets, scores only full suspect buckets, and warns
+  on windows too short. Findings carry `window_label`. Verified end-to-end against the dev
+  ClickHouse (caught two real SQL bugs the fakes couldn't: a `GROUP BY`/`any()` collision
+  and a `-0.0` surprise).
+- **D11 merged in** (roadmap item removed): "mark normal" on a finding now writes a
+  value-level allowlist entry consumed as post-detection suppression, unifying with the
+  time-based baseline model. The standalone per-event Normal toggle is gone from the grid
+  and detail panel (legacy `normal` annotations still honored, read-only); timestamp-order
+  findings keep the per-event path.
+- **Forensic reproducibility**: `DetectorRun.params` snapshots `baseline_id`, the full
+  window payload + `windows_hash`, and `allowlist_hash` + count — a run stays
+  self-describing after the definition/allowlist is edited or deleted.
+- **Frontend**: histogram baseline (blue) + suspect (amber) bands + a zoom/mark cursor
+  toggle; `BaselineManager` (mark ranges → set baseline / add suspect, select/delete,
+  allowlist list); `baseline_id` threaded through every detector view via a small store;
+  run warnings surfaced; a "run all detectors" summary strip. `docs/ANOMALY_DETECTION.md`
+  rewritten for the new model.
+
+## Session 30 — 2026-07-07: context query, analyst-action audit, M3 polish batch
 
 ## Session 30 — 2026-07-07: context query, analyst-action audit, M3 polish batch
 

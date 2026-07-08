@@ -50,6 +50,79 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   must exclude them via `TS_NOT_SENTINEL_SQL` — exactly where the old
   Nullable schema used `timestamp IS NOT NULL`.
 
+### Baseline definitions, suspect windows, and the normality model
+
+Every temporal detector (value novelty, value combos, frequency, numeric
+range, charset, entropy — everything except the mode-less timestamp-order
+detector) answers the same shape of question: *given a period I know was
+normal, what stands out in the periods I'm suspicious of?* Two persistent,
+analyst-declared primitives express "normal", and it is worth being precise
+about which is which:
+
+- **Baseline definitions = time-based normality.** A named, per-timeline
+  Postgres object (`baseline_definitions`, model in `db/postgres.py`) holding
+  one **baseline window** (the known-normal reference period) plus **1..N
+  labeled suspect windows** (the ranges under investigation). Windows are
+  half-open `[start, end)`, need **not** be adjacent (gaps are fine), and the
+  baseline must be disjoint from every suspect window (the API rejects overlap
+  with 422 — "absent from baseline" is meaningless if they share events).
+  Suspect windows *may* overlap each other (a burst examined two ways) with a
+  warning. Cap: 10 suspect windows. Mark them by dragging ranges on the
+  timeline histogram in "mark" mode; manage them in the Baselines panel.
+- **The detector allowlist = value-based normality** (`detector_allowlist`,
+  roadmap D11). An analyst-declared "this `(detector, field, value)` is never
+  an anomaly on this timeline" — created from a finding's **Mark normal**
+  action. Consumed as a post-detection suppression, so the same value is
+  dropped on *every* event, unlike the legacy per-event `normal` annotation it
+  replaces (which only hid one representative event's finding). For the
+  frequency detector the field is the series field, so an entry suppresses a
+  whole known-noisy series.
+
+**How a suspect window scores.** Each temporal detector restricts its scan to
+the union of the baseline and suspect windows (events outside every window are
+ignored), learns its reference from the **baseline** window, and reports one
+finding per (value, suspect window) with the suspect window named in
+`details.window_label`. The "surprise" family of detectors (value novelty,
+combos, charset) use the **suspect window's own event count** as the score
+denominator — not the whole corpus, which overstated rarity whenever the
+windows covered only part of the timeline. A suspect window with fewer than 50
+events gets a `warnings` entry (scores over tiny samples are unstable); it is
+warned about, never silently dropped.
+
+**Frequency's bucket rule (the subtle one).** The bucket interval is derived
+from the **baseline** window (`baseline span / 60`), and the *same*
+epoch-aligned interval buckets every suspect window, so counts are comparable.
+Mean/std come from the baseline window's buckets only, **zero-filled** — a
+bucket with no events is a real `0` in the distribution, not a missing sample,
+or a silent period would inflate the mean. Because `toStartOfInterval` aligns
+buckets to the Unix epoch, a window edge can cut a bucket; **partial buckets
+are excluded** from both the baseline stats and suspect-window scoring (a
+half-covered bucket reads as a fake spike/drop). A suspect window too short to
+contain one full bucket yields a warning rather than a bogus single-bucket
+z-score — the fix is to widen the window or shrink the baseline (a shorter
+baseline → finer interval).
+
+**Forensic reproducibility.** Baseline definitions and allowlist entries are
+freely editable — reproducibility does **not** depend on them surviving.
+Every `DetectorRun` snapshots into its `params` the resolved `baseline_id`,
+the full `windows` payload, a `windows_hash`, and the `allowlist_hash` +
+entry count it was filtered through. So a persisted run stays fully
+self-describing — "why is this value not flagged?" and "what exactly did this
+scan compare?" stay answerable — even after the definition or allowlist is
+later changed or deleted. The legacy single-`baseline_end` split point and the
+`temporal=true` midpoint fallback are still accepted at the API and converted
+to a one-baseline/one-suspect window pair (`windows_from_split`), so old runs
+and clients keep working; internally the detectors have exactly one temporal
+code path.
+
+Three ways an event can be "normal", to keep them straight:
+
+| Mechanism | Scope | Created from | Status |
+|---|---|---|---|
+| Baseline window | time range | histogram "mark" mode | current |
+| Allowlist entry | `(detector, field, value)` | a finding's "Mark normal" | current |
+| `normal` annotation | one event | (legacy) | honored, read-only; no longer created except for timestamp-order findings |
+
 ---
 
 ## 1. Value novelty (rare / first-seen values)
@@ -73,7 +146,7 @@ embedding job required.
 | Mode | What "rare" means | When to use |
 |---|---|---|
 | **Self-baseline** | Value appears ≤ *rarity floor* (default 3) times across the *whole* timeline | General triage — "what's unusual in this dataset overall" |
-| **Temporal** | Value is absent before a split timestamp but present after it | Incident response — "what showed up *after* the incident started that wasn't there before" |
+| **Temporal** | Value is absent from the baseline window but present in a suspect window (see [the normality model](#baseline-definitions-suspect-windows-and-the-normality-model)) | Incident response — "what showed up in the window I'm investigating that wasn't in the known-normal period" |
 
 ### Self-baseline mode
 
@@ -87,14 +160,15 @@ incident window rather than tuning the floor.
 
 ### Temporal mode
 
-You (or the UI, defaulting to the timeline's midpoint) supply a split
-timestamp. Everything before it is the **baseline window**; everything at or
-after it is the **detect window**. A value is flagged only if it appears **zero
-times in the baseline** and **at least once in the detect window** — i.e.,
-genuinely new activity after the split, not just uncommon activity in
-general. The rarity floor is **ignored entirely** in this mode — it's a
-different question (first-seen vs. rare-overall), not a stricter/looser
-version of the same one.
+You select a [baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
+— a baseline window plus one or more suspect windows (or, legacy, a single
+split timestamp defaulting to the timeline midpoint). A value is flagged only
+if it appears **zero times in the baseline window** and **at least once in a
+suspect window** — genuinely new activity in the period you're investigating,
+not just uncommon activity in general. You get one finding per suspect window
+the value appears in, each carrying its `window_label`. The rarity floor is
+**ignored entirely** in this mode; the surprise denominator is the suspect
+window's own event count, not the whole corpus (see [the score](#the-score-surprise)).
 
 ### The score: "surprise"
 
@@ -267,7 +341,7 @@ temporal variant).
 | Mode | Baseline (mean/std source) | When to use |
 |---|---|---|
 | **z-score** (self-baseline) | Every bucket in the series, computed **leave-one-out** | General triage |
-| **temporal-z-score** | Only buckets before the baseline/detect split | Incident response |
+| **temporal-z-score** | The [baseline window's](#baseline-definitions-suspect-windows-and-the-normality-model) full, zero-filled buckets; suspect-window buckets scored against them | Incident response |
 
 **Self-baseline uses leave-one-out scoring.** Each bucket is compared against
 the mean/std of *every other* bucket in that series — not against a mean/std
@@ -279,14 +353,17 @@ document and the in-app Methodology panel previously stated the opposite —
 that the self-baseline "includes this window" — which was wrong; fixed as
 part of the audit that produced this file.)
 
-**Temporal mode** computes mean/std from the baseline window only, then scores
-every detect-window bucket against that fixed, independent baseline — no
+**Temporal mode** computes mean/std from the baseline window's buckets only
+(zero-filled and full-buckets-only — see the [normality model](#baseline-definitions-suspect-windows-and-the-normality-model)
+for the bucket-interval and partial-bucket rules), then scores every
+suspect-window bucket against that fixed, independent baseline — no
 leave-one-out needed since the scored buckets were never part of the
-baseline. A series with zero activity in the baseline but some activity in
-the detect window is still scored (against a floored minimum standard
+baseline. A series with zero activity in the baseline but some activity in a
+suspect window is still scored (against a floored minimum standard
 deviation, see below) rather than silently skipped — "this thing didn't exist
 before and now it does" is exactly the kind of finding temporal mode exists to
-surface.
+surface. A suspect window too short to contain one full baseline-interval
+bucket is warned about instead of scored.
 
 ### Two numerical floors — why they exist and what they mean for interpretation
 
@@ -423,7 +500,7 @@ log) and a caveat (see below).
 
 | | Self-baseline (`iqr`) | Temporal (`temporal-range`) |
 |---|---|---|
-| Baseline | the whole corpus | values before `baseline_end` |
+| Baseline | the whole corpus | values in the baseline window |
 | Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | exact `[min, max]` of the baseline |
 | Flags | statistical outliers | anything outside the historical range |
 
@@ -438,7 +515,7 @@ rule, and it's fully explainable ("the middle 50% of `bytes` sat between 100 and
 **Why temporal uses exact min/max.** With a real baseline/detect split, the
 AMiner-faithful behaviour is exactly right: learn the range the field took
 *before* the incident window, flag anything outside it *after*. "The largest
-`bytes` value in the 300-event baseline was 500; this detect-window value is
+`bytes` value in the 300-event baseline was 500; this suspect-window value is
 9,999."
 
 ### The score
@@ -494,7 +571,7 @@ volume.
 | | Self-baseline (`rare-chars`) | Temporal (`temporal-charset`) |
 |---|---|---|
 | Reference set | characters appearing in **more than** `rarity_floor` (3) distinct values | every character seen in baseline-window values |
-| Flags | values containing a character almost no other value has | detect-window values containing a character the baseline never had |
+| Flags | values containing a character almost no other value has | suspect-window values containing a character the baseline window never had |
 
 **Why self-baseline can't use the plain charset.** The whole corpus's
 character set trivially contains every character in the corpus — nothing could
@@ -505,7 +582,7 @@ a rare character is flagged. "Of 5,000 distinct usernames, exactly one
 contains a NUL byte" is precisely the finding this mode exists for.
 
 **Temporal mode is the AMiner-faithful one:** learn the baseline window's
-alphabet, flag detect-window values whose characters step outside it.
+alphabet, flag suspect-window values whose characters step outside it.
 
 ### The score
 
@@ -585,9 +662,9 @@ degenerate and would flood the band with false lows.
 
 | | Self-baseline (`iqr`) | Temporal (`temporal-iqr`) |
 |---|---|---|
-| Baseline population | entropies of every distinct value in the corpus | entropies of distinct values before `baseline_end` |
+| Baseline population | entropies of every distinct value in the corpus | entropies of distinct values in the baseline window |
 | Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | same fence, learned from the baseline window |
-| Flags | statistical entropy outliers anywhere | detect-window values outside the baseline's band |
+| Flags | statistical entropy outliers anywhere | suspect-window values outside the baseline window's band |
 
 Unlike the numeric-range detector, *both* modes can use the fence directly:
 quartiles are not degenerate over their own population the way an exact
@@ -691,3 +768,20 @@ and its formula's mathematical soundness. Findings:
   rather than papered over — the fix is honest documentation, not a code
   change, since the alternative (a different statistical test per series
   length) would be real added complexity for a niche edge case.
+
+## Explicit baseline + suspect windows (2026-07)
+
+The single-`baseline_end` split point was replaced by explicit
+[baseline definitions](#baseline-definitions-suspect-windows-and-the-normality-model):
+a named baseline window plus 1..N labeled suspect windows per timeline, marked
+on the histogram. Every temporal detector now scores each suspect window
+against the baseline with per-window statistics (surprise denominators are the
+suspect window's own event count; frequency derives its bucket interval from
+the baseline and excludes partial/edge buckets), attributes each finding to its
+window, and warns on windows too small to score. The old whole-corpus surprise
+denominator and whole-timeline frequency buckets — both of which overstated
+significance when the analysis covered only part of the timeline — are gone.
+Per-event "mark normal" was unified into the value-level detector allowlist
+(roadmap D11); the legacy `normal` annotation is still honored but no longer
+created outside timestamp-order findings. Schema for both new tables is managed
+by Alembic (`src/tracesignal/db/migrations`), which this change also adopted.
