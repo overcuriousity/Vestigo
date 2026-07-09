@@ -98,9 +98,9 @@ def test_case_jobs_list_scoped_to_case_and_requires_read_access(client, admin_bo
     _add_member(client, team["id"], member["id"], role="member")
 
     mgr_client = _login_as(client, "jobmgr4")
-    case = mgr_client.post("/api/cases/", json={"name": "jobs-case-4", "team_id": team["id"]}).json()[
-        "case"
-    ]
+    case = mgr_client.post(
+        "/api/cases/", json={"name": "jobs-case-4", "team_id": team["id"]}
+    ).json()["case"]
     other_case = mgr_client.post(
         "/api/cases/", json={"name": "jobs-case-4-other", "team_id": team["id"]}
     ).json()["case"]
