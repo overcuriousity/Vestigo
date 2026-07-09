@@ -106,13 +106,19 @@ Prep landed: shared frontend detector scaffolding (`components/analysis/detector
 a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
 multi-field queries. **D1 (value-combo), D2 (timestamp-order), D3 (charset), D4
-(numeric-range), and D5 (entropy) shipped.**
+(numeric-range), and D5 (entropy) shipped.** Also shipped (beyond the AMiner set, no AMiner
+equivalent): **proportion_shift** — per-(field, value) 2×2 G-test of a value's *share* of
+events between the baseline and each suspect window, BH-FDR across the run, rate-ratio effect
+floor, temporal-only, first-seen excluded (`baseline_cnt ≥ 1`; value_novelty owns those).
 
 High value first:
 
 - [ ] **D6 — Per-value silence** (AMiner `MissingMatchPathValueDetector`): a value that
   appeared regularly in the baseline stops appearing in the detect window (agent killed,
   log source suppressed). Complements the existing `frequency` detector's global silences.
+  *Partially covered by the shipped `proportion_shift` detector's "down"/vanished findings
+  (whole-window share drop to zero); what remains distinct is the periodicity angle
+  ("appeared regularly"), which overlaps D7 — re-scope before building.*
 - [ ] **D7 — Interval-periodicity violations** (AMiner `PathValueTimeIntervalDetector`): learn
   the inter-arrival interval distribution per field value in the baseline; flag deviation
   (missed/shifted periodic events) and, inversely, newly *regular* intervals (beaconing).

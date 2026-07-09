@@ -37,6 +37,7 @@ from tracesignal.db.anomaly_stats import (
     NoveltyFieldInfo,
     OrderFinding,
     RangeFinding,
+    ShiftFinding,
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
@@ -1348,6 +1349,8 @@ async def _run_stat_detector(
     baseline_id: str | None = None,
     limit: int,
     min_skew_seconds: float | None = None,
+    fdr_q: float | None = None,
+    min_ratio: float | None = None,
     field_mappings: dict[str, list[str]] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve analysis windows + value allowlist, then dispatch to the detector.
@@ -1510,6 +1513,31 @@ async def _run_stat_detector(
         )
         return result, resolution
 
+    if detector == "proportion_shift":
+        # Snapshot the *effective* thresholds (request override or server
+        # default) so the persisted run stays self-describing.
+        resolution["shift_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_shift_fdr_q
+        resolution["shift_min_ratio"] = (
+            min_ratio if min_ratio is not None else cfg.stat_shift_min_ratio
+        )
+        result = await run_in_threadpool(
+            svc.find_proportion_shifts,
+            case_id=case_id,
+            source_ids=source_ids,
+            fields=parsed_fields,
+            limit=limit,
+            windows=windows,
+            fdr_q=resolution["shift_fdr_q"],
+            min_ratio=resolution["shift_min_ratio"],
+            max_candidates_per_field=cfg.stat_shift_max_candidates_per_field,
+            exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            inventory_total=inventory_total,
+        )
+        return result, resolution
+
     result = await run_in_threadpool(
         svc.find_value_novelty,
         case_id=case_id,
@@ -1612,12 +1640,15 @@ def _serialize_finding(
     | ComboFinding
     | RangeFinding
     | CharsetFinding
-    | EntropyFinding,
+    | EntropyFinding
+    | ShiftFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy finding to a JSON-safe dict."""
-    # Charset/Entropy finding dataclass fields are exactly the wire keys, so
-    # asdict() avoids a hand-maintained field-by-field transcription that would
-    # silently drop any newly added field.
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift finding dataclass fields are exactly the wire keys,
+    # so asdict() avoids a hand-maintained field-by-field transcription that
+    # would silently drop any newly added field.
+    if isinstance(r, ShiftFinding):
+        return {"type": "proportion_shift", **asdict(r)}
     if isinstance(r, EntropyFinding):
         return {"type": "entropy", **asdict(r)}
     if isinstance(r, CharsetFinding):
@@ -1839,6 +1870,10 @@ async def _persist_detector_run(
             "temporal": temporal,
             "limit": limit,
             "min_skew_seconds": min_skew_seconds,
+            # proportion_shift: effective (request-or-default) thresholds; None
+            # for every other detector.
+            "fdr_q": resolution.get("shift_fdr_q"),
+            "min_ratio": resolution.get("shift_min_ratio"),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
@@ -1874,7 +1909,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', or 'entropy'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', or 'proportion_shift'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1899,6 +1934,23 @@ async def list_anomalies(
         description=(
             "Minimum backwards jump (seconds) for the timestamp_order detector. "
             "Omit to use the server default."
+        ),
+    ),
+    fdr_q: float | None = Query(
+        default=None,
+        gt=0,
+        le=1,
+        description=(
+            "Benjamini-Hochberg false-discovery-rate ceiling for the "
+            "proportion_shift detector. Omit to use the server default."
+        ),
+    ),
+    min_ratio: float | None = Query(
+        default=None,
+        gt=1,
+        description=(
+            "Effect-size floor (rate ratio, either direction) for the "
+            "proportion_shift detector. Omit to use the server default."
         ),
     ),
     baseline_end: datetime | None = Query(  # noqa: B008
@@ -1960,6 +2012,12 @@ async def list_anomalies(
     **entropy**: per field, flags values whose Shannon character entropy falls
     outside a Tukey fence over the field's baseline entropy distribution
     (random-looking or degenerate strings).
+
+    **proportion_shift**: per (field, value), flags values whose *share* of
+    events differs significantly between the baseline window and a suspect
+    window (2×2 G-test, Benjamini-Hochberg FDR across the run, rate-ratio
+    effect floor). Temporal-only — requires baseline_id/baseline_end/temporal;
+    first-seen values are excluded (value_novelty owns those).
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
@@ -1975,6 +2033,8 @@ async def list_anomalies(
         baseline_id=baseline_id,
         limit=limit,
         min_skew_seconds=min_skew_seconds,
+        fdr_q=fdr_q,
+        min_ratio=min_ratio,
         field_mappings=field_mappings,
     )
 
@@ -2026,7 +2086,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', or 'entropy'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', or 'proportion_shift'.",
     )
     fields: str | None = Field(
         default=None,
@@ -2045,6 +2105,17 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         ge=0,
         description="Minimum backwards jump (seconds) for the timestamp_order detector.",
+    )
+    fdr_q: float | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description="BH false-discovery-rate ceiling for the proportion_shift detector.",
+    )
+    min_ratio: float | None = Field(
+        default=None,
+        gt=1,
+        description="Effect-size floor (rate ratio) for the proportion_shift detector.",
     )
     baseline_end: datetime | None = Field(
         default=None,
@@ -2103,6 +2174,8 @@ async def tag_anomalies(
         baseline_id=body.baseline_id,
         limit=body.limit,
         min_skew_seconds=body.min_skew_seconds,
+        fdr_q=body.fdr_q,
+        min_ratio=body.min_ratio,
         field_mappings=field_mappings,
     )
 
@@ -2220,6 +2293,25 @@ async def tag_anomalies(
                     f"of {result.baseline_size:,} events in the corpus "
                     f"(surprise {r.score:.2f})"
                 )
+        elif isinstance(r, ShiftFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the suspect window"
+            bl_pct = f"{r.baseline_rate * 100:.2g}%"
+            if r.count == 0:
+                content = (
+                    f"Proportion shift — {r.field}={r.value!r}: present "
+                    f"{r.baseline_count}× in the {result.baseline_size:,}-event "
+                    f"baseline ({bl_pct}) but absent from {where} "
+                    f"(G={r.g_statistic:.1f}, q={r.q_value:.3g})"
+                )
+            else:
+                content = (
+                    f"Proportion shift — {r.field}={r.value!r}: share of events "
+                    f"went {bl_pct} → {r.window_rate * 100:.2g}% "
+                    f"({r.rate_ratio:.1f}×, {r.direction}) in {where} "
+                    f"(G={r.g_statistic:.1f}, q={r.q_value:.3g})"
+                )
         elif isinstance(r, OrderFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
@@ -2322,7 +2414,11 @@ class PersistAnomalyFindingRequest(BaseModel):
     """Body for persisting one live (not-yet-tagged) anomaly finding."""
 
     detector: str = Field(
-        ..., description="Detector id ('value_novelty', 'charset', …) that produced this finding."
+        ...,
+        description=(
+            "Detector id ('value_novelty', 'charset', 'proportion_shift', …) "
+            "that produced this finding."
+        ),
     )
     content: str = Field(
         ...,

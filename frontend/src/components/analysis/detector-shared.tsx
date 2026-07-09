@@ -1,6 +1,7 @@
 /**
  * detector-shared — scaffolding shared by every statistical-detector view
- * (rare values, value combos, frequency, timestamp order, numeric range).
+ * (rare values, value combos, frequency, proportion shift, timestamp order,
+ * numeric range, charset, entropy).
  *
  * Each view keeps its own bespoke finding-row *body*; the chrome around it —
  * mode toggle, status line, expandable details dump, tag action, marker/runId

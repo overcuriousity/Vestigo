@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series by */
@@ -17,6 +17,10 @@ export interface AnomalyParams {
   z_threshold?: number;
   /** Minimum backwards jump (seconds) for the timestamp_order detector. */
   min_skew_seconds?: number;
+  /** BH false-discovery-rate ceiling for the proportion_shift detector. */
+  fdr_q?: number;
+  /** Effect-size floor (rate ratio) for the proportion_shift detector. */
+  min_ratio?: number;
   /** Explicit temporal baseline end timestamp (legacy split; prefer baseline_id) */
   baseline_end?: string;
   /** Enable legacy temporal mode (backend uses timeline midpoint when baseline_end is absent) */
@@ -68,7 +72,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift";
       content: string;
       details: Record<string, unknown>;
     },

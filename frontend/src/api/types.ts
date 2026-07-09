@@ -352,6 +352,34 @@ export interface EntropyFinding {
   details: Record<string, unknown>;
 }
 
+/** One value-share shift between windows from the proportion_shift detector. */
+export interface ProportionShiftFinding {
+  type: "proportion_shift";
+  field: string;
+  value: string;
+  /** Occurrences in the suspect window; 0 = vanished (baseline-only). */
+  count: number;
+  baseline_count: number;
+  /** baseline_count ÷ baseline window's event total. */
+  baseline_rate: number;
+  /** count ÷ suspect window's event total (0.5-smoothed when count = 0). */
+  window_rate: number;
+  /** window_rate ÷ baseline_rate. */
+  rate_ratio: number;
+  direction: "up" | "down";
+  g_statistic: number;
+  p_value: number;
+  /** Benjamini–Hochberg adjusted p-value across every test in the run. */
+  q_value: number;
+  /** = g_statistic — used for ranking. */
+  score: number;
+  /** First occurrence in the suspect window; null when vanished. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -378,7 +406,8 @@ export type AnomalyFinding =
   | TimestampOrderFinding
   | NumericRangeFinding
   | CharsetFinding
-  | EntropyFinding;
+  | EntropyFinding
+  | ProportionShiftFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -482,7 +511,8 @@ export interface AnomalyMarker {
     | "timestamp_order"
     | "numeric_range"
     | "charset"
-    | "entropy";
+    | "entropy"
+    | "proportion_shift";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

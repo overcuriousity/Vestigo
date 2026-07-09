@@ -17,6 +17,7 @@ import {
   ChevronRight,
   Hash,
   Layers,
+  Percent,
   RefreshCw,
   Rewind,
   Ruler,
@@ -33,10 +34,19 @@ import { OrderViolationsView } from "./OrderViolationsView";
 import { NumericRangeView } from "./NumericRangeView";
 import { CharsetNoveltyView } from "./CharsetNoveltyView";
 import { EntropyView } from "./EntropyView";
+import { ProportionShiftView } from "./ProportionShiftView";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
-type DetectorId = "novelty" | "combo" | "frequency" | "order" | "range" | "charset" | "entropy";
+type DetectorId =
+  | "novelty"
+  | "combo"
+  | "frequency"
+  | "shift"
+  | "order"
+  | "range"
+  | "charset"
+  | "entropy";
 
 const DETECTORS: {
   id: DetectorId;
@@ -48,6 +58,7 @@ const DETECTORS: {
   { id: "novelty", detector: "value_novelty", icon: Hash, label: "Rare values", hint: "Rare or first-seen field values" },
   { id: "combo", detector: "value_combo", icon: Layers, label: "Value combos", hint: "Rare combinations of fields" },
   { id: "frequency", detector: "frequency", icon: Activity, label: "Frequency", hint: "Count spikes and silences" },
+  { id: "shift", detector: "proportion_shift", icon: Percent, label: "Proportion shift", hint: "Value shares that change between windows" },
   { id: "range", detector: "numeric_range", icon: Ruler, label: "Numeric range", hint: "Values outside a learned band" },
   { id: "charset", detector: "charset", icon: Type, label: "Charset novelty", hint: "Never-seen characters" },
   { id: "entropy", detector: "entropy", icon: Shuffle, label: "Entropy outliers", hint: "Random or degenerate strings" },
@@ -181,6 +192,8 @@ function DetectorBody({ id, ...props }: Props & { id: DetectorId }) {
       return <ComboNoveltyView {...shared} onComboDrill={props.onComboDrill} />;
     case "frequency":
       return <FrequencyView {...shared} onDrillField={props.onFrequencyDrill} />;
+    case "shift":
+      return <ProportionShiftView {...shared} onDrillField={props.onDrillField} />;
     case "order":
       return <OrderViolationsView {...shared} />;
     case "range":

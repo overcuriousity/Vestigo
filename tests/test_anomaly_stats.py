@@ -16,9 +16,12 @@ from tracesignal.db.anomaly_stats import (
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
+    _bh_qvalues,
+    _chi2_sf_df1,
     _classify_field,
     _col_expr,
     _full_bucket_starts,
+    _g_statistic,
     windows_from_split,
 )
 
@@ -2148,3 +2151,335 @@ def test_entropy_excludes_normal_marked_events():
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
     assert svc.ch.hydration_calls == [["evt-keep"]]
+
+
+# ---------------------------------------------------------------------------
+# proportion_shift — statistics helpers
+# ---------------------------------------------------------------------------
+
+
+def test_g_statistic_hand_computed():
+    """G for a hand-computable 2×2 table, and 0 for identical proportions."""
+    # rows (baseline 10/1000, window 40/1000): expected cells 25/975 each row.
+    # G = 2·(10·ln(10/25) + 990·ln(990/975) + 40·ln(40/25) + 960·ln(960/975))
+    assert abs(_g_statistic(10, 990, 40, 960) - 19.7360) < 1e-3
+    # Identical proportions carry zero evidence.
+    assert _g_statistic(10, 990, 10, 990) == 0.0
+    # Zero cells contribute nothing rather than NaN.
+    assert _g_statistic(0, 0, 0, 0) == 0.0
+    assert _g_statistic(200, 800, 0, 500) > 0
+
+
+def test_chi2_sf_df1_known_values():
+    """The erfc closed form matches the classic df=1 chi² critical values."""
+    assert abs(_chi2_sf_df1(3.841459) - 0.05) < 1e-4
+    assert abs(_chi2_sf_df1(6.634897) - 0.01) < 1e-4
+    assert _chi2_sf_df1(0.0) == 1.0
+
+
+def test_bh_qvalues():
+    """BH step-up with monotone enforcement, returned in input order."""
+    q = _bh_qvalues([0.01, 0.04, 0.03, 0.5])
+    assert abs(q[0] - 0.04) < 1e-9
+    assert abs(q[1] - 0.04 * 4 / 3) < 1e-9
+    # p=0.03 (rank 2) would be 0.06 raw; monotonicity pulls it down to rank 3's q.
+    assert abs(q[2] - 0.04 * 4 / 3) < 1e-9
+    assert abs(q[3] - 0.5) < 1e-9
+    assert _bh_qvalues([]) == []
+
+
+# ---------------------------------------------------------------------------
+# proportion_shift — detector
+# ---------------------------------------------------------------------------
+
+
+def _shift_windows() -> AnalysisWindows:
+    return _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 15, tzinfo=UTC),
+        datetime(2024, 1, 16, tzinfo=UTC),
+        datetime(2024, 1, 20, tzinfo=UTC),
+        label="incident",
+    )
+
+
+def test_proportion_shift_insufficient_data_without_windows():
+    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
+    svc = _svc([])
+    result = svc.find_proportion_shifts("c1", ["s1"], fields=["attr:user"])
+    assert result.status == "insufficient_data"
+    assert result.detector == "proportion_shift"
+    assert result.method == "g-test"
+    assert any("temporal-only" in w for w in result.warnings)
+    assert svc.ch.client._calls == []
+
+
+def test_proportion_shift_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:user"], windows=_shift_windows()
+    )
+    assert result.status == "no_data"
+
+
+def test_proportion_shift_flags_up_direction():
+    """A value whose share jumps 0.5% → 8% is flagged 'up' with G as score."""
+    responses = [
+        FakeQueryResult(result_rows=[(11000,)], column_names=["count()"]),
+        # window totals: baseline 10000, suspect 1000
+        FakeQueryResult(result_rows=[(10000, 1000)], column_names=["bl", "w0"]),
+        # val, baseline_cnt, bl_last, bl_evt, w0_cnt, w0_first, w0_evt
+        FakeQueryResult(
+            result_rows=[
+                ("4625", 50, datetime(2024, 1, 14), "evt-bl", 80, datetime(2024, 1, 16), "evt-w"),
+            ],
+            column_names=[
+                "val",
+                "baseline_cnt",
+                "bl_last",
+                "bl_evt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:eventid"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert result.method == "g-test"
+    assert result.baseline_size == 10000
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.value == "4625"
+    assert r.direction == "up"
+    assert r.count == 80
+    assert r.baseline_count == 50
+    # G computed on raw counts: (50, 9950, 80, 920).
+    assert abs(r.g_statistic - 225.2477) < 1e-3
+    assert r.score == r.g_statistic
+    assert r.q_value <= 0.05
+    assert abs(r.rate_ratio - 16.0) < 0.01
+    assert r.event_id == "evt-w"
+    assert r.first_seen is not None
+    assert r.details["window_label"] == "incident"
+    assert r.details["allowlist_field"] == "attr:eventid"
+    assert r.details["allowlist_value"] == "4625"
+    assert r.details["m_tests"] == 1
+
+
+def test_proportion_shift_vanished_value_is_down():
+    """A baseline value absent from the suspect window is a maximal 'down'."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[
+                ("heartbeat", 200, datetime(2024, 1, 14, 23), "evt-last", 0, None, ""),
+            ],
+            column_names=[
+                "val",
+                "baseline_cnt",
+                "bl_last",
+                "bl_evt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:service"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.direction == "down"
+    assert r.count == 0
+    assert r.first_seen is None
+    # Representative event = last baseline occurrence.
+    assert r.event_id == "evt-last"
+    assert r.details["last_seen_baseline"] is not None
+    # Ratio uses Haldane–Anscombe smoothing (0.5/500 over 200/1000).
+    assert abs(r.rate_ratio - (0.5 / 500) / 0.2) < 1e-6
+    # The test itself used raw counts: G(200, 800, 0, 500).
+    assert abs(r.g_statistic - 177.2186) < 1e-3
+
+
+def test_proportion_shift_sql_excludes_first_seen():
+    """The candidate scan prunes only first-seen values and keeps baseline rows."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_proportion_shifts("c1", ["s1"], fields=["attr:user"], windows=_shift_windows())
+    candidate_sql = client.full_queries[2]
+    assert "HAVING baseline_cnt >= 1" in candidate_sql
+    # Baseline predicate must be in the WHERE union so vanished values survive.
+    assert "{b0:String}" in candidate_sql and "{b1:String}" in candidate_sql
+    assert "ORDER BY (baseline_cnt + w0_cnt) DESC" in candidate_sql
+
+
+def test_proportion_shift_effect_floor():
+    """A statistically significant but small (<min_ratio) shift is suppressed."""
+    responses = [
+        FakeQueryResult(result_rows=[(200000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(100000, 100000)], column_names=["bl", "w0"]),
+        # 10% → 12%: hugely significant at this volume, ratio only 1.2.
+        FakeQueryResult(
+            result_rows=[
+                (
+                    "200",
+                    10000,
+                    datetime(2024, 1, 14),
+                    "evt-bl",
+                    12000,
+                    datetime(2024, 1, 16),
+                    "evt-w",
+                ),
+            ],
+            column_names=[
+                "val",
+                "baseline_cnt",
+                "bl_last",
+                "bl_evt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:status"], windows=_shift_windows(), min_ratio=2.0
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_proportion_shift_fdr_gates_insignificant_shift():
+    """A large ratio without statistical evidence (tiny counts) fails the q gate."""
+    responses = [
+        FakeQueryResult(result_rows=[(1100,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 100)], column_names=["bl", "w0"]),
+        # 1/1000 → 1/100: ratio 10× but one event in the window — no evidence.
+        FakeQueryResult(
+            result_rows=[
+                ("rareval", 1, datetime(2024, 1, 14), "evt-bl", 1, datetime(2024, 1, 16), "evt-w"),
+            ],
+            column_names=[
+                "val",
+                "baseline_cnt",
+                "bl_last",
+                "bl_evt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:user"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_proportion_shift_allowlist_suppression():
+    responses = [
+        FakeQueryResult(result_rows=[(11000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(10000, 1000)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[
+                ("4625", 50, datetime(2024, 1, 14), "evt-bl", 80, datetime(2024, 1, 16), "evt-w"),
+            ],
+            column_names=[
+                "val",
+                "baseline_cnt",
+                "bl_last",
+                "bl_evt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1",
+        ["s1"],
+        fields=["attr:eventid"],
+        windows=_shift_windows(),
+        allowlist={("attr:eventid", "4625")},
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_proportion_shift_tiny_window_warning():
+    """A suspect window under the event floor is warned about, never dropped."""
+    responses = [
+        FakeQueryResult(result_rows=[(1030,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 30)], column_names=["bl", "w0"]),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:user"], windows=_shift_windows()
+    )
+    assert any("only 30 events" in w for w in result.warnings)
+
+
+def test_proportion_shift_candidate_cap_warning():
+    """Hitting the per-field candidate cap surfaces an FDR-coverage warning."""
+    responses = [
+        FakeQueryResult(result_rows=[(11000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(10000, 1000)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[
+                ("a", 500, datetime(2024, 1, 14), "e1", 50, datetime(2024, 1, 16), "e2"),
+                ("b", 400, datetime(2024, 1, 14), "e3", 40, datetime(2024, 1, 16), "e4"),
+            ],
+            column_names=[
+                "val",
+                "baseline_cnt",
+                "bl_last",
+                "bl_evt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        windows=_shift_windows(),
+        max_candidates_per_field=2,
+    )
+    assert any("candidate cap" in w and "attr:user" in w for w in result.warnings)
+
+
+def test_proportion_shift_insufficient_data_empty_baseline():
+    """A baseline window with zero events cannot anchor a proportion."""
+    responses = [
+        FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(0, 500)], column_names=["bl", "w0"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_proportion_shifts(
+        "c1", ["s1"], fields=["attr:user"], windows=_shift_windows()
+    )
+    assert result.status == "insufficient_data"
+    assert any("baseline window contains no events" in w for w in result.warnings)

@@ -560,6 +560,7 @@ class _FakeStatAnomalyService:
         self.range_calls: list[dict] = []
         self.charset_calls: list[dict] = []
         self.entropy_calls: list[dict] = []
+        self.shift_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
@@ -594,6 +595,10 @@ class _FakeStatAnomalyService:
     def find_entropy_outliers(self, **kwargs):
         self.entropy_calls.append(kwargs)
         return "entropy-result"
+
+    def find_proportion_shifts(self, **kwargs):
+        self.shift_calls.append(kwargs)
+        return "shift-result"
 
 
 @pytest.fixture()
@@ -843,6 +848,145 @@ def test_serialize_finding_charset_shape():
     assert out["type"] == "charset"
     assert out["novel_chars"] == ["\x00"]
     assert out["score"] == 4.6052
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_proportion_shift(patched_store, monkeypatch):
+    """proportion_shift dispatches with effective (config-default) thresholds."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="proportion_shift",
+        fields="attr:eventid",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "shift-result"
+    call = fake_svc.shift_calls[0]
+    assert call["fields"] == ["attr:eventid"]
+    assert call["inventory"] is None
+    # No baseline_id/baseline_end/temporal → the service sees windows=None and
+    # returns insufficient_data itself (temporal-only, no 422).
+    assert call["windows"] is None
+    # Effective thresholds fall back to server config and are snapshotted for
+    # the persisted run.
+    cfg = events.get_settings()
+    assert call["fdr_q"] == cfg.stat_shift_fdr_q
+    assert call["min_ratio"] == cfg.stat_shift_min_ratio
+    assert call["max_candidates_per_field"] == cfg.stat_shift_max_candidates_per_field
+    assert resolution["shift_fdr_q"] == cfg.stat_shift_fdr_q
+    assert resolution["shift_min_ratio"] == cfg.stat_shift_min_ratio
+    assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_proportion_shift_request_overrides(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="proportion_shift",
+        fields="attr:eventid",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+        fdr_q=0.01,
+        min_ratio=3.0,
+    )
+    call = fake_svc.shift_calls[0]
+    assert call["fdr_q"] == 0.01
+    assert call["min_ratio"] == 3.0
+    assert resolution["shift_fdr_q"] == 0.01
+    assert resolution["shift_min_ratio"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_proportion_shift_passes_windows(patched_store, monkeypatch):
+    """A legacy baseline_end split resolves to an AnalysisWindows for the detector."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="proportion_shift",
+        fields="attr:eventid",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=datetime(2024, 1, 15, tzinfo=UTC),
+        temporal=True,
+        limit=50,
+    )
+    call = fake_svc.shift_calls[0]
+    assert call["windows"] is not None
+    assert call["windows"].baseline.end == datetime(2024, 1, 15, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_proportion_shift_auto_fields_resolves_inventory(
+    patched_store, monkeypatch, stub_field_stats_cache
+):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="proportion_shift",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    call = fake_svc.shift_calls[0]
+    assert call["fields"] is None
+    assert call["inventory"] == [("artifact", 2, 10)]
+    assert call["inventory_total"] == 10
+
+
+def test_serialize_finding_proportion_shift_shape():
+    from tracesignal.db.anomaly_stats import ShiftFinding
+
+    f = ShiftFinding(
+        field="attr:eventid",
+        value="4625",
+        count=80,
+        baseline_count=50,
+        baseline_rate=0.005,
+        window_rate=0.08,
+        rate_ratio=16.0,
+        direction="up",
+        g_statistic=225.2477,
+        p_value=0.0,
+        q_value=0.0,
+        score=225.2477,
+        first_seen="2024-01-16T00:00:00+00:00",
+        event_id="evt-1",
+        event=None,
+        details={"detector": "proportion_shift"},
+    )
+    out = events._serialize_finding(f)
+    assert out["type"] == "proportion_shift"
+    assert out["direction"] == "up"
+    assert out["rate_ratio"] == 16.0
+    assert out["q_value"] == 0.0
+    assert out["score"] == 225.2477
 
 
 @pytest.mark.asyncio

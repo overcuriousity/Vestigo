@@ -15,6 +15,7 @@ import {
   Layers,
   Cpu,
   Activity,
+  Percent,
   Rewind,
   Ruler,
   Shuffle,
@@ -279,6 +280,48 @@ export function MethodologyPanel({
               ClickHouse array functions over distinct values — no ML. Values
               shorter than 6 characters are excluded; fields with fewer than
               20 qualifying baseline values are skipped.
+            </Row>
+          </div>
+        </div>
+
+        {/* Proportion shift */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Percent size={11} /> Proportion shift (proportion_shift)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Temporal-only — compares each value's <em>share</em> of events
+              between the baseline window and each suspect window with a 2×2
+              G-test (log-likelihood ratio). All tests in a run — every field ×
+              value × window — are corrected together with Benjamini–Hochberg
+              FDR, so of everything flagged at most ~q (default 5%) is expected
+              false.
+            </Row>
+            <Row label="Signal">
+              Values whose proportion rose or fell significantly — including
+              values that vanish from a suspect window entirely (a maximal
+              "down"). Because it tests shares, not counts, a global volume
+              change alone flags nothing. First-seen values are excluded by
+              construction; Rare values owns those.
+            </Row>
+            <Row label="Score">
+              The G statistic (evidence strength).{" "}
+              <code className="font-mono text-xs">details.q_value</code> is the
+              FDR-adjusted p-value; a finding needs q ≤ threshold <em>and</em> a
+              share change of at least the minimum ratio (default 2×) — on large
+              timelines significance without magnitude is noise.
+            </Row>
+            <Row label="Fields">
+              Same categorical auto-selection as rare values (identifier-like
+              fields have no repeating shares to test); override via the Fields
+              picker.
+            </Row>
+            <Row label="Backend">
+              One ClickHouse GROUP BY per field with per-window counts; the
+              test runs in Python (exact df=1 chi² via erfc — no scipy, fully
+              offline). Events cluster in bursts, so q-values are a ranking
+              aid, not an exact false-positive probability.
             </Row>
           </div>
         </div>

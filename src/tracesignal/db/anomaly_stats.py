@@ -92,6 +92,21 @@ already-ingested data.
     ``_MIN_ENTROPY_VALUE_LEN`` codepoints are excluded throughout. Score =
     distance outside the band ÷ band width, like numeric_range.
 
+**proportion_shift** (``detector="proportion_shift"``)
+    Per (field, value), test whether the value's *share* of events differs
+    significantly between the baseline window and each suspect window — a 2×2
+    G-test (log-likelihood ratio, Dunning 1993) per (value, suspect window),
+    p-values from the exact df=1 chi² survival function, Benjamini–Hochberg
+    FDR across every test in the run, plus an effect-size floor (the share
+    must change by at least ``min_ratio``× in either direction). Two-sided:
+    findings carry ``direction`` ("up"/"down"), and a value that vanishes
+    from a suspect window entirely is a maximal "down" (its rate ratio uses
+    Haldane–Anscombe +0.5 smoothing; the test itself always uses raw counts).
+    Temporal-only (``method="g-test"``): a share can only "shift" between two
+    populations, so there is no self-baseline mode. First-seen values
+    (``baseline_cnt = 0``) are excluded by construction — temporal
+    value_novelty owns those. Score = the G statistic.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -351,6 +366,65 @@ def _window_size_warnings(windows: AnalysisWindows, suspect_totals: list[int]) -
 
 
 # ---------------------------------------------------------------------------
+# Proportion-shift statistics (pure math — no scipy; airgapped-by-default)
+# ---------------------------------------------------------------------------
+
+
+def _g_statistic(a: int, b: int, c: int, d: int) -> float:
+    """2×2 log-likelihood-ratio (G) statistic (Dunning 1993).
+
+    Contingency table rows (baseline, window) × cols (value, other):
+    ``a`` = baseline count of the value, ``b`` = rest of the baseline,
+    ``c`` = suspect-window count, ``d`` = rest of the window. Zero cells
+    contribute nothing (lim x→0 of x·log(x/e) = 0); the clamp absorbs
+    floating-point noise on near-null tables.
+    """
+    n = a + b + c + d
+    if n == 0:
+        return 0.0
+    g = 0.0
+    for obs, row, col in (
+        (a, a + b, a + c),
+        (b, a + b, b + d),
+        (c, c + d, a + c),
+        (d, c + d, b + d),
+    ):
+        if obs > 0:
+            g += obs * math.log(obs * n / (row * col))
+    return max(2.0 * g, 0.0)
+
+
+def _chi2_sf_df1(g: float) -> float:
+    """P(χ²₁ ≥ g) — exact for one degree of freedom via ``erfc(√(g/2))``.
+
+    The df=1 chi² survival function has this closed form, so no scipy
+    dependency is needed for the G-test's p-value.
+    """
+    return math.erfc(math.sqrt(g / 2.0)) if g > 0 else 1.0
+
+
+def _bh_qvalues(pvals: list[float]) -> list[float]:
+    """Benjamini–Hochberg adjusted p-values (step-up), in input order.
+
+    ``q[i] = min over ranks ≥ rank(i) of (p·m/rank)`` — the standard
+    monotone-enforced adjustment; a finding is significant at FDR level q*
+    iff its q-value ≤ q*.
+    """
+    m = len(pvals)
+    if m == 0:
+        return []
+    p = np.asarray(pvals, dtype=np.float64)
+    order = np.argsort(p)  # ascending
+    q = np.empty(m, dtype=np.float64)
+    running = 1.0
+    for rank in range(m, 0, -1):  # walk from the largest p down
+        idx = order[rank - 1]
+        running = min(running, p[idx] * m / rank)
+        q[idx] = running
+    return [float(v) for v in q]
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -444,6 +518,35 @@ class EntropyFinding:
 
 
 @dataclass
+class ShiftFinding:
+    """One value whose share of events shifted between baseline and a suspect window."""
+
+    field: str
+    value: str
+    # Occurrences in the suspect window; 0 = vanished (present only in baseline).
+    count: int
+    baseline_count: int
+    # baseline_count / baseline window's event total.
+    baseline_rate: float
+    # count / suspect window's event total (0.5-smoothed only when count == 0).
+    window_rate: float
+    # window_rate / baseline_rate.
+    rate_ratio: float
+    direction: str  # "up" | "down"
+    g_statistic: float
+    p_value: float
+    # Benjamini–Hochberg adjusted p-value across every test in this run.
+    q_value: float
+    # = g_statistic; used for ranking.
+    score: float
+    # First occurrence in the suspect window; None when vanished.
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class NumericFieldInfo:
     """A numeric-parseable field candidate for the range detector."""
 
@@ -496,10 +599,11 @@ class StatAnomalyResult:
 
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
-    #  | "charset" | "entropy"
+    #  | "charset" | "entropy" | "proportion_shift"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
+    #  | "g-test"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -510,6 +614,7 @@ class StatAnomalyResult:
         | RangeFinding
         | CharsetFinding
         | EntropyFinding
+        | ShiftFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -2447,6 +2552,260 @@ class StatisticalAnomalyService:
             limit=limit,
             case_id=case_id,
             source_ids=source_ids,
+        )
+
+    # ------------------------------------------------------------------
+    # Proportion shift (G-test)
+    # ------------------------------------------------------------------
+
+    def find_proportion_shifts(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        fdr_q: float = 0.05,
+        min_ratio: float = 2.0,
+        max_candidates_per_field: int = 2000,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+    ) -> StatAnomalyResult:
+        """Return values whose share of events shifted between baseline and suspect windows.
+
+        Per (field, value, suspect window), a 2×2 G-test (log-likelihood
+        ratio) compares the value's share of the baseline window's events
+        against its share of the suspect window's events. All tests in the
+        run — every field × candidate value × suspect window — share one
+        Benjamini–Hochberg FDR pool; a finding needs ``q_value ≤ fdr_q``
+        *and* a share change of at least *min_ratio*× in either direction
+        (``direction`` = "up"/"down"). A value present in the baseline but
+        absent from a suspect window is a maximal "down" (rate ratio via
+        Haldane–Anscombe +0.5 smoothing; the test itself uses raw counts, and
+        its representative event is the value's last baseline occurrence).
+
+        Temporal-only: without *windows* the result is ``insufficient_data``
+        — a share can only shift between two populations. First-seen values
+        (``baseline_cnt = 0``) are excluded by construction; temporal
+        value_novelty owns those. The per-field candidate set is capped at
+        *max_candidates_per_field* rows (highest total volume first); hitting
+        the cap understates the FDR pool for that field, which is surfaced as
+        a warning rather than silently accepted. Score = the G statistic.
+        """
+        method = "g-test"
+        if windows is None:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="proportion_shift",
+                method=method,
+                baseline_size=0,
+                warnings=[
+                    "proportion_shift is temporal-only — select or create a baseline "
+                    "definition (baseline + suspect windows)."
+                ],
+            )
+
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="proportion_shift",
+                method=method,
+                baseline_size=0,
+                windows=windows.payload(),
+            )
+
+        baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+        run_warnings = _window_size_warnings(windows, suspect_totals)
+        if baseline_size == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="proportion_shift",
+                method=method,
+                baseline_size=0,
+                warnings=[*run_warnings, "The baseline window contains no events."],
+                windows=windows.payload(),
+            )
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            # Same auto-selection as value_novelty: categorical fields only —
+            # near-unique identifier fields have no repeating shares to test.
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
+
+        # Phase 1: fetch per-(field, value) window counts from ClickHouse.
+        # Candidates ordered by total volume descending — a power-based,
+        # direction-neutral ordering, so the cap drops only the low-volume
+        # values that lacked the power to reach significance anyway.
+        candidates: list[tuple[str, str, int, Any, Any, list[tuple[int, Any, Any]]]] = []
+        evaluated_fields = 0
+        for field_token in scan_fields:
+            params: dict[str, Any] = {**base_params}
+            col = _col_expr(field_token, params, field_mappings)
+            bp, sps = _window_preds(windows, params)
+            params["cap"] = max_candidates_per_field
+            w_blocks = ",\n                    ".join(
+                f"countIf({sp}) AS w{i}_cnt,"
+                f" minIf(timestamp, {sp}) AS w{i}_first,"
+                f" toString(argMinIf(event_id, timestamp, {sp})) AS w{i}_evt"
+                for i, sp in enumerate(sps)
+            )
+            w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+            union_pred = " OR ".join([bp, *sps])
+            # `bp` in the WHERE union keeps baseline-only (vanished) values in
+            # the result; `HAVING baseline_cnt >= 1` is the only prune — it is
+            # definitional (first-seen belongs to value_novelty), so the BH
+            # test count stays honest.
+            sql = f"""
+                SELECT
+                    {col} AS val,
+                    countIf({bp}) AS baseline_cnt,
+                    maxIf(timestamp, {bp}) AS bl_last,
+                    toString(argMaxIf(event_id, timestamp, {bp})) AS bl_evt,
+                    {w_blocks}
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {col} != ''
+                  AND {TS_NOT_SENTINEL_SQL}
+                  AND ({union_pred})
+                GROUP BY val
+                HAVING baseline_cnt >= 1
+                ORDER BY (baseline_cnt + {w_sum}) DESC, val ASC
+                LIMIT {{cap:UInt32}}
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            evaluated_fields += 1
+            if len(rows) >= max_candidates_per_field:
+                run_warnings.append(
+                    f"Field {field_token!r} hit the {max_candidates_per_field}-value "
+                    f"candidate cap — the FDR correction covers only the "
+                    f"{max_candidates_per_field} highest-volume values; treat marginal "
+                    f"q-values for this field as exploratory."
+                )
+            for row in rows:
+                val = row[0]
+                if not val:
+                    continue
+                per_window = [
+                    (int(row[4 + i * 3]), row[5 + i * 3], row[6 + i * 3]) for i in range(len(sps))
+                ]
+                candidates.append((field_token, str(val), int(row[1]), row[2], row[3], per_window))
+
+        # Phase 2: one G-test per (candidate value, non-empty suspect window),
+        # all pooled into a single BH-FDR correction for the run.
+        tests: list[tuple[int, int, float, float]] = []  # (cand_idx, win_idx, g, p)
+        for ci, (_, _, a, _, _, per_window) in enumerate(candidates):
+            for wi, (c, _, _) in enumerate(per_window):
+                n_w = suspect_totals[wi] if wi < len(suspect_totals) else 0
+                if n_w <= 0:
+                    continue
+                g = _g_statistic(a, baseline_size - a, c, n_w - c)
+                tests.append((ci, wi, g, _chi2_sf_df1(g)))
+        qvals = _bh_qvalues([t[3] for t in tests])
+        m_tests = len(tests)
+
+        # Phase 3: gate on FDR + effect floor and build findings.
+        findings: list[ShiftFinding] = []
+        for (ci, wi, g, p), q in zip(tests, qvals, strict=True):
+            if q > fdr_q:
+                continue
+            field_token, val, a, bl_last, bl_evt, per_window = candidates[ci]
+            c, w_first, w_evt = per_window[wi]
+            n_w = suspect_totals[wi]
+            rate_bl = a / baseline_size
+            # Haldane–Anscombe +0.5 smoothing for the *ratio only* when the
+            # value vanished — the test above always used the raw counts.
+            rate_w = c / n_w if c > 0 else 0.5 / n_w
+            ratio = rate_w / rate_bl
+            if 1.0 / min_ratio < ratio < min_ratio:
+                continue
+            direction = "up" if rate_w > rate_bl else "down"
+            window = windows.suspects[wi]
+            first_seen_str = _present_ts(w_first) if c > 0 else None
+            evt_id = w_evt if c > 0 else bl_evt
+            evt_id_str = str(evt_id) if evt_id else None
+            details: dict[str, Any] = {
+                "detector": "proportion_shift",
+                "method": method,
+                "field": field_token,
+                "value": val,
+                "baseline_count": a,
+                "baseline_total": baseline_size,
+                "count": c,
+                "window_total_events": n_w,
+                "baseline_rate": round(rate_bl, 6),
+                "window_rate": round(rate_w, 6),
+                "rate_ratio": round(ratio, 4),
+                "direction": direction,
+                "g_statistic": round(g, 4),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "min_ratio": min_ratio,
+                "window_label": window.label,
+                "window_start": ensure_utc(window.start).isoformat(),
+                "window_end": ensure_utc(window.end).isoformat(),
+                "baseline_size": baseline_size,
+                "allowlist_field": field_token,
+                "allowlist_value": val,
+            }
+            if c == 0:
+                details["last_seen_baseline"] = _present_ts(bl_last)
+            findings.append(
+                ShiftFinding(
+                    field=field_token,
+                    value=val,
+                    count=c,
+                    baseline_count=a,
+                    baseline_rate=round(rate_bl, 6),
+                    window_rate=round(rate_w, 6),
+                    rate_ratio=round(ratio, 4),
+                    direction=direction,
+                    g_statistic=round(g, 4),
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=round(g, 4),
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen_str),
+                    details=details,
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector="proportion_shift",
+            method=method,
+            total_events=baseline_size,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
         )
 
     # ------------------------------------------------------------------

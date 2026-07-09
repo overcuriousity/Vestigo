@@ -69,6 +69,18 @@ class Settings(BaseSettings):
     # Minimum backwards jump (seconds) before the timestamp-order detector
     # flags a record — suppresses sub-second logger jitter. 0 = AMiner-strict.
     stat_order_min_skew: float = 1.0
+    # Proportion-shift detector (G-test): Benjamini-Hochberg false-discovery-rate
+    # ceiling — "of everything flagged, at most this fraction expected false".
+    stat_shift_fdr_q: float = 0.05
+    # Proportion-shift effect-size floor: a value's suspect-window share must
+    # differ from its baseline share by at least this factor (either direction)
+    # to be reported even when statistically significant — on large timelines
+    # significance without magnitude is noise.
+    stat_shift_min_ratio: float = 2.0
+    # Per-field cap on candidate values the proportion-shift scan fetches from
+    # ClickHouse (highest total volume first). Hitting the cap understates the
+    # BH test count for that field; the run carries a warning when it happens.
+    stat_shift_max_candidates_per_field: int = 2000
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.

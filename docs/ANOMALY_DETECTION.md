@@ -9,7 +9,7 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are seven independent analysis tools in TraceSignal:
+There are eight independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -17,14 +17,15 @@ There are seven independent analysis tools in TraceSignal:
 4. [Numeric range](#4-numeric-range-out-of-band-values) — numeric values outside a learned band (ClickHouse, no ML)
 5. [Charset novelty](#5-charset-novelty-never-seen-characters) — values containing characters outside a field's learned character set (ClickHouse, no ML)
 6. [Entropy outliers](#6-entropy-outliers-random-looking-values) — values whose character entropy falls outside the field's learned band (ClickHouse, no ML)
-7. [Semantic similarity search](#7-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+7. [Proportion shift](#7-proportion-shift-value-share-changes-between-windows) — values whose *share* of events changed significantly between the baseline and a suspect window (ClickHouse + a real significance test, no ML)
+8. [Semantic similarity search](#8-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first six are **statistical detectors**: pure counting and arithmetic over
+The first seven are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The seventh needs an explicit embedding step first.
+instant ingestion finishes. The eighth needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–6),
-`src/tracesignal/db/similarity.py` (detector 7). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–7),
+`src/tracesignal/db/similarity.py` (detector 8). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -53,8 +54,10 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
 ### Baseline definitions, suspect windows, and the normality model
 
 Every temporal detector (value novelty, value combos, frequency, numeric
-range, charset, entropy — everything except the mode-less timestamp-order
-detector) answers the same shape of question: *given a period I know was
+range, charset, entropy, proportion shift — everything except the mode-less
+timestamp-order detector; proportion shift is the one detector that is
+temporal-*only*, having no self-baseline mode) answers the same shape of
+question: *given a period I know was
 normal, what stands out in the periods I'm suspicious of?* Two persistent,
 analyst-declared primitives express "normal", and it is worth being precise
 about which is which:
@@ -705,7 +708,120 @@ baseline size in `details`.
 
 ---
 
-## 7. Semantic similarity search
+## 7. Proportion shift (value-share changes between windows)
+
+**What it answers:** "Is this value significantly more (or less) frequent in
+the window I'm investigating than in the known-normal period?" Windows event
+ID `4625` (failed logon) exists in every baseline — a brute-force attempt is
+not a *new* value, it's the same value at 50× the rate. Did `status=failed` go
+from 0.5% of events to 8% after the incident started? Did a service's
+heartbeat vanish entirely?
+
+**Why it's useful — and why it isn't the frequency detector:** the frequency
+detector compares *absolute counts per time bucket* against a z-score band —
+it fires when a series gets louder or quieter in some bucket. Proportion shift
+compares a value's *share of the window's events*, whole window against whole
+window. Three consequences:
+
+- A value whose rate triples but is *spread evenly* across the suspect window
+  never breaches z in any single bucket — frequency misses it; proportion
+  shift is built for exactly that.
+- Because it tests shares, a benign global volume change (more users, verbose
+  logging turned on) flags nothing by itself — every value's share is
+  unchanged. Frequency, comparing absolute counts, would flag everything.
+- In temporal mode, frequency's top findings are dominated by series with zero
+  baseline activity (scored against a floored standard deviation) —
+  effectively re-reporting "first seen". Proportion shift deliberately
+  excludes those (see next paragraph), so its findings are the genuinely new
+  signal neither existing detector surfaces.
+
+**Why it isn't value novelty:** temporal value novelty flags values **absent**
+from the baseline (`baseline_cnt = 0`). Proportion shift requires
+`baseline_cnt ≥ 1` by construction — the two detectors partition the space:
+"never seen before" belongs to value novelty, "seen before but its rate
+changed" belongs here. No finding appears in both.
+
+**Temporal-only.** A share can only "shift" between two populations, so this
+detector has no self-baseline mode — it always needs a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
+(or the legacy split point). Without one it reports `insufficient_data` with a
+warning rather than guessing.
+
+### The test: a 2×2 G-test per (value, suspect window)
+
+For each candidate value and each suspect window, build the 2×2 table: how
+many baseline events are this value vs. not, and how many suspect-window
+events are this value vs. not. The **G-test** (log-likelihood ratio test,
+Dunning 1993 — the standard test for "is this term significantly more frequent
+in corpus B than corpus A", built precisely for skewed count data with rare
+values) asks: *how surprised should we be by this table if the value's share
+hadn't actually changed?*
+
+```
+G = 2 · Σ over the four cells of  observed · ln(observed / expected)
+p = P(χ²₁ ≥ G)      (computed exactly via erfc(√(G/2)) — no scipy needed)
+```
+
+The **score is the G statistic** — evidence strength, same ranking role as
+surprise/z elsewhere. `direction` says which way the share moved (`up` = more
+frequent in the suspect window, `down` = less). A value **present in the
+baseline but absent from a suspect window is a maximal "down"** — a classic
+tampering/silencing signature (log source disabled, service killed). Its rate
+ratio uses Haldane–Anscombe +0.5 smoothing (so the ratio is finite); the test
+itself always uses the raw counts, and its representative event is the value's
+*last baseline occurrence* (`details.last_seen_baseline`).
+
+### Multiple testing: Benjamini–Hochberg FDR
+
+One run performs one test per value per suspect window across up to 15 fields
+— easily thousands of tests. At p < 0.05, ~5% of perfectly normal values would
+look "significant" by chance alone; without correction the findings list would
+be mostly noise. All tests in a run are therefore corrected together with the
+**Benjamini–Hochberg procedure**, and each finding carries its adjusted
+`q_value`. Read q as: *of everything this run flagged, at most about this
+fraction is expected to be a false alarm* — q ≤ 0.05 (the default,
+`TS_STAT_SHIFT_FDR_Q`) means at most ~5% of the flagged set, not 5% per test.
+
+### The effect floor: significant ≠ meaningful
+
+On a 100M-event baseline, a shift from 1.00% to 1.02% is overwhelmingly
+"significant" — and completely uninteresting. A finding therefore also needs
+the share to change by at least a minimum **rate ratio** (default 2×, either
+direction; `TS_STAT_SHIFT_MIN_RATIO`). Both thresholds are echoed in every
+finding's `details` (`q_threshold`, `min_ratio`, `m_tests`) and snapshotted
+into the persisted `DetectorRun`, so a run stays reproducible after the
+defaults change.
+
+### The candidate cap, honestly
+
+Per field, ClickHouse returns at most `TS_STAT_SHIFT_MAX_CANDIDATES_PER_FIELD`
+(default 2000) candidate values, highest total volume first — a power-based,
+direction-neutral ordering (low-volume values almost never had the statistical
+power to reach significance anyway). The BH correction runs over exactly the
+tests performed, so when a field hits the cap the test count `m` is understated
+for that field; the run attaches a warning saying so rather than hiding it.
+Treat marginal q-values on a capped field as exploratory.
+
+### Caveats
+
+- **Events are not independent.** Log events arrive in bursts, retries, and
+  sessions; the G-test assumes independent observations, so p-values (and
+  therefore q-values) are somewhat overconfident. Treat q as a *ranking aid*
+  backed by a principled correction, not an exact false-positive probability —
+  same honesty note as the z-score's normality assumption.
+- **Composition effects.** Shares must sum to 1: if one source goes quiet in
+  the suspect window, every *other* value's share rises mechanically. A page
+  of correlated "up" findings across unrelated fields often means one thing
+  went silent — check the "down"/vanished findings first.
+- A shifted share is not malicious by itself — a deploy, a crawler, or a
+  config change all shift proportions. Rank for triage, as everywhere.
+- **Fields:** same categorical auto-selection as value novelty
+  (identifier-like fields have no repeating shares to test); override via the
+  Fields picker. First-seen exclusion (`baseline_cnt ≥ 1`) is enforced in SQL.
+
+---
+
+## 8. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

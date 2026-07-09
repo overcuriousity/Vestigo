@@ -1,6 +1,36 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 36 — M25: filterlog/suricata/cloudtrail/pcap native converters).
+Last updated: 2026-07-09 (session 37 — proportion_shift detector: G-test value-share shifts).
+
+## Session 37 — 2026-07-09: proportion_shift detector (G-test value-share shifts, BH-FDR)
+
+New statistical detector answering "is this value significantly more/less frequent in the
+suspect window than in the baseline?" — the gap between temporal value_novelty (only
+`baseline_cnt = 0` first-seen) and frequency (bucket-level absolute-count z-scores that miss
+evenly-spread rate shifts, fire on global volume changes, and in temporal mode mostly
+re-report zero-baseline series). Per (field, value, suspect window): 2×2 **G-test**
+(log-likelihood ratio, Dunning 1993) on raw counts, p-values via the exact df=1 chi² survival
+function (`erfc(√(G/2))` — deliberately no scipy dependency, airgapped), **Benjamini–Hochberg
+FDR** pooled across every test in the run, plus a **rate-ratio effect floor** so
+statistically-significant-but-tiny shifts on huge timelines don't flood the list.
+
+Decided semantics: temporal-only (`method="g-test"`; no windows → graceful
+`insufficient_data`, not 422, so the DetectorAccordion sweep stays calm); two-sided with
+`direction: up|down`; **vanished values included** as maximal "down" (representative event =
+last baseline occurrence, Haldane–Anscombe +0.5 smoothing for the displayed ratio only);
+**first-seen excluded** in SQL (`HAVING baseline_cnt >= 1` — value_novelty owns those, and the
+definitional prune keeps the BH test count honest); per-field candidate cap (2000, highest
+volume first) surfaces an FDR-coverage warning when hit; score = G. New `TS_STAT_SHIFT_FDR_Q`
+/ `TS_STAT_SHIFT_MIN_RATIO` / `TS_STAT_SHIFT_MAX_CANDIDATES_PER_FIELD` settings; effective
+thresholds snapshotted into the persisted `DetectorRun` params.
+
+Files: `db/anomaly_stats.py` (`ShiftFinding`, `find_proportion_shifts`, `_g_statistic` /
+`_chi2_sf_df1` / `_bh_qvalues`), `api/routers/events.py` (dispatch, `fdr_q`/`min_ratio`
+request params, serialization, tag content), `core/config.py`; frontend
+`ProportionShiftView.tsx` (temporal-only frame gating on top of `useBaselineRequest`),
+`DetectorAccordion` row, `MethodologyPanel` card, types; docs: `ANOMALY_DETECTION.md` new §7
+(similarity renumbered §8). 13 new service tests (hand-computed G/χ²/BH constants) + 5 router
+tests.
 
 ## Session 36 — 2026-07-08: M25 — native Parquet converters for filterlog, suricata, cloudtrail, pcap
 
