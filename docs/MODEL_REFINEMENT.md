@@ -68,8 +68,9 @@ Timeline → merged Explorer view
 
 Because a Source can belong to multiple Timelines, events **must be stored once per Source**
 (keyed by `source_id`) to avoid duplication. A Timeline query resolves its member source IDs
-and issues a single `source_id IN (…)` predicate — already supported by the optional scope
-in `db/queries.py:18`, just not yet exposed by any endpoint.
+and issues a single `source_id IN (…)` predicate — implemented as the `source_ids` scope on
+`EventQuery` (`db/queries.py`) and resolved per request by
+`api/routers/events.py::_resolve_timeline_scope`.
 
 ---
 

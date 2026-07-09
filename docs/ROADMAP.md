@@ -192,11 +192,12 @@ one commit that also updates `docs/ANOMALY_DETECTION.md`.
   findings (positional, no value key); honored read-only everywhere else. Cut once
   timestamp-order gets a positional-allowlist equivalent — then the `normal`
   annotation origin can be dropped from the mark-normal path entirely.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
   deployment model.
 - CSRF tokens — SameSite=Lax cookies plus the LAN threat model are adequate for now.
-- ~~Alembic adoption~~ — **done** (this PR): Postgres schema is now Alembic-managed
+- ~~Alembic adoption~~ — **done**: Postgres schema is now Alembic-managed
   (`db/migrations`), with pre-Alembic databases auto-stamped at `0001` on startup.
 - Proactive router/query-builder splits — churn risk outweighs payoff at current velocity.

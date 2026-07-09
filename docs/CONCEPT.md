@@ -56,7 +56,7 @@ The current vocabulary is defined and implemented in
 - Upsert events and vectors into the primary store and Qdrant in batches.
 
 ### 6.2 Storage & Vector Backend
-- Primary event store: a fast column-oriented or relational store (tech stack TBD in next step).
+- Primary event store: **ClickHouse** (decision recorded in [`docs/TECH_STACK.md`](./TECH_STACK.md)).
 - Vector store: **Qdrant** (consistent with ScalarForensic, supports local disk and airgapped deployment).
 - One Qdrant collection per case, or per timeline, with deterministic naming.
 - Store embedding model configuration (model name, pooling, normalization) alongside vectors and enforce config-match on query.
@@ -122,5 +122,5 @@ Decisions are recorded in [`docs/TECH_STACK.md`](./TECH_STACK.md):
 2. ✅ Produce an architecture/tech-stack decision record.
 3. ✅ Implement the Case / Source / Timeline / Artifact model refactor.
 4. ✅ Rebuild the frontend UI (React 19 + Vite).
-5. ⬜ Implement authentication.
-6. ⬜ Implement strict offline-mode enforcement (`allow_online` flag exists but is not yet checked anywhere).
+5. ✅ Implement authentication (session-cookie auth + optional OIDC, case-RBAC, teams, audit trail).
+6. ✅ Implement strict offline-mode enforcement (`TS_ALLOW_ONLINE` gates model downloads via `HF_HUB_OFFLINE`; frontend build no longer runs `npm install` on every start).

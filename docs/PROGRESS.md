@@ -1,6 +1,33 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-09 (session 42 — W2 clock-skew correction COMPLETE).
+Last updated: 2026-07-09 (session 43 — docs audit and cleanup).
+
+## Session 43 — 2026-07-09: docs audit — verify state vs. documentation, fix stale claims
+
+Full docs/ sweep against code and test-suite state. `ROADMAP.md` proved accurate: every open
+item (M15/M22/M23/M24/M25, D8–D10, W4–W8, L1/L2) verified still open in code (no
+`hasToken` fast path, no Sigma/`extractGroups` code, `windows_from_split` still live,
+journal/browser converters still vendored-only); every shipped claim (D1–D7,
+proportion_shift, W2 offsets threading, migration 0003, ANOMALY_DETECTION §§1–8 incl. the
+W2 clock-skew note) verified present. Fixed stale spots:
+
+- `CONCEPT.md` — §6.2 "event store TBD" now names ClickHouse; §11 items 5 (auth) and 6
+  (offline enforcement) checked off — both long shipped.
+- `MODEL_REFINEMENT.md` — timeline `source_id IN (…)` scoping was described as "not yet
+  exposed by any endpoint"; now points at `EventQuery.source_ids` +
+  `_resolve_timeline_scope`.
+- `ROADMAP.md` — missing blank line before "Explicitly out of scope"; dropped a stale
+  "(this PR)" reference on the Alembic item.
+- `CLAUDE.md` — archive filename `ROADMAP_PHASEN.md` corrected to `ROADMAP_PHASE{N}.md`.
+
+Verification state: backend 752 passed / 15 skipped; frontend typecheck + 183 tests green.
+The 4 backend failures are environmental, not code: 2 in `test_embeddings_capability.py`
+(embeddings extra not installed in this venv) and 2 (`test_timeline_mappings_api.py`,
+`test_uploads.py`) because the **local dev ClickHouse `tracesignal` database still had the
+legacy `Nullable(DateTime64(3))` timestamp schema** — the app itself would refuse to start
+against it. Resolved same session: the dev `events` table held 0 rows, so instead of the
+full session-27 `EXCHANGE TABLES` migration it was dropped and recreated with the current
+DDL via `ClickHouseStore.init_schema()`; both affected ClickHouse-backed tests pass now.
 
 ## Session 42 — 2026-07-09: W2 per-source clock-skew correction (COMPLETE)
 
