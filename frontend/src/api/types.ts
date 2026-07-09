@@ -236,6 +236,8 @@ export interface Job {
     | null;
   result: unknown;
   error: string | null;
+  case_id?: string | null;
+  created_at?: number;
 }
 
 export interface SimilarResult {

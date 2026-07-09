@@ -17,10 +17,12 @@ import {
   FindingShell,
   RefreshButton,
   TagFindingsBar,
+} from "./detector-shared";
+import {
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-} from "./detector-shared";
+} from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, TimestampOrderFinding } from "@/api/types";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";

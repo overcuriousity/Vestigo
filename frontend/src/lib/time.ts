@@ -16,6 +16,18 @@ function formatUtc(value: string | null | undefined, fmt: (d: Date) => string): 
   }
 }
 
+/** Mirrors cli/progress.py's `_fmt_duration` so web ETAs read like the CLI. */
+export function fmtDuration(seconds: number): string {
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return `${m}m ${String(rs).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}h ${String(rm).padStart(2, "0")}m ${String(rs).padStart(2, "0")}s`;
+}
+
 /** Format a timestamp string for display in the event grid. */
 export function fmtTimestamp(value: string | null | undefined): string {
   return formatUtc(value, (d) => d.toISOString().slice(0, 19).replace("T", " "));

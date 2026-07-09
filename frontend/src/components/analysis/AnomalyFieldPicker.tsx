@@ -23,7 +23,7 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from "@/components/ui/Popover";
-import { selectAutoScanTokens } from "./detector-shared";
+import { selectAutoScanTokens } from "./detector-hooks";
 import { cn } from "@/lib/cn";
 import { anomalyFieldLabel as tokenLabel } from "@/lib/format";
 import type {

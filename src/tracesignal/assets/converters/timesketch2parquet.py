@@ -711,7 +711,7 @@ def main() -> int:
         "-w",
         "--workers",
         type=int,
-        default=os.process_cpu_count() or 4,
+        default=getattr(os, "process_cpu_count", os.cpu_count)() or 4,
         help="parallel parser processes for large plain JSONL files (default: CPU count); "
         "CSV is always parsed single-process (see module docstring)",
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +33,7 @@ class Job:
     # case may poll the job — job visibility follows case RBAC, matching the
     # rest of the access model.
     case_id: str | None = None
+    created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serializable representation."""
@@ -43,6 +45,7 @@ class Job:
             "result": self.result,
             "error": self.error,
             "case_id": self.case_id,
+            "created_at": self.created_at,
         }
 
 
@@ -84,6 +87,13 @@ class JobStore:
     def get(self, job_id: str) -> Job | None:
         """Return a job by ID, or None if not found."""
         return self._jobs.get(job_id)
+
+    def list_by_case(self, case_id: str) -> list[Job]:
+        """Return jobs scoped to a case, newest-first."""
+        with self._lock:
+            jobs = [job for job in self._jobs.values() if job.case_id == case_id]
+        jobs.sort(key=lambda job: job.created_at, reverse=True)
+        return jobs
 
     def update(
         self,

@@ -17,15 +17,17 @@ import {
   FindingShell,
   NeedsBaselinePrompt,
   ResultsBar,
-  useCappedFindings,
-  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
+} from "./detector-shared";
+import {
+  useCappedFindings,
+  useBaselineRequest,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-} from "./detector-shared";
+} from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, NumericRangeFinding } from "@/api/types";
 import { anomalyFieldLabel as fieldLabel } from "@/lib/format";

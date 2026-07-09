@@ -36,8 +36,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 20972,
-      "sha256": "834d26b8fb67dd2239543a222b7cc9c9c371a067cfc176a04934186c52ecc0e4"
+      "size_bytes": 20998,
+      "sha256": "939cf873c8f575aae2323de6698479770dd1284815a2060a9d0210c0817ee1fa"
     },
     {
       "name": "filterlog2timesketch",
@@ -60,8 +60,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 26536,
-      "sha256": "b2e9d764cfca77e8cd09eded3bcb3496e16942a0c2107744d470a52c4825c3fe"
+      "size_bytes": 26562,
+      "sha256": "3bbbee5f7042049723e8dccae84ad03cf41b113efed31cd8a93dc135e8e6e3cc"
     },
     {
       "name": "journal2timesketch",
@@ -96,8 +96,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 21707,
-      "sha256": "a9bcc7e6ffe093c0bd6fb51227d5d17efcce11168963b1c2898c56d47cb03b11"
+      "size_bytes": 21733,
+      "sha256": "9886a074dcd4392cd6ff28ba4344fca4ccbe167a565751ec8536291fba171988"
     },
     {
       "name": "pcap2timesketch",
@@ -122,8 +122,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 35836,
-      "sha256": "32e6223ea50fe7a3892a69cc3c43992a8d47dc1f33b3491ec25f1a418b18785f"
+      "size_bytes": 35862,
+      "sha256": "e4f65144e6780deecfa3ede8088d0190146f13a5a9f80fb02b54bce2dc006043"
     },
     {
       "name": "suricata2timesketch",
@@ -150,8 +150,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 27107,
-      "sha256": "fce9ffe4e2c572f15786c0dc4490c4548f68a52ab83e883f8077b71e0e4b8475"
+      "size_bytes": 27133,
+      "sha256": "21903e4e20b081415a8be545bdc75ef86487ffc46556c53c730065669cd7ddda"
     },
     {
       "name": "timesketch2parquet",
@@ -165,8 +165,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 27794,
-      "sha256": "7049091a50dc6a54e63753a1f8025f584f149a5c407e2e941ab8ce043233d979"
+      "size_bytes": 27820,
+      "sha256": "b3cdbab8cae8cd46fa6628b67b63be539aa329180b13fab1c8af4eadc41bf1e0"
     }
   ]
 }

@@ -360,6 +360,14 @@ async def get_source(source_id: str, case: Case = Depends(require_case_read)) ->
     return {"source": source.to_dict()}
 
 
+@router.get("/{case_id}/jobs")
+async def list_case_jobs(case: Case = Depends(require_case_read)) -> dict[str, Any]:
+    """List background jobs (ingest/embed/enrich) scoped to a case, newest-first."""
+    job_store = get_job_store()
+    jobs = job_store.list_by_case(case.id)
+    return {"jobs": [j.to_dict() for j in jobs]}
+
+
 async def _revalidate_stale_field_mappings(
     store: PostgresStore, case_id: str, source_id: str
 ) -> None:

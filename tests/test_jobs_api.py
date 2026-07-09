@@ -88,6 +88,38 @@ def test_system_job_visible_to_case_members(client, admin_bootstrap, store):
     assert member_client.get(f"/api/jobs/{job.id}").status_code == 200
 
 
+def test_case_jobs_list_scoped_to_case_and_requires_read_access(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    team = _create_team(client, "Job Team 4")
+    manager = _create_user(client, "jobmgr4")
+    member = _create_user(client, "jobmember4")
+    _create_user(client, "jobstranger4")
+    _add_member(client, team["id"], manager["id"], role="manager")
+    _add_member(client, team["id"], member["id"], role="member")
+
+    mgr_client = _login_as(client, "jobmgr4")
+    case = mgr_client.post(
+        "/api/cases/", json={"name": "jobs-case-4", "team_id": team["id"]}
+    ).json()["case"]
+    other_case = mgr_client.post(
+        "/api/cases/", json={"name": "jobs-case-4-other", "team_id": team["id"]}
+    ).json()["case"]
+
+    job = get_job_store().create(kind="ingest", created_by=manager["id"], case_id=case["id"])
+    get_job_store().create(kind="embed", created_by=manager["id"], case_id=other_case["id"])
+
+    member_client = _login_as(client, "jobmember4")
+    resp = member_client.get(f"/api/cases/{case['id']}/jobs")
+    assert resp.status_code == 200
+    job_ids = [j["id"] for j in resp.json()["jobs"]]
+    assert job_ids == [job.id]
+
+    stranger_client = _login_as(client, "jobstranger4")
+    # require_case_read denies with 403 (unlike the single-job route's 404-for-
+    # unguessability trick — case IDs aren't secrets the way job IDs are).
+    assert stranger_client.get(f"/api/cases/{case['id']}/jobs").status_code == 403
+
+
 def test_caseless_job_keeps_owner_or_admin_semantics(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     owner = _create_user(client, "jobowner")

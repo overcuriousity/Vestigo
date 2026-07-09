@@ -663,7 +663,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       lastReportedTsRef.current = ts;
       onVisibleTimestampChange(ts);
     }
-  }, [rows, onVisibleTimestampChange]);
+  }, [rows, onVisibleTimestampChange, ROW_HEIGHT]);
 
   useEffect(() => {
     reportVisibleTimestamp();
@@ -694,7 +694,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       el.scrollTop = anchor.scrollTop + newIndex * ROW_HEIGHT;
     }
     prependAnchorRef.current = null;
-  }, [events]);
+  }, [events, ROW_HEIGHT]);
 
   const handleScroll = useCallback(() => {
     const el = parentRef.current;

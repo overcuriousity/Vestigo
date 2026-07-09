@@ -4,6 +4,8 @@ import { casesApi } from "@/api/cases";
 import { sourcesApi } from "@/api/sources";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
+import { ParserDownloadsPanel } from "@/components/sources/ParserDownloadsPanel";
+import { CaseJobsPanel } from "@/components/jobs/CaseJobsPanel";
 import { Spinner } from "@/components/ui/Spinner";
 import { Badge } from "@/components/ui/Badge";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
@@ -15,7 +17,14 @@ function EmbeddingStatusBadge({ caseId }: { caseId: string }) {
   const { data: sources } = useQuery({
     queryKey: ["sources", caseId],
     queryFn: () => sourcesApi.list(caseId),
-    refetchInterval: 15_000,
+    // Only poll while an embedding could still be in flight; once every
+    // source is embedded there is nothing to watch — a new upload
+    // invalidates ["sources", caseId] and restarts the interval.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data || data.length === 0) return false;
+      return data.every((s) => s.vector_count > 0) ? false : 15_000;
+    },
   });
 
   if (!sources || sources.length === 0) return null;
@@ -57,7 +66,7 @@ export function CaseOverviewPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-3xl px-6 py-8">
+      <div className="mx-auto max-w-7xl px-6 py-8">
         {/* Case header */}
         <div className="mb-8 flex items-start gap-4">
           <FolderOpen
@@ -83,25 +92,35 @@ export function CaseOverviewPage() {
           </div>
         </div>
 
-        <div className="space-y-8">
-          <SourceList caseId={caseId!} />
-          <TimelineList caseId={caseId!} />
+        <div className="grid grid-cols-1 gap-8 lg:grid-cols-[300px_minmax(0,1fr)_300px]">
+          <div className="order-2 lg:order-1">
+            <ParserDownloadsPanel />
+          </div>
 
-          <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
-            <ol className="space-y-2">
-              {guidance.caseOverview.steps.map((step, i) => (
-                <li key={step.title} className="flex gap-2">
-                  <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
-                  <span>
-                    <span className="font-medium text-[var(--color-fg-secondary)]">
-                      {step.title}.
-                    </span>{" "}
-                    {step.body}
-                  </span>
-                </li>
-              ))}
-            </ol>
-          </GuidancePanel>
+          <div className="order-1 space-y-8 lg:order-2">
+            <TimelineList caseId={caseId!} />
+            <SourceList caseId={caseId!} />
+
+            <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
+              <ol className="space-y-2">
+                {guidance.caseOverview.steps.map((step, i) => (
+                  <li key={step.title} className="flex gap-2">
+                    <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
+                    <span>
+                      <span className="font-medium text-[var(--color-fg-secondary)]">
+                        {step.title}.
+                      </span>{" "}
+                      {step.body}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </GuidancePanel>
+          </div>
+
+          <div className="order-3">
+            <CaseJobsPanel caseId={caseId!} />
+          </div>
         </div>
       </div>
     </div>

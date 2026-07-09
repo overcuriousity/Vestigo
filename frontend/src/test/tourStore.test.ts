@@ -39,7 +39,7 @@ describe("tour store", () => {
     useTourStore.getState().handleRouteChange("/settings");
     expect(step().id).toBe("open-case");
     useTourStore.getState().handleRouteChange("/cases/abc123");
-    expect(step().id).toBe("upload-open");
+    expect(step().id).toBe("converter-hint");
   });
 
   it("walks the full step sequence and finishes", () => {
@@ -47,8 +47,8 @@ describe("tour store", () => {
     s.start();
     tourEvent("case-created");
     s.handleRouteChange("/cases/c1");
-    tourEvent("upload-dialog-opened");
     useTourStore.getState().next(); // converter-hint (manual)
+    tourEvent("upload-dialog-opened");
     tourEvent("source-uploaded");
     expect(step().id).toBe("ingesting");
     tourEvent("ingest-complete");

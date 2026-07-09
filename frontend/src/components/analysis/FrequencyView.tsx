@@ -23,13 +23,15 @@ import {
   DetectorStatusLine,
   NeedsBaselinePrompt,
   ResultsBar,
-  useCappedFindings,
   RefreshButton,
   TagFindingsBar,
+} from "./detector-shared";
+import {
+  useCappedFindings,
   useAnomalyMarkers,
   useBaselineRequest,
   useDetectorRunId,
-} from "./detector-shared";
+} from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, FrequencyFinding } from "@/api/types";
 import { cn } from "@/lib/cn";

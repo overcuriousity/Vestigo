@@ -973,7 +973,7 @@ def main() -> int:
         "-w",
         "--workers",
         type=int,
-        default=os.process_cpu_count() or 4,
+        default=getattr(os, "process_cpu_count", os.cpu_count)() or 4,
         help="parallel parser processes across input files (default: CPU count)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="progress on stderr")

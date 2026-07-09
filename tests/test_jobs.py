@@ -85,6 +85,26 @@ def test_failed_and_completed_share_cap_in_completion_order() -> None:
     assert store.get(c.id) is not None
 
 
+def test_list_by_case_filters_and_orders_newest_first() -> None:
+    store = JobStore()
+    other_case = store.create("ingest", case_id="case-b")
+    first = store.create("ingest", case_id="case-a")
+    second = store.create("embed", case_id="case-a")
+    caseless = store.create("embed")
+    first.created_at, second.created_at = 1.0, 2.0
+
+    jobs = store.list_by_case("case-a")
+    assert [j.id for j in jobs] == [second.id, first.id]
+    assert other_case.id not in [j.id for j in jobs]
+    assert caseless.id not in [j.id for j in jobs]
+
+
+def test_list_by_case_empty_when_no_match() -> None:
+    store = JobStore()
+    store.create("ingest", case_id="case-a")
+    assert store.list_by_case("case-b") == []
+
+
 def test_repeated_terminal_updates_do_not_double_count() -> None:
     store = JobStore(max_terminal=2)
     job = store.create("a")

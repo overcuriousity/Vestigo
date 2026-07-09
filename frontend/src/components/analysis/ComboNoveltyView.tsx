@@ -16,14 +16,16 @@ import {
   FindingShell,
   NeedsBaselinePrompt,
   ResultsBar,
-  useCappedFindings,
-  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
+} from "./detector-shared";
+import {
+  useCappedFindings,
+  useBaselineRequest,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-} from "./detector-shared";
+} from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, ValueComboFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
