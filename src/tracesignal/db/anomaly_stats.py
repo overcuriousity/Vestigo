@@ -107,6 +107,45 @@ already-ingested data.
     (``baseline_cnt = 0``) are excluded by construction — temporal
     value_novelty owns those. Score = the G statistic.
 
+**interval_periodicity** (``detector="interval_periodicity"``)
+    Per (field, value), test whether the value's *arrival cadence* changed
+    between the baseline window and each suspect window. Adapted from
+    AMiner's ``PathValueTimeIntervalDetector``, merged with the roadmap's D6
+    (per-value silence) — the periodicity angle is exactly what
+    proportion_shift's whole-window share test cannot see. Inter-arrival
+    deltas are computed strictly *within* each window (the lag partition is
+    ``(value, window)``, so boundary-straddling deltas cannot exist). Two
+    directions, disjoint by construction on the baseline delta
+    coefficient-of-variation (CV = stddev/mean):
+
+    * *cadence break* (``direction`` = "missed"/"accelerated") — a value
+      that arrived regularly in the baseline (CV ≤ regular ceiling, enough
+      intervals) whose arrival *rate* differs in a suspect window: agent
+      killed, heartbeat suppressed, or a periodic job running hot. Tested
+      with a two-sample Poisson-rate likelihood-ratio G (window durations as
+      exposures, df = 1 chi² p-value). For a genuinely periodic value the
+      count variance is sub-Poisson, so the p-value is conservative — a
+      flagged deficit is at least as significant under the periodic model.
+      ``count = 0`` is the maximal "missed" — the per-value silence case —
+      and its representative event is the value's last baseline occurrence.
+    * *new regularity* (``direction`` = "new_regularity", beaconing) — a
+      value that was bursty (CV ≥ irregular floor) or sparse in the baseline
+      whose suspect-window arrivals are too evenly spaced to be random:
+      Greenwood's spacing statistic ``G = Σ(δ/S)²`` over the window's active
+      span ``S``, normal approximation, left-tail p ("more regular than a
+      Poisson process"). Effect floors demand a genuinely tight cadence
+      (window CV ceiling) covering a real fraction of the window (span
+      floor), so a short dense burst never reads as beaconing.
+
+    The CV band between the regular ceiling and the irregular floor is a
+    deliberate dead band — values there are ambiguous and get no test. All
+    tests in a run share one Benjamini–Hochberg FDR pool. Temporal-only
+    (``method="cadence"``): cadence can only change between two populations.
+    First-seen values (``baseline_cnt = 0``) are excluded by construction —
+    temporal value_novelty owns those. Score = ``-log10(p)`` (unlike
+    proportion_shift's raw G: two different statistics must rank on a common
+    scale).
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -424,6 +463,52 @@ def _bh_qvalues(pvals: list[float]) -> list[float]:
     return [float(v) for v in q]
 
 
+def _poisson_rate_g(a: int, d_a: float, c: int, d_c: float) -> float:
+    """Two-sample Poisson-rate log-likelihood-ratio statistic (df = 1).
+
+    ``a`` events over exposure ``d_a`` (baseline duration, seconds) vs.
+    ``c`` events over exposure ``d_c``. Under H0 (one common rate) the
+    expected counts split the total proportionally to exposure; the LR
+    statistic is asymptotically chi²₁, so :func:`_chi2_sf_df1` applies.
+    Zero cells contribute nothing (lim x→0 of x·log(x/e) = 0).
+    """
+    n = a + c
+    if n == 0 or d_a <= 0 or d_c <= 0:
+        return 0.0
+    e_a = n * d_a / (d_a + d_c)
+    e_c = n * d_c / (d_a + d_c)
+    g = 0.0
+    if a > 0:
+        g += a * math.log(a / e_a)
+    if c > 0:
+        g += c * math.log(c / e_c)
+    return max(2.0 * g, 0.0)
+
+
+def _greenwood_p(g: float, n_spacings: int) -> tuple[float, float]:
+    """Left-tail (too-regular) p for Greenwood's spacing statistic.
+
+    ``g = Σ(δᵢ/S)²`` over ``n_spacings`` inter-arrival deltas normalized by
+    their active span ``S``. Under H0 — arrivals from a homogeneous Poisson
+    process, i.e. given the first/last arrival the interior points are
+    uniform on the span — ``E[G] = 2/(N+1)`` and
+    ``Var[G] = 4(N−1)/((N+1)²(N+2)(N+3))``. Returns ``(z, Φ(z))``; a small
+    left-tail p means the spacings are more even than randomness allows
+    (beaconing). The normal approximation is rough for small N — callers
+    gate on a minimum interval count. Burstiness (right tail) is the
+    frequency detector's territory, so it is deliberately not scored here.
+    """
+    n = n_spacings
+    if n < 2:
+        return 0.0, 1.0
+    mean = 2.0 / (n + 1)
+    var = 4.0 * (n - 1) / ((n + 1) ** 2 * (n + 2) * (n + 3))
+    z = (g - mean) / math.sqrt(var)
+    # Φ(z) via erfc — same no-scipy approach as _chi2_sf_df1.
+    p = 0.5 * math.erfc(-z / math.sqrt(2.0))
+    return z, p
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -547,6 +632,38 @@ class ShiftFinding:
 
 
 @dataclass
+class IntervalFinding:
+    """One value whose arrival cadence changed between baseline and a suspect window."""
+
+    field: str
+    value: str
+    # "missed" | "accelerated" (cadence break) | "new_regularity" (beaconing).
+    direction: str
+    # Occurrences in the suspect window; 0 = fully silent (maximal "missed").
+    count: int
+    baseline_count: int
+    # Median inter-arrival delta (seconds) inside each window; None when the
+    # window holds fewer than 2 occurrences of the value.
+    baseline_median_interval: float | None
+    window_median_interval: float | None
+    # stddev/mean of the inter-arrival deltas; None when undefined (< 2 deltas).
+    baseline_cv: float | None
+    window_cv: float | None
+    # Poisson-rate G (cadence break) or Greenwood G (new regularity).
+    statistic: float
+    p_value: float
+    # Benjamini–Hochberg adjusted p-value across every test in this run.
+    q_value: float
+    # -log10(p_value); used for ranking across the two test families.
+    score: float
+    # First occurrence in the suspect window; None when fully silent.
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class NumericFieldInfo:
     """A numeric-parseable field candidate for the range detector."""
 
@@ -599,11 +716,11 @@ class StatAnomalyResult:
 
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
-    #  | "charset" | "entropy" | "proportion_shift"
+    #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
-    #  | "g-test"
+    #  | "g-test" | "cadence"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -615,6 +732,7 @@ class StatAnomalyResult:
         | CharsetFinding
         | EntropyFinding
         | ShiftFinding
+        | IntervalFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -788,6 +906,55 @@ def _stub_event(evt_id: str | None, case_id: str, first_seen: str | None) -> dic
         "embedding_model": None,
         "embedding_config_hash": None,
         "ingest_time": None,
+    }
+
+
+def _interval_window_block(row: tuple, w: int) -> dict[str, Any]:
+    """Parse one window's aggregate block from an interval-periodicity scan row.
+
+    Row layout: ``val`` at index 0, then 10 columns per window ``w``:
+    ``n, k, mean, std, med, sum2, first, last, first_evt, last_evt``.
+    ClickHouse returns NaN (not NULL) for ``avgIf``/``stddevSampIf``/
+    ``quantileIf`` over an empty set and the type default (1970 epoch, empty
+    id) for ``minIf``/``argMinIf`` — every derived number here is therefore
+    gated on the interval count ``k`` (or ``n`` for first/last) instead of
+    trusting the raw value. ``cv`` (stddev/mean) needs ≥ 2 deltas and a
+    positive mean; ``span`` is the value's active first→last extent in
+    seconds and needs ≥ 2 occurrences.
+    """
+
+    def _f(v: Any) -> float | None:
+        if v is None:
+            return None
+        f = float(v)
+        return None if math.isnan(f) else f
+
+    o = 1 + w * 10
+    n = int(row[o])
+    k = int(row[o + 1])
+    mean = _f(row[o + 2]) if k >= 1 else None
+    std = _f(row[o + 3]) if k >= 2 else None
+    med = _f(row[o + 4]) if k >= 1 else None
+    sum2 = _f(row[o + 5]) or 0.0
+    first = row[o + 6] if n >= 1 else None
+    last = row[o + 7] if n >= 1 else None
+    cv = round(std / mean, 4) if std is not None and mean is not None and mean > 0 else None
+    span = None
+    if n >= 2 and first is not None and last is not None:
+        span = (ensure_utc(last) - ensure_utc(first)).total_seconds()
+    return {
+        "n": n,
+        "k": k,
+        "mean": mean,
+        "std": std,
+        "med": round(med, 4) if med is not None else None,
+        "sum2": sum2,
+        "first": first,
+        "last": last,
+        "first_evt": row[o + 8] if n >= 1 else None,
+        "last_evt": row[o + 9] if n >= 1 else None,
+        "cv": cv,
+        "span": span,
     }
 
 
@@ -2796,6 +2963,359 @@ class StatisticalAnomalyService:
         return self._finalize_findings(
             findings,
             detector="proportion_shift",
+            method=method,
+            total_events=baseline_size,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+        )
+
+    # ------------------------------------------------------------------
+    # Interval periodicity (cadence)
+    # ------------------------------------------------------------------
+
+    def find_interval_periodicity(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        fdr_q: float = 0.05,
+        min_rate_ratio: float = 2.0,
+        min_baseline_intervals: int = 5,
+        cv_regular_max: float = 0.5,
+        cv_irregular_min: float = 0.8,
+        beacon_min_intervals: int = 10,
+        beacon_cv_max: float = 0.3,
+        beacon_min_span: float = 0.5,
+        max_candidates_per_field: int = 2000,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+    ) -> StatAnomalyResult:
+        """Return values whose arrival cadence changed between baseline and suspect windows.
+
+        Per (field, value), inter-arrival deltas are computed strictly within
+        each window (lag partitioned by ``(value, window)``, so a delta can
+        never straddle a window boundary). Two disjoint directions gated on
+        the *baseline* delta CV (stddev/mean):
+
+        * cadence break (baseline-regular values, CV ≤ *cv_regular_max* with
+          ≥ *min_baseline_intervals* deltas): a two-sample Poisson-rate
+          likelihood-ratio test of the value's arrival rate, window durations
+          as exposures. ``count = 0`` is the maximal "missed" — per-value
+          silence — and its representative event is the last baseline
+          occurrence. Conservative under true periodicity (sub-Poisson count
+          variance). Effect floor: the rate must change ≥ *min_rate_ratio*×.
+        * new regularity / beaconing (baseline-bursty values, CV ≥
+          *cv_irregular_min*, or sparse baselines below the interval
+          minimum): Greenwood's spacing statistic over the suspect window's
+          deltas, left tail ("too even to be random"), needing
+          ≥ *beacon_min_intervals* deltas. Effect floors: window CV ≤
+          *beacon_cv_max* and active span ≥ *beacon_min_span* of the window.
+
+        The CV dead band between the two gates gets no test. All tests share
+        one Benjamini–Hochberg pool (``q_value ≤ fdr_q``). Temporal-only
+        (``method="cadence"``); first-seen values are excluded by
+        construction (``HAVING baseline_cnt >= 1``) — temporal value_novelty
+        owns those. The per-field candidate set is capped at
+        *max_candidates_per_field* (highest total volume first) with the
+        same warning semantics as proportion_shift. Score = ``-log10(p)``.
+        """
+        method = "cadence"
+        if windows is None:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="interval_periodicity",
+                method=method,
+                baseline_size=0,
+                warnings=[
+                    "interval_periodicity is temporal-only — select or create a baseline "
+                    "definition (baseline + suspect windows)."
+                ],
+            )
+
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="interval_periodicity",
+                method=method,
+                baseline_size=0,
+                windows=windows.payload(),
+            )
+
+        baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+        run_warnings = _window_size_warnings(windows, suspect_totals)
+        if baseline_size == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="interval_periodicity",
+                method=method,
+                baseline_size=0,
+                warnings=[*run_warnings, "The baseline window contains no events."],
+                windows=windows.payload(),
+            )
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            # Same auto-selection as proportion_shift: categorical fields only —
+            # near-unique identifier fields have no repeating arrivals to time.
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
+
+        # Window durations in seconds — the Poisson-rate test's exposures.
+        d_b = (windows.baseline.end - windows.baseline.start).total_seconds()
+        d_ws = [(w.end - w.start).total_seconds() for w in windows.suspects]
+        n_wins = 1 + len(windows.suspects)
+
+        # Phase 1: per (field, value), per-window delta aggregates from
+        # ClickHouse. The lag partition is (value, window index) — the window
+        # index is materialized via arrayJoin over the window predicates
+        # (overlapping suspect windows duplicate the row per window, which is
+        # exactly right: each window's cadence is judged independently), so a
+        # delta can never span two windows. Candidates ordered by total
+        # volume descending, same power-based cap rationale as
+        # proportion_shift.
+        candidates: list[tuple[str, str, list[dict[str, Any]]]] = []
+        evaluated_fields = 0
+        for field_token in scan_fields:
+            params: dict[str, Any] = {**base_params}
+            col = _col_expr(field_token, params, field_mappings)
+            bp, sps = _window_preds(windows, params)
+            params["cap"] = max_candidates_per_field
+            win_exprs = ", ".join(
+                [f"if({bp}, 0, -1)"] + [f"if({sp}, {i + 1}, -1)" for i, sp in enumerate(sps)]
+            )
+            w_blocks = ",\n                    ".join(
+                f"countIf(win = {w}) AS w{w}_n,"
+                f" countIf(win = {w} AND isNotNull(delta)) AS w{w}_k,"
+                f" avgIf(delta, win = {w} AND isNotNull(delta)) AS w{w}_mean,"
+                f" stddevSampIf(delta, win = {w} AND isNotNull(delta)) AS w{w}_std,"
+                f" quantileIf(0.5)(delta, win = {w} AND isNotNull(delta)) AS w{w}_med,"
+                f" sumIf(delta * delta, win = {w} AND isNotNull(delta)) AS w{w}_sum2,"
+                f" minIf(ts, win = {w}) AS w{w}_first,"
+                f" maxIf(ts, win = {w}) AS w{w}_last,"
+                f" toString(argMinIf(event_id, ts, win = {w})) AS w{w}_first_evt,"
+                f" toString(argMaxIf(event_id, ts, win = {w})) AS w{w}_last_evt"
+                for w in range(n_wins)
+            )
+            n_sum = " + ".join(f"w{w}_n" for w in range(n_wins))
+            union_pred = " OR ".join([bp, *sps])
+            # `bp` in the WHERE union keeps baseline-only (silent) values in
+            # the result; `HAVING w0_n >= 1` is the only prune — definitional
+            # (first-seen belongs to value_novelty), so the BH pool stays
+            # honest.
+            sql = f"""
+                SELECT
+                    val,
+                    {w_blocks}
+                FROM (
+                    SELECT
+                        val, ts, event_id, win,
+                        -- toNullable: lagInFrame on the non-Nullable column
+                        -- would yield 1970-01-01 (a huge fake delta) for each
+                        -- partition's first row instead of NULL.
+                        dateDiff('millisecond', lagInFrame(toNullable(ts)) OVER w, ts) / 1000.0
+                            AS delta
+                    FROM (
+                        SELECT
+                            {col} AS val,
+                            timestamp AS ts,
+                            event_id,
+                            arrayJoin(arrayFilter(x -> x >= 0, [{win_exprs}])) AS win
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {col} != ''
+                          AND {TS_NOT_SENTINEL_SQL}
+                          AND ({union_pred})
+                    )
+                    WINDOW w AS (
+                        PARTITION BY val, win
+                        ORDER BY ts, event_id
+                        ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+                    )
+                )
+                GROUP BY val
+                HAVING w0_n >= 1
+                ORDER BY ({n_sum}) DESC, val ASC
+                LIMIT {{cap:UInt32}}
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            evaluated_fields += 1
+            if len(rows) >= max_candidates_per_field:
+                run_warnings.append(
+                    f"Field {field_token!r} hit the {max_candidates_per_field}-value "
+                    f"candidate cap — the FDR correction covers only the "
+                    f"{max_candidates_per_field} highest-volume values; treat marginal "
+                    f"q-values for this field as exploratory."
+                )
+            for row in rows:
+                val = row[0]
+                if not val:
+                    continue
+                blocks = [_interval_window_block(row, w) for w in range(n_wins)]
+                candidates.append((field_token, str(val), blocks))
+
+        # Phase 2: gate each candidate into at most one direction per suspect
+        # window, all tests pooled into a single BH-FDR correction.
+        # test = (kind, cand_idx, win_idx, statistic, p, extra)
+        tests: list[tuple[str, int, int, float, float, dict[str, Any]]] = []
+        for ci, (_, _, blocks) in enumerate(candidates):
+            bl = blocks[0]
+            cv_b = bl["cv"]
+            regular = (
+                bl["k"] >= min_baseline_intervals
+                and cv_b is not None
+                and cv_b <= cv_regular_max
+                and (bl["mean"] or 0) > 0
+            )
+            bursty_or_sparse = (cv_b is not None and cv_b >= cv_irregular_min) or bl[
+                "k"
+            ] < min_baseline_intervals
+            for wi in range(1, n_wins):
+                wb = blocks[wi]
+                d_w = d_ws[wi - 1]
+                if regular:
+                    g = _poisson_rate_g(bl["n"], d_b, wb["n"], d_w)
+                    tests.append(("cadence_break", ci, wi, g, _chi2_sf_df1(g), {}))
+                elif bursty_or_sparse and wb["k"] >= beacon_min_intervals:
+                    span = wb["span"]
+                    if span is None or span <= 0:
+                        continue
+                    g_w = wb["sum2"] / (span * span)
+                    z, p = _greenwood_p(g_w, wb["k"])
+                    tests.append(("beacon", ci, wi, g_w, p, {"z": z, "span": span}))
+        qvals = _bh_qvalues([t[4] for t in tests])
+        m_tests = len(tests)
+
+        # Phase 3: gate on FDR + per-direction effect floors, build findings.
+        findings: list[IntervalFinding] = []
+        for (kind, ci, wi, stat, p, extra), q in zip(tests, qvals, strict=True):
+            if q > fdr_q:
+                continue
+            field_token, val, blocks = candidates[ci]
+            bl, wb = blocks[0], blocks[wi]
+            d_w = d_ws[wi - 1]
+            window = windows.suspects[wi - 1]
+            details: dict[str, Any] = {
+                "detector": "interval_periodicity",
+                "method": method,
+                "field": field_token,
+                "value": val,
+                "count": wb["n"],
+                "baseline_count": bl["n"],
+                "baseline_intervals": bl["k"],
+                "window_intervals": wb["k"],
+                "baseline_median_interval": bl["med"],
+                "window_median_interval": wb["med"],
+                "baseline_cv": bl["cv"],
+                "window_cv": wb["cv"],
+                "baseline_duration_s": round(d_b, 3),
+                "window_duration_s": round(d_w, 3),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "window_label": window.label,
+                "window_start": ensure_utc(window.start).isoformat(),
+                "window_end": ensure_utc(window.end).isoformat(),
+                "baseline_size": baseline_size,
+                "allowlist_field": field_token,
+                "allowlist_value": val,
+            }
+            if kind == "cadence_break":
+                # Haldane–Anscombe +0.5 smoothing when the value went fully
+                # silent — the test above always used the raw counts.
+                rate_b = bl["n"] / d_b
+                rate_w = (wb["n"] if wb["n"] > 0 else 0.5) / d_w
+                ratio = rate_w / rate_b
+                if 1.0 / min_rate_ratio < ratio < min_rate_ratio:
+                    continue
+                direction = "accelerated" if ratio > 1.0 else "missed"
+                med_b = bl["med"]
+                details.update(
+                    {
+                        "direction": direction,
+                        "rate_ratio": round(ratio, 4),
+                        "min_rate_ratio": min_rate_ratio,
+                        "expected_count": round(d_w / med_b, 1) if med_b else None,
+                        "g_statistic": round(stat, 4),
+                    }
+                )
+                if wb["n"] == 0:
+                    details["last_seen_baseline"] = _present_ts(bl["last"])
+            else:  # beacon
+                cv_w = wb["cv"]
+                span_fraction = extra["span"] / d_w if d_w > 0 else 0.0
+                if cv_w is None or cv_w > beacon_cv_max or span_fraction < beacon_min_span:
+                    continue
+                direction = "new_regularity"
+                details.update(
+                    {
+                        "direction": direction,
+                        "greenwood_g": round(stat, 6),
+                        "greenwood_z": round(extra["z"], 4),
+                        "span_seconds": round(extra["span"], 3),
+                        "span_fraction": round(span_fraction, 4),
+                        "beacon_cv_max": beacon_cv_max,
+                        "beacon_min_span": beacon_min_span,
+                    }
+                )
+            score = round(-math.log10(max(p, 1e-300)), 4)
+            silent = wb["n"] == 0
+            first_seen_str = None if silent else _present_ts(wb["first"])
+            evt_id = bl["last_evt"] if silent else wb["first_evt"]
+            evt_id_str = str(evt_id) if evt_id else None
+            findings.append(
+                IntervalFinding(
+                    field=field_token,
+                    value=val,
+                    direction=direction,
+                    count=wb["n"],
+                    baseline_count=bl["n"],
+                    baseline_median_interval=bl["med"],
+                    window_median_interval=wb["med"],
+                    baseline_cv=bl["cv"],
+                    window_cv=wb["cv"],
+                    statistic=round(stat, 6),
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=score,
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen_str),
+                    details=details,
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector="interval_periodicity",
             method=method,
             total_events=baseline_size,
             evaluated_fields=evaluated_fields,
