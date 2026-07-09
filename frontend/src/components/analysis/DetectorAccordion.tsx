@@ -22,6 +22,7 @@ import {
   Rewind,
   Ruler,
   Shuffle,
+  Timer,
   Type,
 } from "lucide-react";
 import { anomaliesApi, type AnomalyParams } from "@/api/anomalies";
@@ -35,6 +36,7 @@ import { NumericRangeView } from "./NumericRangeView";
 import { CharsetNoveltyView } from "./CharsetNoveltyView";
 import { EntropyView } from "./EntropyView";
 import { ProportionShiftView } from "./ProportionShiftView";
+import { IntervalPeriodicityView } from "./IntervalPeriodicityView";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
@@ -43,6 +45,7 @@ type DetectorId =
   | "combo"
   | "frequency"
   | "shift"
+  | "interval"
   | "order"
   | "range"
   | "charset"
@@ -59,6 +62,7 @@ const DETECTORS: {
   { id: "combo", detector: "value_combo", icon: Layers, label: "Value combos", hint: "Rare combinations of fields" },
   { id: "frequency", detector: "frequency", icon: Activity, label: "Frequency", hint: "Count spikes and silences" },
   { id: "shift", detector: "proportion_shift", icon: Percent, label: "Proportion shift", hint: "Value shares that change between windows" },
+  { id: "interval", detector: "interval_periodicity", icon: Timer, label: "Interval cadence", hint: "Broken heartbeats and new beaconing" },
   { id: "range", detector: "numeric_range", icon: Ruler, label: "Numeric range", hint: "Values outside a learned band" },
   { id: "charset", detector: "charset", icon: Type, label: "Charset novelty", hint: "Never-seen characters" },
   { id: "entropy", detector: "entropy", icon: Shuffle, label: "Entropy outliers", hint: "Random or degenerate strings" },
@@ -194,6 +198,8 @@ function DetectorBody({ id, ...props }: Props & { id: DetectorId }) {
       return <FrequencyView {...shared} onDrillField={props.onFrequencyDrill} />;
     case "shift":
       return <ProportionShiftView {...shared} onDrillField={props.onDrillField} />;
+    case "interval":
+      return <IntervalPeriodicityView {...shared} onDrillField={props.onDrillField} />;
     case "order":
       return <OrderViolationsView {...shared} />;
     case "range":

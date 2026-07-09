@@ -81,6 +81,38 @@ class Settings(BaseSettings):
     # ClickHouse (highest total volume first). Hitting the cap understates the
     # BH test count for that field; the run carries a warning when it happens.
     stat_shift_max_candidates_per_field: int = 2000
+    # Interval-periodicity detector (cadence): BH false-discovery-rate ceiling,
+    # shared across both directions (missed cadence + new regularity).
+    stat_interval_fdr_q: float = 0.05
+    # Cadence-break effect floor: the suspect window's arrival rate must differ
+    # from the baseline rate by at least this factor (either direction) to be
+    # reported even when statistically significant.
+    stat_interval_min_rate_ratio: float = 2.0
+    # A value needs at least this many baseline inter-arrival intervals before
+    # its cadence is considered learned (direction a) — fewer than this also
+    # marks the baseline "sparse" for the beaconing gate (direction b).
+    stat_interval_min_baseline_intervals: int = 5
+    # Baseline delta-CV at or below which a value counts as "regular" and is
+    # eligible for cadence-break testing. 1.0 is a Poisson process; 0.5 demands
+    # visibly periodic behavior. The gap up to stat_interval_cv_irregular_min
+    # is a deliberate dead band — neither direction tests those values.
+    stat_interval_cv_regular_max: float = 0.5
+    # Baseline delta-CV at or above which a value counts as "irregular/bursty"
+    # and is eligible for beaconing (new-regularity) testing.
+    stat_interval_cv_irregular_min: float = 0.8
+    # Minimum suspect-window intervals before the Greenwood spacing statistic's
+    # normal approximation is trusted for a beaconing test.
+    stat_interval_beacon_min_intervals: int = 10
+    # Beaconing effect floor: the suspect window's delta-CV must be at or below
+    # this ("period ± small jitter") to be reported.
+    stat_interval_beacon_cv_max: float = 0.3
+    # Beaconing span floor: the value's active span (first..last arrival) must
+    # cover at least this fraction of the suspect window — a short dense burst
+    # of evenly spaced events must not read as beaconing.
+    stat_interval_beacon_min_span: float = 0.5
+    # Per-field cap on candidate values the interval scan fetches (highest
+    # total volume first); same warning semantics as the proportion-shift cap.
+    stat_interval_max_candidates_per_field: int = 2000
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.

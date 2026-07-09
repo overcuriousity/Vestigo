@@ -34,6 +34,7 @@ from tracesignal.db.anomaly_stats import (
     ComboFinding,
     EntropyFinding,
     FreqFinding,
+    IntervalFinding,
     NoveltyFieldInfo,
     OrderFinding,
     RangeFinding,
@@ -1538,6 +1539,38 @@ async def _run_stat_detector(
         )
         return result, resolution
 
+    if detector == "interval_periodicity":
+        # Same effective-threshold snapshotting as proportion_shift; the two
+        # generic tuning params map onto the cadence test's FDR ceiling and
+        # rate-ratio floor. The CV gates/beacon floors are server config only.
+        resolution["interval_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_interval_fdr_q
+        resolution["interval_min_rate_ratio"] = (
+            min_ratio if min_ratio is not None else cfg.stat_interval_min_rate_ratio
+        )
+        result = await run_in_threadpool(
+            svc.find_interval_periodicity,
+            case_id=case_id,
+            source_ids=source_ids,
+            fields=parsed_fields,
+            limit=limit,
+            windows=windows,
+            fdr_q=resolution["interval_fdr_q"],
+            min_rate_ratio=resolution["interval_min_rate_ratio"],
+            min_baseline_intervals=cfg.stat_interval_min_baseline_intervals,
+            cv_regular_max=cfg.stat_interval_cv_regular_max,
+            cv_irregular_min=cfg.stat_interval_cv_irregular_min,
+            beacon_min_intervals=cfg.stat_interval_beacon_min_intervals,
+            beacon_cv_max=cfg.stat_interval_beacon_cv_max,
+            beacon_min_span=cfg.stat_interval_beacon_min_span,
+            max_candidates_per_field=cfg.stat_interval_max_candidates_per_field,
+            exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            inventory_total=inventory_total,
+        )
+        return result, resolution
+
     result = await run_in_threadpool(
         svc.find_value_novelty,
         case_id=case_id,
@@ -1641,12 +1674,15 @@ def _serialize_finding(
     | RangeFinding
     | CharsetFinding
     | EntropyFinding
-    | ShiftFinding,
+    | ShiftFinding
+    | IntervalFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift finding dataclass fields are exactly the wire keys,
-    # so asdict() avoids a hand-maintained field-by-field transcription that
-    # would silently drop any newly added field.
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval finding dataclass fields are exactly the
+    # wire keys, so asdict() avoids a hand-maintained field-by-field
+    # transcription that would silently drop any newly added field.
+    if isinstance(r, IntervalFinding):
+        return {"type": "interval_periodicity", **asdict(r)}
     if isinstance(r, ShiftFinding):
         return {"type": "proportion_shift", **asdict(r)}
     if isinstance(r, EntropyFinding):
@@ -1870,10 +1906,13 @@ async def _persist_detector_run(
             "temporal": temporal,
             "limit": limit,
             "min_skew_seconds": min_skew_seconds,
-            # proportion_shift: effective (request-or-default) thresholds; None
-            # for every other detector.
-            "fdr_q": resolution.get("shift_fdr_q"),
-            "min_ratio": resolution.get("shift_min_ratio"),
+            # proportion_shift / interval_periodicity: effective
+            # (request-or-default) thresholds; the keys are disjoint per
+            # detector, None for every other one.
+            "fdr_q": resolution.get("shift_fdr_q", resolution.get("interval_fdr_q")),
+            "min_ratio": resolution.get(
+                "shift_min_ratio", resolution.get("interval_min_rate_ratio")
+            ),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
@@ -1909,7 +1948,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', or 'proportion_shift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', or 'interval_periodicity'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1942,7 +1981,8 @@ async def list_anomalies(
         le=1,
         description=(
             "Benjamini-Hochberg false-discovery-rate ceiling for the "
-            "proportion_shift detector. Omit to use the server default."
+            "proportion_shift and interval_periodicity detectors. Omit to "
+            "use the server default."
         ),
     ),
     min_ratio: float | None = Query(
@@ -1950,7 +1990,8 @@ async def list_anomalies(
         gt=1,
         description=(
             "Effect-size floor (rate ratio, either direction) for the "
-            "proportion_shift detector. Omit to use the server default."
+            "proportion_shift and interval_periodicity detectors. Omit to "
+            "use the server default."
         ),
     ),
     baseline_end: datetime | None = Query(  # noqa: B008
@@ -2018,6 +2059,13 @@ async def list_anomalies(
     window (2×2 G-test, Benjamini-Hochberg FDR across the run, rate-ratio
     effect floor). Temporal-only — requires baseline_id/baseline_end/temporal;
     first-seen values are excluded (value_novelty owns those).
+
+    **interval_periodicity**: per (field, value), flags values whose arrival
+    *cadence* changed between the baseline and a suspect window — a
+    baseline-regular value that goes missing/accelerates (Poisson-rate test,
+    covers per-value silence) or a baseline-bursty value that becomes
+    suspiciously regular (Greenwood spacing test, beaconing). Temporal-only;
+    BH-FDR across the run.
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
@@ -2086,7 +2134,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', or 'proportion_shift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', or 'interval_periodicity'.",
     )
     fields: str | None = Field(
         default=None,
@@ -2110,12 +2158,12 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         gt=0,
         le=1,
-        description="BH false-discovery-rate ceiling for the proportion_shift detector.",
+        description="BH false-discovery-rate ceiling for the proportion_shift and interval_periodicity detectors.",
     )
     min_ratio: float | None = Field(
         default=None,
         gt=1,
-        description="Effect-size floor (rate ratio) for the proportion_shift detector.",
+        description="Effect-size floor (rate ratio) for the proportion_shift and interval_periodicity detectors.",
     )
     baseline_end: datetime | None = Field(
         default=None,
@@ -2292,6 +2340,40 @@ async def tag_anomalies(
                     f"Rare combination — ({combo}): appears {r.count} time(s) "
                     f"of {result.baseline_size:,} events in the corpus "
                     f"(surprise {r.score:.2f})"
+                )
+        elif isinstance(r, IntervalFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the suspect window"
+            cadence = (
+                f"every ~{r.baseline_median_interval:g}s"
+                if r.baseline_median_interval
+                else "regularly"
+            )
+            if r.direction == "new_regularity":
+                w_cadence = (
+                    f"every ~{r.window_median_interval:g}s" if r.window_median_interval else ""
+                )
+                content = (
+                    f"New regularity — {r.field}={r.value!r}: bursty/sparse in the "
+                    f"baseline (CV {r.baseline_cv if r.baseline_cv is not None else '—'}) "
+                    f"but arrives {w_cadence} (CV {r.window_cv}) in {where} — "
+                    f"beaconing pattern (Greenwood q={r.q_value:.3g})"
+                )
+            elif r.count == 0:
+                expected = r.details.get("expected_count")
+                exp_str = f" of ~{expected:g} expected" if expected else ""
+                content = (
+                    f"Cadence break — {r.field}={r.value!r}: arrived {cadence} in the "
+                    f"baseline but 0 events{exp_str} in {where} "
+                    f"(per-value silence; q={r.q_value:.3g})"
+                )
+            else:
+                ratio = r.details.get("rate_ratio")
+                content = (
+                    f"Cadence break — {r.field}={r.value!r}: arrived {cadence} in the "
+                    f"baseline; rate {ratio:.2g}× ({r.direction}) with {r.count} "
+                    f"events in {where} (q={r.q_value:.3g})"
                 )
         elif isinstance(r, ShiftFinding):
             event_id = r.event_id or ""

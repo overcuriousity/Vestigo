@@ -382,6 +382,36 @@ export interface ProportionShiftFinding {
   details: Record<string, unknown>;
 }
 
+/** One arrival-cadence change between windows from the interval_periodicity detector. */
+export interface IntervalPeriodicityFinding {
+  type: "interval_periodicity";
+  field: string;
+  value: string;
+  /** "missed"/"accelerated" = cadence break; "new_regularity" = beaconing. */
+  direction: "missed" | "accelerated" | "new_regularity";
+  /** Occurrences in the suspect window; 0 = fully silent (maximal "missed"). */
+  count: number;
+  baseline_count: number;
+  /** Median inter-arrival delta (seconds) per window; null below 2 occurrences. */
+  baseline_median_interval: number | null;
+  window_median_interval: number | null;
+  /** stddev ÷ mean of the inter-arrival deltas; null when undefined. */
+  baseline_cv: number | null;
+  window_cv: number | null;
+  /** Poisson-rate G (cadence break) or Greenwood G (new regularity). */
+  statistic: number;
+  p_value: number;
+  /** Benjamini–Hochberg adjusted p-value across every test in the run. */
+  q_value: number;
+  /** −log10(p_value) — used for ranking across the two test families. */
+  score: number;
+  /** First occurrence in the suspect window; null when fully silent. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -409,7 +439,8 @@ export type AnomalyFinding =
   | NumericRangeFinding
   | CharsetFinding
   | EntropyFinding
-  | ProportionShiftFinding;
+  | ProportionShiftFinding
+  | IntervalPeriodicityFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -514,7 +545,8 @@ export interface AnomalyMarker {
     | "numeric_range"
     | "charset"
     | "entropy"
-    | "proportion_shift";
+    | "proportion_shift"
+    | "interval_periodicity";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

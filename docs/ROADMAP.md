@@ -103,25 +103,25 @@ forensic-reproducibility requirement. Update `docs/ANOMALY_DETECTION.md` in the 
 each detector.
 
 Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
-a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
+a `DetectorAccordion` switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
 multi-field queries. **D1 (value-combo), D2 (timestamp-order), D3 (charset), D4
-(numeric-range), and D5 (entropy) shipped.** Also shipped (beyond the AMiner set, no AMiner
-equivalent): **proportion_shift** — per-(field, value) 2×2 G-test of a value's *share* of
-events between the baseline and each suspect window, BH-FDR across the run, rate-ratio effect
-floor, temporal-only, first-seen excluded (`baseline_cnt ≥ 1`; value_novelty owns those).
+(numeric-range), D5 (entropy), and D6+D7 (interval_periodicity — see below) shipped.** Also
+shipped (beyond the AMiner set, no AMiner equivalent): **proportion_shift** — per-(field, value)
+2×2 G-test of a value's *share* of events between the baseline and each suspect window, BH-FDR
+across the run, rate-ratio effect floor, temporal-only, first-seen excluded (`baseline_cnt ≥ 1`;
+value_novelty owns those).
+
+D6+D7 shipped **merged** as the `interval_periodicity` detector (`method="cadence"`): the
+re-scope confirmed proportion_shift already owns whole-window vanished values, leaving only the
+*periodicity* angle distinct — so per-value silence (D6) is subsumed as the maximal `count = 0`
+"missed" case of the cadence-break direction. Two directions, one BH pool: a baseline-regular
+value that breaks rhythm (Poisson-rate LRT; missed/accelerated) and a baseline-bursty value that
+becomes suspiciously regular (Greenwood spacing statistic; beaconing). Temporal-only, `-log10(p)`
+score. See `docs/ANOMALY_DETECTION.md` §8.
 
 High value first:
 
-- [ ] **D6 — Per-value silence** (AMiner `MissingMatchPathValueDetector`): a value that
-  appeared regularly in the baseline stops appearing in the detect window (agent killed,
-  log source suppressed). Complements the existing `frequency` detector's global silences.
-  *Partially covered by the shipped `proportion_shift` detector's "down"/vanished findings
-  (whole-window share drop to zero); what remains distinct is the periodicity angle
-  ("appeared regularly"), which overlaps D7 — re-scope before building.*
-- [ ] **D7 — Interval-periodicity violations** (AMiner `PathValueTimeIntervalDetector`): learn
-  the inter-arrival interval distribution per field value in the baseline; flag deviation
-  (missed/shifted periodic events) and, inversely, newly *regular* intervals (beaconing).
 - [ ] **D8 — Event-sequence novelty** (AMiner `EventSequenceDetector`): n-grams of artifact
   types (or values of one user-chosen grouping field) ordered by time; flag n-grams absent
   from the baseline. `groupArray` + window functions.

@@ -1,6 +1,47 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-09 (session 39 — enricher recovery must not block startup).
+Last updated: 2026-07-09 (session 40 — interval_periodicity detector, D6+D7 merged).
+
+## Session 40 — 2026-07-09: interval_periodicity detector (D6+D7 merged)
+
+Shipped the `interval_periodicity` statistical detector (Milestone 4, AMiner
+`PathValueTimeIntervalDetector`), **merging roadmap items D6 (per-value silence) and D7**. The
+re-scope the roadmap asked for confirmed proportion_shift already owns whole-window vanished
+values, so per-value silence collapses into this detector as the maximal `count = 0` "missed"
+case rather than a separate build.
+
+Per (field, value), inter-arrival gaps are computed strictly within each window (a `lagInFrame`
+partitioned by `(value, window index)` via an `arrayJoin` of the window predicates, so a gap
+can never straddle the baseline/suspect boundary). Which of two tests a value gets is decided
+entirely by its **baseline** delta CV, so the suspect window never selects its own test:
+
+- **Cadence break** (baseline CV ≤ 0.5, ≥ 5 gaps): two-sample Poisson-rate LRT of arrival rate
+  with window durations as exposures (`_poisson_rate_g` → df=1 chi² via the existing `erfc`
+  helper). `direction` = `missed` (the D6 silence case is `count = 0`, representative event =
+  last baseline occurrence) or `accelerated`. Effect floor: rate must change ≥ `min_rate_ratio`×.
+- **Beaconing** (baseline CV ≥ 0.8 or sparse; ≥ 10 window gaps): Greenwood spacing statistic
+  `G = Σ(gap/span)²`, left-tail normal-approx p (`_greenwood_p`). `direction` = `new_regularity`.
+  Effect floors: window CV ≤ 0.3 and active span ≥ 50% of the window.
+
+The CV band 0.5–0.8 is a deliberate dead zone. All tests share one BH-FDR pool; score =
+`-log10(p)` (comparable across the two statistics, unlike proportion_shift's raw-G score).
+Temporal-only; first-seen excluded (`HAVING w0_n >= 1`). New `IntervalFinding` dataclass;
+copies proportion_shift's candidate-cap, allowlist, `_finalize_findings`, and effective-threshold
+snapshotting (`fdr_q`/`min_ratio` request params map onto the cadence FDR ceiling + rate floor).
+
+- **Backend:** `db/anomaly_stats.py` (`find_interval_periodicity`, `_interval_window_block`,
+  `_poisson_rate_g`, `_greenwood_p`, module docstring stanza); `core/config.py` (`stat_interval_*`
+  knobs); `api/routers/events.py` (dispatch branch, `_serialize_finding`, endpoint/tag param
+  strings, tag-reason content, `_persist_detector_run` params).
+- **Frontend:** new `IntervalPeriodicityView.tsx`; `DetectorAccordion.tsx` registry + `Timer`
+  icon; `api/types.ts` (`IntervalPeriodicityFinding` + unions); `api/anomalies.ts` detector
+  unions; `MethodologyPanel.tsx` blurb.
+- **Tests:** `test_anomaly_stats.py` — 20 detector tests + `_poisson_rate_g`/`_greenwood_p` unit
+  tests (Greenwood E/Var validated vs a numpy simulation); `test_events_router.py` — dispatch,
+  request-override, and serialization round-trip. Full suite green; ruff + frontend
+  typecheck/lint/test clean.
+- **Docs:** `ANOMALY_DETECTION.md` §8 (renumbered semantic search to §9); `ROADMAP.md` D6/D7
+  deleted with a merge note.
 
 ## Session 39 — 2026-07-09: startup no longer blocks on ClickHouse recovery (502 fix)
 

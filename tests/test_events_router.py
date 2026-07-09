@@ -561,6 +561,7 @@ class _FakeStatAnomalyService:
         self.charset_calls: list[dict] = []
         self.entropy_calls: list[dict] = []
         self.shift_calls: list[dict] = []
+        self.interval_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
@@ -599,6 +600,10 @@ class _FakeStatAnomalyService:
     def find_proportion_shifts(self, **kwargs):
         self.shift_calls.append(kwargs)
         return "shift-result"
+
+    def find_interval_periodicity(self, **kwargs):
+        self.interval_calls.append(kwargs)
+        return "interval-result"
 
 
 @pytest.fixture()
@@ -987,6 +992,98 @@ def test_serialize_finding_proportion_shift_shape():
     assert out["rate_ratio"] == 16.0
     assert out["q_value"] == 0.0
     assert out["score"] == 225.2477
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_interval_periodicity(patched_store, monkeypatch):
+    """interval_periodicity dispatches with effective (config-default) thresholds."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="interval_periodicity",
+        fields="attr:service",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "interval-result"
+    call = fake_svc.interval_calls[0]
+    assert call["fields"] == ["attr:service"]
+    assert call["windows"] is None
+    cfg = events.get_settings()
+    assert call["fdr_q"] == cfg.stat_interval_fdr_q
+    assert call["min_rate_ratio"] == cfg.stat_interval_min_rate_ratio
+    assert call["min_baseline_intervals"] == cfg.stat_interval_min_baseline_intervals
+    assert call["beacon_min_intervals"] == cfg.stat_interval_beacon_min_intervals
+    assert call["max_candidates_per_field"] == cfg.stat_interval_max_candidates_per_field
+    assert resolution["interval_fdr_q"] == cfg.stat_interval_fdr_q
+    assert resolution["interval_min_rate_ratio"] == cfg.stat_interval_min_rate_ratio
+    assert not fake_svc.shift_calls
+    assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_interval_request_overrides(patched_store, monkeypatch):
+    """The generic fdr_q/min_ratio request params map onto the cadence thresholds."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="interval_periodicity",
+        fields="attr:service",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+        fdr_q=0.01,
+        min_ratio=3.0,
+    )
+    call = fake_svc.interval_calls[0]
+    assert call["fdr_q"] == 0.01
+    assert call["min_rate_ratio"] == 3.0
+    assert resolution["interval_fdr_q"] == 0.01
+    assert resolution["interval_min_rate_ratio"] == 3.0
+
+
+def test_serialize_finding_interval_periodicity_shape():
+    from tracesignal.db.anomaly_stats import IntervalFinding
+
+    f = IntervalFinding(
+        field="attr:service",
+        value="heartbeat",
+        direction="missed",
+        count=0,
+        baseline_count=20160,
+        baseline_median_interval=60.0,
+        window_median_interval=None,
+        baseline_cv=0.017,
+        window_cv=None,
+        statistic=1234.5,
+        p_value=0.0,
+        q_value=0.0,
+        score=300.0,
+        first_seen=None,
+        event_id="evt-bl-last",
+        event=None,
+        details={"detector": "interval_periodicity", "last_seen_baseline": "2024-01-14"},
+    )
+    out = events._serialize_finding(f)
+    assert out["type"] == "interval_periodicity"
+    assert out["direction"] == "missed"
+    assert out["count"] == 0
+    assert out["baseline_median_interval"] == 60.0
+    assert out["score"] == 300.0
+    assert out["details"]["last_seen_baseline"] == "2024-01-14"
 
 
 @pytest.mark.asyncio

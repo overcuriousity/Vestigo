@@ -9,7 +9,7 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are eight independent analysis tools in TraceSignal:
+There are nine independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -18,14 +18,15 @@ There are eight independent analysis tools in TraceSignal:
 5. [Charset novelty](#5-charset-novelty-never-seen-characters) — values containing characters outside a field's learned character set (ClickHouse, no ML)
 6. [Entropy outliers](#6-entropy-outliers-random-looking-values) — values whose character entropy falls outside the field's learned band (ClickHouse, no ML)
 7. [Proportion shift](#7-proportion-shift-value-share-changes-between-windows) — values whose *share* of events changed significantly between the baseline and a suspect window (ClickHouse + a real significance test, no ML)
-8. [Semantic similarity search](#8-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+8. [Interval cadence](#8-interval-cadence-arrival-rhythm-changes-between-windows) — values whose inter-arrival rhythm broke (missed/silent heartbeat) or newly regularized (beaconing) between the baseline and a suspect window (ClickHouse + significance tests, no ML)
+9. [Semantic similarity search](#9-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first seven are **statistical detectors**: pure counting and arithmetic over
+The first eight are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The eighth needs an explicit embedding step first.
+instant ingestion finishes. The ninth needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–7),
-`src/tracesignal/db/similarity.py` (detector 8). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–8),
+`src/tracesignal/db/similarity.py` (detector 9). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -821,7 +822,140 @@ Treat marginal q-values on a capped field as exploratory.
 
 ---
 
-## 8. Semantic similarity search
+## 8. Interval cadence (arrival-rhythm changes between windows)
+
+**What it answers:** "Did something that arrived on a *clock* stop arriving —
+or start?" A host beacons to its collector every 60 seconds; a cron job fires
+hourly; an agent heartbeats. Proportion shift (detector 7) sees a value's
+*share* of events; it cannot see *timing*. Interval cadence learns each value's
+inter-arrival rhythm in the baseline and flags two things:
+
+- **A regular value that breaks rhythm** — the 60-second heartbeat that goes
+  missing (a killed agent, a suppressed log source) or suddenly runs 6× hot.
+  The extreme case — the value goes fully **silent** in the suspect window — is
+  the per-value silence signal (formerly roadmap item D6, now merged here).
+- **A bursty value that becomes suspiciously regular** — *beaconing*. Traffic
+  to one destination that was sporadic in the baseline but arrives every 60
+  seconds ± a jitter in the suspect window is the canonical C2-callback
+  signature. No count-based or share-based detector can see this: the volume
+  and the share can both be unremarkable while the *spacing* screams.
+
+**Why it isn't the frequency or proportion-shift detector:** both of those
+compare *how many* (absolute counts, or share of the window). Interval cadence
+compares *how evenly spaced*. A heartbeat that slips from 60 s to 90 s barely
+moves its count and not at all its share, but it is a rhythm break; a beacon
+train has the same modest volume as the baseline's sporadic traffic but a
+radically different regularity. This detector owns the *spacing* axis the way
+proportion shift owns the *magnitude* axis.
+
+**Why it isn't value novelty:** like proportion shift, it requires
+`baseline_cnt ≥ 1` — a value must exist in the baseline to have a learned
+cadence. First-seen values belong to value novelty; no finding appears in both.
+
+**Temporal-only.** Cadence can only *change* between two populations, so there
+is no self-baseline mode — it always needs a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model).
+Without one it reports `insufficient_data`.
+
+### Two tests, one per direction, gated on baseline regularity
+
+The rhythm is summarized per value per window by the **coefficient of
+variation** of its inter-arrival gaps (CV = standard deviation ÷ mean). CV ≈ 0
+is a metronome; CV ≈ 1 is a memoryless (Poisson) process; CV > 1 is bursty.
+Which test a value gets is decided *entirely by its baseline CV*, so the
+suspect window never selects its own test:
+
+- **Regular baseline** (CV ≤ 0.5, and at least 5 inter-arrival gaps learned) →
+  the **cadence-break test**. A two-sample Poisson-rate likelihood-ratio test
+  compares the value's arrival *rate* in the baseline vs. the suspect window,
+  using each window's duration as the exposure:
+
+  ```
+  Given a events over baseline seconds d_b and c events over window seconds d_w,
+  under "same rate": E_a = (a+c)·d_b/(d_b+d_w),  E_c = (a+c)·d_w/(d_b+d_w)
+  G = 2·[ a·ln(a/E_a) + c·ln(c/E_c) ]        p = P(χ²₁ ≥ G)   (erfc, no scipy)
+  ```
+
+  `direction` is `missed` (rate dropped; `count = 0` is the maximal case, and
+  its representative event is the last baseline occurrence,
+  `details.last_seen_baseline`) or `accelerated` (rate rose). This test is
+  **conservative for genuinely periodic values** — their counts vary *less*
+  than Poisson assumes — so a flagged deficit is at least as significant as its
+  p-value says.
+
+- **Bursty or sparse baseline** (CV ≥ 0.8, or fewer than 5 baseline gaps) →
+  the **beaconing test**. Greenwood's spacing statistic asks whether the
+  suspect window's arrivals are *too evenly spread* to be random. Normalize the
+  gaps by the value's active span `S` (last − first arrival in the window):
+
+  ```
+  G = Σ (gap/S)²   over the N window gaps
+  Under "random arrivals":  E[G] = 2/(N+1),  Var[G] = 4(N−1)/((N+1)²(N+2)(N+3))
+  z = (G − E[G]) / √Var[G]     p = Φ(z)   (left tail = suspiciously regular)
+  ```
+
+  Only the *left* tail is scored — burstiness (the right tail) is the frequency
+  detector's territory. Needs at least 10 window gaps before the normal
+  approximation is trusted. `direction` = `new_regularity`.
+
+The CV band **0.5 < CV < 0.8 is a deliberate dead zone** — those values are
+neither clearly periodic nor clearly bursty, and get no test.
+
+**Score = −log10(p)** for both directions, so the two different statistics rank
+on one comparable scale (this differs from proportion shift, whose score is the
+raw G).
+
+### Multiple testing and effect floors
+
+Every test in a run — both directions, all fields × values × windows — shares
+one **Benjamini–Hochberg** FDR pool; each finding carries its adjusted
+`q_value` (read q exactly as for proportion shift). Significance alone never
+flags — each direction adds an effect floor:
+
+- Cadence break: the arrival **rate must change by at least `min_ratio`×**
+  (default 2, `TS_STAT_INTERVAL_MIN_RATE_RATIO`; Haldane +0.5 smoothing on a
+  zero count for the ratio display only).
+- Beaconing: the window CV must be **≤ 0.3** (`TS_STAT_INTERVAL_BEACON_CV_MAX`
+  — a real cadence, not merely "eviction-order regular") **and** the active
+  span must cover **≥ 50%** of the window (`TS_STAT_INTERVAL_BEACON_MIN_SPAN`),
+  so a short dense burst of eleven evenly spaced events never reads as
+  beaconing.
+
+Thresholds are echoed into every finding's `details` and snapshotted into the
+persisted `DetectorRun`, so a run stays reproducible after the defaults change.
+
+### The candidate cap, honestly
+
+Same treatment as proportion shift: per field ClickHouse returns at most
+`TS_STAT_INTERVAL_MAX_CANDIDATES_PER_FIELD` (default 2000) values, highest total
+volume first; when a field hits the cap the BH test count is understated for
+that field and the run attaches a warning. Treat marginal q-values on a capped
+field as exploratory.
+
+### Caveats
+
+- **Inter-arrival gaps are computed strictly within one window** — the
+  `lagInFrame` that produces each gap is partitioned by (value, window index),
+  so a gap can never straddle the baseline/suspect boundary and corrupt both
+  windows' statistics. A value's first arrival in each window has no predecessor
+  and contributes no gap (that is why a regular value needs ≥ 5 baseline gaps,
+  i.e. ≥ 6 baseline arrivals, to be tested).
+- **The Greenwood normal approximation is rough for small N** — mitigated by
+  the 10-gap floor, but a beaconing q near the threshold on a short train is
+  weaker evidence than the same q on a long one.
+- **Events are not independent** (bursts, retries) — as everywhere, q is a
+  ranking aid backed by a principled correction, not an exact false-positive
+  probability.
+- A broken or new rhythm is **not malicious by itself** — a scheduled
+  maintenance window silences heartbeats; a new monitoring agent legitimately
+  beacons. Rank for triage.
+- **Fields:** same categorical auto-selection as value novelty; override via
+  the Fields picker. First-seen exclusion (`baseline_cnt ≥ 1`) is enforced in
+  SQL.
+
+---
+
+## 9. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

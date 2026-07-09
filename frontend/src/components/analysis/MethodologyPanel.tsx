@@ -19,6 +19,7 @@ import {
   Rewind,
   Ruler,
   Shuffle,
+  Timer,
   Type,
   ShieldCheck,
   BarChart2,
@@ -322,6 +323,53 @@ export function MethodologyPanel({
               test runs in Python (exact df=1 chi² via erfc — no scipy, fully
               offline). Events cluster in bursts, so q-values are a ranking
               aid, not an exact false-positive probability.
+            </Row>
+          </div>
+        </div>
+
+        {/* Interval cadence */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Timer size={11} /> Interval cadence (interval_periodicity)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Temporal-only — measures the inter-arrival gaps of each value
+              inside each window. A value that was <em>regular</em> in the
+              baseline gets a Poisson-rate likelihood-ratio test on its arrival
+              rate (window durations as exposures); a value that was{" "}
+              <em>bursty</em> gets Greenwood's spacing statistic on how evenly
+              its window arrivals are spread. All tests share one
+              Benjamini–Hochberg correction.
+            </Row>
+            <Row label="Signal">
+              A broken heartbeat — a value arriving every ~60 s that goes
+              missing or silent in the suspect window (this subsumes per-value
+              silence), or accelerates — and its inverse, beaconing: a value
+              that was irregular in the baseline but arrives suspiciously
+              evenly in the window (C2 callbacks). Purely temporal: it never
+              reads what a value means.
+            </Row>
+            <Row label="Score">
+              −log10 of the p-value (comparable across the two tests).{" "}
+              <code className="font-mono text-xs">details.q_value</code> is the
+              FDR-adjusted p-value; each direction adds an effect floor — a
+              rate must change ≥ the minimum ratio, and beaconing needs a tight
+              window CV covering a real span fraction — so significance alone
+              never flags.
+            </Row>
+            <Row label="Fields">
+              Same categorical auto-selection as rare values; override via the
+              Fields picker.
+            </Row>
+            <Row label="Backend">
+              One ClickHouse GROUP BY per field: inter-arrival deltas via{" "}
+              <code className="font-mono text-xs">lagInFrame</code> partitioned
+              by (value, window) so a gap never straddles a window edge, then
+              the tests run in Python (no scipy). The Poisson-rate test is
+              conservative for genuinely periodic values (their counts vary
+              less than Poisson), so a flagged deficit is at least as
+              significant.
             </Row>
           </div>
         </div>

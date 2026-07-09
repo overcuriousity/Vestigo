@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import numpy as np
+
 from tracesignal.db.anomaly_stats import (
     AnalysisWindows,
     FreqFinding,
@@ -22,6 +24,8 @@ from tracesignal.db.anomaly_stats import (
     _col_expr,
     _full_bucket_starts,
     _g_statistic,
+    _greenwood_p,
+    _poisson_rate_g,
     windows_from_split,
 )
 
@@ -2483,3 +2487,550 @@ def test_proportion_shift_insufficient_data_empty_baseline():
     )
     assert result.status == "insufficient_data"
     assert any("baseline window contains no events" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# interval_periodicity — statistics helpers
+# ---------------------------------------------------------------------------
+
+
+def test_poisson_rate_g_equal_rates_is_zero():
+    assert _poisson_rate_g(100, 10.0, 50, 5.0) == 0.0
+
+
+def test_poisson_rate_g_total_silence():
+    # All 100 events on one side of an even exposure split: G = 2·100·ln 2.
+    g = _poisson_rate_g(100, 1.0, 0, 1.0)
+    assert abs(g - 200.0 * np.log(2.0)) < 1e-9
+
+
+def test_poisson_rate_g_degenerate_inputs():
+    assert _poisson_rate_g(0, 1.0, 0, 1.0) == 0.0
+    assert _poisson_rate_g(10, 0.0, 5, 1.0) == 0.0
+
+
+def test_greenwood_p_too_few_spacings():
+    assert _greenwood_p(0.5, 1) == (0.0, 1.0)
+
+
+def test_greenwood_moments_match_simulation():
+    """The Greenwood E[G]/Var[G] constants match a uniform-spacings simulation."""
+    rng = np.random.default_rng(42)
+    n = 10
+    gs = []
+    for _ in range(4000):
+        pts = np.sort(rng.random(n - 1))
+        spacings = np.diff(np.concatenate(([0.0], pts, [1.0])))
+        gs.append(float(np.sum(spacings**2)))
+    mean_expected = 2.0 / (n + 1)
+    var_expected = 4.0 * (n - 1) / ((n + 1) ** 2 * (n + 2) * (n + 3))
+    assert abs(np.mean(gs) - mean_expected) < 0.02 * mean_expected
+    assert abs(np.var(gs) - var_expected) < 0.10 * var_expected
+    # Perfectly even spacings sit in the left tail — but at the N = 10
+    # minimum the tail is shallow (z ≈ -1.9): a minimal beacon train is
+    # borderline by design, not a slam dunk.
+    _, p_even_10 = _greenwood_p(1.0 / n, n)
+    assert 0.01 < p_even_10 < 0.05
+    # With a longer train the same perfect regularity is decisive.
+    _, p_even_100 = _greenwood_p(1.0 / 100, 100)
+    assert p_even_100 < 1e-6
+    # A G at the null expectation is unremarkable.
+    _, p_null = _greenwood_p(mean_expected, n)
+    assert 0.4 < p_null < 0.6
+
+
+# ---------------------------------------------------------------------------
+# interval_periodicity — detector
+# ---------------------------------------------------------------------------
+
+# Row layout produced by the candidate scan: val, then 10 columns per window
+# (n, k, mean, std, med, sum2, first, last, first_evt, last_evt), baseline
+# first. `_iv_row` keeps the tests readable.
+
+_IV_COLS = ["val"] + [
+    f"w{w}_{c}"
+    for w in (0, 1)
+    for c in ("n", "k", "mean", "std", "med", "sum2", "first", "last", "first_evt", "last_evt")
+]
+
+
+def _iv_row(val: str, bl: tuple, wb: tuple) -> tuple:
+    return (val, *bl, *wb)
+
+
+def _iv_empty_block() -> tuple:
+    # ClickHouse shape for a window with no occurrences: NaN aggregates and
+    # type-default min/max/argMin values.
+    nan = float("nan")
+    epoch = datetime(1970, 1, 1)
+    return (0, 0, nan, nan, nan, 0.0, epoch, epoch, "", "")
+
+
+def _iv_windows() -> AnalysisWindows:
+    # Baseline 14 days, suspect 4 days (d_b = 1,209,600 s, d_w = 345,600 s).
+    return _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 15, tzinfo=UTC),
+        datetime(2024, 1, 16, tzinfo=UTC),
+        datetime(2024, 1, 20, tzinfo=UTC),
+        label="incident",
+    )
+
+
+def _beacon_windows() -> AnalysisWindows:
+    # Short 2-hour suspect window (d_w = 7,200 s) so a 100-minute beacon train
+    # covers well over the span floor.
+    return _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 15, tzinfo=UTC),
+        datetime(2024, 1, 16, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 16, 2, 0, tzinfo=UTC),
+        label="incident",
+    )
+
+
+# A 60-second heartbeat over the 14-day baseline: regular (CV ≈ 0.017).
+_HEARTBEAT_BL = (
+    20160,
+    20159,
+    60.0,
+    1.0,
+    60.0,
+    20159 * 3601.0,
+    datetime(2024, 1, 1, 0, 0),
+    datetime(2024, 1, 14, 23, 59),
+    "evt-bl-first",
+    "evt-bl-last",
+)
+
+# A bursty baseline (CV = 1.5) — beaconing-gate eligible, cadence-ineligible.
+_BURSTY_BL = (
+    51,
+    50,
+    100.0,
+    150.0,
+    40.0,
+    50 * 32500.0,
+    datetime(2024, 1, 2),
+    datetime(2024, 1, 14),
+    "evt-bl-first",
+    "evt-bl-last",
+)
+
+
+def test_interval_insufficient_data_without_windows():
+    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
+    svc = _svc([])
+    result = svc.find_interval_periodicity("c1", ["s1"], fields=["attr:service"])
+    assert result.status == "insufficient_data"
+    assert result.detector == "interval_periodicity"
+    assert result.method == "cadence"
+    assert any("temporal-only" in w for w in result.warnings)
+    assert svc.ch.client._calls == []
+
+
+def test_interval_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert result.status == "no_data"
+
+
+def test_interval_missed_cadence_full_silence():
+    """A baseline heartbeat with zero suspect-window events is a 'missed' finding."""
+    responses = [
+        FakeQueryResult(result_rows=[(21000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(20500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("heartbeat", _HEARTBEAT_BL, _iv_empty_block())],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert result.status == "ok"
+    assert result.method == "cadence"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.direction == "missed"
+    assert r.count == 0
+    assert r.baseline_count == 20160
+    assert r.first_seen is None
+    # Representative event = last baseline occurrence (the D6 silence case).
+    assert r.event_id == "evt-bl-last"
+    assert r.details["last_seen_baseline"] is not None
+    # ~5,760 arrivals expected from the 60 s baseline cadence over 4 days.
+    assert abs(r.details["expected_count"] - 5760) < 1
+    assert r.q_value <= 0.05
+    assert r.score > 10
+    assert r.details["allowlist_field"] == "attr:service"
+    assert r.details["allowlist_value"] == "heartbeat"
+    assert r.details["m_tests"] == 1
+
+
+def test_interval_accelerated_cadence():
+    """A regular value whose rate jumps 6× is flagged 'accelerated'."""
+    wb = (
+        34560,
+        34559,
+        10.0,
+        0.5,
+        10.0,
+        34559 * 100.25,
+        datetime(2024, 1, 16, 0, 0),
+        datetime(2024, 1, 19, 23, 59),
+        "evt-w-first",
+        "evt-w-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(60000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(21000, 35000)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("heartbeat", _HEARTBEAT_BL, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.direction == "accelerated"
+    assert abs(r.details["rate_ratio"] - 6.0) < 0.01
+    assert r.event_id == "evt-w-first"
+    assert r.first_seen is not None
+    assert r.window_median_interval == 10.0
+
+
+def test_interval_beaconing_new_regularity():
+    """A bursty baseline value arriving every 60 s in the window is beaconing."""
+    wb = (
+        101,
+        100,
+        60.0,
+        0.0,
+        60.0,
+        100 * 3600.0,  # Σδ² with every delta exactly 60 s
+        datetime(2024, 1, 16, 0, 5),
+        datetime(2024, 1, 16, 1, 45),  # span = 6,000 s of the 7,200 s window
+        "evt-w-first",
+        "evt-w-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("10.0.0.66", _BURSTY_BL, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:dest_ip"], windows=_beacon_windows()
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.direction == "new_regularity"
+    assert r.window_cv == 0.0
+    assert r.baseline_cv == 1.5
+    # G = 360,000 / 6,000² = 0.01, well below E[G] = 2/101.
+    assert abs(r.statistic - 0.01) < 1e-9
+    assert r.details["greenwood_z"] < -3
+    assert abs(r.details["span_fraction"] - 6000 / 7200) < 1e-3
+    assert r.q_value <= 0.05
+    assert r.event_id == "evt-w-first"
+
+
+def test_interval_beacon_span_floor_suppresses_burst():
+    """An evenly spaced but short burst (tiny span fraction) is not beaconing."""
+    wb = (
+        101,
+        100,
+        60.0,
+        0.0,
+        60.0,
+        100 * 3600.0,
+        datetime(2024, 1, 16, 0, 5),
+        datetime(2024, 1, 16, 1, 45),  # span 6,000 s of a 345,600 s window
+        "evt-w-first",
+        "evt-w-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("10.0.0.66", _BURSTY_BL, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    # Same data, but the long 4-day suspect window: span fraction ≈ 0.017.
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:dest_ip"], windows=_iv_windows()
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_beacon_cv_floor():
+    """A significant Greenwood z with a loose window CV (> ceiling) is suppressed."""
+    wb = (
+        101,
+        100,
+        60.0,
+        30.0,  # CV 0.5 > beacon_cv_max 0.3
+        60.0,
+        100 * 4500.0,  # Σδ² = k·(mean² + var) = 100·(3600 + 900)
+        datetime(2024, 1, 16, 0, 5),
+        datetime(2024, 1, 16, 1, 45),
+        "evt-w-first",
+        "evt-w-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("10.0.0.66", _BURSTY_BL, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:dest_ip"], windows=_beacon_windows()
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_rate_ratio_effect_floor():
+    """A significant but small (< min_rate_ratio) rate change is suppressed."""
+    wb = (
+        8640,  # 1.5× the baseline rate over the 4-day window
+        8639,
+        40.0,
+        2.0,
+        40.0,
+        8639 * 1604.0,
+        datetime(2024, 1, 16, 0, 0),
+        datetime(2024, 1, 19, 23, 59),
+        "evt-w-first",
+        "evt-w-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(30000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(21000, 9000)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("heartbeat", _HEARTBEAT_BL, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_regularity_gate_excludes_bursty_baseline():
+    """A bursty baseline value with a count drop gets no cadence test at all."""
+    wb = (
+        3,
+        2,
+        1000.0,
+        800.0,
+        900.0,
+        2 * 1640000.0,
+        datetime(2024, 1, 16, 1, 0),
+        datetime(2024, 1, 16, 2, 0),
+        "evt-w-first",
+        "evt-w-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("job", _BURSTY_BL, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    # Bursty baseline → no cadence-break test; k_w = 2 < beacon minimum → no
+    # beacon test either. status stays ok (the field was evaluated).
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_dead_band_gets_no_test():
+    """A baseline CV between the regular ceiling and irregular floor is untested."""
+    dead_band_bl = (
+        201,
+        200,
+        100.0,
+        65.0,  # CV 0.65 — inside the deliberate dead band [0.5, 0.8]
+        90.0,
+        200 * 14225.0,
+        datetime(2024, 1, 1),
+        datetime(2024, 1, 14),
+        "evt-bl-first",
+        "evt-bl-last",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("svc", dead_band_bl, _iv_empty_block())],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_fdr_gates_weak_evidence():
+    """A regular but sparse baseline (7 events) can't establish a missed arrival."""
+    sparse_regular_bl = (
+        7,
+        6,
+        172800.0,  # every ~2 days
+        1000.0,
+        172800.0,
+        6 * 172800.0**2,
+        datetime(2024, 1, 1),
+        datetime(2024, 1, 13),
+        "evt-bl-first",
+        "evt-bl-last",
+    )
+    wb = (
+        1,
+        0,
+        float("nan"),
+        float("nan"),
+        float("nan"),
+        0.0,
+        datetime(2024, 1, 17),
+        datetime(2024, 1, 17),
+        "evt-w",
+        "evt-w",
+    )
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("backup", sparse_regular_bl, wb)],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    # Expected ~2 arrivals, observed 1 — p ≈ 0.5, nowhere near the q gate.
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_allowlist_suppression():
+    responses = [
+        FakeQueryResult(result_rows=[(21000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(20500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[_iv_row("heartbeat", _HEARTBEAT_BL, _iv_empty_block())],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1",
+        ["s1"],
+        fields=["attr:service"],
+        windows=_iv_windows(),
+        allowlist={("attr:service", "heartbeat")},
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_interval_candidate_cap_warning():
+    responses = [
+        FakeQueryResult(result_rows=[(21000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(20500, 500)], column_names=["bl", "w0"]),
+        FakeQueryResult(
+            result_rows=[
+                _iv_row("a", _HEARTBEAT_BL, _iv_empty_block()),
+                _iv_row("b", _HEARTBEAT_BL, _iv_empty_block()),
+            ],
+            column_names=_IV_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1",
+        ["s1"],
+        fields=["attr:service"],
+        windows=_iv_windows(),
+        max_candidates_per_field=2,
+    )
+    assert any("candidate cap" in w and "attr:service" in w for w in result.warnings)
+
+
+def test_interval_tiny_window_warning():
+    responses = [
+        FakeQueryResult(result_rows=[(1030,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 30)], column_names=["bl", "w0"]),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert any("only 30 events" in w for w in result.warnings)
+
+
+def test_interval_insufficient_data_empty_baseline():
+    responses = [
+        FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(0, 500)], column_names=["bl", "w0"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_iv_windows()
+    )
+    assert result.status == "insufficient_data"
+    assert any("baseline window contains no events" in w for w in result.warnings)
+
+
+def test_interval_sql_partitions_deltas_within_windows():
+    """The candidate scan partitions the lag by (value, window) and keeps baseline rows."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_interval_periodicity("c1", ["s1"], fields=["attr:service"], windows=_iv_windows())
+    candidate_sql = client.full_queries[2]
+    # Deltas must be computed strictly within one (value, window) partition —
+    # a boundary-straddling delta would corrupt both windows' statistics.
+    assert "PARTITION BY val, win" in candidate_sql
+    assert "lagInFrame(toNullable(ts))" in candidate_sql
+    assert "arrayJoin(arrayFilter" in candidate_sql
+    # Baseline-only (silent) values must survive; first-seen must not.
+    assert "HAVING w0_n >= 1" in candidate_sql
+    assert "{b0:String}" in candidate_sql and "{b1:String}" in candidate_sql
