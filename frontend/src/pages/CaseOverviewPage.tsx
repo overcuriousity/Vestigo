@@ -59,7 +59,7 @@ export function CaseOverviewPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-5xl px-6 py-8">
+      <div className="mx-auto max-w-7xl px-6 py-8">
         {/* Case header */}
         <div className="mb-8 flex items-start gap-4">
           <FolderOpen
@@ -85,15 +85,14 @@ export function CaseOverviewPage() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
-          <div className="space-y-8">
-            <SourceList caseId={caseId!} />
-            <TimelineList caseId={caseId!} />
+        <div className="grid grid-cols-1 gap-8 lg:grid-cols-[300px_minmax(0,1fr)_300px]">
+          <div className="order-2 lg:order-1">
+            <ParserDownloadsPanel />
           </div>
 
-          <div className="space-y-6">
-            <CaseJobsPanel caseId={caseId!} />
-            <ParserDownloadsPanel />
+          <div className="order-1 space-y-8 lg:order-2">
+            <TimelineList caseId={caseId!} />
+            <SourceList caseId={caseId!} />
 
             <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
               <ol className="space-y-2">
@@ -110,6 +109,10 @@ export function CaseOverviewPage() {
                 ))}
               </ol>
             </GuidancePanel>
+          </div>
+
+          <div className="order-3">
+            <CaseJobsPanel caseId={caseId!} />
           </div>
         </div>
       </div>
