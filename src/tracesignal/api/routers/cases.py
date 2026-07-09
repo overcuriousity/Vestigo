@@ -689,6 +689,10 @@ async def upload_source(
         if fmt in {"tracesignal_parquet", "parquet"}:
             from tracesignal.ingestion.parquet_reader import ParquetEventsParser
 
+            # The ParserConfig here is a throwaway: read_source_meta only reads
+            # the file's footer, and the real parser identity is taken from that
+            # footer below (source_parser). This placeholder config is never
+            # persisted or hashed.
             reader = ParquetEventsParser(
                 case_id, source_id, ParserConfig(name=fmt, version="0.1.0")
             )

@@ -1,6 +1,40 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-09 (session 37 — proportion_shift detector: G-test value-share shifts).
+Last updated: 2026-07-09 (session 38 — PR #81 review hardening: Parquet/pcap converter pipeline).
+
+## Session 38 — 2026-07-09: PR #81 review hardening (Parquet converter pipeline)
+
+Review of the M20/M25 Parquet-converter pipeline PR (#81) surfaced six issues; all fixed in
+this session, with regression tests for the two behavioral ones.
+
+- **Null-provenance guard (forensic, medium).** `parquet_reader.py::_stamp_batch` now rejects
+  any batch with a null in `file_hash`/`byte_offset`/`content_hash`/`source_file`. Previously a
+  null in these columns would be filled to `""` (or, for `byte_offset`, pass through and either
+  crash the insert or collapse to `0` and collide with a real offset-0 row) **after** `event_id`
+  was already derived from the pre-fill value — silently diverging the stored provenance from the
+  id that certifies it. The interchange schema declares these fields nullable, so nothing rejected
+  such a file upfront; now the reader does.
+- **Sentinel comparison (low).** `parquet_reader.py::parse` used a hardcoded `.year == 2299` to
+  map the null-timestamp sentinel back to `None`; replaced with `is_null_ts_sentinel()` from
+  `db/_dt.py` so the check can't go stale if the sentinel value changes.
+- **pcap unbounded-read DoS (medium).** `pcap2tracesignal.py` read attacker-controlled length
+  fields (`incl_len` for classic pcap; section-header and generic block `block_total_length` for
+  pcapng — each up to ~4 GiB) straight into a single `fh.read()`. Added a 256 MiB
+  `_MAX_RECORD_BYTES` cap on all three paths so a crafted/corrupt capture raises `PcapParseError`
+  instead of forcing a multi-GB allocation.
+- **pcap docstring (nit).** Spelled out that `content_hash` covers a different on-disk byte span
+  per format (classic = 16-byte record header + captured data; pcapng = whole block incl. trailer)
+  so an examiner re-verifying by hand hashes the matching span.
+- **`cases.py` comment (nit).** Clarified that the `ParserConfig` built for the interchange-Parquet
+  footer read is a throwaway — the real parser identity comes from the footer (`source_parser`),
+  never persisted or hashed.
+- **Frontend nits.** `UploadDialog.tsx` file input now sets `accept=".csv,.jsonl,.parquet,.log"`;
+  `ConverterPanel.tsx` download anchor gets `rel="noopener noreferrer"`.
+
+Also regenerated `assets/converters/manifest.json` (pcap converter sha256/size changed with the
+DoS fix — `test_manifest_hashes_match_committed_assets` enforces this). New tests:
+`test_parquet_reader.py::TestNullHandling::test_null_provenance_rejected` (4-param) and
+`test_pcap_converter.py::TestOversizedLengthGuard` (classic + pcapng). Full suite green.
 
 ## Session 37 — 2026-07-09: proportion_shift detector (G-test value-share shifts, BH-FDR)
 

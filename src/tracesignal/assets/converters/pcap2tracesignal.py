@@ -22,8 +22,12 @@ Forensic provenance embedded in the output:
   * per input file: sha256 + size in the Parquet footer metadata,
   * per event row: the sha256 of its original file (``file_hash``), the byte
     offset of the packet record within it (``byte_offset``), and the sha256
-    of the raw record bytes (header plus payload as stored on disk) —
-    (``content_hash``),
+    of the raw record bytes (``content_hash``). The exact byte span the
+    ``content_hash`` covers depends on the capture format, so an examiner
+    re-verifying by hand must hash the matching span: classic pcap = the
+    16-byte record header plus captured data; pcapng = the whole block from
+    its type field through the trailing block-total-length (options included).
+    In all cases it is the contiguous ``byte_offset``-anchored span on disk,
   * the converter name and version, which become the server-side parser
     identity.
 
@@ -99,6 +103,13 @@ PARQUET_EVENT_SCHEMA = pa.schema(
 # ---------------------------------------------------------------------------
 # pcap/pcapng parsing (ported from pcap2timesketch.py, converter parity)
 # ---------------------------------------------------------------------------
+
+# Upper bound on a single packet record / pcapng block. The length fields
+# these come from are attacker-controlled (up to ~4 GiB) and are read into
+# memory in one shot; a crafted or corrupt capture could otherwise force a
+# multi-GB allocation (memory-exhaustion DoS). 256 MiB is far above any real
+# packet or block yet bounds the damage — over it we treat the file as corrupt.
+_MAX_RECORD_BYTES = 256 * 1024 * 1024
 
 _PCAP_EXTENSIONS = {".pcap", ".pcapng", ".cap", ".dmp"}
 
@@ -231,6 +242,10 @@ def _iter_pcap_classic(
             raise PcapParseError("truncated pcap packet record header")
 
         ts_sec, ts_frac, incl_len, orig_len = struct.unpack(byte_order + "IIII", hdr)
+        if incl_len > _MAX_RECORD_BYTES:
+            raise PcapParseError(
+                f"pcap packet record length {incl_len} exceeds the {_MAX_RECORD_BYTES}-byte cap"
+            )
         data = fh.read(incl_len)
         if len(data) < incl_len:
             raise PcapParseError("truncated pcap packet data")
@@ -302,6 +317,11 @@ def _iter_pcap_ng(fh: BinaryIO) -> Iterator[_PacketTuple]:
             block_total_length = struct.unpack(byte_order + "I", block_total_length_raw)[0]
             if block_total_length < 16:
                 raise PcapParseError("bad pcapng section header block length")
+            if block_total_length > _MAX_RECORD_BYTES:
+                raise PcapParseError(
+                    f"pcapng section header block length {block_total_length} exceeds the "
+                    f"{_MAX_RECORD_BYTES}-byte cap"
+                )
             remaining = block_total_length - 16
             if len(fh.read(remaining)) < remaining:
                 raise PcapParseError("truncated pcapng section header block body")
@@ -320,6 +340,11 @@ def _iter_pcap_ng(fh: BinaryIO) -> Iterator[_PacketTuple]:
         block_total_length = struct.unpack(byte_order + "I", block_total_length_raw)[0]
         if block_total_length < 12:
             raise PcapParseError("bad pcapng block length")
+        if block_total_length > _MAX_RECORD_BYTES:
+            raise PcapParseError(
+                f"pcapng block length {block_total_length} exceeds the "
+                f"{_MAX_RECORD_BYTES}-byte cap"
+            )
 
         body_len = block_total_length - 12
         body = fh.read(body_len)

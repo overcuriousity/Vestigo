@@ -197,6 +197,7 @@ analysis system for a small, self-hosted team.
 ## Documentation
 
 - [Concept](docs/CONCEPT.md)
+- [Input Formats](docs/INPUT_FORMATS.md) — CSV/JSONL/Parquet field-level normalization spec
 - [Anomaly Detection](docs/ANOMALY_DETECTION.md) — every statistical detector explained, plain language
 - [Tech Stack](docs/TECH_STACK.md)
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — approved Case / Source / Timeline / Artifact redesign

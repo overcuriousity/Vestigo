@@ -122,8 +122,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 34398,
-      "sha256": "f905b9dc96c31e5271f73badd89c48d4dcb031aa755168d5f21f4550f049e6a3"
+      "size_bytes": 35836,
+      "sha256": "32e6223ea50fe7a3892a69cc3c43992a8d47dc1f33b3491ec25f1a418b18785f"
     },
     {
       "name": "suricata2timesketch",

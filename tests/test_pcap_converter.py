@@ -130,6 +130,28 @@ class TestPcapNg:
             assert dict(row["attributes"])["link_type"] == "ethernet"
 
 
+class TestOversizedLengthGuard:
+    """A corrupt/crafted length field must not force a multi-GB allocation."""
+
+    def test_classic_record_length_capped(self, converter):
+        import io
+
+        huge = converter._MAX_RECORD_BYTES + 1
+        # 16-byte record header: ts_sec, ts_frac, incl_len, orig_len.
+        hdr = struct.pack("<IIII", 0, 0, huge, huge)
+        with pytest.raises(converter.PcapParseError, match="exceeds"):
+            list(converter._iter_pcap_classic(io.BytesIO(hdr), "<", False, "ethernet"))
+
+    def test_pcapng_block_length_capped(self, converter):
+        import io
+
+        huge = converter._MAX_RECORD_BYTES + 1
+        # Section Header Block: magic, total_length, byte-order magic.
+        shb = converter._PCAPNG_MAGIC + struct.pack("<I", huge) + b"\x4d\x3c\x2b\x1a"
+        with pytest.raises(converter.PcapParseError, match="exceeds"):
+            list(converter._iter_pcap_ng(io.BytesIO(shb)))
+
+
 class TestDirectoryInput:
     def test_directory_of_captures(self, converter, tmp_path):
         caps = tmp_path / "captures"

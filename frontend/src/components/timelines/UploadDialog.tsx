@@ -140,6 +140,7 @@ export function UploadDialog({ caseId }: Props) {
             <input
               ref={inputRef}
               type="file"
+              accept=".csv,.jsonl,.parquet,.log"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];

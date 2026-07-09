@@ -65,7 +65,7 @@ export function ConverterPanel() {
                 </p>
               </div>
               <Button variant="ghost" size="icon" asChild title={`Download ${c.filename}`}>
-                <a href={convertersApi.downloadUrl(c.name)} download>
+                <a href={convertersApi.downloadUrl(c.name)} download rel="noopener noreferrer">
                   <Download size={13} />
                 </a>
               </Button>

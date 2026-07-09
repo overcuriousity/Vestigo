@@ -225,6 +225,43 @@ class TestNullHandling:
         assert out["timestamp_desc"] == ""
         assert out["display_name"] == ""
 
+    @pytest.mark.parametrize("column", ["file_hash", "byte_offset", "content_hash", "source_file"])
+    def test_null_provenance_rejected(self, tmp_path, column):
+        # A null in a provenance column would let the stored value and the
+        # event_id derived from it silently diverge — must be rejected, not
+        # coerced to "" / 0.
+        row = {
+            "source_file": "x.log",
+            "file_hash": "a" * 64,
+            "byte_offset": 0,
+            "content_hash": "b" * 64,
+            "message": "line",
+            "timestamp": None,
+            "timestamp_desc": None,
+            "artifact": "x",
+            "artifact_long": "x:y",
+            "display_name": None,
+            "tags": [],
+            "attributes": {},
+        }
+        row[column] = None
+        meta = {
+            parquet_format.META_FORMAT_VERSION: parquet_format.FORMAT_VERSION,
+            parquet_format.META_CONVERTER_NAME: "x2tracesignal",
+            parquet_format.META_CONVERTER_VERSION: "1.0.0",
+            parquet_format.META_ORIGINAL_FILES: json.dumps(
+                [{"name": "x.log", "sha256": "a" * 64, "size_bytes": 1}]
+            ),
+        }
+        table = pa.Table.from_pylist(
+            [row], schema=parquet_format.PARQUET_EVENT_SCHEMA.with_metadata(meta)
+        )
+        path = tmp_path / "x.parquet"
+        pq.write_table(table, path)
+
+        with pytest.raises(ValueError, match=f"null values in provenance column '{column}'"):
+            list(_parser().parse_arrow_batches(path))
+
 
 class TestPipelineIntegration:
     def test_end_to_end_bulk_ingest(self, converter_output):

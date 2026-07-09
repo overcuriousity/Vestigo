@@ -26,7 +26,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from tracesignal.db._arrow_schema import EVENT_ARROW_SCHEMA
-from tracesignal.db._dt import NULL_TS_SENTINEL
+from tracesignal.db._dt import NULL_TS_SENTINEL, is_null_ts_sentinel
 from tracesignal.ingestion.parquet_format import (
     ParquetSourceMeta,
     validate_parquet_source,
@@ -85,6 +85,20 @@ class ParquetEventsParser(Parser):
     ) -> pa.RecordBatch:
         """Map an interchange batch onto the full ClickHouse event schema."""
         n = batch.num_rows
+
+        # Provenance columns anchor event identity (event_id is derived from
+        # them). A null here would let the stored column and the id that
+        # certifies it diverge — content_hash/file_hash fill to "" below while
+        # the id was derived from None, and a null byte_offset would collide
+        # with a legitimate offset-0 row. Reject upfront rather than silently
+        # corrupt forensic provenance.
+        for name in ("file_hash", "byte_offset", "content_hash", "source_file"):
+            if batch.column(name).null_count:
+                raise ValueError(
+                    f"TraceSignal Parquet file has null values in provenance "
+                    f"column {name!r}; every row must carry its raw-evidence "
+                    "provenance. Re-create the file with a current converter."
+                )
 
         byte_offsets = batch.column("byte_offset").to_pylist()
         content_hashes = batch.column("content_hash").to_pylist()
@@ -165,7 +179,7 @@ class ParquetEventsParser(Parser):
                     message=row["message"],
                     timestamp=(
                         None
-                        if row["timestamp"] is None or row["timestamp"].year == 2299
+                        if row["timestamp"] is None or is_null_ts_sentinel(row["timestamp"])
                         else row["timestamp"].isoformat()
                     ),
                     timestamp_desc=row["timestamp_desc"] or None,
