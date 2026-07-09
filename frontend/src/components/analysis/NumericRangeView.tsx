@@ -22,6 +22,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useBaselineRequest,
   fieldsParamOf,
   useAnomalyMarkers,
@@ -144,13 +145,14 @@ export function NumericRangeView({
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
+  const fl = useFindingsLimit();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "range", blKey, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "numeric_range", blKey, fieldsParam ?? "__auto__", fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "numeric_range",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -162,7 +164,7 @@ export function NumericRangeView({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
         detector: "numeric_range",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -252,7 +254,7 @@ export function NumericRangeView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} />
           {cap.shown.map((f, i) => (
             <RangeRow
               key={`${f.field}:${f.value}:${i}`}

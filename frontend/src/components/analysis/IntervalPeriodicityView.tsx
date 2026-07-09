@@ -25,6 +25,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useBaselineRequest,
   fieldsParamOf,
   useAnomalyMarkers,
@@ -202,6 +203,7 @@ export function IntervalPeriodicityView({
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
+  const fl = useFindingsLimit();
   const enabled = frame === "baseline" && !needsBaseline;
 
   const { data, isLoading, isFetching, refetch } = useQuery({
@@ -212,11 +214,12 @@ export function IntervalPeriodicityView({
       "interval_periodicity",
       blKey,
       fieldsParam ?? "__auto__",
+      fl.limit,
     ],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "interval_periodicity",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -228,7 +231,7 @@ export function IntervalPeriodicityView({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
         detector: "interval_periodicity",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -340,6 +343,9 @@ export function IntervalPeriodicityView({
             hasMore={cap.hasMore}
             expanded={cap.expanded}
             onToggle={cap.toggle}
+            serverTotal={data?.total_findings}
+            onLoadMore={fl.canRaise ? fl.raise : undefined}
+            loadingMore={isFetching}
           />
           {cap.shown.map((f, i) => (
             <IntervalRow

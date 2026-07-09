@@ -21,6 +21,7 @@ import {
 import {
   useAnomalyMarkers,
   useDetectorRunId,
+  useFindingsLimit,
   useOpenEvent,
 } from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
@@ -121,13 +122,15 @@ export function OrderViolationsView({
   const minSkewParam =
     Number.isFinite(parsedMinSkew) && parsedMinSkew >= 0 ? parsedMinSkew : undefined;
 
+  const fl = useFindingsLimit(100);
+
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "order", minSkewParam],
+    queryKey: ["anomalies", caseId, timelineId, "timestamp_order", minSkewParam, fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "timestamp_order",
         min_skew_seconds: minSkewParam,
-        limit: 100,
+        limit: fl.limit,
       }),
     staleTime: 60_000,
   });
@@ -137,7 +140,7 @@ export function OrderViolationsView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "timestamp_order",
         min_skew_seconds: minSkewParam,
-        limit: 100,
+        limit: fl.limit,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
@@ -222,6 +225,25 @@ export function OrderViolationsView({
               ? "No events with timestamps ingested yet."
               : "No out-of-order timestamps. Records are chronological in file order."}
           </span>
+        </div>
+      )}
+
+      {/* Server-side truncation notice — the per-source "showing" counters
+          below cover the per-source hydration cap, not the global limit. */}
+      {(data?.total_findings ?? 0) > findings.length && (
+        <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
+          <span>
+            {findings.length} of {data?.total_findings} violations
+          </span>
+          {fl.canRaise && (
+            <button
+              className="text-[var(--color-accent)] hover:underline disabled:opacity-50"
+              onClick={fl.raise}
+              disabled={isFetching}
+            >
+              {isFetching ? "Loading…" : "Load more"}
+            </button>
+          )}
         </div>
       )}
 

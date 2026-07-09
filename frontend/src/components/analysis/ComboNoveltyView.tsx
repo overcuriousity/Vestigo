@@ -21,6 +21,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useBaselineRequest,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -165,13 +166,14 @@ export function ComboNoveltyView({
 
   const explicitTooFew = selectedFields !== null && selectedFields.length < MIN_FIELDS;
   const fieldsParam = selectedFields !== null ? selectedFields.join(",") : undefined;
+  const fl = useFindingsLimit();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "combo", blKey, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "value_combo", blKey, fieldsParam ?? "__auto__", fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_combo",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -184,7 +186,7 @@ export function ComboNoveltyView({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_combo",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -282,7 +284,7 @@ export function ComboNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} />
           {cap.shown.map((f, i) => (
             <ComboRow
               key={`${f.values.join("|")}:${i}`}

@@ -1925,6 +1925,7 @@ def _serialize_stat_result(result: Any) -> dict[str, Any]:
         "z_threshold": result.z_threshold,
         "warnings": list(getattr(result, "warnings", []) or []),
         "windows": getattr(result, "windows", None),
+        "total_findings": getattr(result, "total_findings", 0),
     }
 
 

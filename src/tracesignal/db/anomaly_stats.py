@@ -755,6 +755,12 @@ class StatAnomalyResult:
     # Serialized AnalysisWindows.payload() snapshot for temporal runs driven
     # by explicit windows; None for self-baseline runs.
     windows: dict[str, Any] | None = None
+    # Number of findings that survived suppression *before* the ``limit`` cap,
+    # so the UI can say "showing N of M" instead of silently truncating.
+    # For the frequency detector this is counted before the per-event
+    # normal-annotation exclusion (which runs on a hydrated candidate buffer),
+    # so it can overcount by at most the handful of excluded events.
+    total_findings: int = 0
 
 
 @dataclass
@@ -1142,6 +1148,7 @@ class StatisticalAnomalyService:
             results=results,
             warnings=warnings or [],
             windows=windows_payload,
+            total_findings=len(findings),
         )
 
     def field_inventory(
@@ -1632,6 +1639,7 @@ class StatisticalAnomalyService:
             results=results,
             warnings=run_warnings,
             windows=windows.payload() if windows is not None else None,
+            total_findings=len(all_findings),
         )
 
     def _novelty_finding(
@@ -1902,6 +1910,7 @@ class StatisticalAnomalyService:
             results=results,
             warnings=run_warnings,
             windows=windows.payload() if windows is not None else None,
+            total_findings=len(all_findings),
         )
 
     # ------------------------------------------------------------------
@@ -2211,6 +2220,7 @@ class StatisticalAnomalyService:
             baseline_size=total_events,
             results=results,
             windows=windows.payload() if windows is not None else None,
+            total_findings=len(all_findings),
         )
 
     # ------------------------------------------------------------------
@@ -3782,6 +3792,7 @@ class StatisticalAnomalyService:
             z_threshold=z_threshold,
             warnings=warnings,
             windows=windows_payload,
+            total_findings=len(findings),
         )
 
     def _hydrate_freq_findings(
@@ -4070,4 +4081,5 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=total_events,
             results=findings[:limit],
+            total_findings=len(findings),
         )

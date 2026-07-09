@@ -28,6 +28,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useAnomalyMarkers,
   useBaselineRequest,
   useDetectorRunId,
@@ -219,14 +220,16 @@ export function FrequencyView({
     return [...STATIC_SERIES_FIELD_OPTIONS, ...attrOptions];
   }, [fieldsData]);
 
+  const fl = useFindingsLimit(30);
+
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey, fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
         series_field: seriesField,
         z_threshold: zThresholdParam,
-        limit: 30,
+        limit: fl.limit,
         ...blParams,
       }),
     staleTime: 60_000,
@@ -239,7 +242,7 @@ export function FrequencyView({
         detector: "frequency",
         series_field: seriesField,
         z_threshold: zThresholdParam,
-        limit: 30,
+        limit: fl.limit,
         ...blParams,
       }),
     onSuccess: () => {
@@ -370,7 +373,7 @@ export function FrequencyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} />
           {cap.shown.map((f, i) => (
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}

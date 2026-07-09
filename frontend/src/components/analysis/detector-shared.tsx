@@ -41,31 +41,58 @@ export function NeedsBaselinePrompt() {
   );
 }
 
-/** "N findings · showing M" header + show-all/less toggle for a capped list. */
+/** "N findings · showing M" header + show-all/less toggle for a capped list.
+ *
+ * With the optional server props it also surfaces server-side truncation:
+ * when `serverTotal` exceeds `total` (the server capped the scan at its
+ * `limit`) the count reads "N of M findings" and a **Load more** button
+ * raises the limit via `onLoadMore` (see `useFindingsLimit`) — findings are
+ * never silently truncated.
+ */
 export function ResultsBar({
   total,
   shownCount,
   hasMore,
   expanded,
   onToggle,
+  serverTotal,
+  onLoadMore,
+  loadingMore,
 }: {
   total: number;
   shownCount: number;
   hasMore: boolean;
   expanded: boolean;
   onToggle: () => void;
+  /** `total_findings` from the response — findings before the server limit. */
+  serverTotal?: number;
+  /** Raise the server limit and refetch; rendered only when truncated. */
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
 }) {
+  const truncated = serverTotal !== undefined && serverTotal > total;
   return (
     <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
       <span>
-        {total} finding{total === 1 ? "" : "s"}
+        {truncated ? `${total} of ${serverTotal} findings` : `${total} finding${total === 1 ? "" : "s"}`}
         {hasMore ? ` · showing ${shownCount}` : ""}
       </span>
-      {hasMore && (
-        <button className="text-[var(--color-accent)] hover:underline" onClick={onToggle}>
-          {expanded ? "Show fewer" : `Show all ${total}`}
-        </button>
-      )}
+      <span className="flex items-center gap-2">
+        {truncated && onLoadMore && (
+          <button
+            className="text-[var(--color-accent)] hover:underline disabled:opacity-50"
+            onClick={onLoadMore}
+            disabled={loadingMore}
+          >
+            {loadingMore ? "Loading…" : "Load more"}
+          </button>
+        )}
+        {hasMore && (
+          <button className="text-[var(--color-accent)] hover:underline" onClick={onToggle}>
+            {expanded ? "Show fewer" : `Show all ${total}`}
+          </button>
+        )}
+      </span>
     </div>
   );
 }

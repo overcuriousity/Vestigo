@@ -23,6 +23,7 @@ import {
 import {
   useBaselineRequest,
   useCappedFindings,
+  useFindingsLimit,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -154,13 +155,14 @@ export function ValueNoveltyView({
   // empty string — the API client drops empty-string params — so it's sent as
   // the reserved "__none__" token, which the backend maps to "scan nothing".
   const fieldsParam = fieldsParamOf(selectedFields);
+  const fl = useFindingsLimit();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "novelty", blKey, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "value_novelty", blKey, fieldsParam ?? "__auto__", fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_novelty",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -172,7 +174,7 @@ export function ValueNoveltyView({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_novelty",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -270,7 +272,7 @@ export function ValueNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} />
           {cap.shown.map((f, i) => (
             <FindingRow
               key={`${f.field}:${f.value}:${i}`}

@@ -468,6 +468,12 @@ export interface AnomaliesResponse {
   warnings?: string[];
   /** Serialized window snapshot for temporal runs driven by a baseline definition. */
   windows?: AnalysisWindowsPayload | null;
+  /**
+   * Findings that survived suppression before the `limit` cap — when it
+   * exceeds `results.length` the server truncated and the view offers
+   * "load more".
+   */
+  total_findings?: number;
 }
 
 /** One suspect window in a baseline definition (half-open [start, end)). */
