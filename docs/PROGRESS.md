@@ -1,8 +1,8 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-09 (session 44 — D8 event-sequence novelty detector).
+Last updated: 2026-07-10 (session 45 — D8 event-sequence novelty detector).
 
-## Session 44 — 2026-07-09: D8 — event-sequence novelty detector (`sequence_novelty`)
+## Session 45 — 2026-07-10: D8 — event-sequence novelty detector (`sequence_novelty`)
 
 Shipped roadmap D8 (AMiner `EventSequenceDetector` analog) end to end. Per source, events are
 ordered by effective timestamp (record-order tie-breaks) and every run of n consecutive values
@@ -40,6 +40,44 @@ typecheck/lint/183 tests green.
 
 **Docs** — `ANOMALY_DETECTION.md` new §9 (semantic search renumbered §10, intro list now ten
 tools); `ROADMAP.md` D8 item replaced with a shipped summary.
+
+## Session 44 — 2026-07-10: unified disposition taxonomy; stale-panel + 50-cap fixes
+
+Started from the question "is *mark normal* the same as *mark as noise*?" — answer: the
+app had no noise concept at all, and "normal" itself was fragmented across five mechanisms
+(allowlist table, legacy per-event `normal` annotation, system `anomaly` annotations, the
+`pinned` flag, baseline windows). Shipped in three commits:
+
+**PR #86 (`fix/anomaly-panel-limit-and-stale`)** — two user-reported bugs. (a) Mark normal
+looked like a no-op: four views keyed anomalies queries with UI slugs
+(`novelty`/`range`/`combo`/`order`) while `useMarkNormal`'s optimistic filter matches
+`queryKey[3]` against the backend detector id — keys now use detector ids, pinned by a
+vitest suite. (b) Findings silently truncated at the hardcoded limit — detectors now report
+`total_findings` (pre-cap survivors), views show "N of M" with stepped **Load more**
+(50→150→500, `useFindingsLimit`).
+
+**`feat/unified-dispositions` backend** — new `finding_dispositions` table + audited
+`/dispositions` router replaces the fragmentation. Taxonomy: `normal` (baseline extension,
+suppresses detection, hashed into `DetectorRun.params` via `dispositions_hash` — which now
+also covers event-scoped exclusions, closing a reproducibility gap), `dismissed` (new:
+presentation-only noise triage, filtered at response time with explicit `dismissed_count` +
+`include_dismissed` escape hatch, run results stay unfiltered), `confirmed` (replaces
+`pinned`; tag re-runs preserve confirmed `(event, detector)` pairs). Migration `0004` moves
+allowlist rows / `normal` annotations / pinned intents, drops `detector_allowlist` and the
+`pinned` column; `/allowlist` endpoints removed; annotation types tightened to
+`tag`/`comment`. The old per-event-normal path was also un-audited — every disposition
+write is audited now.
+
+**`feat/unified-dispositions` frontend + docs** — `useDisposition` replaces `useMarkNormal`;
+`FindingRowActions` grows Normal/Dismiss/Confirm and is now wired into **all** views
+including the previously-missing ComboNovelty, Frequency, and OrderViolations;
+EventDetailPanel's Persist became Confirm (annotation + disposition in one action); the
+"Normal values" list became a kind-grouped Dispositions list; the dead legacy-normal grid
+indicator was removed. Docs: `ANOMALY_DETECTION.md` normality model rewritten around the
+taxonomy; ROADMAP L2 resolved, follow-ups X1–X3 filed.
+
+Verification: backend suite green except the 3 pre-existing environmental failures
+(embeddings extra); frontend typecheck/lint/197 tests green.
 
 ## Session 43 — 2026-07-09: docs audit — verify state vs. documentation, fix stale claims
 

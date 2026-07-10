@@ -185,26 +185,11 @@ def test_baseline_scoped_to_timeline_and_audited(client, admin_bootstrap, store)
 # ---------------------------------------------------------------------------
 
 
-def test_allowlist_crud_and_idempotent_create(client, admin_bootstrap, store):
-    as_admin(client, admin_bootstrap)
-    case_id, tl_id = _setup_case(client)
-    base = f"/api/cases/{case_id}/timelines/{tl_id}/allowlist"
-
-    body = {
-        "detector": "value_novelty",
-        "field": "attr:user",
-        "value": "svc_backup",
-        "note": "known service account",
-    }
-    entry = client.post(base, json=body).json()["entry"]
-    assert entry["detector"] == "value_novelty"
-
-    # Identical declaration is idempotent — same row, no duplicate.
-    again = client.post(base, json=body).json()["entry"]
-    assert again["id"] == entry["id"]
-    assert len(client.get(base).json()["entries"]) == 1
-
-    resp = client.delete(f"{base}/{entry['id']}")
-    assert resp.status_code == 200
-    assert client.get(base).json()["entries"] == []
-    assert client.delete(f"{base}/{entry['id']}").status_code == 404
+def test_allowlist_endpoints_removed(client):
+    """The /allowlist endpoints were folded into the disposition taxonomy
+    (see routers/dispositions.py); they must no longer exist. Checked against
+    the route table because the SPA catch-all answers unknown paths with the
+    app shell rather than a 404."""
+    api_paths = list(client.get("/api/openapi.json").json()["paths"])
+    assert not any("allowlist" in p for p in api_paths)
+    assert any(p.endswith("/dispositions") for p in api_paths)

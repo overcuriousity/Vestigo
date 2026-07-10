@@ -202,7 +202,12 @@ export interface View {
   created_at: string;
 }
 
-export type AnnotationType = "comment" | "tag" | "anomaly" | "normal";
+/**
+ * The legacy "normal" type is gone: normality/dismissal/confirmation are
+ * dispositions now (see `Disposition`); migration 0004 converted and
+ * deleted the old rows.
+ */
+export type AnnotationType = "comment" | "tag" | "anomaly";
 export type AnnotationOrigin = "user" | "system";
 
 export interface Annotation {
@@ -216,8 +221,6 @@ export interface Annotation {
   created_by: string | null;
   details: Record<string, unknown> | null;
   created_at: string;
-  /** True only for a system annotation created via the per-event "Persist" action. */
-  pinned: boolean;
   /** Which detector produced this system annotation ("value_novelty" | "frequency"); null for human annotations. */
   detector: string | null;
 }
@@ -457,7 +460,7 @@ export interface TimestampOrderFinding {
   details: Record<string, unknown>;
 }
 
-export type AnomalyFinding =
+export type AnomalyFinding = (
   | ValueNoveltyFinding
   | ValueComboFinding
   | FrequencyFinding
@@ -467,7 +470,11 @@ export type AnomalyFinding =
   | EntropyFinding
   | ProportionShiftFinding
   | IntervalPeriodicityFinding
-  | SequenceNoveltyFinding;
+  | SequenceNoveltyFinding
+) & {
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+};
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -490,6 +497,18 @@ export interface AnomaliesResponse {
   warnings?: string[];
   /** Serialized window snapshot for temporal runs driven by a baseline definition. */
   windows?: AnalysisWindowsPayload | null;
+  /**
+   * Findings that survived suppression before the `limit` cap — when it
+   * exceeds `results.length` the server truncated and the view offers
+   * "load more".
+   */
+  total_findings?: number;
+  /**
+   * Findings hidden by `dismissed` dispositions (presentation-only noise
+   * triage). Always reported so nothing is silently dropped; pass
+   * `include_dismissed` to keep them in `results` flagged `dismissed: true`.
+   */
+  dismissed_count?: number;
 }
 
 /** One suspect window in a baseline definition (half-open [start, end)). */
@@ -529,21 +548,32 @@ export interface BaselineMutationResponse {
   warnings: string[];
 }
 
-/** A value-level "this is normal" declaration consumed by the detectors. */
-export interface AllowlistEntry {
+/** Analyst verdict on a finding — the unified disposition taxonomy. */
+export type DispositionKind = "normal" | "dismissed" | "confirmed";
+
+/**
+ * One analyst verdict on an anomaly finding. Scope is exactly one of value
+ * (`field` + `value`, timeline-scoped) or event (`source_id` + `event_id`,
+ * `timeline_id` null). `detector` is a detector id or `"*"` (all detectors).
+ */
+export interface Disposition {
   id: string;
   case_id: string;
-  timeline_id: string;
+  timeline_id: string | null;
+  kind: DispositionKind;
   detector: string;
-  field: string;
-  value: string;
+  field: string | null;
+  value: string | null;
+  source_id: string | null;
+  event_id: string | null;
   note: string | null;
+  details: Record<string, unknown> | null;
   created_by: string | null;
   created_at: string | null;
 }
 
-export interface AllowlistListResponse {
-  entries: AllowlistEntry[];
+export interface DispositionListResponse {
+  dispositions: Disposition[];
 }
 
 /** One active finding fed to the histogram overlay / event grid highlighting. */

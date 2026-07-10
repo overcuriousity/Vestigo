@@ -89,6 +89,27 @@ export function useCappedFindings<T>(findings: T[], initial = 20) {
 }
 
 /**
+ * Server-side findings limit with stepped "load more" (…→50→150→500, capped by
+ * the API's `le=500`). Distinct from `useCappedFindings`, which only trims the
+ * client-side render of what the server already returned — this raises how
+ * much the server computes and returns. Include `limit` in the query key so
+ * raising it refetches.
+ */
+export const FINDINGS_LIMIT_STEPS = [50, 150, 500];
+
+export function useFindingsLimit(initial = 50) {
+  const [limit, setLimit] = useState(initial);
+  const next = FINDINGS_LIMIT_STEPS.find((s) => s > limit);
+  return {
+    limit,
+    canRaise: next !== undefined,
+    raise: () => {
+      if (next !== undefined) setLimit(next);
+    },
+  };
+}
+
+/**
  * Publish the active view's findings as histogram/grid markers, clearing
  * them on unmount or when the finding set changes. `build` may return null
  * to skip findings without a usable timestamp.

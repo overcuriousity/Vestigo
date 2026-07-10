@@ -13,6 +13,7 @@ import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
   ResultsBar,
@@ -21,6 +22,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useBaselineRequest,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -80,6 +82,17 @@ function ComboRow({
       }}
       actions={
         <>
+          <FindingRowActions
+            ts={finding.event?.timestamp ?? finding.first_seen}
+            eventId={finding.event_id}
+            disposition={{
+              caseId,
+              timelineId,
+              detector: "value_combo",
+              details: finding.details,
+              sourceId: finding.event?.source_id,
+            }}
+          />
           {onComboDrill && (
             <button
               title="Filter to this combination"
@@ -165,13 +178,14 @@ export function ComboNoveltyView({
 
   const explicitTooFew = selectedFields !== null && selectedFields.length < MIN_FIELDS;
   const fieldsParam = selectedFields !== null ? selectedFields.join(",") : undefined;
+  const fl = useFindingsLimit();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "combo", blKey, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "value_combo", blKey, fieldsParam ?? "__auto__", fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_combo",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -184,7 +198,7 @@ export function ComboNoveltyView({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_combo",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -282,7 +296,7 @@ export function ComboNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
           {cap.shown.map((f, i) => (
             <ComboRow
               key={`${f.values.join("|")}:${i}`}

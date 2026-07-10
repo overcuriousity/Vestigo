@@ -12,10 +12,10 @@
  */
 import { useState } from "react";
 import { type UseMutationResult } from "@tanstack/react-query";
-import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, RefreshCw, Tag } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, EyeOff, Pin, RefreshCw, Tag } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
-import { useMarkNormal } from "@/hooks/useMarkNormal";
+import { useDisposition } from "@/hooks/useDisposition";
 import type { AnomaliesResponse, TagAnomaliesResponse } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
@@ -41,31 +41,62 @@ export function NeedsBaselinePrompt() {
   );
 }
 
-/** "N findings · showing M" header + show-all/less toggle for a capped list. */
+/** "N findings · showing M" header + show-all/less toggle for a capped list.
+ *
+ * With the optional server props it also surfaces server-side truncation:
+ * when `serverTotal` exceeds `total` (the server capped the scan at its
+ * `limit`) the count reads "N of M findings" and a **Load more** button
+ * raises the limit via `onLoadMore` (see `useFindingsLimit`) — findings are
+ * never silently truncated.
+ */
 export function ResultsBar({
   total,
   shownCount,
   hasMore,
   expanded,
   onToggle,
+  serverTotal,
+  onLoadMore,
+  loadingMore,
+  dismissedCount,
 }: {
   total: number;
   shownCount: number;
   hasMore: boolean;
   expanded: boolean;
   onToggle: () => void;
+  /** `total_findings` from the response — findings before the server limit. */
+  serverTotal?: number;
+  /** Raise the server limit and refetch; rendered only when truncated. */
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
+  /** `dismissed_count` from the response — noise hidden by dispositions, never silently. */
+  dismissedCount?: number;
 }) {
+  const truncated = serverTotal !== undefined && serverTotal > total;
   return (
     <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
       <span>
-        {total} finding{total === 1 ? "" : "s"}
+        {truncated ? `${total} of ${serverTotal} findings` : `${total} finding${total === 1 ? "" : "s"}`}
         {hasMore ? ` · showing ${shownCount}` : ""}
+        {(dismissedCount ?? 0) > 0 ? ` · ${dismissedCount} dismissed` : ""}
       </span>
-      {hasMore && (
-        <button className="text-[var(--color-accent)] hover:underline" onClick={onToggle}>
-          {expanded ? "Show fewer" : `Show all ${total}`}
-        </button>
-      )}
+      <span className="flex items-center gap-2">
+        {truncated && onLoadMore && (
+          <button
+            className="text-[var(--color-accent)] hover:underline disabled:opacity-50"
+            onClick={onLoadMore}
+            disabled={loadingMore}
+          >
+            {loadingMore ? "Loading…" : "Load more"}
+          </button>
+        )}
+        {hasMore && (
+          <button className="text-[var(--color-accent)] hover:underline" onClick={onToggle}>
+            {expanded ? "Show fewer" : `Show all ${total}`}
+          </button>
+        )}
+      </span>
     </div>
   );
 }
@@ -257,7 +288,7 @@ export function FindingRowActions({
   eventId,
   onDrillField,
   onJumpToTime,
-  markNormal,
+  disposition,
 }: {
   /** Field/value for the drill button; omit for detectors without one (order). */
   field?: string;
@@ -267,50 +298,91 @@ export function FindingRowActions({
   onDrillField?: (field: string, value: string) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
   /**
-   * Enables the detector-scoped "Normal" action on the row. `caseId`/
-   * `timelineId` locate the timeline; `detector` + the finding's `details`
-   * (carrying the precomputed `allowlist_field`/`allowlist_value`) form the
-   * suppression key. `sourceId` is only used for the positional fallback.
+   * Enables the Normal / Dismiss / Confirm disposition actions on the row.
+   * `caseId`/`timelineId` locate the timeline; `detector` + the finding's
+   * `details` (carrying the precomputed `allowlist_field`/`allowlist_value`)
+   * form the value key — findings without one (positional, e.g.
+   * timestamp_order) are dispositioned per event. `sourceId` + the row's
+   * `eventId` scope event-level verdicts; Confirm needs both plus `content`
+   * for the persisted annotation text.
    */
-  markNormal?: {
+  disposition?: {
     caseId: string;
     timelineId: string;
     detector: string;
     details: Record<string, unknown>;
     sourceId?: string | null;
+    /** Human-readable finding text stored when confirming. */
+    content?: string;
   };
 }) {
-  // Always instantiate (rules of hooks); it only fires when the button renders.
-  const markNormalMut = useMarkNormal(markNormal?.caseId ?? "", markNormal?.timelineId ?? "");
-  const allowlistField = markNormal?.details?.allowlist_field as string | undefined;
-  const allowlistValue = markNormal?.details?.allowlist_value as string | undefined;
-  const isPositional = markNormal?.detector === "timestamp_order";
-  const canMarkNormal =
-    markNormal !== undefined && (isPositional ? !!eventId : allowlistField !== undefined && allowlistValue !== undefined);
+  // Always instantiate (rules of hooks); it only fires when a button renders.
+  const dispositionMut = useDisposition(
+    disposition?.caseId ?? "",
+    disposition?.timelineId ?? "",
+  );
+  const valueField = disposition?.details?.allowlist_field as string | undefined;
+  const valueValue = disposition?.details?.allowlist_value as string | undefined;
+  const hasValueKey = valueField !== undefined && valueValue !== undefined;
+  const hasEvent = !!eventId && !!disposition?.sourceId;
+  const canNormalOrDismiss = disposition !== undefined && (hasValueKey || hasEvent);
+  const canConfirm = disposition !== undefined && hasEvent && disposition.detector !== "*";
+
+  const act = (kind: "normal" | "dismissed" | "confirmed") => {
+    if (!disposition) return;
+    dispositionMut.mutate({
+      kind,
+      detector: disposition.detector,
+      // Prefer the value key; fall back to the event for positional findings.
+      field: hasValueKey ? valueField : undefined,
+      value: hasValueKey ? valueValue : undefined,
+      sourceId: disposition.sourceId ?? undefined,
+      eventId: eventId ?? undefined,
+      content: disposition.content,
+      details: disposition.details,
+    });
+  };
+  const scopeLabel = hasValueKey ? `${valueField}=${valueValue}` : "this event";
 
   return (
     <>
-      {canMarkNormal && markNormal && (
+      {canNormalOrDismiss && disposition && (
         <button
-          title={
-            isPositional
-              ? "Mark this event OK — this one event is no longer flagged"
-              : `Treat ${allowlistField}=${allowlistValue} as normal — no longer flagged by ${markNormal.detector}`
-          }
+          title={`Normal: treat ${scopeLabel} as expected behavior — extends the baseline, no longer flagged by ${disposition.detector}`}
           className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)]"
           onClick={(e) => {
             e.stopPropagation();
-            markNormalMut.mutate({
-              detector: markNormal.detector,
-              field: allowlistField,
-              value: allowlistValue,
-              sourceId: markNormal.sourceId ?? undefined,
-              eventId: eventId ?? undefined,
-            });
+            act("normal");
           }}
-          disabled={markNormalMut.isPending}
+          disabled={dispositionMut.isPending}
         >
-          {markNormalMut.isPending ? <Spinner size={11} /> : <CircleCheck size={12} />}
+          {dispositionMut.isPending ? <Spinner size={11} /> : <CircleCheck size={12} />}
+        </button>
+      )}
+      {canNormalOrDismiss && disposition && (
+        <button
+          title={`Dismiss: hide ${scopeLabel} as noise for this investigation — detectors keep scoring it`}
+          className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
+          onClick={(e) => {
+            e.stopPropagation();
+            act("dismissed");
+          }}
+          disabled={dispositionMut.isPending}
+        >
+          <EyeOff size={12} />
+        </button>
+      )}
+      {canConfirm && disposition && (
+        <button
+          title="Confirm: escalate as a durable finding — survives detector re-runs"
+          className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-anomaly,var(--color-warning))]"
+          onClick={(e) => {
+            e.stopPropagation();
+            act("confirmed");
+          }}
+          disabled={dispositionMut.isPending}
+        >
+          <Pin size={12} />
         </button>
       )}
       {onDrillField && field !== undefined && value !== undefined && (

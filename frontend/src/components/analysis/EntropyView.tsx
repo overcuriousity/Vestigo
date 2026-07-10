@@ -24,6 +24,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useBaselineRequest,
   fieldsParamOf,
   useAnomalyMarkers,
@@ -78,7 +79,7 @@ function EntropyRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
-          markNormal={{
+          disposition={{
             caseId,
             timelineId,
             detector: "entropy",
@@ -141,13 +142,14 @@ export function EntropyView({
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
+  const fl = useFindingsLimit();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "entropy", blKey, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "entropy", blKey, fieldsParam ?? "__auto__", fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "entropy",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -159,7 +161,7 @@ export function EntropyView({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
         detector: "entropy",
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
@@ -250,7 +252,7 @@ export function EntropyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
           {cap.shown.map((f, i) => (
             <EntropyRow
               key={`${f.field}:${f.value}:${i}`}

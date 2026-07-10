@@ -1,7 +1,5 @@
 import { del, get, post, put } from "./client";
 import type {
-  AllowlistEntry,
-  AllowlistListResponse,
   BaselineListResponse,
   BaselineMutationResponse,
   SuspectWindow,
@@ -14,17 +12,10 @@ export interface BaselineDefinitionInput {
   suspect_windows: Array<Pick<SuspectWindow, "label" | "start" | "end">>;
 }
 
-export interface AllowlistEntryInput {
-  detector: string;
-  field: string;
-  value: string;
-  note?: string | null;
-}
-
 /**
- * CRUD for baseline definitions (baseline range + suspect windows) and the
- * detector value-allowlist — the two persistent-normality primitives a
- * timeline's temporal anomaly detection runs against.
+ * CRUD for baseline definitions (baseline range + suspect windows) — the
+ * time-based normality primitive. Value/event-level normality lives in the
+ * disposition taxonomy (see `dispositionsApi`).
  */
 export const baselinesApi = {
   list: (caseId: string, timelineId: string) =>
@@ -50,19 +41,5 @@ export const baselinesApi = {
   remove: (caseId: string, timelineId: string, baselineId: string) =>
     del<{ deleted: boolean; baseline_id: string }>(
       `/cases/${caseId}/timelines/${timelineId}/baselines/${baselineId}`,
-    ),
-
-  listAllowlist: (caseId: string, timelineId: string) =>
-    get<AllowlistListResponse>(`/cases/${caseId}/timelines/${timelineId}/allowlist`),
-
-  addAllowlist: (caseId: string, timelineId: string, body: AllowlistEntryInput) =>
-    post<{ entry: AllowlistEntry }>(
-      `/cases/${caseId}/timelines/${timelineId}/allowlist`,
-      body,
-    ),
-
-  removeAllowlist: (caseId: string, timelineId: string, entryId: string) =>
-    del<{ deleted: boolean; entry_id: string }>(
-      `/cases/${caseId}/timelines/${timelineId}/allowlist/${entryId}`,
     ),
 };

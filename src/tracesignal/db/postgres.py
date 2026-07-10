@@ -21,6 +21,7 @@ from sqlalchemy import (
     func,
     insert,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -624,28 +625,52 @@ class BaselineDefinition(Base):
         }
 
 
-class DetectorAllowlistEntry(Base):
-    """A value-level "this is normal" declaration for the anomaly detectors.
+class FindingDisposition(Base):
+    """A single analyst verdict on an anomaly finding — the unified taxonomy.
 
-    Analyst-declared metadata (roadmap D11, AMiner-style whitelist rule):
-    the value of *field* is never an anomaly for *detector* on this timeline,
-    regardless of which event carries it. Consumed as a post-detection
-    exclusion in finding assembly — unlike the legacy per-event ``normal``
-    annotation, which only suppressed one representative event's finding.
-    ``detector`` uses the detector key (``value_novelty``, ``frequency``, …);
-    for ``frequency`` the *field* is the series field and the entry
-    suppresses the whole series.
+    One table replaces the previously fragmented mechanisms (the
+    ``detector_allowlist`` table, the per-event ``normal`` annotation, and the
+    ``pinned`` flag on system annotations). ``kind`` carries the verdict:
+
+    - ``normal`` — the behavior is expected; extends the baseline. Suppresses
+      detection (value scope: the ``(field, value)`` pair is dropped
+      post-detection on every event; event scope: the event is excluded from
+      scans). Detection-affecting, therefore hashed into ``DetectorRun.params``
+      via :func:`dispositions_hash`.
+    - ``dismissed`` — noise for this investigation; presentation-only.
+      Detectors keep scoring, the finding is filtered at response
+      serialization with an explicit ``dismissed_count`` (never silently),
+      and it does **not** enter the reproducibility hash.
+    - ``confirmed`` — escalated true positive; durable. Event-scoped with a
+      concrete detector; bulk re-scans preserve the confirmed
+      ``(event, detector)`` pair's system annotation.
+
+    "Undecided" is the absence of a row. Scope is exactly one of value
+    (``field`` + ``value``, timeline-scoped) or event (``source_id`` +
+    ``event_id``; ``timeline_id`` is NULL because events live once per Source
+    and appear in multiple timelines). ``detector`` is a detector key or the
+    literal ``"*"`` wildcard (all detectors), matched at read time via
+    ``detector in (detector, "*")``. For ``frequency``, ``field`` is the
+    series field and a value-scoped row covers the whole series.
     """
 
-    __tablename__ = "detector_allowlist"
+    __tablename__ = "finding_dispositions"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    detector: Mapped[str] = mapped_column(String(32), nullable=False)
-    field: Mapped[str] = mapped_column(String(255), nullable=False)
-    value: Mapped[str] = mapped_column(String(4096), nullable=False)
+    # NULL for event-scoped rows (see class docstring).
+    timeline_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    detector: Mapped[str] = mapped_column(String(32), nullable=False, server_default="*")
+    # Value scope (mutually exclusive with event scope).
+    field: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    value: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # Event scope.
+    source_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    event_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     note: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # confirmed: the finding's structured details snapshot at confirm time.
+    details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -659,24 +684,43 @@ class DetectorAllowlistEntry(Base):
             "id": self.id,
             "case_id": self.case_id,
             "timeline_id": self.timeline_id,
+            "kind": self.kind,
             "detector": self.detector,
             "field": self.field,
             "value": self.value,
+            "source_id": self.source_id,
+            "event_id": self.event_id,
             "note": self.note,
+            "details": self.details,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
-def allowlist_hash(entries: Iterable[DetectorAllowlistEntry]) -> str:
-    """Deterministic SHA-256 over an allowlist's (detector, field, value) triples.
+DISPOSITION_KINDS = ("normal", "dismissed", "confirmed")
+
+
+def dispositions_hash(rows: Iterable[FindingDisposition]) -> str:
+    """Deterministic SHA-256 over the detection-affecting disposition rows.
 
     Stamped into ``DetectorRun.params`` so a run records exactly which
     suppression set it was filtered through ("why is this value not
-    flagged?" stays answerable after the allowlist changes).
+    flagged?" stays answerable after dispositions change). Only
+    ``kind="normal"`` rows enter the hash — ``dismissed`` is presentation-only
+    and ``confirmed`` doesn't suppress anything, so neither changes what a
+    detector computes. Value scope hashes as ``("v", detector, field, value)``,
+    event scope as ``("e", detector, source_id, event_id)`` — the latter closes
+    the old gap where the per-event ``normal`` annotation exclusion was applied
+    but never recorded in the run params.
     """
-    triples = sorted((e.detector, e.field, e.value) for e in entries)
-    return _windows_config_hash({"allowlist": [list(t) for t in triples]})
+    tuples = sorted(
+        ("v", d.detector, d.field or "", d.value or "")
+        if d.field is not None
+        else ("e", d.detector, d.source_id or "", d.event_id or "")
+        for d in rows
+        if d.kind == "normal"
+    )
+    return _windows_config_hash({"dispositions": [list(t) for t in tuples]})
 
 
 class DetectorRun(Base):
@@ -753,18 +797,10 @@ class Annotation(Base):
     # Structured math for system annotations (null for human annotations).
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Which detector produced this system annotation (e.g. "value_novelty",
-    # "frequency"); null for human annotations. Scopes pin/clear behavior so a
-    # pinned finding from one detector doesn't suppress a distinct finding
-    # from another detector on the same event.
+    # "frequency"); null for human annotations. Scopes confirm/clear behavior
+    # so a confirmed finding from one detector doesn't suppress a distinct
+    # finding from another detector on the same event.
     detector: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # True only for a system annotation created via the per-event "Persist"
-    # action. Bulk "Tag N as anomaly" re-runs clear and rewrite system
-    # annotations wholesale (see delete_system_annotations) — pinned rows are
-    # excluded from that clear so a manually-confirmed finding survives a
-    # later re-scan that no longer surfaces it.
-    pinned: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -783,7 +819,6 @@ class Annotation(Base):
             "created_by": self.created_by,
             "origin": self.origin,
             "details": self.details,
-            "pinned": self.pinned,
             "detector": self.detector,
         }
 
@@ -2049,7 +2084,9 @@ class PostgresStore:
             timeline = result.scalar_one_or_none()
             if timeline is None or timeline.is_default:
                 return False
-            for model in (BaselineDefinition, DetectorAllowlistEntry, SavedChart):
+            # Timeline-scoped rows only — event-scoped dispositions carry a
+            # NULL timeline_id and stay with the case/source.
+            for model in (BaselineDefinition, FindingDisposition, SavedChart):
                 await session.execute(
                     delete(model).where(model.case_id == case_id, model.timeline_id == timeline_id)
                 )
@@ -2087,7 +2124,7 @@ class PostgresStore:
                 delete(BaselineDefinition).where(BaselineDefinition.case_id == case_id)
             )
             await session.execute(
-                delete(DetectorAllowlistEntry).where(DetectorAllowlistEntry.case_id == case_id)
+                delete(FindingDisposition).where(FindingDisposition.case_id == case_id)
             )
             await session.execute(
                 delete(SourceEnrichment).where(SourceEnrichment.case_id == case_id)
@@ -2371,81 +2408,196 @@ class PostgresStore:
     # Detector allowlist
     # ------------------------------------------------------------------
 
-    async def list_allowlist_entries(
-        self, case_id: str, timeline_id: str, detector: str | None = None
-    ) -> list[DetectorAllowlistEntry]:
-        """Return a timeline's allowlist entries (optionally one detector's), newest first."""
-        stmt = select(DetectorAllowlistEntry).where(
-            DetectorAllowlistEntry.case_id == case_id,
-            DetectorAllowlistEntry.timeline_id == timeline_id,
-        )
-        if detector is not None:
-            stmt = stmt.where(DetectorAllowlistEntry.detector == detector)
-        async with self.session_factory() as session:
-            result = await session.execute(stmt.order_by(DetectorAllowlistEntry.created_at.desc()))
-            return list(result.scalars().all())
-
-    async def create_allowlist_entry(
+    async def list_dispositions(
         self,
         case_id: str,
-        timeline_id: str,
-        detector: str,
-        field: str,
-        value: str,
-        note: str | None = None,
-        created_by: str | None = None,
-    ) -> DetectorAllowlistEntry:
-        """Create an allowlist entry, or return the existing identical one.
+        timeline_id: str | None = None,
+        source_ids: list[str] | None = None,
+        kinds: list[str] | None = None,
+        detector: str | None = None,
+    ) -> list[FindingDisposition]:
+        """Return a case's disposition rows, newest first.
 
-        Deduplication is by exact (detector, field, value) within the
-        timeline — declaring the same value normal twice is a no-op rather
-        than an error, so the UI action stays idempotent.
+        With *timeline_id*/*source_ids* given, returns the rows visible from
+        that timeline: value-scoped rows matching the timeline plus
+        event-scoped rows (``timeline_id`` NULL) whose ``source_id`` is one of
+        the timeline's sources. *kinds* filters to specific verdicts;
+        *detector* matches the concrete detector **or** the ``"*"`` wildcard.
+        """
+        conditions: list[Any] = [FindingDisposition.case_id == case_id]
+        if timeline_id is not None or source_ids is not None:
+            scope = []
+            if timeline_id is not None:
+                scope.append(FindingDisposition.timeline_id == timeline_id)
+            if source_ids is not None:
+                scope.append(FindingDisposition.source_id.in_(source_ids))
+            conditions.append(or_(*scope))
+        if kinds is not None:
+            conditions.append(FindingDisposition.kind.in_(kinds))
+        if detector is not None:
+            conditions.append(FindingDisposition.detector.in_([detector, "*"]))
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(FindingDisposition)
+                .where(*conditions)
+                .order_by(FindingDisposition.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def create_disposition(
+        self,
+        case_id: str,
+        kind: str,
+        detector: str = "*",
+        timeline_id: str | None = None,
+        field: str | None = None,
+        value: str | None = None,
+        source_id: str | None = None,
+        event_id: str | None = None,
+        note: str | None = None,
+        details: dict | None = None,
+        created_by: str | None = None,
+    ) -> FindingDisposition:
+        """Create a disposition row, or return the existing identical one.
+
+        Deduplication is by exact scope key —
+        ``(kind, detector, field, value, source_id, event_id)`` within the
+        case/timeline — so repeating the same verdict is a no-op rather than
+        an error and the UI action stays idempotent. Scope validation (exactly
+        one of value/event scope) lives in the API layer.
         """
         async with self.session_factory() as session:
             existing = (
                 await session.execute(
-                    select(DetectorAllowlistEntry).where(
-                        DetectorAllowlistEntry.case_id == case_id,
-                        DetectorAllowlistEntry.timeline_id == timeline_id,
-                        DetectorAllowlistEntry.detector == detector,
-                        DetectorAllowlistEntry.field == field,
-                        DetectorAllowlistEntry.value == value,
+                    select(FindingDisposition).where(
+                        FindingDisposition.case_id == case_id,
+                        FindingDisposition.timeline_id == timeline_id,
+                        FindingDisposition.kind == kind,
+                        FindingDisposition.detector == detector,
+                        FindingDisposition.field == field,
+                        FindingDisposition.value == value,
+                        FindingDisposition.source_id == source_id,
+                        FindingDisposition.event_id == event_id,
                     )
                 )
             ).scalar_one_or_none()
             if existing is not None:
                 return existing
-            entry = DetectorAllowlistEntry(
-                id=generate_id(f"allow_{detector}"),
+            row = FindingDisposition(
+                id=generate_id(f"disp_{kind}"),
                 case_id=case_id,
                 timeline_id=timeline_id,
+                kind=kind,
                 detector=detector,
                 field=field,
                 value=value,
+                source_id=source_id,
+                event_id=event_id,
                 note=note,
+                details=details,
                 created_by=created_by,
             )
-            session.add(entry)
+            session.add(row)
             await session.commit()
-            await session.refresh(entry)
-            return entry
+            await session.refresh(row)
+            return row
 
-    async def delete_allowlist_entry(self, case_id: str, timeline_id: str, entry_id: str) -> bool:
-        """Delete an allowlist entry row. Returns True if it existed."""
+    async def create_dispositions_bulk(
+        self, case_id: str, items: list[dict[str, Any]]
+    ) -> list[FindingDisposition]:
+        """Create several disposition rows in one transaction, with per-item dedupe.
+
+        All-or-nothing: a bulk declaration is one analyst intent, so a failure
+        on any item rolls back the whole batch instead of half-applying it.
+        Each *items* dict takes the same keyword arguments as
+        :meth:`create_disposition`; duplicates (against existing rows or
+        earlier items in the same batch, via flush) return the existing row.
+        """
+        async with self.session_factory() as session:
+            rows: list[FindingDisposition] = []
+            for it in items:
+                existing = (
+                    await session.execute(
+                        select(FindingDisposition).where(
+                            FindingDisposition.case_id == case_id,
+                            FindingDisposition.timeline_id == it.get("timeline_id"),
+                            FindingDisposition.kind == it["kind"],
+                            FindingDisposition.detector == it.get("detector", "*"),
+                            FindingDisposition.field == it.get("field"),
+                            FindingDisposition.value == it.get("value"),
+                            FindingDisposition.source_id == it.get("source_id"),
+                            FindingDisposition.event_id == it.get("event_id"),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    rows.append(existing)
+                    continue
+                row = FindingDisposition(
+                    id=generate_id(f"disp_{it['kind']}"),
+                    case_id=case_id,
+                    timeline_id=it.get("timeline_id"),
+                    kind=it["kind"],
+                    detector=it.get("detector", "*"),
+                    field=it.get("field"),
+                    value=it.get("value"),
+                    source_id=it.get("source_id"),
+                    event_id=it.get("event_id"),
+                    note=it.get("note"),
+                    details=it.get("details"),
+                    created_by=it.get("created_by"),
+                )
+                session.add(row)
+                # Make the row visible to the dedupe SELECT of later items.
+                await session.flush()
+                rows.append(row)
+            await session.commit()
+            for row in rows:
+                await session.refresh(row)
+            return rows
+
+    async def delete_disposition(self, case_id: str, disposition_id: str) -> bool:
+        """Delete a disposition row. Returns True if it existed."""
         async with self.session_factory() as session:
             result = await session.execute(
-                select(DetectorAllowlistEntry).where(
-                    DetectorAllowlistEntry.case_id == case_id,
-                    DetectorAllowlistEntry.timeline_id == timeline_id,
-                    DetectorAllowlistEntry.id == entry_id,
+                select(FindingDisposition).where(
+                    FindingDisposition.case_id == case_id,
+                    FindingDisposition.id == disposition_id,
                 )
             )
-            entry = result.scalar_one_or_none()
-            if entry is None:
+            row = result.scalar_one_or_none()
+            if row is None:
                 return False
-            await session.delete(entry)
+            await session.delete(row)
             await session.commit()
             return True
+
+    async def list_confirmed_keys(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        detector: str | None = None,
+    ) -> set[tuple[str, str]]:
+        """Return the confirmed ``(event_id, detector)`` pairs for these sources.
+
+        Used by the bulk tag endpoint so its clear/rewrite cycle preserves the
+        system annotation of a manually-confirmed finding, and skips writing a
+        duplicate over it. The successor of the retired ``pinned`` flag.
+        """
+        conditions = [
+            FindingDisposition.case_id == case_id,
+            FindingDisposition.kind == "confirmed",
+            FindingDisposition.source_id.in_(source_ids),
+        ]
+        if detector is not None:
+            conditions.append(FindingDisposition.detector == detector)
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(FindingDisposition.event_id, FindingDisposition.detector).where(
+                    *conditions
+                )
+            )
+            return {(row[0], row[1]) for row in result.all() if row[0]}
 
     # ------------------------------------------------------------------
     # Detector runs
@@ -2539,7 +2691,6 @@ class PostgresStore:
         created_by: str | None = None,
         origin: str = "user",
         details: dict | None = None,
-        pinned: bool = False,
         detector: str | None = None,
     ) -> Annotation:
         """Persist a new annotation and return it."""
@@ -2553,7 +2704,6 @@ class PostgresStore:
             created_by=created_by,
             origin=origin,
             details=details,
-            pinned=pinned,
             detector=detector,
         )
         async with self.session_factory() as session:
@@ -2581,7 +2731,6 @@ class PostgresStore:
                 created_by=row.get("created_by"),
                 origin=row.get("origin", "user"),
                 details=row.get("details"),
-                pinned=row.get("pinned", False),
                 detector=row.get("detector"),
             )
             for row in rows
@@ -2597,67 +2746,46 @@ class PostgresStore:
         source_ids: list[str],
         annotation_type: str,
         detector: str | None = None,
+        preserve_keys: set[tuple[str, str]] | None = None,
     ) -> int:
-        """Delete all non-pinned system-origin annotations of a given type.
+        """Delete system-origin annotations of a given type.
 
         Used before re-writing outlier tags so that a fresh "Tag outliers" run
-        does not accumulate duplicate machine annotations. Rows with
-        ``pinned=True`` (created via the per-event "Persist" action) are
-        excluded, so a manually-confirmed finding survives even if a later
-        re-scan no longer surfaces it. When ``detector`` is given, only rows
-        from that detector are cleared — findings from a different detector
-        (e.g. ``frequency`` vs ``value_novelty``) on the same sources are left
+        does not accumulate duplicate machine annotations. *preserve_keys* is
+        the confirmed ``(event_id, detector)`` set from
+        :meth:`list_confirmed_keys` — those rows are excluded from the clear,
+        so a manually-confirmed finding survives even if a later re-scan no
+        longer surfaces it. When ``detector`` is given, only rows from that
+        detector are cleared — findings from a different detector (e.g.
+        ``frequency`` vs ``value_novelty``) on the same sources are left
         untouched. Returns the count of deleted rows.
         """
-        from sqlalchemy import delete
-
         conditions = [
             Annotation.case_id == case_id,
             Annotation.source_id.in_(source_ids),
             Annotation.annotation_type == annotation_type,
             Annotation.origin == "system",
-            Annotation.pinned.is_(False),
         ]
         if detector is not None:
             conditions.append(Annotation.detector == detector)
         async with self.session_factory() as session:
+            if preserve_keys:
+                # Row-by-row filter in Python: the pair-tuple NOT IN is not
+                # portable across the SQLite test dialect, and the preserved
+                # set is tiny (manually-confirmed findings only).
+                rows = (
+                    (await session.execute(select(Annotation).where(*conditions)))
+                    .scalars()
+                    .all()
+                )
+                doomed = [a for a in rows if (a.event_id, a.detector or "") not in preserve_keys]
+                for a in doomed:
+                    await session.delete(a)
+                await session.commit()
+                return len(doomed)
             result = await session.execute(delete(Annotation).where(*conditions))
             await session.commit()
             return result.rowcount
-
-    async def list_pinned_event_ids(
-        self,
-        case_id: str,
-        source_ids: list[str],
-        annotation_type: str,
-        detector: str | None = None,
-    ) -> list[str]:
-        """Return event_ids with a pinned (manually-persisted) annotation.
-
-        Used by the bulk tag endpoint to avoid writing a second, duplicate
-        system annotation for an event that already has a pinned one. When
-        ``detector`` is given, only pins from that detector count — a pinned
-        ``value_novelty`` finding no longer suppresses a distinct
-        ``frequency`` finding on the same event.
-        """
-        conditions = [
-            Annotation.case_id == case_id,
-            Annotation.source_id.in_(source_ids),
-            Annotation.annotation_type == annotation_type,
-            Annotation.origin == "system",
-        ]
-        if detector is not None:
-            conditions.append(Annotation.detector == detector)
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(Annotation.event_id)
-                .where(
-                    *conditions,
-                    Annotation.pinned.is_(True),
-                )
-                .distinct()
-            )
-            return [row[0] for row in result.all()]
 
     async def delete_annotation(
         self,

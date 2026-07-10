@@ -79,7 +79,7 @@ function SequenceRow({
           ts={finding.event?.timestamp ?? finding.first_seen}
           eventId={finding.event_id}
           onJumpToTime={onJumpToTime}
-          markNormal={{
+          disposition={{
             caseId,
             timelineId,
             detector: "sequence_novelty",

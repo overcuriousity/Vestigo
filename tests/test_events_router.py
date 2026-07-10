@@ -1250,17 +1250,16 @@ async def test_run_stat_detector_explicit_baseline_end_wins_over_midpoint(
 
 
 @pytest.mark.asyncio
-async def test_run_stat_detector_excludes_normal_annotated_events(
+async def test_run_stat_detector_excludes_normal_disposed_events(
     patched_store, monkeypatch, stub_field_stats_cache
 ):
-    await patched_store.create_annotation(
+    """An event-scoped kind="normal" disposition excludes the event from scans."""
+    await patched_store.create_disposition(
         case_id="c1",
+        kind="normal",
+        detector="*",
         source_id="s1",
         event_id="normal-evt",
-        annotation_id="ann1",
-        annotation_type="normal",
-        origin="user",
-        content="",
     )
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
@@ -1347,6 +1346,9 @@ def _call_list_anomalies(persist: bool = True):
         temporal=False,
         baseline_id=None,
         limit=50,
+        # Passed explicitly: calling the handler directly would otherwise
+        # leave the (truthy) Query(...) sentinel as the value.
+        include_dismissed=False,
         persist=persist,
         case=Case(id="c1"),
         user=_fake_user(),
@@ -1405,6 +1407,84 @@ async def test_tag_anomalies_always_persists_a_run(
     assert response["run_id"] is not None
     run = await timeline_setup.get_detector_run("c1", response["run_id"])
     assert run is not None
+
+
+# ---------------------------------------------------------------------------
+# Dispositions: dismissed filtering + confirmed survival
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dismissed_disposition_filters_response_but_not_run(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A dismissed finding is dropped from the response with an explicit
+    dismissed_count, revealable via include_dismissed — but the persisted
+    DetectorRun keeps the unfiltered result, and the hash ignores it."""
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+    await timeline_setup.create_disposition(
+        case_id="c1",
+        kind="dismissed",
+        detector="value_novelty",
+        source_id="s1",
+        event_id="evt-1",
+    )
+
+    response = await _call_list_anomalies()
+    assert response["results"] == []
+    assert response["dismissed_count"] == 1
+    # The persisted run stores what was actually found.
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.result["results"][0]["event_id"] == "evt-1"
+    # Dismissals never enter the detection snapshot.
+    assert run.params["dispositions_count"] == 0
+
+    revealed = await events.list_anomalies(
+        "c1",
+        "t1",
+        detector="value_novelty",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        min_skew_seconds=None,
+        baseline_end=None,
+        temporal=False,
+        baseline_id=None,
+        limit=50,
+        include_dismissed=True,
+        persist=False,
+        case=Case(id="c1"),
+        user=_fake_user(),
+    )
+    assert revealed["dismissed_count"] == 1
+    assert revealed["results"][0]["dismissed"] is True
+
+
+@pytest.mark.asyncio
+async def test_confirmed_disposition_survives_tag_rerun(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """persist_anomaly_finding writes annotation + confirmed disposition; a
+    later bulk tag re-run preserves the annotation and doesn't duplicate it."""
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    persist_body = events.PersistAnomalyFindingRequest(
+        detector="value_novelty", content="confirmed finding", details={}
+    )
+    persisted = await events.persist_anomaly_finding(
+        "c1", "s1", "evt-1", persist_body, case=Case(id="c1"), user=_fake_user()
+    )
+    assert persisted["disposition"]["kind"] == "confirmed"
+
+    body = events.TagAnomaliesRequest(detector="value_novelty")
+    response = await events.tag_anomalies("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    # The finding's event is already confirmed — not re-tagged.
+    assert response["tagged"] == 0
+
+    anns = await timeline_setup.list_annotations("c1", "s1", "evt-1")
+    assert [a.content for a in anns if a.origin == "system"] == ["confirmed finding"]
 
 
 # ---------------------------------------------------------------------------
@@ -1488,10 +1568,15 @@ async def test_run_stat_detector_unknown_baseline_id_404s(
 async def test_run_stat_detector_applies_allowlist(
     timeline_setup, monkeypatch, stub_field_stats_cache
 ):
-    """An allowlist entry for the detector is passed through as a (field,
-    value) suppression set, and its hash is snapshotted."""
-    await timeline_setup.create_allowlist_entry(
-        "c1", "t1", "value_novelty", "artifact", "known_good"
+    """A value-scoped normal disposition for the detector is passed through as
+    a (field, value) suppression set, and its hash is snapshotted."""
+    await timeline_setup.create_disposition(
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id="t1",
+        field="artifact",
+        value="known_good",
     )
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
@@ -1509,19 +1594,24 @@ async def test_run_stat_detector_applies_allowlist(
         limit=50,
     )
     assert fake_svc.value_novelty_calls[0]["allowlist"] == {("artifact", "known_good")}
-    assert resolution["allowlist_count"] == 1
-    assert len(resolution["allowlist_hash"]) == 64
+    assert resolution["dispositions_count"] == 1
+    assert len(resolution["dispositions_hash"]) == 64
 
 
 @pytest.mark.asyncio
 async def test_run_stat_detector_applies_wildcard_allowlist_across_detectors(
     timeline_setup, monkeypatch, stub_field_stats_cache
 ):
-    """A detector-agnostic (`"*"`) entry suppresses its (field, value) for every
-    value detector, while a detector-scoped entry only affects its own."""
+    """A detector-agnostic (`"*"`) normal disposition suppresses its (field,
+    value) for every value detector, while a detector-scoped one only affects
+    its own."""
     # Wildcard: normal for all value detectors. Scoped: charset only.
-    await timeline_setup.create_allowlist_entry("c1", "t1", "*", "artifact", "wild")
-    await timeline_setup.create_allowlist_entry("c1", "t1", "charset", "artifact", "cs_only")
+    await timeline_setup.create_disposition(
+        "c1", kind="normal", detector="*", timeline_id="t1", field="artifact", value="wild"
+    )
+    await timeline_setup.create_disposition(
+        "c1", kind="normal", detector="charset", timeline_id="t1", field="artifact", value="cs_only"
+    )
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
@@ -1546,7 +1636,7 @@ async def test_run_stat_detector_applies_wildcard_allowlist_across_detectors(
     _, charset_resolution = await run("charset")
     charset_allowlist = fake_svc.charset_calls[0]["allowlist"]
     assert charset_allowlist == {("artifact", "wild"), ("artifact", "cs_only")}
-    assert charset_resolution["allowlist_count"] == 2
+    assert charset_resolution["dispositions_count"] == 2
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,8 @@
  *   2. Detectors — DetectorAccordion: every detector with a live count; expand
  *                  one to drill its ranked findings. (No dropdown, no separate
  *                  run-all — the overview is both.)
- *   3. Normal    — the value allowlist, collapsible at the bottom.
+ *   3. Dispositions — the analyst's verdicts (normal / dismissed / confirmed),
+ *                  collapsible at the bottom.
  *
  * Similarity and Method stay as sibling top tabs.
  */
@@ -199,8 +200,10 @@ export function InvestigatePanel({
                     frequency spikes, …). Expand one to see its ranked findings.
                   </li>
                   <li>
-                    Mark a finding <strong>Normal</strong> to add its value to the
-                    allowlist, so it stops surfacing in future scans.
+                    Disposition a finding: <strong>Normal</strong> extends the
+                    baseline (stops surfacing in future scans),{" "}
+                    <strong>Dismiss</strong> hides it as noise without changing
+                    detection, <strong>Confirm</strong> escalates it durably.
                   </li>
                 </ol>
               </GuidancePanel>
@@ -227,7 +230,7 @@ export function InvestigatePanel({
               onJumpToTime={onJumpToTime}
             />
 
-            {/* 3. Normal values */}
+            {/* 3. Dispositions */}
             <div className="mt-4 border-t border-[var(--color-border)] pt-3">
               <button
                 onClick={() => setNormalOpen((v) => !v)}
@@ -235,7 +238,7 @@ export function InvestigatePanel({
               >
                 {normalOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                 <ShieldCheck size={12} />
-                Normal values
+                Dispositions
                 <InfoHint content={GLOSSARY.normalValues} />
               </button>
               {normalOpen && <NormalValuesList caseId={caseId} timelineId={timelineId} />}

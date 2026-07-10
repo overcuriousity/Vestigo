@@ -297,6 +297,9 @@ def test_value_novelty_self_baseline_limit_applied():
     )
     assert result.status == "ok"
     assert len(result.results) <= 4
+    # The pre-cap survivor count is reported so the UI can offer "load more"
+    # instead of silently truncating.
+    assert result.total_findings == 9
 
 
 def test_value_novelty_event_id_populated():

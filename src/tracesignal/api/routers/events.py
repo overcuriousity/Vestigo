@@ -55,7 +55,7 @@ from tracesignal.db.postgres import (
     Case,
     PostgresStore,
     User,
-    allowlist_hash,
+    dispositions_hash,
     generate_id,
 )
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
@@ -670,7 +670,7 @@ async def list_events(
 
 
 class BulkAnnotateByFilterRequest(BaseModel):
-    annotation_type: str = Field(..., description="Annotation type: 'tag', 'comment', or 'normal'.")
+    annotation_type: str = Field(..., description="Annotation type: 'tag' or 'comment'.")
     content: str = Field(..., min_length=1, max_length=4096)
     q: str | None = None
     q_regex: bool = False
@@ -732,7 +732,8 @@ async def bulk_annotate_by_filter(
     resolved server-side so that events beyond the first loaded page are
     also tagged.  At most 100 000 events are written per call.
     """
-    allowed_types = {"tag", "comment", "normal"}
+    # "normal" retired: normality is a disposition (POST .../dispositions/bulk).
+    allowed_types = {"tag", "comment"}
     if body.annotation_type not in allowed_types:
         raise HTTPException(
             status_code=422,
@@ -1396,27 +1397,34 @@ async def _run_stat_detector(
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Resolve analysis windows + value allowlist, then dispatch to the detector.
+    """Resolve analysis windows + normal dispositions, then dispatch to the detector.
 
     Returns ``(result, resolution)`` where *resolution* carries the forensic
-    snapshot (baseline id/name, windows payload + hash, allowlist hash + count)
-    for :func:`_persist_detector_run`. Shared by ``list_anomalies`` (preview)
-    and ``tag_anomalies`` (persist) so "Tag N anomalies" persists exactly the
-    finding set the preview showed.
+    snapshot (baseline id/name, windows payload + hash, dispositions hash +
+    count) for :func:`_persist_detector_run`. Shared by ``list_anomalies``
+    (preview) and ``tag_anomalies`` (persist) so "Tag N anomalies" persists
+    exactly the finding set the preview showed.
     """
     cfg = get_settings()
     store = get_store()
     svc = _get_stat_anomaly_service()
 
-    # Value-level allowlist (analyst-declared "normal"), and the legacy per-event
-    # `normal` annotations still honored as an event-level exclusion. Both are
-    # independent of window resolution — fetch concurrently. The allowlist covers
-    # entries declared for this detector *plus* detector-agnostic ones (the
-    # `"*"` wildcard, written from a field-value row where no detector context
-    # exists — see docs/ANOMALY_DETECTION.md), so a value marked normal anywhere
-    # suppresses it here too.
-    allow_task = store.list_allowlist_entries(case_id, timeline_id)
-    normal_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
+    # kind="normal" dispositions — analyst-declared expected behavior — are
+    # the only ones that affect detection: value-scoped rows suppress the
+    # (field, value) pair post-detection, event-scoped rows exclude the event
+    # from the scan. Rows cover this detector *plus* detector-agnostic ones
+    # (the `"*"` wildcard, written from a field-value row where no detector
+    # context exists — see docs/ANOMALY_DETECTION.md), so a value marked
+    # normal anywhere suppresses it here too. Independent of window
+    # resolution — fetch concurrently. `dismissed` rows never reach the
+    # detectors (presentation-only, applied by _apply_dismissals).
+    normal_task = store.list_dispositions(
+        case_id,
+        timeline_id=timeline_id,
+        source_ids=source_ids,
+        kinds=["normal"],
+        detector=detector,
+    )
     windows_task = _resolve_analysis_windows(
         store,
         svc,
@@ -1428,17 +1436,20 @@ async def _run_stat_detector(
         temporal,
         source_offsets,
     )
-    all_entries, normal_ids, windows = await asyncio.gather(allow_task, normal_task, windows_task)
-    allow_entries = [e for e in all_entries if e.detector in (detector, "*")]
-    allowlist: set[tuple[str, str]] | None = {(e.field, e.value) for e in allow_entries} or None
-    exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
+    normal_rows, windows = await asyncio.gather(normal_task, windows_task)
+    allowlist: set[tuple[str, str]] | None = {
+        (d.field, d.value) for d in normal_rows if d.field is not None and d.value is not None
+    } or None
+    exclude_ids: set[str] | None = {
+        d.event_id for d in normal_rows if d.event_id is not None
+    } or None
 
     resolution: dict[str, Any] = {
         "baseline_id": baseline_id,
         "windows": windows.payload() if windows is not None else None,
         "windows_hash": windows.config_hash() if windows is not None else None,
-        "allowlist_hash": allowlist_hash(allow_entries),
-        "allowlist_count": len(allow_entries),
+        "dispositions_hash": dispositions_hash(normal_rows),
+        "dispositions_count": len(normal_rows),
     }
 
     if detector == "timestamp_order":
@@ -1957,7 +1968,51 @@ def _serialize_stat_result(result: Any) -> dict[str, Any]:
         "z_threshold": result.z_threshold,
         "warnings": list(getattr(result, "warnings", []) or []),
         "windows": getattr(result, "windows", None),
+        "total_findings": getattr(result, "total_findings", 0),
     }
+
+
+def _apply_dismissals(
+    payload: dict[str, Any],
+    dismissed_rows: list[Any],
+    include_dismissed: bool,
+) -> dict[str, Any]:
+    """Filter ``dismissed``-disposition findings out of a serialized result.
+
+    Presentation-only, applied at response time — the detectors never see
+    dismissals and the persisted ``DetectorRun.result`` stores the unfiltered
+    payload, so dismissing is not a detection decision and never enters the
+    reproducibility hash. The response always carries ``dismissed_count`` so
+    nothing is silently hidden; with ``include_dismissed`` the findings stay
+    in ``results`` flagged ``"dismissed": true`` instead of being dropped.
+    Matching mirrors the value-allowlist key (``details.allowlist_field`` /
+    ``allowlist_value``) plus the per-event fallback on ``event_id``.
+    """
+    value_keys = {(d.field, d.value) for d in dismissed_rows if d.field is not None}
+    event_ids = {d.event_id for d in dismissed_rows if d.event_id is not None}
+
+    def is_dismissed(finding: dict[str, Any]) -> bool:
+        details = finding.get("details") or {}
+        if (details.get("allowlist_field"), details.get("allowlist_value")) in value_keys:
+            return True
+        return finding.get("event_id") in event_ids
+
+    results = payload.get("results", [])
+    if not value_keys and not event_ids:
+        payload["dismissed_count"] = 0
+        return payload
+    if include_dismissed:
+        count = 0
+        for f in results:
+            if is_dismissed(f):
+                f["dismissed"] = True
+                count += 1
+        payload["dismissed_count"] = count
+        return payload
+    kept = [f for f in results if not is_dismissed(f)]
+    payload["dismissed_count"] = len(results) - len(kept)
+    payload["results"] = kept
+    return payload
 
 
 async def _persist_detector_run(
@@ -1979,9 +2034,9 @@ async def _persist_detector_run(
     """Persist a detector scan's request params + serialized result, return the run_id.
 
     *resolution* carries the forensic snapshot from :func:`_run_stat_detector`
-    (resolved baseline id, window ranges + hash, allowlist hash + count) so a
-    persisted run stays fully self-describing even after the baseline
-    definition or allowlist is later edited or deleted.
+    (resolved baseline id, window ranges + hash, dispositions hash + count) so
+    a persisted run stays fully self-describing even after the baseline
+    definition or dispositions are later edited or deleted.
     """
     store = get_store()
     run = await store.create_detector_run(
@@ -2007,8 +2062,8 @@ async def _persist_detector_run(
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
-            "allowlist_hash": resolution.get("allowlist_hash"),
-            "allowlist_count": resolution.get("allowlist_count"),
+            "dispositions_hash": resolution.get("dispositions_hash"),
+            "dispositions_count": resolution.get("dispositions_count"),
             # W2: the per-source clock-skew offsets applied to this run's
             # windows/timestamps (None when none was active), so the run stays
             # reproducible even if a source's offset is later changed.
@@ -2118,6 +2173,14 @@ async def list_anomalies(
         ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
+    include_dismissed: bool = Query(
+        default=False,
+        description=(
+            "Keep dismissed-disposition findings in `results`, flagged "
+            "`dismissed: true`, instead of filtering them out. The response "
+            "always reports `dismissed_count` either way."
+        ),
+    ),
     persist: bool = Query(
         default=True,
         description=(
@@ -2199,6 +2262,8 @@ async def list_anomalies(
     payload = _serialize_stat_result(result)
     run_id = None
     if persist and result.status == "ok":
+        # Persist the *unfiltered* payload — dismissals are presentation-only
+        # and must not rewrite what the run actually found.
         run_id = await _persist_detector_run(
             case_id,
             timeline_id,
@@ -2214,6 +2279,18 @@ async def list_anomalies(
             resolution=resolution,
             source_offsets=source_offsets,
         )
+    # Nothing to filter on an empty result — skip the dispositions read.
+    if payload.get("results"):
+        dismissed_rows = await get_store().list_dispositions(
+            case_id,
+            timeline_id=timeline_id,
+            source_ids=source_ids,
+            kinds=["dismissed"],
+            detector=detector,
+        )
+        payload = _apply_dismissals(dict(payload), dismissed_rows, include_dismissed)
+    else:
+        payload["dismissed_count"] = 0
     # GETs are skipped by the generic audit middleware, so detector-run
     # launches would otherwise leave no trace at all. Audited regardless of
     # `persist` — unpersisted preview scans still read case data and should
@@ -2302,6 +2379,13 @@ class TagAnomaliesRequest(BaseModel):
         ),
     )
     limit: int = Field(default=50, ge=1, le=500)
+    include_dismissed: bool = Field(
+        default=False,
+        description=(
+            "Keep dismissed-disposition findings in `results`, flagged "
+            "`dismissed: true`, instead of filtering them out."
+        ),
+    )
 
 
 @router.post("/{case_id}/timelines/{timeline_id}/anomalies/tag")
@@ -2359,17 +2443,21 @@ async def tag_anomalies(
             "run_id": None,
         }
 
-    # Clear prior (non-pinned) system anomaly annotations for this timeline's
-    # sources. Pinned rows — created via the per-event "Persist" action — are
-    # left alone so a manually-confirmed finding survives even if this
-    # re-scan no longer surfaces it.
-    await store.delete_system_annotations(case_id, source_ids, "anomaly", detector=body.detector)
-    pinned_event_ids = set(
-        await store.list_pinned_event_ids(case_id, source_ids, "anomaly", detector=body.detector)
+    # Clear prior system anomaly annotations for this timeline's sources,
+    # preserving those whose (event, detector) carries a `confirmed`
+    # disposition — created via the per-event "Confirm" action — so a
+    # manually-confirmed finding survives even if this re-scan no longer
+    # surfaces it.
+    confirmed_keys = await store.list_confirmed_keys(
+        case_id, source_ids, detector=body.detector
     )
+    await store.delete_system_annotations(
+        case_id, source_ids, "anomaly", detector=body.detector, preserve_keys=confirmed_keys
+    )
+    confirmed_event_ids = {event_id for event_id, _ in confirmed_keys}
 
-    # Write one system annotation per finding, skipping events that already
-    # have a pinned annotation to avoid a duplicate row for the same event.
+    # Write one system annotation per finding, skipping events whose finding
+    # is already confirmed to avoid a duplicate row for the same event.
     annotation_rows = []
     skipped_unresolved = 0
     for r in result.results:
@@ -2559,7 +2647,7 @@ async def tag_anomalies(
             # detection and tagging) — nothing to attach the annotation to.
             skipped_unresolved += 1
             continue
-        if event_id in pinned_event_ids:
+        if event_id in confirmed_event_ids:
             continue
         annotation_rows.append(
             {
@@ -2611,6 +2699,19 @@ async def tag_anomalies(
         },
     )
 
+    # Nothing to filter on an empty result — skip the dispositions read.
+    if payload.get("results"):
+        dismissed_rows = await store.list_dispositions(
+            case_id,
+            timeline_id=timeline_id,
+            source_ids=source_ids,
+            kinds=["dismissed"],
+            detector=body.detector,
+        )
+        payload = _apply_dismissals(dict(payload), dismissed_rows, body.include_dismissed)
+    else:
+        payload["dismissed_count"] = 0
+
     return {
         "status": "ok",
         "detector": result.detector,
@@ -2619,6 +2720,7 @@ async def tag_anomalies(
         "skipped_unresolved": skipped_unresolved,
         "baseline_size": result.baseline_size,
         "results": payload["results"],
+        "dismissed_count": payload["dismissed_count"],
         "z_threshold": result.z_threshold,
         "run_id": run_id,
     }
@@ -2657,12 +2759,13 @@ async def persist_anomaly_finding(
     Unlike ``/anomalies/tag`` (which re-runs a detector and replaces every
     system annotation for the timeline's sources), this writes exactly one
     row for this event and leaves every other tagged finding untouched — it's
-    the action behind the event detail panel's per-finding "Persist" button,
-    for confirming one finding without re-tagging everything else.
+    the action behind the event detail panel's per-finding "Confirm" button,
+    for escalating one finding without re-tagging everything else.
 
-    Written with ``pinned=True`` so a later bulk "Tag N as anomaly" re-run
-    (which clears and rewrites non-pinned system annotations) doesn't delete
-    this manually-confirmed finding, even if the re-scan no longer surfaces it.
+    Alongside the annotation it writes a ``confirmed`` disposition, so a
+    later bulk "Tag N as anomaly" re-run (which clears and rewrites system
+    annotations except confirmed ones) doesn't delete this manually-confirmed
+    finding, even if the re-scan no longer surfaces it.
     """
     store = get_store()
     annotation_id = generate_id(f"{event_id}_anomaly_{body.detector}")
@@ -2675,8 +2778,16 @@ async def persist_anomaly_finding(
         content=body.content,
         origin="system",
         details=body.details,
-        pinned=True,
         detector=body.detector,
+    )
+    disposition = await store.create_disposition(
+        case_id=case_id,
+        kind="confirmed",
+        detector=body.detector,
+        source_id=source_id,
+        event_id=event_id,
+        details=body.details,
+        created_by=user.id,
     )
     publish_annotation_change(case_id, None, event_id, user)
     await store.record_audit(
@@ -2685,6 +2796,10 @@ async def persist_anomaly_finding(
         case_id=case_id,
         target_type="event",
         target_id=event_id,
-        detail={"detector": body.detector, "source_id": source_id},
+        detail={
+            "detector": body.detector,
+            "source_id": source_id,
+            "disposition_id": disposition.id,
+        },
     )
-    return {"annotation": annotation.to_dict()}
+    return {"annotation": annotation.to_dict(), "disposition": disposition.to_dict()}

@@ -21,6 +21,7 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   NeedsBaselinePrompt,
   ResultsBar,
   RefreshButton,
@@ -28,6 +29,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useAnomalyMarkers,
   useBaselineRequest,
   useDetectorRunId,
@@ -62,13 +64,22 @@ const STATIC_SERIES_FIELD_OPTIONS = [
 ];
 
 interface FreqFindingRowProps {
+  caseId: string;
+  timelineId: string;
   finding: FrequencyFinding;
   zThreshold: number;
   onDrillField?: (field: string, value: string, start: string, end: string) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
 
-function FreqFindingRow({ finding, zThreshold, onDrillField, onJumpToTime }: FreqFindingRowProps) {
+function FreqFindingRow({
+  caseId,
+  timelineId,
+  finding,
+  zThreshold,
+  onDrillField,
+  onJumpToTime,
+}: FreqFindingRowProps) {
   const isSpike = finding.z_score > 0;
   // Severity bands scale off the analyst's own z_threshold (not fixed
   // constants) — otherwise a raised threshold (e.g. z >= 6) would still
@@ -157,8 +168,19 @@ function FreqFindingRow({ finding, zThreshold, onDrillField, onJumpToTime }: Fre
         </div>
       </div>
 
-      {onJumpToTime && (
-        <div className="shrink-0 flex items-center opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="shrink-0 flex items-center opacity-0 group-hover:opacity-100 transition-opacity">
+        <FindingRowActions
+          ts={finding.window_start}
+          eventId={finding.event_id}
+          disposition={{
+            caseId,
+            timelineId,
+            detector: "frequency",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
+        />
+        {onJumpToTime && (
           <button
             title="Jump to this window's start — clears active filters and highlights the window"
             className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
@@ -169,8 +191,8 @@ function FreqFindingRow({ finding, zThreshold, onDrillField, onJumpToTime }: Fre
           >
             <Clock size={12} />
           </button>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
@@ -219,14 +241,16 @@ export function FrequencyView({
     return [...STATIC_SERIES_FIELD_OPTIONS, ...attrOptions];
   }, [fieldsData]);
 
+  const fl = useFindingsLimit(30);
+
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey, fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
         series_field: seriesField,
         z_threshold: zThresholdParam,
-        limit: 30,
+        limit: fl.limit,
         ...blParams,
       }),
     staleTime: 60_000,
@@ -239,7 +263,7 @@ export function FrequencyView({
         detector: "frequency",
         series_field: seriesField,
         z_threshold: zThresholdParam,
-        limit: 30,
+        limit: fl.limit,
         ...blParams,
       }),
     onSuccess: () => {
@@ -370,10 +394,12 @@ export function FrequencyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
           {cap.shown.map((f, i) => (
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}
+              caseId={caseId}
+              timelineId={timelineId}
               finding={f}
               zThreshold={data?.z_threshold ?? zThresholdParam ?? 2.5}
               onDrillField={onDrillField}

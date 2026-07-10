@@ -1,16 +1,16 @@
-"""API routes for baseline definitions and the detector value-allowlist.
+"""API routes for baseline definitions.
 
 A **baseline definition** names one baseline time range (the known-normal
 reference period) plus 1..N labeled suspect windows on a timeline; temporal
 anomaly detectors resolve a ``baseline_id`` to these windows at scan time
-(see ``events.py::_run_stat_detector``). An **allowlist entry** declares one
-(detector, field, value) triple as never-anomalous for the timeline —
-value-level normality, complementing the time-based normality of the
-baseline windows (see ``docs/ANOMALY_DETECTION.md``).
+(see ``events.py::_run_stat_detector``). Value-level normality lives in the
+unified disposition taxonomy (``dispositions.py``,
+``docs/ANOMALY_DETECTION.md``) — the former ``/allowlist`` endpoints were
+folded into it.
 
-Both are analyst-declared metadata, deliberately editable: forensic
+Definitions are analyst-declared metadata, deliberately editable: forensic
 reproducibility is carried by the DetectorRun snapshot (windows +
-allowlist hash in ``params``), never by these rows surviving.
+dispositions hash in ``params``), never by these rows surviving.
 """
 
 from __future__ import annotations
@@ -49,15 +49,6 @@ class BaselineDefinitionCreate(BaseModel):
     baseline_start: datetime
     baseline_end: datetime
     suspect_windows: list[SuspectWindowPayload] = Field(min_length=1)
-
-
-class AllowlistEntryCreate(BaseModel):
-    """Body for declaring one (detector, field, value) as never-anomalous."""
-
-    detector: str = Field(min_length=1, max_length=32)
-    field: str = Field(min_length=1, max_length=255)
-    value: str = Field(max_length=4096)
-    note: str | None = Field(default=None, max_length=4096)
 
 
 def _validate_windows(payload: BaselineDefinitionCreate) -> list[str]:
@@ -220,72 +211,3 @@ async def delete_baseline_definition(
         target_id=baseline_id,
     )
     return {"deleted": True, "baseline_id": baseline_id}
-
-
-@router.get("/{case_id}/timelines/{timeline_id}/allowlist")
-async def list_allowlist_entries(
-    case_id: str,
-    timeline_id: str,
-    case: Case = Depends(require_case_read),
-) -> dict[str, Any]:
-    """List a timeline's detector allowlist entries (newest first)."""
-    await _require_timeline(case_id, timeline_id)
-    entries = await get_store().list_allowlist_entries(case_id, timeline_id)
-    return {"entries": [e.to_dict() for e in entries]}
-
-
-@router.post("/{case_id}/timelines/{timeline_id}/allowlist")
-async def create_allowlist_entry(
-    case_id: str,
-    timeline_id: str,
-    payload: AllowlistEntryCreate,
-    case: Case = Depends(require_case_contribute),
-    user: User = Depends(require_password_current),
-) -> dict[str, Any]:
-    """Declare a (detector, field, value) as never-anomalous for this timeline.
-
-    Idempotent: an identical existing entry is returned instead of duplicated.
-    """
-    await _require_timeline(case_id, timeline_id)
-    store = get_store()
-    entry = await store.create_allowlist_entry(
-        case_id=case_id,
-        timeline_id=timeline_id,
-        detector=payload.detector,
-        field=payload.field,
-        value=payload.value,
-        note=payload.note,
-        created_by=user.id,
-    )
-    await store.record_audit(
-        action="allowlist.create",
-        actor=user,
-        case_id=case_id,
-        target_type="detector_allowlist",
-        target_id=entry.id,
-        detail={"detector": payload.detector, "field": payload.field},
-    )
-    return {"entry": entry.to_dict()}
-
-
-@router.delete("/{case_id}/timelines/{timeline_id}/allowlist/{entry_id}")
-async def delete_allowlist_entry(
-    case_id: str,
-    timeline_id: str,
-    entry_id: str,
-    case: Case = Depends(require_case_contribute),
-    user: User = Depends(require_password_current),
-) -> dict[str, Any]:
-    """Remove an allowlist entry — the value becomes flaggable again."""
-    store = get_store()
-    deleted = await store.delete_allowlist_entry(case_id, timeline_id, entry_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Allowlist entry not found")
-    await store.record_audit(
-        action="allowlist.delete",
-        actor=user,
-        case_id=case_id,
-        target_type="detector_allowlist",
-        target_id=entry_id,
-    )
-    return {"deleted": True, "entry_id": entry_id}

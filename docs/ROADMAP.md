@@ -191,11 +191,24 @@ one commit that also updates `docs/ANOMALY_DETECTION.md`.
   working with exactly one internal temporal code path. Remove the `baseline_end`
   / `temporal` request params and `windows_from_split` once no stored `DetectorRun`
   relies on the legacy shape and the CLI/clients all send `baseline_id`.
-- [ ] **L2 — Per-event `normal` annotation for suppression.** Superseded by the
-  value-level detector allowlist (D11). Now created **only** for timestamp-order
-  findings (positional, no value key); honored read-only everywhere else. Cut once
-  timestamp-order gets a positional-allowlist equivalent — then the `normal`
-  annotation origin can be dropped from the mark-normal path entirely.
+## Disposition follow-ups (from the 2026-07-10 unified-taxonomy change)
+
+L2 (per-event `normal` annotation) is resolved: dispositions
+(`finding_dispositions`, migration `0004`) subsumed the allowlist, the
+per-event `normal` annotation, and the `pinned` flag. Remaining polish:
+
+- [ ] **X1 — "Show dismissed" toggle in the detector views.** The backend
+  supports `include_dismissed=true` (findings return flagged `dismissed: true`)
+  and every view shows the `dismissed_count`; a per-view reveal toggle is not
+  wired yet.
+- [ ] **X2 — TriageMeter disposition awareness.** "Reviewed" is still inferred
+  from user *annotations* only; an event dispositioned normal/dismissed/
+  confirmed without a tag/comment doesn't count. Feed `["dispositions", …]`
+  into `computeProgress`.
+- [ ] **X3 — Event-grid indicator for event-scoped dispositions.** The legacy
+  per-event-normal grid indicator was removed with the annotation; an
+  indicator driven by event-scoped disposition rows could return if analysts
+  miss it.
 
 ## Explicitly out of scope (decided during the audit)
 

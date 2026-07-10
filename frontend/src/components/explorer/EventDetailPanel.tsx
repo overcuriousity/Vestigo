@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight, EyeOff } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -17,11 +16,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/DropdownMenu";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
-import { useMarkNormal } from "@/hooks/useMarkNormal";
+import { useDisposition } from "@/hooks/useDisposition";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
-import { anomaliesApi } from "@/api/anomalies";
-import type { AnomalyMarker, Event, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, Annotation, DispositionKind } from "@/api/types";
 
 interface Props {
   event: Event;
@@ -306,7 +304,6 @@ export function EventDetailPanel({
 }: Props) {
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const qc = useQueryClient();
 
   // Collapsible sections — only Provenance starts closed, everything else
   // stays open since it's read at a glance during triage.
@@ -316,37 +313,28 @@ export function EventDetailPanel({
   const toggleSection = (id: string) =>
     setCollapsedSections((s) => ({ ...s, [id]: !s[id] }));
 
-  const persistMutation = useMutation({
-    mutationFn: (finding: AnomalyMarker) =>
-      anomaliesApi.persistFinding(caseId, sourceId, event.event_id, {
-        detector: finding.detector,
-        content: finding.detail,
-        details: finding.rawDetails,
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["annotations"] });
-    },
-    meta: { successToast: "Finding pinned as annotation", errorTitle: "Pin failed" },
-  });
-
-  // "Mark normal" = value-level normality: the detector never flags this value
-  // again (see docs/ANOMALY_DETECTION.md). Shared with the analysis finding
-  // rows via useMarkNormal. From a *finding* it is detector-scoped; from a
-  // *field:value* row (below) it is detector-agnostic ("*"). timestamp_order
-  // findings are positional, so they fall back to a per-event annotation.
-  const markNormal = useMarkNormal(caseId, timelineId);
-  const markFindingNormal = (finding: AnomalyMarker) => {
+  // Disposition = the analyst's verdict on a finding, shared with the
+  // analysis finding rows via useDisposition (see docs/ANOMALY_DETECTION.md).
+  // From a *finding* it is detector-scoped; from a *field:value* row (below)
+  // it is detector-agnostic ("*"). timestamp_order findings are positional,
+  // so they get an event-scoped disposition. "Confirm" persists the finding
+  // as a durable system annotation + confirmed disposition in one action.
+  const disposition = useDisposition(caseId, timelineId);
+  const dispositionForFinding = (kind: DispositionKind, finding: AnomalyMarker) => {
     const d = (finding.rawDetails ?? {}) as Record<string, unknown>;
-    markNormal.mutate({
+    disposition.mutate({
+      kind,
       detector: finding.detector,
       field: d.allowlist_field as string | undefined,
       value: d.allowlist_value as string | undefined,
       sourceId: finding.sourceId ?? sourceId,
       eventId: finding.eventId ?? event.event_id,
+      content: finding.detail,
+      details: (finding.rawDetails ?? {}) as Record<string, unknown>,
     });
   };
   const markFieldNormal = (fieldKey: string, value: string) =>
-    markNormal.mutate({ detector: "*", field: fieldKey, value });
+    disposition.mutate({ kind: "normal", detector: "*", field: fieldKey, value });
 
   // ── Resize drag ────────────────────────────────────────────────────────
   const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
@@ -400,16 +388,10 @@ export function EventDetailPanel({
     ...effectiveLiveFindings.map((f) => `${f.detail} (not yet tagged)`),
   ];
 
-  // Left accent bar: an analyst marking an event Normal is a deliberate
-  // dismissal, so it always wins over a still-open anomaly finding.
-  const isNormal = userAnnotations.some(
-    (a) => a.annotation_type === "normal" && a.origin === "user",
-  );
-  const accentColor = isNormal
-    ? "var(--color-success)"
-    : anomalyReasons.length > 0
-      ? "var(--color-anomaly)"
-      : "transparent";
+  // Left accent bar: anomaly color while findings are open. (The old
+  // per-event "normal" annotation that could override this is retired —
+  // normality is a disposition now and suppresses the finding itself.)
+  const accentColor = anomalyReasons.length > 0 ? "var(--color-anomaly)" : "transparent";
 
   function handleAdd(content: string) {
     if (!addMode) return;
@@ -705,31 +687,47 @@ export function EventDetailPanel({
                 <span className="ml-1 text-xs text-[var(--color-fg-muted)]">(not yet tagged)</span>
               </span>
               <div className="shrink-0 flex items-center gap-1">
-                <Tooltip content="Persist this finding as a system annotation" side="top">
+                <Tooltip
+                  content="Confirm: escalate as a durable finding — survives detector re-runs"
+                  side="top"
+                >
                   <button
-                    onClick={() => persistMutation.mutate(finding)}
-                    disabled={persistMutation.isPending}
+                    onClick={() => dispositionForFinding("confirmed", finding)}
+                    disabled={disposition.isPending}
                     className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
                   >
-                    {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
-                    Persist
+                    {disposition.isPending ? <Spinner size={10} /> : <Save size={10} />}
+                    Confirm
                   </button>
                 </Tooltip>
                 <Tooltip
                   content={
                     finding.detector === "timestamp_order"
-                      ? "Mark this event as normal"
-                      : "Never flag this value again for this detector"
+                      ? "Normal: this event is expected behavior"
+                      : "Normal: expected behavior — never flagged again for this detector"
                   }
                   side="top"
                 >
                   <button
-                    onClick={() => markFindingNormal(finding)}
-                    disabled={markNormal.isPending}
+                    onClick={() => dispositionForFinding("normal", finding)}
+                    disabled={disposition.isPending}
                     className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)] transition-base"
                   >
-                    {markNormal.isPending ? <Spinner size={10} /> : <CircleCheck size={10} />}
+                    {disposition.isPending ? <Spinner size={10} /> : <CircleCheck size={10} />}
                     Normal
+                  </button>
+                </Tooltip>
+                <Tooltip
+                  content="Dismiss: hide as noise for this investigation — detectors keep scoring"
+                  side="top"
+                >
+                  <button
+                    onClick={() => dispositionForFinding("dismissed", finding)}
+                    disabled={disposition.isPending}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)] transition-base"
+                  >
+                    <EyeOff size={10} />
+                    Dismiss
                   </button>
                 </Tooltip>
               </div>

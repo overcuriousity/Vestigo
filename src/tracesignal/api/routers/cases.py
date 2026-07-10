@@ -89,7 +89,8 @@ class ViewCreate(BaseModel):
 class AnnotationCreate(BaseModel):
     """Payload to create an event annotation."""
 
-    annotation_type: str = Field(..., pattern="^(comment|tag|normal)$")
+    # "normal" retired: normality is a disposition (see routers/dispositions.py).
+    annotation_type: str = Field(..., pattern="^(comment|tag)$")
     content: str = Field(..., min_length=1, max_length=4096)
 
 

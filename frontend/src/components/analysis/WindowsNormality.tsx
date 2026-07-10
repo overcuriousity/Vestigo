@@ -6,20 +6,23 @@
  *    windows). Rendered inline in the Scope area so building/selecting the thing
  *    the `baseline` frame depends on is right where you pick that frame. Windows
  *    are set by typing UTC datetimes *or* arming a row and dragging the histogram.
- *  - `NormalValuesList` — the value-level allowlist, rendered at the bottom. Each
- *    entry shows its scope (`*` = all detectors, else the single detector it was
- *    marked from). Populated by the Normal action on findings / field rows.
+ *  - `NormalValuesList` — the disposition list (normal / dismissed / confirmed),
+ *    rendered at the bottom, grouped by verdict. Each entry shows its scope
+ *    (`*` = all detectors, else the single detector it was marked from; a
+ *    field:value pair or a single event). Populated by the Normal / Dismiss /
+ *    Confirm actions on findings and field rows.
  */
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Crosshair, Pencil, Plus, Trash2, X } from "lucide-react";
 import { baselinesApi } from "@/api/baselines";
+import { dispositionsApi } from "@/api/dispositions";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { InfoHint } from "@/components/ui/InfoHint";
 import { useBaselineStore } from "@/stores/baseline";
-import type { BaselineDefinition } from "@/api/types";
+import type { BaselineDefinition, DispositionKind } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { GLOSSARY } from "@/lib/glossary";
 
@@ -326,56 +329,98 @@ export function BaselineSection({ caseId, timelineId }: Props) {
   );
 }
 
-/** The value-level allowlist ("Normal values"), rendered at the panel bottom. */
+const KIND_META: Record<
+  DispositionKind,
+  { heading: string; hint: string; removeTitle: string }
+> = {
+  normal: {
+    heading: "Normal",
+    hint: "Expected behavior — extends the baseline; hidden from future scans.",
+    removeTitle: "Remove — becomes flaggable again",
+  },
+  dismissed: {
+    heading: "Dismissed",
+    hint: "Noise for this investigation — hidden from view, detectors keep scoring.",
+    removeTitle: "Remove — becomes visible again",
+  },
+  confirmed: {
+    heading: "Confirmed",
+    hint: "Escalated findings — survive detector re-runs.",
+    removeTitle: "Remove — no longer protected across re-runs",
+  },
+};
+
+/** The analyst's dispositions (normal / dismissed / confirmed), grouped by verdict. */
 export function NormalValuesList({ caseId, timelineId }: Props) {
   const qc = useQueryClient();
   const { data } = useQuery({
-    queryKey: ["allowlist", caseId, timelineId],
-    queryFn: () => baselinesApi.listAllowlist(caseId, timelineId),
+    queryKey: ["dispositions", caseId, timelineId],
+    queryFn: () => dispositionsApi.list(caseId, timelineId),
   });
-  const allowlist = data?.entries ?? [];
+  const rows = data?.dispositions ?? [];
   const removeMut = useMutation({
-    mutationFn: (id: string) => baselinesApi.removeAllowlist(caseId, timelineId, id),
+    mutationFn: (id: string) => dispositionsApi.remove(caseId, timelineId, id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] });
-      // Un-suppressing a value must let its findings come back — re-run the
-      // detector queries (adding an entry never needs this: useMarkNormal
+      qc.invalidateQueries({ queryKey: ["dispositions", caseId, timelineId] });
+      // Un-suppressing must let findings come back — re-run the detector
+      // queries (adding a disposition never needs this: useDisposition
       // filters cached results optimistically instead).
       qc.invalidateQueries({ queryKey: ["anomalies", caseId, timelineId] });
     },
-    meta: { successToast: "Removed from normal values" },
+    meta: { successToast: "Disposition removed" },
   });
 
+  const kinds: DispositionKind[] = ["normal", "dismissed", "confirmed"];
   return (
-    <div className="space-y-1 text-sm">
+    <div className="space-y-2 text-sm">
       <p className="text-[10px] text-[var(--color-fg-muted)]">
-        Values marked normal are hidden from future scans — the manual extension of your baseline.
+        Your verdicts on findings. <strong>Normal</strong> extends the baseline,{" "}
+        <strong>Dismissed</strong> hides noise without changing detection,{" "}
+        <strong>Confirmed</strong> pins escalated findings.
       </p>
-      {allowlist.length === 0 && (
+      {rows.length === 0 && (
         <div className="text-xs text-[var(--color-fg-muted)]">
-          None yet. Use <strong>Normal</strong> on a finding or a field value.
+          None yet. Use <strong>Normal</strong>, <strong>Dismiss</strong> or{" "}
+          <strong>Confirm</strong> on a finding or a field value.
         </div>
       )}
-      {allowlist.map((e) => (
-        <div
-          key={e.id}
-          className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-1 text-xs"
-        >
-          <span className="min-w-0 flex-1 truncate">
-            <span className="text-[var(--color-fg-muted)]">
-              {e.detector === "*" ? "all detectors" : e.detector} · {e.field}:
-            </span>{" "}
-            <span className="text-[var(--color-fg-primary)]">{e.value}</span>
-          </span>
-          <button
-            className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
-            onClick={() => removeMut.mutate(e.id)}
-            title="Remove — value becomes flaggable again"
-          >
-            <Trash2 size={11} />
-          </button>
-        </div>
-      ))}
+      {kinds.map((kind) => {
+        const group = rows.filter((d) => d.kind === kind);
+        if (group.length === 0) return null;
+        return (
+          <div key={kind} className="space-y-1">
+            <div
+              className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]"
+              title={KIND_META[kind].hint}
+            >
+              {KIND_META[kind].heading} ({group.length})
+            </div>
+            {group.map((d) => (
+              <div
+                key={d.id}
+                className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-1 text-xs"
+              >
+                <span className="min-w-0 flex-1 truncate" title={d.note ?? undefined}>
+                  <span className="text-[var(--color-fg-muted)]">
+                    {d.detector === "*" ? "all detectors" : d.detector} ·{" "}
+                    {d.field !== null ? `${d.field}:` : "event"}
+                  </span>{" "}
+                  <span className="text-[var(--color-fg-primary)]">
+                    {d.field !== null ? d.value : d.event_id}
+                  </span>
+                </span>
+                <button
+                  className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+                  onClick={() => removeMut.mutate(d.id)}
+                  title={KIND_META[kind].removeTitle}
+                >
+                  <Trash2 size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        );
+      })}
     </div>
   );
 }

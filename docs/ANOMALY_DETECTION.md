@@ -84,19 +84,36 @@ about which is which:
   Suspect windows *may* overlap each other (a burst examined two ways) with a
   warning. Cap: 10 suspect windows. Mark them by dragging ranges on the
   timeline histogram in "mark" mode; manage them in the Baselines panel.
-- **The detector allowlist = value-based normality** (`detector_allowlist`,
-  roadmap D11). An analyst-declared "this `(detector, field, value)` is never
-  an anomaly on this timeline" — created from a finding's **Mark normal**
-  action. Consumed as a post-detection suppression, so the same value is
-  dropped on *every* event, unlike the legacy per-event `normal` annotation it
-  replaces (which only hid one representative event's finding). For the
-  frequency detector the field is the series field, so an entry suppresses a
-  whole known-noisy series. An entry may use the wildcard detector `"*"` to
-  declare a `(field, value)` normal for **every** value-shaped detector at once
-  — this is what the field-value **Normal** action (on an event-detail attribute
-  row, where there is no detector context) writes, versus a finding row's Normal
-  which scopes the entry to that one detector. A detector run applies entries
-  whose detector is its own **or** `"*"`.
+- **Dispositions = the analyst's verdicts on findings**
+  (`finding_dispositions`, router `api/routers/dispositions.py`). One unified
+  taxonomy replaces the former detector allowlist, per-event `normal`
+  annotation and `pinned` flag; every write is audited. `kind` carries the
+  verdict, and the distinction is deliberate:
+  - **`normal`** — "this is expected behavior"; the manual extension of the
+    baseline. The only kind that affects detection: value-scoped rows
+    (`field` + `value`, timeline-scoped) are dropped post-detection on
+    *every* event; event-scoped rows (`source_id` + `event_id`) exclude the
+    event from scans (the positional case, e.g. timestamp order). For the
+    frequency detector the field is the series field, so a row suppresses a
+    whole known-noisy series. `detector` may be the wildcard `"*"` — normal
+    for **every** value-shaped detector at once, written by the field-value
+    **Normal** action (an event-detail attribute row has no detector
+    context) versus a finding row's Normal which scopes to one detector. A
+    detector run applies rows whose detector is its own **or** `"*"`.
+  - **`dismissed`** — "noise for this investigation"; presentation-only.
+    Detectors keep scoring; findings are filtered at response time with an
+    explicit `dismissed_count` (never silently) and an
+    `include_dismissed=true` escape hatch that returns them flagged
+    `dismissed: true`. Never enters the reproducibility hash and never
+    rewrites what a persisted run found.
+  - **`confirmed`** — "escalated true positive"; durable. Event-scoped with a
+    concrete detector; written by the **Confirm** action together with the
+    system `anomaly` annotation. Bulk "Tag N as anomaly" re-runs preserve
+    confirmed `(event, detector)` pairs instead of clearing them.
+
+  Undecided is the absence of a row. Rows are freely deletable (the
+  Dispositions list under Windows & normality); removing one makes the
+  finding flaggable/visible again.
 
 **How a suspect window scores.** Each temporal detector restricts its scan to
 the union of the baseline and suspect windows (events outside every window are
@@ -122,26 +139,30 @@ contain one full bucket yields a warning rather than a bogus single-bucket
 z-score — the fix is to widen the window or shrink the baseline (a shorter
 baseline → finer interval).
 
-**Forensic reproducibility.** Baseline definitions and allowlist entries are
+**Forensic reproducibility.** Baseline definitions and dispositions are
 freely editable — reproducibility does **not** depend on them surviving.
 Every `DetectorRun` snapshots into its `params` the resolved `baseline_id`,
-the full `windows` payload, a `windows_hash`, and the `allowlist_hash` +
-entry count it was filtered through. So a persisted run stays fully
-self-describing — "why is this value not flagged?" and "what exactly did this
-scan compare?" stay answerable — even after the definition or allowlist is
-later changed or deleted. The legacy single-`baseline_end` split point and the
-`temporal=true` midpoint fallback are still accepted at the API and converted
-to a one-baseline/one-suspect window pair (`windows_from_split`), so old runs
-and clients keep working; internally the detectors have exactly one temporal
-code path.
+the full `windows` payload, a `windows_hash`, and the `dispositions_hash` +
+row count it was filtered through (`dispositions_hash` covers the
+detection-affecting `normal` rows only, value- **and** event-scoped — the
+old `allowlist_hash` never recorded the per-event exclusions). So a persisted
+run stays fully self-describing — "why is this value not flagged?" and "what
+exactly did this scan compare?" stay answerable — even after the definition
+or dispositions are later changed or deleted. The legacy
+single-`baseline_end` split point and the `temporal=true` midpoint fallback
+are still accepted at the API and converted to a one-baseline/one-suspect
+window pair (`windows_from_split`), so old runs and clients keep working;
+internally the detectors have exactly one temporal code path.
 
-Three ways an event can be "normal", to keep them straight:
+The ways an event can be "normal" (or otherwise dispositioned), to keep them
+straight:
 
-| Mechanism | Scope | Created from | Status |
+| Mechanism | Scope | Created from | Effect |
 |---|---|---|---|
-| Baseline window | time range | histogram "mark" mode | current |
-| Allowlist entry | `(detector, field, value)` | a finding's "Mark normal" | current |
-| `normal` annotation | one event | (legacy) | honored, read-only; no longer created except for timestamp-order findings |
+| Baseline window | time range | histogram "mark" mode | detectors learn "expected" here |
+| Disposition `normal` | `(detector\|"*", field, value)` or one event | Normal on a finding / field row | suppresses detection; hashed into runs |
+| Disposition `dismissed` | `(detector, field, value)` or one event | Dismiss on a finding | hidden from view only; counted, revealable |
+| Disposition `confirmed` | one event + detector | Confirm on a finding | durable escalation; survives re-scans |
 
 ---
 
@@ -1128,6 +1149,22 @@ window, and warns on windows too small to score. The old whole-corpus surprise
 denominator and whole-timeline frequency buckets — both of which overstated
 significance when the analysis covered only part of the timeline — are gone.
 Per-event "mark normal" was unified into the value-level detector allowlist
-(roadmap D11); the legacy `normal` annotation is still honored but no longer
+(roadmap D11); the legacy `normal` annotation was still honored but no longer
 created outside timestamp-order findings. Schema for both new tables is managed
 by Alembic (`src/tracesignal/db/migrations`), which this change also adopted.
+
+## Unified disposition taxonomy (2026-07)
+
+The remaining fragmentation — `detector_allowlist` table, per-event `normal`
+annotation (the timestamp-order fallback), and the `pinned` flag on system
+annotations — was replaced by the single `finding_dispositions` table
+(migration `0004`, which moves all legacy rows) and the audited
+`/dispositions` endpoints. See
+[the normality model](#baseline-definitions-suspect-windows-and-the-normality-model)
+for the taxonomy (`normal` / `dismissed` / `confirmed`). Two behavior gaps
+closed with it: per-event normality is now audited and hashed into
+`DetectorRun.params` (`dispositions_hash` replaces `allowlist_hash`), and
+"hide as noise without blessing it into the baseline" exists at all
+(`dismissed`, with an explicit `dismissed_count` so nothing is silently
+hidden). Annotation types tightened to `tag`/`comment` (user) and `anomaly`
+(system); the `/allowlist` endpoints are gone.

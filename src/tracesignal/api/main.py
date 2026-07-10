@@ -21,6 +21,7 @@ from tracesignal.api.routers import (
     baselines,
     cases,
     converters,
+    dispositions,
     enrichers,
     events,
     jobs,
@@ -449,6 +450,7 @@ def create_app() -> FastAPI:
     app.include_router(enrichers.router)
     app.include_router(cases.router)
     app.include_router(baselines.router)
+    app.include_router(dispositions.router)
     app.include_router(events.router)
     app.include_router(viz.router)
     app.include_router(jobs.router)

@@ -210,10 +210,13 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         # A real pre-Alembic database has only the revision-0001 tables —
         # drop everything later revisions add, or the upgrade would collide.
         await conn.execute(text("DROP TABLE baseline_definitions"))
-        await conn.execute(text("DROP TABLE detector_allowlist"))
+        await conn.execute(text("DROP TABLE finding_dispositions"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
-        # Simulate a database from before two of the hand-rolled ALTERs.
-        await conn.execute(text("ALTER TABLE annotations DROP COLUMN pinned"))
+        # 0001-era annotations still carried `pinned` (retired by 0004).
+        await conn.execute(
+            text("ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false")
+        )
+        # Simulate a database from before one of the hand-rolled ALTERs.
         await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
     await s.init_schema()
     async with s.engine.begin() as conn:
@@ -224,9 +227,13 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         user_cols = await conn.run_sync(
             lambda c: {col["name"] for col in inspect(c).get_columns("users")}
         )
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
     assert version is not None
-    assert "pinned" in ann_cols
+    # 0004 retires pinned and detector_allowlist, adds finding_dispositions.
+    assert "pinned" not in ann_cols
     assert "onboarding_completed" in user_cols
+    assert "finding_dispositions" in tables
+    assert "detector_allowlist" not in tables
     await s.engine.dispose()
 
 
@@ -272,14 +279,21 @@ async def test_baseline_definition_crud_and_timeline_scoping(store):
 
 
 @pytest.mark.asyncio
-async def test_allowlist_dedupe_and_detector_filter(store):
+async def test_disposition_dedupe_and_detector_filter(store):
     await store.create_case("c1", "Case One")
-    e1 = await store.create_allowlist_entry("c1", "t1", "value_novelty", "attr:user", "svc")
-    e2 = await store.create_allowlist_entry("c1", "t1", "value_novelty", "attr:user", "svc")
+    e1 = await store.create_disposition(
+        "c1", kind="normal", detector="value_novelty", timeline_id="t1", field="attr:user", value="svc"
+    )
+    e2 = await store.create_disposition(
+        "c1", kind="normal", detector="value_novelty", timeline_id="t1", field="attr:user", value="svc"
+    )
     assert e1.id == e2.id
-    await store.create_allowlist_entry("c1", "t1", "frequency", "artifact", "cron")
-    assert len(await store.list_allowlist_entries("c1", "t1")) == 2
-    assert len(await store.list_allowlist_entries("c1", "t1", detector="frequency")) == 1
+    await store.create_disposition(
+        "c1", kind="normal", detector="frequency", timeline_id="t1", field="artifact", value="cron"
+    )
+    assert len(await store.list_dispositions("c1", timeline_id="t1")) == 2
+    # detector filter matches the concrete detector plus "*" wildcard rows.
+    assert len(await store.list_dispositions("c1", timeline_id="t1", detector="frequency")) == 1
 
 
 @pytest.mark.asyncio
@@ -297,16 +311,25 @@ async def test_timeline_and_case_delete_cascade_baseline_rows(store):
         baseline_end=datetime(2026, 1, 2, tzinfo=UTC),
         suspect_windows=[],
     )
-    await store.create_allowlist_entry("c1", tl.id, "value_novelty", "artifact", "x")
+    await store.create_disposition(
+        "c1", kind="normal", detector="value_novelty", timeline_id=tl.id, field="artifact", value="x"
+    )
     assert await store.delete_timeline("c1", tl.id) is True
     assert await store.list_baseline_definitions("c1", tl.id) == []
-    assert await store.list_allowlist_entries("c1", tl.id) == []
+    assert await store.list_dispositions("c1", timeline_id=tl.id) == []
 
     # Case delete cascades rows on the default timeline too.
     default_tl = (await store.list_timelines("c1"))[0]
-    await store.create_allowlist_entry("c1", default_tl.id, "value_novelty", "artifact", "y")
+    await store.create_disposition(
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id=default_tl.id,
+        field="artifact",
+        value="y",
+    )
     assert await store.delete_case("c1") is True
-    assert await store.list_allowlist_entries("c1", default_tl.id) == []
+    assert await store.list_dispositions("c1", timeline_id=default_tl.id) == []
 
 
 # ---------------------------------------------------------------------------

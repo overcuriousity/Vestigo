@@ -402,8 +402,12 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.run_sync(Base.metadata.create_all)
         # A real pre-Alembic database has only the revision-0001 tables.
         await conn.execute(text("DROP TABLE baseline_definitions"))
-        await conn.execute(text("DROP TABLE detector_allowlist"))
+        await conn.execute(text("DROP TABLE finding_dispositions"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
+        # 0001-era annotations still carried `pinned` (retired by 0004).
+        await conn.execute(
+            text("ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false")
+        )
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(

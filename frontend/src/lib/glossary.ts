@@ -19,7 +19,7 @@ export const GLOSSARY = {
   temporal:
     "The detector learns 'normal' from a baseline window, then flags deviations in each suspect window scored against it. Suspect windows need not be adjacent to the baseline.",
   normalValues:
-    "An allowlist of field values you've confirmed as expected. Matching events are suppressed from findings so real anomalies stand out.",
+    "Your verdicts on findings. Normal = expected behavior, extends the baseline and suppresses detection. Dismissed = noise, hidden from view only. Confirmed = escalated, survives re-scans.",
 } as const;
 
 export type GlossaryKey = keyof typeof GLOSSARY;
