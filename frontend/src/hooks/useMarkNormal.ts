@@ -33,7 +33,17 @@ function filterFindings(data: AnomaliesResponse, t: MarkNormalTarget): Anomalies
     }
     return !(t.eventId && f.event_id === t.eventId);
   };
-  return { ...data, results: data.results.filter(keep) };
+  const results = data.results.filter(keep);
+  const dropped = data.results.length - results.length;
+  return {
+    ...data,
+    results,
+    // Keep the "N of M findings" bar consistent with the removal.
+    total_findings:
+      data.total_findings !== undefined
+        ? Math.max(0, data.total_findings - dropped)
+        : undefined,
+  };
 }
 
 /**

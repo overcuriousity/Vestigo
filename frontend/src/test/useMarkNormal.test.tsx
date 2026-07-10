@@ -50,6 +50,7 @@ function response(field: string, value: string): AnomaliesResponse {
         details: { allowlist_field: field, allowlist_value: "other" },
       },
     ],
+    total_findings: 10,
   } as unknown as AnomaliesResponse;
 }
 
@@ -78,6 +79,8 @@ describe("useMarkNormal optimistic filtering", () => {
       await waitFor(() => {
         const data = qc.getQueryData<AnomaliesResponse>(VIEW_KEYS[detector]);
         expect(data?.results.map((f) => f.event_id)).toEqual(["ev2"]);
+        // The "N of M findings" bar must track the removal.
+        expect(data?.total_findings).toBe(9);
       });
     },
   );
