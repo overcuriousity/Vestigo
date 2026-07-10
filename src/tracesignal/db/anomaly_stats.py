@@ -4196,7 +4196,6 @@ class StatisticalAnomalyService:
         """
         self.ch.init_schema()
         db = self.ch.database
-        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "sequential"
 
         total_events = self._count_events(case_id, source_ids)
@@ -4208,71 +4207,53 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
-        # Inner subquery: per source, lag the timestamp over record order and
-        # compute the backwards skew (0 when in order). `dateDiff('millisecond')`
-        # / 1000 keeps sub-second precision that dateDiff('second') would lose.
-        inner = f"""
+        # One window scan per source, never one case-wide PARTITION BY scan:
+        # ClickHouse (verified on 26.6) cannot spill the sort feeding a window
+        # function to disk — MergeSortingTransform runs into max_memory_usage
+        # regardless of max_bytes_before_external_sort — so sorting a 300M-row
+        # case in one query OOMs (code 241). A per-source scan bounds the sort
+        # to one source, and only slim fixed-width columns travel through it;
+        # `message` is hydrated afterwards for just the reported rows.
+        # `select_cols` ends with a trailing comma when non-empty.
+        def _source_inner(select_cols: str) -> str:
+            return f"""
             SELECT
-                source_id,
-                toString(event_id) AS event_id,
-                timestamp,
+                {select_cols}
                 -- toNullable: on the non-Nullable timestamp column lagInFrame
-                -- returns the type default (1970-01-01), not NULL, for each
+                -- returns the type default (1970-01-01), not NULL, for the
                 -- source's first row — which would make the IS NOT NULL
                 -- first-row guard below always-true.
                 lagInFrame(toNullable(timestamp)) OVER w AS prev_ts,
-                byte_offset,
-                line_number,
-                message,
                 if(prev_ts IS NOT NULL AND timestamp < prev_ts,
                    dateDiff('millisecond', timestamp, prev_ts) / 1000.0, 0.) AS skew
             FROM {db}.events
             WHERE case_id = {{cid:String}}
-              AND has({{src:Array(String)}}, source_id)
+              AND source_id = {{sid:String}}
               AND {TS_NOT_SENTINEL_SQL}
             WINDOW w AS (
-                PARTITION BY source_id
                 ORDER BY byte_offset, line_number, event_id
                 ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
             )
         """
 
         # Per-source summary: violation count + worst skew, for the UI's
-        # per-source grouping header and the overall status. Deliberately NOT
-        # built over `inner`: the window sort buffers whole partitions, and
-        # hauling `message`/`toString(event_id)` through a 100M+-row sort is
-        # what blew the memory cap on the 300M-row case — the summary needs
-        # only (source_id, skew), so scan only those.
-        summary_inner = f"""
-            SELECT
-                source_id,
-                lagInFrame(toNullable(timestamp)) OVER w AS prev_ts,
-                if(prev_ts IS NOT NULL AND timestamp < prev_ts,
-                   dateDiff('millisecond', timestamp, prev_ts) / 1000.0, 0.) AS skew
-            FROM {db}.events
-            WHERE case_id = {{cid:String}}
-              AND has({{src:Array(String)}}, source_id)
-              AND {TS_NOT_SENTINEL_SQL}
-            WINDOW w AS (
-                PARTITION BY source_id
-                ORDER BY byte_offset, line_number, event_id
-                ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
-            )
-        """
-        summary_params = {**base_params, "skew": float(min_skew_seconds)}
-        summary_sql = f"""
-            SELECT
-                source_id,
-                countIf(skew >= {{skew:Float64}}) AS n_viol,
-                maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
-            FROM ({summary_inner})
-            GROUP BY source_id
-            {HEAVY_SCAN_SETTINGS}
-        """
-        summary_rows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
-        source_summary: dict[str, tuple[int, float]] = {
-            str(r[0]): (int(r[1]), float(r[2]) if r[2] is not None else 0.0) for r in summary_rows
-        }
+        # per-source grouping header and the overall status.
+        source_summary: dict[str, tuple[int, float]] = {}
+        for sid in source_ids:
+            summary_params = {"cid": case_id, "sid": sid, "skew": float(min_skew_seconds)}
+            summary_sql = f"""
+                SELECT
+                    countIf(skew >= {{skew:Float64}}) AS n_viol,
+                    maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
+                FROM ({_source_inner("")})
+                {HEAVY_SCAN_SETTINGS}
+            """
+            srows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
+            if srows and int(srows[0][0]) > 0:
+                source_summary[sid] = (
+                    int(srows[0][0]),
+                    float(srows[0][1]) if srows[0][1] is not None else 0.0,
+                )
         total_violations = sum(n for n, _ in source_summary.values())
 
         if total_violations == 0:
@@ -4284,21 +4265,34 @@ class StatisticalAnomalyService:
                 results=[],
             )
 
-        # Detail: the worst violations across all sources.
-        detail_params = {**base_params, "skew": float(min_skew_seconds), "lim": limit}
-        detail_sql = f"""
-            SELECT source_id, event_id, timestamp, prev_ts, skew, byte_offset, line_number, message
-            FROM ({inner})
-            WHERE skew >= {{skew:Float64}}
-            ORDER BY skew DESC, source_id, byte_offset
-            LIMIT {{lim:UInt32}}
-            {HEAVY_SCAN_SETTINGS}
-        """
-        rows = self.ch.client.query(detail_sql, parameters=detail_params).result_rows
+        # Detail: each violating source's worst rows (slim columns; no
+        # `message` through the sort), top-`limit` per source so the merged
+        # global top-`limit` is always covered.
+        rows: list[tuple] = []
+        for sid in source_summary:
+            detail_params = {
+                "cid": case_id,
+                "sid": sid,
+                "skew": float(min_skew_seconds),
+                "lim": limit,
+            }
+            detail_sql = f"""
+                SELECT event_id, timestamp, prev_ts, skew, byte_offset, line_number
+                FROM ({_source_inner("toString(event_id) AS event_id, timestamp, byte_offset, line_number,")})
+                WHERE skew >= {{skew:Float64}}
+                ORDER BY skew DESC, byte_offset
+                LIMIT {{lim:UInt32}}
+                {HEAVY_SCAN_SETTINGS}
+            """
+            for r in self.ch.client.query(detail_sql, parameters=detail_params).result_rows:
+                rows.append((sid, *r))
+        # Same global ranking the old single query produced.
+        rows.sort(key=lambda r: (-float(r[4]), str(r[0]), int(r[5])))
 
         findings: list[OrderFinding] = []
         for row in rows:
-            source_id, event_id, ts, prev_ts, skew, byte_offset, line_number, msg = row
+            source_id, event_id, ts, prev_ts, skew, byte_offset, line_number = row
+            msg = ""
             if not event_id:
                 continue
             # Shift the reported pair by this source's offset (skew is left
@@ -4370,12 +4364,29 @@ class StatisticalAnomalyService:
             findings = [
                 f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
+        results = findings[:limit]
+
+        # Hydrate `message` for just the reported rows — the slim scans above
+        # deliberately keep it out of the window sort.
+        if results:
+            hydrated = self.ch.get_events_by_ids(
+                case_id,
+                sorted({f.source_id for f in results}),
+                [f.event_id for f in results],
+            )
+            for f in results:
+                ev = hydrated.get(f.event_id)
+                if ev is not None and f.event is not None:
+                    f.event["message"] = ev.get("message", "")
 
         return StatAnomalyResult(
             status="ok",
             detector="timestamp_order",
             method=method,
             baseline_size=total_events,
-            results=findings[:limit],
-            total_findings=len(findings),
+            results=results,
+            # The true violation count across all sources (from the per-source
+            # summaries) — not the size of the fetched page, which is capped
+            # at `limit` and would make server-side truncation invisible.
+            total_findings=total_violations,
         )

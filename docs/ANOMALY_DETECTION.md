@@ -44,14 +44,18 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
 - **`_HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
   `max_bytes_before_external_group_by = 4 GB`,
   `max_bytes_before_external_sort = 4 GB`, `max_memory_usage = 12 GB`):
-  large GROUP BY states *and* large sorts spill to disk (window functions —
-  the timestamp-order / sequence-novelty `lagInFrame` scans — sort whole
-  partitions, which OOMed the 300M-row case before the sort spill), a runaway
+  large GROUP BY states and plain ORDER BY sorts spill to disk, a runaway
   query fails alone instead of taking the server with it, and concurrent
   panel scans can't oversubscribe the box. Any new detector query that
-  touches the whole corpus must carry it — and a window-function scan should
-  also select only the columns it needs (see the timestamp-order summary
-  scan: dragging `message` through the partition sort is what hurts).
+  touches the whole corpus must carry it.
+- **Window-function sorts cannot spill** (verified empirically on ClickHouse
+  26.6: the `MergeSortingTransform` feeding a window function runs into
+  `max_memory_usage` regardless of `max_bytes_before_external_sort`, code
+  241). Consequences for any `lagInFrame`-style scan: bound the sort — the
+  timestamp-order detector scans **per source** (one query per source, no
+  case-wide `PARTITION BY source_id`) — and keep the sorted rows slim
+  (fixed-width columns only; `message` is hydrated afterwards for just the
+  reported rows). The 300M-row case OOMed on both counts before this.
 - **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is
   a non-Nullable sort-key column; events without a parseable timestamp carry
   `2299-12-31 23:59:59.999 UTC` (`db/_dt.py NULL_TS_SENTINEL`) and are

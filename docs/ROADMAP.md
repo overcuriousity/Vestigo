@@ -209,6 +209,13 @@ per-event `normal` annotation, and the `pinned` flag. Remaining polish:
   per-event-normal grid indicator was removed with the annotation; an
   indicator driven by event-scoped disposition rows could return if analysts
   miss it.
+- [ ] **X4 — sequence_novelty window-sort memory on huge windows.** ClickHouse
+  can't spill window-function sorts (see `ANOMALY_DETECTION.md` query-cost
+  discipline; what OOMed timestamp-order on the 300M case). The sequence
+  detector's `lagInFrame` chain sorts all in-window rows in one query — fine
+  for bounded suspect/baseline windows, OOM risk when a baseline spans most
+  of a 100M+-row case. Restructure per (source, window) like timestamp-order
+  if it bites.
 
 ## Explicitly out of scope (decided during the audit)
 

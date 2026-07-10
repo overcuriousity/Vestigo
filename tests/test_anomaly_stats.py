@@ -1432,16 +1432,19 @@ def test_order_no_data():
     assert result.results == []
 
 
+# Query order (per-source scans): count, then one summary per source, then
+# one detail per violating source; messages hydrated via get_events_by_ids.
+_ORD_SUMMARY_COLS = ["n_viol", "max_skew"]
+_ORD_DETAIL_COLS = ["event_id", "timestamp", "prev_ts", "skew", "byte_offset", "line_number"]
+
+
 def test_order_no_violations():
     """Total events > 0 but zero backwards jumps → ok with empty results."""
     svc = _svc(
         [
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-            # summary: one source, zero violations
-            FakeQueryResult(
-                result_rows=[("s1", 0, None)],
-                column_names=["source_id", "n_viol", "max_skew"],
-            ),
+            # per-source summary: zero violations
+            FakeQueryResult(result_rows=[(0, None)], column_names=_ORD_SUMMARY_COLS),
         ]
     )
     result = svc.find_order_violations("c1", ["s1"])
@@ -1459,31 +1462,21 @@ def test_order_flags_backwards_jump_ranked_by_skew():
     svc = _svc(
         [
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-            FakeQueryResult(
-                result_rows=[("s1", 2, 60.0)],
-                column_names=["source_id", "n_viol", "max_skew"],
-            ),
+            FakeQueryResult(result_rows=[(2, 60.0)], column_names=_ORD_SUMMARY_COLS),
             FakeQueryResult(
                 result_rows=[
-                    ("s1", "evt-a", ts_a, prev_a, 60.0, 100, 3, "record a"),
-                    ("s1", "evt-b", ts_b, prev_b, 5.0, 250, 8, "record b"),
+                    ("evt-a", ts_a, prev_a, 60.0, 100, 3),
+                    ("evt-b", ts_b, prev_b, 5.0, 250, 8),
                 ],
-                column_names=[
-                    "source_id",
-                    "event_id",
-                    "timestamp",
-                    "prev_ts",
-                    "skew",
-                    "byte_offset",
-                    "line_number",
-                    "message",
-                ],
+                column_names=_ORD_DETAIL_COLS,
             ),
         ]
     )
+    svc.ch.events_by_id = {"evt-a": {"message": "record a"}}
     result = svc.find_order_violations("c1", ["s1"], min_skew_seconds=1.0)
     assert result.status == "ok"
     assert [f.event_id for f in result.results] == ["evt-a", "evt-b"]
+    assert result.total_findings == 2
     worst = result.results[0]
     assert worst.skew_seconds == 60.0
     assert worst.score == 60.0
@@ -1494,6 +1487,9 @@ def test_order_flags_backwards_jump_ranked_by_skew():
     assert worst.details["source_max_skew"] == 60.0
     assert worst.details["min_skew_seconds"] == 1.0
     assert worst.event["byte_offset"] == 100
+    # message comes from the post-scan hydration, one batched fetch.
+    assert worst.event["message"] == "record a"
+    assert svc.ch.hydration_calls == [["evt-a", "evt-b"]]
 
 
 def test_order_min_skew_bound_as_param():
@@ -1501,33 +1497,19 @@ def test_order_min_skew_bound_as_param():
     client = RecordingClient(
         [
             FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
-            FakeQueryResult(
-                result_rows=[("s1", 1, 3.0)],
-                column_names=["source_id", "n_viol", "max_skew"],
-            ),
+            FakeQueryResult(result_rows=[(1, 3.0)], column_names=_ORD_SUMMARY_COLS),
             FakeQueryResult(
                 result_rows=[
                     (
-                        "s1",
                         "evt-a",
                         datetime(2024, 1, 1, tzinfo=UTC),
                         datetime(2024, 1, 1, 0, 0, 3, tzinfo=UTC),
                         3.0,
                         10,
                         1,
-                        "m",
                     )
                 ],
-                column_names=[
-                    "source_id",
-                    "event_id",
-                    "timestamp",
-                    "prev_ts",
-                    "skew",
-                    "byte_offset",
-                    "line_number",
-                    "message",
-                ],
+                column_names=_ORD_DETAIL_COLS,
             ),
         ]
     )
@@ -1535,21 +1517,21 @@ def test_order_min_skew_bound_as_param():
     svc.ch = FakeClickHouseStore(client)
     svc.find_order_violations("c1", ["s1"], min_skew_seconds=2.5)
     params = svc.ch.client._all_parameters
-    # params[0] = count(); [1] = summary; [2] = detail
+    # params[0] = count(); [1] = summary(s1); [2] = detail(s1)
     assert params[1]["skew"] == 2.5
     assert params[2]["skew"] == 2.5
-    # The summary scan needs only (source_id, skew) — hauling `message` /
-    # `toString(event_id)` through the whole-partition window sort blew the
-    # ClickHouse memory cap on a 300M-row case. The wide columns belong to
-    # the detail query only.
     summary_sql, detail_sql = svc.ch.client.full_queries[1], svc.ch.client.full_queries[2]
-    assert "message" not in summary_sql
+    # ClickHouse can't spill a window-function sort to disk, so the scans are
+    # per source (bounded sort) and never drag `message` through it — that
+    # combination is what blew the memory cap on a 300M-row case.
+    for sql in (summary_sql, detail_sql):
+        assert "message" not in sql
+        assert "source_id = {sid:String}" in sql
+        assert "PARTITION BY" not in sql
+        # The shared guardrails spill sorts too, not just GROUP BYs.
+        assert "max_bytes_before_external_sort" in sql
     assert "toString(event_id)" not in summary_sql
-    assert "message" in detail_sql
-    # The shared guardrails must spill sorts, not just GROUP BYs — window
-    # functions sort whole partitions.
-    assert "max_bytes_before_external_sort" in summary_sql
-    assert "max_bytes_before_external_sort" in detail_sql
+    assert "toString(event_id) AS event_id" in detail_sql
 
 
 def test_order_excludes_normal_marked_events():
@@ -1557,43 +1539,27 @@ def test_order_excludes_normal_marked_events():
     svc = _svc(
         [
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-            FakeQueryResult(
-                result_rows=[("s1", 2, 60.0)],
-                column_names=["source_id", "n_viol", "max_skew"],
-            ),
+            FakeQueryResult(result_rows=[(2, 60.0)], column_names=_ORD_SUMMARY_COLS),
             FakeQueryResult(
                 result_rows=[
                     (
-                        "s1",
                         "evt-a",
                         datetime(2024, 1, 1, 12, 0, 5, tzinfo=UTC),
                         datetime(2024, 1, 1, 12, 1, 5, tzinfo=UTC),
                         60.0,
                         100,
                         3,
-                        "a",
                     ),
                     (
-                        "s1",
                         "evt-b",
                         datetime(2024, 1, 1, 12, 0, 30, tzinfo=UTC),
                         datetime(2024, 1, 1, 12, 0, 35, tzinfo=UTC),
                         5.0,
                         250,
                         8,
-                        "b",
                     ),
                 ],
-                column_names=[
-                    "source_id",
-                    "event_id",
-                    "timestamp",
-                    "prev_ts",
-                    "skew",
-                    "byte_offset",
-                    "line_number",
-                    "message",
-                ],
+                column_names=_ORD_DETAIL_COLS,
             ),
         ]
     )
@@ -3203,22 +3169,10 @@ def test_order_violations_offset_shifts_reported_timestamps_only():
     svc = _svc(
         [
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(1, 60.0)], column_names=_ORD_SUMMARY_COLS),
             FakeQueryResult(
-                result_rows=[("s1", 1, 60.0)],
-                column_names=["source_id", "n_viol", "max_skew"],
-            ),
-            FakeQueryResult(
-                result_rows=[("s1", "evt-a", ts, prev, 60.0, 100, 3, "record a")],
-                column_names=[
-                    "source_id",
-                    "event_id",
-                    "timestamp",
-                    "prev_ts",
-                    "skew",
-                    "byte_offset",
-                    "line_number",
-                    "message",
-                ],
+                result_rows=[("evt-a", ts, prev, 60.0, 100, 3)],
+                column_names=_ORD_DETAIL_COLS,
             ),
         ]
     )
