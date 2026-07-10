@@ -58,7 +58,7 @@ _dispositions = sa.table(
     sa.column("note", sa.String),
     sa.column("details", sa.JSON),
     sa.column("created_by", sa.String),
-    sa.column("created_at", sa.DateTime),
+    sa.column("created_at", sa.DateTime(timezone=True)),
 )
 
 
@@ -100,7 +100,7 @@ def upgrade() -> None:
         sa.column("value", sa.String),
         sa.column("note", sa.String),
         sa.column("created_by", sa.String),
-        sa.column("created_at", sa.DateTime),
+        sa.column("created_at", sa.DateTime(timezone=True)),
     )
     allowlist_values = [
         {
@@ -133,7 +133,7 @@ def upgrade() -> None:
         sa.column("detector", sa.String),
         sa.column("pinned", sa.Boolean),
         sa.column("created_by", sa.String),
-        sa.column("created_at", sa.DateTime),
+        sa.column("created_at", sa.DateTime(timezone=True)),
     )
 
     # 2. Per-event "normal" annotations -> event-scoped kind="normal",
@@ -227,7 +227,7 @@ def downgrade() -> None:
         sa.column("value", sa.String),
         sa.column("note", sa.String),
         sa.column("created_by", sa.String),
-        sa.column("created_at", sa.DateTime),
+        sa.column("created_at", sa.DateTime(timezone=True)),
     )
     annotations = sa.table(
         "annotations",
@@ -239,7 +239,7 @@ def downgrade() -> None:
         sa.column("content", sa.String),
         sa.column("origin", sa.String),
         sa.column("created_by", sa.String),
-        sa.column("created_at", sa.DateTime),
+        sa.column("created_at", sa.DateTime(timezone=True)),
         sa.column("pinned", sa.Boolean),
         sa.column("detector", sa.String),
     )
