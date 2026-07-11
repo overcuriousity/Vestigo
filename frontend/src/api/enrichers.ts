@@ -57,15 +57,20 @@ export const enrichersApi = {
   ) =>
     put(`/cases/${caseId}/timelines/${timelineId}/enrichers/${key}`, body),
 
-  run: (caseId: string, timelineId: string, key: string) =>
+  run: (caseId: string, timelineId: string, key: string, force = false) =>
     post<{
       // null when every ready source is already enriched at the current config
-      // (status "skipped") — no job is started.
+      // (status "skipped") — no job is started. `force` bypasses that skip and
+      // re-enriches every ready source (idempotent; recovery path when
+      // provenance disagrees with the actual event data).
       job_id: string | null;
       status: string;
       source_ids: string[];
       skipped_source_ids: string[];
-    }>(`/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/run`, {}),
+    }>(
+      `/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/run${force ? "?force=true" : ""}`,
+      {},
+    ),
 
   adminConfigs: () =>
     get<{ enrichers: AdminEnricherConfig[] }>("/admin/enrichers/config").then(

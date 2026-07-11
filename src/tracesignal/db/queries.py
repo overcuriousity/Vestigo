@@ -349,11 +349,21 @@ def _field_column_expr(
 class _ParameterizedQueryBuilder:
     """Build a ClickHouse WHERE clause using named parameters."""
 
-    def __init__(self, field_mappings: dict[str, list[str]] | None = None) -> None:
+    def __init__(
+        self,
+        field_mappings: dict[str, list[str]] | None = None,
+        *,
+        search_blob_ready: bool = False,
+    ) -> None:
         self.conditions: list[str] = []
         self.parameters: dict[str, Any] = {}
         self._counter = 0
         self._field_mappings = field_mappings
+        # M22: when the search_blob column + index are materialized
+        # (ClickHouseStore.search_blob_ready), broad text search prepends an
+        # index-prunable blob pre-filter. Default False keeps generated SQL
+        # byte-identical to the pre-blob form.
+        self._search_blob_ready = search_blob_ready
 
     def _param_name(self) -> str:
         name = f"p{self._counter}"
@@ -520,6 +530,18 @@ class _ParameterizedQueryBuilder:
         """OR-match *value* as a substring across every field an analyst would
         expect a free-text search to cover: the fixed text columns, parser
         tags, and every value in the ``attributes`` Map — not just ``message``.
+
+        Fast path (M22, when ``search_blob_ready``): the same OR-chain is
+        ANDed behind ``search_blob LIKE lowerUTF8(pattern)`` — an
+        index-prunable pre-filter over the materialized lowercased concat of
+        exactly these fields. The blob match is a *superset* of any per-field
+        ILIKE match (each field is contiguous in the blob; lowerUTF8 on both
+        sides mirrors ILIKE's case folding), so results are identical — the
+        ngrambf_v1 skip index just skips granules that can't match, and the
+        unchanged OR-chain stays the source of truth on those that might.
+        Both predicates share one bound parameter: ``lowerUTF8`` never
+        touches ``%``/``_``/``\\``, so the LIKE-escaped value survives
+        folding intact.
         """
         name = self._param_name()
         self.parameters[name] = f"%{_escape_like(value)}%"
@@ -534,7 +556,13 @@ class _ParameterizedQueryBuilder:
         clauses = [f"{c} ILIKE {{{name}:String}}" for c in columns]
         clauses.append(f"arrayExists(v -> v ILIKE {{{name}:String}}, tags)")
         clauses.append(f"arrayExists(v -> v ILIKE {{{name}:String}}, mapValues(attributes))")
-        self.conditions.append("(" + " OR ".join(clauses) + ")")
+        or_chain = "(" + " OR ".join(clauses) + ")"
+        if self._search_blob_ready:
+            self.conditions.append(
+                f"(search_blob LIKE lowerUTF8({{{name}:String}}) AND {or_chain})"
+            )
+        else:
+            self.conditions.append(or_chain)
 
     def add_broad_text_regex(self, value: str) -> None:
         """OR-match *value* as an RE2 regex across the same fields as
@@ -685,7 +713,10 @@ class EventQueryService:
         Both are consumed by :py:meth:`query` (paginated) and
         :py:meth:`iter_events` (streaming export).
         """
-        builder = _ParameterizedQueryBuilder(field_mappings=query.field_mappings)
+        builder = _ParameterizedQueryBuilder(
+            field_mappings=query.field_mappings,
+            search_blob_ready=self.store.search_blob_ready() if query.q else False,
+        )
         builder.add_param("case_id = :name", query.case_id)
 
         # Per-source clock-skew correction (W2). Bind the source→offset arrays
@@ -706,10 +737,11 @@ class EventQueryService:
             if query.q_regex:
                 builder.add_broad_text_regex(query.q)
             else:
-                # ClickHouse tokenbf_v1 index supports hasToken and multiSearchAny.
-                # We use ILIKE for substring search as a simple baseline, broadened
-                # across every field (not just message) so the analyst's free-text
-                # search box behaves like a real "search everything" field.
+                # Case-insensitive substring across every field (not just
+                # message) so the free-text box behaves like a real "search
+                # everything" field. Once the search_blob column is
+                # materialized (M22), the builder prepends an ngrambf-prunable
+                # blob pre-filter with identical result semantics.
                 builder.add_broad_text_search(query.q)
 
         # `artifact` (singular) and `artifacts` (plural) are two independent

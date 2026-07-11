@@ -1602,10 +1602,18 @@ async def run_timeline_enricher(
     timeline_id: str,
     enricher_key: str,
     background_tasks: BackgroundTasks,
+    force: bool = False,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Manually trigger an enrichment run for a timeline's sources."""
+    """Manually trigger an enrichment run for a timeline's sources.
+
+    ``force=true`` re-enriches every ready source, ignoring provenance rows.
+    This is the analyst-facing recovery path when provenance claims a source
+    is enriched but its events say otherwise (e.g. provenance recorded off a
+    partially-applied run by a pre-session-48c build) — the apply is
+    idempotent, so forcing is always safe, just a full re-scan.
+    """
     from tracesignal.enrichers.jobs import (
         get_active_enricher_run,
         run_enrichment_job,
@@ -1638,9 +1646,11 @@ async def run_timeline_enricher(
     # hash), so an admin swapping the .mmdb bumps the hash and forces a re-run.
     # Compute off the loop — config_extras() reads the sidecar/file from disk.
     config_hash = await asyncio.to_thread(enricher.config_hash)
-    already = await store.list_enriched_source_ids(case_id, enricher_key, config_hash)
-    skipped_source_ids = [sid for sid in source_ids if sid in already]
-    source_ids = [sid for sid in source_ids if sid not in already]
+    skipped_source_ids: list[str] = []
+    if not force:
+        already = await store.list_enriched_source_ids(case_id, enricher_key, config_hash)
+        skipped_source_ids = [sid for sid in source_ids if sid in already]
+        source_ids = [sid for sid in source_ids if sid not in already]
     if not source_ids:
         return {
             "job_id": None,
@@ -1682,6 +1692,20 @@ async def run_timeline_enricher(
         job_store=job_store,
         store=store,
         ch_store=ch_store,
+    )
+    await store.record_audit(
+        action="enricher.manual_run",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "enricher_key": enricher_key,
+            "job_id": job.id,
+            "force": force,
+            "source_ids": source_ids,
+            "skipped_source_ids": skipped_source_ids,
+        },
     )
     return {
         "job_id": job.id,

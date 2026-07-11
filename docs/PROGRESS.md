@@ -1,7 +1,61 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 49d — visualization: interactivity, four new chart types,
-scan guardrails).
+Last updated: 2026-07-12 (session 51 — enricher force re-run + search_blob upgrade
+idempotency hardening).
+
+## Session 51 — 2026-07-12: Enricher force re-run (poisoned-provenance recovery) + upgrade guard fix
+
+**Enricher force re-run (`api/routers/cases.py`, `EnrichersDialog.tsx`).** Deployments that
+hit the pre-session-48c partial-staging bug still carry poisoned `SourceEnrichment` rows:
+provenance says "enriched at current config" while most events lack derived fields, so a
+manual run reports "Every ready source is up to date" forever — the only documented recovery
+was a manual SQL DELETE. The run route now takes `?force=true`, which skips the provenance
+filter and re-enriches every ready source (apply is idempotent, so forcing is always safe —
+just a full re-scan). The UI surfaces it: after a skipped run, the row's button becomes
+"Force re-run" with an explanatory tooltip and the toast points at it. Manual runs (forced or
+not) now also write an `enricher.manual_run` audit row with the source/skip lists.
+
+**search_blob upgrade idempotency (`db/clickhouse.py`).** `_ensure_search_blob` early-returned
+on column presence alone — a crash between `ADD COLUMN` and `ADD INDEX` would strand the table
+without the skip index forever (fast path correct but permanently unpruned, silently). The
+guard now requires column *and* index (`system.data_skipping_indices`); every statement is
+`IF NOT EXISTS`, so resuming a half-done upgrade is safe. Regression tests for both fixes.
+
+## Session 50 — 2026-07-11: Perf batch A — one-pass novelty scans + indexed text search
+
+**M22 — search-blob text-search fast path (`db/clickhouse.py`, `db/queries.py`).** Broad
+free-text search (`q`) was a full ILIKE scan OR'd across 6 columns + tags + attribute
+values, issued ≥3× per interaction (page + count + histogram); the old `tokenbf_v1` index
+on `message` was dead weight (ILIKE can't use it, the OR-chain defeats pruning) and is
+dropped. New `search_blob` MATERIALIZED column: `lowerUTF8` concat of exactly the searched
+fields ('\n'-separated, ZSTD(3)), with an `ngrambf_v1(3, 65536, 4, 0)` skip index. When
+ready, `add_broad_text_search` prepends `search_blob LIKE lowerUTF8(pattern)` ANDed before
+the unchanged OR-chain — a strict superset pre-filter (each field contiguous in the blob;
+lowerUTF8 both sides mirrors ILIKE's folding), so **results are identical** with the fast
+path on or off (live test incl. `%`/`_`/`\`, `ß`, Cyrillic, `İ`; `EXPLAIN indexes=1`
+confirms pruning). Upgrade is automatic and idempotent (`_ensure_search_blob` in
+`init_schema`): ADD COLUMN/INDEX, DROP old `message_idx`, then MATERIALIZE COLUMN/INDEX
+**async** (`mutations_sync=0`) — startup never blocks on a 300M-row backfill; a
+MATERIALIZED column reads correctly from unmutated parts, so only index pruning waits.
+`ClickHouseStore.search_blob_ready()` gates the fast path (column present + no pending
+`search_blob` mutation in `system.mutations`; True cached forever, False rechecked every
+60 s). Operational note: on upgraded deployments the fast path activates once
+`system.mutations` drains; failed mutations log a warning but keep the (correct, unpruned)
+fast path on. Enrichment REPLACE PARTITION recomputes the blob from post-enrichment
+attributes (live-tested).
+
+**M23(b) — batched value-novelty scans (`db/anomaly_stats.py`).** `find_value_novelty` ran
+one full `attributes`-Map scan per field (up to 15 per panel-open; ~12 GiB / ~23 s per field
+at 300M rows). All plain-attribute fields now share a single ARRAY JOIN pass
+(`_batched_attr_novelty_rows`, modeled on `field_inventory`'s memory-safe paired
+mapKeys/mapValues pattern): `GROUP BY key, val` + `ORDER BY key, <old per-field order>` +
+`LIMIT n BY key` reproduces the per-field ordering and per-field limit exactly, so findings
+are **identical** to the old loop (live equivalence test against the retired per-field SQL
+as oracle: `tests/test_novelty_batched_clickhouse.py`). Mapped-coalesce and top-level-column
+fields keep the per-field query (coalesce can't be one ARRAY JOIN key; top-level columns
+never read the map). `_MAX_AUTO_SCAN_FIELDS` stays — it now bounds ARRAY JOIN width, not
+round-trips. Finding construction extracted to `_novelty_rows_to_findings`, shared by both
+paths.
 
 ## Session 49d — 2026-07-11: Visualize v3 — click-to-filter, brush-zoom, punch card / pivot / sankey / scatter, viz scan guardrails
 

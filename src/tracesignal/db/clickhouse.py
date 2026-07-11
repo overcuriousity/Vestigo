@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import time
 from collections.abc import Iterator
 from datetime import UTC
 from typing import Any
@@ -114,6 +115,30 @@ _EVENT_COLUMNS = [
     "embedding_config_hash",
 ]
 
+# `search_blob` (M22): lowercased concat of every column the broad free-text
+# search covers, kept in the exact field order add_broad_text_search ORs over.
+# MATERIALIZED — computed server-side on insert (never part of the Arrow
+# insert schema) and computed on the fly when read from a part written before
+# the column existed, so queries against it are always correct; only the skip
+# index's pruning waits on MATERIALIZE COLUMN/INDEX (see _ensure_search_blob).
+# The '\n' separator keeps each source field contiguous, so any within-field
+# substring match is also a blob substring (the superset property the
+# fast-path pre-filter in queries.py relies on); folding is lowerUTF8 on BOTH
+# the blob and the search pattern — the same simple-lowercase tables ILIKE
+# uses internally, which is what keeps `blob LIKE lowerUTF8(pattern)` a
+# superset of the per-field ILIKE OR-chain. ZSTD(3) offsets the text
+# duplication; the ngrambf_v1(3, 65536, 4, 0) skip index prunes granules for
+# any search literal >= 3 chars (~8 B/row; bloom false positives only cost a
+# granule read, never correctness).
+_SEARCH_BLOB_EXPR = (
+    "lowerUTF8(concatWithSeparator('\\n', "
+    "message, display_name, artifact, artifact_long, timestamp_desc, source_file, "
+    "arrayStringConcat(tags, '\\n'), "
+    "arrayStringConcat(mapValues(attributes), '\\n')))"
+)
+_SEARCH_BLOB_COLUMN_DDL = f"search_blob String MATERIALIZED {_SEARCH_BLOB_EXPR} CODEC(ZSTD(3))"
+_SEARCH_BLOB_INDEX_DDL = "search_blob_idx search_blob TYPE ngrambf_v1(3, 65536, 4, 0) GRANULARITY 1"
+
 # `timestamp` is deliberately non-Nullable: it sits in the MergeTree sort key,
 # and a Nullable sort-key column (via allow_nullable_key) disables ClickHouse's
 # read-in-order optimization — turning every ORDER BY timestamp LIMIT N grid
@@ -145,7 +170,8 @@ CREATE TABLE IF NOT EXISTS {database}.{table} (
     attributes Map(String, String),
     embedding_model LowCardinality(String),
     embedding_config_hash FixedString(64),
-    INDEX message_idx message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
+    {search_blob_column},
+    INDEX {search_blob_index},
     INDEX content_hash_idx content_hash TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree()
@@ -245,8 +271,16 @@ class ClickHouseStore:
         if getattr(self, "_schema_ready", False):
             return
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
-        self.client.command(_EVENTS_TABLE_DDL.format(database=self.database, table="events"))
+        self.client.command(
+            _EVENTS_TABLE_DDL.format(
+                database=self.database,
+                table="events",
+                search_blob_column=_SEARCH_BLOB_COLUMN_DDL,
+                search_blob_index=_SEARCH_BLOB_INDEX_DDL,
+            )
+        )
         self._assert_not_legacy_schema()
+        self._ensure_search_blob()
         self._schema_ready = True
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
@@ -277,6 +311,102 @@ class ClickHouseStore:
                 "run the one-time timestamp-sentinel migration (docs/PROGRESS.md) "
                 "with the app stopped before starting this version."
             )
+
+    def _has_search_blob_column(self) -> bool:
+        result = self.client.query(
+            "SELECT count() FROM system.columns "
+            "WHERE database = {db:String} AND table = 'events' AND name = 'search_blob'",
+            parameters={"db": self.database},
+        )
+        return bool(result.result_rows and result.result_rows[0][0])
+
+    def _has_search_blob_index(self) -> bool:
+        result = self.client.query(
+            "SELECT count() FROM system.data_skipping_indices "
+            "WHERE database = {db:String} AND table = 'events' AND name = 'search_blob_idx'",
+            parameters={"db": self.database},
+        )
+        return bool(result.result_rows and result.result_rows[0][0])
+
+    def _ensure_search_blob(self) -> None:
+        """In-place upgrade for pre-`search_blob` deployments (M22). Idempotent.
+
+        Adds the column and skip index, drops the dead ``message_idx`` tokenbf
+        (nothing ever queried ``hasToken*``; ILIKE and ``match()`` can't use
+        it), then kicks off ``MATERIALIZE COLUMN``/``MATERIALIZE INDEX``
+        **asynchronously** (``mutations_sync = 0``). Async is safe: a
+        MATERIALIZED column read from a not-yet-mutated part is computed on
+        the fly, so queries are always correct — only the fast path's index
+        pruning waits, gated by :meth:`search_blob_ready`. Synchronous
+        materialization would block startup for hours on a 300M-row table.
+
+        Both column and index presence are checked (not just the column): a
+        crash between the ``ADD COLUMN`` and ``ADD INDEX`` statements below
+        would otherwise leave the index permanently missing on the next
+        startup, since a column-only guard would short-circuit here forever.
+        Every statement is itself ``IF NOT EXISTS``, so re-running against a
+        partially-upgraded table is safe.
+        """
+        if self._has_search_blob_column() and self._has_search_blob_index():
+            return
+        table = f"{self.database}.events"
+        self.client.command(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {_SEARCH_BLOB_COLUMN_DDL}"
+        )
+        self.client.command(f"ALTER TABLE {table} ADD INDEX IF NOT EXISTS {_SEARCH_BLOB_INDEX_DDL}")
+        self.client.command(f"ALTER TABLE {table} DROP INDEX IF EXISTS message_idx")
+        self.client.command(
+            f"ALTER TABLE {table} MATERIALIZE COLUMN search_blob SETTINGS mutations_sync = 0"
+        )
+        self.client.command(
+            f"ALTER TABLE {table} MATERIALIZE INDEX search_blob_idx SETTINGS mutations_sync = 0"
+        )
+        logger.info(
+            "search_blob column/index added; background materialization started "
+            "(text-search fast path activates when system.mutations drains)"
+        )
+
+    # Re-check cadence for search_blob_ready while materialization is pending.
+    _SEARCH_BLOB_RECHECK_SECONDS = 60.0
+
+    def search_blob_ready(self) -> bool:
+        """True once the search-blob fast path may be used for text search.
+
+        Ready ⇔ the column exists and no unfinished ``search_blob`` mutation
+        (MATERIALIZE COLUMN/INDEX) is pending. Readiness is monotonic — parts
+        never de-materialize — so a ``True`` is cached for the instance
+        lifetime; while ``False``, ClickHouse is re-asked at most every
+        :data:`_SEARCH_BLOB_RECHECK_SECONDS`. A failed/killed mutation counts
+        as ready (the fast path stays *correct* on unmaterialized parts —
+        the blob is computed on read — merely unpruned) but is logged so the
+        operator sees the index never fully built.
+        """
+        if getattr(self, "_search_blob_ready", False):
+            return True
+        now = time.monotonic()
+        checked_at = getattr(self, "_search_blob_checked_at", None)
+        if checked_at is not None and now - checked_at < self._SEARCH_BLOB_RECHECK_SECONDS:
+            return False
+        self._search_blob_checked_at = now
+        if not self._has_search_blob_column():
+            return False
+        result = self.client.query(
+            "SELECT is_done, latest_fail_reason FROM system.mutations "
+            "WHERE database = {db:String} AND table = 'events' "
+            "AND command LIKE '%search_blob%'",
+            parameters={"db": self.database},
+        )
+        for is_done, fail_reason in result.result_rows:
+            if not is_done:
+                return False
+            if fail_reason:
+                logger.warning(
+                    "search_blob materialization mutation failed (%s); fast path "
+                    "enabled but old parts stay unindexed",
+                    fail_reason,
+                )
+        self._search_blob_ready = True
+        return True
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse via the Arrow bulk path.
@@ -433,7 +563,10 @@ class ClickHouseStore:
         )
         self.client.command(f"DROP TABLE IF EXISTS {events_table}")
         # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
-        # indexes, settings) — required for REPLACE PARTITION.
+        # indexes, settings) — required for REPLACE PARTITION. The MATERIALIZED
+        # search_blob column is cloned too, and the base-column INSERT below
+        # recomputes it from the post-mapUpdate attributes — swapped-in parts
+        # land with the blob (and its index) fully materialized.
         self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
         self.client.query(
             f"""

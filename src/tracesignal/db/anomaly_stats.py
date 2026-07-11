@@ -1019,6 +1019,30 @@ def _col_expr(
     return f"attributes[{{{prefix}:String}}]"
 
 
+def _split_novelty_fields(
+    scan_fields: list[str],
+    field_mappings: dict[str, list[str]] | None,
+) -> dict[str, str]:
+    """Return ``{field_token: raw attribute key}`` for the batchable scan fields.
+
+    A token is batchable when it resolves to a plain ``attributes[key]``
+    lookup — no field mapping (coalesce over several raw keys cannot be
+    expressed as a single ARRAY JOIN key) and no top-level column (those
+    read a cheap dedicated column, not the map). Batchable fields share one
+    ARRAY JOIN pass over ``attributes`` in
+    :meth:`StatAnomalyService._batched_attr_novelty_rows`; everything else
+    keeps the per-field query.
+    """
+    attr_keys: dict[str, str] = {}
+    for token in scan_fields:
+        if resolve_mapping(token, field_mappings):
+            continue
+        column, attr_key = resolve_column_token(token)
+        if column is None and attr_key:
+            attr_keys[token] = attr_key
+    return attr_keys
+
+
 def _apply_allowlist(findings: list[Any], allowlist: set[tuple[str, str]] | None) -> list[Any]:
     """Drop findings whose (allowlist_field, allowlist_value) key is allowlisted.
 
@@ -1700,11 +1724,11 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
-            # Each field below is a separate sequential ClickHouse round-trip
-            # (no cross-field batching); cap how many an auto-selected set can
-            # trigger per call. recommend_novelty_fields already sorts
-            # recommended fields by coverage descending, so this keeps the
-            # most useful ones.
+            # Plain-attribute fields share one batched map scan below, but the
+            # cap still bounds the ARRAY JOIN expansion width / LIMIT BY output
+            # (and the residual per-field round-trips for mapped or top-level
+            # fields). recommend_novelty_fields already sorts recommended
+            # fields by coverage descending, so this keeps the most useful ones.
             scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         if total_events == 0:
@@ -1727,7 +1751,45 @@ class StatisticalAnomalyService:
 
         all_findings: list[ValueFinding] = []
 
+        # M23(b): all plain-attribute fields share ONE ARRAY JOIN pass over the
+        # attributes map — that column dominates scan cost, and the former
+        # one-query-per-field loop re-read it once per field. The batched query
+        # reproduces the per-field ordering and per-field LIMIT via
+        # ORDER BY key, ... LIMIT n BY key, so findings are identical to the
+        # old loop's. Mapped (coalesce) and top-level-column fields keep the
+        # per-field query: coalesce can't be a single ARRAY JOIN key, and
+        # top-level columns never read the map in the first place.
+        attr_key_by_token = _split_novelty_fields(scan_fields, field_mappings)
+        rows_by_key: dict[str, list[tuple[Any, ...]]] = {}
+        if attr_key_by_token:
+            rows_by_key = self._batched_attr_novelty_rows(
+                base_params,
+                sorted(set(attr_key_by_token.values())),
+                rarity_floor=rarity_floor,
+                per_field_limit=per_field_limit,
+                windows=windows,
+                source_offsets=source_offsets,
+            )
+
         for field_token in scan_fields:
+            if field_token in attr_key_by_token:
+                # Duplicate tokens naming the same key share the rows — the
+                # old loop ran the identical query twice for identical rows.
+                rows = rows_by_key.get(attr_key_by_token[field_token], [])
+                all_findings.extend(
+                    self._novelty_rows_to_findings(
+                        case_id,
+                        field_token,
+                        rows,
+                        method,
+                        total_events=total_events,
+                        windows=windows,
+                        baseline_size=baseline_size,
+                        suspect_totals=suspect_totals,
+                    )
+                )
+                continue
+
             params: dict[str, Any] = {**base_params}
             bind_offset_params(source_offsets, params)
             col = _col_expr(field_token, params, field_mappings)
@@ -1788,57 +1850,18 @@ class StatisticalAnomalyService:
                 """
 
             rows = self.ch.client.query(sql, parameters=params).result_rows
-
-            for row in rows:
-                if windows is None:
-                    val, cnt, first_seen, evt_id = row
-                    if not val:
-                        continue
-                    all_findings.append(
-                        self._novelty_finding(
-                            case_id,
-                            field_token,
-                            str(val),
-                            int(cnt),
-                            total_events,
-                            first_seen,
-                            evt_id,
-                            method,
-                        )
-                    )
-                else:
-                    val = row[0]
-                    if not val:
-                        continue
-                    # One finding per (value, suspect window with cnt > 0):
-                    # window attribution is part of the claim being made.
-                    for i, w in enumerate(windows.suspects):
-                        w_cnt = int(row[2 + i * 3])
-                        if w_cnt <= 0:
-                            continue
-                        first_seen, evt_id = row[3 + i * 3], row[4 + i * 3]
-                        finding = self._novelty_finding(
-                            case_id,
-                            field_token,
-                            str(val),
-                            w_cnt,
-                            suspect_totals[i] if i < len(suspect_totals) else 0,
-                            first_seen,
-                            evt_id,
-                            method,
-                        )
-                        finding.details.update(
-                            {
-                                "baseline_size": baseline_size,
-                                "window_label": w.label,
-                                "window_start": ensure_utc(w.start).isoformat(),
-                                "window_end": ensure_utc(w.end).isoformat(),
-                                "window_total_events": suspect_totals[i]
-                                if i < len(suspect_totals)
-                                else 0,
-                            }
-                        )
-                        all_findings.append(finding)
+            all_findings.extend(
+                self._novelty_rows_to_findings(
+                    case_id,
+                    field_token,
+                    rows,
+                    method,
+                    total_events=total_events,
+                    windows=windows,
+                    baseline_size=baseline_size,
+                    suspect_totals=suspect_totals,
+                )
+            )
 
         # Value-level allowlist first, then the legacy per-event suppression.
         all_findings = _apply_allowlist(all_findings, allowlist)
@@ -1862,6 +1885,162 @@ class StatisticalAnomalyService:
             windows=windows.payload() if windows is not None else None,
             total_findings=len(all_findings),
         )
+
+    def _batched_attr_novelty_rows(
+        self,
+        base_params: dict[str, Any],
+        attr_keys: list[str],
+        *,
+        rarity_floor: int,
+        per_field_limit: int,
+        windows: AnalysisWindows | None,
+        source_offsets: dict[str, int] | None,
+    ) -> dict[str, list[tuple[Any, ...]]]:
+        """One ARRAY JOIN pass over ``attributes`` for all plain-attribute fields.
+
+        Returns rows keyed by raw attribute key, each row in the exact shape
+        the old per-field query produced (leading ``key`` column stripped).
+        The paired mapKeys/mapValues ARRAY JOIN follows field_inventory's
+        memory-safety pattern (no per-row map re-materialization), the
+        ``has(nkeys, key)`` filter shrinks the expansion before GROUP BY, and
+        ``ORDER BY key, <old per-field order> LIMIT n BY key`` reproduces the
+        per-field ordering and per-field LIMIT exactly — a plain global LIMIT
+        would change which findings survive. ``val != ''`` matches the old
+        ``attributes[key] != ''`` predicate: ARRAY JOIN already omits absent
+        keys (map lookup ⇒ ``''``), the guard covers literally-empty stored
+        values (ingest strips those, enrichment merges may not).
+        """
+        db = self.ch.database
+        eff = effective_ts_sql(source_offsets)
+        params: dict[str, Any] = {**base_params, "nkeys": attr_keys, "lim": per_field_limit}
+        bind_offset_params(source_offsets, params)
+
+        if windows is None:
+            params["floor"] = rarity_floor
+            sql = f"""
+                SELECT
+                    key,
+                    val,
+                    count() AS cnt,
+                    min({eff}) AS first_seen,
+                    toString(argMin(event_id, {eff})) AS evt_id
+                FROM {db}.events
+                ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND has({{nkeys:Array(String)}}, key)
+                  AND val != ''
+                GROUP BY key, val
+                HAVING cnt <= {{floor:UInt32}}
+                ORDER BY key ASC, cnt ASC, first_seen ASC
+                LIMIT {{lim:UInt32}} BY key
+                {HEAVY_SCAN_SETTINGS}
+            """
+        else:
+            bp, sps = _window_preds(windows, params, source_offsets)
+            w_blocks = ",\n                    ".join(
+                f"countIf({sp}) AS w{i}_cnt,"
+                f" minIf({eff}, {sp}) AS w{i}_first,"
+                f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
+                for i, sp in enumerate(sps)
+            )
+            w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+            union_pred = " OR ".join([bp, *sps])
+            sql = f"""
+                SELECT
+                    key,
+                    val,
+                    countIf({bp}) AS baseline_cnt,
+                    {w_blocks}
+                FROM {db}.events
+                ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND has({{nkeys:Array(String)}}, key)
+                  AND val != ''
+                  AND {TS_NOT_SENTINEL_SQL}
+                  AND ({union_pred})
+                GROUP BY key, val
+                HAVING baseline_cnt = 0 AND ({w_sum}) > 0
+                ORDER BY key ASC, ({w_sum}) ASC
+                LIMIT {{lim:UInt32}} BY key
+                {HEAVY_SCAN_SETTINGS}
+            """
+
+        rows_by_key: dict[str, list[tuple[Any, ...]]] = {}
+        for row in self.ch.client.query(sql, parameters=params).result_rows:
+            rows_by_key.setdefault(str(row[0]), []).append(tuple(row[1:]))
+        return rows_by_key
+
+    def _novelty_rows_to_findings(
+        self,
+        case_id: str,
+        field_token: str,
+        rows: list[tuple[Any, ...]],
+        method: str,
+        *,
+        total_events: int,
+        windows: AnalysisWindows | None,
+        baseline_size: int,
+        suspect_totals: list[int],
+    ) -> list[ValueFinding]:
+        """Turn result rows (old per-field shape) into findings — both modes.
+
+        Shared by the batched attribute pass and the residual per-field
+        queries so the finding construction can never drift between them.
+        """
+        findings: list[ValueFinding] = []
+        for row in rows:
+            if windows is None:
+                val, cnt, first_seen, evt_id = row
+                if not val:
+                    continue
+                findings.append(
+                    self._novelty_finding(
+                        case_id,
+                        field_token,
+                        str(val),
+                        int(cnt),
+                        total_events,
+                        first_seen,
+                        evt_id,
+                        method,
+                    )
+                )
+            else:
+                val = row[0]
+                if not val:
+                    continue
+                # One finding per (value, suspect window with cnt > 0):
+                # window attribution is part of the claim being made.
+                for i, w in enumerate(windows.suspects):
+                    w_cnt = int(row[2 + i * 3])
+                    if w_cnt <= 0:
+                        continue
+                    first_seen, evt_id = row[3 + i * 3], row[4 + i * 3]
+                    finding = self._novelty_finding(
+                        case_id,
+                        field_token,
+                        str(val),
+                        w_cnt,
+                        suspect_totals[i] if i < len(suspect_totals) else 0,
+                        first_seen,
+                        evt_id,
+                        method,
+                    )
+                    finding.details.update(
+                        {
+                            "baseline_size": baseline_size,
+                            "window_label": w.label,
+                            "window_start": ensure_utc(w.start).isoformat(),
+                            "window_end": ensure_utc(w.end).isoformat(),
+                            "window_total_events": suspect_totals[i]
+                            if i < len(suspect_totals)
+                            else 0,
+                        }
+                    )
+                    findings.append(finding)
+        return findings
 
     def _novelty_finding(
         self,

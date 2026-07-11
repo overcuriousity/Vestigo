@@ -156,6 +156,13 @@ export function useDisposition(caseId: string, timelineId: string) {
       const snapshots = qc.getQueriesData<AnomaliesResponse>({ queryKey: prefix });
       for (const [key, data] of snapshots) {
         if (!data) continue;
+        // The ["anomalies", case, timeline] prefix also holds non-findings
+        // caches (the field-inventory queries keyed "fields"/"numeric-fields")
+        // whose payload has no `results` array. A detector-agnostic
+        // disposition (detector "*") skips the detector-id guard below, so
+        // without this shape check filterFindings would crash on them —
+        // killing the whole mutation before the API call.
+        if (!Array.isArray(data.results)) continue;
         // A detector-scoped disposition only suppresses that detector's
         // findings (backend matches `detector in (detector, "*")`); the
         // query key carries the detector id at index 3.

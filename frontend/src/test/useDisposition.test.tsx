@@ -206,6 +206,32 @@ describe("useDisposition optimistic filtering", () => {
     });
   });
 
+  it("wildcard verdict survives non-findings caches under the anomalies prefix", async () => {
+    // Regression: the ["anomalies", case, tl] prefix also holds the
+    // field-inventory caches ("fields"/"numeric-fields"), whose payload has
+    // no `results` array. A wildcard disposition used to crash on them
+    // (`data.results.filter` on undefined), killing the mutation before the
+    // API call ever fired.
+    const { dispositionsApi } = await import("@/api/dispositions");
+    const { qc, result } = setup();
+    qc.setQueryData(["anomalies", CASE, TL, "fields"], { fields: [{ token: "attr:host" }] });
+    qc.setQueryData(["anomalies", CASE, TL, "numeric-fields"], { fields: [] });
+    qc.setQueryData(VIEW_KEYS.value_novelty, response("host", "evil"));
+
+    result.current.mutate({ kind: "normal", detector: "*", field: "host", value: "evil" });
+
+    await waitFor(() => {
+      expect(
+        qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.value_novelty)?.results,
+      ).toHaveLength(1);
+    });
+    expect(dispositionsApi.create).toHaveBeenCalled();
+    // Inventory caches pass through untouched.
+    expect(qc.getQueryData(["anomalies", CASE, TL, "fields"])).toEqual({
+      fields: [{ token: "attr:host" }],
+    });
+  });
+
   it("removes a positional finding by event id (timestamp_order)", async () => {
     const { dispositionsApi } = await import("@/api/dispositions");
     const { qc, result } = setup();

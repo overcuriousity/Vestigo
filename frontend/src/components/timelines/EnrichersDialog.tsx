@@ -74,20 +74,33 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
     meta: { errorTitle: "Enricher config change failed" },
   });
 
+  // Enrichers whose last "Run now" was skipped (provenance says every ready
+  // source is already enriched). For those the row offers "Force re-run" —
+  // the recovery path when provenance disagrees with the actual event data
+  // (e.g. a partially-applied run recorded full provenance).
+  const [skippedKeys, setSkippedKeys] = useState<Set<string>>(new Set());
+
   const runMutation = useMutation({
-    mutationFn: (key: string) => enrichersApi.run(caseId, timeline.id, key),
-    onSuccess: (res, key) => {
+    mutationFn: (vars: { key: string; force?: boolean }) =>
+      enrichersApi.run(caseId, timeline.id, vars.key, vars.force),
+    onSuccess: (res, vars) => {
       // Skipped run: every ready source already enriched at the current config
       // (same enricher + data version), so no job started — say so instead of
-      // letting the click look like it did nothing.
+      // letting the click look like it did nothing, and unlock a force re-run.
       if (res.job_id === null) {
+        setSkippedKeys((prev) => new Set(prev).add(vars.key));
         toast.info(
-          `${key}: already enriched`,
-          "Every ready source is up to date — no job started.",
+          `${vars.key}: already enriched`,
+          "Every ready source is up to date — no job started. If events are missing derived fields anyway, use Force re-run.",
         );
         return;
       }
-      addJob(res.job_id, `${key} enrichment`, [
+      setSkippedKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(vars.key);
+        return next;
+      });
+      addJob(res.job_id, `${vars.key} enrichment`, [
         ["events", caseId, timeline.id],
         ["fields", caseId, timeline.id],
       ]);
@@ -123,8 +136,9 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
               onModeChange={(mode) =>
                 configMutation.mutate({ key: e.key, mode, enabled: e.enabled })
               }
-              onRun={() => runMutation.mutate(e.key)}
-              isRunning={runMutation.isPending && runMutation.variables === e.key}
+              onRun={(force) => runMutation.mutate({ key: e.key, force })}
+              isRunning={runMutation.isPending && runMutation.variables?.key === e.key}
+              wasSkipped={skippedKeys.has(e.key)}
             />
           ))}
         </div>
@@ -139,12 +153,14 @@ function EnricherRow({
   onModeChange,
   onRun,
   isRunning,
+  wasSkipped,
 }: {
   enricher: TimelineEnricherInfo;
   onToggle: (enabled: boolean) => void;
   onModeChange: (mode: "automatic" | "manual") => void;
-  onRun: () => void;
+  onRun: (force: boolean) => void;
   isRunning: boolean;
+  wasSkipped: boolean;
 }) {
   return (
     <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-2">
@@ -181,9 +197,14 @@ function EnricherRow({
             variant="ghost"
             size="sm"
             disabled={!enricher.enabled || !enricher.eligible || isRunning}
-            onClick={onRun}
+            title={
+              wasSkipped
+                ? "Re-enrich every ready source, ignoring the already-enriched record — use when derived fields are missing despite 'up to date'"
+                : undefined
+            }
+            onClick={() => onRun(wasSkipped)}
           >
-            {isRunning ? "Running…" : "Run now"}
+            {isRunning ? "Running…" : wasSkipped ? "Force re-run" : "Run now"}
           </Button>
         </div>
       </div>

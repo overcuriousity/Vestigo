@@ -1147,6 +1147,31 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
 
     _jobs._release_enricher_run(timeline.id, "stub-skip", res["job_id"])
 
+    # force=True bypasses matching provenance entirely — the recovery path when
+    # provenance claims "enriched" but the events disagree (e.g. provenance
+    # recorded off a partially-applied run by a pre-session-48c build).
+    await store.record_source_enrichment(
+        case_id="ck",
+        source_id="sk",
+        timeline_id=timeline.id,
+        enricher_key="stub-skip",
+        enricher_config_hash=config_hash,
+        job_id="prior-job",
+        rows_applied=3,
+    )
+    res = await run_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-skip",
+        background_tasks=BackgroundTasks(),
+        force=True,
+        case=case,
+        user=user,
+    )
+    assert res["job_id"] is not None
+    assert res["source_ids"] == ["sk"]
+    assert res["skipped_source_ids"] == []
+    _jobs._release_enricher_run(timeline.id, "stub-skip", res["job_id"])
+
 
 @pytest.mark.asyncio
 async def test_manual_run_409_and_auto_trigger_skip_when_run_active(store, monkeypatch):

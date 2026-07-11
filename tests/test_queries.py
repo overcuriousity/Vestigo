@@ -86,9 +86,15 @@ class FakeClickHouseStore:
         self.database = "tracesignal"
         self.client = FakeClickHouseClient(event_rows)
         self.schema_initialized = False
+        # M22 fast path off by default: existing SQL-shape tests pin the
+        # pre-blob search SQL byte-for-byte.
+        self._search_blob_ready = False
 
     def init_schema(self) -> None:
         self.schema_initialized = True
+
+    def search_blob_ready(self) -> bool:
+        return self._search_blob_ready
 
 
 @pytest.fixture
@@ -177,6 +183,49 @@ def test_keyword_search_unaffected_by_regex_flag_default(service: EventQueryServ
     assert "message ILIKE {p1:String}" in query
     assert "match(" not in query
     assert params.get("p1") == "%100\\%\\_done%"
+
+
+def test_text_search_fast_path_prepends_blob_prefilter() -> None:
+    """M22: with search_blob ready, the blob LIKE pre-filter wraps the OR-chain."""
+    store = FakeClickHouseStore()
+    store._search_blob_ready = True
+    service = EventQueryService(store=store)
+    service.query(EventQuery(case_id="case-1", q="login"))
+    query, params = _last_query(service)
+    assert "(search_blob LIKE lowerUTF8({p1:String}) AND (" in query
+    # The full OR-chain survives unchanged as the source of truth.
+    assert "message ILIKE {p1:String}" in query
+    assert "arrayExists(v -> v ILIKE {p1:String}, mapValues(attributes))" in query
+    # One shared bound parameter for both predicates.
+    assert params.get("p1") == "%login%"
+    assert "p2" not in params or "%login%" not in str(params.get("p2"))
+
+
+def test_text_search_fast_path_off_sql_unchanged() -> None:
+    """Fast path off: search SQL is byte-identical to the pre-blob form."""
+    store = FakeClickHouseStore()
+    service = EventQueryService(store=store)
+    service.query(EventQuery(case_id="case-1", q="login"))
+    query, _ = _last_query(service)
+    assert "search_blob" not in query
+    assert (
+        "(message ILIKE {p1:String} OR display_name ILIKE {p1:String} OR "
+        "artifact ILIKE {p1:String} OR artifact_long ILIKE {p1:String} OR "
+        "timestamp_desc ILIKE {p1:String} OR source_file ILIKE {p1:String} OR "
+        "arrayExists(v -> v ILIKE {p1:String}, tags) OR "
+        "arrayExists(v -> v ILIKE {p1:String}, mapValues(attributes)))"
+    ) in query
+
+
+def test_regex_search_never_uses_blob_fast_path() -> None:
+    """Regex search stays a full scan even when the blob is ready."""
+    store = FakeClickHouseStore()
+    store._search_blob_ready = True
+    service = EventQueryService(store=store)
+    service.query(EventQuery(case_id="case-1", q="^root$", q_regex=True))
+    query, _ = _last_query(service)
+    assert "search_blob" not in query
+    assert "match(message, {p1:String})" in query
 
 
 def test_artifact_and_tag_filters_are_parameterized(

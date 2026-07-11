@@ -61,20 +61,12 @@ resolved — this file holds only the condensed, still-open action items.
   multiprocessing. CSV intra-file parallelism (record-boundary-aware chunking) deferred,
   same treatment as pcap's.
 
-- [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
-  deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a
-  timeline has field mappings, which the 300M reference case doesn't; add the planned
-  Postgres cache (key = case + sorted sources + mappings + per-source `computed_at`) only if
-  a mapped timeline at that scale measures slow. (b) Per-field novelty scans each re-read the
-  whole `attributes` map column (~12 GiB / ~23 s per field at 300M rows); batching all
-  scanned fields into one pass over `attributes` would amortize that ~7× for a panel open.
-
-- [ ] **M22 residue — tokenbf text-search fast path.** Items (a) typed `IN` for String
-  columns, (c) single-round-trip histogram, and (d) novelty auto-field selection via the
-  field-stats cache landed 2026-07-06 (session 24). Remaining: broad text search is still
-  a full scan per query (~0.4 s/2.8M rows after cleanup) × histogram+count+page per
-  interaction — consider a `tokenbf_v1`-indexed fast path via `hasTokenCaseInsensitive`
-  when `q` is a plain token (needs index DDL on existing tables).
+- [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Remaining:
+  (a) `canonical_inventory` stays a live query — it only runs when a timeline has field
+  mappings, which the 300M reference case doesn't; add the planned Postgres cache (key =
+  case + sorted sources + mappings + per-source `computed_at`) only if a mapped timeline at
+  that scale measures slow. ((b) — batching per-field novelty scans into one `attributes`
+  pass — landed 2026-07-11, session 50.)
 
 - [ ] **M24 — Visualize scan-avoidance (deferred from session 33).** Every viz chart
   aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, the new

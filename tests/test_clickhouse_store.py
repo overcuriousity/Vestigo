@@ -169,6 +169,119 @@ class TestEventsSchema:
         assert store._schema_ready is True
 
 
+class _SearchBlobClient(_RecordingClient):
+    """Fake with controllable search_blob column/index/mutation state."""
+
+    def __init__(
+        self,
+        has_column: bool,
+        mutations: list[tuple[int, str]] | None = None,
+        has_index: bool | None = None,
+    ):
+        super().__init__()
+        self.has_column = has_column
+        # Defaults to has_column so existing column-only callers keep working.
+        self.has_index = has_column if has_index is None else has_index
+        self.mutations = mutations if mutations is not None else []
+
+    def query(self, query, parameters=None):
+        self.queries.append((query, parameters))
+        if "system.columns" in query and "search_blob" in query:
+            return _FakeResult([(1 if self.has_column else 0,)])
+        if "system.data_skipping_indices" in query:
+            return _FakeResult([(1 if self.has_index else 0,)])
+        if "system.mutations" in query:
+            return _FakeResult(self.mutations)
+        return _FakeResult([(42,)])
+
+
+class TestSearchBlob:
+    def test_ddl_contains_blob_column_and_index(self):
+        from tracesignal.db.clickhouse import _SEARCH_BLOB_COLUMN_DDL, _SEARCH_BLOB_INDEX_DDL
+
+        assert "search_blob String MATERIALIZED lowerUTF8" in _SEARCH_BLOB_COLUMN_DDL
+        assert "CODEC(ZSTD(3))" in _SEARCH_BLOB_COLUMN_DDL
+        assert "ngrambf_v1(3, 65536, 4, 0)" in _SEARCH_BLOB_INDEX_DDL
+        # The dead tokenbf message index is gone from fresh-install DDL.
+        assert "message_idx" not in _EVENTS_TABLE_DDL
+        assert "{search_blob_column}" in _EVENTS_TABLE_DDL
+        assert "{search_blob_index}" in _EVENTS_TABLE_DDL
+        # Blob covers every broad-search field, in add_broad_text_search order.
+        for col in (
+            "message",
+            "display_name",
+            "artifact",
+            "artifact_long",
+            "timestamp_desc",
+            "source_file",
+            "arrayStringConcat(tags",
+            "mapValues(attributes)",
+        ):
+            assert col in _SEARCH_BLOB_COLUMN_DDL
+
+    def test_ensure_upgrades_missing_column(self, store):
+        store.client = _SearchBlobClient(has_column=False)
+        store._ensure_search_blob()
+        cmds = store.client.commands
+        assert any("ADD COLUMN IF NOT EXISTS search_blob" in c for c in cmds)
+        assert any("ADD INDEX IF NOT EXISTS search_blob_idx" in c for c in cmds)
+        assert any("DROP INDEX IF EXISTS message_idx" in c for c in cmds)
+        # Materialization is asynchronous — startup never blocks on backfill.
+        assert any("MATERIALIZE COLUMN search_blob SETTINGS mutations_sync = 0" in c for c in cmds)
+        assert any(
+            "MATERIALIZE INDEX search_blob_idx SETTINGS mutations_sync = 0" in c for c in cmds
+        )
+
+    def test_ensure_noop_when_column_present(self, store):
+        store.client = _SearchBlobClient(has_column=True)
+        store._ensure_search_blob()
+        assert store.client.commands == []
+
+    def test_ensure_resumes_when_column_present_but_index_missing(self, store):
+        # Regression: a crash between ADD COLUMN and ADD INDEX must not
+        # permanently strand the table without the index — a column-only
+        # guard would short-circuit here forever.
+        store.client = _SearchBlobClient(has_column=True, has_index=False)
+        store._ensure_search_blob()
+        cmds = store.client.commands
+        assert any("ADD COLUMN IF NOT EXISTS search_blob" in c for c in cmds)
+        assert any("ADD INDEX IF NOT EXISTS search_blob_idx" in c for c in cmds)
+        assert any("DROP INDEX IF EXISTS message_idx" in c for c in cmds)
+        assert any("MATERIALIZE COLUMN search_blob SETTINGS mutations_sync = 0" in c for c in cmds)
+        assert any(
+            "MATERIALIZE INDEX search_blob_idx SETTINGS mutations_sync = 0" in c for c in cmds
+        )
+
+    def test_ready_true_when_no_pending_mutations(self, store):
+        store.client = _SearchBlobClient(has_column=True, mutations=[])
+        assert store.search_blob_ready() is True
+
+    def test_ready_false_while_mutation_pending_with_recheck_ttl(self, store):
+        store.client = _SearchBlobClient(has_column=True, mutations=[(0, "")])
+        assert store.search_blob_ready() is False
+        queries_after_first = len(store.client.queries)
+        # Within the recheck TTL the negative result is served from cache.
+        assert store.search_blob_ready() is False
+        assert len(store.client.queries) == queries_after_first
+
+    def test_ready_true_is_cached_forever(self, store):
+        store.client = _SearchBlobClient(has_column=True, mutations=[])
+        assert store.search_blob_ready() is True
+        queries_after_first = len(store.client.queries)
+        assert store.search_blob_ready() is True
+        assert len(store.client.queries) == queries_after_first
+
+    def test_ready_false_when_column_missing(self, store):
+        store.client = _SearchBlobClient(has_column=False)
+        assert store.search_blob_ready() is False
+
+    def test_failed_mutation_counts_as_ready(self, store):
+        # Fast path stays correct on unmaterialized parts (blob computed on
+        # read); a failed mutation only means old parts stay unindexed.
+        store.client = _SearchBlobClient(has_column=True, mutations=[(1, "disk full")])
+        assert store.search_blob_ready() is True
+
+
 def _make_event(i: int, **overrides) -> Event:
     kwargs: dict = {
         "case_id": "case-1",
