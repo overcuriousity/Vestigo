@@ -9,7 +9,7 @@
  * and handle old versions explicitly instead of silently misreading them.
  */
 import type { EventFilters } from "@/api/types";
-import { filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
+import { filtersToParams, filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
 import type { Metric } from "./transforms";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
@@ -22,7 +22,11 @@ export type ChartType =
   | "histogram"
   | "box"
   | "violin"
-  | "ecdf";
+  | "ecdf"
+  | "punchcard"
+  | "pivot"
+  | "sankey"
+  | "scatter";
 
 export type CompareSpec =
   | { mode: "off" }
@@ -38,12 +42,19 @@ export interface ChartOptions {
   topN?: number;
   bins?: number;
   buckets?: number;
+  /** pivot/sankey: per-axis top-N caps. */
+  limitX?: number;
+  limitY?: number;
+  /** scatter: server-side sample size. */
+  sampleLimit?: number;
 }
 
 export interface ChartConfig {
   v: 1;
-  /** Field token, or null for pure event-count charts (chartType "time"). */
+  /** Field token, or null for pure event-count charts ("time"/"punchcard"). */
   field: string | null;
+  /** Second field token for two-field charts (pivot/sankey/scatter), else null. */
+  fieldY: string | null;
   scale: Scale;
   chartType: ChartType;
   metric: Metric;
@@ -54,6 +65,7 @@ export interface ChartConfig {
 export const DEFAULT_CHART_CONFIG: ChartConfig = {
   v: 1,
   field: null,
+  fieldY: null,
   scale: "nominal",
   // Events-over-time is the fresh-load default: it needs no field, runs on the
   // already-optimized single-pass histogram, and never lands on an empty canvas
@@ -74,6 +86,10 @@ const CHART_TYPES: ChartType[] = [
   "box",
   "violin",
   "ecdf",
+  "punchcard",
+  "pivot",
+  "sankey",
+  "scatter",
 ];
 const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
@@ -93,6 +109,7 @@ export function chartConfigToParams(
   params.set("c_type", config.chartType);
   params.set("c_scale", config.scale);
   if (config.field) params.set("c_field", config.field);
+  if (config.fieldY) params.set("c_field_y", config.fieldY);
   if (config.metric !== "count") params.set("c_metric", config.metric);
   if (config.compare.mode !== "off") {
     params.set("c_compare", config.compare.mode);
@@ -118,6 +135,7 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
   const scale = params.get("c_scale");
   if (scale && (SCALES as string[]).includes(scale)) config.scale = scale as Scale;
   config.field = params.get("c_field") || null;
+  config.fieldY = params.get("c_field_y") || null;
   const metric = params.get("c_metric");
   if (metric && (METRICS as string[]).includes(metric)) config.metric = metric as Metric;
 
@@ -166,6 +184,8 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
     config.scale = raw.scale as Scale;
   }
   if (typeof raw.field === "string" && raw.field) config.field = raw.field;
+  // Additive v1 field — absent in older saved configs, which load as null.
+  if (typeof raw.fieldY === "string" && raw.fieldY) config.fieldY = raw.fieldY;
   if (typeof raw.metric === "string" && (METRICS as string[]).includes(raw.metric)) {
     config.metric = raw.metric as Metric;
   }
@@ -182,6 +202,24 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
     config.options = raw.options as ChartOptions;
   }
   return config;
+}
+
+/**
+ * Rebuild the URL params for a new filter set while carrying over every
+ * `c_*` chart-config key from *prev*. `filtersToParams` builds a FRESH
+ * URLSearchParams, so any filter write on the Visualize page (click-to-
+ * filter, brush-zoom, reset range) must go through this or it silently
+ * wipes the chart config out of the URL.
+ */
+export function filterParamsPreservingChartConfig(
+  next: EventFilters,
+  prev: URLSearchParams,
+): URLSearchParams {
+  const params = filtersToParams(next);
+  for (const [k, v] of prev.entries()) {
+    if (k.startsWith("c_")) params.set(k, v);
+  }
+  return params;
 }
 
 /** Shape a ChartConfig for storage (saved charts): compare filters go

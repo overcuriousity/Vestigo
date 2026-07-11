@@ -11,6 +11,7 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap } from "@/components/viz/lib/colors";
+import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
@@ -29,6 +30,8 @@ interface LineChartProps {
    * areas — reads as composition of the total rather than per-series shape. */
   seriesMode?: "overlay" | "stacked";
   showLegend?: boolean;
+  /** Click-to-filter: clicking a legend entry reports its field=value pair. */
+  onValueClick?: ChartValueClickHandler;
 }
 
 /**
@@ -43,6 +46,7 @@ export function LineChart({
   height = 260,
   seriesMode = "overlay",
   showLegend = true,
+  onValueClick,
 }: LineChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const ref = useChartRef(svgRef);
@@ -191,6 +195,16 @@ export function LineChart({
             label: s.value,
             color: colorMap.get(s.value) ?? "var(--color-accent)",
           }))}
+          onEntryClick={
+            onValueClick
+              ? (key, e) =>
+                  onValueClick({
+                    entries: [[data.field, key]],
+                    clientX: e.clientX,
+                    clientY: e.clientY,
+                  })
+              : undefined
+          }
         />
       )}
       {hoverIdx != null && (

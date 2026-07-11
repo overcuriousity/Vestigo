@@ -5,11 +5,18 @@
  */
 import type { ChartType, Scale } from "./chartConfig";
 
-export type DataKind = "time" | "terms" | "numeric" | "timeseries";
+export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter";
 
 export const CHART_META: Record<
   ChartType,
-  { label: string; scales: Scale[]; dataKind: DataKind; supportsCompare?: boolean }
+  {
+    label: string;
+    scales: Scale[];
+    dataKind: DataKind;
+    supportsCompare?: boolean;
+    /** Two-field charts (pivot/sankey/scatter) need a second field picked. */
+    requiresSecondField?: boolean;
+  }
 > = {
   // Event count over time needs no field, so it is meaningful whatever scale
   // the currently-picked field has — available under every scale.
@@ -47,6 +54,32 @@ export const CHART_META: Record<
   box: { label: "Box plot", scales: ["ratio"], dataKind: "numeric" },
   violin: { label: "Violin plot", scales: ["ratio"], dataKind: "numeric" },
   ecdf: { label: "ECDF", scales: ["ratio"], dataKind: "numeric" },
+  // Field-free like `time` — meaningful whatever the picked field's scale is.
+  punchcard: {
+    label: "Punch card (day × hour)",
+    scales: ["nominal", "ordinal", "interval", "ratio"],
+    dataKind: "punchcard",
+  },
+  // pivot and sankey are two marks over the SAME field×field aggregation —
+  // switching between them refetches nothing.
+  pivot: {
+    label: "Heatmap (field × field)",
+    scales: ["nominal", "ordinal"],
+    dataKind: "pivot",
+    requiresSecondField: true,
+  },
+  sankey: {
+    label: "Flow / Sankey (field × field)",
+    scales: ["nominal", "ordinal"],
+    dataKind: "pivot",
+    requiresSecondField: true,
+  },
+  scatter: {
+    label: "Scatter (numeric × numeric)",
+    scales: ["interval", "ratio"],
+    dataKind: "scatter",
+    requiresSecondField: true,
+  },
 };
 
 export const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];

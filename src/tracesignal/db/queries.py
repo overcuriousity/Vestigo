@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +34,7 @@ from tracesignal.db._offsets import (
     effective_ts_sql,
     offset_raw_bounds,
 )
-from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+from tracesignal.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import (
     apply_mappings_to_attribute_keys,
@@ -637,6 +638,27 @@ class _ParameterizedQueryBuilder:
 
     def where_clause(self) -> str:
         return " AND ".join(self.conditions)
+
+
+def _gated_scan(fn):
+    """Admit at most TS_STAT_SCAN_CONCURRENCY heavy scans to ClickHouse at once.
+
+    Same admission control as ``anomaly_stats._gated_scan``: each viz
+    aggregation's per-query ``max_memory_usage`` cap is budget/concurrency,
+    so the gate is what makes the total budget actually hold when several
+    charts render concurrently (see ``db/_scan.py``). Applied to the public
+    aggregation entry points only — internal helpers (``_field_terms_impl``,
+    the ``_compare`` layer scans) run while the caller holds the slot, and
+    gating them too would deadlock. Callers run in FastAPI's threadpool, so
+    blocking on the semaphore is safe.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with HEAVY_SCAN_GATE:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class EventQueryService:
@@ -1382,6 +1404,7 @@ class EventQueryService:
             },
         }
 
+    @_gated_scan
     def histogram(self, query: EventQuery, buckets: int = 60) -> dict[str, Any]:
         """Return a bucketed event-count histogram honoring all query filters.
 
@@ -1410,6 +1433,7 @@ class EventQueryService:
                 WHERE {where} AND {TS_NOT_SENTINEL_SQL}
                 GROUP BY bucket
                 ORDER BY bucket
+                {HEAVY_SCAN_SETTINGS}
                 """,
                 parameters=parameters,
             )
@@ -1452,6 +1476,7 @@ class EventQueryService:
             WHERE {where} AND {TS_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
@@ -1468,6 +1493,7 @@ class EventQueryService:
             "buckets": [{"start": ensure_utc_iso(row[0]), "count": row[1]} for row in rows],
         }
 
+    @_gated_scan
     def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
         """Return a top-N terms aggregation (value → count) for *field_token*.
 
@@ -1480,6 +1506,12 @@ class EventQueryService:
         the top *limit* — present so a bar/pie chart can render a truthful
         "Other" slice instead of silently dropping the tail.
         """
+        return self._field_terms_impl(query, field_token, limit=limit)
+
+    def _field_terms_impl(
+        self, query: EventQuery, field_token: str, limit: int = 50
+    ) -> dict[str, Any]:
+        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate."""
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
@@ -1502,6 +1534,7 @@ class EventQueryService:
             GROUP BY val
             ORDER BY c DESC, val ASC
             LIMIT {int(limit)}
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
@@ -1532,6 +1565,7 @@ class EventQueryService:
     # outlier burst cares about (0.01/0.05/0.95/0.99).
     _NUMERIC_QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
 
+    @_gated_scan
     def field_numeric_stats(
         self, query: EventQuery, field_token: str, bins: int = 30
     ) -> dict[str, Any]:
@@ -1569,6 +1603,7 @@ class EventQueryService:
                    stddevPop(v) AS sd, {quantile_exprs}
             FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
@@ -1606,6 +1641,7 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters={**parameters, "mn": mn, "bw": bin_width},
         )
@@ -1630,6 +1666,7 @@ class EventQueryService:
             "bins": bins_out,
         }
 
+    @_gated_scan
     def field_value_timeseries(
         self,
         query: EventQuery,
@@ -1649,12 +1686,25 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
+        # W2: range and bucket over the offset-corrected timestamp, matching
+        # `histogram` — otherwise the time chart and this value×time chart
+        # would bucket the same filtered view on different timelines whenever
+        # a source carries a clock-skew offset. The sentinel guard stays on
+        # the raw column (sentinel rows are never shifted).
+        eff = effective_ts_sql(query.source_offsets)
 
         if query.start is not None and query.end is not None:
             min_ts: datetime | None = ensure_utc(query.start)
             max_ts: datetime | None = ensure_utc(query.end)
         else:
-            min_ts, max_ts = query_timestamp_range(self.store.client, database, where, parameters)
+            min_ts, max_ts = query_timestamp_range(
+                self.store.client,
+                database,
+                where,
+                parameters,
+                ts_expr=eff,
+                settings=HEAVY_SCAN_SETTINGS,
+            )
 
         empty: dict[str, Any] = {
             "field": field_token,
@@ -1666,7 +1716,7 @@ class EventQueryService:
         if min_ts is None or max_ts is None:
             return empty
 
-        terms = self.field_terms(query, field_token, limit=series_limit)
+        terms = self._field_terms_impl(query, field_token, limit=series_limit)
         top_values = [v["value"] for v in terms["values"]]
         if not top_values:
             return {
@@ -1684,7 +1734,7 @@ class EventQueryService:
 
         bucket_result = self.store.client.query(
             f"""
-            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+            SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
                    {col_expr} AS val,
                    count() AS c
             FROM {database}.events
@@ -1692,6 +1742,7 @@ class EventQueryService:
                 AND has({{series_values:Array(String)}}, {col_expr})
             GROUP BY bucket, val
             ORDER BY bucket
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
@@ -1744,7 +1795,18 @@ class EventQueryService:
         ranges = []
         for query in (primary, comparison):
             where, parameters = self._build_where(query)
-            ranges.append(query_timestamp_range(self.store.client, database, where, parameters))
+            # W2: each layer's range respects its own clock-skew offsets,
+            # matching `_bucketed_counts`' bucketing expression.
+            ranges.append(
+                query_timestamp_range(
+                    self.store.client,
+                    database,
+                    where,
+                    parameters,
+                    ts_expr=effective_ts_sql(query.source_offsets),
+                    settings=HEAVY_SCAN_SETTINGS,
+                )
+            )
         mins = [r[0] for r in ranges if r[0] is not None]
         maxs = [r[1] for r in ranges if r[1] is not None]
         if not mins or not maxs:
@@ -1754,19 +1816,22 @@ class EventQueryService:
     def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
         """Return epoch-aligned bucket-start (ISO) → event count for *query*."""
         where, parameters = self._build_where(query)
+        eff = effective_ts_sql(query.source_offsets)
         result = self.store.client.query(
             f"""
-            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+            SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
                    count() AS c
             FROM {self.store.database}.events
             WHERE {where} AND {TS_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
         return {ensure_utc_iso(row[0]): row[1] for row in result.result_rows}
 
+    @_gated_scan
     def compare_time_histogram(
         self, primary: EventQuery, comparison: EventQuery, buckets: int = 60
     ) -> dict[str, Any]:
@@ -1832,6 +1897,7 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_expr} != ''
             GROUP BY val
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
@@ -1843,6 +1909,7 @@ class EventQueryService:
                 counts[val] = count
         return counts, total
 
+    @_gated_scan
     def compare_field_terms(
         self, primary: EventQuery, comparison: EventQuery, field_token: str, limit: int = 50
     ) -> dict[str, Any]:
@@ -1854,7 +1921,7 @@ class EventQueryService:
         categories — the terms-kind comparability invariant.
         """
         self.store.init_schema()
-        terms = self.field_terms(primary, field_token, limit=limit)
+        terms = self._field_terms_impl(primary, field_token, limit=limit)
         top_values = [v["value"] for v in terms["values"]]
         primary_by_value = {v["value"]: v["count"] for v in terms["values"]}
 
@@ -1898,6 +1965,7 @@ class EventQueryService:
             SELECT count(v), min(v), max(v)
             FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters=parameters,
         )
@@ -1922,11 +1990,13 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
+            {HEAVY_SCAN_SETTINGS}
             """,
             parameters={**parameters, "mn": mn, "bw": bin_width},
         )
         return {row[0]: row[1] for row in result.result_rows}
 
+    @_gated_scan
     def compare_field_numeric(
         self, primary: EventQuery, comparison: EventQuery, field_token: str, bins: int = 30
     ) -> dict[str, Any]:
@@ -1990,4 +2060,182 @@ class EventQueryService:
             "bins": bins_out,
             "primary_total": p_count,
             "comparison_total": c_count,
+        }
+
+    @_gated_scan
+    def time_punchcard(self, query: EventQuery) -> dict[str, Any]:
+        """Return event counts grouped by (day-of-week × hour-of-day), UTC.
+
+        One scan; ``dow`` follows ClickHouse's ISO convention (1 = Monday …
+        7 = Sunday). Day/hour are extracted **in UTC explicitly** — ``toHour``
+        et al. otherwise interpret a ``DateTime64`` in the server's timezone,
+        which would silently reshape the punch card between deployments; the
+        UTC-only convention is stated in the chart caption. Cells with zero
+        events are omitted (sparse) — the frontend zero-fills the 7×24 grid.
+        Powers the punch-card chart on the Visualization page.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        eff = effective_ts_sql(query.source_offsets)
+        result = self.store.client.query(
+            f"""
+            SELECT toDayOfWeek({eff}, 0, 'UTC') AS dow,
+                   toHour({eff}, 'UTC') AS hod,
+                   count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND {TS_NOT_SENTINEL_SQL}
+            GROUP BY dow, hod
+            ORDER BY dow, hod
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        cells = [
+            {"dow": int(row[0]), "hour": int(row[1]), "count": int(row[2])}
+            for row in result.result_rows
+        ]
+        return {
+            "kind": "punchcard",
+            "total": sum(c["count"] for c in cells),
+            "max_count": max((c["count"] for c in cells), default=0),
+            "cells": cells,
+        }
+
+    @_gated_scan
+    def field_pivot(
+        self,
+        query: EventQuery,
+        field_x: str,
+        field_y: str,
+        limit_x: int = 10,
+        limit_y: int = 10,
+    ) -> dict[str, Any]:
+        """Return a top-X × top-Y co-occurrence count matrix for two fields.
+
+        Three scans: two parallel top-N terms scans fix each axis's value
+        list (same fused single-scan query as :py:meth:`field_terms`), then
+        one matrix scan groups by both values with everything outside a
+        top-N list folded to ``''`` — the same truthful "Other" rollup trick
+        as the compare-terms layer, applied per axis. ``total`` counts only
+        events where **both** fields are non-empty (the joint-presence subset
+        the matrix describes), so captions stay honest about coverage.
+        Powers the field×field heatmap and the flow (Sankey) chart.
+        """
+        self.store.init_schema()
+        terms_x, terms_y = self._run_parallel(
+            lambda: self._field_terms_impl(query, field_x, limit=limit_x),
+            lambda: self._field_terms_impl(query, field_y, limit=limit_y),
+        )
+        x_values = [v["value"] for v in terms_x["values"]]
+        y_values = [v["value"] for v in terms_y["values"]]
+        base = {
+            "kind": "pivot",
+            "field_x": field_x,
+            "field_y": field_y,
+            "x_values": x_values,
+            "y_values": y_values,
+            "x_distinct": terms_x["distinct"],
+            "y_distinct": terms_y["distinct"],
+        }
+        if not x_values or not y_values:
+            return {**base, "cells": [], "total": 0}
+
+        where, parameters = self._build_where(query)
+        col_x = _field_column_expr(
+            field_x, parameters, "field_key_x", field_mappings=query.field_mappings
+        )
+        col_y = _field_column_expr(
+            field_y, parameters, "field_key_y", field_mappings=query.field_mappings
+        )
+        parameters["pivot_x_values"] = x_values
+        parameters["pivot_y_values"] = y_values
+        result = self.store.client.query(
+            f"""
+            SELECT if(has({{pivot_x_values:Array(String)}}, {col_x}), {col_x}, '') AS xv,
+                   if(has({{pivot_y_values:Array(String)}}, {col_y}), {col_y}, '') AS yv,
+                   count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND {col_x} != '' AND {col_y} != ''
+            GROUP BY xv, yv
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        cells = [{"x": row[0], "y": row[1], "count": int(row[2])} for row in result.result_rows]
+        return {**base, "cells": cells, "total": sum(c["count"] for c in cells)}
+
+    @_gated_scan
+    def field_scatter(
+        self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
+    ) -> dict[str, Any]:
+        """Return a uniform random sample of (x, y) numeric value pairs.
+
+        Two scans, same deliberate two-pass policy as
+        :py:meth:`field_numeric_stats`: the first computes the total pair
+        count and the **true** per-axis extents (axes and caption must
+        describe the full data, not the sample); the second draws the sample
+        with ``ORDER BY rand() LIMIT n`` — a bounded partial sort under the
+        heavy-scan settings (the events table declares no SAMPLE key, so
+        table sampling isn't available). Only events where **both** casts
+        are numeric participate; ``total == 0`` signals the caller to fall
+        back to categorical treatment, mirroring ``field_numeric_stats``.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        col_x = _field_column_expr(
+            field_x, parameters, "field_key_x", field_mappings=query.field_mappings
+        )
+        col_y = _field_column_expr(
+            field_y, parameters, "field_key_y", field_mappings=query.field_mappings
+        )
+        pairs_subquery = (
+            f"SELECT toFloat64OrNull(toString({col_x})) AS vx, "
+            f"toFloat64OrNull(toString({col_y})) AS vy "
+            f"FROM {self.store.database}.events WHERE {where}"
+        )
+        stats_result = self.store.client.query(
+            f"""
+            SELECT count(), min(vx), max(vx), min(vy), max(vy)
+            FROM ({pairs_subquery}) AS t
+            WHERE vx IS NOT NULL AND vy IS NOT NULL
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        row = stats_result.result_rows[0] if stats_result.result_rows else None
+        total = int(row[0]) if row and row[0] else 0
+        base = {"kind": "scatter", "field_x": field_x, "field_y": field_y}
+        if not total:
+            return {
+                **base,
+                "total": 0,
+                "sampled": 0,
+                "x_min": None,
+                "x_max": None,
+                "y_min": None,
+                "y_max": None,
+                "points": [],
+            }
+
+        sample_result = self.store.client.query(
+            f"""
+            SELECT vx, vy
+            FROM ({pairs_subquery}) AS t
+            WHERE vx IS NOT NULL AND vy IS NOT NULL
+            ORDER BY rand()
+            LIMIT {int(limit)}
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        points = [[float(r[0]), float(r[1])] for r in sample_result.result_rows]
+        return {
+            **base,
+            "total": total,
+            "sampled": len(points),
+            "x_min": row[1],
+            "x_max": row[2],
+            "y_min": row[3],
+            "y_max": row[4],
+            "points": points,
         }

@@ -8,6 +8,7 @@ import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { sequentialColor } from "@/components/viz/lib/colors";
+import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -39,6 +40,9 @@ interface HeatmapProps {
   data: FieldTimeseriesResponse;
   svgRef?: React.RefObject<SVGSVGElement | null>;
   height?: number;
+  /** Click-to-filter: clicking a row label or cell reports the row's
+   * field=value pair. */
+  onValueClick?: ChartValueClickHandler;
 }
 
 /**
@@ -47,7 +51,7 @@ interface HeatmapProps {
  * burst concentrated in one value (e.g. one status code spiking) versus a
  * broad, correlated spike across values.
  */
-export function Heatmap({ data, svgRef, height }: HeatmapProps) {
+export function Heatmap({ data, svgRef, height, onValueClick }: HeatmapProps) {
   const [hover, setHover] = useState<{
     x: number;
     y: number;
@@ -99,6 +103,15 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
               />
               {data.series.map((s) => {
                 const ry = yBand(s.value) ?? 0;
+                const clickValue =
+                  onValueClick != null
+                    ? (e: React.MouseEvent) =>
+                        onValueClick({
+                          entries: [[data.field, s.value]],
+                          clientX: e.clientX,
+                          clientY: e.clientY,
+                        })
+                    : undefined;
                 return (
                   <g key={s.value}>
                     <text
@@ -108,6 +121,8 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
                       textAnchor="end"
                       fontSize={11}
                       fill="var(--viz-ink-primary)"
+                      style={clickValue ? { cursor: "pointer" } : undefined}
+                      onClick={clickValue}
                     >
                       {s.value.length > 20 ? s.value.slice(0, 19) + "…" : s.value}
                     </text>
@@ -121,6 +136,8 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
                           width={xBand.bandwidth()}
                           height={yBand.bandwidth()}
                           fill={b.count === 0 ? "var(--viz-grid)" : sequentialColor(b.count / maxCount)}
+                          style={clickValue ? { cursor: "pointer" } : undefined}
+                          onClick={clickValue}
                           onMouseEnter={() =>
                             setHover({
                               x: rx + xBand.bandwidth() / 2 + margin.left,

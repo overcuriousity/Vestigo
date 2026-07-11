@@ -1,6 +1,73 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 48 — keyset pagination + entropy detector memory fix).
+Last updated: 2026-07-11 (session 49 — visualization: interactivity, four new chart types,
+scan guardrails).
+
+## Session 49 — 2026-07-11: Visualize v3 — click-to-filter, brush-zoom, punch card / pivot / sankey / scatter, viz scan guardrails
+
+Four-part visualization upgrade (user-prioritized: interactivity + new chart types + speed/
+robustness + UX polish; M24 scan-avoidance stays deferred, see ROADMAP).
+
+**Backend hardening (`db/queries.py`).** Every viz aggregation now carries
+`HEAVY_SCAN_SETTINGS` and acquires the `HEAVY_SCAN_GATE` admission semaphore — previously
+detector-only, leaving chart scans unbounded (the exact stacking pattern behind the
+session-52-incident OOM). Gating is on public entry points only; `field_terms` split into a
+gated wrapper + ungated `_field_terms_impl` so `field_value_timeseries`/`compare_field_terms`
+can't deadlock a `TS_STAT_SCAN_CONCURRENCY=1` deployment (regression-tested with a counting
+gate). Also fixed a W2 clock-skew inconsistency: `field_value_timeseries`, `_bucketed_counts`,
+and `_union_timestamp_range` bucketed/ranged on raw `timestamp` while `histogram` used the
+offset-corrected expression — the time chart and value×time chart could bucket the same view
+on different timelines. All three now use `effective_ts_sql` (sentinel guard stays raw).
+`query_timestamp_range` grew an optional `settings` trailing-clause param.
+
+**Three new aggregations + endpoints (`api/routers/viz.py`).**
+`GET .../viz/time-punchcard` (day-of-week × hour-of-day counts; extraction pinned to UTC via
+`toDayOfWeek(ts, 0, 'UTC')`/`toHour(ts, 'UTC')` so server timezone can never reshape the
+card), `GET .../viz/field-pivot` (top-X × top-Y co-occurrence matrix: two parallel fused
+terms scans fix the axes, one matrix scan folds outside-top-N to `''` per axis — the
+compare-terms Other-rollup trick applied twice), and `GET .../viz/field-scatter` (uniform
+random sample via `ORDER BY rand() LIMIT n` — no SAMPLE key on the events table — plus a
+stats scan so axes/caption describe the FULL data, not the sample). All resolve filters
+through the shared `_resolve_event_query`, so charts keep mirroring the Explorer view.
+
+**Four new chart types (frontend, hand-rolled SVG, no new deps — d3-sankey skipped).**
+Punch card (`PunchCard.tsx`, the "nights and weekends" view), field×field heatmap
+(`PivotHeatmap.tsx`), Sankey flow (`SankeyFlow.tsx` — two-column bipartite stacking over the
+SAME field-pivot response as the heatmap, so switching marks refetches nothing), and scatter
+(`ScatterChart.tsx`, linear/log with per-axis fallback). `ChartConfig` gained optional
+`fieldY` (`c_field_y`) + `limitX`/`limitY`/`sampleLimit` options — **still `v: 1`**
+(additive; old frontends degrade unknown chart types to the default "time" chart, verified
+by test). Rail: second field picker for two-field charts, per-chart option controls, two new
+presets ("When does activity happen?", "How do two fields relate?"). Captions state UTC,
+per-axis top-N rollups, and "showing N of M points (uniform random sample)".
+
+**Interactivity — the explore→visualize→refine loop closes.** Click-to-filter on bar /
+pie (slices + legend) / heatmap (rows + cells) / line (legend) / pivot cells / sankey
+ribbons+nodes: charts report `[fieldToken, value]` entries via a shared
+`ChartValueClickHandler` (`viz/lib/interaction.ts`); a `ChartActionPopover` offers Filter in
+/ Filter out / Open in Explorer (two-step by design — misclicks on small marks must not
+silently rewrite the filter set; filter-out hidden for two-value conjunctions where
+per-key AND exclusion wouldn't mean "not this cell"). Other marks never clickable. Brush-zoom
+landed on the workbench time chart (`CompareHistogram`, covering compare-off via the
+`histogramToCompare` adapter): one overlay drives nearest-bucket hover AND drag-to-select,
+ranges snap outward to the server's epoch-aligned bucket grid, and a "Reset range" chip
+appears whenever start/end filters are active. Filter writes go through
+`filterParamsPreservingChartConfig` — `filtersToParams` builds a fresh `URLSearchParams`, so
+without re-copying the `c_*` keys a chart click would wipe its own config out of the URL
+(unit-tested). `applyFieldFilter`/`dropMode`/`mapFieldTokenToFilterKey` extracted from
+ExplorerPage into `lib/fieldFilters.ts` (behavior-identical) and now unit-tested directly;
+Explorer and Visualize share one filter-mutation semantics.
+
+**UX polish.** Compare is no longer silently hidden for unsupported chart types — the
+control renders disabled with the reason ("no honest two-layer encoding" vs "not supported
+yet"). Stale "treemap" docstring reference removed (`viz.py`). Scale auto-probe skips
+field-free (punchcard) and two-field charts so it can't yank the analyst off a deliberately
+picked chart type.
+
+Tests: backend suite green incl. new settings/gate/skew/punchcard/pivot/scatter coverage;
+frontend 231 tests across 24 files (chartConfig round-trips, fieldFilters unit tests, chart
+smoke renders incl. pivot-click and brush-drag simulations, caption lines). ROADMAP: M24
+rescoped to scan-avoidance only; new deferred M26 (histogram-implementation unification).
 
 ## Session 48b — 2026-07-11: entropy detector no longer explodes chars into rows
 

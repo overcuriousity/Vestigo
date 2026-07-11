@@ -32,6 +32,7 @@ def query_timestamp_range(
     where: str,
     parameters: dict[str, Any],
     ts_expr: str = "timestamp",
+    settings: str = "",
 ) -> tuple[datetime | None, datetime | None]:
     """Return the (min, max) UTC timestamp for rows matching *where*.
 
@@ -47,10 +48,15 @@ def query_timestamp_range(
     also have bound the offset arrays into *parameters*. The sentinel guard
     always stays on the raw ``timestamp`` column (sentinel-ness is a physical
     property, never shifted).
+
+    *settings* is an optional trailing SQL clause (pass
+    ``db/_scan.py::HEAVY_SCAN_SETTINGS`` to bound the scan's memory/threads);
+    empty by default so callers with their own settings discipline are
+    unaffected.
     """
     result = client.query(
         f"SELECT min({ts_expr}), max({ts_expr}) FROM {database}.events "
-        f"WHERE {where} AND {TS_NOT_SENTINEL_SQL}",
+        f"WHERE {where} AND {TS_NOT_SENTINEL_SQL} {settings}",
         parameters=parameters,
     )
     row = result.result_rows[0] if result.result_rows else (None, None)

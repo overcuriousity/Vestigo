@@ -74,4 +74,29 @@ export const CHART_PRESETS: ChartPreset[] = [
       options: {},
     },
   },
+  {
+    id: "activity-rhythm",
+    label: "When does activity happen?",
+    question:
+      "Does activity cluster in working hours, or is something running nights and weekends (UTC)?",
+    config: {
+      chartType: "punchcard",
+      metric: "count",
+      compare: { mode: "off" },
+      options: {},
+    },
+  },
+  {
+    id: "field-relationship",
+    label: "How do two fields relate?",
+    question:
+      "Which value pairs co-occur — which accounts touch which hosts, which IPs hit which ports?",
+    config: {
+      chartType: "pivot",
+      scale: "nominal",
+      metric: "count",
+      compare: { mode: "off" },
+      options: {},
+    },
+  },
 ];

@@ -80,4 +80,69 @@ describe("buildCaptionLines", () => {
     });
     expect(lines.some((l) => l.includes("capped"))).toBe(false);
   });
+
+  it("punchcard header line states day×hour and UTC", () => {
+    const config: ChartConfig = { ...DEFAULT_CHART_CONFIG, chartType: "punchcard" };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Punch card (day × hour)",
+      config,
+      facts: { primaryTotal: 100 },
+    });
+    expect(
+      lines.some((l) => l.includes("day-of-week × hour-of-day, UTC")),
+    ).toBe(true);
+  });
+
+  it("pivot caption names both fields and per-axis capping", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "pivot",
+      field: "attr:username",
+      fieldY: "attr:workstation",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Heatmap (field × field)",
+      config,
+      facts: { xDistinct: 40, xShown: 10, yDistinct: 5, yShown: 5 },
+    });
+    expect(lines.some((l) => l.includes("attr:username × attr:workstation"))).toBe(true);
+    expect(lines).toContain('x-axis: top 10 of 40 distinct values (rest in "Other")');
+    expect(lines.some((l) => l.startsWith("y-axis:"))).toBe(false);
+  });
+
+  it("scatter caption states the sample truthfully", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "scatter",
+      field: "attr:bytes",
+      fieldY: "attr:latency",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Scatter (numeric × numeric)",
+      config,
+      facts: { sampledPoints: 5000, totalPoints: 120000 },
+    });
+    expect(lines).toContain(
+      "showing 5,000 of 120,000 points (uniform random sample; axes span full data)",
+    );
+  });
+
+  it("no sample line when every point is drawn", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "scatter",
+      field: "attr:bytes",
+      fieldY: "attr:latency",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Scatter (numeric × numeric)",
+      config,
+      facts: { sampledPoints: 800, totalPoints: 800 },
+    });
+    expect(lines.some((l) => l.includes("random sample"))).toBe(false);
+  });
 });

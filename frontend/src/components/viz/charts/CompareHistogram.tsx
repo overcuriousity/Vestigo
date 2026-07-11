@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
+import { bisector } from "d3-array";
 import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
@@ -8,6 +9,7 @@ import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
+import { svgLocalPoint } from "@/components/viz/lib/pointer";
 import { applyMetric, METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import type { CompareTimeResponse } from "@/api/types";
 
@@ -16,6 +18,10 @@ const fmtMetric = formatNum(",.2~f");
 // utcFormat, not timeFormat — bucket starts are UTC instants (see TimeHistogram).
 const fmtTick = utcFormat("%b %d %H:%M");
 const fmtFull = utcFormat("%Y-%m-%d %H:%M:%S UTC");
+const bisectDate = bisector((d: Date) => d).left;
+
+/** Drags narrower than this are treated as clicks, not range selections. */
+const MIN_BRUSH_PX = 5;
 
 interface CompareHistogramProps {
   data: CompareTimeResponse;
@@ -25,6 +31,9 @@ interface CompareHistogramProps {
   hasComparison: boolean;
   svgRef?: React.RefObject<SVGSVGElement | null>;
   height?: number;
+  /** Brush-to-zoom: dragging a span reports it (snapped outward to bucket
+   * boundaries) so the page can narrow the shared start/end filters. */
+  onRangeSelect?: (startIso: string, endIso: string) => void;
 }
 
 /**
@@ -35,6 +44,10 @@ interface CompareHistogramProps {
  * layers identically, except `ratio` which collapses them into one derived
  * percentage line. Null metric bins (first delta bin, zero-baseline ratio
  * bins) are skipped, never drawn as 0.
+ *
+ * Hover and brush both run on one full-plot overlay (nearest-bucket readout,
+ * like the Explorer's TimelineHistogram): drag a span and release to zoom
+ * the page's time range to it via `onRangeSelect`.
  */
 export function CompareHistogram({
   data,
@@ -42,8 +55,13 @@ export function CompareHistogram({
   hasComparison,
   svgRef,
   height = 280,
+  onRangeSelect,
 }: CompareHistogramProps) {
   const [hover, setHover] = useState<{ x: number; y: number; index: number } | null>(null);
+  const [brush, setBrush] = useState<{ x0: number; x1: number } | null>(null);
+  // Drag anchor lives in a ref: it must be readable synchronously in
+  // mousemove/mouseup without re-render races (TimelineHistogram's pattern).
+  const dragAnchorRef = useRef<number | null>(null);
   const ref = useChartRef(svgRef);
 
   const buckets = data.buckets;
@@ -82,6 +100,18 @@ export function CompareHistogram({
   const dates = buckets.map((b) => new Date(b.start));
   const domainMax = dates.length > 1 ? dates[dates.length - 1] : dates[0];
 
+  /** Snap a dragged [t0, t1] outward to the epoch-aligned bucket grid the
+   * server used, so the zoomed range never cuts a bucket in half. */
+  const snapRange = (t0: number, t1: number): [string, string] => {
+    const iv = Math.max(1, data.interval_seconds) * 1000;
+    const start = Math.floor(t0 / iv) * iv;
+    const end = Math.ceil(t1 / iv) * iv;
+    return [
+      new Date(start).toISOString(),
+      new Date(end > start ? end : start + iv).toISOString(),
+    ];
+  };
+
   return (
     <div className="flex flex-col gap-2">
       {/* Ratio collapses both layers into one derived series — a single
@@ -106,6 +136,47 @@ export function CompareHistogram({
               y: y(Math.max(0, value)),
               height: Math.abs(y(value) - yZero),
             });
+
+            const indexAt = (px: number): number => {
+              const target = x.invert(px);
+              let idx = bisectDate(dates, target, 1);
+              idx = Math.min(dates.length - 1, Math.max(0, idx));
+              if (
+                idx > 0 &&
+                target.getTime() - dates[idx - 1].getTime() <
+                  dates[idx].getTime() - target.getTime()
+              ) {
+                idx -= 1;
+              }
+              return idx;
+            };
+
+            const hoverAt = (px: number) => {
+              const idx = indexAt(px);
+              const v = primaryValues[idx];
+              const anchorY = v == null ? yZero : isRatio ? y(v) : bar(v).y;
+              setHover({
+                x: x(dates[idx]) + barWidth / 2 + margin.left,
+                y: anchorY + margin.top,
+                index: idx,
+              });
+            };
+
+            const endBrush = (commit: boolean) => {
+              const anchor = dragAnchorRef.current;
+              dragAnchorRef.current = null;
+              const b = brush;
+              setBrush(null);
+              if (!commit || anchor == null || b == null || onRangeSelect == null) return;
+              const lo = Math.min(b.x0, b.x1);
+              const hi = Math.max(b.x0, b.x1);
+              if (hi - lo < MIN_BRUSH_PX) return;
+              const [startIso, endIso] = snapRange(
+                x.invert(lo).getTime(),
+                x.invert(hi).getTime(),
+              );
+              onRangeSelect(startIso, endIso);
+            };
 
             return (
               <>
@@ -159,31 +230,75 @@ export function CompareHistogram({
                         height={bh}
                         fill="var(--color-accent)"
                         opacity={0.9}
-                        onMouseEnter={() =>
-                          setHover({
-                            x: x(dates[i]) + barWidth / 2 + margin.left,
-                            y: by + margin.top,
-                            index: i,
-                          })
-                        }
-                        onMouseLeave={() => setHover(null)}
                       />
                     );
                   })}
                 {isRatio && (
-                  <RatioLine
-                    values={primaryValues}
-                    dates={dates}
-                    x={x}
-                    y={y}
-                    barWidth={barWidth}
-                    onHover={(i, px, py) =>
-                      setHover(
-                        i == null ? null : { x: px + margin.left, y: py + margin.top, index: i },
-                      )
-                    }
+                  <RatioLine values={primaryValues} dates={dates} x={x} y={y} barWidth={barWidth} />
+                )}
+                {hover != null && brush == null && (
+                  <line
+                    x1={x(dates[hover.index]) + barWidth / 2}
+                    x2={x(dates[hover.index]) + barWidth / 2}
+                    y1={0}
+                    y2={innerHeight}
+                    stroke="var(--viz-axis)"
+                    strokeWidth={1}
+                    strokeDasharray="2,2"
                   />
                 )}
+                {brush != null && (
+                  <rect
+                    x={Math.min(brush.x0, brush.x1)}
+                    y={0}
+                    width={Math.abs(brush.x1 - brush.x0)}
+                    height={innerHeight}
+                    fill="var(--color-accent)"
+                    opacity={0.15}
+                    stroke="var(--color-accent)"
+                    strokeWidth={1}
+                  />
+                )}
+                {/* One overlay drives hover readout AND the brush gesture —
+                    per-bar handlers would fight the drag. */}
+                <rect
+                  x={0}
+                  y={0}
+                  width={innerWidth}
+                  height={innerHeight}
+                  fill="transparent"
+                  style={onRangeSelect ? { cursor: "crosshair" } : undefined}
+                  onMouseDown={
+                    onRangeSelect
+                      ? (e) => {
+                          const local = svgLocalPoint(e, margin);
+                          if (!local) return;
+                          e.preventDefault();
+                          dragAnchorRef.current = local.x;
+                          setBrush({ x0: local.x, x1: local.x });
+                        }
+                      : undefined
+                  }
+                  onMouseMove={(e) => {
+                    const local = svgLocalPoint(e, margin);
+                    if (!local) return;
+                    if (dragAnchorRef.current != null) {
+                      const clamped = Math.max(0, Math.min(innerWidth, local.x));
+                      setBrush({ x0: dragAnchorRef.current, x1: clamped });
+                      setHover(null);
+                      return;
+                    }
+                    hoverAt(local.x);
+                  }}
+                  onMouseUp={() => endBrush(true)}
+                  onMouseLeave={() => {
+                    // Leaving mid-drag commits like TimelineHistogram (the
+                    // analyst dragged past the edge on purpose more often
+                    // than not); a plain hover just clears.
+                    if (dragAnchorRef.current != null) endBrush(true);
+                    else setHover(null);
+                  }}
+                />
               </>
             );
           }}
@@ -226,14 +341,12 @@ function RatioLine({
   x,
   y,
   barWidth,
-  onHover,
 }: {
   values: (number | null)[];
   dates: Date[];
   x: (d: Date) => number;
   y: (v: number) => number;
   barWidth: number;
-  onHover: (index: number | null, px: number, py: number) => void;
 }) {
   const segments: { i: number; px: number; py: number }[][] = [];
   let current: { i: number; px: number; py: number }[] = [];
@@ -259,15 +372,7 @@ function RatioLine({
         />
       ))}
       {segments.flat().map((p) => (
-        <circle
-          key={p.i}
-          cx={p.px}
-          cy={p.py}
-          r={3}
-          fill="var(--color-accent)"
-          onMouseEnter={() => onHover(p.i, p.px, p.py)}
-          onMouseLeave={() => onHover(null, 0, 0)}
-        />
+        <circle key={p.i} cx={p.px} cy={p.py} r={3} fill="var(--color-accent)" />
       ))}
     </>
   );

@@ -893,6 +893,65 @@ export interface FieldTimeseriesResponse {
   series: FieldTimeseriesSeries[];
 }
 
+/** One (day-of-week × hour-of-day) cell; `dow` is ISO (1=Mon … 7=Sun), UTC. */
+export interface PunchcardCell {
+  dow: number;
+  hour: number;
+  count: number;
+}
+
+/**
+ * Event counts by (day-of-week × hour-of-day), UTC, from `viz/time-punchcard`.
+ * Sparse — cells with zero events are omitted; the chart zero-fills the 7×24 grid.
+ */
+export interface PunchcardResponse {
+  kind: "punchcard";
+  total: number;
+  max_count: number;
+  cells: PunchcardCell[];
+}
+
+/** One co-occurrence cell; `""` on an axis means "outside that axis's top-N" (Other). */
+export interface FieldPivotCell {
+  x: string;
+  y: string;
+  count: number;
+}
+
+/**
+ * Top-X × top-Y co-occurrence matrix for two fields from `viz/field-pivot`.
+ * `total` counts only events where both fields are non-empty.
+ */
+export interface FieldPivotResponse {
+  kind: "pivot";
+  field_x: string;
+  field_y: string;
+  x_values: string[];
+  y_values: string[];
+  x_distinct: number;
+  y_distinct: number;
+  cells: FieldPivotCell[];
+  total: number;
+}
+
+/**
+ * Uniform random sample of numeric (x, y) pairs from `viz/field-scatter`.
+ * Extents describe the FULL data, not the sample; `total === 0` means one or
+ * both fields have no numeric values — fall back to a categorical hint.
+ */
+export interface FieldScatterResponse {
+  kind: "scatter";
+  field_x: string;
+  field_y: string;
+  total: number;
+  sampled: number;
+  x_min: number | null;
+  x_max: number | null;
+  y_min: number | null;
+  y_max: number | null;
+  points: [number, number][];
+}
+
 /** One shared-grid time bucket carrying both compare layers' raw counts. */
 export interface CompareTimeBucket {
   start: string;

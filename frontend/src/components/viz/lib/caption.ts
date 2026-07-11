@@ -27,6 +27,14 @@ export interface CaptionFacts {
    * drill-down) — takes over the kind=time field line instead of the
    * generic "event count over time" phrasing. */
   focusedValue?: string;
+  /** kind=pivot: per-axis top-N truthfulness (Other rollup). */
+  xDistinct?: number;
+  xShown?: number;
+  yDistinct?: number;
+  yShown?: number;
+  /** kind=scatter: sample-size truthfulness. */
+  sampledPoints?: number;
+  totalPoints?: number;
 }
 
 const fmtInt = (n: number) => n.toLocaleString("en-US");
@@ -82,9 +90,13 @@ export function buildCaptionLines(args: {
       ? `field: ${field} = ${facts.focusedValue}`
       : chartType === "time"
         ? `event count over time — ${chartLabel}`
-        : field
-          ? `field: ${field} (${scale}) — ${chartLabel}`
-          : undefined,
+        : chartType === "punchcard"
+          ? `event count by day-of-week × hour-of-day, UTC — ${chartLabel}`
+          : field && config.fieldY
+            ? `fields: ${field} × ${config.fieldY} — ${chartLabel}`
+            : field
+              ? `field: ${field} (${scale}) — ${chartLabel}`
+              : undefined,
   );
 
   // Layer summaries: what each series is, with its total.
@@ -135,6 +147,25 @@ export function buildCaptionLines(args: {
         (facts.otherCount != null && facts.otherCount > 0
           ? `; ${fmtInt(facts.otherCount)} events in "Other")`
           : ")"),
+    );
+  }
+  if (facts.xDistinct != null && facts.xShown != null && facts.xDistinct > facts.xShown) {
+    lines.push(
+      `x-axis: top ${fmtInt(facts.xShown)} of ${fmtInt(facts.xDistinct)} distinct values (rest in "Other")`,
+    );
+  }
+  if (facts.yDistinct != null && facts.yShown != null && facts.yDistinct > facts.yShown) {
+    lines.push(
+      `y-axis: top ${fmtInt(facts.yShown)} of ${fmtInt(facts.yDistinct)} distinct values (rest in "Other")`,
+    );
+  }
+  if (
+    facts.sampledPoints != null &&
+    facts.totalPoints != null &&
+    facts.totalPoints > facts.sampledPoints
+  ) {
+    lines.push(
+      `showing ${fmtInt(facts.sampledPoints)} of ${fmtInt(facts.totalPoints)} points (uniform random sample; axes span full data)`,
     );
   }
   if (metric === "delta") lines.push("first bin omitted (Δ undefined)");

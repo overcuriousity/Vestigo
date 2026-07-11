@@ -6,8 +6,11 @@ import type {
   CompareTimeResponse,
   EventFilters,
   FieldNumericResponse,
+  FieldPivotResponse,
+  FieldScatterResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
+  PunchcardResponse,
   SavedChart,
   VizFieldsResponse,
 } from "./types";
@@ -70,6 +73,50 @@ export const vizApi = {
       field,
       buckets,
       series_limit: seriesLimit,
+    }),
+
+  /** Event counts by (day-of-week × hour-of-day), UTC — the punch-card chart. */
+  punchcard: (
+    caseId: string,
+    timelineId: string,
+    filters: EventFilters = {},
+  ): Promise<PunchcardResponse> =>
+    get<PunchcardResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/time-punchcard`, {
+      ...serializeEventFilterParams(filters),
+    }),
+
+  /** Top-X × top-Y co-occurrence matrix — feeds the pivot heatmap and Sankey flow. */
+  fieldPivot: (
+    caseId: string,
+    timelineId: string,
+    fieldX: string,
+    fieldY: string,
+    filters: EventFilters = {},
+    limitX = 10,
+    limitY = 10,
+  ): Promise<FieldPivotResponse> =>
+    get<FieldPivotResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-pivot`, {
+      ...serializeEventFilterParams(filters),
+      field_x: fieldX,
+      field_y: fieldY,
+      limit_x: limitX,
+      limit_y: limitY,
+    }),
+
+  /** Uniform random sample of numeric (x, y) pairs for the scatter plot. */
+  fieldScatter: (
+    caseId: string,
+    timelineId: string,
+    fieldX: string,
+    fieldY: string,
+    filters: EventFilters = {},
+    limit = 5000,
+  ): Promise<FieldScatterResponse> =>
+    get<FieldScatterResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-scatter`, {
+      ...serializeEventFilterParams(filters),
+      field_x: fieldX,
+      field_y: fieldY,
+      limit,
     }),
 
   /**

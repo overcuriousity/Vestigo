@@ -1868,3 +1868,395 @@ def test_embedding_wizard_scans_carry_memory_settings(service):
     assert len(scans) == 2
     for q in scans:
         assert HEAVY_SCAN_SETTINGS in q
+
+
+# ── heavy-scan guardrails + clock-skew on viz aggregations ──────────────────
+
+
+def test_viz_aggregations_carry_memory_settings() -> None:
+    """Every viz aggregation scan must carry the shared heavy-scan SETTINGS
+    clause (db/_scan.py) — a chart over a high-cardinality field is a
+    whole-corpus GROUP BY exactly like a detector scan, and without the
+    per-query memory cap N concurrent charts can stack unbounded scans."""
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    q = EventQuery(case_id="c1", source_ids=["s1"])
+
+    terms_row = FakeQueryResult(result_rows=[["a", 1, 1, 1]])
+    stats_row = FakeQueryResult(
+        result_rows=[[4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]]
+    )
+
+    services = {
+        "histogram": _viz_service([("intDiv(toUnixTimestamp", FakeQueryResult(result_rows=[]))]),
+        "histogram_explicit": _viz_service(
+            [("toStartOfInterval", FakeQueryResult(result_rows=[]))]
+        ),
+        "field_terms": _viz_service([("GROUP BY val", terms_row)]),
+        "field_numeric_stats": _viz_service(
+            [
+                ("stddevPop(v)", stats_row),
+                ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 4]])),
+            ]
+        ),
+        "field_value_timeseries": _viz_service(
+            [
+                ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+                ("GROUP BY val", terms_row),
+                ("toStartOfInterval", FakeQueryResult(result_rows=[])),
+            ]
+        ),
+    }
+    services["histogram"].histogram(q)
+    services["histogram_explicit"].histogram(
+        EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts)
+    )
+    services["field_terms"].field_terms(q, "artifact")
+    services["field_numeric_stats"].field_numeric_stats(q, "attr:latency_ms", bins=2)
+    services["field_value_timeseries"].field_value_timeseries(q, "attr:status_code", buckets=4)
+
+    for name, svc in services.items():
+        queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+        assert queries, name
+        for sql in queries:
+            assert HEAVY_SCAN_SETTINGS in sql, f"{name} scan missing settings:\n{sql}"
+
+
+def test_viz_compare_aggregations_carry_memory_settings() -> None:
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
+    p = EventQuery(case_id="c1", source_ids=["s1"], q="dos", start=min_ts, end=max_ts)
+    c = EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts)
+
+    svc_time = _seq_service(
+        [
+            (
+                "toStartOfInterval",
+                [FakeQueryResult(result_rows=[]), FakeQueryResult(result_rows=[])],
+            ),
+        ]
+    )
+    svc_time.compare_time_histogram(p, c, buckets=2)
+
+    svc_terms = _seq_service(
+        [
+            ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])]),
+            ("cmp_values", [FakeQueryResult(result_rows=[["GET", 3]])]),
+        ]
+    )
+    svc_terms.compare_field_terms(p, c, "attr:method")
+
+    svc_numeric = _seq_service(
+        [
+            (
+                "count(v), min(v), max(v)",
+                [
+                    FakeQueryResult(result_rows=[[5, 0.0, 10.0]]),
+                    FakeQueryResult(result_rows=[[5, 0.0, 10.0]]),
+                ],
+            ),
+            (
+                "toInt64(floor(",
+                [FakeQueryResult(result_rows=[[0, 5]]), FakeQueryResult(result_rows=[[0, 5]])],
+            ),
+        ]
+    )
+    svc_numeric.compare_field_numeric(p, c, "attr:bytes", bins=2)
+
+    for name, svc in (("time", svc_time), ("terms", svc_terms), ("numeric", svc_numeric)):
+        queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+        assert queries, name
+        for sql in queries:
+            assert HEAVY_SCAN_SETTINGS in sql, f"compare {name} scan missing settings:\n{sql}"
+
+
+class _CountingGate:
+    """Context-manager stand-in for HEAVY_SCAN_GATE that detects re-entry."""
+
+    def __init__(self) -> None:
+        self.acquired = 0
+        self.depth = 0
+        self.max_depth = 0
+
+    def __enter__(self) -> None:
+        self.acquired += 1
+        self.depth += 1
+        self.max_depth = max(self.max_depth, self.depth)
+
+    def __exit__(self, *exc: Any) -> None:
+        self.depth -= 1
+
+
+def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> None:
+    """Public viz aggregations acquire the admission gate exactly once — the
+    nested field_terms call inside field_value_timeseries / compare_field_terms
+    must go through the ungated impl, or a BoundedSemaphore(1) deployment
+    (TS_STAT_SCAN_CONCURRENCY=1) would deadlock against itself."""
+    import tracesignal.db.queries as queries_mod
+
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+
+    gate = _CountingGate()
+    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
+    svc = _viz_service(
+        [
+            ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 1, 1, 1]])),
+            ("toStartOfInterval", FakeQueryResult(result_rows=[])),
+        ]
+    )
+    svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code", buckets=4
+    )
+    assert gate.acquired == 1
+    assert gate.max_depth == 1
+
+    gate2 = _CountingGate()
+    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate2)
+    svc2 = _seq_service(
+        [
+            ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])]),
+            ("cmp_values", [FakeQueryResult(result_rows=[["GET", 3]])]),
+        ]
+    )
+    svc2.compare_field_terms(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos"),
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:method",
+    )
+    assert gate2.acquired == 1
+    assert gate2.max_depth == 1
+
+
+def test_field_value_timeseries_honors_source_offsets() -> None:
+    """W2: the value×time chart must range and bucket on the offset-corrected
+    timestamp like `histogram` does, or the two charts bucket the same filtered
+    view on different timelines whenever a source is skew-corrected."""
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _viz_service(
+        [
+            ("min(if(", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 1, 1, 1]])),
+            ("toStartOfInterval", FakeQueryResult(result_rows=[])),
+        ]
+    )
+    svc.field_value_timeseries(
+        EventQuery(case_id="c1", source_ids=["s1"], source_offsets={"s1": 3600}),
+        "attr:status_code",
+        buckets=4,
+    )
+    queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    range_q = next(sql for sql in queries if "min(if(" in sql)
+    bucket_q = next(sql for sql in queries if "toStartOfInterval" in sql)
+    assert "addSeconds(timestamp, transform(source_id" in range_q
+    assert "toStartOfInterval(if(" in bucket_q
+    assert "addSeconds(timestamp, transform(source_id" in bucket_q
+
+
+def test_compare_time_histogram_honors_source_offsets() -> None:
+    """W2: both compare layers bucket (and, without an explicit window, range)
+    on their own offset-corrected timestamps."""
+    p_min = datetime(2024, 1, 1, tzinfo=UTC)
+    p_max = datetime(2024, 1, 1, 6, tzinfo=UTC)
+    svc = _seq_service(
+        [
+            (
+                "min(if(",
+                [
+                    FakeQueryResult(result_rows=[[p_min, p_max]]),
+                    FakeQueryResult(result_rows=[[p_min, p_max]]),
+                ],
+            ),
+            (
+                "toStartOfInterval",
+                [FakeQueryResult(result_rows=[]), FakeQueryResult(result_rows=[])],
+            ),
+        ]
+    )
+    offsets = {"s1": 3600}
+    svc.compare_time_histogram(
+        EventQuery(case_id="c1", source_ids=["s1"], q="dos", source_offsets=offsets),
+        EventQuery(case_id="c1", source_ids=["s1"], source_offsets=offsets),
+        buckets=6,
+    )
+    queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    range_qs = [sql for sql in queries if "min(if(" in sql]
+    bucket_qs = [sql for sql in queries if "toStartOfInterval" in sql]
+    assert len(range_qs) == 2
+    assert len(bucket_qs) == 2
+    for sql in bucket_qs:
+        assert "toStartOfInterval(if(" in sql
+
+
+# ── time_punchcard / field_pivot / field_scatter ─────────────────────────────
+
+
+def test_time_punchcard_returns_sparse_cells_and_totals() -> None:
+    svc = _viz_service(
+        [
+            (
+                "toDayOfWeek",
+                FakeQueryResult(result_rows=[[1, 9, 40], [1, 10, 60], [6, 3, 7]]),
+            ),
+        ]
+    )
+    result = svc.time_punchcard(EventQuery(case_id="c1", source_ids=["s1"]))
+    assert result["kind"] == "punchcard"
+    assert result["total"] == 107
+    assert result["max_count"] == 60
+    assert result["cells"] == [
+        {"dow": 1, "hour": 9, "count": 40},
+        {"dow": 1, "hour": 10, "count": 60},
+        {"dow": 6, "hour": 3, "count": 7},
+    ]
+    sql, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
+    # Day/hour extraction pinned to UTC — server timezone must never reshape
+    # the punch card — and sentinel (undated) rows excluded.
+    assert "toDayOfWeek(timestamp, 0, 'UTC')" in sql
+    assert "toHour(timestamp, 'UTC')" in sql
+    assert TS_NOT_SENTINEL_SQL in sql
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
+    assert HEAVY_SCAN_SETTINGS in sql
+
+
+def test_time_punchcard_honors_source_offsets() -> None:
+    svc = _viz_service([("toDayOfWeek", FakeQueryResult(result_rows=[]))])
+    svc.time_punchcard(EventQuery(case_id="c1", source_ids=["s1"], source_offsets={"s1": 3600}))
+    sql, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "addSeconds(timestamp, transform(source_id" in sql
+
+
+def test_field_pivot_builds_matrix_with_other_rollup() -> None:
+    svc = _viz_service(
+        [
+            # Terms scan for field_x = artifact (bare column expr).
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
+            # Terms scan for field_y = attr:status (map lookup expr).
+            (
+                "attributes[{field_key:String}] AS val",
+                FakeQueryResult(result_rows=[["200", 80, 100, 4]]),
+            ),
+            # Matrix scan: '' cells are the per-axis Other rollups.
+            (
+                "GROUP BY xv, yv",
+                FakeQueryResult(result_rows=[["auth", "200", 50], ["", "200", 9], ["auth", "", 5]]),
+            ),
+        ]
+    )
+    result = svc.field_pivot(
+        EventQuery(case_id="c1", source_ids=["s1"]), "artifact", "attr:status", limit_x=5, limit_y=5
+    )
+    assert result["kind"] == "pivot"
+    assert result["x_values"] == ["auth"]
+    assert result["y_values"] == ["200"]
+    assert result["x_distinct"] == 3
+    assert result["y_distinct"] == 4
+    assert result["total"] == 64
+    assert {"x": "", "y": "200", "count": 9} in result["cells"]
+
+    matrix_sql, matrix_params = next(
+        (sql, p)
+        for sql, p in svc.store.client.queries  # type: ignore[union-attr]
+        if "GROUP BY xv, yv" in sql
+    )
+    # Both axes bind their own field-key params (never a shared name) and
+    # their own top-N value lists.
+    assert matrix_params is not None
+    assert matrix_params.get("field_key_y") == "status"
+    assert matrix_params.get("pivot_x_values") == ["auth"]
+    assert matrix_params.get("pivot_y_values") == ["200"]
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
+    assert HEAVY_SCAN_SETTINGS in matrix_sql
+
+
+def test_field_pivot_empty_axis_skips_matrix_scan() -> None:
+    svc = _viz_service(
+        [
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
+            ("attributes[{field_key:String}] AS val", FakeQueryResult(result_rows=[])),
+        ]
+    )
+    result = svc.field_pivot(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", "attr:status")
+    assert result["cells"] == []
+    assert result["total"] == 0
+    assert not any(
+        "GROUP BY xv, yv" in sql
+        for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
+    )
+
+
+def test_field_pivot_acquires_scan_gate_once(monkeypatch: Any) -> None:
+    """The two parallel terms scans run under the parent's single gate slot."""
+    import tracesignal.db.queries as queries_mod
+
+    gate = _CountingGate()
+    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
+    svc = _viz_service(
+        [
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
+            (
+                "attributes[{field_key:String}] AS val",
+                FakeQueryResult(result_rows=[["200", 80, 100, 4]]),
+            ),
+            ("GROUP BY xv, yv", FakeQueryResult(result_rows=[["auth", "200", 50]])),
+        ]
+    )
+    svc.field_pivot(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", "attr:status")
+    assert gate.acquired == 1
+    assert gate.max_depth == 1
+
+
+def test_field_scatter_samples_points_with_true_extents() -> None:
+    svc = _viz_service(
+        [
+            ("min(vx)", FakeQueryResult(result_rows=[[120000, 0.0, 1000.0, -5.0, 99.0]])),
+            (
+                "ORDER BY rand()",
+                FakeQueryResult(result_rows=[[10.0, 1.0], [500.0, 42.0]]),
+            ),
+        ]
+    )
+    result = svc.field_scatter(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:bytes", "attr:latency", limit=2
+    )
+    assert result["kind"] == "scatter"
+    assert result["total"] == 120000
+    assert result["sampled"] == 2
+    # Extents come from the full-data stats scan, not the sample.
+    assert (result["x_min"], result["x_max"]) == (0.0, 1000.0)
+    assert (result["y_min"], result["y_max"]) == (-5.0, 99.0)
+    assert result["points"] == [[10.0, 1.0], [500.0, 42.0]]
+
+    sample_sql = next(
+        sql
+        for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
+        if "ORDER BY rand()" in sql
+    )
+    assert "LIMIT 2" in sample_sql
+    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
+    assert HEAVY_SCAN_SETTINGS in sample_sql
+    assert "toFloat64OrNull(toString(" in sample_sql
+
+
+def test_field_scatter_non_numeric_skips_sample_scan() -> None:
+    """total == 0 (no numeric pairs) → no second scan, categorical fallback signal."""
+    svc = _viz_service([("min(vx)", FakeQueryResult(result_rows=[[0, None, None, None, None]]))])
+    result = svc.field_scatter(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:user_agent", "attr:bytes"
+    )
+    assert result["total"] == 0
+    assert result["points"] == []
+    assert result["x_min"] is None
+    assert not any(
+        "ORDER BY rand()" in sql
+        for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
+    )

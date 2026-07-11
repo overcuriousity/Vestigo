@@ -3,6 +3,7 @@ import {
   chartConfigToParams,
   chartConfigToStored,
   DEFAULT_CHART_CONFIG,
+  filterParamsPreservingChartConfig,
   paramsToChartConfig,
   parseStoredChartConfig,
   type ChartConfig,
@@ -11,6 +12,7 @@ import {
 const fullConfig: ChartConfig = {
   v: 1,
   field: "attr:src_ip",
+  fieldY: null,
   scale: "nominal",
   chartType: "time",
   metric: "ratio",
@@ -62,6 +64,52 @@ describe("URL round-trip", () => {
     const params = new URLSearchParams({ c_compare: "custom", c_compare_filters: "{broken" });
     expect(paramsToChartConfig(params).compare).toEqual({ mode: "off" });
   });
+
+  it("round-trips a two-field chart (c_field_y)", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "pivot",
+      field: "attr:username",
+      fieldY: "attr:workstation",
+      options: { limitX: 8, limitY: 12 },
+    };
+    const params = chartConfigToParams(config);
+    expect(params.get("c_field_y")).toBe("attr:workstation");
+    expect(paramsToChartConfig(params)).toEqual(config);
+  });
+
+  it("clears a stale c_field_y when the next config has none", () => {
+    const params = chartConfigToParams({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "sankey",
+      field: "artifact",
+      fieldY: "attr:status",
+    });
+    chartConfigToParams(DEFAULT_CHART_CONFIG, params);
+    expect(params.get("c_field_y")).toBeNull();
+  });
+});
+
+describe("filterParamsPreservingChartConfig", () => {
+  it("writes the new filters while carrying over every c_* key", () => {
+    const prev = chartConfigToParams(fullConfig, new URLSearchParams({ q: "old" }));
+    const next = filterParamsPreservingChartConfig(
+      { q: "dos", start: "2024-01-01T00:00:00Z", end: "2024-01-02T00:00:00Z" },
+      prev,
+    );
+    // Filters replaced wholesale…
+    expect(next.get("q")).toBe("dos");
+    expect(next.get("start")).toBe("2024-01-01T00:00:00Z");
+    // …chart config untouched (round-trips to the same object).
+    expect(paramsToChartConfig(next)).toEqual(fullConfig);
+  });
+
+  it("drops removed filters instead of inheriting them", () => {
+    const prev = chartConfigToParams(fullConfig, new URLSearchParams({ q: "old" }));
+    const next = filterParamsPreservingChartConfig({}, prev);
+    expect(next.get("q")).toBeNull();
+    expect(paramsToChartConfig(next)).toEqual(fullConfig);
+  });
 });
 
 describe("stored (saved chart) round-trip", () => {
@@ -81,5 +129,32 @@ describe("stored (saved chart) round-trip", () => {
   it("baseline compare survives the round-trip", () => {
     const config: ChartConfig = { ...DEFAULT_CHART_CONFIG, compare: { mode: "baseline" } };
     expect(parseStoredChartConfig(chartConfigToStored(config))).toEqual(config);
+  });
+
+  it("round-trips a two-field chart through the stored shape", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "scatter",
+      scale: "ratio",
+      field: "attr:bytes",
+      fieldY: "attr:latency",
+      options: { sampleLimit: 10000 },
+    };
+    expect(parseStoredChartConfig(chartConfigToStored(config))).toEqual(config);
+  });
+
+  it("loads pre-fieldY v1 configs with fieldY null (additive field)", () => {
+    const stored = chartConfigToStored(fullConfig) as Record<string, unknown>;
+    delete stored.fieldY;
+    expect(parseStoredChartConfig(stored)).toEqual({ ...fullConfig, fieldY: null });
+  });
+
+  it("falls back to the default chart type for unknown stored types", () => {
+    // An OLD frontend loading a NEWER config (unknown chartType) must degrade
+    // gracefully, not error — this locks the forward-compat behavior in.
+    const stored = { ...chartConfigToStored(fullConfig), chartType: "hologram" };
+    const parsed = parseStoredChartConfig(stored);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.chartType).toBe(DEFAULT_CHART_CONFIG.chartType);
   });
 });

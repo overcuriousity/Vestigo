@@ -16,11 +16,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, HelpCircle, Lightbulb, X } from "lucide-react";
+import { ArrowLeft, HelpCircle, Lightbulb, RotateCcw, X } from "lucide-react";
 import { vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
-import { paramsToFilters } from "@/lib/queryParams";
+import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { applyFieldEntries } from "@/lib/fieldFilters";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -33,6 +34,8 @@ import {
 import { ExportControls } from "@/components/viz/ExportControls";
 import { CompareFilterEditor } from "@/components/viz/CompareFilterEditor";
 import { SavedChartsRail } from "@/components/viz/SavedChartsRail";
+import { ChartActionPopover } from "@/components/viz/ChartActionPopover";
+import type { ChartValueClick } from "@/components/viz/lib/interaction";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
@@ -42,8 +45,13 @@ import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
+import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
+import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
+import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import {
   chartConfigToParams,
+  filterParamsPreservingChartConfig,
   paramsToChartConfig,
   type ChartConfig,
   type ChartType,
@@ -58,6 +66,7 @@ import type {
   CompareNumericResponse,
   CompareTermsResponse,
   CompareTimeResponse,
+  EventFilters,
   HistogramResponse,
 } from "@/api/types";
 
@@ -81,6 +90,16 @@ const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
 };
 
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
+
+/** Why Compare is disabled for a chart type — shown instead of hiding the
+ * control (see chartMeta: pie/box/violin/ecdf have no honest two-layer
+ * encoding; the newer kinds simply have no compare aggregation yet). */
+function compareUnavailableReason(chartType: ChartType): string {
+  if (chartType === "punchcard" || chartType === "pivot" || chartType === "sankey" || chartType === "scatter") {
+    return "Compare isn't supported for this chart type yet.";
+  }
+  return "This chart type has no honest two-layer encoding — overlaid layers would misrepresent one of them. Use Bar, Histogram, or the Time histogram to compare.";
+}
 
 /** Adapt the single-layer histogram response to the compare shape so one
  * chart component renders both the compare-off and compare-on cases. */
@@ -115,8 +134,28 @@ export function VisualizePage() {
     [setSearchParams],
   );
 
-  const { field, scale, chartType, metric } = config;
+  // The one place a filter change is written from this page — the helper
+  // carries the `c_*` chart-config keys over, since `filtersToParams`
+  // builds a fresh URLSearchParams (see its doc comment).
+  const updateFilters = useCallback(
+    (next: EventFilters) => {
+      setSearchParams((prev) => filterParamsPreservingChartConfig(next, prev));
+    },
+    [setSearchParams],
+  );
+
+  // Click-to-filter: charts report the clicked mark's field=value pair(s);
+  // the popover offers filter in / filter out / open in Explorer.
+  const [pendingClick, setPendingClick] = useState<ChartValueClick | null>(null);
+  const handleChartValueClick = useCallback((click: ChartValueClick) => {
+    setPendingClick(click);
+  }, []);
+
+  const { field, fieldY, scale, chartType, metric } = config;
   const dataKind = CHART_META[chartType].dataKind;
+  const requiresSecondField = !!CHART_META[chartType].requiresSecondField;
+  // "time" and "punchcard" chart the whole event count — no field involved.
+  const fieldFree = dataKind === "time" || dataKind === "punchcard";
   const compareOn = config.compare.mode !== "off";
   const compareSupported = !!CHART_META[chartType].supportsCompare;
   const compareApiSpec: CompareMode | null =
@@ -129,6 +168,9 @@ export function VisualizePage() {
   const topN = Math.min(config.options.topN ?? 10, dataKind === "timeseries" ? 20 : 50);
   const bins = config.options.bins ?? 30;
   const buckets = config.options.buckets ?? 60;
+  const limitX = config.options.limitX ?? 10;
+  const limitY = config.options.limitY ?? 10;
+  const sampleLimit = config.options.sampleLimit ?? 5000;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Preset strip: open by default on a fresh page (no chart state in the
@@ -170,26 +212,28 @@ export function VisualizePage() {
     queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
     // Run only when a numeric chart actually needs the data, or when a
     // *field-dependent* chart needs its one-time scale probe. The field-free
-    // time chart (the fresh-load default) never needs it — skipping the probe
-    // there avoids the field_numeric_stats double-scan on first paint.
+    // charts (time, punchcard) never need it, and the two-field charts have
+    // their own endpoints and keep their chart type — skipping the probe
+    // there avoids the field_numeric_stats double-scan.
     enabled:
       !!(caseId && timelineId && field) &&
       (dataKind === "numeric" ||
-        (dataKind !== "time" && field !== autoProbedField.current)),
+        (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
   });
 
   useEffect(() => {
     if (!field || field === autoProbedField.current) return;
     if (numericQuery.data == null) return;
     autoProbedField.current = field;
-    // Don't yank the analyst off the field-independent time chart.
-    if (dataKind === "time") return;
+    // Don't yank the analyst off the field-independent charts (time,
+    // punchcard) or a deliberately-picked two-field chart.
+    if (fieldFree || requiresSecondField) return;
     const isNumeric = numericQuery.data.count > 0;
     updateConfig({
       scale: isNumeric ? "ratio" : "nominal",
       chartType: isNumeric ? "histogram" : "bar",
     });
-  }, [field, numericQuery.data, dataKind, updateConfig]);
+  }, [field, numericQuery.data, fieldFree, requiresSecondField, updateConfig]);
 
   // Keep chartType valid when the analyst switches scale — clamped at event
   // time rather than in an effect, so there is never a render with an
@@ -276,6 +320,26 @@ export function VisualizePage() {
     enabled: !!(caseId && timelineId) && dataKind === "time",
   });
 
+  const punchcardQuery = useQuery({
+    queryKey: ["viz-punchcard", caseId, timelineId, filters],
+    queryFn: () => vizApi.punchcard(caseId!, timelineId!, filters),
+    enabled: !!(caseId && timelineId) && dataKind === "punchcard",
+  });
+
+  // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
+  // — switching between those chart types refetches nothing.
+  const pivotQuery = useQuery({
+    queryKey: ["viz-field-pivot", caseId, timelineId, field, fieldY, filters, limitX, limitY],
+    queryFn: () => vizApi.fieldPivot(caseId!, timelineId!, field!, fieldY!, filters, limitX, limitY),
+    enabled: !!(caseId && timelineId && field && fieldY) && dataKind === "pivot",
+  });
+
+  const scatterQuery = useQuery({
+    queryKey: ["viz-field-scatter", caseId, timelineId, field, fieldY, filters, sampleLimit],
+    queryFn: () => vizApi.fieldScatter(caseId!, timelineId!, field!, fieldY!, filters, sampleLimit),
+    enabled: !!(caseId && timelineId && field && fieldY) && dataKind === "scatter",
+  });
+
   const availableChartTypes = chartTypesFor(scale);
 
   // Data-derived caption facts for the active query — totals, grid width,
@@ -314,6 +378,18 @@ export function VisualizePage() {
   } else if (dataKind === "timeseries" && timeseriesQuery.data) {
     facts.shownValues = timeseriesQuery.data.series.length;
     facts.intervalSeconds = timeseriesQuery.data.interval_seconds;
+  } else if (dataKind === "punchcard" && punchcardQuery.data) {
+    facts.primaryTotal = punchcardQuery.data.total;
+  } else if (dataKind === "pivot" && pivotQuery.data) {
+    facts.primaryTotal = pivotQuery.data.total;
+    facts.xDistinct = pivotQuery.data.x_distinct;
+    facts.xShown = pivotQuery.data.x_values.length;
+    facts.yDistinct = pivotQuery.data.y_distinct;
+    facts.yShown = pivotQuery.data.y_values.length;
+  } else if (dataKind === "scatter" && scatterQuery.data) {
+    facts.primaryTotal = scatterQuery.data.total;
+    facts.sampledPoints = scatterQuery.data.sampled;
+    facts.totalPoints = scatterQuery.data.total;
   }
 
   const captionLines = buildCaptionLines({
@@ -330,7 +406,10 @@ export function VisualizePage() {
     (dataKind === "terms" && (compareTermsOn ? compareTermsQuery.isLoading : termsQuery.isLoading)) ||
     (dataKind === "numeric" &&
       (compareNumericOn ? compareNumericQuery.isLoading : numericQuery.isLoading)) ||
-    (dataKind === "timeseries" && timeseriesQuery.isLoading);
+    (dataKind === "timeseries" && timeseriesQuery.isLoading) ||
+    (dataKind === "punchcard" && punchcardQuery.isLoading) ||
+    (dataKind === "pivot" && pivotQuery.isLoading) ||
+    (dataKind === "scatter" && scatterQuery.isLoading);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -359,9 +438,9 @@ export function VisualizePage() {
         {/* Field picker */}
         <div>
           <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Field
+            {requiresSecondField ? "Field (X)" : "Field"}
           </label>
-          {dataKind === "time" ? (
+          {fieldFree ? (
             <div className="rounded border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg-muted)]">
               — event count —
             </div>
@@ -383,6 +462,35 @@ export function VisualizePage() {
             </Select>
           )}
         </div>
+
+        {/* Second field picker — pivot/sankey/scatter chart both axes */}
+        {requiresSecondField && (
+          <div>
+            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+              Field (Y)
+            </label>
+            <Select
+              value={fieldY ?? undefined}
+              onValueChange={(v) => updateConfig({ fieldY: v })}
+            >
+              <SelectTrigger className="text-sm">
+                <SelectValue placeholder="Choose a second field…" />
+              </SelectTrigger>
+              <SelectContent>
+                {(fieldsQuery.data?.fields ?? [])
+                  .filter((f) => f.token !== field)
+                  .map((f) => (
+                    <SelectItem key={f.token} value={f.token}>
+                      {f.token}{" "}
+                      <span className="text-[var(--color-fg-muted)]">
+                        ({f.distinct} distinct)
+                      </span>
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
 
         {/* Scale of measurement */}
         <div>
@@ -435,63 +543,75 @@ export function VisualizePage() {
           </Select>
         </div>
 
-        {/* Compare — time histogram, bar (grouped), numeric histogram (overlay) */}
-        {compareSupported && (
-          <div>
-            <label className="mb-1 flex items-center gap-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Compare
-              <Tooltip
-                content="Adds a second layer evaluated on the same time grid: the whole timeline (baseline) or a second filter set. Both layers always share the time range and bucket width, so they are directly comparable."
-                side="right"
+        {/* Compare — time histogram, bar (grouped), numeric histogram (overlay).
+            Always rendered; disabled (with the reason) for chart types without
+            an honest two-layer encoding, instead of silently disappearing. */}
+        <div>
+          <label className="mb-1 flex items-center gap-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Compare
+            <Tooltip
+              content={
+                compareSupported
+                  ? "Adds a second layer evaluated on the same time grid: the whole timeline (baseline) or a second filter set. Both layers always share the time range and bucket width, so they are directly comparable."
+                  : compareUnavailableReason(chartType)
+              }
+              side="right"
+            >
+              <HelpCircle size={12} className="text-[var(--color-fg-muted)]" />
+            </Tooltip>
+          </label>
+          <div className="space-y-1">
+            {(
+              [
+                { mode: "off", label: "Off" },
+                { mode: "baseline", label: "Baseline (all events)" },
+                { mode: "custom", label: "Custom filters" },
+              ] as const
+            ).map((opt) => (
+              <label
+                key={opt.mode}
+                className={`flex items-center gap-2 rounded px-2 py-1.5 text-sm ${
+                  !compareSupported
+                    ? "cursor-not-allowed opacity-50"
+                    : config.compare.mode === opt.mode
+                      ? "cursor-pointer bg-[var(--color-accent-dim)]"
+                      : "cursor-pointer hover:bg-[var(--color-bg-hover)]"
+                }`}
               >
-                <HelpCircle size={12} className="text-[var(--color-fg-muted)]" />
-              </Tooltip>
-            </label>
-            <div className="space-y-1">
-              {(
-                [
-                  { mode: "off", label: "Off" },
-                  { mode: "baseline", label: "Baseline (all events)" },
-                  { mode: "custom", label: "Custom filters" },
-                ] as const
-              ).map((opt) => (
-                <label
-                  key={opt.mode}
-                  className={`flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
-                    config.compare.mode === opt.mode
-                      ? "bg-[var(--color-accent-dim)]"
-                      : "hover:bg-[var(--color-bg-hover)]"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="compare"
-                    checked={config.compare.mode === opt.mode}
-                    onChange={() =>
-                      updateConfig({
-                        compare:
-                          opt.mode === "custom"
-                            ? { mode: "custom", filters: {} }
-                            : { mode: opt.mode },
-                      })
-                    }
-                    className="accent-[var(--color-accent)]"
-                  />
-                  {opt.label}
-                </label>
-              ))}
-            </div>
-            {config.compare.mode === "custom" && (
-              <div className="mt-2 rounded border border-[var(--color-border)] p-2">
-                <CompareFilterEditor
-                  filters={config.compare.filters}
-                  onChange={(f) => updateConfig({ compare: { mode: "custom", filters: f } })}
-                  fields={fieldsQuery.data?.fields ?? []}
+                <input
+                  type="radio"
+                  name="compare"
+                  disabled={!compareSupported}
+                  checked={compareSupported && config.compare.mode === opt.mode}
+                  onChange={() =>
+                    updateConfig({
+                      compare:
+                        opt.mode === "custom"
+                          ? { mode: "custom", filters: {} }
+                          : { mode: opt.mode },
+                    })
+                  }
+                  className="accent-[var(--color-accent)]"
                 />
-              </div>
-            )}
+                {opt.label}
+              </label>
+            ))}
           </div>
-        )}
+          {!compareSupported && (
+            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+              {compareUnavailableReason(chartType)}
+            </p>
+          )}
+          {compareSupported && config.compare.mode === "custom" && (
+            <div className="mt-2 rounded border border-[var(--color-border)] p-2">
+              <CompareFilterEditor
+                filters={config.compare.filters}
+                onChange={(f) => updateConfig({ compare: { mode: "custom", filters: f } })}
+                fields={fieldsQuery.data?.fields ?? []}
+              />
+            </div>
+          )}
+        </div>
 
         {/* Metric */}
         {dataKind === "time" && (
@@ -703,6 +823,77 @@ export function VisualizePage() {
             />
           </div>
         )}
+        {dataKind === "pivot" && (
+          <>
+            <div>
+              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+                Top X values: {limitX}
+              </label>
+              <input
+                type="range"
+                min={3}
+                max={50}
+                step={1}
+                value={limitX}
+                onChange={(e) =>
+                  updateConfig({ options: { ...config.options, limitX: Number(e.target.value) } })
+                }
+                className="w-full accent-[var(--color-accent)]"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+                Top Y values: {limitY}
+              </label>
+              <input
+                type="range"
+                min={3}
+                max={50}
+                step={1}
+                value={limitY}
+                onChange={(e) =>
+                  updateConfig({ options: { ...config.options, limitY: Number(e.target.value) } })
+                }
+                className="w-full accent-[var(--color-accent)]"
+              />
+            </div>
+          </>
+        )}
+        {dataKind === "scatter" && (
+          <div className="space-y-3">
+            <div>
+              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+                Sample size
+              </label>
+              <Select
+                value={String(sampleLimit)}
+                onValueChange={(v) =>
+                  updateConfig({ options: { ...config.options, sampleLimit: Number(v) } })
+                }
+              >
+                <SelectTrigger className="text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="1000">1,000 points</SelectItem>
+                  <SelectItem value="5000">5,000 points</SelectItem>
+                  <SelectItem value="10000">10,000 points</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+              <input
+                type="checkbox"
+                checked={config.options.logScale ?? false}
+                onChange={(e) =>
+                  updateConfig({ options: { ...config.options, logScale: e.target.checked } })
+                }
+                className="accent-[var(--color-accent)]"
+              />
+              Log-scale axes (positive values only)
+            </label>
+          </div>
+        )}
 
         <div className="mt-auto space-y-3 border-t border-[var(--color-border)] pt-3">
           {caseId && timelineId && (
@@ -715,7 +906,15 @@ export function VisualizePage() {
           )}
           <ExportControls
             svgRef={svgRef}
-            filename={`${dataKind === "time" ? "events_over_time" : (field ?? "visualization")}_${chartType}`}
+            filename={`${
+              dataKind === "time"
+                ? "events_over_time"
+                : dataKind === "punchcard"
+                  ? "activity_punchcard"
+                  : requiresSecondField && field && fieldY
+                    ? `${field}_x_${fieldY}`
+                    : (field ?? "visualization")
+            }_${chartType}`}
             captionLines={captionLines}
           />
         </div>
@@ -723,6 +922,21 @@ export function VisualizePage() {
 
       {/* Canvas */}
       <div className="flex-1 overflow-auto p-4">
+        {(filters.start || filters.end) && (
+          <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+            <span>
+              Time range: {filters.start ?? "…"} → {filters.end ?? "…"}
+            </span>
+            <button
+              type="button"
+              onClick={() => updateFilters({ ...filters, start: undefined, end: undefined })}
+              className="flex items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 hover:bg-[var(--color-bg-hover)]"
+              title="Clear the start/end range (set by brush-zoom or inherited from the Explorer)"
+            >
+              <RotateCcw size={11} /> Reset range
+            </button>
+          </div>
+        )}
         {presetsOpen && (
           <div className="mb-4 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-3">
             <div className="mb-2 flex items-center justify-between">
@@ -753,7 +967,7 @@ export function VisualizePage() {
             </div>
           </div>
         )}
-        {dataKind !== "time" && !field ? (
+        {!fieldFree && !field ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
             {fieldsQuery.isLoading ? (
               <>
@@ -763,6 +977,10 @@ export function VisualizePage() {
             ) : (
               "Choose a field to visualize."
             )}
+          </div>
+        ) : requiresSecondField && !fieldY ? (
+          <div className="flex h-full items-center justify-center text-sm text-[var(--color-fg-muted)]">
+            Choose a second field (Y) to chart {CHART_META[chartType].label.toLowerCase()}.
           </div>
         ) : loading ? (
           <div className="flex h-full items-center justify-center">
@@ -776,6 +994,7 @@ export function VisualizePage() {
                 metric={metric}
                 hasComparison={compareOn}
                 svgRef={svgRef}
+                onRangeSelect={(start, end) => updateFilters({ ...filters, start, end })}
               />
             )}
             {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (
@@ -786,13 +1005,14 @@ export function VisualizePage() {
                 sort={config.options.sort ?? "count"}
                 logScale={config.options.logScale ?? false}
                 svgRef={svgRef}
+                onValueClick={handleChartValueClick}
               />
             )}
             {chartType === "pie" && termsQuery.data && (
-              <PieChart terms={termsQuery.data} svgRef={svgRef} />
+              <PieChart terms={termsQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
             )}
             {chartType === "heatmap" && timeseriesQuery.data && (
-              <Heatmap data={timeseriesQuery.data} svgRef={svgRef} />
+              <Heatmap data={timeseriesQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
             )}
             {chartType === "line" && timeseriesQuery.data && (
               <LineChart
@@ -800,6 +1020,7 @@ export function VisualizePage() {
                 seriesMode={config.options.seriesMode ?? "overlay"}
                 showLegend={config.options.legend ?? true}
                 svgRef={svgRef}
+                onValueClick={handleChartValueClick}
               />
             )}
             {chartType === "histogram" &&
@@ -820,10 +1041,48 @@ export function VisualizePage() {
             {chartType === "ecdf" && numericQuery.data && (
               <EcdfChart stats={numericQuery.data} svgRef={svgRef} />
             )}
+            {chartType === "punchcard" && punchcardQuery.data && (
+              <PunchCard data={punchcardQuery.data} svgRef={svgRef} />
+            )}
+            {chartType === "pivot" && pivotQuery.data && (
+              <PivotHeatmap
+                data={pivotQuery.data}
+                svgRef={svgRef}
+                onValueClick={handleChartValueClick}
+              />
+            )}
+            {chartType === "sankey" && pivotQuery.data && (
+              <SankeyFlow
+                data={pivotQuery.data}
+                svgRef={svgRef}
+                onValueClick={handleChartValueClick}
+              />
+            )}
+            {chartType === "scatter" && scatterQuery.data && (
+              <ScatterChart
+                data={scatterQuery.data}
+                logScale={config.options.logScale ?? false}
+                svgRef={svgRef}
+              />
+            )}
             <ChartCaption lines={captionLines} />
           </div>
         )}
       </div>
+
+      {pendingClick && caseId && timelineId && (
+        <ChartActionPopover
+          click={pendingClick}
+          explorerHref={`/cases/${caseId}/timelines/${timelineId}?${filtersToParams(
+            applyFieldEntries(filters, pendingClick.entries, true),
+          ).toString()}`}
+          onFilter={(include) => {
+            updateFilters(applyFieldEntries(filters, pendingClick.entries, include));
+            setPendingClick(null);
+          }}
+          onClose={() => setPendingClick(null)}
+        />
+      )}
     </div>
   );
 }

@@ -77,15 +77,27 @@ resolved — this file holds only the condensed, still-open action items.
   when `q` is a plain token (needs index DDL on existing tables).
 
 - [ ] **M24 — Visualize scan-avoidance (deferred from session 33).** Every viz chart
-  aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, all compare
-  variants in `db/queries.py`) is a live full-column scan; the `db/field_stats.py` cache
-  (distinct/coverage + 3 samples per field) is consumed only by `viz/fields`. Follow-ups:
-  (a) seed first-load *unfiltered* top-values from the cache instead of a live `field_terms`
-  scan; (b) merge `field_value_timeseries`' ~3 scans (terms + range + bucket) into fewer
-  passes; (c) baseline-mode compare re-scans the whole timeline every render — cache or bound
-  it. Not `field_numeric_stats`: its two scans are a deliberate fixed-width-bin
-  reproducibility choice (documented in the method). Session 33 already removed the first-load
-  numeric probe and defaulted Visualize to the single-pass histogram.
+  aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, the new
+  `time_punchcard`/`field_pivot`/`field_scatter`, all compare variants in `db/queries.py`)
+  is a live full-column scan; the `db/field_stats.py` cache (distinct/coverage + 3 samples
+  per field) is consumed only by `viz/fields`. Session 49 applied the **memory guardrails**
+  (`HEAVY_SCAN_SETTINGS` + `HEAVY_SCAN_GATE` admission gate, previously detector-only) to
+  every viz aggregation, so the scans are now bounded — M24's remaining scope is avoiding
+  them: (a) seed first-load *unfiltered* top-values from the cache instead of a live
+  `field_terms` scan; (b) merge `field_value_timeseries`' ~3 scans (terms + range + bucket)
+  into fewer passes; (c) baseline-mode compare re-scans the whole timeline every render —
+  cache or bound it. Not `field_numeric_stats`: its two scans are a deliberate
+  fixed-width-bin reproducibility choice (documented in the method). Known accepted wrinkle:
+  compare runs its two layer scans in parallel inside one gate slot, so a compare render can
+  momentarily use ~2× the per-slot budget (each scan still individually capped by
+  `max_memory_usage`).
+
+- [ ] **M26 — Unify the two time-histogram implementations (deferred, session 49).** The
+  Explorer's `TimelineHistogram` (div-bars, markers/baseline bands/scroll indicator/mark
+  mode) and the Visualize page's `TimeHistogram`/`CompareHistogram` (d3-SVG, now with its
+  own brush-zoom) duplicate bucket math and brush gestures. Deliberately deferred: after
+  session 49 the shared piece is only the brush gesture, and TimelineHistogram carries
+  Explorer-only concerns that make a merge high-risk/low-payoff. Revisit if the two drift.
 
 ## Milestone 3 — polish
 

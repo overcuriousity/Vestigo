@@ -197,3 +197,143 @@ async def test_compare_custom_inherits_primary_time_window(monkeypatch):
     # Comparability invariant: custom layer shares the primary's window.
     assert comparison.start == start
     assert comparison.end == end
+
+
+# ── GET .../viz/time-punchcard / field-pivot / field-scatter ────────────────
+
+
+class _FakeAggService:
+    """Captures calls to the new aggregation methods."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def time_punchcard(self, query):
+        self.calls.append(("punchcard", query))
+        return {"kind": "punchcard"}
+
+    def field_pivot(self, query, field_x, field_y, limit_x, limit_y):
+        self.calls.append(("pivot", query, field_x, field_y, limit_x, limit_y))
+        return {"kind": "pivot"}
+
+    def field_scatter(self, query, field_x, field_y, limit):
+        self.calls.append(("scatter", query, field_x, field_y, limit))
+        return {"kind": "scatter"}
+
+
+def _patch_agg(monkeypatch) -> _FakeAggService:
+    svc = _FakeAggService()
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
+    monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
+    return svc
+
+
+# The GET handlers declare every shared filter param with a FastAPI Query
+# default — calling the plain function directly would otherwise pass the
+# Query marker objects as values.
+_FILTER_KWARGS = {
+    "q": None,
+    "q_regex": False,
+    "artifact": None,
+    "artifacts": None,
+    "source_id": None,
+    "tag": None,
+    "exclude_tag": None,
+    "tags_include": None,
+    "tags_exclude": None,
+    "ids": None,
+    "start": None,
+    "end": None,
+    "filters": None,
+    "exclusions": None,
+    "filter_modes": None,
+    "exclusion_modes": None,
+    "annotated": None,
+    "annotation_tag_value": None,
+    "run_id": None,
+}
+
+
+@pytest.mark.asyncio
+async def test_time_punchcard_resolves_scope_and_calls_service(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_time_punchcard("c1", "t1", case=None, **_FILTER_KWARGS)
+    assert result == {"kind": "punchcard"}
+    kind, query = svc.calls[0]
+    assert kind == "punchcard"
+    assert query.case_id == "c1"
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_field_pivot_passes_fields_and_limits(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_pivot(
+        "c1",
+        "t1",
+        field_x="attr:username",
+        field_y="attr:workstation",
+        limit_x=7,
+        limit_y=9,
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "pivot"}
+    kind, query, field_x, field_y, limit_x, limit_y = svc.calls[0]
+    assert (field_x, field_y, limit_x, limit_y) == ("attr:username", "attr:workstation", 7, 9)
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_field_pivot_same_field_is_422(monkeypatch):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_field_pivot(
+            "c1",
+            "t1",
+            field_x="artifact",
+            field_y="artifact",
+            limit_x=10,
+            limit_y=10,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_field_scatter_passes_fields_and_limit(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_scatter(
+        "c1",
+        "t1",
+        field_x="attr:bytes",
+        field_y="attr:latency",
+        limit=1000,
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "scatter"}
+    kind, query, field_x, field_y, limit = svc.calls[0]
+    assert (field_x, field_y, limit) == ("attr:bytes", "attr:latency", 1000)
+
+
+@pytest.mark.asyncio
+async def test_field_scatter_same_field_is_422(monkeypatch):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_field_scatter(
+            "c1",
+            "t1",
+            field_x="attr:bytes",
+            field_y="attr:bytes",
+            limit=1000,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert exc.value.status_code == 422

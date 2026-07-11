@@ -7,6 +7,7 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
+import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { FieldTermsResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -16,12 +17,15 @@ interface PieChartProps {
   terms: FieldTermsResponse;
   svgRef?: React.RefObject<SVGSVGElement | null>;
   height?: number;
+  /** Click-to-filter: clicking a slice or legend entry reports its
+   * field=value pair (the Other slice is never clickable). */
+  onValueClick?: ChartValueClickHandler;
 }
 
 /** Donut chart for a categorical field's top values — identity is never
  * color-alone here: every non-trivial slice gets a direct label, and the
  * legend lists every value regardless of slice size. */
-export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
+export function PieChart({ terms, svgRef, height = 260, onValueClick }: PieChartProps) {
   const [hover, setHover] = useState<{ x: number; y: number; label: string; count: number } | null>(
     null,
   );
@@ -69,9 +73,21 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
                 const path = arcGen(a) ?? undefined;
                 const frac = a.data.count / total;
                 const [lx, ly] = labelArc.centroid(a);
+                const clickable = onValueClick != null && a.data.key !== OTHER_KEY;
                 return (
                   <g
                     key={a.data.key}
+                    style={clickable ? { cursor: "pointer" } : undefined}
+                    onClick={
+                      clickable
+                        ? (e) =>
+                            onValueClick({
+                              entries: [[terms.field, a.data.key]],
+                              clientX: e.clientX,
+                              clientY: e.clientY,
+                            })
+                        : undefined
+                    }
                     onMouseEnter={() =>
                       setHover({
                         x: cx + margin.left + lx,
@@ -111,7 +127,20 @@ export function PieChart({ terms, svgRef, height = 260 }: PieChartProps) {
         entries={rows.map((r) => ({
           label: `${r.label} (${fmtCount(r.count)})`,
           color: colorMap.get(r.key) ?? "var(--color-accent)",
+          key: r.key,
         }))}
+        onEntryClick={
+          onValueClick
+            ? (key, e) => {
+                if (key === OTHER_KEY) return;
+                onValueClick({
+                  entries: [[terms.field, key]],
+                  clientX: e.clientX,
+                  clientY: e.clientY,
+                });
+              }
+            : undefined
+        }
       />
       <ChartTooltip x={hover?.x ?? 0} y={hover?.y ?? 0} visible={hover != null}>
         {hover && (

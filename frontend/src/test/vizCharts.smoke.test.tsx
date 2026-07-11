@@ -10,7 +10,8 @@
  * the chart's `{width > 0 && ...}` gate actually renders content.
  */
 import { describe, it, expect, beforeAll } from "vitest";
-import { render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
+import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
@@ -20,11 +21,18 @@ import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { TimeHistogram } from "@/components/viz/charts/TimeHistogram";
+import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
+import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
+import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import type {
   FieldNumericResponse,
+  FieldPivotResponse,
+  FieldScatterResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
   HistogramBucket,
+  PunchcardResponse,
 } from "@/api/types";
 
 beforeAll(() => {
@@ -98,6 +106,50 @@ const TIMESERIES: FieldTimeseriesResponse = {
   ],
 };
 
+const PUNCHCARD: PunchcardResponse = {
+  kind: "punchcard",
+  total: 107,
+  max_count: 60,
+  cells: [
+    { dow: 1, hour: 9, count: 40 },
+    { dow: 1, hour: 10, count: 60 },
+    { dow: 6, hour: 3, count: 7 },
+  ],
+};
+
+const PIVOT: FieldPivotResponse = {
+  kind: "pivot",
+  field_x: "attr:username",
+  field_y: "attr:workstation",
+  x_values: ["alice", "bob"],
+  y_values: ["WS01", "WS02"],
+  x_distinct: 5,
+  y_distinct: 3,
+  cells: [
+    { x: "alice", y: "WS01", count: 40 },
+    { x: "bob", y: "WS02", count: 12 },
+    { x: "", y: "WS01", count: 3 },
+  ],
+  total: 55,
+};
+
+const SCATTER: FieldScatterResponse = {
+  kind: "scatter",
+  field_x: "attr:bytes",
+  field_y: "attr:latency",
+  total: 1000,
+  sampled: 3,
+  x_min: 0,
+  x_max: 100,
+  y_min: 1,
+  y_max: 50,
+  points: [
+    [10, 5],
+    [50, 20],
+    [99, 49],
+  ],
+};
+
 function expectSvg(container: HTMLElement) {
   expect(container.querySelector("svg")).not.toBeNull();
 }
@@ -162,5 +214,129 @@ describe("chart smoke render", () => {
   it("TimeHistogram renders the empty state", () => {
     const { getByText } = render(<TimeHistogram buckets={[]} />);
     getByText(/no events over time/i);
+  });
+
+  it("PunchCard renders with punchcard data", () => {
+    const { container } = render(<PunchCard data={PUNCHCARD} />);
+    expectSvg(container);
+  });
+  it("PunchCard renders the empty state", () => {
+    const { getByText } = render(
+      <PunchCard data={{ kind: "punchcard", total: 0, max_count: 0, cells: [] }} />,
+    );
+    getByText(/no dated events/i);
+  });
+
+  it("PivotHeatmap renders with pivot data (incl. Other rollup)", () => {
+    const { container, getByText } = render(<PivotHeatmap data={PIVOT} />);
+    expectSvg(container);
+    getByText("Other"); // '' cell surfaces as an explicit Other row/column
+  });
+  it("PivotHeatmap renders the empty state", () => {
+    const { getByText } = render(
+      <PivotHeatmap data={{ ...PIVOT, cells: [], total: 0 }} />,
+    );
+    getByText(/no events with both fields/i);
+  });
+  it("PivotHeatmap reports both field=value pairs on cell click", () => {
+    const clicks: [string, string][][] = [];
+    const { container } = render(
+      <PivotHeatmap data={PIVOT} onValueClick={(c) => clicks.push(c.entries)} />,
+    );
+    const cells = [...container.querySelectorAll("rect")].filter(
+      (r) => r.style.cursor === "pointer",
+    );
+    expect(cells.length).toBeGreaterThan(0);
+    cells[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(clicks[0]).toEqual([
+      ["attr:username", "alice"],
+      ["attr:workstation", "WS01"],
+    ]);
+  });
+
+  it("SankeyFlow renders with pivot data", () => {
+    const { container } = render(<SankeyFlow data={PIVOT} />);
+    expectSvg(container);
+    expect(container.querySelectorAll("path").length).toBeGreaterThan(0);
+  });
+  it("SankeyFlow renders the empty state", () => {
+    const { getByText } = render(<SankeyFlow data={{ ...PIVOT, cells: [], total: 0 }} />);
+    getByText(/no events with both fields/i);
+  });
+
+  it("ScatterChart renders sampled points", () => {
+    const { container } = render(<ScatterChart data={SCATTER} />);
+    expectSvg(container);
+    expect(container.querySelectorAll("circle").length).toBe(3);
+  });
+  it("ScatterChart renders the categorical-fallback empty state", () => {
+    const { getByText } = render(
+      <ScatterChart
+        data={{ ...SCATTER, total: 0, sampled: 0, points: [], x_min: null, x_max: null, y_min: null, y_max: null }}
+      />,
+    );
+    getByText(/no events with numeric values/i);
+  });
+  it("ScatterChart renders with log scale (positive domain)", () => {
+    const { container } = render(<ScatterChart data={{ ...SCATTER, x_min: 1 }} logScale />);
+    expectSvg(container);
+  });
+
+  it("CompareHistogram brush drag reports a bucket-snapped range", () => {
+    const ranges: [string, string][] = [];
+    const { container } = render(
+      <CompareHistogram
+        data={{
+          kind: "time",
+          interval_seconds: 3600,
+          min: "2024-01-01T00:00:00Z",
+          max: "2024-01-01T02:00:00Z",
+          buckets: [
+            { start: "2024-01-01T00:00:00Z", primary: 5, comparison: 0 },
+            { start: "2024-01-01T01:00:00Z", primary: 12, comparison: 0 },
+          ],
+          primary_total: 17,
+          comparison_total: 0,
+        }}
+        metric="count"
+        hasComparison={false}
+        onRangeSelect={(start, end) => ranges.push([start, end])}
+      />,
+    );
+    const overlay = container.querySelector('rect[fill="transparent"]');
+    expect(overlay).not.toBeNull();
+    fireEvent.mouseDown(overlay!, { clientX: 100, clientY: 60 });
+    fireEvent.mouseMove(overlay!, { clientX: 250, clientY: 60 });
+    fireEvent.mouseUp(overlay!, { clientX: 250, clientY: 60 });
+    expect(ranges).toHaveLength(1);
+    const [start, end] = ranges[0];
+    // Snapped outward to the hour grid the buckets used.
+    expect(new Date(start).getTime() % 3_600_000).toBe(0);
+    expect(new Date(end).getTime() % 3_600_000).toBe(0);
+    expect(new Date(end).getTime()).toBeGreaterThan(new Date(start).getTime());
+  });
+
+  it("CompareHistogram ignores sub-threshold drags (clicks)", () => {
+    const ranges: [string, string][] = [];
+    const { container } = render(
+      <CompareHistogram
+        data={{
+          kind: "time",
+          interval_seconds: 3600,
+          min: "2024-01-01T00:00:00Z",
+          max: "2024-01-01T02:00:00Z",
+          buckets: [{ start: "2024-01-01T00:00:00Z", primary: 5, comparison: 0 }],
+          primary_total: 5,
+          comparison_total: 0,
+        }}
+        metric="count"
+        hasComparison={false}
+        onRangeSelect={(start, end) => ranges.push([start, end])}
+      />,
+    );
+    const overlay = container.querySelector('rect[fill="transparent"]');
+    fireEvent.mouseDown(overlay!, { clientX: 100, clientY: 60 });
+    fireEvent.mouseUp(overlay!, { clientX: 102, clientY: 60 });
+    expect(ranges).toHaveLength(0);
   });
 });

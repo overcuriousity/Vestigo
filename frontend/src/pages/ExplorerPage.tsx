@@ -51,17 +51,12 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation, FieldMatchMode } from "@/api/types";
-
-/** Remove `key`'s match-mode entry; collapse to undefined when the map empties. */
-function dropMode(
-  modes: Record<string, FieldMatchMode> | undefined,
-  key: string,
-): Record<string, FieldMatchMode> | undefined {
-  if (!modes || !(key in modes)) return modes;
-  const { [key]: _removed, ...rest } = modes;
-  return Object.keys(rest).length > 0 ? rest : undefined;
-}
+import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation } from "@/api/types";
+import {
+  applyFieldFilter,
+  dropMode,
+  mapFieldTokenToFilterKey,
+} from "@/lib/fieldFilters";
 
 const PAGE_SIZE = 100;
 
@@ -254,66 +249,15 @@ export function ExplorerPage() {
     [filters, setFilters],
   );
 
-  /**
-   * Special cases:
-   *   - filterKey "q"       → sets the top-level full-text search param
-   *   - filterKey "artifact" → sets the dedicated artifact param (include only)
-   *   - filterKey "tag"     → sets the dedicated tag param (include only)
-   *   - everything else     → goes into filters{} or exclusions{}
-   */
-  const applyFieldFilter = useCallback(
-    (f: EventFilters, fieldKey: string, value: string, include: boolean): EventFilters => {
-      const next = { ...f };
-
-      if (fieldKey === "q") {
-        // Full-text search: always "include" (no exclusion concept for free text)
-        next.q = value;
-      } else if (fieldKey === "artifact") {
-        if (include) {
-          next.artifact = value;
-        } else {
-          const prev = next.exclusions?.artifact ?? [];
-          if (!prev.includes(value)) {
-            next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, artifact: [...prev, value] };
-          }
-        }
-      } else if (fieldKey === "tag") {
-        if (include) {
-          next.tag = value;
-        } else {
-          next.excludeTag = value;
-        }
-      } else if (include) {
-        const prev = next.filters?.[fieldKey] ?? [];
-        if (!prev.includes(value)) {
-          next.filters = { ...(next.filters ?? {}), [fieldKey]: [...prev, value] };
-        }
-        // Grid-cell values are literal — reset any pattern mode on the key,
-        // otherwise the cell text would be reinterpreted as glob/regex.
-        next.filterModes = dropMode(next.filterModes, fieldKey);
-      } else {
-        const prev = next.exclusions?.[fieldKey] ?? [];
-        if (!prev.includes(value)) {
-          next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
-          // Same literal-value rule; mode is per key, so this also flips any
-          // pre-existing pattern-mode values of the key back to exact —
-          // visible via the chips' badge disappearing.
-          next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
-        }
-      }
-
-      return next;
-    },
-    [],
-  );
-
-  /** Handler wired to the detail panel's filter-in/filter-out buttons. */
+  /** Handler wired to the detail panel's filter-in/filter-out buttons —
+   * the mutation semantics live in `lib/fieldFilters.ts` (shared with the
+   * Visualize page's click-to-filter charts). */
   const handleAddFilter = useCallback(
     (fieldKey: string, value: string, include: boolean) => {
       setFilters(applyFieldFilter(filters, fieldKey, value, include));
       tourEvent("filter-added");
     },
-    [filters, setFilters, applyFieldFilter],
+    [filters, setFilters],
   );
 
   /** Wired to the detail panel's per-field histogram button. */
@@ -325,18 +269,14 @@ export function ExplorerPage() {
   }, []);
 
   /** Maps an anomaly-finding field token to a filter-rail filterKey. */
-  const mapAnomalyField = useCallback((field: string): string => {
-    if (field.startsWith("attr:")) return field.slice(5);
-    if (field === "tags") return "tag";
-    return field;
-  }, []);
+  const mapAnomalyField = mapFieldTokenToFilterKey;
 
   /** Wired to ValueNoveltyView — sets a field=value filter from a rare-value finding. */
   const handleDrillField = useCallback(
     (field: string, value: string) => {
       setFilters(applyFieldFilter(filters, mapAnomalyField(field), value, true));
     },
-    [filters, setFilters, applyFieldFilter, mapAnomalyField],
+    [filters, setFilters, mapAnomalyField],
   );
 
   /**
@@ -353,7 +293,7 @@ export function ExplorerPage() {
       }
       setFilters(next);
     },
-    [filters, setFilters, applyFieldFilter, mapAnomalyField],
+    [filters, setFilters, mapAnomalyField],
   );
 
   /**
@@ -368,7 +308,7 @@ export function ExplorerPage() {
         end,
       });
     },
-    [filters, setFilters, applyFieldFilter, mapAnomalyField],
+    [filters, setFilters, mapAnomalyField],
   );
 
   // ── Panel visibility state ────────────────────────────────────────────

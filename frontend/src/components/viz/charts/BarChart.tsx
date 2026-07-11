@@ -8,6 +8,7 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
+import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { CompareTermsResponse, FieldTermsResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -36,6 +37,9 @@ interface BarChartProps {
   sort?: "count" | "value";
   /** Log-scaled value axis — zero counts render as zero-length bars. */
   logScale?: boolean;
+  /** Click-to-filter: clicking a bar reports its field=value pair (Other is
+   * never clickable — it has no single value to filter on). */
+  onValueClick?: ChartValueClickHandler;
 }
 
 /**
@@ -59,6 +63,7 @@ export function BarChart({
   orientation = "horizontal",
   sort = "count",
   logScale = false,
+  onValueClick,
 }: BarChartProps) {
   const [hover, setHover] = useState<{
     x: number;
@@ -102,6 +107,19 @@ export function BarChart({
   }
 
   const grouped = compare != null;
+  const fieldToken = compare?.field ?? terms?.field ?? null;
+  const rowClickProps = (r: BarRow) =>
+    onValueClick != null && fieldToken != null && r.key !== OTHER_KEY
+      ? {
+          style: { cursor: "pointer" } as const,
+          onClick: (e: React.MouseEvent) =>
+            onValueClick({
+              entries: [[fieldToken, r.key]],
+              clientX: e.clientX,
+              clientY: e.clientY,
+            }),
+        }
+      : {};
   const colorMap = buildSeriesColorMap(
     rows.map((r) => ({ key: r.key, isOther: r.key === OTHER_KEY })),
   );
@@ -183,6 +201,7 @@ export function BarChart({
                     return (
                       <g
                         key={r.key}
+                        {...rowClickProps(r)}
                         onMouseEnter={() =>
                           setHover({
                             x: bx + bandwidth / 2 + margin.left,
@@ -265,6 +284,7 @@ export function BarChart({
                   return (
                     <g
                       key={r.key}
+                      {...rowClickProps(r)}
                       onMouseEnter={() =>
                         setHover({
                           x: Math.max(bw, cw ?? 0) + margin.left + 6,

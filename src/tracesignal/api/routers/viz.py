@@ -176,7 +176,7 @@ async def get_field_terms(
     """Return a top-N terms aggregation (value → count) for *field*.
 
     Powers the per-value histogram modal's top-list and nominal/ordinal
-    chart types (bar, pie, treemap) on the Visualization page.
+    chart types (bar, pie) on the Visualization page.
     """
     query = await _resolve_event_query(
         case_id,
@@ -342,6 +342,213 @@ async def get_field_value_timeseries(
         field,
         buckets,
         series_limit,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/time-punchcard")
+async def get_time_punchcard(
+    case_id: str,
+    timeline_id: str,
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return event counts by (day-of-week × hour-of-day), UTC.
+
+    Field-free like ``GET .../histogram``. ``dow`` is ISO (1 = Monday …
+    7 = Sunday); extraction is pinned to UTC (see
+    ``EventQueryService.time_punchcard``). Powers the punch-card chart —
+    the "does activity happen outside working hours?" view.
+    """
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.time_punchcard,
+        query,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/field-pivot")
+async def get_field_pivot(
+    case_id: str,
+    timeline_id: str,
+    field_x: str = Query(..., description="X-axis field token, e.g. 'attr:username'"),
+    field_y: str = Query(..., description="Y-axis field token, e.g. 'attr:workstation'"),
+    limit_x: int = Query(default=10, ge=1, le=50),
+    limit_y: int = Query(default=10, ge=1, le=50),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return a top-X × top-Y co-occurrence matrix for two categorical fields.
+
+    ``""`` on either axis of a cell means "outside that axis's top-N"
+    (truthful Other rollup). Powers the field×field heatmap and the flow
+    (Sankey) chart on the Visualization page.
+    """
+    if field_x == field_y:
+        raise HTTPException(status_code=422, detail="field_x and field_y must differ")
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_pivot,
+        query,
+        field_x,
+        field_y,
+        limit_x,
+        limit_y,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/field-scatter")
+async def get_field_scatter(
+    case_id: str,
+    timeline_id: str,
+    field_x: str = Query(..., description="X-axis numeric field token, e.g. 'attr:bytes_sent'"),
+    field_y: str = Query(..., description="Y-axis numeric field token, e.g. 'attr:duration_ms'"),
+    limit: int = Query(default=5000, ge=100, le=20000, description="Max sampled points"),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return a uniform random sample of (x, y) numeric pairs for a scatter plot.
+
+    ``total`` is the full pair count and the per-axis min/max describe the
+    full data (not the sample), so the frontend caption can state "showing
+    N of M points (uniform random sample)" truthfully. ``total == 0`` means
+    one or both fields have no numeric values under the current filters —
+    the frontend falls back to a categorical hint, mirroring field-numeric.
+    """
+    if field_x == field_y:
+        raise HTTPException(status_code=422, detail="field_x and field_y must differ")
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_scatter,
+        query,
+        field_x,
+        field_y,
+        limit,
     )
 
 
