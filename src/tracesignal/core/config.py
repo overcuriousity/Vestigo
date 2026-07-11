@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     # Per-field cap on candidate values the interval scan fetches (highest
     # total volume first); same warning semantics as the proportion-shift cap.
     stat_interval_max_candidates_per_field: int = 2000
+    # Value-distribution-drift detector (D9): BH false-discovery-rate ceiling
+    # shared by both test branches (KS numeric / k-category G-test).
+    stat_drift_fdr_q: float = 0.05
+    # KS effect floor — minimum D statistic (max CDF gap) for a finding.
+    stat_drift_min_ks_d: float = 0.1
+    # Categorical effect floor — minimum total-variation distance.
+    stat_drift_min_tvd: float = 0.05
+    # Minimum field-bearing events on each side of a test; smaller sides are
+    # skipped (excluded from the FDR pool) with a warning.
+    stat_drift_min_samples: int = 20
     # Sequence-novelty detector: default n-gram length (AMiner
     # EventSequenceDetector's default sequence length).
     # Constrained here so a bad TS_STAT_SEQUENCE_NGRAM fails at startup as a

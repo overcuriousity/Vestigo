@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "value_distribution_drift";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series / build event sequences by */
@@ -17,7 +17,7 @@ export interface AnomalyParams {
   z_threshold?: number;
   /** Minimum backwards jump (seconds) for the timestamp_order detector. */
   min_skew_seconds?: number;
-  /** BH false-discovery-rate ceiling for the proportion_shift detector. */
+  /** BH false-discovery-rate ceiling (proportion_shift, interval_periodicity, value_distribution_drift). */
   fdr_q?: number;
   /** Effect-size floor (rate ratio) for the proportion_shift detector. */
   min_ratio?: number;
@@ -76,7 +76,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "value_distribution_drift";
       content: string;
       details: Record<string, unknown>;
     },

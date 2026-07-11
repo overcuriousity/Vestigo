@@ -32,6 +32,7 @@ from tracesignal.db.anomaly_stats import (
     AnalysisWindows,
     CharsetFinding,
     ComboFinding,
+    DistributionDriftFinding,
     EntropyFinding,
     FreqFinding,
     IntervalFinding,
@@ -1666,6 +1667,32 @@ async def _run_stat_detector(
         )
         return result, resolution
 
+    if detector == "value_distribution_drift":
+        # Same effective-threshold snapshotting; only fdr_q is overridable per
+        # request — the two effect floors (KS D / TVD) have branch-specific
+        # units the generic min_ratio param can't express, so they stay
+        # server config.
+        resolution["drift_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_drift_fdr_q
+        result = await run_in_threadpool(
+            svc.find_distribution_drift,
+            case_id=case_id,
+            source_ids=source_ids,
+            source_offsets=source_offsets,
+            fields=parsed_fields,
+            limit=limit,
+            windows=windows,
+            fdr_q=resolution["drift_fdr_q"],
+            min_ks_d=cfg.stat_drift_min_ks_d,
+            min_tvd=cfg.stat_drift_min_tvd,
+            min_samples=cfg.stat_drift_min_samples,
+            exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            inventory_total=inventory_total,
+        )
+        return result, resolution
+
     result = await run_in_threadpool(
         svc.find_value_novelty,
         case_id=case_id,
@@ -1772,13 +1799,16 @@ def _serialize_finding(
     | EntropyFinding
     | ShiftFinding
     | IntervalFinding
-    | SequenceFinding,
+    | SequenceFinding
+    | DistributionDriftFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift/Interval/Sequence finding dataclass fields are
-    # exactly the wire keys, so asdict() avoids a hand-maintained
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Drift finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval/Sequence/Drift finding dataclass fields
+    # are exactly the wire keys, so asdict() avoids a hand-maintained
     # field-by-field transcription that would silently drop any newly added
     # field.
+    if isinstance(r, DistributionDriftFinding):
+        return {"type": "value_distribution_drift", **asdict(r)}
     if isinstance(r, SequenceFinding):
         return {"type": "sequence_novelty", **asdict(r)}
     if isinstance(r, IntervalFinding):
@@ -2051,10 +2081,12 @@ async def _persist_detector_run(
             "temporal": temporal,
             "limit": limit,
             "min_skew_seconds": min_skew_seconds,
-            # proportion_shift / interval_periodicity: effective
-            # (request-or-default) thresholds; the keys are disjoint per
-            # detector, None for every other one.
-            "fdr_q": resolution.get("shift_fdr_q") or resolution.get("interval_fdr_q"),
+            # proportion_shift / interval_periodicity / value_distribution_drift:
+            # effective (request-or-default) thresholds; the keys are disjoint
+            # per detector, None for every other one.
+            "fdr_q": resolution.get("shift_fdr_q")
+            or resolution.get("interval_fdr_q")
+            or resolution.get("drift_fdr_q"),
             "min_ratio": resolution.get("shift_min_ratio")
             or resolution.get("interval_min_rate_ratio"),
             # sequence_novelty: effective (request-or-default) n-gram length.
@@ -2098,7 +2130,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', or 'sequence_novelty'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', or 'value_distribution_drift'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -2131,8 +2163,9 @@ async def list_anomalies(
         le=1,
         description=(
             "Benjamini-Hochberg false-discovery-rate ceiling for the "
-            "proportion_shift and interval_periodicity detectors. Omit to "
-            "use the server default."
+            "proportion_shift, interval_periodicity, and "
+            "value_distribution_drift detectors. Omit to use the server "
+            "default."
         ),
     ),
     min_ratio: float | None = Query(
@@ -2237,6 +2270,13 @@ async def list_anomalies(
     `series_field` values and flags n-grams that occur in a suspect window
     but never in the baseline window (AMiner EventSequenceDetector analog).
     Temporal-only; surprise-scored against the window's own n-gram total.
+
+    **value_distribution_drift**: per *field*, flags fields whose whole value
+    distribution changed between the baseline and a suspect window — a
+    Kolmogorov-Smirnov test for numeric fields, a k-category G-test (top-50
+    categories + __other__) for categorical ones. Temporal-only; one BH-FDR
+    pool across both branches, effect floors on KS D / total-variation
+    distance (server config).
     """
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
@@ -2322,7 +2362,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', or 'sequence_novelty'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', or 'value_distribution_drift'.",
     )
     fields: str | None = Field(
         default=None,

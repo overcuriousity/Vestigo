@@ -146,6 +146,36 @@ already-ingested data.
     proportion_shift's raw G: two different statistics must rank on a common
     scale).
 
+**value_distribution_drift** (``detector="value_distribution_drift"``)
+    Per field, test whether the field's *whole value distribution* changed
+    between the baseline window and each suspect window — the shape, not one
+    value's volume (frequency) or share (proportion_shift). Adapted from
+    AMiner's ``VariableTypeDetector``, simplified to two field-agnostic
+    tests chosen by syntactic field kind:
+
+    * *numeric* fields (``numeric_ratio ≥ 0.9``, same probe as the range
+      detector): two-sample Kolmogorov–Smirnov test, computed inside
+      ClickHouse (``kolmogorovSmirnovTestIf``) over ``toFloat64OrNull``
+      values — baseline vs. window, one conditional aggregate per suspect
+      window, one scan per field. Effect floor on the D statistic (the
+      maximum CDF gap).
+    * *categorical* fields: k-category G-test (2×k log-likelihood ratio)
+      over the top ``_DRIFT_TOP_K`` baseline categories plus an exact
+      ``__other__`` bucket, p-value via the df = buckets−1 chi² survival
+      function (:func:`_chi2_sf`). Effect floor on the total-variation
+      distance between the normalized vectors — the categorical analog of
+      the KS D.
+
+    All tests in a run — both branches, every (field × suspect window) —
+    share one Benjamini–Hochberg FDR pool. Sides with fewer than
+    ``min_samples`` field-bearing events are skipped (excluded from the
+    pool, warned). Temporal-only (``method="drift"``): a distribution can
+    only drift between two populations. Findings are per *field* (the
+    allowlist key is ``(field, "*")``); the representative event is the most
+    extreme window value in the drifted direction (numeric) or the first
+    window occurrence of the most-shifted category (categorical). Score =
+    ``-log10(p)`` so the two statistics rank on one scale.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -249,6 +279,18 @@ _MIN_ENTROPY_BASELINE = 20
 # entirely (baseline and detect): character entropy of a 3-char string is
 # degenerate and would swamp the band with false lows.
 _MIN_ENTROPY_VALUE_LEN = 6
+
+# Distribution-drift categorical branch: number of named categories in the
+# G-test vector (top by baseline count, deterministic tie-break on value);
+# everything else folds into one exact __other__ bucket. A statistical-shape
+# constant (bounds df at 50), not a tunable.
+_DRIFT_TOP_K = 50
+
+# Guard LIMIT on the drift categorical GROUP BY — categorical fields are
+# low-cardinality by _classify_field, so this only trips on a misclassified
+# field; when it does, the __other__ bucket is truncated and a warning is
+# attached.
+_DRIFT_MAX_CATEGORY_ROWS = 10000
 
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
@@ -453,6 +495,109 @@ def _chi2_sf_df1(g: float) -> float:
     dependency is needed for the G-test's p-value.
     """
     return math.erfc(math.sqrt(g / 2.0)) if g > 0 else 1.0
+
+
+def _chi2_sf(x: float, df: int) -> float:
+    """P(χ²_df ≥ x) via the regularized upper incomplete gamma Q(df/2, x/2).
+
+    ``df == 1`` delegates to the exact erfc closed form (:func:`_chi2_sf_df1`);
+    ``df ≥ 2`` uses the standard gammp/gammq split (series for ``x/2 < df/2+1``,
+    modified-Lentz continued fraction otherwise) on ``math.lgamma`` — same
+    no-scipy constraint as every other statistic in this module.
+    """
+    if x <= 0:
+        return 1.0
+    if df == 1:
+        return _chi2_sf_df1(x)
+    a = df / 2.0
+    y = x / 2.0
+    log_prefactor = -y + a * math.log(y) - math.lgamma(a)
+    if y < a + 1.0:
+        # Series for the lower regularized gamma P(a, y); Q = 1 - P.
+        term = 1.0 / a
+        total = term
+        n = a
+        for _ in range(500):
+            n += 1.0
+            term *= y / n
+            total += term
+            if abs(term) < abs(total) * 1e-15:
+                break
+        p_lower = total * math.exp(log_prefactor)
+        return max(0.0, min(1.0, 1.0 - p_lower))
+    # Modified Lentz continued fraction for Q(a, y) directly.
+    tiny = 1e-300
+    b = y + 1.0 - a
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for i in range(1, 500):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return max(0.0, min(1.0, h * math.exp(log_prefactor)))
+
+
+def _ks_pair(value: Any) -> tuple[float, float]:
+    """Normalize ``kolmogorovSmirnovTest``'s (D, p) aggregate result.
+
+    ClickHouse declares the result as a *named* tuple
+    ``(d_statistic, p_value)``, which clickhouse_connect surfaces as a dict
+    (verified against a live server); a plain driver/tuple shape is handled
+    too so the contract is explicit rather than driver-version-dependent.
+    """
+    if isinstance(value, dict):
+        return float(value["d_statistic"]), float(value["p_value"])
+    return float(value[0]), float(value[1])
+
+
+def _g_statistic_k(baseline: list[int], window: list[int]) -> float:
+    """2×k log-likelihood-ratio (G) statistic over parallel count vectors.
+
+    Rows (baseline, window) × k category columns — the k-vector
+    generalization of :func:`_g_statistic`. Zero cells contribute nothing
+    (lim x→0 of x·log(x/e) = 0); all-empty columns are skipped. Asymptotically
+    chi² with df = (non-empty columns) − 1.
+    """
+    n_b, n_w = sum(baseline), sum(window)
+    n = n_b + n_w
+    if n == 0 or n_b == 0 or n_w == 0:
+        return 0.0
+    g = 0.0
+    for b_cnt, w_cnt in zip(baseline, window, strict=True):
+        col = b_cnt + w_cnt
+        if col == 0:
+            continue
+        if b_cnt > 0:
+            g += b_cnt * math.log(b_cnt * n / (n_b * col))
+        if w_cnt > 0:
+            g += w_cnt * math.log(w_cnt * n / (n_w * col))
+    return max(2.0 * g, 0.0)
+
+
+def _tvd(baseline: list[int], window: list[int]) -> float:
+    """Total-variation distance between the two normalized count vectors.
+
+    ``0.5·Σ|p_i − q_i|`` ∈ [0, 1] — the categorical analog of the KS D
+    statistic (the largest probability mass that sits in different
+    categories), used as the drift detector's categorical effect floor.
+    """
+    n_b, n_w = sum(baseline), sum(window)
+    if n_b == 0 or n_w == 0:
+        return 0.0
+    return 0.5 * sum(
+        abs(b_cnt / n_b - w_cnt / n_w) for b_cnt, w_cnt in zip(baseline, window, strict=True)
+    )
 
 
 def _bh_qvalues(pvals: list[float]) -> list[float]:
@@ -677,6 +822,34 @@ class IntervalFinding:
 
 
 @dataclass
+class DistributionDriftFinding:
+    """One field whose value distribution drifted between baseline and a suspect window."""
+
+    field: str
+    # Suspect-window label — the finding is per *field*, so the window names it.
+    value: str
+    test: str  # "ks" | "g-test-k"
+    # KS D statistic or the 2×k G statistic.
+    statistic: float
+    # The floor-gated effect size: KS D again, or the total-variation distance.
+    effect: float
+    # "up" | "down" (numeric, by median shift) | "mixed" (categorical).
+    direction: str
+    # Field-bearing events on each side of the test.
+    baseline_n: int
+    window_n: int
+    p_value: float
+    # Benjamini–Hochberg adjusted p-value across every test in this run.
+    q_value: float
+    # -log10(p_value); ranks both test families on one scale.
+    score: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class NumericFieldInfo:
     """A numeric-parseable field candidate for the range detector."""
 
@@ -752,11 +925,11 @@ class StatAnomalyResult:
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
-    #  | "sequence_novelty"
+    #  | "sequence_novelty" | "value_distribution_drift"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
-    #  | "g-test" | "cadence" | "ngram"
+    #  | "g-test" | "cadence" | "ngram" | "drift"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -770,6 +943,7 @@ class StatAnomalyResult:
         | ShiftFinding
         | IntervalFinding
         | SequenceFinding
+        | DistributionDriftFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -3430,6 +3604,479 @@ class StatisticalAnomalyService:
             method=method,
             total_events=baseline_size,
             evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+        )
+
+    # ------------------------------------------------------------------
+    # Value-distribution drift
+    # ------------------------------------------------------------------
+
+    def _drift_split_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None,
+        total_events: int,
+        field_mappings: dict[str, list[str]] | None,
+        inventory: list[tuple[str, int, int]] | None,
+        inventory_total: int | None,
+    ) -> tuple[list[str], list[str]]:
+        """Return ``(numeric_fields, categorical_fields)`` for the drift scan.
+
+        Explicit *fields* are honored verbatim and branch-classified by one
+        batched numeric-ratio probe (same syntactic test as
+        :meth:`recommend_numeric_fields` — no content assumptions). Auto mode
+        blends the numeric recommender's fields (KS branch) with the novelty
+        recommender's categorical fields (G-test branch), numeric first,
+        capped at ``_MAX_AUTO_SCAN_FIELDS`` total.
+        """
+        db = self.ch.database
+        if fields is not None:
+            scan = [t for t in fields if t]
+            if not scan:
+                return [], []
+            params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+            parts = []
+            for i, tok in enumerate(scan):
+                expr = _col_expr(tok, params, field_mappings, prefix=f"df{i}")
+                parts.append(
+                    f"countIf(toFloat64OrNull({expr}) IS NOT NULL) AS num{i}, "
+                    f"countIf({expr} != '') AS ne{i}"
+                )
+            probe_sql = (
+                f"SELECT {', '.join(parts)}"
+                f" FROM {db}.events"
+                f" WHERE case_id = {{cid:String}}"
+                f" AND has({{src:Array(String)}}, source_id)"
+                f" {HEAVY_SCAN_SETTINGS}"
+            )
+            rows = self.ch.client.query(probe_sql, parameters=params).result_rows
+            numeric: list[str] = []
+            categorical: list[str] = []
+            r = rows[0] if rows else [0] * (2 * len(scan))
+            for i, tok in enumerate(scan):
+                num, ne = int(r[i * 2]), int(r[i * 2 + 1])
+                ratio = num / ne if ne else 0.0
+                (numeric if ratio >= _MIN_NUMERIC_RATIO else categorical).append(tok)
+            return numeric, categorical
+
+        if inventory is None:
+            inventory, inventory_total = self.field_inventory(
+                case_id, source_ids, total_events, field_mappings
+            )
+        numeric = [
+            f.token
+            for f in self.recommend_numeric_fields(
+                case_id,
+                source_ids,
+                total=inventory_total,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            if f.recommended
+        ]
+        numeric_set = set(numeric)
+        categorical = [
+            f.token
+            for f in self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            if f.recommended and f.token not in numeric_set
+        ]
+        numeric = numeric[:_MAX_AUTO_SCAN_FIELDS]
+        categorical = categorical[: _MAX_AUTO_SCAN_FIELDS - len(numeric)]
+        return numeric, categorical
+
+    @_gated_scan
+    def find_distribution_drift(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        fdr_q: float = 0.05,
+        min_ks_d: float = 0.1,
+        min_tvd: float = 0.05,
+        min_samples: int = 20,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> StatAnomalyResult:
+        """Return fields whose value distribution drifted between baseline and suspects.
+
+        Per (field, suspect window), one two-sample test of the whole
+        distribution — Kolmogorov–Smirnov inside ClickHouse for numeric
+        fields, a 2×k G-test over the top ``_DRIFT_TOP_K`` baseline
+        categories (+ exact ``__other__`` bucket) for categorical fields.
+        All tests in the run share one Benjamini–Hochberg FDR pool; a
+        finding needs ``q_value ≤ fdr_q`` *and* its branch's effect floor
+        (KS ``D ≥ min_ks_d`` / total-variation ``≥ min_tvd``). Sides with
+        fewer than *min_samples* field-bearing events are skipped (not
+        pooled) and warned about.
+
+        Temporal-only: without *windows* the result is ``insufficient_data``
+        — a distribution can only drift between two populations. Findings
+        are per field (allowlist key ``(field, "*")``). Score =
+        ``-log10(p)`` so both test families rank on one scale. See the
+        module docstring and ``docs/ANOMALY_DETECTION.md`` §11.
+        """
+        method = "drift"
+        if windows is None:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="value_distribution_drift",
+                method=method,
+                baseline_size=0,
+                warnings=[
+                    "value_distribution_drift is temporal-only — select or create a "
+                    "baseline definition (baseline + suspect windows)."
+                ],
+            )
+
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="value_distribution_drift",
+                method=method,
+                baseline_size=0,
+                windows=windows.payload(),
+            )
+
+        baseline_size, suspect_totals = self._window_totals(
+            case_id, source_ids, windows, source_offsets
+        )
+        run_warnings = _window_size_warnings(windows, suspect_totals)
+        if baseline_size == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="value_distribution_drift",
+                method=method,
+                baseline_size=0,
+                warnings=[*run_warnings, "The baseline window contains no events."],
+                windows=windows.payload(),
+            )
+
+        numeric_fields, categorical_fields = self._drift_split_fields(
+            case_id,
+            source_ids,
+            fields,
+            total_events,
+            field_mappings,
+            inventory,
+            inventory_total,
+        )
+
+        # One pooled test list across both branches; each entry carries what
+        # Phase 3 needs to build its finding without re-querying.
+        tests: list[dict[str, Any]] = []
+        fields_with_tests: set[str] = set()
+        skipped_by_field: dict[str, int] = defaultdict(int)
+
+        # --- KS branch: one scan per numeric field, all windows batched. ---
+        for field_token in numeric_fields:
+            params = {**base_params}
+            col = _col_expr(field_token, params, field_mappings)
+            bp, sps = _window_preds(windows, params, source_offsets)
+            union_pred = " OR ".join([bp, *sps])
+            in_ws = ", ".join(f"{sp} AS in_w{i}" for i, sp in enumerate(sps))
+            w_blocks = ",\n                    ".join(
+                f"countIf(in_w{i}) AS w{i}_n,"
+                f" quantilesIf(0.05, 0.5, 0.95)(num, in_w{i}) AS w{i}_q,"
+                f" kolmogorovSmirnovTestIf('two-sided')(num, toUInt8(in_w{i}), in_bl OR in_w{i})"
+                f" AS w{i}_ks,"
+                f" argMinIf((toString(event_id), eff_ts), num, in_w{i}) AS w{i}_lo,"
+                f" argMaxIf((toString(event_id), eff_ts), num, in_w{i}) AS w{i}_hi"
+                for i in range(len(sps))
+            )
+            sql = f"""
+                SELECT
+                    countIf(in_bl) AS bl_n,
+                    quantilesIf(0.05, 0.5, 0.95)(num, in_bl) AS bl_q,
+                    {w_blocks}
+                FROM (
+                    SELECT toFloat64OrNull({col}) AS num,
+                           {bp} AS in_bl,
+                           {in_ws},
+                           event_id,
+                           {eff} AS eff_ts
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {TS_NOT_SENTINEL_SQL}
+                      AND ({union_pred})
+                )
+                WHERE num IS NOT NULL
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            row = rows[0]
+            bl_n = int(row[0])
+            bl_q = row[1]
+            for wi in range(len(sps)):
+                o = 2 + wi * 5
+                w_n = int(row[o])
+                if bl_n < min_samples or w_n < min_samples:
+                    if bl_n + w_n > 0:
+                        skipped_by_field[field_token] += 1
+                    continue
+                d_stat, p = _ks_pair(row[o + 2])
+                if math.isnan(d_stat) or math.isnan(p):
+                    continue
+                fields_with_tests.add(field_token)
+                tests.append(
+                    {
+                        "test": "ks",
+                        "field": field_token,
+                        "wi": wi,
+                        "statistic": d_stat,
+                        "effect": d_stat,
+                        "p": p,
+                        "bl_n": bl_n,
+                        "w_n": w_n,
+                        "bl_q": bl_q,
+                        "w_q": row[o + 1],
+                        "lo": row[o + 3],
+                        "hi": row[o + 4],
+                    }
+                )
+
+        # --- Categorical branch: proportion_shift-shaped GROUP BY per field,
+        # folded to top-K + exact __other__ in Python. ---
+        for field_token in categorical_fields:
+            params = {**base_params}
+            col = _col_expr(field_token, params, field_mappings)
+            bp, sps = _window_preds(windows, params, source_offsets)
+            union_pred = " OR ".join([bp, *sps])
+            params["catcap"] = _DRIFT_MAX_CATEGORY_ROWS
+            w_blocks = ",\n                    ".join(
+                f"countIf({sp}) AS w{i}_cnt,"
+                f" minIf({eff}, {sp}) AS w{i}_first,"
+                f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
+                for i, sp in enumerate(sps)
+            )
+            sql = f"""
+                SELECT
+                    {col} AS val,
+                    countIf({bp}) AS baseline_cnt,
+                    maxIf({eff}, {bp}) AS bl_last,
+                    toString(argMaxIf(event_id, {eff}, {bp})) AS bl_evt,
+                    {w_blocks}
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {col} != ''
+                  AND {TS_NOT_SENTINEL_SQL}
+                  AND ({union_pred})
+                GROUP BY val
+                ORDER BY baseline_cnt DESC, val ASC
+                LIMIT {{catcap:UInt32}}
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            rows = [r for r in rows if r[0]]
+            if not rows:
+                continue
+            if len(rows) >= _DRIFT_MAX_CATEGORY_ROWS:
+                run_warnings.append(
+                    f"Field {field_token!r} exceeded the {_DRIFT_MAX_CATEGORY_ROWS}-category "
+                    f"scan guard — its __other__ bucket is truncated; treat this field's "
+                    f"drift results as exploratory (it does not look categorical)."
+                )
+            named = rows[:_DRIFT_TOP_K]
+            tail = rows[_DRIFT_TOP_K:]
+            k_truncated = bool(tail)
+            other_bl = sum(int(r[1]) for r in tail)
+            for wi in range(len(sps)):
+                co = 4 + wi * 3
+                bl_vec = [int(r[1]) for r in named]
+                w_vec = [int(r[co]) for r in named]
+                if k_truncated:
+                    bl_vec.append(other_bl)
+                    w_vec.append(sum(int(r[co]) for r in tail))
+                bl_tot, w_tot = sum(bl_vec), sum(w_vec)
+                if bl_tot < min_samples or w_tot < min_samples:
+                    if bl_tot + w_tot > 0:
+                        skipped_by_field[field_token] += 1
+                    continue
+                df = sum(1 for b, w in zip(bl_vec, w_vec, strict=True) if b + w > 0) - 1
+                if df < 1:
+                    continue
+                g = _g_statistic_k(bl_vec, w_vec)
+                fields_with_tests.add(field_token)
+                tests.append(
+                    {
+                        "test": "g-test-k",
+                        "field": field_token,
+                        "wi": wi,
+                        "statistic": g,
+                        "effect": _tvd(bl_vec, w_vec),
+                        "p": _chi2_sf(g, df),
+                        "bl_n": bl_tot,
+                        "w_n": w_tot,
+                        "df": df,
+                        "named": named,
+                        "co": co,
+                        "k_truncated": k_truncated,
+                        "other_bl": other_bl,
+                        "other_w": w_vec[-1] if k_truncated else 0,
+                        "bl_tot": bl_tot,
+                        "w_tot": w_tot,
+                    }
+                )
+
+        for field_token, n_skipped in skipped_by_field.items():
+            run_warnings.append(
+                f"Field {field_token!r}: {n_skipped} test(s) skipped — fewer than "
+                f"{min_samples} field-bearing events on one side; skipped tests are "
+                f"not in the FDR pool."
+            )
+
+        # One BH pool across both branches, then gate on FDR + effect floor.
+        qvals = _bh_qvalues([t["p"] for t in tests])
+        m_tests = len(tests)
+        findings: list[DistributionDriftFinding] = []
+        for t, q in zip(tests, qvals, strict=True):
+            if q > fdr_q:
+                continue
+            floor = min_ks_d if t["test"] == "ks" else min_tvd
+            if t["effect"] < floor:
+                continue
+            window = windows.suspects[t["wi"]]
+            p = t["p"]
+            score = round(-math.log10(max(p, 1e-300)), 4)
+            details: dict[str, Any] = {
+                "detector": "value_distribution_drift",
+                "method": method,
+                "test": t["test"],
+                "field": t["field"],
+                "statistic": round(t["statistic"], 6),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "score_basis": "-log10(p)",
+                "baseline_n": t["bl_n"],
+                "window_n": t["w_n"],
+                "window_label": window.label,
+                "window_start": ensure_utc(window.start).isoformat(),
+                "window_end": ensure_utc(window.end).isoformat(),
+                "baseline_size": baseline_size,
+                # Field-level suppression: the finding is per-field, not
+                # per-value, so the allowlist value is the wildcard.
+                "allowlist_field": t["field"],
+                "allowlist_value": "*",
+            }
+            if t["test"] == "ks":
+                bl_med, w_med = float(t["bl_q"][1]), float(t["w_q"][1])
+                direction = "up" if w_med > bl_med else "down"
+                rep = t["hi"] if direction == "up" else t["lo"]
+                evt_id, rep_ts = (rep[0], rep[1]) if rep and rep[0] else (None, None)
+                first_seen = _present_ts(rep_ts)
+                details.update(
+                    {
+                        "ks_d": round(t["effect"], 6),
+                        "min_ks_d": min_ks_d,
+                        "direction": direction,
+                        "baseline_median": round(bl_med, 6),
+                        "window_median": round(w_med, 6),
+                        "baseline_p05": round(float(t["bl_q"][0]), 6),
+                        "baseline_p95": round(float(t["bl_q"][2]), 6),
+                        "window_p05": round(float(t["w_q"][0]), 6),
+                        "window_p95": round(float(t["w_q"][2]), 6),
+                    }
+                )
+            else:
+                direction = "mixed"
+                named, co = t["named"], t["co"]
+                bl_tot, w_tot = t["bl_tot"], t["w_tot"]
+                contributors = sorted(
+                    (
+                        {
+                            "value": str(r[0]),
+                            "baseline_share": round(int(r[1]) / bl_tot, 6),
+                            "window_share": round(int(r[co]) / w_tot, 6),
+                            "delta": round(int(r[co]) / w_tot - int(r[1]) / bl_tot, 6),
+                        }
+                        for r in named
+                    ),
+                    key=lambda c: abs(c["delta"]),
+                    reverse=True,
+                )
+                top = contributors[0] if contributors else None
+                evt_id, first_seen = None, None
+                if top is not None:
+                    top_row = next(r for r in named if str(r[0]) == top["value"])
+                    if int(top_row[co]) > 0:
+                        evt_id = top_row[co + 2] or None
+                        first_seen = _present_ts(top_row[co + 1])
+                    else:
+                        # Most-shifted category vanished from the window — its
+                        # last baseline occurrence represents the finding.
+                        evt_id = top_row[3] or None
+                        first_seen = None
+                details.update(
+                    {
+                        "g_statistic": round(t["statistic"], 6),
+                        "df": t["df"],
+                        "tvd": round(t["effect"], 6),
+                        "min_tvd": min_tvd,
+                        "k_categories": len(named),
+                        "k_truncated": t["k_truncated"],
+                        "other_baseline": t["other_bl"],
+                        "other_window": t["other_w"],
+                        "top_contributors": contributors[:5],
+                    }
+                )
+            evt_id_str = str(evt_id) if evt_id else None
+            findings.append(
+                DistributionDriftFinding(
+                    field=t["field"],
+                    value=window.label,
+                    test=t["test"],
+                    statistic=round(t["statistic"], 6),
+                    effect=round(t["effect"], 6),
+                    direction=direction,
+                    baseline_n=t["bl_n"],
+                    window_n=t["w_n"],
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=score,
+                    first_seen=first_seen,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen),
+                    details=details,
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector="value_distribution_drift",
+            method=method,
+            total_events=baseline_size,
+            evaluated_fields=len(fields_with_tests),
             exclude_event_ids=exclude_event_ids,
             limit=limit,
             case_id=case_id,

@@ -20,13 +20,16 @@ from tracesignal.db.anomaly_stats import (
     TimeWindow,
     ValueFinding,
     _bh_qvalues,
+    _chi2_sf,
     _chi2_sf_df1,
     _classify_field,
     _col_expr,
     _full_bucket_starts,
     _g_statistic,
+    _g_statistic_k,
     _greenwood_p,
     _poisson_rate_g,
+    _tvd,
     _window_preds,
     effective_ts_sql,
     windows_from_split,
@@ -3556,3 +3559,414 @@ def test_sequence_multi_source_merges_counts_and_verifies_baselines():
     # Every per-source query is bound to exactly one source.
     for p in svc.ch.client._all_parameters[2:]:
         assert p["src"] in (["s1"], ["s2"])
+
+
+# ---------------------------------------------------------------------------
+# value_distribution_drift detector
+# ---------------------------------------------------------------------------
+
+
+def test_chi2_sf_matches_known_values():
+    """General chi² survival: df=1 erfc form, df=2 closed form, df=5 reference."""
+    assert abs(_chi2_sf(3.84, 1) - _chi2_sf_df1(3.84)) < 1e-12
+    # df=2 closed form: P(χ²₂ ≥ x) = exp(-x/2).
+    assert abs(_chi2_sf(4.0, 2) - np.exp(-2.0)) < 1e-12
+    # Classic table value: P(χ²₅ ≥ 11.07) ≈ 0.0500.
+    assert abs(_chi2_sf(11.07, 5) - 0.05) < 1e-3
+    # Both gamma branches (series y < a+1, continued fraction y ≥ a+1).
+    assert 0.0 < _chi2_sf(1.0, 10) < 1.0
+    assert _chi2_sf(50.0, 10) < 1e-6
+    assert _chi2_sf(0.0, 3) == 1.0
+
+
+def test_g_statistic_k_and_tvd_known_values():
+    """2×k G against a hand-computed table; TVD against its definition."""
+    # baseline (900, 100) vs window (500, 500): G = 406.9969 (hand-computed).
+    assert abs(_g_statistic_k([900, 100], [500, 500]) - 406.9969) < 1e-3
+    assert abs(_tvd([900, 100], [500, 500]) - 0.4) < 1e-12
+    # Degenerate inputs contribute nothing.
+    assert _g_statistic_k([0, 0], [0, 0]) == 0.0
+    assert _tvd([0, 0], [1, 1]) == 0.0
+    # All-empty columns are skipped (no NaN).
+    assert _g_statistic_k([10, 0], [10, 0]) == 0.0
+
+
+def _drift_probe(numeric: bool) -> FakeQueryResult:
+    """Numeric-ratio probe response for one explicit field."""
+    return FakeQueryResult(
+        result_rows=[(95, 100) if numeric else (0, 100)],
+        column_names=["num0", "ne0"],
+    )
+
+
+def _drift_ks_row(
+    bl_n: int = 1000,
+    w_n: int = 500,
+    d: float = 0.35,
+    p: float = 1e-8,
+    bl_q: tuple = (1.0, 5.0, 9.0),
+    w_q: tuple = (2.0, 8.0, 11.0),
+) -> FakeQueryResult:
+    """One numeric-field KS scan row (single suspect window)."""
+    return FakeQueryResult(
+        result_rows=[
+            (
+                bl_n,
+                list(bl_q),
+                w_n,
+                list(w_q),
+                (d, p),
+                ("evt-lo", datetime(2024, 1, 16, 1, tzinfo=UTC)),
+                ("evt-hi", datetime(2024, 1, 16, 2, tzinfo=UTC)),
+            )
+        ],
+        column_names=["bl_n", "bl_q", "w0_n", "w0_q", "w0_ks", "w0_lo", "w0_hi"],
+    )
+
+
+def _drift_cat_rows(rows: list[tuple]) -> FakeQueryResult:
+    """Categorical GROUP BY response: (val, bl_cnt, bl_last, bl_evt, w0_cnt, w0_first, w0_evt)."""
+    return FakeQueryResult(
+        result_rows=rows,
+        column_names=["val", "baseline_cnt", "bl_last", "bl_evt", "w0_cnt", "w0_first", "w0_evt"],
+    )
+
+
+def _cat_row(val: str, bl: int, w: int) -> tuple:
+    return (
+        val,
+        bl,
+        datetime(2024, 1, 14, tzinfo=UTC),
+        f"evt-bl-{val}",
+        w,
+        datetime(2024, 1, 16, tzinfo=UTC),
+        f"evt-w-{val}",
+    )
+
+
+def test_distribution_drift_insufficient_data_without_windows():
+    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
+    svc = _svc([])
+    result = svc.find_distribution_drift("c1", ["s1"], fields=["attr:duration"])
+    assert result.status == "insufficient_data"
+    assert result.detector == "value_distribution_drift"
+    assert result.method == "drift"
+    assert any("temporal-only" in w for w in result.warnings)
+    assert svc.ch.client._calls == []
+
+
+def test_distribution_drift_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    assert result.status == "no_data"
+
+
+def test_distribution_drift_insufficient_data_empty_baseline():
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(0, 500)], column_names=["bl", "w0"]),
+        ]
+    )
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    assert result.status == "insufficient_data"
+    assert any("baseline window contains no events" in w for w in result.warnings)
+
+
+def test_distribution_drift_numeric_ks_detected():
+    """A fake KS (D=0.35, p=1e-8) on a numeric field yields one 'up' finding."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert result.method == "drift"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.test == "ks"
+    assert r.field == "attr:duration"
+    assert r.value == "incident"
+    assert r.statistic == 0.35
+    assert r.effect == 0.35
+    # Window median 8.0 > baseline median 5.0 → up; representative = max event.
+    assert r.direction == "up"
+    assert r.event_id == "evt-hi"
+    assert r.first_seen is not None
+    assert r.baseline_n == 1000
+    assert r.window_n == 500
+    # Score = -log10(p).
+    assert abs(r.score - 8.0) < 1e-9
+    assert r.details["ks_d"] == 0.35
+    assert r.details["window_label"] == "incident"
+    assert r.details["baseline_median"] == 5.0
+    assert r.details["window_median"] == 8.0
+    assert r.details["allowlist_field"] == "attr:duration"
+    assert r.details["allowlist_value"] == "*"
+    assert r.details["m_tests"] == 1
+
+
+def test_distribution_drift_ks_dict_tuple_shape():
+    """clickhouse_connect returns the KS named tuple as a dict — must parse.
+
+    Verified against a live server: the result of kolmogorovSmirnovTestIf
+    arrives as {'d_statistic': ..., 'p_value': ...}, not an indexable tuple.
+    """
+    row = _drift_ks_row()
+    r0 = list(row.result_rows[0])
+    r0[4] = {"d_statistic": 0.35, "p_value": 1e-8}
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        FakeQueryResult(result_rows=[tuple(r0)], column_names=row.column_names),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    assert result.results[0].statistic == 0.35
+
+
+def test_distribution_drift_numeric_down_direction_uses_min_event():
+    """Window median below baseline median → 'down', representative = min event."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(bl_q=(1.0, 5.0, 9.0), w_q=(0.5, 2.0, 4.0)),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    r = result.results[0]
+    assert r.direction == "down"
+    assert r.event_id == "evt-lo"
+
+
+def test_distribution_drift_categorical_gtest_detected():
+    """A 3-category share shift is flagged with the hand-computed G and TVD."""
+    rows = [_cat_row("a", 700, 200), _cat_row("b", 200, 300), _cat_row("c", 100, 500)]
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 1000)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=False),
+        _drift_cat_rows(rows),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:status"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.test == "g-test-k"
+    assert r.direction == "mixed"
+    assert r.baseline_n == 1000
+    assert r.window_n == 1000
+    # Shares .7/.2/.1 → .2/.3/.5: TVD = 0.5·(0.5 + 0.1 + 0.4) = 0.5.
+    assert abs(r.effect - 0.5) < 1e-9
+    assert abs(r.statistic - _g_statistic_k([700, 200, 100], [200, 300, 500])) < 1e-3
+    assert r.details["df"] == 2
+    assert r.details["k_truncated"] is False
+    assert r.details["k_categories"] == 3
+    # Most-shifted category is 'a' (delta -0.5); still present in the window,
+    # so its first window occurrence represents the finding.
+    assert r.details["top_contributors"][0]["value"] == "a"
+    assert r.event_id == "evt-w-a"
+    assert r.details["allowlist_value"] == "*"
+
+
+def test_distribution_drift_categorical_vanished_top_category_uses_baseline_event():
+    """When the most-shifted category vanished, its last baseline event represents it."""
+    rows = [
+        ("gone", 800, datetime(2024, 1, 14, tzinfo=UTC), "evt-bl-gone", 0, None, ""),
+        _cat_row("kept", 200, 900),
+    ]
+    responses = [
+        FakeQueryResult(result_rows=[(2000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 1000)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=False),
+        _drift_cat_rows(rows),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:service"], windows=_shift_windows()
+    )
+    r = result.results[0]
+    assert r.details["top_contributors"][0]["value"] == "gone"
+    assert r.event_id == "evt-bl-gone"
+    assert r.first_seen is None
+
+
+def test_distribution_drift_fdr_gates_insignificant():
+    """A weak KS (p=0.5) never survives the q gate."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(d=0.02, p=0.5),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_distribution_drift_ks_effect_floor():
+    """Significant p but D below min_ks_d is suppressed (300M-row guard)."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(d=0.05, p=1e-12),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows(), min_ks_d=0.1
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_distribution_drift_tvd_effect_floor():
+    """Hugely significant but tiny categorical shift fails the TVD floor."""
+    rows = [_cat_row("a", 100000, 103000), _cat_row("b", 100000, 97000)]
+    responses = [
+        FakeQueryResult(result_rows=[(400000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(200000, 200000)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=False),
+        _drift_cat_rows(rows),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:status"], windows=_shift_windows(), min_tvd=0.05
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_distribution_drift_min_sample_floor_skips_test():
+    """A window side below min_samples is skipped (not pooled) with a warning."""
+    responses = [
+        FakeQueryResult(result_rows=[(1010,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 10)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(w_n=10),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows(), min_samples=20
+    )
+    # The only candidate test was skipped → nothing evaluated.
+    assert result.status == "insufficient_data"
+    assert any("skipped" in w and "attr:duration" in w for w in result.warnings)
+
+
+def test_distribution_drift_allowlist_suppression():
+    """A field-level allowlist entry (field, '*') suppresses its findings."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1",
+        ["s1"],
+        fields=["attr:duration"],
+        windows=_shift_windows(),
+        allowlist={("attr:duration", "*")},
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_distribution_drift_tiny_window_warning():
+    """_window_size_warnings passes through for small suspect windows."""
+    responses = [
+        FakeQueryResult(result_rows=[(1030,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 30)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        _drift_ks_row(w_n=30),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    assert any("only 30 events" in w for w in result.warnings)
+
+
+def test_distribution_drift_topk_other_bucket():
+    """Categories beyond the top-K fold into one exact __other__ bucket."""
+    from tracesignal.db import anomaly_stats
+
+    # 52 categories: 50 named + 2 folded. The two tail categories (lowest
+    # baseline counts) shift hard into the window.
+    rows = [_cat_row(f"v{i:02d}", 1000 - i, 500) for i in range(50)]
+    rows += [_cat_row("tail1", 10, 5000), _cat_row("tail2", 5, 5000)]
+    responses = [
+        FakeQueryResult(result_rows=[(200000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(60000, 40000)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=False),
+        _drift_cat_rows(rows),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:url"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.details["k_categories"] == anomaly_stats._DRIFT_TOP_K
+    assert r.details["k_truncated"] is True
+    assert r.details["other_baseline"] == 15
+    assert r.details["other_window"] == 10000
+    # df bounded: 50 named + other = 51 buckets → df = 50.
+    assert r.details["df"] == anomaly_stats._DRIFT_TOP_K
+
+
+def test_distribution_drift_sql_shapes():
+    """KS scan filters NULL numerics; categorical scan groups with the cap."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(3000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(2000, 1000)], column_names=["bl", "w0"]),
+            FakeQueryResult(
+                result_rows=[(95, 100, 0, 100)], column_names=["num0", "ne0", "num1", "ne1"]
+            ),
+            _drift_ks_row(),
+            _drift_cat_rows([_cat_row("a", 900, 100), _cat_row("b", 100, 900)]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration", "attr:status"], windows=_shift_windows()
+    )
+    assert result.status == "ok"
+    ks_sql = client.full_queries[3]
+    assert "kolmogorovSmirnovTestIf('two-sided')" in ks_sql
+    assert "WHERE num IS NOT NULL" in ks_sql
+    assert "toFloat64OrNull" in ks_sql
+    cat_sql = client.full_queries[4]
+    assert "GROUP BY val" in cat_sql
+    assert "LIMIT {catcap:UInt32}" in cat_sql
+    assert "ORDER BY baseline_cnt DESC, val ASC" in cat_sql
+    # Both branches' tests share one BH pool.
+    assert all(r.details["m_tests"] == 2 for r in result.results)

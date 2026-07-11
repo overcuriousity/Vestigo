@@ -480,6 +480,36 @@ export interface TimestampOrderFinding {
   dismissed?: boolean;
 }
 
+/** One whole-field distribution change between windows from the value_distribution_drift detector. */
+export interface DistributionDriftFinding {
+  type: "value_distribution_drift";
+  field: string;
+  /** Suspect-window label — the finding is per field, so the window names it. */
+  value: string;
+  /** "ks" (numeric Kolmogorov–Smirnov) | "g-test-k" (categorical G-test). */
+  test: "ks" | "g-test-k";
+  /** KS D statistic or the 2×k G statistic. */
+  statistic: number;
+  /** The floor-gated effect size: KS D again, or the total-variation distance. */
+  effect: number;
+  /** "up" | "down" (numeric, by median shift) | "mixed" (categorical). */
+  direction: "up" | "down" | "mixed";
+  /** Field-bearing events on each side of the test. */
+  baseline_n: number;
+  window_n: number;
+  p_value: number;
+  /** Benjamini–Hochberg adjusted p-value across every test in the run. */
+  q_value: number;
+  /** −log10(p_value) — ranks both test families on one scale. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+}
+
 export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
@@ -490,7 +520,8 @@ export type AnomalyFinding =
   | EntropyFinding
   | ProportionShiftFinding
   | IntervalPeriodicityFinding
-  | SequenceNoveltyFinding;
+  | SequenceNoveltyFinding
+  | DistributionDriftFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -620,7 +651,8 @@ export interface AnomalyMarker {
     | "entropy"
     | "proportion_shift"
     | "interval_periodicity"
-    | "sequence_novelty";
+    | "sequence_novelty"
+    | "value_distribution_drift";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

@@ -1,6 +1,28 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 49 — show-dismissed toggle, TriageMeter disposition awareness).
+Last updated: 2026-07-11 (session 49 — show-dismissed toggle, TriageMeter dispositions, D9 drift detector).
+
+## Session 49b — 2026-07-11: D9 value_distribution_drift detector
+
+Milestone-4 D9 shipped (`detector="value_distribution_drift"`, `method="drift"`), adapted
+from AMiner's VariableTypeDetector: per field × suspect window, one whole-distribution
+test — numeric fields via ClickHouse's `kolmogorovSmirnovTestIf('two-sided')` over
+`toFloat64OrNull` (first use in the codebase; one scan per field, all windows batched
+with `-If` combinators, quantiles + drifted-direction argMin/argMax in the same scan),
+categorical fields via a 2×k G-test over the top-50 baseline categories + exact
+`__other__` bucket (folded in Python from the full GROUP BY, 10k-row scan guard). New
+pure-math helpers: general `_chi2_sf(x, df)` (regularized upper incomplete gamma on
+`math.lgamma`, df=1 delegates to the erfc form), `_g_statistic_k`, `_tvd`. One BH-FDR
+pool across both branches; score `-log10(p)`; effect floors KS D ≥ 0.1 / TVD ≥ 0.05 and
+a 20-sample-per-side floor (`TS_STAT_DRIFT_*`), fdr_q request-overridable. Findings are
+per-field (allowlist key `(field, "*")`). Wired end to end: router dispatch/serialize/
+persistence, config, frontend `DistributionDriftView` (temporal-only, cloned from
+interval view) + DetectorAccordion row, 15 new backend tests (incl. hand-computed G and
+chi² reference values), `docs/ANOMALY_DETECTION.md` §10 (similarity renumbered §11).
+Verified against live ClickHouse: `kolmogorovSmirnovTestIf` parses and clickhouse_connect
+returns the named result tuple as a *dict* (`{'d_statistic', 'p_value'}`), not an
+indexable tuple — `_ks_pair` normalizes both shapes (caught pre-deploy by probing the
+dev server; a tuple-index parse would have KeyError'd in production).
 
 ## Session 49 — 2026-07-11: X1 show-dismissed toggle + X2 TriageMeter dispositions
 

@@ -20,6 +20,7 @@ import {
   ListOrdered,
   Percent,
   RefreshCw,
+  Replace,
   Rewind,
   Ruler,
   Shuffle,
@@ -38,6 +39,7 @@ import { CharsetNoveltyView } from "./CharsetNoveltyView";
 import { EntropyView } from "./EntropyView";
 import { ProportionShiftView } from "./ProportionShiftView";
 import { IntervalPeriodicityView } from "./IntervalPeriodicityView";
+import { DistributionDriftView } from "./DistributionDriftView";
 import { EventSequenceView } from "./EventSequenceView";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
@@ -48,6 +50,7 @@ type DetectorId =
   | "frequency"
   | "shift"
   | "interval"
+  | "drift"
   | "sequence"
   | "order"
   | "range"
@@ -66,6 +69,7 @@ const DETECTORS: {
   { id: "frequency", detector: "frequency", icon: Activity, label: "Frequency", hint: "Count spikes and silences" },
   { id: "shift", detector: "proportion_shift", icon: Percent, label: "Proportion shift", hint: "Value shares that change between windows" },
   { id: "interval", detector: "interval_periodicity", icon: Timer, label: "Interval cadence", hint: "Broken heartbeats and new beaconing" },
+  { id: "drift", detector: "value_distribution_drift", icon: Replace, label: "Distribution drift", hint: "Whole-field value-mix changes between windows" },
   { id: "sequence", detector: "sequence_novelty", icon: ListOrdered, label: "Event sequences", hint: "Never-seen event orderings (n-grams)" },
   { id: "range", detector: "numeric_range", icon: Ruler, label: "Numeric range", hint: "Values outside a learned band" },
   { id: "charset", detector: "charset", icon: Type, label: "Charset novelty", hint: "Never-seen characters" },
@@ -204,6 +208,8 @@ function DetectorBody({ id, ...props }: Props & { id: DetectorId }) {
       return <ProportionShiftView {...shared} onDrillField={props.onDrillField} />;
     case "interval":
       return <IntervalPeriodicityView {...shared} onDrillField={props.onDrillField} />;
+    case "drift":
+      return <DistributionDriftView {...shared} onDrillField={props.onDrillField} />;
     case "sequence":
       return <EventSequenceView {...shared} />;
     case "order":

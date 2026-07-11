@@ -9,7 +9,7 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are ten independent analysis tools in TraceSignal:
+There are eleven independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -20,14 +20,15 @@ There are ten independent analysis tools in TraceSignal:
 7. [Proportion shift](#7-proportion-shift-value-share-changes-between-windows) — values whose *share* of events changed significantly between the baseline and a suspect window (ClickHouse + a real significance test, no ML)
 8. [Interval cadence](#8-interval-cadence-arrival-rhythm-changes-between-windows) — values whose inter-arrival rhythm broke (missed/silent heartbeat) or newly regularized (beaconing) between the baseline and a suspect window (ClickHouse + significance tests, no ML)
 9. [Event sequences](#9-event-sequences-never-seen-orderings) — time-ordered n-grams of a field's values that occur in a suspect window but never in the baseline (ClickHouse, no ML)
-10. [Semantic similarity search](#10-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+10. [Value-distribution drift](#10-value-distribution-drift-whole-field-shape-changes-between-windows) — fields whose *whole value distribution* changed between the baseline and a suspect window (ClickHouse + significance tests, no ML)
+11. [Semantic similarity search](#11-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first nine are **statistical detectors**: pure counting and arithmetic over
+The first ten are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The tenth needs an explicit embedding step first.
+instant ingestion finishes. The eleventh needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–9),
-`src/tracesignal/db/similarity.py` (detector 10). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–10),
+`src/tracesignal/db/similarity.py` (detector 11). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -1094,7 +1095,113 @@ every event.
 
 ---
 
-## 10. Semantic similarity search
+## 10. Value-distribution drift (whole-field shape changes between windows)
+
+**What it answers:** "Did this field's *mix of values* change between the
+known-normal period and the window I'm investigating?" Response sizes that
+quietly doubled, a status-code mix that tilted from 200s toward 500s, a
+user-agent population that gained a new majority — none of these is one rare
+value (value novelty), one value's share (proportion shift), or a volume
+change (frequency). The unit of finding here is the **field**, not a value:
+one finding says "this field's whole distribution is different in this
+window." Adapted from AMiner's `VariableTypeDetector`, reduced to two
+field-agnostic tests.
+
+**Why it isn't proportion shift:** proportion shift tests each value's share
+separately and needs that single value's change to clear an effect floor. A
+drift of many small shifts — every category moving a little, or a numeric
+field's whole curve sliding — never produces one significant value, but the
+aggregate shape change is exactly what a whole-distribution test sees.
+Conversely, one value spiking hard is proportion shift's territory and will
+usually fire both; the drift finding then names the same culprit in
+`top_contributors`.
+
+**Why it isn't numeric range:** the range detector flags individual events
+outside a learned band. A distribution can drift substantially while every
+single value stays inside the old min/max (e.g. the median doubling within an
+unchanged range). Drift tests the population, range tests the outliers.
+
+**Temporal-only.** A distribution can only drift between two populations, so
+there is no self-baseline mode — it always needs a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model).
+Without one it reports `insufficient_data` with a warning rather than
+guessing.
+
+### Two tests, one per field kind
+
+The branch is chosen **syntactically** (never by field meaning, per the
+field-agnostic rule):
+
+- **Numeric fields** (≥ 90% of non-empty values parse as numbers — the same
+  probe the numeric-range detector uses): a **two-sample Kolmogorov–Smirnov
+  test**, computed *inside ClickHouse* via the
+  `kolmogorovSmirnovTestIf('two-sided')` aggregate over `toFloat64OrNull`
+  values — baseline sample vs. suspect-window sample, one conditional
+  aggregate per suspect window, one scan per field. The KS statistic **D** is
+  the largest gap between the two cumulative distribution curves — directly
+  readable as "at least D of the probability mass sits on a different side of
+  some threshold." The finding's `direction` (up/down) comes from the median
+  shift, and its representative event is the window's most extreme value in
+  the drifted direction (`argMax`/`argMin` in the same scan).
+- **Categorical fields** (the novelty recommender's categorical class): a
+  **k-category G-test** — the 2×k generalization of proportion shift's 2×2 —
+  over the top **50** baseline categories plus one exact `__other__` bucket
+  (folded in Python from the full GROUP BY, so no mass is dropped;
+  `details.k_truncated` says whether folding happened). The p-value uses the
+  chi² survival function with df = buckets − 1, computed with a pure-`math`
+  regularized incomplete gamma (`_chi2_sf`) — no scipy, airgap-safe. The
+  finding carries `top_contributors`: the ≤ 5 categories with the largest
+  share change, which is usually the whole story. The representative event is
+  the most-shifted category's first window occurrence (or its last baseline
+  occurrence if it vanished).
+
+Auto field selection blends both recommenders — numeric-recommended fields to
+the KS branch, remaining categorical fields to the G branch — under the usual
+15-field cap; the Fields picker overrides, and explicitly picked fields are
+branch-classified by the same numeric-ratio probe.
+
+### Multiple testing and the effect floors
+
+Every (field × suspect window) test from **both branches** lands in one
+Benjamini–Hochberg pool (`TS_STAT_DRIFT_FDR_Q`, default 0.05) — same q-value
+reading as proportion shift. Because both branches must rank on one scale and
+their raw statistics live on different scales (D vs. G), the **score is
+`−log10(p)`**, the interval-cadence convention.
+
+Significance alone never flags: each branch has its own effect floor, both in
+the *fraction-of-probability-mass* family so one intuition covers both —
+numeric findings need **D ≥ 0.1** (`TS_STAT_DRIFT_MIN_KS_D`), categorical
+findings need a **total-variation distance ≥ 0.05** (`TS_STAT_DRIFT_MIN_TVD`;
+TVD = 0.5·Σ|share difference|, the categorical analog of D). Sides with fewer
+than `TS_STAT_DRIFT_MIN_SAMPLES` (20) field-bearing events are skipped
+entirely — excluded from the FDR pool, with a warning — rather than tested on
+noise. Effect floors are server config only; the request can override `fdr_q`
+but the floors' units are branch-specific.
+
+Findings are per field, so the disposition/allowlist key is `(field, "*")` —
+"this field's drift is expected" suppresses the field, not one value.
+
+### Caveats
+
+- **Heavy ties make KS conservative.** The KS test assumes continuous data;
+  log-derived numerics (ports, sizes, durations rounded to seconds) are full
+  of ties, which *lowers* the true significance of a given D — flagged
+  findings are at least as real as their p-value claims, but subtle drifts in
+  very tied fields may be missed.
+- **Composition effects, again.** Shares sum to 1: one source going quiet
+  tilts every categorical mix it participated in. A page of categorical drift
+  findings across unrelated fields often has one silence at the root — read
+  `top_contributors` before treating each finding as independent.
+- **`__other__` is a bucket, not a value.** When a field has more than 50
+  baseline categories, changes *inside* the folded tail partially cancel;
+  the test is exact for the named categories and conservative for the tail.
+- Events are not independent (bursts, retries, sessions) — the same
+  p-values-are-overconfident honesty note as every other significance test
+  here. Rank with q, verify by looking.
+
+---
+
+## 11. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's
