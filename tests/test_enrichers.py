@@ -540,11 +540,10 @@ async def test_reconcile_orphaned_enrichment_jobs_applies_and_returns_reruns(sto
     assert chunks == [[("e1", "ip:geo_country", "DE")]]
     assert await store.list_staged_rows_for_job("job1", limit=10) == []
     assert await store.list_orphaned_enrichment_job_runs() == []
-    # Provenance recorded with the staged config hash.
-    provenance = await store.list_source_enrichments("s1")
-    assert len(provenance) == 1
-    assert provenance[0].enricher_config_hash == "hash1"
-    assert provenance[0].rows_applied == 1
+    # No provenance: the marker can't say which sources the crashed run
+    # finished staging, and a provenance row off partial staging would make
+    # the run route skip the source forever. The scheduled re-run records it.
+    assert await store.list_source_enrichments("s1") == []
     # The run is returned so the caller can schedule a re-run.
     assert [r.job_id for r in recovered] == ["job1"]
 
@@ -1267,6 +1266,74 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
     assert "boom" in job_store.get(job2.id).error
     assert await store.list_orphaned_enrichment_job_runs() == []
     assert get_active_enricher_run("t1", "stub-broken") is None
+
+
+@pytest.mark.asyncio
+async def test_failed_run_records_provenance_only_for_fully_staged_sources(store):
+    """A mid-run failure must not mark the in-flight source as enriched.
+
+    The run route skips provenance-matched sources, so a provenance row
+    written off partial staging would permanently block finishing the source
+    ("no enricher started" with the source left unenriched).
+    """
+    from tracesignal.core.jobs import JobStore
+    from tracesignal.enrichers import registry
+    from tracesignal.enrichers.base import Enricher
+    from tracesignal.enrichers.jobs import run_enrichment_job
+
+    class StubSecondSourceBoom(Enricher):
+        key = "stub-partial"
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = r"^v-s\d$"
+        output_fields = ("out",)
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            if raw_value == "v-s2":
+                raise RuntimeError("boom on second source")
+            return {"out": "enriched"}
+
+    registry.register(StubSecondSourceBoom())
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src1", file_hash="c" * 64, size_bytes=1)
+    await store.create_source("c1", "s2", "src2", file_hash="d" * 64, size_bytes=1)
+
+    from tracesignal.db.clickhouse import ClickHouseStore
+
+    class _FakeCH(_RecordingClickHouse):
+        iter_source_events = ClickHouseStore.iter_source_events
+
+        def count_events(self, case_id, source_ids):
+            return len(source_ids)
+
+        def list_events(self, case_id, source_id, limit, after_event_id=None):
+            if after_event_id is not None:
+                return []
+            return [{"event_id": f"e-{source_id}", "attributes": {"field": f"v-{source_id}"}}]
+
+    job_store = JobStore()
+    job = job_store.create(kind="enrich")
+    await run_enrichment_job(
+        job_id=job.id,
+        case_id="c1",
+        timeline_id="t1",
+        enricher_key="stub-partial",
+        source_ids=["s1", "s2"],
+        job_store=job_store,
+        store=store,
+        ch_store=_FakeCH(),
+    )
+    assert job_store.get(job.id).status == "failed"
+    assert job_store.get(job.id).result["sources_covered"] == 1
+    # s1 finished staging before the failure: applied + provenance recorded.
+    assert len(await store.list_source_enrichments("s1")) == 1
+    # s2 was in flight: no provenance, so a re-run is not skipped.
+    assert await store.list_source_enrichments("s2") == []
+    # Marker cleared either way — the failure was deterministic, no auto re-run.
+    assert await store.list_orphaned_enrichment_job_runs() == []
 
 
 @pytest.mark.asyncio

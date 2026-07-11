@@ -1,6 +1,19 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 48 — keyset pagination + entropy detector memory fix).
+Last updated: 2026-07-11 (session 48 — keyset pagination, entropy memory fix, partial-staging provenance fix).
+
+## Session 48c — 2026-07-11: no provenance off partial enrichment staging
+
+After the OOM crash chain, a manual enricher run reported "no job started" while the source
+was unenriched. Cause: `_apply_staged_rows` wrote a full `SourceEnrichment` provenance row for
+every source it touched — including sources whose staging was cut short by the crash (applied
+via failure cleanup or startup reconciliation). The run route skips provenance-matched sources,
+so partial provenance permanently blocked re-enrichment. Fix: `_apply_staged_rows` takes
+`complete_source_ids`; the failure path passes the sources fully staged before the error,
+startup reconciliation passes none (its scheduled re-run records provenance on success).
+Partial rows are still applied (valid values, idempotent rewrite) — the source just stays
+eligible. Audit `enricher.applied` now carries a `partial` flag. Recovery for already-poisoned
+rows: `DELETE FROM source_enrichments WHERE case_id=... AND source_id=...`, then re-run.
 
 ## Session 48b — 2026-07-11: entropy detector no longer explodes chars into rows
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 
@@ -187,7 +188,12 @@ def _process_batch(
     return rows
 
 
-async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, job_id: str) -> int:
+async def _apply_staged_rows(
+    store: PostgresStore,
+    ch_store: ClickHouseStore,
+    job_id: str,
+    complete_source_ids: Collection[str] | None = None,
+) -> int:
     """Apply a job's staged rows to ``events.attributes``, one source at a time.
 
     Per staged source: serialize on the per-(case, source) apply lock, verify
@@ -202,6 +208,15 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
     provenance row. A failure leaves that source's staged rows intact for the
     next attempt; the rewrite is idempotent, so a crash between REPLACE and
     the staged-row delete just re-applies identical values.
+
+    ``complete_source_ids`` limits which sources get a provenance row: only
+    sources the job fully staged may be recorded as enriched, because the
+    ``run_timeline_enricher`` route skips provenance-matched sources on the
+    next run — provenance written off partial staging would permanently block
+    finishing the source. ``None`` (the success path) means every staged
+    source is complete. Partial sources still get their staged rows applied
+    and deleted (the values are valid; the rewrite is idempotent), they just
+    stay eligible for a re-run.
 
     No concurrent ingest can append to the partition mid-apply: enrichers
     only run on ``is_ready`` sources, and sources are ingest-once.
@@ -296,15 +311,17 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
                 await asyncio.to_thread(ch_store.delete_source_events, case_id, source_id)
                 await store.delete_staged_rows_for_source(job_id, source_id)
                 continue
-            await store.record_source_enrichment(
-                case_id=case_id,
-                source_id=source_id,
-                timeline_id=timeline_id,
-                enricher_key=enricher_key,
-                enricher_config_hash=config_hash,
-                job_id=job_id,
-                rows_applied=applied,
-            )
+            source_complete = complete_source_ids is None or source_id in complete_source_ids
+            if source_complete:
+                await store.record_source_enrichment(
+                    case_id=case_id,
+                    source_id=source_id,
+                    timeline_id=timeline_id,
+                    enricher_key=enricher_key,
+                    enricher_config_hash=config_hash,
+                    job_id=job_id,
+                    rows_applied=applied,
+                )
             await store.delete_staged_rows_for_source(job_id, source_id)
             # Enrichment just added/stripped derived keys in events.attributes
             # — the only mutation path for an ingested source — so refresh the
@@ -351,6 +368,7 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
                     "enricher_key": enricher_key,
                     "enricher_config_hash": config_hash,
                     "rows_applied": applied,
+                    "partial": not source_complete,
                 },
             )
             applied_total += applied
@@ -488,9 +506,14 @@ async def run_enrichment_job(
         # results are valid — partial coverage, idempotent rewrite) and clear
         # the marker so a deterministic failure isn't auto re-run on every
         # restart. If the apply itself fails (e.g. ClickHouse down), the
-        # marker stays and reconciliation gets it.
+        # marker stays and reconciliation gets it. Only sources fully staged
+        # before the failure may get a provenance row — the in-flight source's
+        # staging is partial, and provenance would make the run route skip it
+        # forever.
         try:
-            await _apply_staged_rows(store, ch_store, job_id)
+            await _apply_staged_rows(
+                store, ch_store, job_id, complete_source_ids=source_ids[:completed_sources]
+            )
             await store.finish_enrichment_job_run(job_id)
             if remaining > 0:
                 await store.record_audit(
@@ -528,13 +551,16 @@ async def reconcile_orphaned_enrichment_jobs(
     (delete), this recovers forward (apply + reschedule) — a shared helper
     would need mode flags that obscure both. The in-memory JobStore is empty
     on a fresh boot, so any ``EnrichmentJobRun`` marker still present means
-    the process died mid-run. Staged rows are valid,
-    complete results — they are applied to ``events.attributes`` here rather
-    than discarded, then the marker is cleared. Returns the recovered runs so
-    the caller can schedule fresh re-runs (``schedule_enrichment_reruns``) to
-    cover whatever the crashed run never processed; the run/re-run overlap is
-    safe because ``mapUpdate`` overwrites the same derived keys with
-    recomputed values.
+    the process died mid-run. Staged rows are valid results — they are
+    applied to ``events.attributes`` here rather than discarded, then the
+    marker is cleared. No provenance is recorded for any of them: the marker
+    doesn't say which sources the crashed run finished staging, and a
+    provenance row written off partial staging would make the run route skip
+    the source forever. Returns the recovered runs so the caller can schedule
+    fresh re-runs (``schedule_enrichment_reruns``) to cover whatever the
+    crashed run never processed — the re-run records provenance on success;
+    the run/re-run overlap is safe because ``mapUpdate`` overwrites the same
+    derived keys with recomputed values.
 
     If applying fails (e.g. ClickHouse unreachable), the marker and staged
     rows are left intact for the next restart.
@@ -543,7 +569,9 @@ async def reconcile_orphaned_enrichment_jobs(
     recovered: list[EnrichmentJobRun] = []
     for run in orphaned:
         try:
-            applied = await _apply_staged_rows(store, ch_store, run.job_id)
+            applied = await _apply_staged_rows(
+                store, ch_store, run.job_id, complete_source_ids=frozenset()
+            )
             await store.finish_enrichment_job_run(run.job_id)
         except Exception:  # noqa: BLE001
             logger.exception(
