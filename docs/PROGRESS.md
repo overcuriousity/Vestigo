@@ -1,7 +1,22 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 49d — visualization: interactivity, four new chart types,
-scan guardrails).
+Last updated: 2026-07-11 (session 50 — perf batch: batched novelty scans (M23b), search-blob
+text-search fast path (M22)).
+
+## Session 50 — 2026-07-11: Perf batch A — one-pass novelty scans + indexed text search
+
+**M23(b) — batched value-novelty scans (`db/anomaly_stats.py`).** `find_value_novelty` ran
+one full `attributes`-Map scan per field (up to 15 per panel-open; ~12 GiB / ~23 s per field
+at 300M rows). All plain-attribute fields now share a single ARRAY JOIN pass
+(`_batched_attr_novelty_rows`, modeled on `field_inventory`'s memory-safe paired
+mapKeys/mapValues pattern): `GROUP BY key, val` + `ORDER BY key, <old per-field order>` +
+`LIMIT n BY key` reproduces the per-field ordering and per-field limit exactly, so findings
+are **identical** to the old loop (live equivalence test against the retired per-field SQL
+as oracle: `tests/test_novelty_batched_clickhouse.py`). Mapped-coalesce and top-level-column
+fields keep the per-field query (coalesce can't be one ARRAY JOIN key; top-level columns
+never read the map). `_MAX_AUTO_SCAN_FIELDS` stays — it now bounds ARRAY JOIN width, not
+round-trips. Finding construction extracted to `_novelty_rows_to_findings`, shared by both
+paths.
 
 ## Session 49d — 2026-07-11: Visualize v3 — click-to-filter, brush-zoom, punch card / pivot / sankey / scatter, viz scan guardrails
 

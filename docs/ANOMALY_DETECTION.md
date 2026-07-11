@@ -309,12 +309,14 @@ message is close to unique) and bury real signal in noise. Restricting to
 `categorical` fields (status codes, artifact types, usernames, hostnames,
 event IDs, parser names) is what makes the score meaningful.
 
-Auto-selection is capped at 15 fields per scan (`_MAX_AUTO_SCAN_FIELDS`) —
-each field is a separate sequential ClickHouse query, so an uncapped
-recommendation set (up to ~54 candidate fields) could turn one panel-open
-into dozens of round-trips. The highest-coverage recommended fields win the
-cap; you can always override with an explicit field list via the Fields
-picker to scan something the auto-selector skipped.
+Auto-selection is capped at 15 fields per scan (`_MAX_AUTO_SCAN_FIELDS`).
+All plain-attribute fields in a scan share **one** ARRAY JOIN pass over the
+`attributes` map (M23b — the map column dominates scan cost, and the former
+one-query-per-field loop re-read it once per field); the cap bounds that
+pass's expansion width plus the residual per-field queries for top-level
+columns and mapped canonical fields. The highest-coverage recommended fields
+win the cap; you can always override with an explicit field list via the
+Fields picker to scan something the auto-selector skipped.
 
 ### Value combinations (the `value_combo` variant)
 

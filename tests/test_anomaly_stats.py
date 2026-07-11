@@ -455,10 +455,12 @@ def test_value_novelty_two_suspect_windows_attributed_separately():
             FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
             # baseline_total, w0_total, w1_total
             FakeQueryResult(result_rows=[(600, 100, 200)], column_names=["bl", "w0", "w1"]),
-            # val, baseline_cnt, w0_cnt, w0_first, w0_evt, w1_cnt, w1_first, w1_evt
+            # key, val, baseline_cnt, w0_cnt, w0_first, w0_evt, w1_cnt, w1_first, w1_evt
+            # (batched attr scan rows carry the leading map key)
             FakeQueryResult(
                 result_rows=[
                     (
+                        "user",
                         "svc_x",
                         0,
                         4,
@@ -470,6 +472,7 @@ def test_value_novelty_two_suspect_windows_attributed_separately():
                     )
                 ],
                 column_names=[
+                    "key",
                     "val",
                     "baseline_cnt",
                     "w0_cnt",
@@ -528,14 +531,92 @@ def test_value_novelty_small_window_warns():
             FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
             FakeQueryResult(result_rows=[(600, 5)], column_names=["bl", "w0"]),
             FakeQueryResult(
-                result_rows=[("svc_x", 0, 3, datetime(2024, 1, 11), "evt-a")],
-                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                result_rows=[("user", "svc_x", 0, 3, datetime(2024, 1, 11), "evt-a")],
+                column_names=["key", "val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
             ),
         ]
     )
     result = svc.find_value_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
     assert len(result.results) == 1  # still surfaced
     assert any("tiny" in w and "unstable" in w for w in result.warnings)
+
+
+def test_value_novelty_batched_sql_shape_self_baseline():
+    """Attr fields share one ARRAY JOIN pass; top-level fields stay per-field."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),  # batched attr scan
+            FakeQueryResult(result_rows=[], column_names=[]),  # artifact per-field scan
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty("c1", ["s1"], fields=["attr:user", "attr:host", "artifact"])
+
+    batched_sql = client.full_queries[1]
+    assert "ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val" in batched_sql
+    assert "has({nkeys:Array(String)}, key)" in batched_sql
+    assert "GROUP BY key, val" in batched_sql
+    assert "ORDER BY key ASC, cnt ASC, first_seen ASC" in batched_sql
+    assert "LIMIT {lim:UInt32} BY key" in batched_sql
+    assert "attributes[{fk:String}]" not in batched_sql
+    assert sorted(client._all_parameters[1]["nkeys"]) == ["host", "user"]
+
+    artifact_sql = client.full_queries[2]
+    assert "ARRAY JOIN" not in artifact_sql
+    assert "artifact AS val" in artifact_sql
+    assert "LIMIT {lim:UInt32}" in artifact_sql
+    assert "BY key" not in artifact_sql
+
+
+def test_value_novelty_batched_sql_shape_temporal():
+    """The temporal batched scan keeps windows, sentinel guard and per-key limit."""
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 10, tzinfo=UTC),
+        datetime(2024, 1, 11, tzinfo=UTC),
+        datetime(2024, 1, 12, tzinfo=UTC),
+    )
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(60, 10)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),  # batched attr scan
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
+
+    batched_sql = client.full_queries[2]
+    assert "ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val" in batched_sql
+    assert "HAVING baseline_cnt = 0 AND (w0_cnt) > 0" in batched_sql
+    assert "LIMIT {lim:UInt32} BY key" in batched_sql
+    assert "timestamp !=" in batched_sql  # sentinel guard
+    # Window bounds bound as parameters (forensic reproducibility).
+    params = client._all_parameters[2]
+    assert params["b0"] == "2024-01-01 00:00:00"
+    assert params["w0s"] == "2024-01-11 00:00:00"
+
+
+def test_value_novelty_mapped_field_stays_per_field():
+    """A canonical mapped field keeps the coalesce per-field query (no batching)."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),  # mapped per-field scan
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty(
+        "c1", ["s1"], fields=["user"], field_mappings={"user": ["username", "uid"]}
+    )
+
+    mapped_sql = client.full_queries[1]
+    assert "ARRAY JOIN" not in mapped_sql
+    assert "coalesce(nullif(attributes[{fk_m0:String}], '')" in mapped_sql
 
 
 def test_windows_from_split_reproduces_adjacent_split():
@@ -1214,15 +1295,16 @@ def test_value_novelty_smart_default_calls_recommender():
             result_rows=[("status_code", 6, 500)],  # attr categorical
             column_names=["key", "dist", "cov_count"],
         ),  # attribute keys
-        # find_value_novelty field scans (recommended fields = artifact + attr:status_code):
+        # find_value_novelty scans (recommended fields = artifact + attr:status_code):
+        # the batched attribute pass runs first, then the per-field top-level scan.
         FakeQueryResult(
-            result_rows=[("404", 2, datetime(2024, 1, 1), "evt-1")],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
-        ),  # artifact field scan
+            result_rows=[("status_code", "404", 2, datetime(2024, 1, 1), "evt-1")],
+            column_names=["key", "val", "cnt", "first_seen", "evt_id"],
+        ),  # batched attr scan (attr:status_code)
         FakeQueryResult(
             result_rows=[],
             column_names=[],
-        ),  # attr:status_code field scan
+        ),  # artifact per-field scan
     ]
     svc = _svc(responses)
     result = svc.find_value_novelty("c1", ["s1"], rarity_floor=3)
@@ -1235,9 +1317,10 @@ def test_value_novelty_smart_default_calls_recommender():
 
 
 def test_value_novelty_auto_mode_caps_scanned_fields():
-    """C11: auto-selected fields are capped at _MAX_AUTO_SCAN_FIELDS — each
-    field is a separate sequential ClickHouse round-trip, so an uncapped
-    recommended set could turn one panel-open into dozens of them."""
+    """C11: auto-selected fields are capped at _MAX_AUTO_SCAN_FIELDS — the cap
+    now bounds the batched ARRAY JOIN key set (expansion width / LIMIT BY
+    output), not a per-field round-trip count: all plain-attribute fields
+    share a single batched scan."""
     from tracesignal.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS, NoveltyFieldInfo
 
     total = 1000
@@ -1256,9 +1339,12 @@ def test_value_novelty_auto_mode_caps_scanned_fields():
 
     svc.find_value_novelty("c1", ["s1"], rarity_floor=3)
 
-    # First call is the total() count; every call after it is one field scan.
+    # First call is the total() count; all attr fields collapse into ONE
+    # batched scan whose key list carries exactly the capped field set.
     field_scan_calls = svc.ch.client._calls[1:]
-    assert len(field_scan_calls) == _MAX_AUTO_SCAN_FIELDS
+    assert len(field_scan_calls) == 1
+    batched_params = svc.ch.client._all_parameters[1]
+    assert len(batched_params["nkeys"]) == _MAX_AUTO_SCAN_FIELDS
 
 
 # ---------------------------------------------------------------------------
