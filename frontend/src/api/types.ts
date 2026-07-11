@@ -275,6 +275,8 @@ export interface ValueNoveltyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One anomalous time window from the frequency detector. */
@@ -292,6 +294,8 @@ export interface FrequencyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One rare / first-seen field *combination* from the value_combo detector. */
@@ -308,6 +312,8 @@ export interface ValueComboFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One out-of-range numeric value from the numeric_range detector. */
@@ -325,6 +331,8 @@ export interface NumericRangeFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One value containing never-seen characters from the charset detector. */
@@ -341,6 +349,8 @@ export interface CharsetFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One entropy-outlier value from the entropy detector. */
@@ -360,6 +370,8 @@ export interface EntropyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One value-share shift between windows from the proportion_shift detector. */
@@ -388,6 +400,8 @@ export interface ProportionShiftFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One arrival-cadence change between windows from the interval_periodicity detector. */
@@ -418,6 +432,8 @@ export interface IntervalPeriodicityFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
@@ -439,6 +455,8 @@ export interface SequenceNoveltyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One out-of-order timestamp finding from the timestamp_order detector. */
@@ -458,9 +476,11 @@ export interface TimestampOrderFinding {
   score: number;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
-export type AnomalyFinding = (
+export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
   | FrequencyFinding
@@ -470,11 +490,7 @@ export type AnomalyFinding = (
   | EntropyFinding
   | ProportionShiftFinding
   | IntervalPeriodicityFinding
-  | SequenceNoveltyFinding
-) & {
-  /** Present (true) only when the request passed `include_dismissed`. */
-  dismissed?: boolean;
-};
+  | SequenceNoveltyFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";

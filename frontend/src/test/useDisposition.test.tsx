@@ -27,17 +27,20 @@ vi.mock("@/stores/toasts", () => ({
 const CASE = "c1";
 const TL = "t1";
 
-/** The exact query keys the analysis views use (key[3] = backend detector id). */
+/**
+ * The exact query keys the analysis views use (key[3] = backend detector id;
+ * the last element is the show-dismissed toggle from useShowDismissed).
+ */
 const VIEW_KEYS: Record<string, unknown[]> = {
-  value_novelty: ["anomalies", CASE, TL, "value_novelty", "bl", "__auto__", 50],
-  numeric_range: ["anomalies", CASE, TL, "numeric_range", "bl", "__auto__", 50],
-  value_combo: ["anomalies", CASE, TL, "value_combo", "bl", "__auto__", 50],
-  timestamp_order: ["anomalies", CASE, TL, "timestamp_order", 0, 100],
-  charset: ["anomalies", CASE, TL, "charset", "bl", "__auto__", 50],
-  entropy: ["anomalies", CASE, TL, "entropy", "bl", "__auto__", 50],
-  frequency: ["anomalies", CASE, TL, "frequency", "host", 3, "bl", 30],
-  proportion_shift: ["anomalies", CASE, TL, "proportion_shift", "bl", "__auto__", 50],
-  interval_periodicity: ["anomalies", CASE, TL, "interval_periodicity", "bl", "__auto__", 50],
+  value_novelty: ["anomalies", CASE, TL, "value_novelty", "bl", "__auto__", 50, false],
+  numeric_range: ["anomalies", CASE, TL, "numeric_range", "bl", "__auto__", 50, false],
+  value_combo: ["anomalies", CASE, TL, "value_combo", "bl", "__auto__", 50, false],
+  timestamp_order: ["anomalies", CASE, TL, "timestamp_order", 0, 100, false],
+  charset: ["anomalies", CASE, TL, "charset", "bl", "__auto__", 50, false],
+  entropy: ["anomalies", CASE, TL, "entropy", "bl", "__auto__", 50, false],
+  frequency: ["anomalies", CASE, TL, "frequency", "host", 3, "bl", 30, false],
+  proportion_shift: ["anomalies", CASE, TL, "proportion_shift", "bl", "__auto__", 50, false],
+  interval_periodicity: ["anomalies", CASE, TL, "interval_periodicity", "bl", "__auto__", 50, false],
 };
 
 function response(field: string, value: string): AnomaliesResponse {
@@ -102,6 +105,43 @@ describe("useDisposition optimistic filtering", () => {
       const data = qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.value_novelty);
       expect(data?.results.map((f) => f.event_id)).toEqual(["ev2"]);
       expect(data?.dismissed_count).toBe(1);
+    });
+  });
+
+  it("dismissed flags (not removes) in a cache fetched with the show-dismissed toggle", async () => {
+    const { qc, result } = setup();
+    const key = [...VIEW_KEYS.value_novelty.slice(0, -1), true];
+    qc.setQueryData(key, response("host", "evil"));
+
+    result.current.mutate({
+      kind: "dismissed",
+      detector: "value_novelty",
+      field: "host",
+      value: "evil",
+    });
+
+    await waitFor(() => {
+      const data = qc.getQueryData<AnomaliesResponse>(key);
+      // Row stays, flagged; total_findings untouched.
+      expect(data?.results.map((f) => [f.event_id, f.dismissed ?? false])).toEqual([
+        ["ev1", true],
+        ["ev2", false],
+      ]);
+      expect(data?.total_findings).toBe(10);
+      expect(data?.dismissed_count).toBe(1);
+    });
+  });
+
+  it("normal still removes even in a show-dismissed cache", async () => {
+    const { qc, result } = setup();
+    const key = [...VIEW_KEYS.value_novelty.slice(0, -1), true];
+    qc.setQueryData(key, response("host", "evil"));
+
+    result.current.mutate({ kind: "normal", detector: "value_novelty", field: "host", value: "evil" });
+
+    await waitFor(() => {
+      const data = qc.getQueryData<AnomaliesResponse>(key);
+      expect(data?.results.map((f) => f.event_id)).toEqual(["ev2"]);
     });
   });
 

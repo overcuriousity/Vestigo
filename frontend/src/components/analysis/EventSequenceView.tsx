@@ -24,6 +24,7 @@ import {
 import {
   useCappedFindings,
   useFindingsLimit,
+  useShowDismissed,
   useBaselineRequest,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -71,6 +72,7 @@ function SequenceRow({
 
   return (
     <FindingShell
+      dismissed={finding.dismissed}
       details={finding.details}
       onClick={() => {
         if (finding.event_id) openEvent.mutate();
@@ -142,6 +144,7 @@ export function EventSequenceView({
   const qc = useQueryClient();
 
   const fl = useFindingsLimit();
+  const sd = useShowDismissed();
   const enabled = frame === "baseline" && !needsBaseline;
 
   // Dynamic attribute fields extend the grouping-field dropdown (same source
@@ -164,7 +167,7 @@ export function EventSequenceView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey, fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey, fl.limit, sd.enabled],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "sequence_novelty",
@@ -172,6 +175,7 @@ export function EventSequenceView({
         ngram_size: ngramSize,
         limit: fl.limit,
         ...blParams,
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
     enabled,
@@ -316,7 +320,7 @@ export function EventSequenceView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} showDismissed={sd.enabled} onToggleDismissed={sd.toggle} />
           {cap.shown.map((f, i) => (
             <SequenceRow
               key={`${f.field}:${f.value}:${i}`}

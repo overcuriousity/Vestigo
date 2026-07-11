@@ -33,6 +33,7 @@ import {
   useAnomalyMarkers,
   useBaselineRequest,
   useDetectorRunId,
+  useShowDismissed,
 } from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, FrequencyFinding } from "@/api/types";
@@ -96,6 +97,7 @@ function FreqFindingRow({
     <div
       className={cn(
         "group flex items-start gap-2 rounded border p-2 cursor-pointer transition-colors",
+        finding.dismissed && "opacity-60",
         severity === "high"
           ? "border-[var(--color-error)]/50 bg-[var(--color-error)]/5 hover:bg-[var(--color-error)]/10"
           : severity === "medium"
@@ -242,9 +244,10 @@ export function FrequencyView({
   }, [fieldsData]);
 
   const fl = useFindingsLimit(30);
+  const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey, fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey, fl.limit, sd.enabled],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
@@ -252,6 +255,7 @@ export function FrequencyView({
         z_threshold: zThresholdParam,
         limit: fl.limit,
         ...blParams,
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
     enabled: !needsBaseline,
@@ -394,7 +398,7 @@ export function FrequencyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} showDismissed={sd.enabled} onToggleDismissed={sd.toggle} />
           {cap.shown.map((f, i) => (
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}

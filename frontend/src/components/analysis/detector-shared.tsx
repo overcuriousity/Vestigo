@@ -59,6 +59,8 @@ export function ResultsBar({
   onLoadMore,
   loadingMore,
   dismissedCount,
+  showDismissed,
+  onToggleDismissed,
 }: {
   total: number;
   shownCount: number;
@@ -72,14 +74,34 @@ export function ResultsBar({
   loadingMore?: boolean;
   /** `dismissed_count` from the response — noise hidden by dispositions, never silently. */
   dismissedCount?: number;
+  /** Reveal-dismissed toggle state (see `useShowDismissed`); rendered as a link. */
+  showDismissed?: boolean;
+  onToggleDismissed?: () => void;
 }) {
   const truncated = serverTotal !== undefined && serverTotal > total;
+  const hasDismissed = (dismissedCount ?? 0) > 0 || showDismissed;
   return (
     <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
       <span>
         {truncated ? `${total} of ${serverTotal} findings` : `${total} finding${total === 1 ? "" : "s"}`}
         {hasMore ? ` · showing ${shownCount}` : ""}
-        {(dismissedCount ?? 0) > 0 ? ` · ${dismissedCount} dismissed` : ""}
+        {hasDismissed ? ` · ${dismissedCount ?? 0} dismissed` : ""}
+        {hasDismissed && onToggleDismissed && (
+          <>
+            {" "}
+            <button
+              className="text-[var(--color-accent)] hover:underline"
+              onClick={onToggleDismissed}
+              title={
+                showDismissed
+                  ? "Hide dismissed findings again"
+                  : "Reveal dismissed findings, dimmed, in place"
+              }
+            >
+              {showDismissed ? "hide" : "show"}
+            </button>
+          </>
+        )}
       </span>
       <span className="flex items-center gap-2">
         {truncated && onLoadMore && (
@@ -186,6 +208,7 @@ export function FindingShell({
   actions,
   details,
   highlight = false,
+  dismissed = false,
   title,
   children,
 }: {
@@ -196,6 +219,8 @@ export function FindingShell({
   details: Record<string, unknown>;
   /** Accent highlight, e.g. temporal-mode "first seen" findings. */
   highlight?: boolean;
+  /** Dismissed finding revealed via the show-dismissed toggle — dimmed. */
+  dismissed?: boolean;
   title?: string;
   children: React.ReactNode;
 }) {
@@ -205,14 +230,23 @@ export function FindingShell({
     <div
       className={cn(
         "group rounded border transition-colors cursor-pointer",
-        highlight
+        highlight && !dismissed
           ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-dim)]"
           : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+        dismissed && "opacity-60",
       )}
       title={title}
     >
       {/* Main row */}
       <div className="flex items-start gap-2 p-2" onClick={onClick}>
+        {dismissed && (
+          <span
+            title="Dismissed — hidden as noise; revealed by the show-dismissed toggle"
+            className="mt-0.5 shrink-0 text-[var(--color-fg-muted)]"
+          >
+            <EyeOff size={12} />
+          </span>
+        )}
         <div className="min-w-0 flex-1 space-y-0.5">{children}</div>
 
         {/* Actions */}

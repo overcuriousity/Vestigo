@@ -24,6 +24,7 @@ import {
   useBaselineRequest,
   useCappedFindings,
   useFindingsLimit,
+  useShowDismissed,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -75,6 +76,7 @@ function FindingRow({
 
   return (
     <FindingShell
+      dismissed={finding.dismissed}
       highlight={isFirstSeen}
       details={finding.details}
       onClick={() => {
@@ -156,15 +158,17 @@ export function ValueNoveltyView({
   // the reserved "__none__" token, which the backend maps to "scan nothing".
   const fieldsParam = fieldsParamOf(selectedFields);
   const fl = useFindingsLimit();
+  const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "value_novelty", blKey, fieldsParam ?? "__auto__", fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "value_novelty", blKey, fieldsParam ?? "__auto__", fl.limit, sd.enabled],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_novelty",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
     enabled: !needsBaseline,
@@ -272,7 +276,7 @@ export function ValueNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} showDismissed={sd.enabled} onToggleDismissed={sd.toggle} />
           {cap.shown.map((f, i) => (
             <FindingRow
               key={`${f.field}:${f.value}:${i}`}

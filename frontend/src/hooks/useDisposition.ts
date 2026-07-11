@@ -27,17 +27,20 @@ export interface DispositionTarget {
   details?: Record<string, unknown>;
 }
 
+/** True when the disposition target covers this finding. */
+function matchesTarget(f: AnomalyFinding, t: DispositionTarget): boolean {
+  if (t.field !== undefined && t.value !== undefined) {
+    return (
+      (f.details as Record<string, unknown>)?.allowlist_field === t.field &&
+      (f.details as Record<string, unknown>)?.allowlist_value === t.value
+    );
+  }
+  return !!t.eventId && f.event_id === t.eventId;
+}
+
 /** Drop the findings a new normal/dismissed disposition suppresses. */
 function filterFindings(data: AnomaliesResponse, t: DispositionTarget): AnomaliesResponse {
-  const keep = (f: AnomalyFinding) => {
-    if (t.field !== undefined && t.value !== undefined) {
-      return !(
-        (f.details as Record<string, unknown>)?.allowlist_field === t.field &&
-        (f.details as Record<string, unknown>)?.allowlist_value === t.value
-      );
-    }
-    return !(t.eventId && f.event_id === t.eventId);
-  };
+  const keep = (f: AnomalyFinding) => !matchesTarget(f, t);
   const results = data.results.filter(keep);
   const dropped = data.results.length - results.length;
   return {
@@ -51,6 +54,26 @@ function filterFindings(data: AnomaliesResponse, t: DispositionTarget): Anomalie
     // Dismissed findings stay counted — the backend reports them the same way.
     dismissed_count:
       t.kind === "dismissed" ? (data.dismissed_count ?? 0) + dropped : data.dismissed_count,
+  };
+}
+
+/**
+ * Flag (not drop) the findings a new dismissal covers — for caches fetched
+ * with `include_dismissed` (the show-dismissed toggle), where dismissed rows
+ * stay visible, dimmed. `total_findings` is untouched: the backend keeps
+ * dismissed findings counted there when they stay in `results`.
+ */
+function markFindingsDismissed(data: AnomaliesResponse, t: DispositionTarget): AnomaliesResponse {
+  let flagged = 0;
+  const results = data.results.map((f) => {
+    if (!matchesTarget(f, t) || f.dismissed) return f;
+    flagged += 1;
+    return { ...f, dismissed: true };
+  });
+  return {
+    ...data,
+    results,
+    dismissed_count: (data.dismissed_count ?? 0) + flagged,
   };
 }
 
@@ -136,7 +159,17 @@ export function useDisposition(caseId: string, timelineId: string) {
         // findings (backend matches `detector in (detector, "*")`); the
         // query key carries the detector id at index 3.
         if (t.detector !== "*" && key[3] !== t.detector) continue;
-        qc.setQueryData(key, filterFindings(data, t));
+        // Caches fetched with the show-dismissed toggle carry `true` as the
+        // key's last element (see useShowDismissed): there, a dismissal keeps
+        // the row visible, flagged + dimmed, matching what a refetch returns.
+        // Normal still removes — the backend suppresses it either way.
+        const showsDismissed = key[key.length - 1] === true;
+        qc.setQueryData(
+          key,
+          t.kind === "dismissed" && showsDismissed
+            ? markFindingsDismissed(data, t)
+            : filterFindings(data, t),
+        );
       }
       return { snapshots };
     },

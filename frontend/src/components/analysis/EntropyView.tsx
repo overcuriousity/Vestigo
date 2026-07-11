@@ -25,6 +25,7 @@ import {
 import {
   useCappedFindings,
   useFindingsLimit,
+  useShowDismissed,
   useBaselineRequest,
   fieldsParamOf,
   useAnomalyMarkers,
@@ -67,6 +68,7 @@ function EntropyRow({
 
   return (
     <FindingShell
+      dismissed={finding.dismissed}
       details={finding.details}
       onClick={() => {
         if (finding.event_id) openEvent.mutate();
@@ -143,15 +145,17 @@ export function EntropyView({
 
   const fieldsParam = fieldsParamOf(selectedFields);
   const fl = useFindingsLimit();
+  const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "entropy", blKey, fieldsParam ?? "__auto__", fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "entropy", blKey, fieldsParam ?? "__auto__", fl.limit, sd.enabled],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "entropy",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
     enabled: !needsBaseline,
@@ -252,7 +256,7 @@ export function EntropyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} showDismissed={sd.enabled} onToggleDismissed={sd.toggle} />
           {cap.shown.map((f, i) => (
             <EntropyRow
               key={`${f.field}:${f.value}:${i}`}

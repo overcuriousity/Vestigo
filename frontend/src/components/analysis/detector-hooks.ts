@@ -89,6 +89,18 @@ export function useCappedFindings<T>(findings: T[], initial = 20) {
 }
 
 /**
+ * Per-view "show dismissed" reveal toggle. When on, the scan request carries
+ * `include_dismissed=true` and dismissed findings come back flagged
+ * `dismissed: true` instead of dropped — rendered dimmed by `FindingShell`.
+ * Include `enabled` in the query key (last element — `useDisposition` keys
+ * its optimistic-update branch off that position) so toggling refetches.
+ */
+export function useShowDismissed() {
+  const [enabled, setEnabled] = useState(false);
+  return { enabled, toggle: () => setEnabled((v) => !v) };
+}
+
+/**
  * Server-side findings limit with stepped "load more" (…→50→150→500, capped by
  * the API's `le=500`). Distinct from `useCappedFindings`, which only trims the
  * client-side render of what the server already returned — this raises how

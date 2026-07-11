@@ -32,6 +32,8 @@ export interface AnomalyParams {
   limit?: number;
   /** Persist this scan as a DetectorRun and return its run_id (default: true). */
   persist?: boolean;
+  /** Keep dismissed findings in `results`, flagged `dismissed: true` (default: false). */
+  include_dismissed?: boolean;
   [key: string]: string | number | boolean | null | undefined;
 }
 

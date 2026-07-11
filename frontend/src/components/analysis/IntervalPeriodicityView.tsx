@@ -26,6 +26,7 @@ import {
 import {
   useCappedFindings,
   useFindingsLimit,
+  useShowDismissed,
   useBaselineRequest,
   fieldsParamOf,
   useAnomalyMarkers,
@@ -90,6 +91,7 @@ function IntervalRow({
 
   return (
     <FindingShell
+      dismissed={finding.dismissed}
       details={finding.details}
       onClick={() => {
         if (finding.event_id) openEvent.mutate();
@@ -204,6 +206,7 @@ export function IntervalPeriodicityView({
 
   const fieldsParam = fieldsParamOf(selectedFields);
   const fl = useFindingsLimit();
+  const sd = useShowDismissed();
   const enabled = frame === "baseline" && !needsBaseline;
 
   const { data, isLoading, isFetching, refetch } = useQuery({
@@ -215,6 +218,7 @@ export function IntervalPeriodicityView({
       blKey,
       fieldsParam ?? "__auto__",
       fl.limit,
+      sd.enabled,
     ],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
@@ -222,6 +226,7 @@ export function IntervalPeriodicityView({
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
     enabled,
@@ -347,6 +352,8 @@ export function IntervalPeriodicityView({
             onLoadMore={fl.canRaise ? fl.raise : undefined}
             loadingMore={isFetching}
             dismissedCount={data?.dismissed_count}
+            showDismissed={sd.enabled}
+            onToggleDismissed={sd.toggle}
           />
           {cap.shown.map((f, i) => (
             <IntervalRow

@@ -23,6 +23,7 @@ import {
 import {
   useCappedFindings,
   useFindingsLimit,
+  useShowDismissed,
   useBaselineRequest,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -75,6 +76,7 @@ function ComboRow({
 
   return (
     <FindingShell
+      dismissed={finding.dismissed}
       highlight={isFirstSeen}
       details={finding.details}
       onClick={() => {
@@ -179,15 +181,17 @@ export function ComboNoveltyView({
   const explicitTooFew = selectedFields !== null && selectedFields.length < MIN_FIELDS;
   const fieldsParam = selectedFields !== null ? selectedFields.join(",") : undefined;
   const fl = useFindingsLimit();
+  const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "value_combo", blKey, fieldsParam ?? "__auto__", fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "value_combo", blKey, fieldsParam ?? "__auto__", fl.limit, sd.enabled],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_combo",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     // Don't fire while the explicit selection is below the two-field minimum.
     enabled: !explicitTooFew && !needsBaseline,
@@ -296,7 +300,7 @@ export function ComboNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} showDismissed={sd.enabled} onToggleDismissed={sd.toggle} />
           {cap.shown.map((f, i) => (
             <ComboRow
               key={`${f.values.join("|")}:${i}`}

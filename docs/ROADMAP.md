@@ -197,14 +197,6 @@ L2 (per-event `normal` annotation) is resolved: dispositions
 (`finding_dispositions`, migration `0004`) subsumed the allowlist, the
 per-event `normal` annotation, and the `pinned` flag. Remaining polish:
 
-- [ ] **X1 — "Show dismissed" toggle in the detector views.** The backend
-  supports `include_dismissed=true` (findings return flagged `dismissed: true`)
-  and every view shows the `dismissed_count`; a per-view reveal toggle is not
-  wired yet.
-- [ ] **X2 — TriageMeter disposition awareness.** "Reviewed" is still inferred
-  from user *annotations* only; an event dispositioned normal/dismissed/
-  confirmed without a tag/comment doesn't count. Feed `["dispositions", …]`
-  into `computeProgress`.
 - [ ] **X3 — Event-grid indicator for event-scoped dispositions.** The legacy
   per-event-normal grid indicator was removed with the annotation; an
   indicator driven by event-scoped disposition rows could return if analysts

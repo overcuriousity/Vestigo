@@ -7,14 +7,16 @@ import { SessionMomentum } from "./SessionMomentum";
 import { Progress } from "@/components/ui/Progress";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { SESSION_START } from "@/lib/session";
-import type { Annotation } from "@/api/types";
+import type { Annotation, Disposition } from "@/api/types";
 
 interface Props {
   annotations: Annotation[];
+  /** Analyst verdicts — an event-scoped disposition counts as reviewed. */
+  dispositions: Disposition[];
   totalEvents: number | null;
 }
 
-function computeProgress(annotations: Annotation[]) {
+function computeProgress(annotations: Annotation[], dispositions: Disposition[]) {
   const byEvent = new Map<string, Annotation[]>();
   for (const a of annotations) {
     const list = byEvent.get(a.event_id) ?? [];
@@ -29,9 +31,18 @@ function computeProgress(annotations: Annotation[]) {
       .map((a) => a.event_id),
   );
 
-  // Anomalies reviewed = anomaly events that also have a user annotation
-  const anomaliesReviewed = [...anomalyEventIds].filter((eid) =>
-    (byEvent.get(eid) ?? []).some((a) => a.origin === "user"),
+  // Anomalies reviewed = anomaly events with a user annotation OR an
+  // event-scoped disposition (normal/dismissed/confirmed without a tag or
+  // comment is still a review verdict). Value-scoped dispositions don't map
+  // to single events, so they can't feed a per-event meter.
+  const dispositionedEventIds = new Set<string>();
+  for (const d of dispositions) {
+    if (d.event_id !== null) dispositionedEventIds.add(d.event_id);
+  }
+  const anomaliesReviewed = [...anomalyEventIds].filter(
+    (eid) =>
+      dispositionedEventIds.has(eid) ||
+      (byEvent.get(eid) ?? []).some((a) => a.origin === "user"),
   ).length;
 
   // Events triaged this session = distinct events with a user annotation
@@ -50,9 +61,9 @@ function computeProgress(annotations: Annotation[]) {
   };
 }
 
-export function TriageMeter({ annotations, totalEvents: _totalEvents }: Props) {
+export function TriageMeter({ annotations, dispositions, totalEvents: _totalEvents }: Props) {
   const { totalAnomalies, anomaliesReviewed, triagedThisSession } =
-    computeProgress(annotations);
+    computeProgress(annotations, dispositions);
 
   const anomalyPct =
     totalAnomalies > 0 ? Math.round((anomaliesReviewed / totalAnomalies) * 100) : 0;

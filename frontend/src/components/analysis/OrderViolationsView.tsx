@@ -22,6 +22,7 @@ import {
   useAnomalyMarkers,
   useDetectorRunId,
   useFindingsLimit,
+  useShowDismissed,
   useOpenEvent,
 } from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
@@ -70,6 +71,7 @@ function ViolationRow({
 
   return (
     <FindingShell
+      dismissed={finding.dismissed}
       details={finding.details}
       onClick={() => openEvent.mutate()}
       title={`Event at ${fmtTs(finding.timestamp)} follows a record dated ${fmtTs(finding.prev_timestamp)}`}
@@ -130,14 +132,16 @@ export function OrderViolationsView({
     Number.isFinite(parsedMinSkew) && parsedMinSkew >= 0 ? parsedMinSkew : undefined;
 
   const fl = useFindingsLimit(100);
+  const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "timestamp_order", minSkewParam, fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "timestamp_order", minSkewParam, fl.limit, sd.enabled],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "timestamp_order",
         min_skew_seconds: minSkewParam,
         limit: fl.limit,
+        ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
   });
@@ -236,12 +240,31 @@ export function OrderViolationsView({
       )}
 
       {/* Server-side truncation notice — the per-source "showing" counters
-          below cover the per-source hydration cap, not the global limit. */}
-      {(data?.total_findings ?? 0) > findings.length && (
+          below cover the per-source hydration cap, not the global limit.
+          Also shown untruncated when dismissed findings exist, so the
+          show-dismissed toggle always has a home. */}
+      {((data?.total_findings ?? 0) > findings.length ||
+        (data?.dismissed_count ?? 0) > 0 ||
+        sd.enabled) && (
         <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
           <span>
-            {findings.length} of {data?.total_findings} violations
-            {(data?.dismissed_count ?? 0) > 0 ? ` · ${data?.dismissed_count} dismissed` : ""}
+            {findings.length} of {data?.total_findings ?? findings.length} violations
+            {((data?.dismissed_count ?? 0) > 0 || sd.enabled) && (
+              <>
+                {` · ${data?.dismissed_count ?? 0} dismissed`}{" "}
+                <button
+                  className="text-[var(--color-accent)] hover:underline"
+                  onClick={sd.toggle}
+                  title={
+                    sd.enabled
+                      ? "Hide dismissed findings again"
+                      : "Reveal dismissed findings, dimmed, in place"
+                  }
+                >
+                  {sd.enabled ? "hide" : "show"}
+                </button>
+              </>
+            )}
           </span>
           {fl.canRaise && (
             <button

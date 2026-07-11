@@ -1,6 +1,28 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 48 — keyset pagination, entropy memory fix, partial-staging provenance fix).
+Last updated: 2026-07-11 (session 49 — show-dismissed toggle, TriageMeter disposition awareness).
+
+## Session 49 — 2026-07-11: X1 show-dismissed toggle + X2 TriageMeter dispositions
+
+Frontend-only disposition polish (roadmap X1/X2, both closed):
+
+- **X1.** Every detector view can now reveal dismissed findings in place: a
+  `useShowDismissed` hook (detector-hooks) threads `include_dismissed=true` into the scan
+  request and the query key's last element; `ResultsBar` (and OrderViolations' bespoke bar)
+  grew a show/hide link next to the dismissed count; `FindingShell` renders dismissed rows
+  dimmed with an EyeOff badge (FrequencyView's bespoke row just dims). `useDisposition`'s
+  optimistic update branches on the key's trailing toggle flag: in a revealed cache, a
+  dismissal flags the row (`dismissed: true`, `dismissed_count`+1, `total_findings`
+  untouched) instead of removing it — matching what a refetch returns; `normal` still
+  removes (backend suppresses it regardless). `dismissed?` moved from an intersection on
+  the `AnomalyFinding` union into each finding interface so per-detector narrowing keeps it.
+- **X2.** TriageMeter "reviewed" now counts event-scoped dispositions, not just user
+  annotations: ExplorerPage consumes the `["dispositions", caseId, timelineId]` query
+  (already invalidated by every disposition mutation) and `computeProgress` unions those
+  event ids into the reviewed set. Value-scoped dispositions stay out — they don't map to
+  single events.
+
+Typecheck, oxlint, vitest (199, incl. 2 new useDisposition branch tests) all green.
 
 ## Session 48c — 2026-07-11: no provenance off partial enrichment staging
 

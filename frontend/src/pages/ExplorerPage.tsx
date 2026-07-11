@@ -23,6 +23,7 @@ import {
 
 import { eventsApi } from "@/api/events";
 import { annotationsApi } from "@/api/annotations";
+import { dispositionsApi } from "@/api/dispositions";
 import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
@@ -567,6 +568,15 @@ export function ExplorerPage() {
     refetchInterval: 30_000,
   });
 
+  // Feeds the TriageMeter's reviewed count: an event dispositioned
+  // normal/dismissed/confirmed counts as reviewed even without a user
+  // annotation. The key is invalidated by useDisposition on every verdict.
+  const { data: dispositionsData } = useQuery({
+    queryKey: ["dispositions", caseId, timelineId],
+    queryFn: () => dispositionsApi.list(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
   const { data: views } = useQuery({
     queryKey: ["views", caseId],
     queryFn: () => viewsApi.list(caseId!),
@@ -985,7 +995,7 @@ export function ExplorerPage() {
 
           {/* Right-side actions */}
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-            <TriageMeter annotations={annotations ?? []} totalEvents={total} />
+            <TriageMeter annotations={annotations ?? []} dispositions={dispositionsData?.dispositions ?? []} totalEvents={total} />
 
             <Tooltip content={histogramOpen ? "Hide histogram" : "Show histogram"}>
               <Button
