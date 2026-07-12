@@ -371,28 +371,6 @@ class AnalysisWindows:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def windows_from_split(
-    baseline_end: datetime, min_ts: datetime, max_ts: datetime
-) -> AnalysisWindows:
-    """Build the legacy split-point window pair from a single ``baseline_end``.
-
-    Preserves the original temporal contract — baseline = everything before
-    the split, detect = everything after, adjacent and exhaustive — as one
-    ``AnalysisWindows`` value, so detector internals have exactly one
-    temporal code path. Using the real ``min_ts``/``max_ts`` (instead of
-    ±infinity) keeps the year-2299 no-timestamp sentinel out of the detect
-    window by construction; the max is padded by 1 ms because windows are
-    half-open and ``max_ts`` itself must stay inside.
-    """
-    baseline_end = ensure_utc(baseline_end)
-    return AnalysisWindows(
-        baseline=TimeWindow("baseline", ensure_utc(min_ts), baseline_end),
-        suspects=(
-            TimeWindow("detect", baseline_end, ensure_utc(max_ts) + timedelta(milliseconds=1)),
-        ),
-    )
-
-
 def _window_preds(
     windows: AnalysisWindows,
     params: dict[str, Any],

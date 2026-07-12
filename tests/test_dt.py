@@ -22,10 +22,10 @@ def test_ensure_utc_leaves_aware_non_utc_datetime_unchanged():
 
 
 def test_to_clickhouse_utc_converts_non_utc_offset():
-    """A `+02:00` baseline_end must land at the correct UTC instant, not
+    """A `+02:00` window bound must land at the correct UTC instant, not
     the wall-clock digits with the offset silently dropped — regression
     test for F8 (value_novelty/frequency detectors disagreeing on where a
-    temporal split falls)."""
+    temporal window boundary falls)."""
     plus_two = timezone(timedelta(hours=2))
     aware = datetime(2026, 6, 25, 14, 0, 0, tzinfo=plus_two)
     assert to_clickhouse_utc(aware) == "2026-06-25 12:00:00"

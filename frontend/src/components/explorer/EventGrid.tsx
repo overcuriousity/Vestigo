@@ -18,8 +18,8 @@ import {
   type ColumnDef,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown } from "lucide-react";
-import type { AnomalyMarker, Event, Annotation } from "@/api/types";
+import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
+import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
@@ -62,6 +62,8 @@ interface Props {
   onSortToggle: () => void;
   /** Active (not-yet-tagged) analysis findings, keyed by event ID. */
   liveAnomalies?: Map<string, AnomalyMarker[]>;
+  /** Event-scoped disposition rows (confirmed/dismissed/normal), keyed by event ID. */
+  dispositions?: Map<string, Disposition[]>;
   /** Called with the timestamp of the topmost visible row whenever scroll position changes. */
   onVisibleTimestampChange?: (ts: string | null) => void;
   /** Soft visual highlight for a time window (e.g. a Frequency finding's anomalous window). */
@@ -83,6 +85,8 @@ interface AnnotationCellProps {
   sourceId: string;
   /** Active, not-yet-tagged findings for this event. */
   liveFindings?: AnomalyMarker[];
+  /** Event-scoped disposition rows for this event. */
+  dispositions?: Disposition[];
 }
 
 function TagPopover({
@@ -267,12 +271,42 @@ function CommentPopover({
   );
 }
 
-/** Combined annotation column: anomaly indicator + tag popover + comment popover.
+// Disposition indicator (X3): one icon per verdicted event. When an event
+// carries several kinds, the most consequential wins: a confirmed hit matters
+// more than a dismissal, which matters more than "expected behavior".
+const DISPOSITION_PRIORITY: DispositionKind[] = ["confirmed", "dismissed", "normal"];
+const DISPOSITION_ICONS = {
+  confirmed: { Icon: Flag, color: "var(--color-danger)", label: "Confirmed" },
+  dismissed: { Icon: EyeOff, color: "var(--color-fg-muted)", label: "Dismissed" },
+  normal: { Icon: ShieldCheck, color: "var(--color-success)", label: "Marked normal" },
+} as const;
+
+function dispositionTooltipLine(d: Disposition): string {
+  const detector = d.detector === "*" ? "any detector" : d.detector;
+  const label = DISPOSITION_ICONS[d.kind].label;
+  return `${label} (${detector})${d.note ? ` — ${d.note}` : ""}`;
+}
+
+export function DispositionIndicator({ dispositions }: { dispositions: Disposition[] }) {
+  const kind = DISPOSITION_PRIORITY.find((k) => dispositions.some((d) => d.kind === k));
+  if (!kind) return <span className="p-1 w-[13px]" />;
+  const { Icon, color } = DISPOSITION_ICONS[kind];
+  return (
+    <Tooltip content={dispositions.map(dispositionTooltipLine).join(" · ")} side="top">
+      <span className="p-1" style={{ color }}>
+        <Icon size={13} />
+      </span>
+    </Tooltip>
+  );
+}
+
+/** Combined annotation column: anomaly + disposition indicators + tag/comment popovers.
  *
  * Normality/dismissal/confirmation are dispositions (finding_dispositions,
  * managed under Windows & normality), not per-event annotations — the old
- * per-event `normal` annotation and its grid indicator are retired (rows were
- * migrated to event-scoped normal dispositions). See docs/ANOMALY_DETECTION.md.
+ * per-event `normal` annotation was migrated to event-scoped normal
+ * dispositions (migration 0004), and event-scoped rows of any kind are what
+ * the DispositionIndicator renders. See docs/ANOMALY_DETECTION.md.
  */
 function AnnotationCell(props: AnnotationCellProps) {
   const persistedAnomalies = props.anns.filter((a) => a.annotation_type === "anomaly");
@@ -299,6 +333,7 @@ function AnnotationCell(props: AnnotationCellProps) {
       ) : (
         <span className="p-1 w-[13px]" /> /* placeholder matching the icon's own box, to keep layout stable */
       )}
+      <DispositionIndicator dispositions={props.dispositions ?? []} />
       <TagPopover {...props} />
       <CommentPopover {...props} />
     </div>
@@ -326,6 +361,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   sortDir,
   onSortToggle,
   liveAnomalies,
+  dispositions,
   onVisibleTimestampChange,
   highlightRange,
 }, ref) {
@@ -368,7 +404,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       // Annotation column — outlier indicator + tag/comment popovers
       {
         id: "_annotations",
-        size: 104,
+        size: 125,
         enableResizing: false,
         header: () => null,
         cell: ({ row }) => (
@@ -378,6 +414,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             caseId={caseId}
             sourceId={row.original.source_id}
             liveFindings={liveAnomalies?.get(row.original.event_id)}
+            dispositions={dispositions?.get(row.original.event_id)}
           />
         ),
       },
@@ -576,7 +613,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, sortDir, onSortToggle, liveAnomalies]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, sortDir, onSortToggle, liveAnomalies, dispositions]);
 
   const columnWidths = useUiStore((s) => s.columnWidths);
   const setColumnWidth = useUiStore((s) => s.setColumnWidth);

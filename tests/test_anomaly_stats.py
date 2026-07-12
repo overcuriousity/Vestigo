@@ -32,7 +32,6 @@ from tracesignal.db.anomaly_stats import (
     _tvd,
     _window_preds,
     effective_ts_sql,
-    windows_from_split,
 )
 
 
@@ -617,19 +616,6 @@ def test_value_novelty_mapped_field_stays_per_field():
     mapped_sql = client.full_queries[1]
     assert "ARRAY JOIN" not in mapped_sql
     assert "coalesce(nullif(attributes[{fk_m0:String}], '')" in mapped_sql
-
-
-def test_windows_from_split_reproduces_adjacent_split():
-    """The legacy shim yields baseline=[min, split), one suspect=[split, max+1ms)."""
-    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
-    split = datetime(2024, 1, 15, tzinfo=UTC)
-    max_ts = datetime(2024, 1, 31, tzinfo=UTC)
-    w = windows_from_split(split, min_ts, max_ts)
-    assert w.baseline.start == min_ts
-    assert w.baseline.end == split
-    assert len(w.suspects) == 1
-    assert w.suspects[0].start == split
-    assert w.suspects[0].end > max_ts
 
 
 def test_full_bucket_starts_excludes_partial_edges():

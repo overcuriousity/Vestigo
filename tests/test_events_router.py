@@ -640,8 +640,6 @@ async def test_run_stat_detector_dispatches_to_frequency(patched_store, monkeypa
         fields=None,
         series_field="artifact",
         z_threshold=3.0,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "frequency-result"
@@ -664,8 +662,6 @@ async def test_run_stat_detector_dispatches_to_value_novelty(patched_store, monk
         fields="artifact,attr:user_agent",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "value-novelty-result"
@@ -695,8 +691,6 @@ async def test_run_stat_detector_auto_fields_resolves_cache_inventory(
         fields=None,
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     call = fake_svc.value_novelty_calls[0]
@@ -718,8 +712,6 @@ async def test_run_stat_detector_dispatches_to_value_combo(patched_store, monkey
         fields="attr:action,attr:hour",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "value-combo-result"
@@ -741,8 +733,6 @@ async def test_run_stat_detector_value_combo_rejects_single_field(patched_store,
             fields="artifact",
             series_field="artifact",
             z_threshold=None,
-            baseline_end=None,
-            temporal=False,
             limit=50,
         )
     assert exc.value.status_code == 422
@@ -762,8 +752,6 @@ async def test_run_stat_detector_dispatches_to_numeric_range(patched_store, monk
         fields="attr:bytes",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "range-result"
@@ -784,8 +772,6 @@ async def test_run_stat_detector_dispatches_to_charset(patched_store, monkeypatc
         fields="attr:user",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "charset-result"
@@ -808,8 +794,6 @@ async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatc
         fields="attr:host",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "entropy-result"
@@ -875,15 +859,13 @@ async def test_run_stat_detector_dispatches_to_proportion_shift(patched_store, m
         fields="attr:eventid",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "shift-result"
     call = fake_svc.shift_calls[0]
     assert call["fields"] == ["attr:eventid"]
     assert call["inventory"] is None
-    # No baseline_id/baseline_end/temporal → the service sees windows=None and
+    # No baseline_id → the service sees windows=None and
     # returns insufficient_data itself (temporal-only, no 422).
     assert call["windows"] is None
     # Effective thresholds fall back to server config and are snapshotted for
@@ -910,8 +892,6 @@ async def test_run_stat_detector_proportion_shift_request_overrides(patched_stor
         fields="attr:eventid",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
         fdr_q=0.01,
         min_ratio=3.0,
@@ -925,7 +905,8 @@ async def test_run_stat_detector_proportion_shift_request_overrides(patched_stor
 
 @pytest.mark.asyncio
 async def test_run_stat_detector_proportion_shift_passes_windows(patched_store, monkeypatch):
-    """A legacy baseline_end split resolves to an AnalysisWindows for the detector."""
+    """A baseline_id resolves to an AnalysisWindows for the detector."""
+    bid = await _make_baseline(patched_store)
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
@@ -937,8 +918,7 @@ async def test_run_stat_detector_proportion_shift_passes_windows(patched_store, 
         fields="attr:eventid",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=datetime(2024, 1, 15, tzinfo=UTC),
-        temporal=True,
+        baseline_id=bid,
         limit=50,
     )
     call = fake_svc.shift_calls[0]
@@ -961,8 +941,6 @@ async def test_run_stat_detector_proportion_shift_auto_fields_resolves_inventory
         fields=None,
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     call = fake_svc.shift_calls[0]
@@ -1014,8 +992,6 @@ async def test_run_stat_detector_dispatches_to_interval_periodicity(patched_stor
         fields="attr:service",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "interval-result"
@@ -1048,8 +1024,6 @@ async def test_run_stat_detector_interval_request_overrides(patched_store, monke
         fields="attr:service",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
         fdr_q=0.01,
         min_ratio=3.0,
@@ -1106,8 +1080,6 @@ async def test_run_stat_detector_dispatches_to_sequence_novelty(patched_store, m
         fields=None,
         series_field="attr:proc",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert result == "sequence-result"
@@ -1135,8 +1107,6 @@ async def test_run_stat_detector_sequence_ngram_override(patched_store, monkeypa
         fields=None,
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
         ngram_size=4,
     )
@@ -1182,8 +1152,6 @@ async def test_run_stat_detector_dispatches_to_timestamp_order(patched_store, mo
         fields=None,
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=True,  # ignored by this detector
         limit=50,
         min_skew_seconds=5.0,
     )
@@ -1193,60 +1161,6 @@ async def test_run_stat_detector_dispatches_to_timestamp_order(patched_store, mo
     # Mode-less: never touches the value/frequency paths.
     assert not fake_svc.frequency_calls
     assert not fake_svc.value_novelty_calls
-
-
-@pytest.mark.asyncio
-async def test_run_stat_detector_resolves_timeline_midpoint_when_temporal_and_no_baseline(
-    patched_store, monkeypatch
-):
-    """temporal=True with no explicit baseline_end falls back to the timeline
-    midpoint, converted to a baseline+suspect window pair via the legacy shim."""
-    midpoint = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-    fake_svc = _FakeStatAnomalyService(midpoint=midpoint)
-    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
-
-    _, resolution = await events._run_stat_detector(
-        "c1",
-        "t1",
-        ["s1"],
-        detector="frequency",
-        fields=None,
-        series_field="artifact",
-        z_threshold=None,
-        baseline_end=None,
-        temporal=True,
-        limit=50,
-    )
-    windows = fake_svc.frequency_calls[0]["windows"]
-    # Baseline ends at the midpoint; a single "detect" suspect window follows.
-    assert windows.baseline.end == midpoint
-    assert len(windows.suspects) == 1
-    assert windows.suspects[0].start == midpoint
-    assert resolution["windows"]["baseline"]["end"] == midpoint.isoformat()
-
-
-@pytest.mark.asyncio
-async def test_run_stat_detector_explicit_baseline_end_wins_over_midpoint(
-    patched_store, monkeypatch
-):
-    explicit = datetime(2024, 1, 10, 0, 0, 0, tzinfo=UTC)
-    fake_svc = _FakeStatAnomalyService(midpoint=datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC))
-    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
-
-    await events._run_stat_detector(
-        "c1",
-        "t1",
-        ["s1"],
-        detector="frequency",
-        fields=None,
-        series_field="artifact",
-        z_threshold=None,
-        baseline_end=explicit,
-        temporal=True,
-        limit=50,
-    )
-    windows = fake_svc.frequency_calls[0]["windows"]
-    assert windows.baseline.end == explicit
 
 
 @pytest.mark.asyncio
@@ -1272,8 +1186,6 @@ async def test_run_stat_detector_excludes_normal_disposed_events(
         fields=None,
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert fake_svc.value_novelty_calls[0]["exclude_event_ids"] == {"normal-evt"}
@@ -1342,8 +1254,6 @@ def _call_list_anomalies(persist: bool = True):
         series_field="artifact",
         z_threshold=None,
         min_skew_seconds=None,
-        baseline_end=None,
-        temporal=False,
         baseline_id=None,
         limit=50,
         # Passed explicitly: calling the handler directly would otherwise
@@ -1448,8 +1358,6 @@ async def test_dismissed_disposition_filters_response_but_not_run(
         series_field="artifact",
         z_threshold=None,
         min_skew_seconds=None,
-        baseline_end=None,
-        temporal=False,
         baseline_id=None,
         limit=50,
         include_dismissed=True,
@@ -1529,8 +1437,6 @@ async def test_run_stat_detector_baseline_id_builds_windows(
         fields="artifact",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         baseline_id=bid,
         limit=50,
     )
@@ -1556,8 +1462,6 @@ async def test_run_stat_detector_unknown_baseline_id_404s(
             fields="artifact",
             series_field="artifact",
             z_threshold=None,
-            baseline_end=None,
-            temporal=False,
             baseline_id="no-such-baseline",
             limit=50,
         )
@@ -1589,8 +1493,6 @@ async def test_run_stat_detector_applies_allowlist(
         fields="artifact",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
     )
     assert fake_svc.value_novelty_calls[0]["allowlist"] == {("artifact", "known_good")}
@@ -1624,8 +1526,6 @@ async def test_run_stat_detector_applies_wildcard_allowlist_across_detectors(
             fields="artifact",
             series_field="artifact",
             z_threshold=None,
-            baseline_end=None,
-            temporal=False,
             limit=50,
         )
 
@@ -1661,8 +1561,6 @@ async def test_detector_run_replays_after_baseline_deleted(
         series_field="artifact",
         z_threshold=None,
         min_skew_seconds=None,
-        baseline_end=None,
-        temporal=False,
         baseline_id=bid,
         limit=50,
         persist=True,
@@ -1751,8 +1649,6 @@ async def test_persist_detector_run_stamps_source_offsets(patched_store):
         fields="artifact",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
         payload={"results": []},
         resolution={},
@@ -1773,8 +1669,6 @@ async def test_persist_detector_run_offsets_none_when_inactive(patched_store):
         fields="artifact",
         series_field="artifact",
         z_threshold=None,
-        baseline_end=None,
-        temporal=False,
         limit=50,
         payload={"results": []},
         resolution={},

@@ -44,7 +44,6 @@ from tracesignal.db.anomaly_stats import (
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
-    windows_from_split,
 )
 from tracesignal.db.field_stats import (
     ensure_source_field_stats,
@@ -1341,41 +1340,23 @@ def _windows_from_definition(definition: BaselineDefinition) -> AnalysisWindows:
 
 async def _resolve_analysis_windows(
     store: PostgresStore,
-    svc: StatisticalAnomalyService,
     case_id: str,
     timeline_id: str,
-    source_ids: list[str],
     baseline_id: str | None,
-    baseline_end: datetime | None,
-    temporal: bool,
-    source_offsets: dict[str, int] | None = None,
 ) -> AnalysisWindows | None:
     """Resolve the temporal windows for a detector run.
 
-    Precedence: an explicit ``baseline_id`` (a saved definition) wins; else an
-    explicit legacy ``baseline_end`` split; else ``temporal=True`` falls back
-    to the timeline midpoint. The legacy split forms are converted to a single
-    baseline+suspect window pair via ``windows_from_split`` so the detectors
-    have one temporal code path. Returns None for self-baseline runs.
+    An explicit ``baseline_id`` (a saved baseline definition) yields its
+    baseline + suspect windows; ``None`` means a self-baseline run. (The
+    legacy single-``baseline_end`` split and ``temporal=true`` midpoint
+    fallback were removed — saved definitions are the only temporal input.)
     """
-    if baseline_id is not None:
-        definition = await store.get_baseline_definition(case_id, timeline_id, baseline_id)
-        if definition is None:
-            raise HTTPException(
-                status_code=404, detail=f"Unknown baseline definition: {baseline_id}"
-            )
-        return _windows_from_definition(definition)
-
-    if baseline_end is None and not temporal:
+    if baseline_id is None:
         return None
-
-    min_ts, max_ts = await run_in_threadpool(
-        svc.get_timeline_range, case_id, source_ids, source_offsets
-    )
-    if min_ts is None or max_ts is None:
-        return None
-    split = ensure_utc(baseline_end) if baseline_end is not None else min_ts + (max_ts - min_ts) / 2
-    return windows_from_split(split, min_ts, max_ts)
+    definition = await store.get_baseline_definition(case_id, timeline_id, baseline_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"Unknown baseline definition: {baseline_id}")
+    return _windows_from_definition(definition)
 
 
 async def _run_stat_detector(
@@ -1387,8 +1368,6 @@ async def _run_stat_detector(
     fields: str | None,
     series_field: str,
     z_threshold: float | None,
-    baseline_end: datetime | None,
-    temporal: bool,
     baseline_id: str | None = None,
     limit: int,
     min_skew_seconds: float | None = None,
@@ -1426,17 +1405,7 @@ async def _run_stat_detector(
         kinds=["normal"],
         detector=detector,
     )
-    windows_task = _resolve_analysis_windows(
-        store,
-        svc,
-        case_id,
-        timeline_id,
-        source_ids,
-        baseline_id,
-        baseline_end,
-        temporal,
-        source_offsets,
-    )
+    windows_task = _resolve_analysis_windows(store, case_id, timeline_id, baseline_id)
     normal_rows, windows = await asyncio.gather(normal_task, windows_task)
     allowlist: set[tuple[str, str]] | None = {
         (d.field, d.value) for d in normal_rows if d.field is not None and d.value is not None
@@ -2053,8 +2022,6 @@ async def _persist_detector_run(
     fields: str | None,
     series_field: str,
     z_threshold: float | None,
-    baseline_end: datetime | None,
-    temporal: bool,
     limit: int,
     payload: dict[str, Any],
     resolution: dict[str, Any],
@@ -2077,8 +2044,6 @@ async def _persist_detector_run(
             "fields": fields,
             "series_field": series_field,
             "z_threshold": z_threshold,
-            "baseline_end": baseline_end.isoformat() if baseline_end else None,
-            "temporal": temporal,
             "limit": limit,
             "min_skew_seconds": min_skew_seconds,
             # proportion_shift / interval_periodicity / value_distribution_drift:
@@ -2185,24 +2150,11 @@ async def list_anomalies(
             "Sequence length (n) for the sequence_novelty detector. Omit to use the server default."
         ),
     ),
-    baseline_end: datetime | None = Query(  # noqa: B008
-        default=None,
-        description="Explicit temporal baseline end timestamp (detect window = after this).",
-    ),
-    temporal: bool = Query(
-        default=False,
-        description=(
-            "Enable legacy temporal mode.  When no baseline_end is given the "
-            "timeline midpoint is used as the baseline/detect split.  Prefer "
-            "baseline_id for an explicit baseline + suspect windows."
-        ),
-    ),
     baseline_id: str | None = Query(
         default=None,
         description=(
             "ID of a saved baseline definition (baseline range + suspect windows) "
-            "to run temporal detection against. Takes precedence over "
-            "baseline_end/temporal."
+            "to run temporal detection against. Omit for a self-baseline run."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
@@ -2256,7 +2208,7 @@ async def list_anomalies(
     **proportion_shift**: per (field, value), flags values whose *share* of
     events differs significantly between the baseline window and a suspect
     window (2×2 G-test, Benjamini-Hochberg FDR across the run, rate-ratio
-    effect floor). Temporal-only — requires baseline_id/baseline_end/temporal;
+    effect floor). Temporal-only — requires baseline_id;
     first-seen values are excluded (value_novelty owns those).
 
     **interval_periodicity**: per (field, value), flags values whose arrival
@@ -2287,8 +2239,6 @@ async def list_anomalies(
         fields=fields,
         series_field=series_field,
         z_threshold=z_threshold,
-        baseline_end=baseline_end,
-        temporal=temporal,
         baseline_id=baseline_id,
         limit=limit,
         min_skew_seconds=min_skew_seconds,
@@ -2311,8 +2261,6 @@ async def list_anomalies(
             fields=fields,
             series_field=series_field,
             z_threshold=z_threshold,
-            baseline_end=baseline_end,
-            temporal=temporal,
             limit=limit,
             min_skew_seconds=min_skew_seconds,
             payload=payload,
@@ -2346,8 +2294,6 @@ async def list_anomalies(
             "timeline_id": timeline_id,
             "fields": fields,
             "series_field": series_field,
-            "temporal": temporal,
-            "baseline_end": baseline_end.isoformat() if baseline_end else None,
             "baseline_id": resolution.get("baseline_id"),
             "windows_hash": resolution.get("windows_hash"),
             "persist": persist,
@@ -2399,23 +2345,11 @@ class TagAnomaliesRequest(BaseModel):
         le=5,
         description="Sequence length (n) for the sequence_novelty detector.",
     )
-    baseline_end: datetime | None = Field(
-        default=None,
-        description="Explicit temporal baseline end timestamp.",
-    )
-    temporal: bool = Field(
-        default=False,
-        description=(
-            "Enable legacy temporal mode.  When no baseline_end is given the "
-            "timeline midpoint is used as the baseline/detect split.  Prefer "
-            "baseline_id."
-        ),
-    )
     baseline_id: str | None = Field(
         default=None,
         description=(
             "ID of a saved baseline definition to run temporal detection against. "
-            "Takes precedence over baseline_end/temporal."
+            "Omit for a self-baseline run."
         ),
     )
     limit: int = Field(default=50, ge=1, le=500)
@@ -2458,8 +2392,6 @@ async def tag_anomalies(
         fields=body.fields,
         series_field=body.series_field,
         z_threshold=body.z_threshold,
-        baseline_end=body.baseline_end,
-        temporal=body.temporal,
         baseline_id=body.baseline_id,
         limit=body.limit,
         min_skew_seconds=body.min_skew_seconds,
@@ -2731,8 +2663,6 @@ async def tag_anomalies(
         fields=body.fields,
         series_field=body.series_field,
         z_threshold=body.z_threshold,
-        baseline_end=body.baseline_end,
-        temporal=body.temporal,
         limit=body.limit,
         min_skew_seconds=body.min_skew_seconds,
         payload=payload,
@@ -2750,8 +2680,7 @@ async def tag_anomalies(
             "detector": body.detector,
             "timeline_id": timeline_id,
             "tagged": tagged,
-            "temporal": body.temporal,
-            "baseline_end": body.baseline_end.isoformat() if body.baseline_end else None,
+            "baseline_id": resolution.get("baseline_id"),
         },
     )
 

@@ -80,12 +80,15 @@ def aligned_bucket_starts(min_ts: datetime, max_ts: datetime, interval: int) -> 
     alignment — deriving starts from the query's result rows instead would
     drop any bucket in which no row matched. Always yields at least one
     bucket, even when the range collapses to a point.
+
+    ``end_epoch`` is the aligned start of the bucket *containing* ``max_ts``
+    and must itself be yielded — a half-open range stopping at ``end_epoch``
+    would silently drop every event in the trailing partial bucket (the
+    newest data) from any chart zero-filled onto this grid.
     """
     start_epoch = int(min_ts.timestamp() // interval) * interval
     end_epoch = int(max_ts.timestamp() // interval) * interval
-    if end_epoch <= start_epoch:
-        end_epoch = start_epoch + interval
     return [
         ensure_utc_iso(datetime.fromtimestamp(epoch, tz=UTC))
-        for epoch in range(start_epoch, end_epoch, interval)
+        for epoch in range(start_epoch, end_epoch + interval, interval)
     ]

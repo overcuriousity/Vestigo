@@ -23,11 +23,7 @@ export interface AnomalyParams {
   min_ratio?: number;
   /** Sequence length (n) for the sequence_novelty detector. Omit to use the server default. */
   ngram_size?: number;
-  /** Explicit temporal baseline end timestamp (legacy split; prefer baseline_id) */
-  baseline_end?: string;
-  /** Enable legacy temporal mode (backend uses timeline midpoint when baseline_end is absent) */
-  temporal?: boolean;
-  /** ID of a saved baseline definition (baseline range + suspect windows). */
+  /** ID of a saved baseline definition (baseline range + suspect windows). Omit for self-baseline. */
   baseline_id?: string;
   limit?: number;
   /** Persist this scan as a DetectorRun and return its run_id (default: true). */

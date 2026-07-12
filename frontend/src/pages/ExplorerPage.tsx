@@ -52,7 +52,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation } from "@/api/types";
+import type { AnomalyMarker, Disposition, Event, EventFilters, EventPage, Annotation } from "@/api/types";
 import {
   applyFieldFilter,
   dropMode,
@@ -563,6 +563,21 @@ export function ExplorerPage() {
     }
     return m;
   }, [annotations]);
+
+  // Event-scoped disposition rows (confirmed/dismissed/normal verdicts on one
+  // concrete event), keyed by event ID — drives the grid's triage indicator
+  // (X3). Value-scoped rows (field+value) are excluded: they can match
+  // millions of rows and belong to the finding views, not the grid.
+  const dispositionMap = useMemo<Map<string, Disposition[]>>(() => {
+    const m = new Map<string, Disposition[]>();
+    for (const d of dispositionsData?.dispositions ?? []) {
+      if (!d.event_id) continue;
+      const list = m.get(d.event_id) ?? [];
+      list.push(d);
+      m.set(d.event_id, list);
+    }
+    return m;
+  }, [dispositionsData]);
 
   // Findings from the active (not-yet-tagged) analysis tab, keyed by event ID —
   // lets the grid mark rows and the detail panel show/persist findings before
@@ -1083,6 +1098,7 @@ export function ExplorerPage() {
                   sortDir={sortDir}
                   onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
                   liveAnomalies={liveAnomaliesByEvent}
+                  dispositions={dispositionMap}
                   onVisibleTimestampChange={setCurrentPositionTs}
                   highlightRange={rangeHighlight}
                 />

@@ -84,21 +84,21 @@ async def test_list_viz_fields_empty_timeline(monkeypatch):
 
 
 class _FakeCompareService:
-    """Captures the (primary, comparison) EventQuery pair per compare kind."""
+    """Captures the (primary, comparison, cache token) per compare kind."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, object, object]] = []
+        self.calls: list[tuple] = []
 
-    def compare_time_histogram(self, primary, comparison, buckets):
-        self.calls.append(("time", primary, comparison))
+    def compare_time_histogram(self, primary, comparison, buckets, baseline_cache_token=None):
+        self.calls.append(("time", primary, comparison, baseline_cache_token))
         return {"kind": "time"}
 
-    def compare_field_terms(self, primary, comparison, field, limit):
-        self.calls.append(("terms", primary, comparison))
+    def compare_field_terms(self, primary, comparison, field, limit, baseline_cache_token=None):
+        self.calls.append(("terms", primary, comparison, baseline_cache_token))
         return {"kind": "terms"}
 
-    def compare_field_numeric(self, primary, comparison, field, bins):
-        self.calls.append(("numeric", primary, comparison))
+    def compare_field_numeric(self, primary, comparison, field, bins, baseline_cache_token=None):
+        self.calls.append(("numeric", primary, comparison, baseline_cache_token))
         return {"kind": "numeric"}
 
 
@@ -106,11 +106,31 @@ async def _fake_id_filters(case_id, source_ids, **_kwargs):
     return None, None, None
 
 
-def _patch_compare(monkeypatch) -> _FakeCompareService:
+class _FakeStatsRow:
+    def __init__(self, source_id: str) -> None:
+        import datetime as _dt
+
+        self.source_id = source_id
+        self.computed_at = _dt.datetime(2026, 1, 1, tzinfo=_dt.UTC)
+        self.events_total = 10
+
+
+class _FakePgStore:
+    """Only what the baseline branch touches: the freshness-fingerprint read."""
+
+    def __init__(self, rows: list[_FakeStatsRow] | None = None) -> None:
+        self.rows = rows if rows is not None else []
+
+    async def get_source_field_stats(self, source_ids):
+        return [r for r in self.rows if r.source_id in source_ids]
+
+
+def _patch_compare(monkeypatch, pg_store: _FakePgStore | None = None) -> _FakeCompareService:
     svc = _FakeCompareService()
     monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
     monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
     monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
+    monkeypatch.setattr(viz, "get_store", lambda: pg_store or _FakePgStore())
     return svc
 
 
@@ -156,7 +176,7 @@ async def test_compare_baseline_clears_filters_keeps_scope_and_window(monkeypatc
     )
     await viz.compare_layers("c1", "t1", body, case=None)
 
-    kind, primary, comparison = svc.calls[0]
+    kind, primary, comparison, _token = svc.calls[0]
     assert kind == "time"
     assert primary.q == "dos"
     assert primary.field_filters == {"attr:src_ip": ["203.0.113.7"]}
@@ -191,7 +211,7 @@ async def test_compare_custom_inherits_primary_time_window(monkeypatch):
     )
     await viz.compare_layers("c1", "t1", body, case=None)
 
-    kind, _primary, comparison = svc.calls[0]
+    kind, _primary, comparison, _token = svc.calls[0]
     assert kind == "terms"
     assert comparison.q == "error"
     # Comparability invariant: custom layer shares the primary's window.
@@ -337,3 +357,111 @@ async def test_field_scatter_same_field_is_422(monkeypatch):
             **_FILTER_KWARGS,
         )
     assert exc.value.status_code == 422
+
+
+# ── GET .../viz/field-terms cache branch (M24a) ─────────────────────────────
+
+
+class _FakeTermsService:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def field_terms(self, query, field, limit):
+        self.calls.append((query, field, limit))
+        return {"kind": "live"}
+
+
+def _patch_terms(monkeypatch, cached_result) -> _FakeTermsService:
+    svc = _FakeTermsService()
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
+    monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
+
+    async def fake_ensure(store, clickhouse, case_id, source_ids):
+        return {}
+
+    monkeypatch.setattr(viz, "ensure_source_field_stats", fake_ensure)
+    monkeypatch.setattr(viz, "merged_field_terms", lambda stats, field, limit: cached_result)
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_field_terms_unfiltered_served_from_cache(monkeypatch):
+    cached = {"field": "artifact", "total": 5, "distinct": 2, "values": [], "other_count": 0}
+    svc = _patch_terms(monkeypatch, cached)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {**cached, "cached": True}
+    assert svc.calls == []  # no ClickHouse scan
+
+
+@pytest.mark.asyncio
+async def test_field_terms_cache_gap_falls_back_live(monkeypatch):
+    svc = _patch_terms(monkeypatch, None)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_field_terms_any_filter_forces_live_path(monkeypatch):
+    cached = {"field": "artifact", "total": 5, "distinct": 2, "values": [], "other_count": 0}
+    svc = _patch_terms(monkeypatch, cached)
+    kwargs = {**_FILTER_KWARGS, "q": "dos"}
+    result = await viz.get_field_terms("c1", "t1", field="artifact", limit=50, case=None, **kwargs)
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_field_terms_mapped_token_forces_live_path(monkeypatch):
+    cached = {"field": "proto_c", "total": 5, "distinct": 2, "values": [], "other_count": 0}
+    svc = _patch_terms(monkeypatch, cached)
+
+    async def scope_with_mappings(case_id, timeline_id):
+        return ["s1"], {"proto_c": ["proto", "protocol"]}, None
+
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", scope_with_mappings)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="proto_c", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1
+
+
+# ── POST .../viz/compare baseline-cache token (M24c) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compare_baseline_passes_freshness_token(monkeypatch):
+    svc = _patch_compare(monkeypatch, _FakePgStore([_FakeStatsRow("s1"), _FakeStatsRow("s2")]))
+    body = viz.CompareRequest(kind="time", comparison=viz.ComparisonSpec(mode="baseline"))
+    await viz.compare_layers("c1", "t1", body, case=None)
+    token = svc.calls[0][3]
+    assert token is not None
+    assert token[0] == "c1"
+    assert [sid for sid, _, _ in token[1]] == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_compare_baseline_missing_stats_row_disables_cache(monkeypatch):
+    svc = _patch_compare(monkeypatch, _FakePgStore([_FakeStatsRow("s1")]))  # s2 missing
+    body = viz.CompareRequest(kind="time", comparison=viz.ComparisonSpec(mode="baseline"))
+    await viz.compare_layers("c1", "t1", body, case=None)
+    assert svc.calls[0][3] is None
+
+
+@pytest.mark.asyncio
+async def test_compare_custom_mode_never_gets_token(monkeypatch):
+    svc = _patch_compare(monkeypatch, _FakePgStore([_FakeStatsRow("s1"), _FakeStatsRow("s2")]))
+    body = viz.CompareRequest(
+        kind="time",
+        comparison=viz.ComparisonSpec(mode="custom", filters=viz.CompareFilters(q="x")),
+    )
+    await viz.compare_layers("c1", "t1", body, case=None)
+    assert svc.calls[0][3] is None

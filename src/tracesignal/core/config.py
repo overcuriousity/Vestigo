@@ -156,6 +156,12 @@ class Settings(BaseSettings):
     # stack past the ClickHouse host's RAM — observed as a kernel OOM-kill
     # of clickhouse-server, not a clean query error.
     stat_scan_concurrency: int = Field(default=2, ge=1)
+    # Max entries in the process-local baseline-compare layer cache
+    # (db/viz_cache.py, M24c) — memoizes the unfiltered baseline layer of
+    # Visualize compare renders so it isn't a full-timeline re-scan on every
+    # filtered render. 0 disables caching entirely. Entries are small
+    # bounded aggregates; freshness is keyed, not TTL'd.
+    viz_baseline_cache_entries: int = Field(default=64, ge=0)
 
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP

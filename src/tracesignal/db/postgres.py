@@ -751,7 +751,9 @@ class DetectorRun(Base):
     timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     detector: Mapped[str] = mapped_column(String(32), nullable=False)
     # Request params the scan was run with (fields/series_field, z_threshold,
-    # baseline_end, temporal, limit, ...) — kept for forensic reproducibility.
+    # baseline_id, windows, limit, ...) — kept for forensic reproducibility.
+    # Rows persisted before the legacy split-point removal may still carry
+    # baseline_end/temporal keys; params are never replayed, only displayed.
     params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # Serialized StatAnomalyResult (status/method/baseline_size/z_threshold/
     # results), the same shape returned to the client by list_anomalies —

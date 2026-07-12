@@ -171,11 +171,11 @@ detection-affecting `normal` rows only, value- **and** event-scoped — the
 old `allowlist_hash` never recorded the per-event exclusions). So a persisted
 run stays fully self-describing — "why is this value not flagged?" and "what
 exactly did this scan compare?" stay answerable — even after the definition
-or dispositions are later changed or deleted. The legacy
-single-`baseline_end` split point and the `temporal=true` midpoint fallback
-are still accepted at the API and converted to a one-baseline/one-suspect
-window pair (`windows_from_split`), so old runs and clients keep working;
-internally the detectors have exactly one temporal code path.
+or dispositions are later changed or deleted. Saved baseline definitions
+(`baseline_id`) are the only temporal input — the legacy single-`baseline_end`
+split point and `temporal=true` midpoint fallback were removed once nothing
+depended on them (runs persisted with those params still render: stored
+`params` are displayed, never replayed).
 
 The ways an event can be "normal" (or otherwise dispositioned), to keep them
 straight:
@@ -225,8 +225,7 @@ incident window rather than tuning the floor.
 ### Temporal mode
 
 You select a [baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
-— a baseline window plus one or more suspect windows (or, legacy, a single
-split timestamp defaulting to the timeline midpoint). A value is flagged only
+— a baseline window plus one or more suspect windows. A value is flagged only
 if it appears **zero times in the baseline window** and **at least once in a
 suspect window** — genuinely new activity in the period you're investigating,
 not just uncommon activity in general. You get one finding per suspect window
@@ -801,9 +800,8 @@ changed" belongs here. No finding appears in both.
 
 **Temporal-only.** A share can only "shift" between two populations, so this
 detector has no self-baseline mode — it always needs a
-[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
-(or the legacy split point). Without one it reports `insufficient_data` with a
-warning rather than guessing.
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model).
+Without one it reports `insufficient_data` with a warning rather than guessing.
 
 ### The test: a 2×2 G-test per (value, suspect window)
 

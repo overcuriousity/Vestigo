@@ -1,7 +1,68 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-12 (session 51 — enricher force re-run + search_blob upgrade
-idempotency hardening).
+Last updated: 2026-07-12 (session 52 — M24 viz scan-avoidance, L1 legacy-split removal,
+X3 disposition grid indicator).
+
+## Session 52 — 2026-07-12: M24 scan-avoidance + L1 removal + X3 grid indicator
+
+User-prioritized hardening batch (user-friendliness/stability/speed over features); new
+features (D10, Milestone 5) deliberately not touched.
+
+**M24(b) — fused `field_value_timeseries` (`db/queries.py`).** Top-N value selection and
+per-bucket counting merged into one nested-aggregate scan (no window functions — they can't
+spill): inner `GROUP BY (sentinel-flag, bucket, value)`, outer ranking on total count with
+sentinel rows included (matching `field_terms`' ranking exactly) while `groupArrayIf` keeps
+sentinel buckets out of the plotted series. 3 scans → 2 without an explicit window, → 1 with
+one (the common brush-zoom case). The range scan stays deliberately separate (grid must cover
+all filtered rows, not just rows carrying the field). Live equivalence test with the retired
+two-query flow as oracle (`tests/test_viz_timeseries_fused_clickhouse.py`): ties at the top-N
+boundary, sentinel rows, clock offsets, mapped fields, high cardinality.
+
+**M24(a) — cached first-load `field_terms` (`db/field_stats.py`, `api/routers/viz.py`).**
+`STATS_VERSION = 2`: the per-source stats payload now carries per-field top-50 value counts
+(every top-level candidate column + top 200 attribute keys by coverage; `LIMIT n BY key`
+pattern; `HEAVY_SCAN_SETTINGS` added to all four per-source stats queries). Fields with any
+top value over 256 chars get no list — cached values are served verbatim, never truncated.
+`merged_field_terms` reproduces the exact live response shape; the cross-source top-N merge
+is approximate (documented next to the distinct-max note; single-source timelines exact),
+counts/total/other_count exact. The endpoint serves the cache only for fully unfiltered,
+unmapped queries — skipping ClickHouse and the gate slot — and marks responses
+`"cached": true`; any filter, mapped token, limit > 50, truncated key list, or oversized
+field falls back live. Self-healing recompute absorbs the version bump (no migration).
+
+**M24(c) — baseline-compare LRU (`db/viz_cache.py` new, `db/queries.py`, `viz.py`,
+`core/config.py`).** The baseline comparison layer (filters dropped, timeline scope + primary
+window kept) was a full-timeline re-scan on every filtered render. Now memoized in a
+process-local thread-safe LRU (`TS_VIZ_BASELINE_CACHE_ENTRIES`, default 64, 0 disables).
+Freshness is keyed, not TTL'd: the compare endpoint folds per-source
+`source_field_stats.computed_at` + `events_total` into a token (moves on exactly ingest +
+enrichment apply; missing stats row → no token → bypass). Time range/buckets and numeric
+stats/bins cache exact; terms counts key on the primary's top-N list (hits only when it's
+unchanged — accepted). Baseline mode also skips the primary range scan (comparison ⊇ primary,
+so union range == baseline range — invariant documented at the construction site). Warm
+render: one scan per gate slot instead of 2–4. Live oracle = the unchanged no-token path.
+
+**L1 — legacy split removal (`api/routers/events.py`, `db/anomaly_stats.py`, frontend).**
+`baseline_end`/`temporal` request params, the midpoint fallback, and `windows_from_split`
+removed; `baseline_id` (saved baseline definitions) is the only temporal input. Verified
+safe first: stored `DetectorRun.params` are displayed, never replayed; CLI has no detector
+command; frontend only ever sent `temporal: false`. `BaselineDefinition.baseline_end` and
+detector `temporal-*` method names untouched. `docs/ANOMALY_DETECTION.md` updated.
+
+**Trailing-bucket loss fix (`db/_buckets.py`), found by the batch's /verify pass.**
+`aligned_bucket_starts` excluded the bucket containing `max_ts` (`range` stop is exclusive,
+`end_epoch` is that bucket's start), so the value×time chart and the compare time histogram
+silently dropped every event in the trailing partial bucket — the newest data — and compare's
+reported totals disagreed with the plotted buckets (1980/2000 in verification). Pre-existing
+since the helper was introduced; grid now includes `end_epoch`. Explorer's histogram (own SQL
+path) and the detectors' `_full_bucket_starts` (deliberately partial-excluding) were never
+affected. `tests/test_buckets.py` pins the boundaries.
+
+**X3 — event-grid disposition indicator (`EventGrid.tsx`, `ExplorerPage.tsx`).** Event-scoped
+disposition rows (confirmed/dismissed/normal on one concrete event) now render a verdict icon
+in the annotation column — Flag > EyeOff > ShieldCheck by priority, tooltip with kind /
+detector / note. Data reuses the existing timeline dispositions query (already invalidated on
+every verdict); value-scoped rows deliberately excluded from the grid.
 
 ## Session 51 — 2026-07-12: Enricher force re-run (poisoned-provenance recovery) + upgrade guard fix
 

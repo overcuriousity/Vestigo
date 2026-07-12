@@ -47,6 +47,7 @@ from tracesignal.db.field_recommend import (
     timeline_cohesion_summary,
     timeline_universal_cohesion,
 )
+from tracesignal.db.viz_cache import baseline_cache
 
 # Sentinel for "no parseable timestamp" — see the definition and rationale in
 # `db/_dt.py`. Local aliases keep the historical names used throughout this
@@ -1708,12 +1709,26 @@ class EventQueryService:
     ) -> dict[str, Any]:
         """Return per-value event counts bucketed over time for *field_token*.
 
-        Restricts to the top *series_limit* values by overall count (via
-        :py:meth:`field_terms`) so a high-cardinality field doesn't explode
-        into hundreds of series — the Visualization page surfaces
-        ``field_terms``' ``other_count``/``distinct`` alongside this so the
-        analyst knows series were capped. Powers the multi-series line chart
-        and the value×time heatmap.
+        Restricts to the top *series_limit* values by overall count so a
+        high-cardinality field doesn't explode into hundreds of series — the
+        Visualization page surfaces ``field_terms``' ``other_count``/
+        ``distinct`` alongside this so the analyst knows series were capped.
+        Powers the multi-series line chart and the value×time heatmap.
+
+        Top-value selection and per-bucket counting are fused into one scan
+        (M24b): the inner aggregate groups by (sentinel-flag, bucket, value),
+        the outer ranks values by their total count — sentinel rows included,
+        matching ``field_terms``' ranking exactly — while ``groupArrayIf``
+        keeps sentinel buckets out of the plotted series, matching the old
+        bucket scan's ``TS_NOT_SENTINEL_SQL`` predicate. No window functions:
+        those can't spill to disk (see ``_scan.py``), plain GROUP BY + ORDER
+        BY/LIMIT stay within ``HEAVY_SCAN_SETTINGS``' memory budget.
+
+        The timestamp-range scan (when no explicit window is set) stays a
+        separate query on purpose: the bucket grid must cover *all* filtered
+        rows — not just rows carrying a non-empty field value — and the
+        arbitrary ``_build_where`` filters rule out partition min/max
+        shortcuts.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
@@ -1748,9 +1763,34 @@ class EventQueryService:
         if min_ts is None or max_ts is None:
             return empty
 
-        terms = self._field_terms_impl(query, field_token, limit=series_limit)
-        top_values = [v["value"] for v in terms["values"]]
-        if not top_values:
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
+
+        fused_result = self.store.client.query(
+            f"""
+            SELECT val,
+                   sum(c) AS total,
+                   groupArrayIf((bucket, c), ok) AS plot_buckets
+            FROM (
+                SELECT ({TS_NOT_SENTINEL_SQL}) AS ok,
+                       toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
+                       {col_expr} AS val,
+                       count() AS c
+                FROM {database}.events
+                WHERE {where} AND {col_expr} != ''
+                GROUP BY ok, bucket, val
+            )
+            GROUP BY val
+            ORDER BY total DESC, val ASC
+            LIMIT {int(series_limit)}
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        rows = fused_result.result_rows
+        if not rows:
             return {
                 **empty,
                 "interval_seconds": 0,
@@ -1758,33 +1798,13 @@ class EventQueryService:
                 "max": max_ts.isoformat(),
             }
 
-        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
-        )
-        parameters["series_values"] = top_values
-
-        bucket_result = self.store.client.query(
-            f"""
-            SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
-                   {col_expr} AS val,
-                   count() AS c
-            FROM {database}.events
-            WHERE {where} AND {TS_NOT_SENTINEL_SQL}
-                AND has({{series_values:Array(String)}}, {col_expr})
-            GROUP BY bucket, val
-            ORDER BY bucket
-            {HEAVY_SCAN_SETTINGS}
-            """,
-            parameters=parameters,
-        )
-
-        # Pivot into one bucket-list per value, in the same top-N order as
-        # `terms`, filling buckets with zero rows so every series has an
-        # entry for every bucket the chart draws.
-        by_value: dict[str, dict[str, int]] = {v: {} for v in top_values}
-        for bucket_ts, val, count in bucket_result.result_rows:
-            by_value.setdefault(val, {})[ensure_utc_iso(bucket_ts)] = count
+        # Pivot into one bucket-list per value, in the same top-N order the
+        # ranking produced, filling buckets with zero rows so every series
+        # has an entry for every bucket the chart draws.
+        top_values = [row[0] for row in rows]
+        by_value: dict[str, dict[str, int]] = {}
+        for val, _total, plot_buckets in rows:
+            by_value[val] = {ensure_utc_iso(bucket_ts): count for bucket_ts, count in plot_buckets}
 
         # Derive bucket starts from [min_ts, max_ts] rather than from the
         # query result rows: a bucket where *none* of the top-N values had
@@ -1823,27 +1843,43 @@ class EventQueryService:
         """
         if primary.start is not None and primary.end is not None:
             return ensure_utc(primary.start), ensure_utc(primary.end)
-        database = self.store.database
-        ranges = []
-        for query in (primary, comparison):
-            where, parameters = self._build_where(query)
-            # W2: each layer's range respects its own clock-skew offsets,
-            # matching `_bucketed_counts`' bucketing expression.
-            ranges.append(
-                query_timestamp_range(
-                    self.store.client,
-                    database,
-                    where,
-                    parameters,
-                    ts_expr=effective_ts_sql(query.source_offsets),
-                    settings=HEAVY_SCAN_SETTINGS,
-                )
-            )
+        ranges = [self._layer_timestamp_range(query) for query in (primary, comparison)]
         mins = [r[0] for r in ranges if r[0] is not None]
         maxs = [r[1] for r in ranges if r[1] is not None]
         if not mins or not maxs:
             return None, None
         return min(mins), max(maxs)
+
+    def _baseline_cached(self, token: tuple | None, key: tuple, compute: Callable[[], Any]) -> Any:
+        """Run *compute* through the baseline-layer cache when a token is set.
+
+        The single token/no-token branch shared by every baseline-layer wrap
+        in the ``compare_*`` methods (M24c): ``token is None`` — custom mode,
+        no freshness fingerprint, or a non-compare caller — means always
+        compute live; otherwise memoize under *key* (which must already
+        include the token).
+        """
+        if token is None:
+            return compute()
+        return baseline_cache().get_or_compute(key, compute)
+
+    def _layer_timestamp_range(self, query: EventQuery) -> tuple[datetime | None, datetime | None]:
+        """One layer's (min, max) data range — explicit window short-circuits.
+
+        W2: the range respects the layer's own clock-skew offsets, matching
+        `_bucketed_counts`' bucketing expression.
+        """
+        if query.start is not None and query.end is not None:
+            return ensure_utc(query.start), ensure_utc(query.end)
+        where, parameters = self._build_where(query)
+        return query_timestamp_range(
+            self.store.client,
+            self.store.database,
+            where,
+            parameters,
+            ts_expr=effective_ts_sql(query.source_offsets),
+            settings=HEAVY_SCAN_SETTINGS,
+        )
 
     def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
         """Return epoch-aligned bucket-start (ISO) → event count for *query*."""
@@ -1865,7 +1901,11 @@ class EventQueryService:
 
     @_gated_scan
     def compare_time_histogram(
-        self, primary: EventQuery, comparison: EventQuery, buckets: int = 60
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        buckets: int = 60,
+        baseline_cache_token: tuple | None = None,
     ) -> dict[str, Any]:
         """Return event counts over time for two layers on one shared bucket grid.
 
@@ -1875,9 +1915,24 @@ class EventQueryService:
         that grid and zero-filled onto it, so the two series are comparable
         by construction. The response carries only raw counts; derived
         metrics (delta/rate/ratio/cumulative) are frontend transforms.
+
+        ``baseline_cache_token`` (M24c, non-None only in baseline mode, see
+        the compare endpoint): the comparison layer is a strict superset of
+        the primary — same sources and explicit window, all filters dropped —
+        so the union range equals the baseline's own range, letting the
+        primary range scan be skipped outright; the baseline range and bucket
+        counts are memoized in :py:mod:`viz_cache` keyed on the token.
         """
         self.store.init_schema()
-        min_ts, max_ts = self._union_timestamp_range(primary, comparison)
+        window = (primary.start, primary.end)
+        if baseline_cache_token is not None:
+            min_ts, max_ts = self._baseline_cached(
+                baseline_cache_token,
+                ("time_range", baseline_cache_token, window),
+                lambda: self._layer_timestamp_range(comparison),
+            )
+        else:
+            min_ts, max_ts = self._union_timestamp_range(primary, comparison)
         if min_ts is None or max_ts is None:
             return {
                 "kind": "time",
@@ -1892,7 +1947,11 @@ class EventQueryService:
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
         primary_counts, comparison_counts = self._run_parallel(
             lambda: self._bucketed_counts(primary, interval),
-            lambda: self._bucketed_counts(comparison, interval),
+            lambda: self._baseline_cached(
+                baseline_cache_token,
+                ("time_buckets", baseline_cache_token, window, interval),
+                lambda: self._bucketed_counts(comparison, interval),
+            ),
         )
         starts = aligned_bucket_starts(min_ts, max_ts, interval)
         bucket_list = [
@@ -1943,7 +2002,12 @@ class EventQueryService:
 
     @_gated_scan
     def compare_field_terms(
-        self, primary: EventQuery, comparison: EventQuery, field_token: str, limit: int = 50
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        baseline_cache_token: tuple | None = None,
     ) -> dict[str, Any]:
         """Return top-N term counts for two layers over one shared category list.
 
@@ -1951,6 +2015,12 @@ class EventQueryService:
         list; the comparison layer is then counted against those same values
         (everything else folds into its ``other``), so both bar groups share
         categories — the terms-kind comparability invariant.
+
+        ``baseline_cache_token`` (M24c): the baseline layer's counts depend
+        on the primary's top-N value list (render-variant), so the cache key
+        includes it — hits happen only on re-renders whose primary top-N is
+        unchanged (option toggles, tab switches, repeat renders), a
+        deliberately narrower win than the time/numeric kinds.
         """
         self.store.init_schema()
         terms = self._field_terms_impl(primary, field_token, limit=limit)
@@ -1960,8 +2030,11 @@ class EventQueryService:
         comparison_by_value: dict[str, int] = {}
         comparison_total = 0
         if top_values:
-            comparison_by_value, comparison_total = self._terms_counts_for_values(
-                comparison, field_token, top_values
+            window = (primary.start, primary.end)
+            comparison_by_value, comparison_total = self._baseline_cached(
+                baseline_cache_token,
+                ("terms_counts", baseline_cache_token, window, field_token, tuple(top_values)),
+                lambda: self._terms_counts_for_values(comparison, field_token, top_values),
             )
 
         values = [
@@ -2030,7 +2103,12 @@ class EventQueryService:
 
     @_gated_scan
     def compare_field_numeric(
-        self, primary: EventQuery, comparison: EventQuery, field_token: str, bins: int = 30
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        field_token: str,
+        bins: int = 30,
+        baseline_cache_token: tuple | None = None,
     ) -> dict[str, Any]:
         """Return fixed-width numeric histograms for two layers on shared bin edges.
 
@@ -2038,11 +2116,21 @@ class EventQueryService:
         both layers are bucketed on those explicit edges — the numeric-kind
         comparability invariant. Same fixed-width/reproducible-edges policy
         as :py:meth:`field_numeric_stats`.
+
+        ``baseline_cache_token`` (M24c): the baseline layer's stats and bin
+        counts are memoized; bin-count keys include the derived edges
+        (mn/bin_width), so a hit is exact regardless of what the primary
+        contributed to the union.
         """
         self.store.init_schema()
+        window = (primary.start, primary.end)
         (p_count, p_mn, p_mx), (c_count, c_mn, c_mx) = self._run_parallel(
             lambda: self._numeric_layer_stats(primary, field_token),
-            lambda: self._numeric_layer_stats(comparison, field_token),
+            lambda: self._baseline_cached(
+                baseline_cache_token,
+                ("num_stats", baseline_cache_token, window, field_token),
+                lambda: self._numeric_layer_stats(comparison, field_token),
+            ),
         )
 
         mins = [m for m in (p_mn, c_mn) if m is not None]
@@ -2063,17 +2151,22 @@ class EventQueryService:
         span = mx - mn
         bin_width = span / bin_count if span > 0 else 1.0
 
+        def comparison_bins_fn() -> dict[int, int]:
+            if not c_count:
+                return {}
+            return self._baseline_cached(
+                baseline_cache_token,
+                ("num_bins", baseline_cache_token, window, field_token, bin_count, mn, bin_width),
+                lambda: self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count),
+            )
+
         primary_bins, comparison_bins = self._run_parallel(
             lambda: (
                 self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
                 if p_count
                 else {}
             ),
-            lambda: (
-                self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
-                if c_count
-                else {}
-            ),
+            comparison_bins_fn,
         )
         bins_out = [
             {

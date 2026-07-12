@@ -38,7 +38,11 @@ from tracesignal.api.routers.events import (
     _validate_field_regexes,
     _validate_regex,
 )
-from tracesignal.db.field_stats import ensure_source_field_stats, merged_inventory
+from tracesignal.db.field_stats import (
+    ensure_source_field_stats,
+    merged_field_terms,
+    merged_inventory,
+)
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery
 
@@ -146,6 +150,37 @@ _ANNOTATION_TAG_VALUE = Query(default=None)
 _RUN_ID = Query(default=None)
 
 
+def _is_unfiltered(query: EventQuery) -> bool:
+    """True when *query* restricts nothing beyond the timeline's own scope.
+
+    The cache-eligibility check for M24a: an unfiltered first-load
+    aggregation depends only on (timeline sources, field), which the
+    per-source ``field_stats`` cache can answer without a ClickHouse scan.
+    ``source_ids`` (timeline scope) is deliberately not a filter here — the
+    cached merge runs over exactly those sources.
+    """
+    return (
+        not any(
+            [
+                query.q,
+                query.artifact,
+                query.artifacts,
+                query.source_id,
+                query.tag,
+                query.exclude_tag,
+                query.start,
+                query.end,
+                query.field_filters,
+                query.field_exclusions,
+                query.tags_include,
+                query.tags_exclude,
+            ]
+        )
+        and query.event_ids is None
+        and query.exclude_event_ids is None
+    )
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-terms")
 async def get_field_terms(
     case_id: str,
@@ -201,6 +236,18 @@ async def get_field_terms(
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
     )
+    # M24a: an unfiltered first load is answerable from the per-source
+    # field_stats cache — no ClickHouse scan, no HEAVY_SCAN_GATE slot. A
+    # canonical mapped field must stay live (coalesce over several raw keys
+    # dedupes per event; not derivable from per-key caches), and any filter
+    # or a cache gap falls through to the live path below.
+    if _is_unfiltered(query) and not (query.field_mappings and field in query.field_mappings):
+        stats = await ensure_source_field_stats(
+            get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
+        )
+        cached = merged_field_terms(stats, field, limit)
+        if cached is not None:
+            return {**cached, "cached": True}
     service = _get_query_service()
     return await _run_regex_guarded(
         _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
@@ -647,6 +694,7 @@ async def compare_layers(
 
     primary = await _resolve_body_query(case_id, timeline_id, body.primary)
 
+    baseline_token: tuple | None = None
     if body.comparison.mode == "baseline":
         # All events of the timeline: filters dropped, timeline scope and
         # explicit time window kept — "the whole" the primary is a part of.
@@ -677,6 +725,27 @@ async def compare_layers(
             filter_modes=None,
             exclusion_modes=None,
         )
+        # M24c: freshness fingerprint for the baseline-layer cache. The
+        # comparison layer here is a strict superset of the primary (same
+        # timeline sources + explicit window, all filters dropped) — the
+        # compare_* methods' cache paths and their primary-range-scan skip
+        # both rest on that invariant; anything that could make a primary
+        # filter *add* rows outside timeline scope breaks it. computed_at
+        # moves on exactly the two source-mutation events (ingest,
+        # enrichment apply); a source without a stats row disables caching
+        # for this render (token stays None — always safe).
+        rows = await get_store().get_source_field_stats(comparison.source_ids or [])
+        by_source = {row.source_id: row for row in rows}
+        if comparison.source_ids and all(sid in by_source for sid in comparison.source_ids):
+            baseline_token = (
+                case_id,
+                tuple(
+                    sorted(
+                        (sid, by_source[sid].computed_at.isoformat(), by_source[sid].events_total)
+                        for sid in comparison.source_ids
+                    )
+                ),
+            )
     else:
         if body.comparison.filters is None:
             raise HTTPException(status_code=422, detail="mode='custom' requires 'filters'")
@@ -695,14 +764,31 @@ async def compare_layers(
     )
     if body.kind == "time":
         return await _run_regex_guarded(
-            q_regex, service.compare_time_histogram, primary, comparison, body.buckets
+            q_regex,
+            service.compare_time_histogram,
+            primary,
+            comparison,
+            body.buckets,
+            baseline_cache_token=baseline_token,
         )
     if body.kind == "terms":
         return await _run_regex_guarded(
-            q_regex, service.compare_field_terms, primary, comparison, body.field, body.limit
+            q_regex,
+            service.compare_field_terms,
+            primary,
+            comparison,
+            body.field,
+            body.limit,
+            baseline_cache_token=baseline_token,
         )
     return await _run_regex_guarded(
-        q_regex, service.compare_field_numeric, primary, comparison, body.field, body.bins
+        q_regex,
+        service.compare_field_numeric,
+        primary,
+        comparison,
+        body.field,
+        body.bins,
+        baseline_cache_token=baseline_token,
     )
 
 

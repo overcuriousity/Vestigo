@@ -68,22 +68,6 @@ resolved — this file holds only the condensed, still-open action items.
   that scale measures slow. ((b) — batching per-field novelty scans into one `attributes`
   pass — landed 2026-07-11, session 50.)
 
-- [ ] **M24 — Visualize scan-avoidance (deferred from session 33).** Every viz chart
-  aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, the new
-  `time_punchcard`/`field_pivot`/`field_scatter`, all compare variants in `db/queries.py`)
-  is a live full-column scan; the `db/field_stats.py` cache (distinct/coverage + 3 samples
-  per field) is consumed only by `viz/fields`. Session 49 applied the **memory guardrails**
-  (`HEAVY_SCAN_SETTINGS` + `HEAVY_SCAN_GATE` admission gate, previously detector-only) to
-  every viz aggregation, so the scans are now bounded — M24's remaining scope is avoiding
-  them: (a) seed first-load *unfiltered* top-values from the cache instead of a live
-  `field_terms` scan; (b) merge `field_value_timeseries`' ~3 scans (terms + range + bucket)
-  into fewer passes; (c) baseline-mode compare re-scans the whole timeline every render —
-  cache or bound it. Not `field_numeric_stats`: its two scans are a deliberate
-  fixed-width-bin reproducibility choice (documented in the method). Known accepted wrinkle:
-  compare runs its two layer scans in parallel inside one gate slot, so a compare render can
-  momentarily use ~2× the per-slot budget (each scan still individually capped by
-  `max_memory_usage`).
-
 - [ ] **M26 — Unify the two time-histogram implementations (deferred, session 49).** The
   Explorer's `TimelineHistogram` (div-bars, markers/baseline bands/scroll indicator/mark
   mode) and the Visualize page's `TimeHistogram`/`CompareHistogram` (d3-SVG, now with its
@@ -185,30 +169,6 @@ Hard, high value:
   references to saved Views, charts, and tagged events — the report writes itself during the
   investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is
   mostly a new Postgres model + frontend editor. Timesketch's most-loved feature.
-
-## Legacy-removal suspects (flagged 2026-07-08, verify before cutting)
-
-Code kept only for backward compatibility with older runs/clients. Each is a
-**candidate** for removal — confirm nothing still depends on it, then delete in
-one commit that also updates `docs/ANOMALY_DETECTION.md`.
-
-- [ ] **L1 — Single-`baseline_end` split point + `temporal=true` midpoint fallback.**
-  Superseded by explicit baseline definitions (baseline + 1..N suspect windows).
-  Still accepted at the API and converted via `windows_from_split`
-  (`db/anomaly_stats.py`), so old persisted runs and any pre-window client keep
-  working with exactly one internal temporal code path. Remove the `baseline_end`
-  / `temporal` request params and `windows_from_split` once no stored `DetectorRun`
-  relies on the legacy shape and the CLI/clients all send `baseline_id`.
-## Disposition follow-ups (from the 2026-07-10 unified-taxonomy change)
-
-L2 (per-event `normal` annotation) is resolved: dispositions
-(`finding_dispositions`, migration `0004`) subsumed the allowlist, the
-per-event `normal` annotation, and the `pinned` flag. Remaining polish:
-
-- [ ] **X3 — Event-grid indicator for event-scoped dispositions.** The legacy
-  per-event-normal grid indicator was removed with the annotation; an
-  indicator driven by event-scoped disposition rows could return if analysts
-  miss it.
 
 ## Explicitly out of scope (decided during the audit)
 

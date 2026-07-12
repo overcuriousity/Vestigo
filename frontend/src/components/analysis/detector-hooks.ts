@@ -17,19 +17,19 @@ import type { AnomalyMarker, Event } from "@/api/types";
  * detector view calls this so a change to the frame or active baseline re-runs
  * the scan and all views stay consistent. `needsBaseline` is true when the
  * frame is `baseline` but no definition is active — the view should prompt to
- * pick/build one rather than silently fall back to the legacy midpoint split.
+ * pick/build one rather than silently run a self-baseline scan.
  */
 export function useBaselineRequest(): {
-  params: { temporal?: boolean; baseline_id?: string };
+  params: { baseline_id?: string };
   key: string;
   needsBaseline: boolean;
 } {
   const frame = useBaselineStore((s) => s.frame);
   const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
-  if (frame !== "baseline") return { params: { temporal: false }, key: "self", needsBaseline: false };
+  if (frame !== "baseline") return { params: {}, key: "self", needsBaseline: false };
   if (activeBaselineId)
     return { params: { baseline_id: activeBaselineId }, key: `bl:${activeBaselineId}`, needsBaseline: false };
-  return { params: { temporal: false }, key: "self", needsBaseline: true };
+  return { params: {}, key: "self", needsBaseline: true };
 }
 
 // Auto-scan field selection for the string detectors (charset/entropy). Mirrors
