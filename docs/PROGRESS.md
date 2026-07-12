@@ -49,6 +49,15 @@ safe first: stored `DetectorRun.params` are displayed, never replayed; CLI has n
 command; frontend only ever sent `temporal: false`. `BaselineDefinition.baseline_end` and
 detector `temporal-*` method names untouched. `docs/ANOMALY_DETECTION.md` updated.
 
+**Trailing-bucket loss fix (`db/_buckets.py`), found by the batch's /verify pass.**
+`aligned_bucket_starts` excluded the bucket containing `max_ts` (`range` stop is exclusive,
+`end_epoch` is that bucket's start), so the value×time chart and the compare time histogram
+silently dropped every event in the trailing partial bucket — the newest data — and compare's
+reported totals disagreed with the plotted buckets (1980/2000 in verification). Pre-existing
+since the helper was introduced; grid now includes `end_epoch`. Explorer's histogram (own SQL
+path) and the detectors' `_full_bucket_starts` (deliberately partial-excluding) were never
+affected. `tests/test_buckets.py` pins the boundaries.
+
 **X3 — event-grid disposition indicator (`EventGrid.tsx`, `ExplorerPage.tsx`).** Event-scoped
 disposition rows (confirmed/dismissed/normal on one concrete event) now render a verdict icon
 in the annotation column — Flag > EyeOff > ShieldCheck by priority, tooltip with kind /
