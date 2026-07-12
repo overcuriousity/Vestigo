@@ -660,7 +660,10 @@ def test_apply_enrichments_runs_atomic_partition_rewrite():
     client = store.client
     # Triples inserted into the scratch rows table.
     assert client.inserts == [
-        ("vestigo.tmp_enrich_rows_job1", [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")])
+        (
+            "vestigo.tmp_enrich_rows_job1",
+            [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")],
+        )
     ]
     # Enriched partition copy built via mapUpdate join, pinned join_use_nulls.
     # The source map is first passed through mapFilter to strip this enricher's

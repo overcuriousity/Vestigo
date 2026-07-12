@@ -2,8 +2,12 @@
 
 ## Supported versions
 
-Vestigo is pre-1.0 and under active development. Security fixes are only
-guaranteed for the latest commit on `main`.
+| Version | Supported |
+| ------- | --------- |
+| 1.0.x   | ✅        |
+| < 1.0   | ❌ (pre-release; upgrade to 1.0) |
+
+Security fixes land on `main` and are released as 1.0.x patch versions.
 
 ## Reporting a vulnerability
 

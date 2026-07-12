@@ -1,7 +1,34 @@
-# TraceSignal Implementation Progress
+# Vestigo Implementation Progress
 
-Last updated: 2026-07-12 (session 53 — re-vendor 2timesketch batch: apache, cowrie, evtx,
-syslog).
+Last updated: 2026-07-12 (session 54 — release 1.0: rename to Vestigo, brand, changelog,
+release workflow).
+
+## Session 54 — 2026-07-12: release 1.0 — TraceSignal renamed to Vestigo
+
+Release-engineering session; no feature work. (Historical entries below deliberately keep
+the old TraceSignal name — they are point-in-time records.)
+
+- **Rename (full):** package `src/vestigo`, CLI `vestigo`/`vestigo-web` (was `tsig`/
+  `tsig-web`), env prefix `VESTIGO_` (was `TS_`), DB defaults (`vestigo` for Postgres db/user,
+  ClickHouse database, Qdrant collection prefix), converter scripts `*2vestigo.py`, Parquet
+  footer keys `vestigo.*` with a `tracesignal.*` read fallback in
+  `ingestion/parquet_format.py`. `docs/archive/` and this file's older entries keep the old
+  name. Manifest hashes refreshed. Name chosen after availability check (PyPI/GitHub);
+  *vestigo* = Latin "I follow the tracks".
+- **Brand:** new geometric step-track mark (one band out of cadence = the anomaly) as
+  `frontend/public/favicon.svg` (prefers-color-scheme aware), `VestigoMark` component in
+  TopBar/LoginPage, `docs/assets/logo{,-dark}.svg` wordmarks, README `<picture>` header.
+- **Version 1.0.0** in `pyproject.toml` + `frontend/package.json`; new `CHANGELOG.md`
+  (Keep-a-Changelog) with a condensed 1.0.0 entry incl. rename migration notes.
+- **Release workflow** `.github/workflows/release.yml` on `v*` tags: backend/frontend gates
+  (mirrors ci.yml incl. tag-matches-pyproject check), buildx image push to
+  `ghcr.io/overcuriousity/vestigo` ({version}, {major}.{minor}, latest), GitHub release with
+  the CHANGELOG section as notes.
+- **Docs:** README gets ghcr pull instructions and a "Stability & upgrades" section (Alembic
+  auto-migration, Parquet v1 stability, append-only config-hash identity, honest
+  no-in-place-migration statement for ClickHouse/Qdrant); SECURITY.md supported-versions
+  table now 1.0.x.
+- Remaining manual steps: merge PR, `gh repo rename Vestigo`, tag `v1.0.0`.
 
 ## Session 53 — 2026-07-12: vendor newest 2timesketch converter batch
 

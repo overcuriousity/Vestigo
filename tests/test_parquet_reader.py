@@ -20,12 +20,7 @@ from vestigo.ingestion.pipeline import IngestionPipeline
 from vestigo.models.event import Event, derive_event_id
 
 _SCRIPT = (
-    Path(__file__).parent.parent
-    / "src"
-    / "vestigo"
-    / "assets"
-    / "converters"
-    / "nginx2vestigo.py"
+    Path(__file__).parent.parent / "src" / "vestigo" / "assets" / "converters" / "nginx2vestigo.py"
 )
 DATA = Path(__file__).parent / "data"
 
@@ -179,6 +174,19 @@ class TestValidation:
         path = self._write(tmp_path / "x.parquet", parquet_format.PARQUET_EVENT_SCHEMA, meta)
         with pytest.raises(ValueError, match="no original evidence files"):
             list(_parser().parse_arrow_batches(path))
+
+    def test_accepts_legacy_tracesignal_keys(self, tmp_path):
+        """Files from pre-rename (*2tracesignal.py) converters still validate."""
+        meta = {
+            key.replace("vestigo.", "tracesignal.", 1): value
+            for key, value in self._good_meta().items()
+        }
+        path = self._write(tmp_path / "x.parquet", parquet_format.PARQUET_EVENT_SCHEMA, meta)
+        parsed = parquet_format.validate_parquet_source(
+            pq.ParquetFile(path).schema_arrow, pq.ParquetFile(path).schema_arrow.metadata
+        )
+        assert parsed.converter_name == "x2vestigo"
+        assert parsed.original_files[0].name == "x.log"
 
     def test_rejects_wrong_column_type(self, tmp_path):
         fields = [

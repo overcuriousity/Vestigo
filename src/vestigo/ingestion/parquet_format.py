@@ -150,9 +150,7 @@ def validate_parquet_source(schema: pa.Schema, metadata: dict[bytes, bytes]) -> 
 
     missing = [name for name in PARQUET_EVENT_SCHEMA.names if schema.get_field_index(name) < 0]
     if missing:
-        raise ValueError(
-            f"Vestigo Parquet file is missing required columns: {', '.join(missing)}."
-        )
+        raise ValueError(f"Vestigo Parquet file is missing required columns: {', '.join(missing)}.")
     for name in PARQUET_EVENT_SCHEMA.names:
         expected = PARQUET_EVENT_SCHEMA.field(name).type
         actual = schema.field(name).type

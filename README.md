@@ -131,6 +131,12 @@ For active frontend development, run `npm install && npm run dev` in `frontend/`
 
 ### Docker/Podman Compose (optional containerized app)
 
+Released application images are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/overcuriousity/vestigo:latest
+```
+
 `docker-compose.yml` ships with a **commented-out** `app` service that builds the image from
 the local checkout (`Dockerfile`) and reaches the backing services over the compose-internal
 network. Uncomment it, then `docker compose up -d` (or `podman compose up -d`) brings up the
@@ -184,6 +190,29 @@ On the **airgapped machine**:
    run on matching OS/architecture (e.g. build on the same Linux distribution/glibc version
    you'll run on), since the `.venv/` carries compiled wheels (PyTorch, onnxruntime, etc.).
 
+## Stability & upgrades
+
+What the 1.0 line guarantees, and what it doesn't:
+
+- **PostgreSQL metadata schema** is Alembic-managed; the app migrates to the current head
+  automatically on startup. Upgrading a 1.0.x deployment is: stop, update code/image, start.
+- **Parquet interchange format v1** (converter output) is stable: files produced by any 1.0
+  converter script remain ingestible by any 1.0 server. Files written by pre-rename
+  (`*2tracesignal.py`) converters are still accepted.
+- **Forensic identity is append-only**: parser/embedding config hashes (`config_hash()`)
+  identify processing configurations; existing hashes never change meaning within 1.0.x.
+- **ClickHouse and Qdrant schemas** have no in-place migration story yet: within 1.0.x they
+  won't change; a future change would come with an explicit re-ingest/re-embed procedure in
+  the release notes, never a silent one.
+- The REST API is versioned by the app itself (`/api/health` reports the version); breaking
+  API changes are reserved for 2.0.
+
+**Upgrading from a pre-1.0 (TraceSignal) deployment:** the project was renamed for 1.0 —
+CLI `tsig` → `vestigo`, env vars `TS_*` → `VESTIGO_*`, and default backing-store names are
+now `vestigo`. Existing data stays where it is: rename your env vars and pin the old names
+via `VESTIGO_POSTGRES_URL`, `VESTIGO_CLICKHOUSE_DATABASE`, and
+`VESTIGO_QDRANT_COLLECTION_PREFIX`. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Inspiration
 
 Vestigo's design draws on two projects:
@@ -210,6 +239,7 @@ analysis system for a small, self-hosted team.
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — approved Case / Source / Timeline / Artifact redesign
 - [Roadmap](docs/ROADMAP.md)
 - [Progress](docs/PROGRESS.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 

@@ -108,7 +108,9 @@ async def _resolve_actor(store: PostgresStore, username: str | None) -> User:
 @app.command()
 def ingest(
     path: str = typer.Argument(..., help="Path to log file or directory to ingest."),
-    case: str = typer.Option(..., "--case", "-c", help="Target case ID (see 'vestigo cases list')."),
+    case: str = typer.Option(
+        ..., "--case", "-c", help="Target case ID (see 'vestigo cases list')."
+    ),
     source: str = typer.Option(..., "--source", "-s", help="Source name."),
     format: str | None = typer.Option(
         None,
@@ -214,7 +216,9 @@ def ingest(
 
 @app.command()
 def embed(
-    case: str = typer.Option(..., "--case", "-c", help="Target case ID (see 'vestigo cases list')."),
+    case: str = typer.Option(
+        ..., "--case", "-c", help="Target case ID (see 'vestigo cases list')."
+    ),
     source: str = typer.Option(..., "--source", "-s", help="Source name or ID."),
     batch_size: int = typer.Option(
         64,

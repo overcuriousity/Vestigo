@@ -20,12 +20,7 @@ import pytest
 from vestigo.ingestion import parquet_format
 
 _SCRIPT = (
-    Path(__file__).parent.parent
-    / "src"
-    / "vestigo"
-    / "assets"
-    / "converters"
-    / "pcap2vestigo.py"
+    Path(__file__).parent.parent / "src" / "vestigo" / "assets" / "converters" / "pcap2vestigo.py"
 )
 DATA = Path(__file__).parent / "data"
 
