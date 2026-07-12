@@ -46,7 +46,8 @@ resolved — this file holds only the condensed, still-open action items.
   `*2timesketch` scripts stay vendored **permanently** as a minimal-dependency (stdlib-only,
   no pyarrow) alternative — `scripts/vendor_converters.py` is not retired, and native/vendored
   converters are listed side by side in `manifest.json`/`/api/converters`. Remaining:
-  journal, browser (still vendored-only, not yet ported to native). Follow-ups from the nginx
+  journal, browser, apache, cowrie, evtx, syslog (still vendored-only, not yet ported to
+  native — the last four vendored from upstream `d6e5e61`, session 53). Follow-ups from the nginx
   pilot, still open: benchmark converter worker-count/parallel-threshold defaults on a
   multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred; pcap intra-file
   parallelism (record-boundary chunking, analogous to nginx's newline chunking) deferred —

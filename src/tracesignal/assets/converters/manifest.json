@@ -1,9 +1,21 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "303869e321a620e529eef116ef2cd787fd1ca4cb",
+  "commit": "d6e5e617353eb6a41fe712d1e207cfcc8dc17cdc",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
+    {
+      "name": "apache2timesketch",
+      "filename": "apache2timesketch.py",
+      "description": "Apache HTTP Server access (combined/common, other_vhosts) and error logs (2.4 and 2.2 formats) to Timesketch timeline.",
+      "inputs": [
+        "access.log*",
+        "other_vhosts_access.log*",
+        "error.log*"
+      ],
+      "size_bytes": 63365,
+      "sha256": "6c4d99396b2d8174edee52c97d40c0066402c9deb110d446819497026d6408a3"
+    },
     {
       "name": "browser2timesketch",
       "filename": "browser2timesketch.py",
@@ -13,7 +25,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 101161,
-      "sha256": "9b8425726da2c46310b52211f7980c3b0243f1a022eb3996cd216cebc8c75c82"
+      "sha256": "cde13b29ef9460252e93d8b566813c2c44c1900bda6620373e3d4b13ee405c16"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -23,7 +35,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 42610,
-      "sha256": "98ed1120344c8a95d34e58f8d59164b5cca8974c43ebbaa6390e1079b51fcdb9"
+      "sha256": "d84d8cbb395f0e35d8fbdd96961613df858b4b2cee47eb15afd02b584d2df7a2"
     },
     {
       "name": "cloudtrail2tracesignal",
@@ -40,6 +52,30 @@
       "sha256": "7da1e5d2fdc7a8838d80c5e02408645bed87230c553549a6b11250a23427a91d"
     },
     {
+      "name": "cowrie2timesketch",
+      "filename": "cowrie2timesketch.py",
+      "description": "Cowrie SSH/Telnet honeypot JSON logs (plain, rotated, or gzip) to Timesketch timeline.",
+      "inputs": [
+        "cowrie.json",
+        "cowrie.json.YYYY-MM-DD",
+        "cowrie.json*.gz"
+      ],
+      "size_bytes": 43729,
+      "sha256": "c36b364b09fe477befd32bfee03407bfd33940c0e109cc835256ab91e5a90c5c"
+    },
+    {
+      "name": "evtx2timesketch",
+      "filename": "evtx2timesketch.py",
+      "description": "Windows Event Log text exports (wevtutil XML, evtx_dump XML/JSONL) to Timesketch timeline.",
+      "inputs": [
+        "wevtutil qe /f:xml export",
+        "evtx_dump --format xml",
+        "evtx_dump -o jsonl"
+      ],
+      "size_bytes": 57648,
+      "sha256": "571a277bcd19ea7358e68aa9b2902c1554898450fb4ac4badc8acc466ba0bf66"
+    },
+    {
       "name": "filterlog2timesketch",
       "filename": "filterlog2timesketch.py",
       "description": "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",
@@ -47,7 +83,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 51113,
-      "sha256": "77e9be35c2706897f009f2e6c4bbde2a3dd5d0118e4aa51a51b64f1cb46a4bb8"
+      "sha256": "18bd8d9092d9ad34ff93a7cb06c7cf8292a5b2d27a832c3a6e996841d97603dc"
     },
     {
       "name": "filterlog2tracesignal",
@@ -71,7 +107,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 38902,
-      "sha256": "c4b46abf2584042ff1718899b3f47d710ee0b13681d2e752f63b21b14fed9380"
+      "sha256": "874493b165471df8353e396713e23273bd5e04f59be92888676d3c3e51ba8380"
     },
     {
       "name": "nginx2timesketch",
@@ -82,7 +118,7 @@
         "error.log*"
       ],
       "size_bytes": 46573,
-      "sha256": "4cb8391520d0d89c46e00580237f74ae36f062428a679a362ff6d0d92f784857"
+      "sha256": "6f0a2df17785135ea847491a5b8bc822c6c5a9d205d54eec43c305ce5a7ce734"
     },
     {
       "name": "nginx2tracesignal",
@@ -108,7 +144,7 @@
         "*.pcapng"
       ],
       "size_bytes": 62362,
-      "sha256": "9c0d7963ce8226464c032300a210189e7c86891fe3f1fe8b79e8628a3dd40388"
+      "sha256": "f33608e822a9f77787671ef236df7b9637b64a91553519117da71930ac0e3394"
     },
     {
       "name": "pcap2tracesignal",
@@ -135,7 +171,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 53516,
-      "sha256": "762f32313af78714ae35d3a1e9e8ac45ce310e9a6a3911436f99dedd8f37d0f2"
+      "sha256": "acbd78c630870f109bac81a733c5298041b4e5d747215ed84a76347820c9cbae"
     },
     {
       "name": "suricata2tracesignal",
@@ -152,6 +188,20 @@
       ],
       "size_bytes": 29538,
       "sha256": "ca5f65bf8d75a12f6a284a677b2b56fd5ec882a1fe87ea0aa6073ddd5f2e3ca6"
+    },
+    {
+      "name": "syslog2timesketch",
+      "filename": "syslog2timesketch.py",
+      "description": "Linux syslog/auth.log (RFC 3164 plain text, rotated or gzip) to Timesketch timeline.",
+      "inputs": [
+        "auth.log*",
+        "secure*",
+        "syslog*",
+        "messages*",
+        "cron.log*"
+      ],
+      "size_bytes": 52830,
+      "sha256": "a6ea1cc1bbefbd9706b0a1491e6ccb09c290bc715fd7f2195e0ccaeb787acdb8"
     },
     {
       "name": "timesketch2parquet",

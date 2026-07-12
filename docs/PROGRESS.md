@@ -1,7 +1,22 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-12 (session 52 — M24 viz scan-avoidance, L1 legacy-split removal,
-X3 disposition grid indicator).
+Last updated: 2026-07-12 (session 53 — re-vendor 2timesketch batch: apache, cowrie, evtx,
+syslog).
+
+## Session 53 — 2026-07-12: vendor newest 2timesketch converter batch
+
+Re-synced the vendored converter suite to upstream `overcuriousity/2timesketch` commit
+`d6e5e61` (was `303869e`): four new stdlib-only converters — `apache2timesketch.py`,
+`cowrie2timesketch.py`, `evtx2timesketch.py`, `syslog2timesketch.py` — added to
+`scripts/vendor_converters.py`'s `CONVERTERS` table and vendored into
+`src/tracesignal/assets/converters/` (manifest now 17 entries). Existing vendored files
+changed only in their commit stamp. New in the vendor script: `MODULE_DEPS` — upstream's
+`apache.py` imports from its sibling `nginx.py`, so dependency module bodies are now inlined
+before the module body (the module's own top-level definitions shadow same-named dependency
+ones; `X as Y` imports become alias assignments capturing the dependency's originals).
+Verified: all 11 vendored scripts run standalone, apache parses combined-access and 2.4-error
+sample lines correctly, `tests/test_converters_api.py` passes. Native `*2tracesignal.py`
+Parquet ports of the four new formats added to M25's remaining list.
 
 ## Session 52 — 2026-07-12: M24 scan-avoidance + L1 removal + X3 grid indicator
 

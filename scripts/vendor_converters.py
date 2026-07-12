@@ -28,6 +28,13 @@ UPSTREAM_URL = "https://github.com/overcuriousity/2timesketch"
 
 # name -> (module basename, entry script, description, supported inputs)
 CONVERTERS = {
+    "apache2timesketch": (
+        "apache",
+        "apache2timesketch.py",
+        "Apache HTTP Server access (combined/common, other_vhosts) and error logs "
+        "(2.4 and 2.2 formats) to Timesketch timeline.",
+        ["access.log*", "other_vhosts_access.log*", "error.log*"],
+    ),
     "browser2timesketch": (
         "browser",
         "browser2timesketch.py",
@@ -39,6 +46,19 @@ CONVERTERS = {
         "cloudtrail2timesketch.py",
         "AWS CloudTrail JSON/JSON.gz exports to Timesketch timeline.",
         ["CloudTrail .json / .json.gz"],
+    ),
+    "cowrie2timesketch": (
+        "cowrie",
+        "cowrie2timesketch.py",
+        "Cowrie SSH/Telnet honeypot JSON logs (plain, rotated, or gzip) to Timesketch timeline.",
+        ["cowrie.json", "cowrie.json.YYYY-MM-DD", "cowrie.json*.gz"],
+    ),
+    "evtx2timesketch": (
+        "evtx",
+        "evtx2timesketch.py",
+        "Windows Event Log text exports (wevtutil XML, evtx_dump XML/JSONL) to "
+        "Timesketch timeline.",
+        ["wevtutil qe /f:xml export", "evtx_dump --format xml", "evtx_dump -o jsonl"],
     ),
     "filterlog2timesketch": (
         "filterlog",
@@ -65,12 +85,26 @@ CONVERTERS = {
         "Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers.",
         ["*.pcap", "*.pcapng"],
     ),
+    "syslog2timesketch": (
+        "syslog",
+        "syslog2timesketch.py",
+        "Linux syslog/auth.log (RFC 3164 plain text, rotated or gzip) to Timesketch timeline.",
+        ["auth.log*", "secure*", "syslog*", "messages*", "cron.log*"],
+    ),
     "suricata2timesketch": (
         "suricata",
         "suricata2timesketch.py",
         "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
         ["eve.json", "fast.log", "OPNsense suricata syslog export"],
     ),
+}
+
+# Sibling converter modules a module imports from (beyond common/terminal).
+# Dependency bodies are inlined *before* the module body, so the module's own
+# top-level definitions shadow same-named dependency ones; `X as Y` imports
+# become alias assignments that still capture the dependency's originals.
+MODULE_DEPS: dict[str, list[str]] = {
+    "apache": ["nginx"],
 }
 
 _FUTURE_RE = re.compile(r"^from __future__ import.*\n", re.MULTILINE)
@@ -158,6 +192,10 @@ def vendor(upstream: Path) -> None:
         )
         if module == "browser":
             module_body = _rewrite_browser(module_body)
+        dep_bodies = [
+            _strip((upstream / "timesketch_converters" / f"{dep}.py").read_text("utf-8"))
+            for dep in MODULE_DEPS.get(module, [])
+        ]
         entry_body = _strip((upstream / entry).read_text("utf-8"))
 
         header = (
@@ -175,7 +213,9 @@ def vendor(upstream: Path) -> None:
             "\n"
             f'__version__ = "{version}+vendored.{commit[:12]}"\n'
         )
-        content = "\n".join([header, terminal_body, common_body, module_body, entry_body])
+        content = "\n".join(
+            [header, terminal_body, common_body, *dep_bodies, module_body, entry_body]
+        )
         out = ASSETS_DIR / f"{name}.py"
         out.write_text(content, encoding="utf-8")
 
