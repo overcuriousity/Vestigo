@@ -222,9 +222,7 @@ def test_explicit_window(service):
 
 
 def test_clock_offset(service):
-    query = EventQuery(
-        case_id=CASE_ID, source_ids=[SRC_A, SRC_B], source_offsets={SRC_B: -3600}
-    )
+    query = EventQuery(case_id=CASE_ID, source_ids=[SRC_A, SRC_B], source_offsets={SRC_B: -3600})
     _assert_equivalent(service, query, "attr:proto")
 
 
@@ -253,7 +251,5 @@ def test_empty_field(service):
 
 
 def test_filtered_query(service):
-    query = EventQuery(
-        case_id=CASE_ID, source_ids=[SRC_A], field_filters={"proto": ["tcp", "udp"]}
-    )
+    query = EventQuery(case_id=CASE_ID, source_ids=[SRC_A], field_filters={"proto": ["tcp", "udp"]})
     _assert_equivalent(service, query, "attr:proto")

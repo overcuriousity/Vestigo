@@ -413,9 +413,7 @@ async def test_field_terms_any_filter_forces_live_path(monkeypatch):
     cached = {"field": "artifact", "total": 5, "distinct": 2, "values": [], "other_count": 0}
     svc = _patch_terms(monkeypatch, cached)
     kwargs = {**_FILTER_KWARGS, "q": "dos"}
-    result = await viz.get_field_terms(
-        "c1", "t1", field="artifact", limit=50, case=None, **kwargs
-    )
+    result = await viz.get_field_terms("c1", "t1", field="artifact", limit=50, case=None, **kwargs)
     assert result == {"kind": "live"}
     assert len(svc.calls) == 1
 
@@ -441,9 +439,7 @@ async def test_field_terms_mapped_token_forces_live_path(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_compare_baseline_passes_freshness_token(monkeypatch):
-    svc = _patch_compare(
-        monkeypatch, _FakePgStore([_FakeStatsRow("s1"), _FakeStatsRow("s2")])
-    )
+    svc = _patch_compare(monkeypatch, _FakePgStore([_FakeStatsRow("s1"), _FakeStatsRow("s2")]))
     body = viz.CompareRequest(kind="time", comparison=viz.ComparisonSpec(mode="baseline"))
     await viz.compare_layers("c1", "t1", body, case=None)
     token = svc.calls[0][3]
@@ -462,9 +458,7 @@ async def test_compare_baseline_missing_stats_row_disables_cache(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_compare_custom_mode_never_gets_token(monkeypatch):
-    svc = _patch_compare(
-        monkeypatch, _FakePgStore([_FakeStatsRow("s1"), _FakeStatsRow("s2")])
-    )
+    svc = _patch_compare(monkeypatch, _FakePgStore([_FakeStatsRow("s1"), _FakeStatsRow("s2")]))
     body = viz.CompareRequest(
         kind="time",
         comparison=viz.ComparisonSpec(mode="custom", filters=viz.CompareFilters(q="x")),

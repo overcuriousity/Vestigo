@@ -1804,9 +1804,7 @@ class EventQueryService:
         top_values = [row[0] for row in rows]
         by_value: dict[str, dict[str, int]] = {}
         for val, _total, plot_buckets in rows:
-            by_value[val] = {
-                ensure_utc_iso(bucket_ts): count for bucket_ts, count in plot_buckets
-            }
+            by_value[val] = {ensure_utc_iso(bucket_ts): count for bucket_ts, count in plot_buckets}
 
         # Derive bucket starts from [min_ts, max_ts] rather than from the
         # query result rows: a bucket where *none* of the top-N values had
@@ -1852,9 +1850,7 @@ class EventQueryService:
             return None, None
         return min(mins), max(maxs)
 
-    def _layer_timestamp_range(
-        self, query: EventQuery
-    ) -> tuple[datetime | None, datetime | None]:
+    def _layer_timestamp_range(self, query: EventQuery) -> tuple[datetime | None, datetime | None]:
         """One layer's (min, max) data range — explicit window short-circuits.
 
         W2: the range respects the layer's own clock-skew offsets, matching

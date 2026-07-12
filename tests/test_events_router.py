@@ -1163,8 +1163,6 @@ async def test_run_stat_detector_dispatches_to_timestamp_order(patched_store, mo
     assert not fake_svc.value_novelty_calls
 
 
-
-
 @pytest.mark.asyncio
 async def test_run_stat_detector_excludes_normal_disposed_events(
     patched_store, monkeypatch, stub_field_stats_cache

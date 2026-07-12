@@ -256,7 +256,9 @@ def _synthetic_stats() -> dict:
         "s2": (
             3,
             {
-                "top_level": {"artifact": {"distinct": 2, "coverage": 3, "values": [["b", 2], ["a", 1]]}},
+                "top_level": {
+                    "artifact": {"distinct": 2, "coverage": 3, "values": [["b", 2], ["a", 1]]}
+                },
                 "attributes": {
                     "user": {
                         "distinct": 1,
