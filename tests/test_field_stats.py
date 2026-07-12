@@ -201,3 +201,135 @@ async def test_delete_source_field_stats(pg_store):
     )
     await pg_store.delete_source_field_stats("gone")
     assert await pg_store.get_source_field_stats(["gone"]) == []
+
+
+# ── merged_field_terms (M24a) ────────────────────────────────────────────────
+
+
+def test_compute_payload_top_values_ordering(ch_store):
+    _, payload = compute_source_field_stats(ch_store, CASE_ID, SRC_A)
+    # count DESC, value ASC — matches _field_terms_impl's ordering.
+    assert payload["attributes"]["src_ip"]["values"] == [["10.0.0.2", 2], ["10.0.0.1", 1]]
+    assert payload["attributes"]["status"]["values"] == [["200", 2], ["500", 1]]
+    assert payload["top_level"]["artifact"]["values"] == [["test:artifact", 3]]
+    assert payload["attr_keys_truncated"] is False
+
+
+def test_merged_field_terms_matches_live(ch_store):
+    from tracesignal.db.field_stats import merged_field_terms
+    from tracesignal.db.queries import EventQuery
+
+    svc = EventQueryService(store=ch_store)
+    stats = _stats_for(ch_store)
+    # Single source: must be identical (no merge approximation).
+    stats_a = {SRC_A: stats[SRC_A]}
+    for token in ("attr:src_ip", "attr:status", "artifact"):
+        live = svc.field_terms(EventQuery(case_id=CASE_ID, source_ids=[SRC_A]), token)
+        assert merged_field_terms(stats_a, token, 50) == live
+    # Both sources: per-source top-50 covers every value in this fixture,
+    # so the merge is exact here too.
+    for token in ("attr:status", "artifact"):
+        live = svc.field_terms(EventQuery(case_id=CASE_ID, source_ids=[SRC_A, SRC_B]), token)
+        cached = merged_field_terms(stats, token, 50)
+        assert cached["total"] == live["total"]
+        assert cached["values"] == live["values"]
+        assert cached["other_count"] == live["other_count"]
+
+
+def _synthetic_stats() -> dict:
+    return {
+        "s1": (
+            4,
+            {
+                "top_level": {"artifact": {"distinct": 1, "coverage": 4, "values": [["a", 4]]}},
+                "attributes": {
+                    "user": {
+                        "distinct": 2,
+                        "coverage": 4,
+                        "samples": ["x"],
+                        "values": [["x", 3], ["y", 1]],
+                    }
+                },
+                "attr_keys_truncated": False,
+            },
+        ),
+        "s2": (
+            3,
+            {
+                "top_level": {"artifact": {"distinct": 2, "coverage": 3, "values": [["b", 2], ["a", 1]]}},
+                "attributes": {
+                    "user": {
+                        "distinct": 1,
+                        "coverage": 3,
+                        "samples": ["y"],
+                        "values": [["y", 3]],
+                    }
+                },
+                "attr_keys_truncated": False,
+            },
+        ),
+    }
+
+
+def test_merged_field_terms_merge_math():
+    from tracesignal.db.field_stats import merged_field_terms
+
+    result = merged_field_terms(_synthetic_stats(), "attr:user", 50)
+    # y: 1+3=4, x: 3 — counts sum, rank (-count, value).
+    assert result["values"] == [{"value": "y", "count": 4}, {"value": "x", "count": 3}]
+    assert result["total"] == 7
+    assert result["distinct"] == 2  # max across sources
+    assert result["other_count"] == 0
+
+    # Tie broken by value ASC; limit cut produces an exact residual.
+    result = merged_field_terms(_synthetic_stats(), "artifact", 1)
+    assert result["values"] == [{"value": "a", "count": 5}]
+    assert result["total"] == 7
+    assert result["other_count"] == 2
+
+
+def test_merged_field_terms_fallbacks():
+    from tracesignal.db.field_stats import _TOP_VALUES_PER_FIELD, merged_field_terms
+
+    stats = _synthetic_stats()
+    # limit beyond the cached per-field top-N.
+    assert merged_field_terms(stats, "attr:user", _TOP_VALUES_PER_FIELD + 1) is None
+    # Unknown top-level column (not in the candidate list).
+    assert merged_field_terms(stats, "message", 50) is None
+    # A covering source without a values list (oversized values / old payload).
+    del stats["s2"][1]["attributes"]["user"]["values"]
+    assert merged_field_terms(stats, "attr:user", 50) is None
+    # Key absent from a source whose key list was truncated.
+    stats2 = _synthetic_stats()
+    del stats2["s2"][1]["attributes"]["user"]
+    stats2["s2"][1]["attr_keys_truncated"] = True
+    assert merged_field_terms(stats2, "attr:user", 50) is None
+    # Key absent without truncation = zero coverage there — safe to merge.
+    stats3 = _synthetic_stats()
+    del stats3["s2"][1]["attributes"]["user"]
+    result = merged_field_terms(stats3, "attr:user", 50)
+    assert result["total"] == 4
+    assert result["values"][0] == {"value": "x", "count": 3}
+    # Zero coverage everywhere: empty result, not a fallback.
+    empty = merged_field_terms(_synthetic_stats(), "attr:missing", 50)
+    assert empty == {
+        "field": "attr:missing",
+        "total": 0,
+        "distinct": 0,
+        "values": [],
+        "other_count": 0,
+    }
+
+
+def test_oversized_value_drops_values_list(ch_store):
+    src = f"fs-src-big-{uuid.uuid4().hex[:6]}"
+    big = "B" * 300
+    ch_store.insert_events(
+        [_event(src, 1, {"blob": big, "ok": "small"}), _event(src, 2, {"blob": "tiny"})]
+    )
+    try:
+        _, payload = compute_source_field_stats(ch_store, CASE_ID, src)
+        assert "values" not in payload["attributes"]["blob"]
+        assert payload["attributes"]["ok"]["values"] == [["small", 1]]
+    finally:
+        ch_store.delete_source_events(CASE_ID, src)

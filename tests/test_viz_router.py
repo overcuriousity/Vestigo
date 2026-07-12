@@ -337,3 +337,80 @@ async def test_field_scatter_same_field_is_422(monkeypatch):
             **_FILTER_KWARGS,
         )
     assert exc.value.status_code == 422
+
+
+# ── GET .../viz/field-terms cache branch (M24a) ─────────────────────────────
+
+
+class _FakeTermsService:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def field_terms(self, query, field, limit):
+        self.calls.append((query, field, limit))
+        return {"kind": "live"}
+
+
+def _patch_terms(monkeypatch, cached_result) -> _FakeTermsService:
+    svc = _FakeTermsService()
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
+    monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
+
+    async def fake_ensure(store, clickhouse, case_id, source_ids):
+        return {}
+
+    monkeypatch.setattr(viz, "ensure_source_field_stats", fake_ensure)
+    monkeypatch.setattr(viz, "merged_field_terms", lambda stats, field, limit: cached_result)
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_field_terms_unfiltered_served_from_cache(monkeypatch):
+    cached = {"field": "artifact", "total": 5, "distinct": 2, "values": [], "other_count": 0}
+    svc = _patch_terms(monkeypatch, cached)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {**cached, "cached": True}
+    assert svc.calls == []  # no ClickHouse scan
+
+
+@pytest.mark.asyncio
+async def test_field_terms_cache_gap_falls_back_live(monkeypatch):
+    svc = _patch_terms(monkeypatch, None)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_field_terms_any_filter_forces_live_path(monkeypatch):
+    cached = {"field": "artifact", "total": 5, "distinct": 2, "values": [], "other_count": 0}
+    svc = _patch_terms(monkeypatch, cached)
+    kwargs = {**_FILTER_KWARGS, "q": "dos"}
+    result = await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, case=None, **kwargs
+    )
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_field_terms_mapped_token_forces_live_path(monkeypatch):
+    cached = {"field": "proto_c", "total": 5, "distinct": 2, "values": [], "other_count": 0}
+    svc = _patch_terms(monkeypatch, cached)
+
+    async def scope_with_mappings(case_id, timeline_id):
+        return ["s1"], {"proto_c": ["proto", "protocol"]}, None
+
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", scope_with_mappings)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="proto_c", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1

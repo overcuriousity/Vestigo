@@ -38,7 +38,11 @@ from tracesignal.api.routers.events import (
     _validate_field_regexes,
     _validate_regex,
 )
-from tracesignal.db.field_stats import ensure_source_field_stats, merged_inventory
+from tracesignal.db.field_stats import (
+    ensure_source_field_stats,
+    merged_field_terms,
+    merged_inventory,
+)
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery
 
@@ -146,6 +150,37 @@ _ANNOTATION_TAG_VALUE = Query(default=None)
 _RUN_ID = Query(default=None)
 
 
+def _is_unfiltered(query: EventQuery) -> bool:
+    """True when *query* restricts nothing beyond the timeline's own scope.
+
+    The cache-eligibility check for M24a: an unfiltered first-load
+    aggregation depends only on (timeline sources, field), which the
+    per-source ``field_stats`` cache can answer without a ClickHouse scan.
+    ``source_ids`` (timeline scope) is deliberately not a filter here — the
+    cached merge runs over exactly those sources.
+    """
+    return (
+        not any(
+            [
+                query.q,
+                query.artifact,
+                query.artifacts,
+                query.source_id,
+                query.tag,
+                query.exclude_tag,
+                query.start,
+                query.end,
+                query.field_filters,
+                query.field_exclusions,
+                query.tags_include,
+                query.tags_exclude,
+            ]
+        )
+        and query.event_ids is None
+        and query.exclude_event_ids is None
+    )
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-terms")
 async def get_field_terms(
     case_id: str,
@@ -201,6 +236,18 @@ async def get_field_terms(
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
     )
+    # M24a: an unfiltered first load is answerable from the per-source
+    # field_stats cache — no ClickHouse scan, no HEAVY_SCAN_GATE slot. A
+    # canonical mapped field must stay live (coalesce over several raw keys
+    # dedupes per event; not derivable from per-key caches), and any filter
+    # or a cache gap falls through to the live path below.
+    if _is_unfiltered(query) and not (query.field_mappings and field in query.field_mappings):
+        stats = await ensure_source_field_stats(
+            get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
+        )
+        cached = merged_field_terms(stats, field, limit)
+        if cached is not None:
+            return {**cached, "cached": True}
     service = _get_query_service()
     return await _run_regex_guarded(
         _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),

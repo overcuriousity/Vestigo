@@ -17,6 +17,13 @@ Merge semantics across sources:
 * Canonical ``field_mappings`` aggregates are NOT derivable from per-source
   caches (an event carrying several raw keys must be deduped exactly), so
   that small query stays live — see the callers in ``api/routers/events.py``.
+* Per-field top values (``values``, M24a) merge by **summing counts across
+  per-source top-N lists** — a documented approximation in the same
+  acceptance class as the ``distinct`` max-merge: a value that ranks just
+  below every source's per-source cutoff is under-counted (or missed)
+  relative to a global scan. Single-source timelines are exact. Per-value
+  counts that do survive are exact sums, and ``other_count`` is computed as
+  the exact residual against the summed coverage.
 
 Read paths are self-healing: a cache miss (pre-existing database, missed
 trigger, ``STATS_VERSION`` bump) computes and stores the stats on the spot —
@@ -29,6 +36,8 @@ import asyncio
 import zlib
 from typing import TYPE_CHECKING, Any
 
+from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+
 # Top-level categorical columns tracked in the payload — single-sourced from
 # the anomaly recommender, whose inventory this cache replaces.
 from tracesignal.db.anomaly_stats import _NOVELTY_CANDIDATE_TOP_LEVEL
@@ -40,7 +49,7 @@ if TYPE_CHECKING:
 
 # Bump whenever the payload shape below changes — mismatched rows are treated
 # as cache misses and recomputed, so no migration is ever needed.
-STATS_VERSION = 1
+STATS_VERSION = 2
 
 
 def _effective_stats_version() -> int:
@@ -71,19 +80,65 @@ _MAX_ATTR_KEYS_PER_SOURCE = 5000
 # timeline wizard).
 _SAMPLES_PER_FIELD = 3
 
+# Top values (value → count) retained per field (M24a) — matches the
+# field-terms endpoint's default limit so an unfiltered first chart load can
+# be served entirely from this cache.
+_TOP_VALUES_PER_FIELD = 50
+
+# Attribute keys (top by coverage) that get a top-values list. Deliberately
+# far above the viz field picker's 50-key cap but far below
+# _MAX_ATTR_KEYS_PER_SOURCE, bounding the payload growth.
+_VALUES_KEYS_PER_SOURCE = 200
+
+# A field whose top-N contains any value longer than this gets NO values
+# list at all (live fallback): cached values must be servable verbatim —
+# truncation would fabricate values that don't exist in the data.
+_MAX_VALUE_LEN = 256
+
+
+def _attach_top_values(entries: dict[str, dict[str, Any]], rows: list[Any]) -> None:
+    """Group ``(key, value, count)`` rows into per-field ``values`` lists.
+
+    A field whose top-N contains any value longer than ``_MAX_VALUE_LEN``
+    gets no ``values`` entry at all — cached values are served verbatim, so
+    truncating would fabricate values that don't exist in the data.
+    """
+    per_field: dict[str, list[list[Any]]] = {}
+    oversized: set[str] = set()
+    for key, val, cnt in rows:
+        if len(val) > _MAX_VALUE_LEN:
+            oversized.add(key)
+        per_field.setdefault(key, []).append([val, int(cnt)])
+    for key, values in per_field.items():
+        if key in oversized or key not in entries:
+            continue
+        entries[key]["values"] = values
+
 
 def compute_source_field_stats(
     clickhouse: ClickHouseStore, case_id: str, source_id: str
 ) -> tuple[int, dict[str, Any]]:
-    """Compute one source's field stats with two aggregation queries.
+    """Compute one source's field stats with four aggregation queries.
 
     Returns ``(events_total, payload)`` where payload is::
 
         {
-          "top_level": {"artifact": {"distinct": 3, "coverage": 9000}, ...},
+          "top_level": {"artifact": {"distinct": 3, "coverage": 9000,
+                                     "values": [["log:nginx", 9000], ...]}, ...},
           "attributes": {"src_ip": {"distinct": 41, "coverage": 8000,
-                                     "samples": ["10.0.0.5", ...]}, ...},
+                                    "samples": ["10.0.0.5", ...],
+                                    "values": [["10.0.0.5", 4000], ...]}, ...},
+          "attr_keys_truncated": false,
         }
+
+    ``values`` (M24a) holds the top ``_TOP_VALUES_PER_FIELD`` values by count
+    — present for every top-level column and for the top
+    ``_VALUES_KEYS_PER_SOURCE`` attribute keys by coverage; absent for
+    truncated keys and for fields with oversized values (see
+    ``_attach_top_values``). ``attr_keys_truncated`` distinguishes "key
+    absent ⇒ zero coverage in this source" (safe to merge) from "key possibly
+    dropped by the ``_MAX_ATTR_KEYS_PER_SOURCE`` cap" (the read side must
+    fall back to a live scan).
 
     Synchronous (blocking ClickHouse client) — run in a worker thread from
     async contexts.
@@ -97,7 +152,7 @@ def compute_source_field_stats(
         f"SELECT count() FROM {db}.events WHERE {where}", parameters=params
     )
     total = int(total_res.result_rows[0][0]) if total_res.result_rows else 0
-    payload: dict[str, Any] = {"top_level": {}, "attributes": {}}
+    payload: dict[str, Any] = {"top_level": {}, "attributes": {}, "attr_keys_truncated": False}
     if total == 0:
         return 0, payload
 
@@ -106,7 +161,8 @@ def compute_source_field_stats(
         for col in _NOVELTY_CANDIDATE_TOP_LEVEL
     ]
     top_res = clickhouse.client.query(
-        f"SELECT {', '.join(agg_parts)} FROM {db}.events WHERE {where}", parameters=params
+        f"SELECT {', '.join(agg_parts)} FROM {db}.events WHERE {where} {HEAVY_SCAN_SETTINGS}",
+        parameters=params,
     )
     if top_res.result_rows:
         row = top_res.result_rows[0]
@@ -129,6 +185,7 @@ def compute_source_field_stats(
         GROUP BY k
         ORDER BY cov DESC
         LIMIT {{max_keys:UInt32}}
+        {HEAVY_SCAN_SETTINGS}
         """,
         parameters={**params, "max_keys": _MAX_ATTR_KEYS_PER_SOURCE},
     )
@@ -138,6 +195,46 @@ def compute_source_field_stats(
             "coverage": int(cov),
             "samples": list(samples),
         }
+    payload["attr_keys_truncated"] = len(payload["attributes"]) >= _MAX_ATTR_KEYS_PER_SOURCE
+
+    # Top values per top-level column, one scan via tuple unpivot. Ordering
+    # `count DESC, value ASC` matches _field_terms_impl exactly so a cached
+    # merge reproduces the live ranking.
+    unpivot = ", ".join(f"('{col}', {col})" for col in _NOVELTY_CANDIDATE_TOP_LEVEL)
+    top_values_res = clickhouse.client.query(
+        f"""
+        SELECT t.1 AS k, t.2 AS v, count() AS c
+        FROM {db}.events
+        ARRAY JOIN [{unpivot}] AS t
+        WHERE {where} AND t.2 != ''
+        GROUP BY k, v
+        ORDER BY k, c DESC, v ASC
+        LIMIT {{n_vals:UInt32}} BY k
+        {HEAVY_SCAN_SETTINGS}
+        """,
+        parameters={**params, "n_vals": _TOP_VALUES_PER_FIELD},
+    )
+    _attach_top_values(payload["top_level"], top_values_res.result_rows)
+
+    # Top values for the highest-coverage attribute keys, memory-safe
+    # LIMIT n BY key pattern (see anomaly_stats._batched_attr_novelty_rows).
+    value_keys = sorted(payload["attributes"], key=lambda k: -payload["attributes"][k]["coverage"])
+    value_keys = value_keys[:_VALUES_KEYS_PER_SOURCE]
+    if value_keys:
+        attr_values_res = clickhouse.client.query(
+            f"""
+            SELECT k, v, count() AS c
+            FROM {db}.events
+            ARRAY JOIN mapKeys(attributes) AS k, mapValues(attributes) AS v
+            WHERE {where} AND has({{vkeys:Array(String)}}, k) AND v != ''
+            GROUP BY k, v
+            ORDER BY k, c DESC, v ASC
+            LIMIT {{n_vals:UInt32}} BY k
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters={**params, "vkeys": value_keys, "n_vals": _TOP_VALUES_PER_FIELD},
+        )
+        _attach_top_values(payload["attributes"], attr_values_res.result_rows)
     return total, payload
 
 
@@ -254,6 +351,67 @@ def merged_inventory(
     ranked = sorted(merged_attrs.items(), key=lambda kv: -kv[1][1])[:max_attr_keys]
     inventory.extend((f"attr:{key}", dist, cov) for key, (dist, cov) in ranked)
     return inventory, total
+
+
+def merged_field_terms(
+    stats: dict[str, tuple[int, dict[str, Any]]],
+    field_token: str,
+    limit: int = 50,
+) -> dict[str, Any] | None:
+    """Cached equivalent of ``EventQueryService.field_terms`` for unfiltered queries.
+
+    Returns the exact ``field_terms`` response shape, or ``None`` when the
+    cache cannot answer honestly and the caller must fall back to a live
+    scan: *limit* exceeds the cached per-field top-N, any covering source
+    lacks a ``values`` list (oversized values, pre-M24a payload), or the
+    token is an attribute key absent from a source whose key list was
+    truncated. ``total``/per-value counts are exact sums; ``distinct`` is
+    max-across-sources and the top-N merge is approximate (module docstring).
+    """
+    if limit > _TOP_VALUES_PER_FIELD:
+        return None
+    is_attr = field_token.startswith("attr:")
+    key = field_token.removeprefix("attr:")
+    if not is_attr and key not in _NOVELTY_CANDIDATE_TOP_LEVEL:
+        return None
+
+    total_cov = 0
+    distinct = 0
+    counts: dict[str, int] = {}
+    for _, payload in stats.values():
+        if is_attr:
+            entry = payload.get("attributes", {}).get(key)
+            if entry is None:
+                if payload.get("attr_keys_truncated"):
+                    return None
+                continue
+        else:
+            entry = payload.get("top_level", {}).get(key)
+            if entry is None:
+                continue
+        cov = int(entry.get("coverage", 0))
+        if cov <= 0:
+            continue
+        values = entry.get("values")
+        if values is None:
+            return None
+        total_cov += cov
+        distinct = max(distinct, int(entry.get("distinct", 0)))
+        for val, cnt in values:
+            counts[val] = counts.get(val, 0) + int(cnt)
+
+    if total_cov == 0:
+        return {"field": field_token, "total": 0, "distinct": 0, "values": [], "other_count": 0}
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    top = [{"value": val, "count": cnt} for val, cnt in ranked]
+    other = total_cov - sum(cnt for _, cnt in ranked)
+    return {
+        "field": field_token,
+        "total": total_cov,
+        "distinct": distinct,
+        "values": top,
+        "other_count": max(0, other),
+    }
 
 
 def merged_field_coverage(stats: dict[str, tuple[int, dict[str, Any]]]) -> dict[str, Any]:
