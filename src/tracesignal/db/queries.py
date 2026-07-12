@@ -1850,6 +1850,19 @@ class EventQueryService:
             return None, None
         return min(mins), max(maxs)
 
+    def _baseline_cached(self, token: tuple | None, key: tuple, compute: Callable[[], Any]) -> Any:
+        """Run *compute* through the baseline-layer cache when a token is set.
+
+        The single token/no-token branch shared by every baseline-layer wrap
+        in the ``compare_*`` methods (M24c): ``token is None`` — custom mode,
+        no freshness fingerprint, or a non-compare caller — means always
+        compute live; otherwise memoize under *key* (which must already
+        include the token).
+        """
+        if token is None:
+            return compute()
+        return baseline_cache().get_or_compute(key, compute)
+
     def _layer_timestamp_range(self, query: EventQuery) -> tuple[datetime | None, datetime | None]:
         """One layer's (min, max) data range — explicit window short-circuits.
 
@@ -1913,7 +1926,8 @@ class EventQueryService:
         self.store.init_schema()
         window = (primary.start, primary.end)
         if baseline_cache_token is not None:
-            min_ts, max_ts = baseline_cache().get_or_compute(
+            min_ts, max_ts = self._baseline_cached(
+                baseline_cache_token,
                 ("time_range", baseline_cache_token, window),
                 lambda: self._layer_timestamp_range(comparison),
             )
@@ -1931,16 +1945,13 @@ class EventQueryService:
             }
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        if baseline_cache_token is not None:
-            comparison_fn = lambda: baseline_cache().get_or_compute(  # noqa: E731
-                ("time_buckets", baseline_cache_token, window, interval),
-                lambda: self._bucketed_counts(comparison, interval),
-            )
-        else:
-            comparison_fn = lambda: self._bucketed_counts(comparison, interval)  # noqa: E731
         primary_counts, comparison_counts = self._run_parallel(
             lambda: self._bucketed_counts(primary, interval),
-            comparison_fn,
+            lambda: self._baseline_cached(
+                baseline_cache_token,
+                ("time_buckets", baseline_cache_token, window, interval),
+                lambda: self._bucketed_counts(comparison, interval),
+            ),
         )
         starts = aligned_bucket_starts(min_ts, max_ts, interval)
         bucket_list = [
@@ -2019,22 +2030,12 @@ class EventQueryService:
         comparison_by_value: dict[str, int] = {}
         comparison_total = 0
         if top_values:
-            if baseline_cache_token is not None:
-                window = (primary.start, primary.end)
-                comparison_by_value, comparison_total = baseline_cache().get_or_compute(
-                    (
-                        "terms_counts",
-                        baseline_cache_token,
-                        window,
-                        field_token,
-                        tuple(top_values),
-                    ),
-                    lambda: self._terms_counts_for_values(comparison, field_token, top_values),
-                )
-            else:
-                comparison_by_value, comparison_total = self._terms_counts_for_values(
-                    comparison, field_token, top_values
-                )
+            window = (primary.start, primary.end)
+            comparison_by_value, comparison_total = self._baseline_cached(
+                baseline_cache_token,
+                ("terms_counts", baseline_cache_token, window, field_token, tuple(top_values)),
+                lambda: self._terms_counts_for_values(comparison, field_token, top_values),
+            )
 
         values = [
             {
@@ -2123,18 +2124,13 @@ class EventQueryService:
         """
         self.store.init_schema()
         window = (primary.start, primary.end)
-        if baseline_cache_token is not None:
-            comparison_stats_fn = lambda: baseline_cache().get_or_compute(  # noqa: E731
-                ("num_stats", baseline_cache_token, window, field_token),
-                lambda: self._numeric_layer_stats(comparison, field_token),
-            )
-        else:
-            comparison_stats_fn = lambda: self._numeric_layer_stats(  # noqa: E731
-                comparison, field_token
-            )
         (p_count, p_mn, p_mx), (c_count, c_mn, c_mx) = self._run_parallel(
             lambda: self._numeric_layer_stats(primary, field_token),
-            comparison_stats_fn,
+            lambda: self._baseline_cached(
+                baseline_cache_token,
+                ("num_stats", baseline_cache_token, window, field_token),
+                lambda: self._numeric_layer_stats(comparison, field_token),
+            ),
         )
 
         mins = [m for m in (p_mn, c_mn) if m is not None]
@@ -2158,22 +2154,11 @@ class EventQueryService:
         def comparison_bins_fn() -> dict[int, int]:
             if not c_count:
                 return {}
-            if baseline_cache_token is not None:
-                return baseline_cache().get_or_compute(
-                    (
-                        "num_bins",
-                        baseline_cache_token,
-                        window,
-                        field_token,
-                        bin_count,
-                        mn,
-                        bin_width,
-                    ),
-                    lambda: self._numeric_bin_counts(
-                        comparison, field_token, mn, bin_width, bin_count
-                    ),
-                )
-            return self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
+            return self._baseline_cached(
+                baseline_cache_token,
+                ("num_bins", baseline_cache_token, window, field_token, bin_count, mn, bin_width),
+                lambda: self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count),
+            )
 
         primary_bins, comparison_bins = self._run_parallel(
             lambda: (
