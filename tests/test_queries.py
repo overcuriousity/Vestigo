@@ -1573,14 +1573,12 @@ def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2, 3, 2], ["b", 1, 3, 2]])),
             (
-                "toStartOfInterval",
+                "groupArrayIf",
                 FakeQueryResult(
                     result_rows=[
-                        [bucket1, "a", 2],
-                        [bucket1, "b", 1],
-                        [bucket2, "a", 1],
+                        ["a", 3, [(bucket1, 2), (bucket2, 1)]],
+                        ["b", 1, [(bucket1, 1)]],
                     ]
                 ),
             ),
@@ -1608,13 +1606,12 @@ def test_field_value_timeseries_zero_fills_buckets_with_no_top_value_events() ->
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2, 2, 1]])),
             (
-                "toStartOfInterval",
+                "groupArrayIf",
                 # Only bucket1 and bucket4 have rows — bucket2 (06:00) and
                 # bucket3 (12:00) had zero matching events entirely and are
-                # absent from the GROUP BY result.
-                FakeQueryResult(result_rows=[[bucket1, "a", 1], [bucket4, "a", 1]]),
+                # absent from the plotted buckets.
+                FakeQueryResult(result_rows=[["a", 2, [(bucket1, 1), (bucket4, 1)]]]),
             ),
         ]
     )
@@ -1953,8 +1950,7 @@ def test_viz_aggregations_carry_memory_settings() -> None:
         "field_value_timeseries": _viz_service(
             [
                 ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-                ("GROUP BY val", terms_row),
-                ("toStartOfInterval", FakeQueryResult(result_rows=[])),
+                ("groupArrayIf", FakeQueryResult(result_rows=[["a", 1, [(min_ts, 1)]]])),
             ]
         ),
     }
@@ -2055,8 +2051,7 @@ def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> Non
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 1, 1, 1]])),
-            ("toStartOfInterval", FakeQueryResult(result_rows=[])),
+            ("groupArrayIf", FakeQueryResult(result_rows=[["a", 1, [(min_ts, 1)]]])),
         ]
     )
     svc.field_value_timeseries(
@@ -2091,8 +2086,7 @@ def test_field_value_timeseries_honors_source_offsets() -> None:
     svc = _viz_service(
         [
             ("min(if(", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 1, 1, 1]])),
-            ("toStartOfInterval", FakeQueryResult(result_rows=[])),
+            ("groupArrayIf", FakeQueryResult(result_rows=[])),
         ]
     )
     svc.field_value_timeseries(

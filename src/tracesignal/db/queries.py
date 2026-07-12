@@ -1708,12 +1708,26 @@ class EventQueryService:
     ) -> dict[str, Any]:
         """Return per-value event counts bucketed over time for *field_token*.
 
-        Restricts to the top *series_limit* values by overall count (via
-        :py:meth:`field_terms`) so a high-cardinality field doesn't explode
-        into hundreds of series — the Visualization page surfaces
-        ``field_terms``' ``other_count``/``distinct`` alongside this so the
-        analyst knows series were capped. Powers the multi-series line chart
-        and the value×time heatmap.
+        Restricts to the top *series_limit* values by overall count so a
+        high-cardinality field doesn't explode into hundreds of series — the
+        Visualization page surfaces ``field_terms``' ``other_count``/
+        ``distinct`` alongside this so the analyst knows series were capped.
+        Powers the multi-series line chart and the value×time heatmap.
+
+        Top-value selection and per-bucket counting are fused into one scan
+        (M24b): the inner aggregate groups by (sentinel-flag, bucket, value),
+        the outer ranks values by their total count — sentinel rows included,
+        matching ``field_terms``' ranking exactly — while ``groupArrayIf``
+        keeps sentinel buckets out of the plotted series, matching the old
+        bucket scan's ``TS_NOT_SENTINEL_SQL`` predicate. No window functions:
+        those can't spill to disk (see ``_scan.py``), plain GROUP BY + ORDER
+        BY/LIMIT stay within ``HEAVY_SCAN_SETTINGS``' memory budget.
+
+        The timestamp-range scan (when no explicit window is set) stays a
+        separate query on purpose: the bucket grid must cover *all* filtered
+        rows — not just rows carrying a non-empty field value — and the
+        arbitrary ``_build_where`` filters rule out partition min/max
+        shortcuts.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
@@ -1748,9 +1762,34 @@ class EventQueryService:
         if min_ts is None or max_ts is None:
             return empty
 
-        terms = self._field_terms_impl(query, field_token, limit=series_limit)
-        top_values = [v["value"] for v in terms["values"]]
-        if not top_values:
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        col_expr = _field_column_expr(
+            field_token, parameters, "field_key", field_mappings=query.field_mappings
+        )
+
+        fused_result = self.store.client.query(
+            f"""
+            SELECT val,
+                   sum(c) AS total,
+                   groupArrayIf((bucket, c), ok) AS plot_buckets
+            FROM (
+                SELECT ({TS_NOT_SENTINEL_SQL}) AS ok,
+                       toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
+                       {col_expr} AS val,
+                       count() AS c
+                FROM {database}.events
+                WHERE {where} AND {col_expr} != ''
+                GROUP BY ok, bucket, val
+            )
+            GROUP BY val
+            ORDER BY total DESC, val ASC
+            LIMIT {int(series_limit)}
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        rows = fused_result.result_rows
+        if not rows:
             return {
                 **empty,
                 "interval_seconds": 0,
@@ -1758,33 +1797,15 @@ class EventQueryService:
                 "max": max_ts.isoformat(),
             }
 
-        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
-        )
-        parameters["series_values"] = top_values
-
-        bucket_result = self.store.client.query(
-            f"""
-            SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
-                   {col_expr} AS val,
-                   count() AS c
-            FROM {database}.events
-            WHERE {where} AND {TS_NOT_SENTINEL_SQL}
-                AND has({{series_values:Array(String)}}, {col_expr})
-            GROUP BY bucket, val
-            ORDER BY bucket
-            {HEAVY_SCAN_SETTINGS}
-            """,
-            parameters=parameters,
-        )
-
-        # Pivot into one bucket-list per value, in the same top-N order as
-        # `terms`, filling buckets with zero rows so every series has an
-        # entry for every bucket the chart draws.
-        by_value: dict[str, dict[str, int]] = {v: {} for v in top_values}
-        for bucket_ts, val, count in bucket_result.result_rows:
-            by_value.setdefault(val, {})[ensure_utc_iso(bucket_ts)] = count
+        # Pivot into one bucket-list per value, in the same top-N order the
+        # ranking produced, filling buckets with zero rows so every series
+        # has an entry for every bucket the chart draws.
+        top_values = [row[0] for row in rows]
+        by_value: dict[str, dict[str, int]] = {}
+        for val, _total, plot_buckets in rows:
+            by_value[val] = {
+                ensure_utc_iso(bucket_ts): count for bucket_ts, count in plot_buckets
+            }
 
         # Derive bucket starts from [min_ts, max_ts] rather than from the
         # query result rows: a bucket where *none* of the top-N values had
