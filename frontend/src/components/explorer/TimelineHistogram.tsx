@@ -203,6 +203,41 @@ export function TimelineHistogram({
     [data, isFetching, onRangeSelect],
   );
 
+  // Cluster markers that land within ~0.5% of chart width of each other —
+  // closer than one flag's own footprint, so separate flags would only
+  // overplot into one indistinguishable dot (the feed publishes findings for
+  // all detectors at once, so hundreds of markers sharing buckets is normal).
+  // A cluster renders one flag carrying its count; clicking zooms to its
+  // earliest finding.
+  const markerClusters = useMemo(() => {
+    if (!markers || markers.length === 0 || !data || buckets.length === 0) return [];
+    const byPos = new Map<
+      number,
+      { pct: number; offscreen: boolean; ts: string; labels: string[]; count: number }
+    >();
+    for (const m of markers) {
+      const plotted = plotMarker(m.ts, buckets, data.interval_seconds);
+      if (!plotted) continue;
+      // 0.5%-of-width position bins; offscreen markers cluster separately.
+      const key = Math.round(plotted.pct * 2) * 2 + (plotted.offscreen ? 1 : 0);
+      const cluster = byPos.get(key);
+      if (cluster) {
+        cluster.count += 1;
+        if (cluster.labels.length < 5) cluster.labels.push(m.label);
+        if (m.ts < cluster.ts) cluster.ts = m.ts;
+      } else {
+        byPos.set(key, {
+          pct: plotted.pct,
+          offscreen: plotted.offscreen,
+          ts: m.ts,
+          labels: [m.label],
+          count: 1,
+        });
+      }
+    }
+    return [...byPos.values()];
+  }, [markers, buckets, data]);
+
   const handleMouseDown = useCallback(
     (idx: number) => {
       // Refuse to start a new brush against bars that may still be rendered
@@ -395,18 +430,21 @@ export function TimelineHistogram({
       </div>
 
       {/* Anomaly markers — a clickable flag in the top margin (never overlaps
-          the bars) plus a click-through guide line so bins stay clickable. */}
-      {markers && markers.length > 0 && (
+          the bars) plus a click-through guide line so bins stay clickable.
+          Co-located markers render as one flag with a count (see markerClusters). */}
+      {markerClusters.length > 0 && (
         <div className="pointer-events-none absolute inset-x-0 top-0 h-16 px-2">
           <div className="relative h-full w-full">
-            {markers.map((m, i) => {
-              const plotted = plotMarker(m.ts, buckets, data.interval_seconds);
-              if (!plotted) return null;
+            {markerClusters.map((c, i) => {
+              const summary =
+                c.count === 1
+                  ? c.labels[0]
+                  : `${c.count} findings: ${c.labels.join(", ")}${c.count > c.labels.length ? ", …" : ""}`;
               return (
                 <div
                   key={i}
                   className="absolute top-0 bottom-0"
-                  style={{ left: `${plotted.pct}%`, opacity: plotted.offscreen ? 0.4 : 1 }}
+                  style={{ left: `${c.pct}%`, opacity: c.offscreen ? 0.4 : 1 }}
                 >
                   {/* Guide line — pointer-events-none so it never blocks bin clicks */}
                   <div className="pointer-events-none absolute top-2 bottom-0 w-px -translate-x-1/2 bg-[var(--color-anomaly)]" />
@@ -414,22 +452,27 @@ export function TimelineHistogram({
                   <button
                     type="button"
                     title={
-                      plotted.offscreen
-                        ? `${m.label} (outside current view — click to jump)`
-                        : `${m.label} — click to zoom in`
+                      c.offscreen
+                        ? `${summary} (outside current view — click to jump)`
+                        : `${summary} — click to zoom in`
                     }
                     onClick={(e) => {
                       e.stopPropagation();
-                      jumpToMarker(m.ts);
+                      jumpToMarker(c.ts);
                     }}
                     disabled={isFetching}
                     className={cn(
-                      "absolute top-0 h-2 w-2 -translate-x-1/2 rounded-full border border-[var(--color-bg-surface)] bg-[var(--color-anomaly)] transition-transform",
+                      "absolute top-0 -translate-x-1/2 rounded-full border border-[var(--color-bg-surface)] bg-[var(--color-anomaly)] transition-transform",
+                      c.count > 1
+                        ? "flex h-3 min-w-3 items-center justify-center px-0.5 text-[8px] font-semibold leading-none text-[var(--color-bg-surface)]"
+                        : "h-2 w-2",
                       isFetching
                         ? "pointer-events-none opacity-50"
                         : "pointer-events-auto cursor-pointer hover:scale-125",
                     )}
-                  />
+                  >
+                    {c.count > 1 ? (c.count > 99 ? "99+" : c.count) : null}
+                  </button>
                 </div>
               );
             })}

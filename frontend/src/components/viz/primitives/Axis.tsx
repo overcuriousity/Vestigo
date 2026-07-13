@@ -30,7 +30,18 @@ export function AxisBottom({
   rotate?: boolean;
 }) {
   const maxByWidth = Math.max(2, Math.floor(innerWidth / MIN_TICK_SPACING));
-  const tickValues = scale.ticks(Math.min(ticks, maxByWidth));
+  const rawTicks: (number | Date)[] = scale.ticks(Math.min(ticks, maxByWidth));
+  // Numeric ticks with a rounding tickFormat can collapse into duplicate
+  // labels on a small domain (same failure as AxisLeft) — keep the last of
+  // each label run. Time ticks are left alone: their format granularity
+  // adapts to the span, so runs are intentional there (e.g. hour ticks
+  // within one labelled day).
+  const tickValues =
+    typeof rawTicks[0] === "number"
+      ? rawTicks.filter(
+          (v, i, all) => i === all.length - 1 || tickFormat(v) !== tickFormat(all[i + 1]),
+        )
+      : rawTicks;
   return (
     <g transform={`translate(0,${innerHeight})`}>
       <line x1={0} x2={scale.range()[1]} stroke="var(--viz-axis)" strokeWidth={1} />
@@ -127,7 +138,14 @@ export function AxisLeft({
   tickFormat?: (value: number) => string;
   showGrid?: boolean;
 }) {
-  const tickValues = scale.ticks(ticks);
+  // A small integer domain (e.g. counts 0–3) makes d3 emit fractional ticks
+  // that a rounding tickFormat collapses into duplicates ("0 1 1 2 2 3 3") —
+  // keep only the last tick of each label run (the one nearest the value the
+  // label claims, since d3 ticks ascend).
+  const fmt = tickFormat ?? String;
+  const tickValues = scale
+    .ticks(ticks)
+    .filter((v, i, all) => i === all.length - 1 || fmt(v) !== fmt(all[i + 1]));
   return (
     <g>
       <line

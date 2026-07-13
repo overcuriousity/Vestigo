@@ -13,19 +13,21 @@ import { useMemo, useState } from "react";
 import { Info } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
 import { DETECTORS, type DetectorId } from "./detector-registry";
-import { useCappedFindings, useDetectorSweep, useOpenEvent } from "./detector-hooks";
+import { SWEEP_LIMIT, useAnomalyMarkers, useCappedFindings, useDetectorSweep, useOpenEvent } from "./detector-hooks";
 import { FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar } from "./detector-shared";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
 import { useTriageCoverage } from "@/hooks/useTriageCoverage";
 import { cn } from "@/lib/cn";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
-import type { Event } from "@/api/types";
+import type { AnomalyMarker, Event } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
   onSelectEvent: (event: Event) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
+  /** Publish the feed's findings as histogram/grid markers (see useAnomalyMarkers). */
+  onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
 }
 
 function FeedRow({
@@ -83,7 +85,7 @@ function FeedRow({
   );
 }
 
-export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }: Props) {
+export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime, onAnomalyMarkers }: Props) {
   const sweep = useDetectorSweep(caseId, timelineId);
   const { summary } = useTriageCoverage(caseId, timelineId);
   const [activeChips, setActiveChips] = useState<Set<DetectorId>>(new Set());
@@ -92,22 +94,55 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }
     if (!sweep.data) return [];
     return DETECTORS.map((meta) => {
       const response = sweep.data![meta.id];
+      const items = (response?.results ?? []).map((f, rank) => normalizeFinding(meta, f, rank));
       return {
         meta,
         error: response === null,
-        items: (response?.results ?? []).map((f, rank) => normalizeFinding(meta, f, rank)),
+        items,
+        // Post-suppression finding count before the sweep's limit cap — what
+        // the chip badge shows; `items.length` is only the fetched slice.
+        total: response?.total_findings ?? items.length,
       };
     });
   }, [sweep.data]);
 
-  const feed = useMemo(() => {
-    const lists = perDetector
-      .filter((d) => activeChips.size === 0 || activeChips.has(d.meta.id))
-      .map((d) => d.items);
-    return interleaveByRank(lists);
-  }, [perDetector, activeChips]);
+  const chipFiltered = useMemo(
+    () => perDetector.filter((d) => activeChips.size === 0 || activeChips.has(d.meta.id)),
+    [perDetector, activeChips],
+  );
+
+  const feed = useMemo(
+    () => interleaveByRank(chipFiltered.map((d) => d.items)),
+    [chipFiltered],
+  );
+  const serverTotal = useMemo(
+    () => chipFiltered.reduce((sum, d) => sum + d.total, 0),
+    [chipFiltered],
+  );
 
   const cap = useCappedFindings(feed, 30);
+
+  // Default marker publisher: every fetched finding with a timestamp lands on
+  // the histogram/grid, across all detectors (chip filters intentionally do
+  // not narrow the overlay — they're a reading aid, not a scope change).
+  const allItems = useMemo(() => perDetector.flatMap((d) => d.items), [perDetector]);
+  useAnomalyMarkers(
+    allItems,
+    (item) =>
+      item.ts
+        ? {
+            ts: item.ts,
+            label: item.title,
+            detail: `${item.detectorLabel}: ${item.title} — ${item.subtitle}`,
+            eventId: item.eventId,
+            sourceId: item.sourceId,
+            detector: item.detector as AnomalyMarker["detector"],
+            rawDetails: item.raw.details,
+            windowEnd: item.raw.type === "frequency" ? item.raw.window_end : undefined,
+          }
+        : null,
+    onAnomalyMarkers,
+  );
 
   if (sweep.needsBaseline) return <NeedsBaselinePrompt />;
 
@@ -131,14 +166,14 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }
           </span>{" "}
           findings reviewed
           {summary.anyTruncated && (
-            <span> (coverage checked against the top 50 findings per detector)</span>
+            <span> (coverage checked against the top {SWEEP_LIMIT} findings per detector)</span>
           )}
         </p>
       )}
 
       {/* Detector chips — count per detector, toggling filters the feed. */}
       <div className="flex flex-wrap items-center gap-1">
-        {perDetector.map(({ meta, items, error }) => {
+        {perDetector.map(({ meta, total, error }) => {
           const active = activeChips.size === 0 || activeChips.has(meta.id);
           return (
             <button
@@ -162,10 +197,10 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }
                 <span
                   className={cn(
                     "font-mono",
-                    items.length > 0 ? "text-[var(--color-anomaly)]" : "text-[var(--color-fg-muted)]",
+                    total > 0 ? "text-[var(--color-anomaly)]" : "text-[var(--color-fg-muted)]",
                   )}
                 >
-                  {items.length}
+                  {total}
                 </span>
               )}
             </button>
@@ -195,6 +230,9 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }
             hasMore={cap.hasMore}
             expanded={cap.expanded}
             onToggle={cap.toggle}
+            // "N of M findings" when the sweep's per-detector limit truncated —
+            // the per-detector Advanced views can raise their own limits.
+            serverTotal={serverTotal}
           />
           {cap.shown.map((item, i) => (
             <FeedRow

@@ -368,6 +368,10 @@ export function FindingRowActions({
   const hasEvent = !!eventId && !!disposition?.sourceId;
   const canNormalOrDismiss = disposition !== undefined && (hasValueKey || hasEvent);
   const canConfirm = disposition !== undefined && hasEvent && disposition.detector !== "*";
+  // Buttons that can't act still render, disabled with the reason — a row
+  // where they'd silently vanish reads as a broken UI, not a scoping limit.
+  const noScopeReason =
+    "Unavailable: this finding has no field=value key and no representative event to scope a verdict to";
 
   const act = (kind: "normal" | "dismissed" | "confirmed") => {
     if (!disposition) return;
@@ -387,41 +391,68 @@ export function FindingRowActions({
 
   return (
     <>
-      {canNormalOrDismiss && disposition && (
+      {disposition && (
         <button
-          title={`Normal: treat ${scopeLabel} as expected behavior — extends the baseline, no longer flagged by ${disposition.detector}`}
-          className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)]"
+          title={
+            canNormalOrDismiss
+              ? `Normal: treat ${scopeLabel} as expected behavior — extends the baseline, no longer flagged by ${disposition.detector}`
+              : noScopeReason
+          }
+          className={cn(
+            "rounded p-0.5 text-[var(--color-fg-muted)]",
+            canNormalOrDismiss
+              ? "hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)]"
+              : "cursor-not-allowed opacity-40",
+          )}
           onClick={(e) => {
             e.stopPropagation();
-            act("normal");
+            if (canNormalOrDismiss) act("normal");
           }}
-          disabled={dispositionMut.isPending}
+          disabled={dispositionMut.isPending || !canNormalOrDismiss}
         >
           {dispositionMut.isPending ? <Spinner size={11} /> : <CircleCheck size={12} />}
         </button>
       )}
-      {canNormalOrDismiss && disposition && (
+      {disposition && (
         <button
-          title={`Dismiss: hide ${scopeLabel} as noise for this investigation — detectors keep scoring it`}
-          className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
+          title={
+            canNormalOrDismiss
+              ? `Dismiss: hide ${scopeLabel} as noise for this investigation — detectors keep scoring it`
+              : noScopeReason
+          }
+          className={cn(
+            "rounded p-0.5 text-[var(--color-fg-muted)]",
+            canNormalOrDismiss
+              ? "hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
+              : "cursor-not-allowed opacity-40",
+          )}
           onClick={(e) => {
             e.stopPropagation();
-            act("dismissed");
+            if (canNormalOrDismiss) act("dismissed");
           }}
-          disabled={dispositionMut.isPending}
+          disabled={dispositionMut.isPending || !canNormalOrDismiss}
         >
           <EyeOff size={12} />
         </button>
       )}
-      {canConfirm && disposition && (
+      {disposition && disposition.detector !== "*" && (
         <button
-          title="Confirm: escalate as a durable finding — survives detector re-runs"
-          className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-anomaly,var(--color-warning))]"
+          title={
+            canConfirm
+              ? "Confirm: escalate as a durable finding — survives detector re-runs"
+              : "Unavailable: no representative event to persist a confirmed finding against"
+          }
+          className={cn(
+            "rounded p-0.5 text-[var(--color-fg-muted)]",
+            canConfirm
+              ? "hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-anomaly,var(--color-warning))]"
+              : "cursor-not-allowed opacity-40",
+          )}
           onClick={(e) => {
             e.stopPropagation();
-            act("confirmed");
+            if (canConfirm) act("confirmed");
           }}
-          disabled={dispositionMut.isPending}
+          disabled={dispositionMut.isPending || !canConfirm}
         >
           <Pin size={12} />
         </button>

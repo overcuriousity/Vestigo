@@ -22,6 +22,11 @@ export interface PendingRange {
   end: string;
 }
 
+/** Which builder draft row the next histogram brush fills. Lives here (not in
+ * the builder component) so the builder drawer can get out of the way while a
+ * brush is awaited and survive being hidden without losing the armed row. */
+export type ArmedTarget = { kind: "baseline" } | { kind: "suspect"; index: number };
+
 interface BaselineState {
   /** Global scope all detectors run under. */
   frame: DetectorFrame;
@@ -35,6 +40,9 @@ interface BaselineState {
   /** A range brushed in mark mode, awaiting assignment to a window row. */
   pendingRange: PendingRange | null;
   setPendingRange: (range: PendingRange | null) => void;
+  /** The builder row the next brush fills; null = default (baseline row). */
+  armed: ArmedTarget | null;
+  setArmed: (armed: ArmedTarget | null) => void;
 }
 
 export const useBaselineStore = create<BaselineState>((set) => ({
@@ -45,7 +53,11 @@ export const useBaselineStore = create<BaselineState>((set) => ({
   // to self so a stale `baseline` frame never runs against no definition.
   setActiveBaselineId: (id) => set(id ? { activeBaselineId: id, frame: "baseline" } : { activeBaselineId: null, frame: "self" }),
   markMode: false,
-  setMarkMode: (markMode) => set({ markMode, pendingRange: markMode ? null : null }),
+  // Entering or leaving mark mode drops any half-finished brush state; leaving
+  // also disarms so a hidden builder drawer reappears (see BaselineBuilderDrawer).
+  setMarkMode: (markMode) => set({ markMode, pendingRange: null, ...(markMode ? {} : { armed: null }) }),
   pendingRange: null,
   setPendingRange: (range) => set({ pendingRange: range }),
+  armed: null,
+  setArmed: (armed) => set({ armed }),
 }));

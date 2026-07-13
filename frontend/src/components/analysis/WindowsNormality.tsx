@@ -21,7 +21,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { InfoHint } from "@/components/ui/InfoHint";
-import { useBaselineStore } from "@/stores/baseline";
+import { useBaselineStore, type ArmedTarget } from "@/stores/baseline";
 import type { BaselineDefinition, DispositionKind } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { GLOSSARY } from "@/lib/glossary";
@@ -44,8 +44,9 @@ interface Draft {
   suspects: SuspectDraft[];
 }
 
-/** Which draft row the next histogram brush fills. */
-type Armed = { kind: "baseline" } | { kind: "suspect"; index: number } | null;
+/** Which draft row the next histogram brush fills — see ArmedTarget in
+ * stores/baseline.ts; it lives in the store so the drawer can hide while a
+ * brush is awaited without this component unmounting and losing it. */
 
 const EMPTY_DRAFT: Draft = { name: "", baseline: { start: "", end: "" }, suspects: [] };
 
@@ -83,12 +84,11 @@ function draftFromDefinition(d: BaselineDefinition): Draft {
 
 export function BaselineSection({ caseId, timelineId }: Props) {
   const qc = useQueryClient();
-  const { activeBaselineId, setActiveBaselineId, markMode, setMarkMode, pendingRange, setPendingRange } =
+  const { activeBaselineId, setActiveBaselineId, markMode, setMarkMode, pendingRange, armed, setArmed } =
     useBaselineStore();
 
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [armed, setArmed] = useState<Armed>(null);
   // The definition builder is a big form; once the analyst has saved baselines
   // it collapses behind a "+ New definition" button so saved defs lead. It
   // stays open while there's nothing saved yet, or whenever a build is active.
@@ -101,17 +101,21 @@ export function BaselineSection({ caseId, timelineId }: Props) {
   const definitions = data?.baselines ?? [];
 
   // A histogram brush lands in `pendingRange`; drop it into the armed row.
+  // A brush with no armed row (mark mode toggled directly on the histogram)
+  // defaults to the baseline window — the most common thing to mark. Turning
+  // mark mode off (which also clears pendingRange/armed in the store) lets
+  // the builder drawer reappear with the filled row.
   useEffect(() => {
-    if (!pendingRange || !armed) return;
+    if (!pendingRange) return;
+    const target = armed ?? { kind: "baseline" as const };
     const win = { start: pendingRange.start, end: pendingRange.end };
     setDraft((d) => {
-      if (armed.kind === "baseline") return { ...d, baseline: win };
-      const suspects = d.suspects.map((s, i) => (i === armed.index ? { ...s, ...win } : s));
+      if (target.kind === "baseline") return { ...d, baseline: win };
+      const suspects = d.suspects.map((s, i) => (i === target.index ? { ...s, ...win } : s));
       return { ...d, suspects };
     });
-    setPendingRange(null);
-    setArmed(null);
-  }, [pendingRange, armed, setPendingRange]);
+    setMarkMode(false);
+  }, [pendingRange, armed, setMarkMode]);
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["baselines", caseId, timelineId] });
 
@@ -161,7 +165,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
     if (markMode) setMarkMode(false);
   }
 
-  function armRow(target: Armed) {
+  function armRow(target: ArmedTarget) {
     if (!markMode) setMarkMode(true);
     setArmed(target);
   }
@@ -194,11 +198,9 @@ export function BaselineSection({ caseId, timelineId }: Props) {
             </button>
           )}
         </div>
-        {markMode && (
-          <div className="rounded bg-[var(--color-accent-dim)] px-2 py-1 text-[11px] text-[var(--color-accent)]">
-            {armed ? "Drag on the histogram to fill the highlighted row." : "Marking on — arm a row (crosshair) then drag the histogram."}
-          </div>
-        )}
+        {/* No inline mark-mode hint here: while mark mode is on, the builder
+            drawer hides itself and the floating pill (BaselineBuilderDrawer)
+            carries the "drag on the histogram" guidance instead. */}
 
         {/* Baseline row */}
         <WindowRow

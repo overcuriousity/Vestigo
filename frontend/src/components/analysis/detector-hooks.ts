@@ -34,9 +34,13 @@ export function useBaselineRequest(): {
   return { params: {}, key: "self", needsBaseline: true };
 }
 
+/** Per-detector fetch cap for the sweep — also quoted in the feed's coverage
+ * copy and the accordion's coverage tooltips, so keep it a single constant. */
+export const SWEEP_LIMIT = 50;
+
 /**
  * The detector sweep: one auto-run scan per registered detector under the
- * active frame (limit 50, unpersisted). Formerly DetectorAccordion's private
+ * active frame (limit SWEEP_LIMIT, unpersisted). Formerly DetectorAccordion's private
  * count query — lifted here and widened to keep the full responses so the
  * unified findings feed and the accordion's count badges share ONE fetch.
  * A detector that errors maps to null (rendered as "err"). Query-key bumped
@@ -59,7 +63,7 @@ export function useDetectorSweep(caseId: string, timelineId: string) {
       const pairs = await Promise.all(
         DETECTORS.map((d) =>
           anomaliesApi
-            .list(caseId, timelineId, { detector: d.detector, limit: 50, persist: false, ...blParams })
+            .list(caseId, timelineId, { detector: d.detector, limit: SWEEP_LIMIT, persist: false, ...blParams })
             .then((r) => [d.id, r] as const)
             .catch(() => [d.id, null] as const),
         ),
@@ -190,10 +194,12 @@ export function useAnomalyMarkers<T>(
     return () => onFindingsChange([]);
     // `build` closes over per-render display data derived from the same
     // query result as `findings` (stable react-query reference) — keying the
-    // effect on `findings` alone matches the pre-extraction behavior and
-    // avoids a re-fire loop on every render.
+    // effect on `findings` (plus the handler, whose identity only changes
+    // when the caller hands marker ownership over, e.g. FindingsFeed while
+    // Advanced is open) matches the pre-extraction behavior and avoids a
+    // re-fire loop on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [findings]);
+  }, [findings, onFindingsChange]);
 }
 
 /** Mutation that fetches a finding's full event by id and surfaces it. */

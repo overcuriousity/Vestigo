@@ -64,8 +64,15 @@ export function DetectorAccordion(props: Props) {
           {DETECTORS.filter((d) => d.category === cat.id).map((d) => {
             const isOpen = open === d.id;
             const response = sweep.data?.[d.id];
+            // Post-suppression finding total before the sweep's limit cap —
+            // results.length is only the fetched slice (≤50) and reads as an
+            // arbitrary cutoff next to the coverage badge's real denominator.
             const count =
-              response === undefined ? undefined : response === null ? -1 : response.results.length;
+              response === undefined
+                ? undefined
+                : response === null
+                  ? -1
+                  : (response.total_findings ?? response.results.length);
             return (
               <div key={d.id} className="border-b border-[var(--color-border)] last:border-b-0">
                 <button

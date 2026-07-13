@@ -88,6 +88,7 @@ export function InvestigatePanel({
 
   const setFrame = useBaselineStore((s) => s.setFrame);
   const markMode = useBaselineStore((s) => s.markMode);
+  const pendingRange = useBaselineStore((s) => s.pendingRange);
   const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
 
   useEffect(() => {
@@ -95,15 +96,20 @@ export function InvestigatePanel({
   }, [similarAnchor]);
 
   // Marking on the histogram is only meaningful for building a baseline — pull
-  // the user to the baseline frame and open the builder drawer so the brushed
-  // range can land in the window editor.
+  // the user to the baseline frame. The builder drawer is deliberately NOT
+  // opened here: it would overlay the histogram and make the drag impossible.
   useEffect(() => {
     if (markMode) {
       setTab("anomalies");
       setFrame("baseline");
-      setBaselineBuilderOpen(true);
     }
-  }, [markMode, setFrame, setBaselineBuilderOpen]);
+  }, [markMode, setFrame]);
+
+  // A brushed range landed — now open the drawer so it shows up in the window
+  // editor (BaselineSection consumes pendingRange on mount).
+  useEffect(() => {
+    if (pendingRange) setBaselineBuilderOpen(true);
+  }, [pendingRange, setBaselineBuilderOpen]);
 
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
@@ -221,12 +227,16 @@ export function InvestigatePanel({
             {/* 1. Scope */}
             <FrameBar caseId={caseId} timelineId={timelineId} />
 
-            {/* 2. Unified findings feed */}
+            {/* 2. Unified findings feed. It publishes the histogram/grid
+                anomaly markers by default; while Advanced is open the expanded
+                detector view owns the markers instead (exactly one publisher,
+                so the two never fight over the shared marker state). */}
             <FindingsFeed
               caseId={caseId}
               timelineId={timelineId}
               onSelectEvent={onSelectEvent}
               onJumpToTime={onJumpToTime}
+              onAnomalyMarkers={advancedOpen ? undefined : onAnomalyMarkers}
             />
 
             {/* 3. Advanced: the per-detector accordion, collapsed by default */}

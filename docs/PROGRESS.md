@@ -1,7 +1,56 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-13 (session 56 — triage de-gamification, per-detector coverage,
-disposition burn-down).
+Last updated: 2026-07-13 (session 57 — Investigate-panel restructure bugfixes).
+
+## Session 57 — 2026-07-13: Investigate-panel restructure bugfixes
+
+Four regressions from the session-55 UI restructure, reported from real use:
+
+- **Histogram anomaly markers gone by default.** The old default view (per-detector
+  accordion) published markers via `useAnomalyMarkers`; the new default `FindingsFeed`
+  didn't. The feed now publishes every fetched finding (all detectors, chip filters don't
+  narrow the overlay) as markers; while the Advanced accordion is open the expanded
+  detector view owns the markers instead (`InvestigatePanel` hands the callback to exactly
+  one publisher, and `useAnomalyMarkers` now keys on the handler too so ownership
+  hand-over republishes/clears).
+- **Baseline mark-by-drag broken.** `BaselineBuilderDrawer` (fixed full-screen overlay)
+  opened the moment mark mode armed, covering the histogram. Now: arming no longer opens
+  the drawer; while mark mode is on an open drawer stays *mounted* (draft survives) but
+  hides + drops pointer events, replaced by a floating "drag on the histogram" pill with
+  cancel; the drawer opens/reappears when the brushed range lands. The armed-row target
+  moved into `useBaselineStore` so it survives the hidden drawer, a brush with no armed
+  row defaults to the baseline window, and consuming a brush turns mark mode off.
+- **Counts capped at 50 / inconsistent.** Feed chips and accordion badges showed
+  `results.length` (the sweep's limit-50 slice) next to coverage badges built from real
+  totals. Both now show `total_findings ?? results.length`, and the feed's results bar
+  shows "N of M findings" via its existing `serverTotal` truncation affordance.
+- **Mark-normal dead from the feed.** `useDisposition`'s optimistic removal only touched
+  `["anomalies", …]` caches; the feed reads the `["detector-sweep-v2", …]` cache, so a
+  verdict left the row visibly untouched. The mutation now also filters matching findings
+  out of every sweep cache entry (detector-scoped via the registry mapping), with
+  snapshot/rollback on error. Sweeps never fetch `include_dismissed`, so plain removal
+  matches a refetch.
+
+Follow-up sweep for the same defect classes:
+
+- **Histogram marker clustering** (`TimelineHistogram`): the feed now publishes up to
+  11×50 markers; co-located ones overplotted into one dot. Markers within ~0.5% of chart
+  width cluster into one flag carrying a count (99+ cap), tooltip lists up to 5 labels,
+  click zooms to the cluster's earliest finding.
+- **Disposition buttons no longer silently vanish** (`FindingRowActions`): findings with
+  no value key and no representative event used to render no Normal/Dismiss/Confirm at
+  all; they now render disabled with a tooltip stating the scoping reason.
+- **Duplicate axis ticks** (`Axis.tsx`): small integer domains make d3 emit fractional
+  ticks that rounding formats collapse into duplicate labels ("0 1 1 2 2 3 3", seen on
+  the triage burn-down). `AxisLeft` and numeric `AxisBottom` keep only the last tick of
+  each label run; time ticks untouched (their label runs are intentional).
+- `SWEEP_LIMIT` constant replaces the magic 50 in the sweep fetch + feed coverage copy;
+  removed WindowsNormality's now-unreachable inline mark-mode hint (the drawer hides
+  while mark mode is on; the floating pill carries the guidance).
+
+Left deliberately: `useDisposition`'s detector-at-key-index-3 convention (commented,
+holds for all 11 views) and sweep-total drift after verdicts until the next refetch
+(documented in the hook — invalidating 11 detector scans per verdict isn't worth it).
 
 ## Session 56 — 2026-07-13: triage de-gamification + honest progress surfaces
 
