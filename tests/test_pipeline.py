@@ -45,15 +45,18 @@ class FakeClickHouseStore:
         case_id: str,
         source_id: str,
         limit: int,
-        after_event_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+        after: Any = None,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        # The real store pages by a (timestamp, event_id) keyset; the cursor is
+        # opaque to iter_source_events, so the fake pages by event_id alone.
         events = sorted(
             (e.as_dict() for e in self.events if e.case_id == case_id and e.source_id == source_id),
             key=lambda e: e["event_id"],
         )
-        if after_event_id is not None:
-            events = [e for e in events if e["event_id"] > after_event_id]
-        return events[:limit]
+        if after is not None:
+            events = [e for e in events if e["event_id"] > after]
+        page = events[:limit]
+        return page, (page[-1]["event_id"] if page else None)
 
     # Reuse the real batching iterator on top of the fake list_events.
     iter_source_events = ClickHouseStore.iter_source_events

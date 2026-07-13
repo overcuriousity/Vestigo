@@ -803,12 +803,13 @@ def test_iter_source_events_batches_and_stops():
     class _FakeCH:
         iter_source_events = ClickHouseStore.iter_source_events
 
-        def list_events(self, case_id, source_id, limit, after_event_id=None):
-            calls.append(after_event_id)
+        def list_events(self, case_id, source_id, limit, after=None):
+            calls.append(after)
             data = [{"event_id": str(i)} for i in range(5)]  # 5 rows total
-            if after_event_id is not None:
-                data = [e for e in data if e["event_id"] > after_event_id]
-            return data[:limit]
+            if after is not None:
+                data = [e for e in data if e["event_id"] > after]
+            page = data[:limit]
+            return page, (page[-1]["event_id"] if page else None)
 
     batches = list(_FakeCH().iter_source_events("c1", "s1", batch_size=2))
     assert [len(b) for b in batches] == [2, 2, 1]
@@ -817,9 +818,9 @@ def test_iter_source_events_batches_and_stops():
     calls.clear()
 
     class _EmptyCH(_FakeCH):
-        def list_events(self, case_id, source_id, limit, after_event_id=None):
-            calls.append(after_event_id)
-            return []
+        def list_events(self, case_id, source_id, limit, after=None):
+            calls.append(after)
+            return [], None
 
     assert list(_EmptyCH().iter_source_events("c1", "s1", batch_size=2)) == []
     assert calls == [None]
@@ -1272,10 +1273,10 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
         def count_events(self, case_id, source_ids):
             return len(source_ids)
 
-        def list_events(self, case_id, source_id, limit, after_event_id=None):
-            if after_event_id is not None:
-                return []
-            return [{"event_id": "e1", "attributes": {"field": "match-me"}}]
+        def list_events(self, case_id, source_id, limit, after=None):
+            if after is not None:
+                return [], None
+            return [{"event_id": "e1", "attributes": {"field": "match-me"}}], "e1"
 
     job_store = JobStore()
     job = job_store.create(kind="enrich")
@@ -1366,10 +1367,12 @@ async def test_failed_run_records_provenance_only_for_fully_staged_sources(store
         def count_events(self, case_id, source_ids):
             return len(source_ids)
 
-        def list_events(self, case_id, source_id, limit, after_event_id=None):
-            if after_event_id is not None:
-                return []
-            return [{"event_id": f"e-{source_id}", "attributes": {"field": f"v-{source_id}"}}]
+        def list_events(self, case_id, source_id, limit, after=None):
+            if after is not None:
+                return [], None
+            return [
+                {"event_id": f"e-{source_id}", "attributes": {"field": f"v-{source_id}"}}
+            ], f"e-{source_id}"
 
     job_store = JobStore()
     job = job_store.create(kind="enrich")

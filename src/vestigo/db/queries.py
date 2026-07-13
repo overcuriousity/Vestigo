@@ -6,7 +6,7 @@ import functools
 import logging
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -1043,38 +1043,48 @@ class EventQueryService:
         """Yield every event matching *query*, paging through ClickHouse in batches.
 
         This is used for streaming export where the full result set should not
-        be materialised in memory.  The ``limit`` and ``offset`` fields of
-        *query* are ignored — all matching rows are yielded.
+        be materialised in memory.  The ``limit``, ``offset``, and cursor
+        fields of *query* are ignored — all matching rows are yielded.
+
+        Batches advance by keyset cursor, never OFFSET: each batch seeks past
+        the previous batch's last (effective-timestamp, event_id) key via the
+        same tuple predicate the Explorer's cursor mode uses (`_build_where`),
+        so every batch is an index-pruned top-N read. An OFFSET loop would
+        re-sort the full result and materialize offset+batch rows on every
+        batch — O(n²) row touches across an n-event export. The effective
+        (offset-corrected) timestamp is selected alongside the row columns so
+        the cursor round-trips the exact ordering key, including the
+        no-timestamp storage sentinel, without reparsing presented values.
         """
         self.store.init_schema()
 
-        where, parameters = self._build_where(query)
         database = self.store.database
         sort_dir = query.order.upper()
         eff = effective_ts_sql(query.source_offsets)
-        offset = 0
+        q = replace(query, after=None, before=None, offset=0)
 
         while True:
+            where, parameters = self._build_where(q)
             result = self.store.client.query(
                 f"""
-                SELECT {_EVENT_SELECT_COLUMNS}
+                SELECT {_EVENT_SELECT_COLUMNS}, {eff} AS _cursor_ts
                 FROM {database}.events
                 WHERE {where}
-                ORDER BY {eff} {sort_dir}, event_id
+                ORDER BY {eff} {sort_dir}, event_id {sort_dir}
                 LIMIT {batch_size}
-                OFFSET {offset}
                 """,
                 parameters=parameters,
             )
             columns = result.column_names
             rows = result.result_rows
             for row in rows:
-                yield _normalize_event_row(
-                    dict(zip(columns, row, strict=False)), query.source_offsets
-                )
+                event = dict(zip(columns, row, strict=False))
+                event.pop("_cursor_ts", None)
+                yield _normalize_event_row(event, query.source_offsets)
             if len(rows) < batch_size:
                 break
-            offset += batch_size
+            last = dict(zip(columns, rows[-1], strict=False))
+            q = replace(q, after=(last["_cursor_ts"], str(last["event_id"])))
 
     def query_event_refs(self, query: EventQuery, cap: int = 100_000) -> list[tuple[str, str]]:
         """Return (event_id, source_id) pairs for all events matching *query*.

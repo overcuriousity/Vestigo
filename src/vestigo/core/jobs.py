@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,7 +66,7 @@ class JobStore:
         self._max_terminal = max_terminal
         # Job IDs in completion order (dict insertion order is creation order,
         # which is not the same thing).
-        self._terminal_order: list[str] = []
+        self._terminal_order: deque[str] = deque()
         self._lock = threading.Lock()
 
     def create(
@@ -125,7 +126,7 @@ class JobStore:
     def _evict_locked(self) -> None:
         """Drop the oldest-finished jobs beyond the cap (caller holds the lock)."""
         while len(self._terminal_order) > self._max_terminal:
-            old_id = self._terminal_order.pop(0)
+            old_id = self._terminal_order.popleft()
             self._jobs.pop(old_id, None)
 
 

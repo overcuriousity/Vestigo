@@ -1058,8 +1058,13 @@ class _BatchedFakeClient:
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
 
     def _make_rows(self, n: int) -> list[list[Any]]:
+        # `_cursor_ts` (last column) must be a real datetime — iter_events
+        # feeds it back through the keyset cursor's DateTime64 formatting.
         return [
-            [f"evt-{self._select_call}-{i}"] + ["x"] * (len(self.columns) - 1) for i in range(n)
+            [f"evt-{self._select_call}-{i}"]
+            + ["x"] * (len(self.columns) - 2)
+            + [datetime(2024, 1, 1, 12, 0, self._select_call, i * 1000)]
+            for i in range(n)
         ]
 
     def query(
@@ -1103,6 +1108,7 @@ _EVENT_COLUMNS = [
     "attributes",
     "embedding_model",
     "embedding_config_hash",
+    "_cursor_ts",
 ]
 
 

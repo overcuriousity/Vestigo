@@ -209,11 +209,12 @@ def _group_related_fields(
     for t in usable:
         groups.setdefault(find(t), []).append(t)
     # Preserve input order within and across groups; keep only real groups.
+    token_order = {t: i for i, t in enumerate(tokens)}
     ordered = sorted(
         (g for g in groups.values() if len(g) >= 2),
-        key=lambda g: tokens.index(g[0]),
+        key=lambda g: token_order[g[0]],
     )
-    return [sorted(g, key=tokens.index) for g in ordered]
+    return [sorted(g, key=token_order.__getitem__) for g in ordered]
 
 
 def recommend_fields(

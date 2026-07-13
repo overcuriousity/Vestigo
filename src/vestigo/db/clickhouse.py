@@ -25,7 +25,7 @@ import logging
 import re
 import time
 from collections.abc import Iterator
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -34,7 +34,7 @@ import pyarrow as pa
 
 from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
-from vestigo.db._dt import is_null_ts_sentinel
+from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
 from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 from vestigo.models.event import Event
 
@@ -736,24 +736,40 @@ class ClickHouseStore:
         case_id: str,
         source_id: str,
         limit: int,
-        after_event_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return a batch of raw event rows for a source ordered by event_id.
+        after: tuple[datetime, str] | None = None,
+    ) -> tuple[list[dict[str, Any]], tuple[datetime, str] | None]:
+        """Return a batch of raw event rows for a source, plus the next keyset cursor.
 
-        This is used by the embedding pipeline to read events that were
-        previously ingested without vectors.
+        This is used by the embedding pipeline and enrichers to read events
+        source by source. Returns ``(rows, next_after)``; feed ``next_after``
+        back as ``after`` to fetch the following batch (``None`` when the
+        batch came back empty).
 
-        Pagination is keyset-based (``after_event_id`` cursor) rather than
-        OFFSET: the table sort key is (case_id, source_id, timestamp, event_id),
-        so an ORDER BY event_id OFFSET query would re-sort the whole source and
-        materialize offset+limit full-width rows per batch — memory grows with
-        the offset and can OOM the server on large sources.
+        Pagination is keyset-based on ``(timestamp, event_id)`` — the tail of
+        the table sort key (case_id, source_id, timestamp, event_id) — rather
+        than OFFSET or a bare event_id cursor. OFFSET re-sorts the whole
+        source and materializes offset+limit rows per batch (memory grows
+        with the offset and can OOM the server); an ``ORDER BY event_id``
+        cursor is sort-key-misaligned, so every batch re-sorted the entire
+        partition and the predicate pruned nothing — O(n²·log n) total scan
+        work across a source. Aligned with the sort key, each batch is a
+        read-in-order top-N; the redundant scalar ``timestamp >=`` bound is
+        what lets the primary index prune granules (tuple comparisons don't —
+        same trick as queries.py::_WhereBuilder.add_cursor). The cursor is
+        built from the *raw* stored timestamp (including the no-timestamp
+        year-2299 sentinel), captured before datetime normalization rewrites
+        the presented value.
         """
         after_clause = ""
-        parameters = {"case_id": case_id, "source_id": source_id}
-        if after_event_id is not None:
-            after_clause = "AND event_id > {after_event_id:String}"
-            parameters["after_event_id"] = after_event_id
+        parameters: dict[str, Any] = {"case_id": case_id, "source_id": source_id}
+        if after is not None:
+            after_ts, after_id = after
+            after_clause = (
+                "AND (timestamp, event_id) > ({after_ts:DateTime64(3)}, {after_id:UUID}) "
+                "AND timestamp >= {after_ts:DateTime64(3)}"
+            )
+            parameters["after_ts"] = to_clickhouse_utc(after_ts, precise=True)
+            parameters["after_id"] = after_id
         result = self.client.query(
             f"""
             SELECT
@@ -781,16 +797,19 @@ class ClickHouseStore:
             FROM {self.database}.events
             WHERE case_id = {{case_id:String}} AND source_id = {{source_id:String}}
             {after_clause}
-            ORDER BY event_id
+            ORDER BY timestamp, event_id
             LIMIT {limit}
             """,
             parameters=parameters,
         )
         columns = result.column_names
-        return [
-            _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
-            for row in result.result_rows
-        ]
+        rows = [dict(zip(columns, row, strict=False)) for row in result.result_rows]
+        next_after: tuple[datetime, str] | None = None
+        if rows:
+            next_after = (rows[-1]["timestamp"], str(rows[-1]["event_id"]))
+        for row in rows:
+            _normalize_event_datetimes(row)
+        return rows, next_after
 
     def iter_source_events(
         self,
@@ -804,22 +823,22 @@ class ClickHouseStore:
         enrichers). Stops on an empty batch; a short batch also ends the
         iteration (the table can't grow mid-job — sources are ingest-once).
         Each ``next()`` issues one blocking query, so async callers should
-        drive the iterator from a worker thread.
+        drive the iterator from a worker thread. The keyset cursor returned
+        by ``list_events`` is threaded through opaquely.
         """
-        after_event_id: str | None = None
+        after: tuple[datetime, str] | None = None
         while True:
-            batch = self.list_events(
+            batch, after = self.list_events(
                 case_id=case_id,
                 source_id=source_id,
                 limit=batch_size,
-                after_event_id=after_event_id,
+                after=after,
             )
             if not batch:
                 return
             yield batch
             if len(batch) < batch_size:
                 return
-            after_event_id = batch[-1]["event_id"]
 
     def get_events_by_ids(
         self,

@@ -2548,25 +2548,66 @@ class PostgresStore:
         on any item rolls back the whole batch instead of half-applying it.
         Each *items* dict takes the same keyword arguments as
         :meth:`create_disposition`; duplicates (against existing rows or
-        earlier items in the same batch, via flush) return the existing row.
+        earlier items in the same batch) return the existing row.
+
+        Dedupe runs against one prefetched in-memory index keyed by the full
+        scope tuple instead of a per-item SELECT + flush (3n round-trips for
+        an n-item batch — routine collapses can batch large); the per-row
+        refresh was dropped too, since ``expire_on_commit=False`` keeps
+        attributes live and ``created_at`` has a Python-side default.
         """
+        if not items:
+            return []
+
+        def _scope_key(
+            timeline_id: Any,
+            kind: Any,
+            detector: Any,
+            field: Any,
+            value: Any,
+            source_id: Any,
+            event_id: Any,
+        ) -> tuple:
+            return (timeline_id, kind, detector, field, value, source_id, event_id)
+
         async with self.session_factory() as session:
-            rows: list[FindingDisposition] = []
-            for it in items:
-                existing = (
+            # One prefetch covering every row a batch item could collide with.
+            # NULL scope columns rule out a composite-tuple IN (NULL never
+            # matches IN), so narrow by the NOT NULL columns and finish the
+            # exact match in the dict lookup.
+            existing_rows = (
+                (
                     await session.execute(
                         select(FindingDisposition).where(
                             FindingDisposition.case_id == case_id,
-                            FindingDisposition.timeline_id == it.get("timeline_id"),
-                            FindingDisposition.kind == it["kind"],
-                            FindingDisposition.detector == it.get("detector", "*"),
-                            FindingDisposition.field == it.get("field"),
-                            FindingDisposition.value == it.get("value"),
-                            FindingDisposition.source_id == it.get("source_id"),
-                            FindingDisposition.event_id == it.get("event_id"),
+                            FindingDisposition.kind.in_({it["kind"] for it in items}),
+                            FindingDisposition.detector.in_(
+                                {it.get("detector", "*") for it in items}
+                            ),
                         )
                     )
-                ).scalar_one_or_none()
+                )
+                .scalars()
+                .all()
+            )
+            by_key: dict[tuple, FindingDisposition] = {
+                _scope_key(
+                    r.timeline_id, r.kind, r.detector, r.field, r.value, r.source_id, r.event_id
+                ): r
+                for r in existing_rows
+            }
+            rows: list[FindingDisposition] = []
+            for it in items:
+                key = _scope_key(
+                    it.get("timeline_id"),
+                    it["kind"],
+                    it.get("detector", "*"),
+                    it.get("field"),
+                    it.get("value"),
+                    it.get("source_id"),
+                    it.get("event_id"),
+                )
+                existing = by_key.get(key)
                 if existing is not None:
                     rows.append(existing)
                     continue
@@ -2585,12 +2626,10 @@ class PostgresStore:
                     created_by=it.get("created_by"),
                 )
                 session.add(row)
-                # Make the row visible to the dedupe SELECT of later items.
-                await session.flush()
+                # Make the row visible to the dedupe lookup of later items.
+                by_key[key] = row
                 rows.append(row)
             await session.commit()
-            for row in rows:
-                await session.refresh(row)
             return rows
 
     async def update_disposition_details(
