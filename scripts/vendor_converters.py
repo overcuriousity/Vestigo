@@ -97,6 +97,13 @@ CONVERTERS = {
         "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
         ["eve.json", "fast.log", "OPNsense suricata syslog export"],
     ),
+    "webhoneypot2timesketch": (
+        "webhoneypot",
+        "webhoneypot2timesketch.py",
+        "DShield webhoneypot (isc-agent) HTTP request logs to Timesketch timeline, incl. "
+        "reverse-proxy X-Forwarded-For/X-Real-Ip client resolution and matched signature metadata.",
+        ["webhoneypot_YYYY-MM-DD.json"],
+    ),
 }
 
 # Sibling converter modules a module imports from (beyond common/terminal).

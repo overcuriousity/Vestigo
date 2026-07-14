@@ -1,7 +1,27 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-13 (session 58 — PR109 review fixes: deterministic capped
-materialization, strict scope validation, durable materialization outcome).
+Last updated: 2026-07-14 (session 59 — re-vendor 2timesketch converters, add
+webhoneypot2timesketch).
+
+## Session 59 — 2026-07-14: re-vendor 2timesketch converters
+
+Re-synced the vendored converter suite to upstream `overcuriousity/2timesketch` commit
+`d4838eb28104d79b0d650aecfa61478ec773dedc` (`uv run python scripts/vendor_converters.py
+--upstream /path/to/2timesketch`) — the only upstream change since the last sync (`d6e5e61`,
+session 53) was a new converter, `webhoneypot2timesketch.py` (DShield web honeypot
+`webhoneypot_YYYY-MM-DD.json` HTTP request logs; reverse-proxy `X-Forwarded-For`/`X-Real-Ip`
+client resolution kept alongside the raw socket peer in `socket_src_ip`; matched signature
+metadata promoted). Added its entry to `scripts/vendor_converters.py`'s `CONVERTERS` dict —
+`/api/converters` and the frontend downloads panel are manifest-driven, so no other code
+changes were needed. The other eleven vendored scripts changed only in their embedded
+upstream-commit header/`__version__` string; no logic diff.
+
+Also, from the previous session's PR review: `src/vestigo/__init__.py.__version__` had been
+missed in the 1.1.1 version bump (`test_version_matches_pyproject` caught it), and
+`create_dispositions_bulk`'s dedupe rewrite had no direct test coverage — both fixed with a
+follow-up commit (version bump; five new tests in `test_postgres_store.py` covering empty
+batch, within-batch dedupe, dedupe against an existing row, cross-timeline scope-narrowing
+correctness, and event scope).
 
 ## Session 58 — 2026-07-13: PR109 review fixes
 

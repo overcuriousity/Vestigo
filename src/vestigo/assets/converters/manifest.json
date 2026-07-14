@@ -1,6 +1,6 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "d6e5e617353eb6a41fe712d1e207cfcc8dc17cdc",
+  "commit": "d4838eb28104d79b0d650aecfa61478ec773dedc",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
@@ -14,7 +14,7 @@
         "error.log*"
       ],
       "size_bytes": 63365,
-      "sha256": "6c4d99396b2d8174edee52c97d40c0066402c9deb110d446819497026d6408a3"
+      "sha256": "d596db377983cf613ba959abb8d18ea36dcc1b36c9bc85d50b80f3a64382d60f"
     },
     {
       "name": "browser2timesketch",
@@ -25,7 +25,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 101161,
-      "sha256": "cde13b29ef9460252e93d8b566813c2c44c1900bda6620373e3d4b13ee405c16"
+      "sha256": "85e34a5b62c40148ab1cc3c61a6085a69f023f89744bf7db4a324befe157251b"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -35,7 +35,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 42610,
-      "sha256": "d84d8cbb395f0e35d8fbdd96961613df858b4b2cee47eb15afd02b584d2df7a2"
+      "sha256": "ebe273009802fd7cbf2cad6948a59f42d48473c880b5dcd89bababc74eae1967"
     },
     {
       "name": "cloudtrail2vestigo",
@@ -61,7 +61,7 @@
         "cowrie.json*.gz"
       ],
       "size_bytes": 43729,
-      "sha256": "c36b364b09fe477befd32bfee03407bfd33940c0e109cc835256ab91e5a90c5c"
+      "sha256": "903ba07927e9bbba28ccb47099ae1014bc4c7e35a6ee8293e25192de6281991c"
     },
     {
       "name": "evtx2timesketch",
@@ -73,7 +73,7 @@
         "evtx_dump -o jsonl"
       ],
       "size_bytes": 57648,
-      "sha256": "571a277bcd19ea7358e68aa9b2902c1554898450fb4ac4badc8acc466ba0bf66"
+      "sha256": "9304d2b32b8a71b2ee392889f0da6fdc891b44f869c8516e36a389b1483bd82d"
     },
     {
       "name": "filterlog2timesketch",
@@ -83,7 +83,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 51113,
-      "sha256": "18bd8d9092d9ad34ff93a7cb06c7cf8292a5b2d27a832c3a6e996841d97603dc"
+      "sha256": "4d2b1b1067b671034a6598c3fc81f91db5974ff0560df032b7babbac2740a382"
     },
     {
       "name": "filterlog2vestigo",
@@ -107,7 +107,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 38902,
-      "sha256": "874493b165471df8353e396713e23273bd5e04f59be92888676d3c3e51ba8380"
+      "sha256": "4893baf4d013e3baab68e093a9a1eb00ff985cba63fbf690be284c3d8805f957"
     },
     {
       "name": "nginx2timesketch",
@@ -118,7 +118,7 @@
         "error.log*"
       ],
       "size_bytes": 46573,
-      "sha256": "6f0a2df17785135ea847491a5b8bc822c6c5a9d205d54eec43c305ce5a7ce734"
+      "sha256": "2e38e25d6fc3865a0e9fae34633b941113ebe850f3f8332637bb98ea5d46a1a5"
     },
     {
       "name": "nginx2vestigo",
@@ -144,7 +144,7 @@
         "*.pcapng"
       ],
       "size_bytes": 62362,
-      "sha256": "f33608e822a9f77787671ef236df7b9637b64a91553519117da71930ac0e3394"
+      "sha256": "e57236e9ab07b4c76d9deb7803adb24de58e1a148ef660e0a8a3ddf3eb0de683"
     },
     {
       "name": "pcap2vestigo",
@@ -171,7 +171,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 53516,
-      "sha256": "acbd78c630870f109bac81a733c5298041b4e5d747215ed84a76347820c9cbae"
+      "sha256": "481c3007566a5f2938d33399c9600deaf94e66a851315a178436071eaf022f1e"
     },
     {
       "name": "suricata2vestigo",
@@ -201,7 +201,7 @@
         "cron.log*"
       ],
       "size_bytes": 52830,
-      "sha256": "a6ea1cc1bbefbd9706b0a1491e6ccb09c290bc715fd7f2195e0ccaeb787acdb8"
+      "sha256": "b82af622fb6936a6bcc5ef63bcf79d3e84548d9dc99f690203926512ad8bccc1"
     },
     {
       "name": "timesketch2parquet",
@@ -217,6 +217,16 @@
       ],
       "size_bytes": 30185,
       "sha256": "2f7b520af9e9c370722350fe785fe1142863407be235c18080189ceb90c14617"
+    },
+    {
+      "name": "webhoneypot2timesketch",
+      "filename": "webhoneypot2timesketch.py",
+      "description": "DShield webhoneypot (isc-agent) HTTP request logs to Timesketch timeline, incl. reverse-proxy X-Forwarded-For/X-Real-Ip client resolution and matched signature metadata.",
+      "inputs": [
+        "webhoneypot_YYYY-MM-DD.json"
+      ],
+      "size_bytes": 42631,
+      "sha256": "4be7ef35c939dbe62d0041c37f516d54acdedbc665c217cff3a6e24d907f075c"
     }
   ]
 }
