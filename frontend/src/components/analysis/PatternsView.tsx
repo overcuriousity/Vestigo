@@ -9,13 +9,15 @@
  * collapsed" count. Routine motifs stay listed here (dimmed, un-markable) —
  * suppression is never silent.
  */
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, EyeOff, Info, Repeat, Undo2 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { dispositionsApi } from "@/api/dispositions";
+import { jobsApi } from "@/api/jobs";
 import { useDisposition } from "@/hooks/useDisposition";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import {
   DetectorStatusLine,
   FindingRowActions,
@@ -34,7 +36,7 @@ interface Props {
   timelineId: string;
   onSelectEvent: (event: Event) => void;
   onDrillField?: (field: string, value: string) => void;
-  onJumpToTime?: (ts: string, eventId?: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
 
 const SERIES_FIELD_OPTIONS = [
@@ -67,6 +69,59 @@ function materializationIssue(details: Record<string, unknown> | null): string |
   return null;
 }
 
+/** Occurrence rows the materialization wrote, or null before it reports. */
+function materializedRows(details: Record<string, unknown> | null): number | null {
+  const mat = details?.materialization as
+    | { status?: string; rows_written?: number }
+    | undefined;
+  if (mat?.status !== "completed" || typeof mat.rows_written !== "number") return null;
+  return mat.rows_written;
+}
+
+/**
+ * Inline watcher for one routine-materialization background job: polls until
+ * it reaches a terminal state, then refreshes the dispositions (so
+ * `details.materialization` lands on the routine row) and the event grid
+ * (whose collapse just became active). Rendered per active job in the
+ * routine-patterns section — the analyst sees "collapsing…" instead of a
+ * silently dimming row.
+ */
+function MaterializationWatch({
+  caseId,
+  timelineId,
+  jobId,
+  onDone,
+}: {
+  caseId: string;
+  timelineId: string;
+  jobId: string;
+  onDone: (jobId: string) => void;
+}) {
+  const qc = useQueryClient();
+  const { data: job } = useQuery({
+    queryKey: ["job", jobId],
+    queryFn: () => jobsApi.get(jobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "completed" || status === "failed" ? false : 1000;
+    },
+  });
+  const done = job?.status === "completed" || job?.status === "failed";
+  useEffect(() => {
+    if (!done) return;
+    qc.invalidateQueries({ queryKey: ["dispositions", caseId, timelineId] });
+    qc.invalidateQueries({ queryKey: ["events"] });
+    onDone(jobId);
+  }, [done, jobId, caseId, timelineId, qc, onDone]);
+  if (!job || done) return null;
+  return (
+    <div className="flex items-center gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5 text-xs text-[var(--color-fg-muted)]">
+      <Spinner size={11} />
+      <span>Collapsing occurrences in the event grid…</span>
+    </div>
+  );
+}
+
 /** Humanize a gap in seconds: 90 → "1.5 min", 300 → "5 min", 7200 → "2 h". */
 function fmtPeriod(seconds: number): string {
   if (seconds < 1) return `${(seconds * 1000).toFixed(0)} ms`;
@@ -97,13 +152,16 @@ function MotifRow({
   isRoutine,
   onSelectEvent,
   onJumpToTime,
+  onRoutineMarked,
 }: {
   caseId: string;
   timelineId: string;
   finding: SequenceMotifFinding;
   isRoutine: boolean;
   onSelectEvent: (event: Event) => void;
-  onJumpToTime?: (ts: string, eventId?: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
+  /** Called with the materialization job id after a routine mark succeeds. */
+  onRoutineMarked: (jobId: string | undefined) => void;
 }) {
   const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
   const dispositionMut = useDisposition(caseId, timelineId);
@@ -119,27 +177,37 @@ function MotifRow({
         <>
           {!isRoutine && (
             <button
-              title="Mark routine: a real, recurring, expected pattern — its occurrences can be collapsed in the event grid (always with a visible count)"
+              title="Mark routine: a real, recurring, expected pattern (cron jobs, heartbeats, poller loops) — its occurrences can be collapsed in the event grid (always with a visible count). Reversible via Unmark below."
               className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-accent)]"
               disabled={dispositionMut.isPending}
               onClick={(e) => {
                 e.stopPropagation();
-                dispositionMut.mutate({
-                  kind: "routine",
-                  detector: "sequence_motif",
-                  field: finding.field,
-                  value: finding.value,
-                  details: finding.details,
-                });
+                dispositionMut.mutate(
+                  {
+                    kind: "routine",
+                    detector: "sequence_motif",
+                    field: finding.field,
+                    value: finding.value,
+                    details: finding.details,
+                  },
+                  { onSuccess: (data) => onRoutineMarked(data.materializationJobId) },
+                );
               }}
             >
               {dispositionMut.isPending ? <Spinner size={11} /> : <Repeat size={12} />}
             </button>
           )}
+          {/* The motif's own jump — targets its first occurrence and spans to
+              the last, so the whole recurring pattern highlights in the grid. */}
           <FindingRowActions
-            ts={finding.event?.timestamp ?? finding.first_seen}
+            ts={finding.first_seen ?? finding.event?.timestamp}
             eventId={finding.event_id}
-            onJumpToTime={onJumpToTime}
+            jumpTitle="Jump to this pattern's first occurrence in the grid — highlights its whole first-to-last span, clears active filters (a breadcrumb lets you return)"
+            onJumpToTime={
+              onJumpToTime
+                ? (ts, eventId) => onJumpToTime(ts, eventId, finding.last_seen ?? undefined)
+                : undefined
+            }
             disposition={{
               caseId,
               timelineId,
@@ -256,6 +324,18 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
   });
   const [routineOpen, setRoutineOpen] = useState(false);
 
+  // Active routine-materialization jobs being watched. A successful mark
+  // lands its job id here and pops the routine section open, so the row's
+  // new home — and the "collapsing…" progress — are immediately visible.
+  const [matJobIds, setMatJobIds] = useState<string[]>([]);
+  const handleRoutineMarked = useCallback((jobId: string | undefined) => {
+    setRoutineOpen(true);
+    if (jobId) setMatJobIds((ids) => (ids.includes(jobId) ? ids : [...ids, jobId]));
+  }, []);
+  const handleMatDone = useCallback((jobId: string) => {
+    setMatJobIds((ids) => ids.filter((id) => id !== jobId));
+  }, []);
+
   const findings = useMemo(
     () =>
       (data?.results ?? []).filter((r): r is SequenceMotifFinding => r.type === "sequence_motif"),
@@ -265,6 +345,22 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
 
   return (
     <div className="space-y-3">
+      {/* First-run explainer — folds away permanently once dismissed. */}
+      <GuidancePanel id="investigate-patterns" title="How pattern mining works">
+        <p>
+          This tab <strong>discovers repeating event sequences</strong> (motifs) —
+          it needs no baseline and detects nothing by itself; it shows the log's
+          routine structure so you can separate it from the interesting rest.
+        </p>
+        <p className="mt-1">
+          <strong>Mark routine</strong> when you recognize a sequence as expected
+          operations — cron jobs, heartbeats, poller loops, backup runs. Its
+          occurrences collapse in the event grid behind a visible "N routine
+          events" count, decluttering the timeline without hiding anything.
+          Routine patterns stay listed below and can be unmarked anytime.
+        </p>
+      </GuidancePanel>
+
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
         <span className="shrink-0 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
@@ -367,6 +463,7 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
               isRoutine={routineValues.has(`${f.field}:${f.value}`)}
               onSelectEvent={onSelectEvent}
               onJumpToTime={onJumpToTime}
+              onRoutineMarked={handleRoutineMarked}
             />
           ))}
         </div>
@@ -382,6 +479,15 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
             <Repeat size={12} />
             Routine patterns ({routineRows.length})
           </button>
+          {matJobIds.map((jobId) => (
+            <MaterializationWatch
+              key={jobId}
+              caseId={caseId}
+              timelineId={timelineId}
+              jobId={jobId}
+              onDone={handleMatDone}
+            />
+          ))}
           {routineOpen && (
             <div className="space-y-1">
               {routineRows.map((d) => (
@@ -392,6 +498,14 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
                   <span className="min-w-0 flex-1 break-all font-mono text-[var(--color-fg-secondary)]">
                     {fieldLabel(d.field ?? "")}: {d.value}
                   </span>
+                  {materializedRows(d.details) !== null && (
+                    <span
+                      className="shrink-0 text-[var(--color-fg-muted)]"
+                      title="Occurrence events this pattern collapses in the grid"
+                    >
+                      {materializedRows(d.details)!.toLocaleString()} collapsed
+                    </span>
+                  )}
                   {materializationIssue(d.details) && (
                     <span
                       title={materializationIssue(d.details)!}

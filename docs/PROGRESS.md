@@ -1,7 +1,40 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-14 (session 59 — re-vendor 2timesketch converters, add
-webhoneypot2timesketch).
+Last updated: 2026-07-14 (session 61 — Investigate panel disposition/pattern
+feedback overhaul, v1.1.2).
+
+## Session 61 — 2026-07-14: Investigate panel verdict-feedback overhaul
+
+Analyst verdicts produced almost no visible feedback in the Investigate panel; this
+session makes every disposition an immediate, durable, visible state change (v1.1.2).
+
+- **`confirmed` flag on findings** (mirror of `dismissed`): anomaly list/tag responses
+  now stamp `"confirmed": true` on findings covered by a confirmed disposition
+  (`_apply_confirmations` in `api/routers/events.py`, presentation-only, one shared
+  dispositions read with the dismissed filter). The UI renders a durable amber
+  "confirmed" badge + tinted border (`FindingShell`), fills and disables the Pin
+  button, and `useDisposition` flags the row optimistically on click.
+- **Verdict feedback**: row actions are dimmed-but-visible at rest (was hover-only
+  `opacity-0`); Normal flashes the row green for ~300 ms before the optimistic
+  removal; verdict toasts gained an **Undo** button (deletes the just-created
+  disposition; Confirm deliberately has no undo — it also wrote a system annotation).
+- **Dispositions header counts**: the collapsed Dispositions section shows
+  "N normal · N dismissed · N confirmed · N routine" live (ticks on every verdict).
+- **Patterns tab**: first-run GuidancePanel explaining motifs and when to Mark
+  routine; routine marks now poll their materialization job (`MaterializationWatch`,
+  1 s interval) showing "collapsing occurrences…" then refresh dispositions + grid;
+  routine rows show "N collapsed" from `details.materialization.rows_written`; the
+  routine section auto-expands on a successful mark; the motif dims optimistically
+  (routine-dispositions cache append). Jump-to-time from a motif targets its first
+  occurrence and passes `last_seen` as the range end so the whole span highlights;
+  frequency findings in the feed now forward `window_end` too; tooltips spell out
+  "clears filters, breadcrumb returns".
+
+Verified end-to-end against an isolated stack (`tsig_verify` DBs): confirm →
+`confirmed: true` in the list response; routine mark → materialization job
+`completed {rows_written: 597}` persisted onto the disposition; normal → finding
+suppressed, delete (undo) → finding back. Full pytest (952) and frontend
+typecheck/lint/vitest (271) green.
 
 ## Session 59 — 2026-07-14: re-vendor 2timesketch converters
 

@@ -134,7 +134,10 @@ about which is which:
   - **`confirmed`** — "escalated true positive"; durable. Event-scoped with a
     concrete detector; written by the **Confirm** action together with the
     system `anomaly` annotation. Bulk "Tag N as anomaly" re-runs preserve
-    confirmed `(event, detector)` pairs instead of clearing them.
+    confirmed `(event, detector)` pairs instead of clearing them. List
+    responses stamp covered findings `confirmed: true` (presentation-only,
+    mirror of the `dismissed` flag) so the UI renders a durable confirmed
+    badge and disables re-confirming.
 
   Undecided is the absence of a row. Rows are freely deletable (the
   Dispositions list under Windows & normality); removing one makes the

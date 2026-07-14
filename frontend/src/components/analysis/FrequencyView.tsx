@@ -12,6 +12,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Info,
+  Pin,
   TrendingUp,
   TrendingDown,
   Clock,
@@ -139,6 +140,15 @@ function FreqFindingRow({
           <span className="font-mono text-xs text-[var(--color-fg-primary)] font-medium break-all">
             {finding.series_value}
           </span>
+          {finding.confirmed && (
+            <span
+              title="Confirmed — escalated as a durable finding; survives detector re-runs"
+              className="flex shrink-0 items-center gap-1 rounded bg-[var(--color-anomaly,var(--color-warning))]/15 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-anomaly,var(--color-warning))]"
+            >
+              <Pin size={10} />
+              confirmed
+            </span>
+          )}
         </div>
 
         {/* Window label */}
@@ -170,10 +180,11 @@ function FreqFindingRow({
         </div>
       </div>
 
-      <div className="shrink-0 flex items-center opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="shrink-0 flex items-center opacity-50 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
         <FindingRowActions
           ts={finding.window_start}
           eventId={finding.event_id}
+          confirmed={finding.confirmed}
           disposition={{
             caseId,
             timelineId,

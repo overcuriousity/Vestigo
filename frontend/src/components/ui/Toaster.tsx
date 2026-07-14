@@ -49,6 +49,16 @@ function ToastCard({ item }: { item: ToastItem }) {
             {item.description}
           </Toast.Description>
         )}
+        {item.action && (
+          <Toast.Action altText={item.action.label} asChild>
+            <button
+              onClick={item.action.onClick}
+              className="mt-1 rounded border border-[var(--color-border)] px-2 py-0.5 text-xs font-medium text-[var(--color-fg-primary)] hover:bg-[var(--color-bg-hover)]"
+            >
+              {item.action.label}
+            </button>
+          </Toast.Action>
+        )}
       </div>
       <Toast.Close
         aria-label="Dismiss"

@@ -73,6 +73,7 @@ function ViolationRow({
   return (
     <FindingShell
       dismissed={finding.dismissed}
+      confirmed={finding.confirmed}
       details={finding.details}
       onClick={() => openEvent.mutate()}
       title={`Event at ${fmtTs(finding.timestamp)} follows a record dated ${fmtTs(finding.prev_timestamp)}`}

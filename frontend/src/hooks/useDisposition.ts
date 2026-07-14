@@ -5,7 +5,13 @@ import { DETECTORS, type DetectorId } from "@/components/analysis/detector-regis
 import { dispositionsApi } from "@/api/dispositions";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { toast } from "@/stores/toasts";
-import type { AnomaliesResponse, AnomalyFinding, DispositionKind } from "@/api/types";
+import type {
+  AnomaliesResponse,
+  AnomalyFinding,
+  Disposition,
+  DispositionKind,
+  DispositionListResponse,
+} from "@/api/types";
 
 /** Shape of the shared detector-sweep cache (see useDetectorSweep). */
 type SweepData = Record<DetectorId, AnomaliesResponse | null>;
@@ -84,6 +90,19 @@ function markFindingsDismissed(data: AnomaliesResponse, t: DispositionTarget): A
   };
 }
 
+/** Flag (not drop) the findings a new confirmation covers — the row stays
+ * visible with a durable confirmed badge, matching what a refetch returns
+ * (the backend stamps `confirmed: true` on covered findings). */
+function markFindingsConfirmed(data: AnomaliesResponse, t: DispositionTarget): AnomaliesResponse {
+  let changed = false;
+  const results = data.results.map((f) => {
+    if (!matchesTarget(f, t) || f.confirmed) return f;
+    changed = true;
+    return { ...f, confirmed: true };
+  });
+  return changed ? { ...data, results } : data;
+}
+
 const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string; hint: string }> = {
   normal: {
     title: (label) => `Marked normal — ${label}`,
@@ -126,7 +145,9 @@ const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string;
 export function useDisposition(caseId: string, timelineId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (t: DispositionTarget): Promise<void> => {
+    mutationFn: async (
+      t: DispositionTarget,
+    ): Promise<{ dispositionId?: string; materializationJobId?: string }> => {
       if (t.kind === "confirmed") {
         if (!t.sourceId || !t.eventId) {
           throw new Error("Cannot confirm: no owning event for this finding.");
@@ -136,10 +157,10 @@ export function useDisposition(caseId: string, timelineId: string) {
           content: t.content ?? "Manually confirmed finding",
           details: t.details ?? {},
         });
-        return;
+        return {};
       }
       if (t.field !== undefined && t.value !== undefined) {
-        await dispositionsApi.create(caseId, timelineId, {
+        const res = await dispositionsApi.create(caseId, timelineId, {
           kind: t.kind,
           detector: t.detector,
           field: t.field,
@@ -148,23 +169,55 @@ export function useDisposition(caseId: string, timelineId: string) {
           // occurrence materialization server-side).
           details: t.kind === "routine" ? (t.details ?? null) : undefined,
         });
-        return;
+        return {
+          dispositionId: res.disposition.id,
+          materializationJobId: res.materialization_job_id,
+        };
       }
       // Positional / value-less: event scope. Without an owning event there
       // is nothing to mark, so surface that rather than a false success.
       if (!t.sourceId || !t.eventId) {
         throw new Error("Cannot set disposition: no value key and no owning event.");
       }
-      await dispositionsApi.create(caseId, timelineId, {
+      const res = await dispositionsApi.create(caseId, timelineId, {
         kind: t.kind,
         detector: t.detector,
         source_id: t.sourceId,
         event_id: t.eventId,
       });
+      return { dispositionId: res.disposition.id };
     },
     onMutate: async (t) => {
-      // confirmed and routine leave the finding visible — no optimistic removal.
-      if (t.kind === "confirmed" || t.kind === "routine") return { snapshots: [], sweepSnapshots: [] };
+      // routine leaves the findings list untouched — instead, optimistically
+      // append a row to the routine-dispositions cache so the motif dims on
+      // click (PatternsView derives `isRoutine` from that cache).
+      if (t.kind === "routine") {
+        const routineKey = ["dispositions", caseId, timelineId, "routine"] as const;
+        await qc.cancelQueries({ queryKey: routineKey });
+        const routineSnapshot = qc.getQueryData<DispositionListResponse>(routineKey);
+        if (routineSnapshot && t.field !== undefined && t.value !== undefined) {
+          const optimistic: Disposition = {
+            id: `optimistic-${t.field}-${t.value}`,
+            case_id: caseId,
+            timeline_id: timelineId,
+            kind: "routine",
+            detector: t.detector,
+            field: t.field,
+            value: t.value,
+            source_id: null,
+            event_id: null,
+            note: null,
+            details: (t.details as Disposition["details"]) ?? null,
+            created_by: null,
+            created_at: null,
+          };
+          qc.setQueryData(routineKey, {
+            ...routineSnapshot,
+            dispositions: [optimistic, ...routineSnapshot.dispositions],
+          });
+        }
+        return { snapshots: [], sweepSnapshots: [], routineSnapshot };
+      }
       const prefix = ["anomalies", caseId, timelineId] as const;
       await qc.cancelQueries({ queryKey: prefix });
       const snapshots = qc.getQueriesData<AnomaliesResponse>({ queryKey: prefix });
@@ -185,13 +238,16 @@ export function useDisposition(caseId: string, timelineId: string) {
         // "dismissed-shown" key segment (see useShowDismissed): there, a
         // dismissal keeps the row visible, flagged + dimmed, matching what a
         // refetch returns. Normal still removes — the backend suppresses it
-        // either way.
+        // either way. Confirmed never removes: it flags the row so it renders
+        // its durable confirmed badge immediately.
         const showsDismissed = key.includes(SHOW_DISMISSED_KEY);
         qc.setQueryData(
           key,
-          t.kind === "dismissed" && showsDismissed
-            ? markFindingsDismissed(data, t)
-            : filterFindings(data, t),
+          t.kind === "confirmed"
+            ? markFindingsConfirmed(data, t)
+            : t.kind === "dismissed" && showsDismissed
+              ? markFindingsDismissed(data, t)
+              : filterFindings(data, t),
         );
       }
       // The shared detector sweep (feeding FindingsFeed and the accordion's
@@ -210,17 +266,20 @@ export function useDisposition(caseId: string, timelineId: string) {
           const response = next[meta.id];
           if (!response) continue;
           if (t.detector !== "*" && meta.detector !== t.detector) continue;
-          const filtered = filterFindings(response, t);
-          if (filtered.results.length !== response.results.length) {
-            next[meta.id] = filtered;
+          const updated =
+            t.kind === "confirmed"
+              ? markFindingsConfirmed(response, t)
+              : filterFindings(response, t);
+          if (updated !== response && (t.kind === "confirmed" || updated.results.length !== response.results.length)) {
+            next[meta.id] = updated;
             changed = true;
           }
         }
         if (changed) qc.setQueryData(key, next);
       }
-      return { snapshots, sweepSnapshots };
+      return { snapshots, sweepSnapshots, routineSnapshot: undefined };
     },
-    onError: (_err, _t, ctx) => {
+    onError: (_err, t, ctx) => {
       // Roll the optimistically removed rows back; the global mutation error
       // toast (lib/queryClient.ts) reports why.
       for (const [key, data] of ctx?.snapshots ?? []) {
@@ -229,13 +288,35 @@ export function useDisposition(caseId: string, timelineId: string) {
       for (const [key, data] of ctx?.sweepSnapshots ?? []) {
         if (data) qc.setQueryData(key, data);
       }
+      if (t.kind === "routine" && ctx?.routineSnapshot) {
+        qc.setQueryData(["dispositions", caseId, timelineId, "routine"], ctx.routineSnapshot);
+      }
     },
-    onSuccess: (_data, t) => {
+    onSuccess: (data, t) => {
       const label =
         t.field !== undefined && t.value !== undefined ? `${t.field}=${t.value}` : "event";
-      toast.success(TOAST_BY_KIND[t.kind].title(label), TOAST_BY_KIND[t.kind].hint);
-      qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
-      qc.invalidateQueries({ queryKey: ["dispositions", caseId, timelineId] });
+      const invalidate = () => {
+        qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
+        qc.invalidateQueries({ queryKey: ["dispositions", caseId, timelineId] });
+      };
+      // Undo deletes the just-created disposition — the finding resurfaces on
+      // the next refetch. Confirm has no undo here: it also persisted a system
+      // annotation, so undoing it is a deliberate act in the dispositions list.
+      const undo =
+        data.dispositionId !== undefined
+          ? {
+              label: "Undo",
+              onClick: () => {
+                void dispositionsApi.remove(caseId, timelineId, data.dispositionId!).then(() => {
+                  invalidate();
+                  qc.invalidateQueries({ queryKey: ["events"] });
+                  toast.info(`Undone — ${label}`, "The verdict was removed.");
+                });
+              },
+            }
+          : undefined;
+      toast.success(TOAST_BY_KIND[t.kind].title(label), TOAST_BY_KIND[t.kind].hint, undo);
+      invalidate();
       if (t.kind === "confirmed") {
         qc.invalidateQueries({ queryKey: ["annotations"] });
       }

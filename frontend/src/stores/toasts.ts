@@ -10,16 +10,23 @@ import { create } from "zustand";
 
 export type ToastKind = "success" | "error" | "info";
 
+/** Optional inline action button (e.g. "Undo") — clicking it dismisses the toast. */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface ToastItem {
   id: number;
   kind: ToastKind;
   title: string;
   description?: string;
+  action?: ToastAction;
 }
 
 interface ToastState {
   toasts: ToastItem[];
-  push: (kind: ToastKind, title: string, description?: string) => void;
+  push: (kind: ToastKind, title: string, description?: string, action?: ToastAction) => void;
   dismiss: (id: number) => void;
 }
 
@@ -27,7 +34,7 @@ let nextId = 1;
 
 export const useToastStore = create<ToastState>((set, get) => ({
   toasts: [],
-  push: (kind, title, description) => {
+  push: (kind, title, description, action) => {
     // Dedup: a burst of identical failures (e.g. several queries hitting the
     // same dead endpoint on one page) collapses into one visible toast.
     const dup = get().toasts.some(
@@ -36,7 +43,7 @@ export const useToastStore = create<ToastState>((set, get) => ({
     if (dup) return;
     set((s) => ({
       // Cap the stack so a pathological error storm can't fill the screen.
-      toasts: [...s.toasts.slice(-4), { id: nextId++, kind, title, description }],
+      toasts: [...s.toasts.slice(-4), { id: nextId++, kind, title, description, action }],
     }));
   },
   dismiss: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
@@ -44,10 +51,10 @@ export const useToastStore = create<ToastState>((set, get) => ({
 
 /** Imperative emitters — usable outside React (query cache, event handlers). */
 export const toast = {
-  success: (title: string, description?: string) =>
-    useToastStore.getState().push("success", title, description),
-  error: (title: string, description?: string) =>
-    useToastStore.getState().push("error", title, description),
-  info: (title: string, description?: string) =>
-    useToastStore.getState().push("info", title, description),
+  success: (title: string, description?: string, action?: ToastAction) =>
+    useToastStore.getState().push("success", title, description, action),
+  error: (title: string, description?: string, action?: ToastAction) =>
+    useToastStore.getState().push("error", title, description, action),
+  info: (title: string, description?: string, action?: ToastAction) =>
+    useToastStore.getState().push("info", title, description, action),
 };

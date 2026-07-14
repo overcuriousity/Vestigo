@@ -93,6 +93,7 @@ function DriftRow({
   return (
     <FindingShell
       dismissed={finding.dismissed}
+      confirmed={finding.confirmed}
       details={finding.details}
       onClick={() => {
         if (finding.event_id) openEvent.mutate();

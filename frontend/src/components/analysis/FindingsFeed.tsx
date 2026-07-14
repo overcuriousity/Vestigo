@@ -25,7 +25,7 @@ interface Props {
   caseId: string;
   timelineId: string;
   onSelectEvent: (event: Event) => void;
-  onJumpToTime?: (ts: string, eventId?: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
   /** Publish the feed's findings as histogram/grid markers (see useAnomalyMarkers). */
   onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
 }
@@ -42,6 +42,7 @@ function FeedRow({
   return (
     <FindingShell
       dismissed={item.raw.dismissed}
+      confirmed={item.raw.confirmed}
       details={item.raw.details}
       onClick={() => {
         if (item.eventId) openEvent.mutate();
@@ -50,7 +51,18 @@ function FeedRow({
         <FindingRowActions
           ts={item.ts}
           eventId={item.eventId}
-          onJumpToTime={onJumpToTime}
+          // Frequency findings carry a window — forward its end so the jump
+          // highlights the whole anomalous window, not just its start.
+          onJumpToTime={
+            onJumpToTime
+              ? (ts, eventId) =>
+                  onJumpToTime(
+                    ts,
+                    eventId,
+                    item.raw.type === "frequency" ? item.raw.window_end : undefined,
+                  )
+              : undefined
+          }
           disposition={{
             caseId,
             timelineId,

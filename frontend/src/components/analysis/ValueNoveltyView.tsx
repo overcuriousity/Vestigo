@@ -77,6 +77,7 @@ function FindingRow({
   return (
     <FindingShell
       dismissed={finding.dismissed}
+      confirmed={finding.confirmed}
       highlight={isFirstSeen}
       details={finding.details}
       onClick={() => {

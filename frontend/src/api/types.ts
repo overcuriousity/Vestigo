@@ -283,6 +283,8 @@ export interface ValueNoveltyFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One anomalous time window from the frequency detector. */
@@ -302,6 +304,8 @@ export interface FrequencyFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One rare / first-seen field *combination* from the value_combo detector. */
@@ -320,6 +324,8 @@ export interface ValueComboFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One out-of-range numeric value from the numeric_range detector. */
@@ -339,6 +345,8 @@ export interface NumericRangeFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One value containing never-seen characters from the charset detector. */
@@ -357,6 +365,8 @@ export interface CharsetFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One entropy-outlier value from the entropy detector. */
@@ -378,6 +388,8 @@ export interface EntropyFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One value-share shift between windows from the proportion_shift detector. */
@@ -408,6 +420,8 @@ export interface ProportionShiftFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One arrival-cadence change between windows from the interval_periodicity detector. */
@@ -440,6 +454,8 @@ export interface IntervalPeriodicityFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
@@ -463,6 +479,8 @@ export interface SequenceNoveltyFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One out-of-order timestamp finding from the timestamp_order detector. */
@@ -484,6 +502,8 @@ export interface TimestampOrderFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One whole-field distribution change between windows from the value_distribution_drift detector. */
@@ -514,6 +534,8 @@ export interface DistributionDriftFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 /** One recurring event-order n-gram from the sequence_motif miner. */
@@ -543,6 +565,8 @@ export interface SequenceMotifFinding {
   details: Record<string, unknown>;
   /** Present (true) only when the request passed `include_dismissed`. */
   dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
 }
 
 export type AnomalyFinding =

@@ -41,7 +41,7 @@ export const dispositionsApi = {
     ),
 
   create: (caseId: string, timelineId: string, body: DispositionInput) =>
-    post<{ disposition: Disposition }>(
+    post<{ disposition: Disposition; materialization_job_id?: string }>(
       `/cases/${caseId}/timelines/${timelineId}/dispositions`,
       body,
     ),

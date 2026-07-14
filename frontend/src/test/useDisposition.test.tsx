@@ -15,7 +15,10 @@ import { useDisposition } from "@/hooks/useDisposition";
 import type { AnomaliesResponse } from "@/api/types";
 
 vi.mock("@/api/dispositions", () => ({
-  dispositionsApi: { create: vi.fn().mockResolvedValue({}) },
+  dispositionsApi: {
+    create: vi.fn().mockResolvedValue({ disposition: { id: "d1" } }),
+    remove: vi.fn().mockResolvedValue({ deleted: true, disposition_id: "d1" }),
+  },
 }));
 vi.mock("@/api/anomalies", () => ({
   anomaliesApi: { persistFinding: vi.fn().mockResolvedValue({}) },
@@ -146,7 +149,7 @@ describe("useDisposition optimistic filtering", () => {
     });
   });
 
-  it("confirmed calls the persist endpoint and leaves the cache untouched", async () => {
+  it("confirmed calls the persist endpoint and flags (not removes) the finding", async () => {
     const { anomaliesApi } = await import("@/api/anomalies");
     const { qc, result } = setup();
     qc.setQueryData(VIEW_KEYS.charset, response("host", "evil"));
@@ -168,7 +171,12 @@ describe("useDisposition optimistic filtering", () => {
       "ev1",
       expect.objectContaining({ detector: "charset", content: "confirmed finding" }),
     );
-    expect(qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.charset)?.results).toHaveLength(2);
+    // Row stays, optimistically flagged confirmed — the durable badge state.
+    const data = qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.charset);
+    expect(data?.results.map((f) => [f.event_id, f.confirmed ?? false])).toEqual([
+      ["ev1", true],
+      ["ev2", false],
+    ]);
   });
 
   it("leaves other detectors' caches untouched for a detector-scoped verdict", async () => {

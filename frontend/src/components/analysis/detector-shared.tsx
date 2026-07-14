@@ -10,7 +10,7 @@
  * marker/runId plumbing) lives in detector-hooks.ts so this file only exports
  * components (react fast-refresh requirement).
  */
-import { useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { type UseMutationResult } from "@tanstack/react-query";
 import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, EyeOff, Pin, RefreshCw, Tag } from "lucide-react";
 import { Button } from "@/components/ui/Button";
@@ -210,17 +210,30 @@ export function DetectorStatusLine({
  * hover, expand toggle, and the expandable `details` key/value dump. The
  * detector-specific row body is passed as `children`.
  */
+/**
+ * Row-level channel between FindingShell and the action buttons rendered in
+ * its `actions` slot: the shell's durable `confirmed` state (disables the Pin
+ * and renders the badge), and a `flash` trigger so a verdict can tint the row
+ * (e.g. green for "accepted as normal") for a beat before the optimistic
+ * removal — removal reads as feedback, not as the row silently vanishing.
+ */
+const FindingRowCtx = createContext<{
+  confirmed: boolean;
+  flash: (kind: "normal") => void;
+}>({ confirmed: false, flash: () => {} });
+
 export function FindingShell({
   onClick,
   actions,
   details,
   highlight = false,
   dismissed = false,
+  confirmed = false,
   title,
   children,
 }: {
   onClick?: () => void;
-  /** Hover-revealed action icon buttons (drill, jump-to-time, …). */
+  /** Action icon buttons (verdicts, drill, jump-to-time, …). */
   actions?: React.ReactNode;
   /** The finding's structured `details` — rendered as an expandable dump. */
   details: Record<string, unknown>;
@@ -228,18 +241,37 @@ export function FindingShell({
   highlight?: boolean;
   /** Dismissed finding revealed via the show-dismissed toggle — dimmed. */
   dismissed?: boolean;
+  /** Covered by a confirmed disposition — durable badge + tinted border. */
+  confirmed?: boolean;
   title?: string;
   children: React.ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [flashing, setFlashing] = useState(false);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+    },
+    [],
+  );
+  const flash = (_kind: "normal") => {
+    setFlashing(true);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashing(false), 600);
+  };
 
   return (
     <div
       className={cn(
         "group rounded border transition-colors cursor-pointer",
-        highlight && !dismissed
-          ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-dim)]"
-          : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+        flashing
+          ? "border-[var(--color-success)] bg-[var(--color-success)]/10"
+          : confirmed && !dismissed
+            ? "border-[var(--color-anomaly,var(--color-warning))]/50 hover:border-[var(--color-anomaly,var(--color-warning))]"
+            : highlight && !dismissed
+              ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-dim)]"
+              : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
         dismissed && "opacity-60",
       )}
       title={title}
@@ -254,11 +286,21 @@ export function FindingShell({
             <EyeOff size={12} />
           </span>
         )}
+        {confirmed && !dismissed && (
+          <span
+            title="Confirmed — escalated as a durable finding; survives detector re-runs"
+            className="mt-0.5 flex shrink-0 items-center gap-1 rounded bg-[var(--color-anomaly,var(--color-warning))]/15 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-anomaly,var(--color-warning))]"
+          >
+            <Pin size={10} />
+            confirmed
+          </span>
+        )}
         <div className="min-w-0 flex-1 space-y-0.5">{children}</div>
 
-        {/* Actions */}
-        <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          {actions}
+        {/* Actions — dimmed at rest (not hidden: the verdict affordances must
+            be discoverable without hover, incl. on touch), full on hover/focus. */}
+        <div className="shrink-0 flex items-center gap-1 opacity-50 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+          <FindingRowCtx.Provider value={{ confirmed, flash }}>{actions}</FindingRowCtx.Provider>
           <button
             title={expanded ? "Collapse" : "Details"}
             className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"
@@ -318,9 +360,10 @@ export function TagFindingsBar({
 }
 
 /**
- * Hover-revealed row actions shared by every finding row: drill-to-filter and
- * jump-to-time. Both are omitted when their handler is absent. `ts` falls back
- * across the caller (event timestamp, then first_seen).
+ * Row actions shared by every finding row (dimmed at rest, full on hover):
+ * verdicts, drill-to-filter and jump-to-time. Handler-less actions are
+ * omitted. `ts` falls back across the caller (event timestamp, then
+ * first_seen).
  */
 export function FindingRowActions({
   field,
@@ -330,7 +373,14 @@ export function FindingRowActions({
   onDrillField,
   onJumpToTime,
   disposition,
+  confirmed,
+  jumpTitle,
 }: {
+  /** Explicit confirmed state for rows not wrapped in FindingShell (which
+   * provides it via context) — e.g. FrequencyView's bespoke row. */
+  confirmed?: boolean;
+  /** Override for the jump-to-time tooltip (e.g. "Jump to first occurrence…"). */
+  jumpTitle?: string;
   /** Field/value for the drill button; omit for detectors without one (order). */
   field?: string;
   value?: string;
@@ -362,6 +412,8 @@ export function FindingRowActions({
     disposition?.caseId ?? "",
     disposition?.timelineId ?? "",
   );
+  const rowCtx = useContext(FindingRowCtx);
+  const row = { ...rowCtx, confirmed: confirmed ?? rowCtx.confirmed };
   const valueField = disposition?.details?.allowlist_field as string | undefined;
   const valueValue = disposition?.details?.allowlist_value as string | undefined;
   const hasValueKey = valueField !== undefined && valueValue !== undefined;
@@ -375,17 +427,26 @@ export function FindingRowActions({
 
   const act = (kind: "normal" | "dismissed" | "confirmed") => {
     if (!disposition) return;
-    dispositionMut.mutate({
-      kind,
-      detector: disposition.detector,
-      // Prefer the value key; fall back to the event for positional findings.
-      field: hasValueKey ? valueField : undefined,
-      value: hasValueKey ? valueValue : undefined,
-      sourceId: disposition.sourceId ?? undefined,
-      eventId: eventId ?? undefined,
-      content: disposition.content,
-      details: disposition.details,
-    });
+    const fire = () =>
+      dispositionMut.mutate({
+        kind,
+        detector: disposition.detector,
+        // Prefer the value key; fall back to the event for positional findings.
+        field: hasValueKey ? valueField : undefined,
+        value: hasValueKey ? valueValue : undefined,
+        sourceId: disposition.sourceId ?? undefined,
+        eventId: eventId ?? undefined,
+        content: disposition.content,
+        details: disposition.details,
+      });
+    if (kind === "normal") {
+      // Flash the row green for a beat before the optimistic removal, so the
+      // disappearance reads as "accepted", not as the row silently vanishing.
+      row.flash("normal");
+      setTimeout(fire, 300);
+      return;
+    }
+    fire();
   };
   const scopeLabel = hasValueKey ? `${valueField}=${valueValue}` : "this event";
 
@@ -438,23 +499,27 @@ export function FindingRowActions({
       {disposition && disposition.detector !== "*" && (
         <button
           title={
-            canConfirm
-              ? "Confirm: escalate as a durable finding — survives detector re-runs"
-              : "Unavailable: no representative event to persist a confirmed finding against"
+            row.confirmed
+              ? "Already confirmed — a durable finding covers this event"
+              : canConfirm
+                ? "Confirm: escalate as a durable finding — survives detector re-runs"
+                : "Unavailable: no representative event to persist a confirmed finding against"
           }
           className={cn(
-            "rounded p-0.5 text-[var(--color-fg-muted)]",
-            canConfirm
-              ? "hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-anomaly,var(--color-warning))]"
-              : "cursor-not-allowed opacity-40",
+            "rounded p-0.5",
+            row.confirmed
+              ? "cursor-default text-[var(--color-anomaly,var(--color-warning))]"
+              : canConfirm
+                ? "text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-anomaly,var(--color-warning))]"
+                : "cursor-not-allowed opacity-40 text-[var(--color-fg-muted)]",
           )}
           onClick={(e) => {
             e.stopPropagation();
-            if (canConfirm) act("confirmed");
+            if (canConfirm && !row.confirmed) act("confirmed");
           }}
-          disabled={dispositionMut.isPending || !canConfirm}
+          disabled={dispositionMut.isPending || !canConfirm || row.confirmed}
         >
-          <Pin size={12} />
+          <Pin size={12} fill={row.confirmed ? "currentColor" : "none"} />
         </button>
       )}
       {onDrillField && field !== undefined && value !== undefined && (
@@ -471,7 +536,10 @@ export function FindingRowActions({
       )}
       {onJumpToTime && (
         <button
-          title="Jump to this event's time — clears active filters"
+          title={
+            jumpTitle ??
+            "Jump to this event's time in the grid — clears active filters (a breadcrumb lets you return to the filtered view)"
+          }
           className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
           onClick={(e) => {
             e.stopPropagation();

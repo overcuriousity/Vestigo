@@ -44,6 +44,7 @@ import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
 import { NormalValuesList } from "./WindowsNormality";
 import { TriageBurndown } from "./TriageBurndown";
 import { timelinesApi } from "@/api/timelines";
+import { dispositionsApi } from "@/api/dispositions";
 import { useUiStore } from "@/stores/ui";
 import { useBaselineStore } from "@/stores/baseline";
 import { cn } from "@/lib/cn";
@@ -120,6 +121,24 @@ export function InvestigatePanel({
     queryKey: ["timeline-sources", caseId, timelineId],
     queryFn: () => timelinesApi.listSources(caseId, timelineId),
   });
+
+  // Verdict counts for the Dispositions header — the persistent "my triage
+  // work so far" signal, visible even while the section is collapsed. The
+  // ["dispositions", …] prefix is invalidated by useDisposition on every
+  // verdict, so these tick up immediately.
+  const { data: dispositionData } = useQuery({
+    queryKey: ["dispositions", caseId, timelineId, "all"],
+    queryFn: () => dispositionsApi.list(caseId, timelineId),
+  });
+  const verdictCounts = (() => {
+    const counts = { normal: 0, dismissed: 0, confirmed: 0, routine: 0 };
+    for (const d of dispositionData?.dispositions ?? []) counts[d.kind] += 1;
+    return counts;
+  })();
+  const verdictSummary = (["normal", "dismissed", "confirmed", "routine"] as const)
+    .filter((k) => verdictCounts[k] > 0)
+    .map((k) => `${verdictCounts[k]} ${k}`)
+    .join(" · ");
 
   const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
@@ -274,6 +293,11 @@ export function InvestigatePanel({
                 <ShieldCheck size={12} />
                 Dispositions
                 <InfoHint content={GLOSSARY.normalValues} />
+                {verdictSummary && (
+                  <span className="ml-auto font-mono text-[10px] font-normal normal-case tracking-normal text-[var(--color-fg-muted)]">
+                    {verdictSummary}
+                  </span>
+                )}
               </button>
               {normalOpen && (
                 <div className="space-y-3">

@@ -2124,6 +2124,25 @@ def _apply_dismissals(
     return payload
 
 
+def _apply_confirmations(payload: dict[str, Any], confirmed_rows: list[Any]) -> dict[str, Any]:
+    """Stamp ``"confirmed": true`` on findings covered by a confirmed disposition.
+
+    Presentation-only, like :func:`_apply_dismissals` — the flag lets the UI
+    render a durable confirmed state (badge, disabled re-confirm) instead of
+    leaving the row indistinguishable from an untriaged one. Confirmed
+    dispositions are always event-scoped with a concrete detector
+    (``_validate_scope``), so matching is by ``event_id`` alone; the
+    dispositions read is already detector-filtered.
+    """
+    event_ids = {d.event_id for d in confirmed_rows if d.event_id is not None}
+    if not event_ids:
+        return payload
+    for f in payload.get("results", []):
+        if f.get("event_id") in event_ids:
+            f["confirmed"] = True
+    return payload
+
+
 async def _persist_detector_run(
     case_id: str,
     timeline_id: str,
@@ -2405,14 +2424,17 @@ async def list_anomalies(
         )
     # Nothing to filter on an empty result — skip the dispositions read.
     if payload.get("results"):
-        dismissed_rows = await get_store().list_dispositions(
+        disposition_rows = await get_store().list_dispositions(
             case_id,
             timeline_id=timeline_id,
             source_ids=source_ids,
-            kinds=["dismissed"],
+            kinds=["dismissed", "confirmed"],
             detector=detector,
         )
+        dismissed_rows = [d for d in disposition_rows if d.kind == "dismissed"]
+        confirmed_rows = [d for d in disposition_rows if d.kind == "confirmed"]
         payload = _apply_dismissals(dict(payload), dismissed_rows, include_dismissed)
+        payload = _apply_confirmations(payload, confirmed_rows)
     else:
         payload["dismissed_count"] = 0
     # GETs are skipped by the generic audit middleware, so detector-run
@@ -2852,14 +2874,17 @@ async def tag_anomalies(
 
     # Nothing to filter on an empty result — skip the dispositions read.
     if payload.get("results"):
-        dismissed_rows = await store.list_dispositions(
+        disposition_rows = await store.list_dispositions(
             case_id,
             timeline_id=timeline_id,
             source_ids=source_ids,
-            kinds=["dismissed"],
+            kinds=["dismissed", "confirmed"],
             detector=body.detector,
         )
+        dismissed_rows = [d for d in disposition_rows if d.kind == "dismissed"]
+        confirmed_rows = [d for d in disposition_rows if d.kind == "confirmed"]
         payload = _apply_dismissals(dict(payload), dismissed_rows, body.include_dismissed)
+        payload = _apply_confirmations(payload, confirmed_rows)
     else:
         payload["dismissed_count"] = 0
 

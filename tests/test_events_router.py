@@ -1464,6 +1464,33 @@ async def test_dismissed_disposition_filters_response_but_not_run(
 
 
 @pytest.mark.asyncio
+async def test_confirmed_disposition_stamps_finding(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A confirmed disposition stamps its finding `confirmed: true` in list
+    responses (presentation-only, mirror of the dismissed flag) — the finding
+    stays in results, and uncovered findings carry no flag."""
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    # Before any disposition: no flag.
+    response = await _call_list_anomalies(persist=False)
+    assert "confirmed" not in response["results"][0]
+
+    await timeline_setup.create_disposition(
+        case_id="c1",
+        kind="confirmed",
+        detector="value_novelty",
+        source_id="s1",
+        event_id="evt-1",
+    )
+
+    response = await _call_list_anomalies(persist=False)
+    assert response["results"][0]["confirmed"] is True
+    assert response["dismissed_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_confirmed_disposition_survives_tag_rerun(
     timeline_setup, monkeypatch, stub_field_stats_cache
 ):
