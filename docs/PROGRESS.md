@@ -1,7 +1,22 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-14 (session 59 — re-vendor 2timesketch converters, add
-webhoneypot2timesketch).
+Last updated: 2026-07-14 (session 60 — re-vendor 2timesketch converters,
+webhoneypot granular HTTP parsing).
+
+## Session 60 — 2026-07-14: re-vendor 2timesketch converters (upstream 53a1fb1)
+
+Re-synced the vendored converter suite to upstream `overcuriousity/2timesketch` commit
+`53a1fb1ae5c2d0418de5489d1d63a4127588b004` (`uv run python scripts/vendor_converters.py
+--upstream ~/Projekte/2timesketch`). Single upstream change since the last sync (`d4838eb`,
+session 59): **granular HTTP parsing in `webhoneypot2timesketch.py`** — well-known headers
+promoted to fixed `http_*` columns (Content-Type, Cookie, Authorization, X-Forwarded-For, …),
+URL split into `url_path` / `url_query` / `url_query_params` plus a percent-decoded
+`url_fetch_target` (SSRF-style `?url=`/`?uri=`/`?dest=` probes), and JSON-RPC / MCP fields
+extracted from JSON request bodies (`jsonrpc_method`, `mcp_client_name`, …); raw `http_uri`
+/ `http_data` / `http_headers` preserved unchanged. The other eleven converters changed only
+in their embedded upstream-commit header and `__version__` string; `manifest.json`
+regenerated. Converter test suites green (79 passed); `/api/converters` and the frontend
+downloads panel are manifest-driven, so no code changes were needed.
 
 ## Session 59 — 2026-07-14: re-vendor 2timesketch converters
 

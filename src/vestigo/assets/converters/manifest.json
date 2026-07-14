@@ -1,6 +1,6 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "d4838eb28104d79b0d650aecfa61478ec773dedc",
+  "commit": "53a1fb1ae5c2d0418de5489d1d63a4127588b004",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
@@ -14,7 +14,7 @@
         "error.log*"
       ],
       "size_bytes": 63365,
-      "sha256": "d596db377983cf613ba959abb8d18ea36dcc1b36c9bc85d50b80f3a64382d60f"
+      "sha256": "816c54f08a572595b56d8aa8dbdaf2c10869a41a0eb705771e0d3dc32dc0a02e"
     },
     {
       "name": "browser2timesketch",
@@ -25,7 +25,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 101161,
-      "sha256": "85e34a5b62c40148ab1cc3c61a6085a69f023f89744bf7db4a324befe157251b"
+      "sha256": "147aec982e02d4e30807c29d1f27497479154a73eacc1814d98ae0c7b9209a75"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -35,7 +35,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 42610,
-      "sha256": "ebe273009802fd7cbf2cad6948a59f42d48473c880b5dcd89bababc74eae1967"
+      "sha256": "aab31b5466412ed7b9ce1bc36f9681579bfb8de6ce5b874d73a1584bdbe3cb78"
     },
     {
       "name": "cloudtrail2vestigo",
@@ -61,7 +61,7 @@
         "cowrie.json*.gz"
       ],
       "size_bytes": 43729,
-      "sha256": "903ba07927e9bbba28ccb47099ae1014bc4c7e35a6ee8293e25192de6281991c"
+      "sha256": "a58b3fece0df83ba8d2d19ea8bacf7a953fb22526deb7b13e6b2ab6bc46cd870"
     },
     {
       "name": "evtx2timesketch",
@@ -73,7 +73,7 @@
         "evtx_dump -o jsonl"
       ],
       "size_bytes": 57648,
-      "sha256": "9304d2b32b8a71b2ee392889f0da6fdc891b44f869c8516e36a389b1483bd82d"
+      "sha256": "a4b52d55bca5c5bbe8ec1479d50ba9d195936a15a9250e2042ff5628cefd7df6"
     },
     {
       "name": "filterlog2timesketch",
@@ -83,7 +83,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 51113,
-      "sha256": "4d2b1b1067b671034a6598c3fc81f91db5974ff0560df032b7babbac2740a382"
+      "sha256": "01efacd73c95b1191eeb979f9e8c2224978947c94bc1a4a42e1aa36f6e3e08b4"
     },
     {
       "name": "filterlog2vestigo",
@@ -107,7 +107,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 38902,
-      "sha256": "4893baf4d013e3baab68e093a9a1eb00ff985cba63fbf690be284c3d8805f957"
+      "sha256": "420b3aaedf98c2b78757ed19775def20926ce491b64f7bf60786438fa973df46"
     },
     {
       "name": "nginx2timesketch",
@@ -118,7 +118,7 @@
         "error.log*"
       ],
       "size_bytes": 46573,
-      "sha256": "2e38e25d6fc3865a0e9fae34633b941113ebe850f3f8332637bb98ea5d46a1a5"
+      "sha256": "7ff9dfc5cb14fbeb075e8c438a3d32ab56ce2408efac2a993552e269bc0667c0"
     },
     {
       "name": "nginx2vestigo",
@@ -144,7 +144,7 @@
         "*.pcapng"
       ],
       "size_bytes": 62362,
-      "sha256": "e57236e9ab07b4c76d9deb7803adb24de58e1a148ef660e0a8a3ddf3eb0de683"
+      "sha256": "8da315abd85a40beb79945e908a8991f6f07cf2c2fecb725b7716a4c006b27e0"
     },
     {
       "name": "pcap2vestigo",
@@ -171,7 +171,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 53516,
-      "sha256": "481c3007566a5f2938d33399c9600deaf94e66a851315a178436071eaf022f1e"
+      "sha256": "a71436c6fafa3b93d30a9869f897300f837b465c7ac1c3e613e4f3f324367c65"
     },
     {
       "name": "suricata2vestigo",
@@ -201,7 +201,7 @@
         "cron.log*"
       ],
       "size_bytes": 52830,
-      "sha256": "b82af622fb6936a6bcc5ef63bcf79d3e84548d9dc99f690203926512ad8bccc1"
+      "sha256": "a4ae692668eb3fa859fd76b9790777c47100022265175cb4f32d66502bc7f5bb"
     },
     {
       "name": "timesketch2parquet",
@@ -225,8 +225,8 @@
       "inputs": [
         "webhoneypot_YYYY-MM-DD.json"
       ],
-      "size_bytes": 42631,
-      "sha256": "4be7ef35c939dbe62d0041c37f516d54acdedbc665c217cff3a6e24d907f075c"
+      "size_bytes": 48141,
+      "sha256": "ad67506ad76cdc70a22d6f9d90c32df17dd1f05c6e19116faa7b0acceb8f3963"
     }
   ]
 }
