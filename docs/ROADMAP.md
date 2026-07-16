@@ -210,6 +210,53 @@ via polling. Data-model overhaul explicitly approved by the user.
   rethink value-novelty "first seen" and baseline-window semantics for unbounded,
   ever-growing sources.
 
+## Milestone 7 — forensic examination expansion (X-Ways/Autopsy role, decided 2026-07-16)
+
+Expand Vestigo beyond log investigation into a forensic examination tool, with the twist
+that artifacts are analyzed as **time-annotated items**. Parsing stays permanently out of
+core scope — external Parquet-interchange converters handle it (disk-image extraction,
+carving, dfVFS traversal are converter territory).
+
+**Vocabulary decision (2026-07-16): Artifact = a file** — both a logfile that gets
+ingested and a file on an examined filesystem. This redefines the current per-event
+`artifact`/`artifact_long` meaning (Plaso type strings, see `docs/MODEL_REFINEMENT.md`);
+those columns need renaming to a type/kind concept as part of E1 — a deliberate
+vocabulary refactor with the same discipline as the 2026-06 Case/Source/Timeline one.
+
+Target model:
+
+```
+Source (evidence unit, hashed)
+  └── Artifact (N)    ← entity: a file — kind, path, content_hash, size, attributes
+        └── Event (M)  ← time annotation: timestamp + normalized role (MACB, visited, run, …)
+```
+
+- [ ] **E1 — Model design doc.** Amend `docs/MODEL_REFINEMENT.md` before any code:
+  Artifact entity, the vocabulary rename (per-event type column loses the "artifact"
+  name), and a closed timestamp-role taxonomy (M/A/C/B, `visited`, `run`, …) replacing
+  free-text `timestamp_desc`. Constraints: artifact identity must be converter-stamped
+  and deterministic (like `derive_event_id`), never derived by query-time grouping;
+  log lines degrade gracefully (artifact-less events or 1:1 artifact).
+- [ ] **E2 — Parquet interchange v2.** Separate `artifacts` + `events` streams,
+  converter-stamped deterministic artifact IDs, versioned footer; content blobs as a
+  content-addressed sha256 sidecar (selective — items of interest, not full images).
+  Keep v1 readable. Pilot converter: MFT/`fls` → artifacts + MACB events (richest test
+  of the model).
+- [ ] **E3 — Storage + query layer.** ClickHouse `artifacts` table; events gain
+  `artifact_id`; Explorer pivot (file list with M/A/C/B columns = events pivoted by
+  role per artifact). Hierarchy via materialized `path` + `parent_artifact_id` — no
+  graph store, no new backing services.
+- [ ] **E4 — Artifact detail UI.** Blob store (generalize the existing content-addressed
+  source retention) + viewers (hex/text/image).
+- [ ] **E5 — Examination extras.** Hashsets (NSRL/known-bad join on `content_hash` via
+  ClickHouse dictionary), image gallery, content keyword search (extracted-text column
+  + tokenbf index).
+
+Carries over unchanged: provenance chain (Source `file_hash`, per-event
+`content_hash`/`byte_offset`, UUIDv5 identity), detectors/embeddings/Sigma (W5) and
+schema-on-read (W8) gain the new domain for free, auth/RBAC/audit as chain-of-custody
+baseline. In-memory JobStore stays — heavy work lives in converters.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
