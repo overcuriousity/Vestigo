@@ -25,6 +25,7 @@ from vestigo.api.routers import (
     enrichers,
     events,
     jobs,
+    sigma,
     stream,
     viz,
 )
@@ -454,6 +455,7 @@ def create_app() -> FastAPI:
     app.include_router(events.router)
     app.include_router(viz.router)
     app.include_router(jobs.router)
+    app.include_router(sigma.router)
     app.include_router(stream.router)
     app.include_router(converters.router)
 

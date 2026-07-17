@@ -1,6 +1,49 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-17 (session 62 — backend bug-hunt fixes, v1.1.3).
+Last updated: 2026-07-17 (session 63 — W5 Sigma rule runner).
+
+## Session 63 — 2026-07-17: Sigma rule runner (W5)
+
+Milestone-5 W5 shipped: deterministic Sigma signature matching over ClickHouse,
+deliberately separate from the statistical detectors. Full design + semantics in
+`docs/ANOMALY_DETECTION.md` §13; design decisions (user-confirmed): pySigma +
+custom ClickHouse backend, global rules dir (`VESTIGO_SIGMA_RULES_PATH`) plus
+per-case uploads, no hit cap (streamed writes), timeline run scope, per-rule
+delete+rewrite preserving confirmed, logsource stored-not-enforced in v1.
+
+- **New `src/vestigo/sigma/` package**: `rules.py` (directory walk, SHA-256
+  hashing, nearest `vestigo-fieldmap.yml`, malformed-file tolerance),
+  `backend.py` (pySigma `TextQueryBackend` → one ClickHouse boolean expression
+  per rule; ILIKE/cased/re/cidr/compare/null/keywords; field resolution chain
+  ruleset fieldmap → timeline canonical `field_mappings` → raw `attributes[...]`
+  with fallback-field tracking; single audited literal-quoting boundary with
+  adversarial injection tests), `runner.py` (background job: per-rule scan
+  streamed under `HEAVY_SCAN_GATE` through a bounded queue — no in-memory hit
+  list — batched `Annotation(origin=system, annotation_type="sigma")` writes,
+  incremental `SigmaRun` persistence, `sigma.run` audit event).
+- **Rule identity**: Sigma `id` UUID dash-stripped = exactly 32 hex, fits
+  `Annotation.detector` — per-rule idempotent re-runs via
+  `delete_system_annotations(detector=<rule_key>)`; content-hash[:32] fallback.
+- **Postgres**: `sigma_rules` (case uploads) + `sigma_runs` (per-rule compiled
+  SQL, content hash, match count, status — forensic run record), Alembic `0006`.
+- **API** (`api/routers/sigma.py`): global/case rule listing, upload (1 MiB cap,
+  parse-validated, dup-409), enable/delete, timeline run launch
+  (`kind="sigma_run"` job + persisted run), run history/detail. Contribute for
+  writes, read for listings; upload/delete/run audited.
+- **Tag integration**: `sigma: <title>` labels join the unified tag panel —
+  `_resolve_tags_filter` unions sigma-annotation event_ids, `tags/merged` lists
+  them (`list_distinct_sigma_tags`).
+- **Frontend**: Sigma tab in the InvestigatePanel (`SigmaPanel.tsx`) — rule
+  picker with level/logsource badges and YAML upload, run launch into the
+  JobTray, run history with per-rule status/count/SQL and fallback-field
+  warnings, filter-grid-by-rule via a new `onTagFilter` Explorer callback.
+- Config: `VESTIGO_SIGMA_RULES_PATH`, `VESTIGO_SIGMA_ANNOTATION_BATCH_SIZE`.
+  Deps: `pysigma` (pure Python, offline), explicit `pyyaml`.
+- Tests: 37 new (compiler semantics + escaping adversarial cases, loader,
+  router CRUD/RBAC); full suite 996 passed; frontend typecheck/lint/vitest
+  (272) green. ClickHouse-dependent semantics (`ILIKE` escaping, guarded
+  `isIPAddressInRange`, NOT/ILIKE precedence) verified against a live 24.10
+  server during development.
 
 ## Session 62 — 2026-07-17: Backend audit bugfixes (v1.1.3)
 

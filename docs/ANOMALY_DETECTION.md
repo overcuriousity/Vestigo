@@ -1363,6 +1363,92 @@ coverage badges — exact key equality, never n-gram containment.
 
 ---
 
+## 13. Sigma rule runner (signature matching)
+
+**What it answers:** "Which events match *known-bad patterns* the DFIR
+community has already written signatures for?" — a PowerShell download
+cradle, a suspicious service install, an off-hours RDP logon. Not a
+statistical detector at all: [Sigma](https://github.com/SigmaHQ/sigma) rules
+are deterministic YAML signatures, and a hit is a binary match, not a score.
+
+**Why it's useful:** it turns a blank 300M-event grid into a triage starting
+point. Running a community ruleset (or a team's own) instantly surfaces every
+event a known signature recognizes — the complement of the statistical
+detectors, which find what *no* signature knows yet. Signature matching says
+"this is a pattern someone has seen before"; the detectors say "this is
+unusual for *this* corpus." Both feed the same annotation/tag UI.
+
+**Modes:** none. The runner is mode-less — no baseline/suspect split, no
+self-baseline; every selected rule is evaluated over the full timeline scope.
+
+**How it works, step by step** (`src/vestigo/sigma/`, run as a background
+job — `kind="sigma_run"`):
+
+1. **Rules load** from two origins: the admin-managed global directory
+   (`VESTIGO_SIGMA_RULES_PATH`, an offline file drop — e.g. a vendored
+   SigmaHQ clone — re-read and re-hashed on every run) and case-scoped
+   uploads (Postgres `sigma_rules`). Malformed files are reported per rule,
+   never fatal.
+2. **Each rule compiles to one ClickHouse boolean expression**
+   (`sigma/backend.py`, a pySigma `TextQueryBackend`). Field names resolve
+   through a three-step chain: an optional per-ruleset `vestigo-fieldmap.yml`
+   (Sigma name → Vestigo field token) → the timeline's canonical
+   `field_mappings` (inline coalesce over the mapped raw keys) → a raw
+   `attributes['<name>']` fallback. Fields that land on the raw fallback are
+   recorded (`fallback_fields`) and flagged in the UI — a hit through an
+   unvouched-for raw key deserves suspicion. Matching semantics: plain
+   strings are case-insensitive `ILIKE` with `*`/`?` wildcards (Sigma spec);
+   `|cased` → `LIKE`; `|re` → RE2 `match()`; `|cidr` →
+   `isIPAddressInRange` guarded behind `isIPv4String`/`isIPv6String`
+   (ClickHouse throws on non-IP input); numeric comparisons through
+   `toFloat64OrNull`; `null`/missing both mean `= ''` (Map lookups return
+   `''` for absent keys); field-less keywords search the lowercased
+   `search_blob` column. Values are embedded as literals (pySigma's text
+   backend model has no bind-parameter path) through one audited quoting
+   boundary with adversarial tests (`tests/test_sigma_backend.py`).
+3. **Per rule**: previous hits are cleared
+   (`delete_system_annotations(annotation_type="sigma", detector=<rule_key>)`,
+   preserving confirmed findings), then matching `(event_id, source_id)`
+   rows stream under the shared `HEAVY_SCAN_GATE` and are written in batches
+   as `Annotation(origin="system", annotation_type="sigma")` with content
+   `sigma: <rule title>` — no cap; a match-everything rule streams without
+   materializing its hit list. Re-runs are therefore idempotent per rule.
+4. **The run persists** (Postgres `sigma_runs`): per rule, the exact YAML
+   content hash, the compiled SQL, the match count, and a status
+   (`matched | empty | not_applicable | error`). Every tag's "why is this
+   event flagged" is answerable from the annotation `details` (rule key,
+   title, level, content hash, run id) plus the run record's SQL.
+
+**Rule identity.** A rule's `detector` value is its Sigma `id` UUID with
+dashes stripped (exactly 32 hex, fitting `Annotation.detector`); rules
+without an `id` fall back to the first 32 hex of their content SHA-256.
+Editing a rule's YAML changes its content hash (recorded per run), but a
+stable Sigma `id` keeps delete+rewrite targeting the same logical rule.
+
+**Where hits surface.** The unified tag filter panel (the `sigma: <title>`
+labels join user tags and parser tags in `tags/merged` and
+`_resolve_tags_filter`), plus the Sigma tab's per-rule results with
+jump-to-Explorer. Confirmed findings survive re-runs via the standard
+disposition mechanism.
+
+### Caveats
+
+- **A hit is not a verdict.** Community rules are written against specific
+  log sources; without field mappings a rule may match through the raw
+  `attributes` fallback on a field that merely shares a name. The
+  fallback-field warning exists for exactly this.
+- **`logsource` is not enforced (v1).** A Windows process-creation rule
+  evaluated over firewall logs simply matches nothing (or worse, matches
+  coincidentally). The logsource triple is stored and displayed for manual
+  rule selection; automatic scoping is a possible follow-up.
+- **Numeric equality is textual.** `EventID: 4624` compares as the string
+  `'4624'` — `"04624"` does not match; `|gt`/`|lt` comparisons go through
+  `toFloat64OrNull` and treat non-numeric values as no-match.
+- **Unsupported constructs** (correlation rules, aggregations) report the
+  rule as `not_applicable` rather than failing the run.
+
+---
+
 ## Reality check (2026-07)
 
 This document was written alongside an audit of every statistical detector's

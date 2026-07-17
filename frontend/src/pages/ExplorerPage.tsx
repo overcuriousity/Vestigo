@@ -312,6 +312,14 @@ export function ExplorerPage() {
     [filters, setFilters, mapAnomalyField],
   );
 
+  /** Wired to SigmaPanel — filters the grid to one Sigma rule's hits by tag. */
+  const handleTagDrill = useCallback(
+    (tag: string) => {
+      setFilters({ ...filters, tagsInclude: [tag] });
+    },
+    [filters, setFilters],
+  );
+
   // ── Panel visibility state ────────────────────────────────────────────
   const filterRailOpen = useUiStore((s) => s.filterRailOpen);
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
@@ -1195,6 +1203,7 @@ export function ExplorerPage() {
                     onAnomalyMarkers={setAnomalyMarkers}
                     onAnomalyRunId={setAnomalyRunId}
                     onJumpToTime={handleJumpToTime}
+                    onTagFilter={handleTagDrill}
                   />
                 )}
               </div>

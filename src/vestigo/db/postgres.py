@@ -17,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     String,
+    Text,
     delete,
     func,
     insert,
@@ -838,6 +839,104 @@ class Annotation(Base):
             "origin": self.origin,
             "details": self.details,
             "detector": self.detector,
+        }
+
+
+class SigmaRule(Base):
+    """A case-scoped Sigma detection rule uploaded by an analyst.
+
+    Global rules (from ``Settings.sigma_rules_path``) stay on disk and are
+    hashed at run time; only per-case uploads live here. ``rule_key`` is the
+    32-hex identity used everywhere hits reference the rule: the Sigma
+    ``id`` UUID with dashes stripped when present, else the first 32 hex of
+    ``content_hash``. It fits ``Annotation.detector`` (String(32)) exactly,
+    which is what makes per-rule delete+rewrite of hit annotations possible.
+    """
+
+    __tablename__ = "sigma_rules"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    rule_key: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Sigma's own `id` field (a UUID string), when the rule declares one.
+    rule_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    logsource: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    yaml_content: Mapped[str] = mapped_column(Text, nullable=False)
+    # SHA-256 of yaml_content — the forensic identity of what was evaluated.
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the SigmaRule API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "rule_key": self.rule_key,
+            "title": self.title,
+            "rule_uuid": self.rule_uuid,
+            "level": self.level,
+            "logsource": self.logsource,
+            "yaml_content": self.yaml_content,
+            "content_hash": self.content_hash,
+            "enabled": self.enabled,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "origin": "case",
+        }
+
+
+class SigmaRun(Base):
+    """A persisted Sigma-runner evaluation over one timeline.
+
+    Rows accumulate like :class:`DetectorRun` — a case's history of which
+    rules ran, the exact ClickHouse SQL each compiled to, and what they
+    matched stays auditable. ``results`` holds one entry per rule:
+    ``{rule_key, title, level, content_hash, sql, match_count, status,
+    error, fallback_fields, logsource}`` with status one of
+    ``matched | empty | not_applicable | error``.
+    """
+
+    __tablename__ = "sigma_runs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # queued | running | completed | failed — mirrors the ephemeral Job, but
+    # survives restarts (the Job does not).
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    # Scope + selection snapshot: source_ids, selected rule refs, batch size.
+    params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    results: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the SigmaRun API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "status": self.status,
+            "params": self.params,
+            "results": self.results,
+            "error": self.error,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
 
 
@@ -2737,6 +2836,143 @@ class PostgresStore:
             return result.scalar_one_or_none()
 
     # ------------------------------------------------------------------
+    # Sigma rules + runs
+    # ------------------------------------------------------------------
+
+    async def create_sigma_rule(
+        self,
+        case_id: str,
+        rule_key: str,
+        title: str,
+        yaml_content: str,
+        content_hash: str,
+        rule_uuid: str | None = None,
+        level: str | None = None,
+        logsource: dict | None = None,
+        created_by: str | None = None,
+    ) -> SigmaRule:
+        """Persist an uploaded case-scoped Sigma rule and return it."""
+        rule = SigmaRule(
+            id=generate_id("sigma_rule"),
+            case_id=case_id,
+            rule_key=rule_key,
+            title=title,
+            rule_uuid=rule_uuid,
+            level=level,
+            logsource=logsource,
+            yaml_content=yaml_content,
+            content_hash=content_hash,
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(rule)
+            await session.commit()
+            await session.refresh(rule)
+            return rule
+
+    async def list_sigma_rules(self, case_id: str) -> list[SigmaRule]:
+        """Return the case's uploaded Sigma rules, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SigmaRule)
+                .where(SigmaRule.case_id == case_id)
+                .order_by(SigmaRule.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def get_sigma_rule(self, case_id: str, rule_id: str) -> SigmaRule | None:
+        """Return one uploaded rule by case and row id."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SigmaRule).where(SigmaRule.case_id == case_id, SigmaRule.id == rule_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def set_sigma_rule_enabled(self, case_id: str, rule_id: str, enabled: bool) -> bool:
+        """Toggle an uploaded rule's enabled flag; True when the row existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(SigmaRule)
+                .where(SigmaRule.case_id == case_id, SigmaRule.id == rule_id)
+                .values(enabled=enabled)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def delete_sigma_rule(self, case_id: str, rule_id: str) -> bool:
+        """Delete an uploaded rule row; True when it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(SigmaRule).where(SigmaRule.case_id == case_id, SigmaRule.id == rule_id)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def create_sigma_run(
+        self,
+        case_id: str,
+        timeline_id: str,
+        params: dict,
+        created_by: str | None = None,
+    ) -> SigmaRun:
+        """Persist a new (queued) Sigma run record and return it."""
+        run = SigmaRun(
+            id=generate_id("sigma_run"),
+            case_id=case_id,
+            timeline_id=timeline_id,
+            params=params,
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(run)
+            await session.commit()
+            await session.refresh(run)
+            return run
+
+    async def update_sigma_run(
+        self,
+        run_id: str,
+        status: str | None = None,
+        results: list | None = None,
+        error: str | None = None,
+        completed: bool = False,
+    ) -> None:
+        """Update a Sigma run's status/results; stamps completed_at when asked."""
+        values: dict[str, Any] = {}
+        if status is not None:
+            values["status"] = status
+        if results is not None:
+            values["results"] = results
+        if error is not None:
+            values["error"] = error[:4096]
+        if completed:
+            values["completed_at"] = datetime.now(UTC)
+        if not values:
+            return
+        async with self.session_factory() as session:
+            await session.execute(update(SigmaRun).where(SigmaRun.id == run_id).values(**values))
+            await session.commit()
+
+    async def list_sigma_runs(self, case_id: str, limit: int = 50) -> list[SigmaRun]:
+        """Return the case's Sigma runs, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SigmaRun)
+                .where(SigmaRun.case_id == case_id)
+                .order_by(SigmaRun.created_at.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def get_sigma_run(self, case_id: str, run_id: str) -> SigmaRun | None:
+        """Return one Sigma run by case and run id."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SigmaRun).where(SigmaRun.case_id == case_id, SigmaRun.id == run_id)
+            )
+            return result.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
     # Annotations
     # ------------------------------------------------------------------
 
@@ -2935,6 +3171,33 @@ class PostgresStore:
                     Annotation.source_id.in_(source_ids),
                     Annotation.annotation_type == "tag",
                     Annotation.origin == "user",
+                )
+                .distinct()
+                .order_by(Annotation.content)
+            )
+            return [row[0] for row in result.all()]
+
+    async def list_distinct_sigma_tags(
+        self,
+        case_id: str,
+        source_ids: list[str],
+    ) -> list[str]:
+        """Return the distinct Sigma hit labels (``sigma: <title>``) in these sources.
+
+        Sigma hits are system annotations (``annotation_type="sigma"``), so
+        they never appear in :meth:`list_distinct_tag_contents` (user tags) —
+        this feeds the unified tag filter panel alongside it.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.content)
+                .where(
+                    Annotation.case_id == case_id,
+                    Annotation.source_id.in_(source_ids),
+                    Annotation.annotation_type == "sigma",
+                    Annotation.origin == "system",
                 )
                 .distinct()
                 .order_by(Annotation.content)

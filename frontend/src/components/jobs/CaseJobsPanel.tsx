@@ -13,6 +13,7 @@ const KIND_LABELS: Record<string, string> = {
   ingest: "Ingest",
   embed: "Embed",
   enrich: "Enrich",
+  sigma_run: "Sigma scan",
 };
 
 interface Props {

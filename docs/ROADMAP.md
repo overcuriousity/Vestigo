@@ -158,11 +158,11 @@ Easy, low value (deferred, revisit on demand):
 
 Hard, high value:
 
-- [ ] **W5 — Sigma rule runner.** Background job evaluating Sigma rules (offline YAML,
-  airgap-friendly) over ClickHouse, writing hits as `Annotation(origin=system)` with the rule
-  id/title as tag — lands in the existing annotation/tag filter UI for free. Canonical field
-  mappings are the natural hook for Sigma's field taxonomy. Needs a Sigma-to-ClickHouse-SQL
-  backend (pySigma has a generic backend model). Strongest single DFIR-adoption lever.
+- [ ] **W5 residue — Sigma runner follow-ups.** The runner shipped (session 63:
+  `src/vestigo/sigma/`, `docs/ANOMALY_DETECTION.md` §13). Deliberately deferred:
+  automatic `logsource` scoping (rules currently run over the full timeline scope,
+  logsource stored + displayed for manual selection); end-to-end run test against live
+  ClickHouse (covered manually via `/verify`; unit tests cover compiler/loader/router).
 - [ ] **W6 — Log template clustering (Drain-style).** Collapse structurally identical lines
   into templates so 50M repeats of one error can be muted and the one odd line surfaces.
   Deterministic and SQL-explainable beats embeddings here: start with a ClickHouse-side

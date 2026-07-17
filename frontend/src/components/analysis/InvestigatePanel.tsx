@@ -24,6 +24,7 @@ import {
   Repeat,
   Search,
   ShieldCheck,
+  Sigma,
   SlidersHorizontal,
   X,
 } from "lucide-react";
@@ -40,6 +41,7 @@ import { GLOSSARY } from "@/lib/glossary";
 import { DetectorAccordion } from "./DetectorAccordion";
 import { FindingsFeed } from "./FindingsFeed";
 import { PatternsView } from "./PatternsView";
+import { SigmaPanel } from "./SigmaPanel";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
 import { NormalValuesList } from "./WindowsNormality";
 import { TriageBurndown } from "./TriageBurndown";
@@ -50,7 +52,7 @@ import { useBaselineStore } from "@/stores/baseline";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
-type Tab = "anomalies" | "patterns" | "similar" | "methodology";
+type Tab = "anomalies" | "patterns" | "sigma" | "similar" | "methodology";
 
 interface Props {
   caseId: string;
@@ -66,6 +68,7 @@ interface Props {
   onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
   onAnomalyRunId?: (runId: string | undefined) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
+  onTagFilter?: (tag: string) => void;
 }
 
 export function InvestigatePanel({
@@ -82,6 +85,7 @@ export function InvestigatePanel({
   onAnomalyMarkers,
   onAnomalyRunId,
   onJumpToTime,
+  onTagFilter,
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
   const [normalOpen, setNormalOpen] = useState(false);
@@ -194,6 +198,7 @@ export function InvestigatePanel({
           [
             ["anomalies", AlertTriangle, "Anomalies"],
             ["patterns", Repeat, "Patterns"],
+            ["sigma", Sigma, "Sigma"],
             ["similar", Search, "Similarity"],
             ["methodology", BookOpen, "Method"],
           ] as [Tab, React.ElementType, string][]
@@ -317,6 +322,10 @@ export function InvestigatePanel({
             onDrillField={onDrillField}
             onJumpToTime={onJumpToTime}
           />
+        )}
+
+        {tab === "sigma" && (
+          <SigmaPanel caseId={caseId} timelineId={timelineId} onTagFilter={onTagFilter} />
         )}
 
         {tab === "similar" && (

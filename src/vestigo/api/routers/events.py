@@ -355,7 +355,12 @@ async def _resolve_tags_filter(
     ann_ids = await store.list_event_ids_by_annotation_type(
         case_id, source_ids, "tag", origin="user", content_in=tag_values
     )
-    return TagFilter(tag_values=tag_values, postgres_event_ids=ann_ids)
+    # Sigma hits are a third tag population: system annotations whose content
+    # is the "sigma: <title>" label shown in the unified tag panel.
+    sigma_ids = await store.list_event_ids_by_annotation_type(
+        case_id, source_ids, "sigma", origin="system", content_in=tag_values
+    )
+    return TagFilter(tag_values=tag_values, postgres_event_ids=list({*ann_ids, *sigma_ids}))
 
 
 def _intersect_optional(*id_lists: list[str] | None) -> list[str] | None:
@@ -939,8 +944,9 @@ async def list_merged_tags(
     store = get_store()
     service = _get_query_service()
     ann_tags = await store.list_distinct_tag_contents(case_id, source_ids)
+    sigma_tags = await store.list_distinct_sigma_tags(case_id, source_ids)
     parser_tags = await run_in_threadpool(service.list_distinct_parser_tags, case_id, source_ids)
-    return {"tags": sorted(set(ann_tags) | set(parser_tags))}
+    return {"tags": sorted(set(ann_tags) | set(sigma_tags) | set(parser_tags))}
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")

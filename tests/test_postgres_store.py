@@ -211,6 +211,9 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         # drop everything later revisions add, or the upgrade would collide.
         await conn.execute(text("DROP TABLE baseline_definitions"))
         await conn.execute(text("DROP TABLE finding_dispositions"))
+        # 0006 adds the Sigma runner tables.
+        await conn.execute(text("DROP TABLE sigma_rules"))
+        await conn.execute(text("DROP TABLE sigma_runs"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))

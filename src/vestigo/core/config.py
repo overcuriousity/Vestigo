@@ -191,6 +191,16 @@ class Settings(BaseSettings):
     # temp file plus a retained content-addressed copy).
     max_upload_bytes: int = Field(default=10 * 1024**3, ge=0)
 
+    # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
+    # directory scanned for *.yml/*.yaml at run time — an offline file drop
+    # (e.g. a vendored SigmaHQ clone); empty string disables the global set.
+    # Rules uploaded per case live in Postgres instead.
+    sigma_rules_path: str = ""
+    # Postgres rows per bulk_create_annotations chunk while a Sigma run
+    # persists hits. Hits stream from ClickHouse in blocks, so this bounds
+    # both write-transaction size and peak memory for match-everything rules.
+    sigma_annotation_batch_size: int = Field(default=5_000, ge=100, le=50_000)
+
     # Enrichers: where admin-uploaded enricher assets (e.g. the MaxMind
     # GeoLite2 database) are stored.
     enricher_data_path: str = "data/enrichers"
