@@ -785,10 +785,13 @@ class EventQueryService:
         if query.exclude_tag:
             builder.add_tag_exclusion(query.exclude_tag)
 
+        # `precise=True` throughout: the plain form truncates to whole
+        # seconds, silently excluding events in the boundary second's
+        # fractional part from an `end` bound (and over-including on `start`).
         if query.start is not None:
             builder.add_param(
                 f"{eff} >= :name",
-                to_clickhouse_utc(query.start),
+                to_clickhouse_utc(query.start, precise=True),
             )
             if eff != "timestamp":
                 # Widened raw-column bound so the primary index still prunes
@@ -796,18 +799,18 @@ class EventQueryService:
                 # results (see offset_raw_bounds).
                 builder.add_param(
                     "timestamp >= :name",
-                    to_clickhouse_utc(query.start - timedelta(seconds=max_off)),
+                    to_clickhouse_utc(query.start - timedelta(seconds=max_off), precise=True),
                 )
 
         if query.end is not None:
             builder.add_param(
                 f"{eff} <= :name",
-                to_clickhouse_utc(query.end),
+                to_clickhouse_utc(query.end, precise=True),
             )
             if eff != "timestamp":
                 builder.add_param(
                     "timestamp <= :name",
-                    to_clickhouse_utc(query.end - timedelta(seconds=min_off)),
+                    to_clickhouse_utc(query.end - timedelta(seconds=min_off), precise=True),
                 )
 
         if query.start is not None or query.end is not None:

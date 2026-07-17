@@ -399,13 +399,13 @@ def _window_preds(
     """
     bind_offset_params(source_offsets, params)
     eff = effective_ts_sql(source_offsets)
-    params["b0"] = to_clickhouse_utc(windows.baseline.start)
-    params["b1"] = to_clickhouse_utc(windows.baseline.end)
+    params["b0"] = to_clickhouse_utc(windows.baseline.start, precise=True)
+    params["b1"] = to_clickhouse_utc(windows.baseline.end, precise=True)
     baseline_pred = f"({eff} >= {{b0:String}} AND {eff} < {{b1:String}})"
     suspect_preds = []
     for i, w in enumerate(windows.suspects):
-        params[f"w{i}s"] = to_clickhouse_utc(w.start)
-        params[f"w{i}e"] = to_clickhouse_utc(w.end)
+        params[f"w{i}s"] = to_clickhouse_utc(w.start, precise=True)
+        params[f"w{i}e"] = to_clickhouse_utc(w.end, precise=True)
         suspect_preds.append(f"({eff} >= {{w{i}s:String}} AND {eff} < {{w{i}e:String}})")
     return baseline_pred, suspect_preds
 
@@ -5267,10 +5267,10 @@ class StatisticalAnomalyService:
         eff = effective_ts_sql(source_offsets)
         scope_parts = []
         if start is not None:
-            params["ms"] = to_clickhouse_utc(start)
+            params["ms"] = to_clickhouse_utc(start, precise=True)
             scope_parts.append(f"{eff} >= {{ms:String}}")
         if end is not None:
-            params["me"] = to_clickhouse_utc(end)
+            params["me"] = to_clickhouse_utc(end, precise=True)
             scope_parts.append(f"{eff} < {{me:String}}")
         scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
 
@@ -5538,10 +5538,10 @@ class StatisticalAnomalyService:
         eff = effective_ts_sql(source_offsets)
         scope_parts = []
         if start is not None:
-            params["ms"] = to_clickhouse_utc(start)
+            params["ms"] = to_clickhouse_utc(start, precise=True)
             scope_parts.append(f"{eff} >= {{ms:String}}")
         if end is not None:
-            params["me"] = to_clickhouse_utc(end)
+            params["me"] = to_clickhouse_utc(end, precise=True)
             scope_parts.append(f"{eff} < {{me:String}}")
         scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
         gram_lags = ", ".join(

@@ -298,8 +298,19 @@ def test_time_range_filter_formats_datetime(service: EventQueryService) -> None:
     query, params = _last_query(service)
     assert "timestamp >= {p1:String}" in query
     assert "timestamp <= {p2:String}" in query
-    assert params.get("p1") == "2024-01-01 12:00:00"
-    assert params.get("p2") == "2024-01-02 12:00:00"
+    assert params.get("p1") == "2024-01-01 12:00:00.000"
+    assert params.get("p2") == "2024-01-02 12:00:00.000"
+
+
+def test_time_range_filter_keeps_millisecond_precision(service: EventQueryService) -> None:
+    # Regression: the bounds were truncated to whole seconds, so an `end` of
+    # …00.500 excluded events at …00.001–.500 (and `start` over-included).
+    start = datetime(2024, 1, 1, 12, 0, 0, 250_000, tzinfo=UTC)
+    end = datetime(2024, 1, 2, 12, 0, 0, 500_000, tzinfo=UTC)
+    service.query(EventQuery(case_id="case-1", start=start, end=end))
+    _, params = _last_query(service)
+    assert params.get("p1") == "2024-01-01 12:00:00.250"
+    assert params.get("p2") == "2024-01-02 12:00:00.500"
 
 
 def test_time_range_filter_excludes_sentinel_rows(service: EventQueryService) -> None:
@@ -379,8 +390,8 @@ def test_active_offset_time_filter_widens_raw_bound(service: EventQueryService) 
     assert "if(" in query and ">= {p" in query
     # Widened raw bounds: lower = start - max_off (1h earlier), upper =
     # end - min_off (min_off = 0 here, so unchanged).
-    assert "2024-01-01 11:00:00" in params.values()
-    assert "2024-01-02 12:00:00" in params.values()
+    assert "2024-01-01 11:00:00.000" in params.values()
+    assert "2024-01-02 12:00:00.000" in params.values()
 
 
 def test_normalize_event_row_applies_source_offset() -> None:

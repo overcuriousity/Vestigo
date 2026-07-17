@@ -434,7 +434,7 @@ def test_value_novelty_temporal_window_bounds_converted_to_utc_for_sql():
     b1_values = [p["b1"] for p in svc.ch.client._all_parameters if "b1" in p]
     assert b1_values
     # 14:00 +02:00 == 12:00 UTC.
-    assert all(v == "2024-01-15 12:00:00" for v in b1_values)
+    assert all(v == "2024-01-15 12:00:00.000" for v in b1_values)
 
 
 def test_value_novelty_two_suspect_windows_attributed_separately():
@@ -595,8 +595,8 @@ def test_value_novelty_batched_sql_shape_temporal():
     assert "timestamp !=" in batched_sql  # sentinel guard
     # Window bounds bound as parameters (forensic reproducibility).
     params = client._all_parameters[2]
-    assert params["b0"] == "2024-01-01 00:00:00"
-    assert params["w0s"] == "2024-01-11 00:00:00"
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    assert params["w0s"] == "2024-01-11 00:00:00.000"
 
 
 def test_value_novelty_mapped_field_stays_per_field():
@@ -3597,8 +3597,8 @@ def test_sequence_sql_shape():
     assert "HAVING baseline_cnt = 0 AND (w0_cnt) > 0" in novel_sql
     # Window bounds bound as parameters (forensic reproducibility).
     params = client._all_parameters[3]
-    assert params["b0"] == "2024-01-01 00:00:00"
-    assert params["w0s"] == "2024-01-16 00:00:00"
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    assert params["w0s"] == "2024-01-16 00:00:00.000"
 
 
 def test_sequence_offset_uses_effective_ts():
@@ -3945,8 +3945,8 @@ def test_motif_sql_shape_and_time_scope():
     assert "ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING" in cadence_sql
     params = client._all_parameters[1]
     assert params["msup"] == 4
-    assert params["ms"] == "2024-01-01 00:00:00"
-    assert params["me"] == "2024-02-01 00:00:00"
+    assert params["ms"] == "2024-01-01 00:00:00.000"
+    assert params["me"] == "2024-02-01 00:00:00.000"
 
 
 def test_motif_unscoped_has_no_window_params():
@@ -4043,8 +4043,8 @@ def test_resolve_motif_occurrences_honors_mining_scope():
     # same as the miner — not as a post-hoc filter on assembled grams.
     assert sql.index("{ms:String}") < sql.index("WINDOW w AS")
     params = client._all_parameters[0]
-    assert params["ms"] == "2024-01-01 00:00:00"
-    assert params["me"] == "2024-02-01 00:00:00"
+    assert params["ms"] == "2024-01-01 00:00:00.000"
+    assert params["me"] == "2024-02-01 00:00:00.000"
 
 
 def test_resolve_motif_occurrences_cap_warning():
