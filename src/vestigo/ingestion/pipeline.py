@@ -122,24 +122,28 @@ class IngestionPipeline:
         first_exception: BaseException | None = None
         single_file = len(files) == 1
         for file_path in files:
-            fmt = format_name or detect_format(file_path)
-            # Use the caller-supplied file hash for a single-file upload; for
-            # directory ingestion compute a per-file hash.
-            file_hash = self.file_hash if single_file else hash_file(file_path)
-            source_name = self.source_name if single_file else file_path.name
-            if not file_hash:
-                raise ValueError(
-                    f"Could not compute file hash for {file_path}; "
-                    "ingestion requires a file-level hash for forensic integrity."
-                )
-            parser = get_parser(
-                fmt,
-                self.case_id,
-                self.source_id,
-                file_hash=file_hash,
-                source_name=source_name or file_path.name,
-            )
             try:
+                # Per-file setup runs inside the try so a single bad file in a
+                # directory ingest (unknown extension, unreadable) lands in
+                # result.errors like a parse failure, instead of aborting the
+                # whole run without an error summary.
+                fmt = format_name or detect_format(file_path)
+                # Use the caller-supplied file hash for a single-file upload;
+                # for directory ingestion compute a per-file hash.
+                file_hash = self.file_hash if single_file else hash_file(file_path)
+                source_name = self.source_name if single_file else file_path.name
+                if not file_hash:
+                    raise ValueError(
+                        f"Could not compute file hash for {file_path}; "
+                        "ingestion requires a file-level hash for forensic integrity."
+                    )
+                parser = get_parser(
+                    fmt,
+                    self.case_id,
+                    self.source_id,
+                    file_hash=file_hash,
+                    source_name=source_name or file_path.name,
+                )
                 self._ingest_file(file_path, parser, result, total_bytes, bytes_done)
             except Exception as exc:  # noqa: BLE001
                 if first_exception is None:
@@ -380,7 +384,10 @@ class EmbeddingPipeline:
 
         config_hash = config.config_hash()
         points: list[PointStruct] = []
-        for row, vector in zip(batch, vectors, strict=False):
+        # strict: an encoder returning a different count than it was given is
+        # a bug — surface it (run()'s per-batch handler reports it) instead of
+        # silently dropping the unmatched rows' vectors.
+        for row, vector in zip(batch, vectors, strict=True):
             points.append(
                 PointStruct(
                     id=row["event_id"],
