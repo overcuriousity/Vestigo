@@ -5,7 +5,7 @@
  * the filter set the agent ran.
  */
 import { describe, expect, it } from "vitest";
-import { specToEventFilters } from "@/api/agent";
+import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
 
 describe("specToEventFilters", () => {
   it("maps every FilterSpec field onto EventFilters", () => {
@@ -59,5 +59,30 @@ describe("specToEventFilters", () => {
       filter_modes: { f: "exact" },
     });
     expect(filters.filterModes).toBeUndefined();
+  });
+
+  it("maps annotation-state, run, ids and routine-collapse fields", () => {
+    const spec: AgentFilterSpec = {
+      annotated: ["tag", "anomaly"],
+      annotation_tag_value: "bad",
+      run_id: "run-1",
+      event_ids: ["e1", "e2"],
+      collapse_routine: true,
+    };
+    const f = specToEventFilters(spec);
+    expect(f.annotated).toEqual(["tag", "anomaly"]);
+    expect(f.annotationTagValue).toBe("bad");
+    expect(f.anomalyRunId).toBe("run-1");
+    expect(f.ids).toEqual(["e1", "e2"]);
+    expect(f.collapseRoutine).toBe(true);
+  });
+
+  it("omits the new fields when absent", () => {
+    const f = specToEventFilters({});
+    expect(f.annotated).toBeUndefined();
+    expect(f.annotationTagValue).toBeUndefined();
+    expect(f.anomalyRunId).toBeUndefined();
+    expect(f.ids).toBeUndefined();
+    expect(f.collapseRoutine).toBeUndefined();
   });
 });

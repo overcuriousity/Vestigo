@@ -26,6 +26,11 @@ export interface AgentFilterSpec {
   exclusion_modes?: Record<string, string>;
   tags_include?: string[] | null;
   tags_exclude?: string[] | null;
+  annotated?: ("tag" | "anomaly")[] | null;
+  annotation_tag_value?: string | null;
+  run_id?: string | null;
+  event_ids?: string[] | null;
+  collapse_routine?: boolean;
 }
 
 export interface AgentConversation {
@@ -82,6 +87,11 @@ export function specToEventFilters(spec: AgentFilterSpec): EventFilters {
   if (em) f.exclusionModes = em;
   if (spec.tags_include?.length) f.tagsInclude = spec.tags_include;
   if (spec.tags_exclude?.length) f.tagsExclude = spec.tags_exclude;
+  if (spec.annotated?.length) f.annotated = spec.annotated;
+  if (spec.annotation_tag_value) f.annotationTagValue = spec.annotation_tag_value;
+  if (spec.run_id) f.anomalyRunId = spec.run_id;
+  if (spec.event_ids?.length) f.ids = spec.event_ids;
+  if (spec.collapse_routine) f.collapseRoutine = true;
   return f;
 }
 
