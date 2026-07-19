@@ -561,6 +561,10 @@ async def test_stream_turn_maps_events(monkeypatch):
     assert call["args"] == {"word": "hi"}
     result_event = next(e for e in events if e["type"] == "tool_result")
     assert "echo" in str(result_event["result"])
+    # The first chunk of a text part arrives as PartStartEvent, not a delta —
+    # the streamed text_delta events must still reassemble the full text.
+    streamed = "".join(e["text"] for e in events if e["type"] == "text_delta")
+    assert streamed == "the echo came back"
     turn = events[-1]["turn"]
     assert turn.output_text == "the echo came back"
     assert len(turn.new_messages) >= 2

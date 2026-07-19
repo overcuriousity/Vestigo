@@ -37,6 +37,8 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
     TextPartDelta,
 )
 from pydantic_ai.models import Model
@@ -257,7 +259,12 @@ async def stream_turn(
         context, message_history=history or None, usage_limits=limits
     ) as stream:
         async for event in stream:
-            if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+            if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                # A text part's first chunk arrives in the start event, not as
+                # a delta — dropping it clips the opening of every segment.
+                if event.part.content:
+                    yield {"type": "text_delta", "text": event.part.content}
+            elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                 if event.delta.content_delta:
                     yield {"type": "text_delta", "text": event.delta.content_delta}
             elif isinstance(event, FunctionToolCallEvent):
