@@ -33,6 +33,24 @@ export interface AgentFilterSpec {
   collapse_routine?: boolean;
 }
 
+/** An agent-proposed annotation, propose→confirm (A1): the agent never
+ * writes annotations directly — `propose_annotation` creates one of these,
+ * and an analyst confirms or rejects it via the endpoints below. */
+export interface AgentProposal {
+  id: string;
+  conversation_id: string;
+  case_id: string;
+  timeline_id: string;
+  status: "proposed" | "confirmed" | "rejected";
+  tag: string | null;
+  comment: string | null;
+  rationale: string;
+  events: { source_id: string; event_id: string }[];
+  created_at: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+}
+
 export interface AgentConversation {
   id: string;
   case_id: string;
@@ -127,6 +145,21 @@ export const agentApi = {
 
   deleteConversation: (caseId: string, conversationId: string) =>
     del<{ deleted: boolean }>(`/cases/${caseId}/agent/conversations/${conversationId}`),
+
+  listProposals: (caseId: string, conversationId: string) =>
+    get<{ proposals: AgentProposal[] }>(
+      `/cases/${caseId}/agent/conversations/${conversationId}/proposals`,
+    ),
+
+  confirmProposal: (caseId: string, conversationId: string, proposalId: string) =>
+    post<{ proposal: AgentProposal; written: number; skipped_event_ids: string[] }>(
+      `/cases/${caseId}/agent/conversations/${conversationId}/proposals/${proposalId}/confirm`,
+    ),
+
+  rejectProposal: (caseId: string, conversationId: string, proposalId: string) =>
+    post<{ proposal: AgentProposal }>(
+      `/cases/${caseId}/agent/conversations/${conversationId}/proposals/${proposalId}/reject`,
+    ),
 
   /**
    * Send a message and stream the agent's turn. Resolves once the stream

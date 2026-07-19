@@ -5,7 +5,12 @@
  * the filter set the agent ran.
  */
 import { describe, expect, it } from "vitest";
-import { specToEventFilters, formatTokenCount, type AgentFilterSpec } from "@/api/agent";
+import {
+  specToEventFilters,
+  formatTokenCount,
+  type AgentFilterSpec,
+  type AgentProposal,
+} from "@/api/agent";
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import type { EventFilters } from "@/api/types";
@@ -172,6 +177,36 @@ describe("agent finding apply → effective filters", () => {
       collapseRoutine: false,
     });
     expect(effective.ids).toEqual(["a", "b"]);
+  });
+});
+
+/**
+ * ProposalCard's "Open in Explorer" reuses FindingCard's apply path: a
+ * proposal's events map onto EventFilters.ids via the same
+ * specToEventFilters({ event_ids }) seam, so it inherits the overlay-loss
+ * fix covered above rather than re-deriving the mapping.
+ */
+describe("proposal events → Explorer filter mapping", () => {
+  it("round-trips a proposal's event ids into EventFilters.ids", () => {
+    const proposal: AgentProposal = {
+      id: "prop-1",
+      conversation_id: "conv-1",
+      case_id: "case-1",
+      timeline_id: "tl-1",
+      status: "confirmed",
+      tag: "suspicious",
+      comment: null,
+      rationale: "clustered auth failures",
+      events: [
+        { source_id: "s1", event_id: "e1" },
+        { source_id: "s2", event_id: "e2" },
+      ],
+      created_at: null,
+      decided_by: "alice",
+      decided_at: null,
+    };
+    const f = specToEventFilters({ event_ids: proposal.events.map((e) => e.event_id) });
+    expect(f.ids).toEqual(["e1", "e2"]);
   });
 });
 

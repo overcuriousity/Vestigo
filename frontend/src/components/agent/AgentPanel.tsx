@@ -8,7 +8,7 @@
  * `agent_available` (gated by the parent), so an unconfigured install shows
  * no trace of the feature.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Send, Sparkles, Square, Trash2, Wrench, X } from "lucide-react";
 
@@ -17,6 +17,7 @@ import {
   formatTokenCount,
   type AgentFilterSpec,
   type AgentMessage,
+  type AgentProposal,
   type AgentStreamEvent,
 } from "@/api/agent";
 import { useAgentStore } from "@/stores/agent";
@@ -24,6 +25,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
+import { ProposalCard } from "./ProposalCard";
 import { Markdown } from "./Markdown";
 import type { EventFilters } from "@/api/types";
 
@@ -54,6 +56,7 @@ type ChatItem =
       spec: AgentFilterSpec;
       total?: number | null;
     }
+  | { kind: "proposal"; proposalId: string }
   | { kind: "error"; detail: string };
 
 function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
@@ -69,6 +72,15 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
           promptTokens: m.prompt_tokens,
           completionTokens: m.completion_tokens,
         });
+      }
+    } else if (m.role === "tool" && m.tool_name === "propose_annotation") {
+      // propose_annotation is rendered from its *result* row (which carries
+      // proposal_id, the key into the proposals query) rather than the call
+      // row (which only carries the proposed tag/comment/event_ids) — the
+      // call row intentionally produces nothing.
+      const result = m.tool_result as { proposal_id?: string } | null;
+      if (result?.proposal_id) {
+        items.push({ kind: "proposal", proposalId: result.proposal_id });
       }
     } else if (m.role === "tool" && m.tool_args) {
       // Tool rows come in pairs (call with args, then result); render on the
@@ -121,14 +133,30 @@ function itemsFromStream(events: AgentStreamEvent[]): ChatItem[] {
           description: args.description ?? "",
           spec: args.filters ?? {},
         });
+      } else if (e.tool === "propose_annotation") {
+        // Rendered from the paired tool_result below, once proposal_id is
+        // known — the call event only carries the proposed tag/comment.
       } else {
         items.push({ kind: "tool", tool: e.tool, args: e.args });
+      }
+    } else if (e.type === "tool_result") {
+      // Most tool_result rows stay invisible (results feed the model, not
+      // the analyst) — propose_annotation is the one exception, since its
+      // proposal_id is only known once the result lands.
+      if (e.tool === "propose_annotation") {
+        if (text) {
+          items.push({ kind: "assistant", content: text });
+          text = "";
+        }
+        const result = e.result as { proposal_id?: string } | null;
+        if (result?.proposal_id) {
+          items.push({ kind: "proposal", proposalId: result.proposal_id });
+        }
       }
     } else if (e.type === "error") {
       items.push({ kind: "error", detail: e.detail });
     }
-    // "tool_result" rows stay invisible (results feed the model, not the
-    // analyst); "done" is handled by the caller via query invalidation.
+    // "done" is handled by the caller via query invalidation.
   }
   if (text) {
     items.push({
@@ -181,6 +209,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     enabled: !!activeId,
   });
 
+  const proposalsQuery = useQuery({
+    queryKey: ["agent-proposals", caseId, activeId],
+    queryFn: () => agentApi.listProposals(caseId, activeId!),
+    enabled: !!activeId,
+  });
+  const proposalsById = useMemo(() => {
+    const map: Record<string, AgentProposal> = {};
+    for (const p of proposalsQuery.data?.proposals ?? []) map[p.id] = p;
+    return map;
+  }, [proposalsQuery.data]);
+
   const createMutation = useMutation({
     mutationFn: () => agentApi.createConversation(caseId, timelineId),
     onSuccess: (conversation) => {
@@ -227,7 +266,12 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         caseId,
         conversationId,
         { content, view_filters: currentFilters },
-        (event) => setStreamEvents((prev) => [...prev, event]),
+        (event) => {
+          setStreamEvents((prev) => [...prev, event]);
+          if (event.type === "tool_result" && event.tool === "propose_annotation") {
+            queryClient.invalidateQueries({ queryKey: ["agent-proposals", caseId, conversationId] });
+          }
+        },
         abort.signal,
       );
     } catch (err) {
@@ -376,6 +420,21 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 description={item.description}
                 spec={item.spec}
                 total={item.total}
+                onApply={onApplyFilters}
+              />
+            );
+          }
+          if (item.kind === "proposal") {
+            const proposal = proposalsById[item.proposalId];
+            if (!proposal || !activeId) {
+              return <ToolRow key={i} tool="propose_annotation" />;
+            }
+            return (
+              <ProposalCard
+                key={i}
+                caseId={caseId}
+                conversationId={activeId}
+                proposal={proposal}
                 onApply={onApplyFilters}
               />
             );
