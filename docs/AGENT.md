@@ -177,7 +177,7 @@ to server behavior.
 
 | Variable | Meaning |
 |---|---|
-| `VESTIGO_AGENT_MODEL` | Model name (e.g. `qwen3:32b`, `kimi-k2.5`). Required. |
+| `VESTIGO_AGENT_MODEL` | Model name (e.g. `qwen3:32b`, `kimi-for-coding`). Required. |
 | `VESTIGO_AGENT_PROVIDER` | Wire protocol: `openai` (default) or `anthropic`. |
 | `VESTIGO_AGENT_API_BASE_URL` | Endpoint base URL. Required for `openai`; defaults to Anthropic's API for `anthropic`. |
 | `VESTIGO_AGENT_API_KEY` | API key, if the endpoint needs one. |
