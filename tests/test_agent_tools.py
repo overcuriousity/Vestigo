@@ -125,3 +125,71 @@ async def test_annotations_tools(store):
     single = await _call(server, "get_event_annotations", {"source_id": "s1", "event_id": "e2"})
     assert single["total"] == 1
     assert single["annotations"][0]["created_by"] == "bob"
+
+
+async def test_sigma_rules_tools(store, monkeypatch):
+    await store.init_schema()
+    import vestigo.api.routers.sigma as sigma_router
+
+    async def no_global():
+        return []
+
+    monkeypatch.setattr(sigma_router, "_load_global", no_global)
+    from vestigo.db.postgres import SigmaRule, generate_id
+
+    rule = SigmaRule(
+        id=generate_id("sigma_rule"),
+        case_id="c1",
+        rule_key="a" * 32,
+        title="Suspicious PowerShell",
+        level="high",
+        logsource={"product": "windows"},
+        yaml_content="title: Suspicious PowerShell\ndetection: {}\n",
+        content_hash="b" * 64,
+    )
+    async with store.session_factory() as session:
+        session.add(rule)
+        await session.commit()
+
+    server = build_tool_server(_scope("c1", "t1"))
+    listed = await _call(server, "list_sigma_rules")
+    assert listed["total"] == 1
+    meta = listed["rules"][0]
+    assert meta["title"] == "Suspicious PowerShell"
+    assert "yaml_content" not in meta
+
+    full = await _call(server, "get_sigma_rule", {"rule_id": rule.id})
+    assert "Suspicious PowerShell" in full["yaml_content"]
+
+    missing = await _call(server, "get_sigma_rule", {"rule_id": "nope"})
+    assert "error" in missing
+
+
+async def test_sigma_runs_tools(store):
+    await store.init_schema()
+    run = await store.create_sigma_run("c1", "t1", {"source_ids": ["s1"]}, created_by="alice")
+    await store.update_sigma_run(
+        run.id,
+        status="completed",
+        results=[
+            {
+                "rule_key": "a" * 32,
+                "title": "R",
+                "match_count": 3,
+                "status": "matched",
+                "sql": "SELECT 1",
+            }
+        ],
+        completed=True,
+    )
+    other_timeline = await store.create_sigma_run("c1", "t2", {}, created_by="alice")
+    assert other_timeline.id != run.id
+
+    server = build_tool_server(_scope("c1", "t1"))
+    listed = await _call(server, "list_sigma_runs")
+    assert listed["total"] == 1
+    assert listed["runs"][0]["status"] == "completed"
+    assert "results" not in listed["runs"][0]
+
+    full = await _call(server, "get_sigma_run", {"run_id": run.id})
+    assert full["results"][0]["match_count"] == 3

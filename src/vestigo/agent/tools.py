@@ -14,6 +14,7 @@ Explorer must match exactly what the agent saw.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -498,5 +499,75 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             return {"error": f"source {source_id} is not part of this timeline"}
         rows = await get_store().list_annotations(scope.case_id, source_id, event_id)
         return {"total": len(rows), "annotations": [_slim_annotation(r) for r in rows]}
+
+    @server.tool()
+    async def list_sigma_rules() -> dict[str, Any]:
+        """List Sigma detection rules available to this case (metadata only).
+
+        Covers both the global rule directory and case-uploaded rules. Use
+        get_sigma_rule with a case rule's id to read its YAML body.
+        """
+        from vestigo.api.deps import get_store
+        from vestigo.api.routers.sigma import _global_rule_dict, _load_global
+
+        global_rules, case_rows = await asyncio.gather(
+            _load_global(), get_store().list_sigma_rules(scope.case_id)
+        )
+        rules = [_global_rule_dict(r) for r in global_rules]
+        for row in case_rows:
+            rules.append(
+                {
+                    "origin": "case",
+                    "id": row.id,
+                    "rule_key": row.rule_key,
+                    "title": row.title,
+                    "level": row.level,
+                    "logsource": row.logsource,
+                    "enabled": row.enabled,
+                }
+            )
+        return {"total": len(rules), "rules": rules}
+
+    @server.tool()
+    async def get_sigma_rule(rule_id: str) -> dict[str, Any]:
+        """Fetch one case-uploaded Sigma rule including its full YAML content."""
+        from vestigo.api.deps import get_store
+
+        row = await get_store().get_sigma_rule(scope.case_id, rule_id)
+        if row is None:
+            return {"error": f"no case-uploaded sigma rule with id {rule_id}"}
+        return row.to_dict()
+
+    @server.tool()
+    async def list_sigma_runs() -> dict[str, Any]:
+        """List past Sigma evaluations over this timeline (newest first, no per-rule detail)."""
+        from vestigo.api.deps import get_store
+
+        rows = await get_store().list_sigma_runs(scope.case_id)
+        rows = [r for r in rows if r.timeline_id == scope.timeline_id]
+        return {
+            "total": len(rows),
+            "runs": [
+                {
+                    "id": r.id,
+                    "status": r.status,
+                    "created_by": r.created_by,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                    "rule_count": len(r.results or []),
+                }
+                for r in rows
+            ],
+        }
+
+    @server.tool()
+    async def get_sigma_run(run_id: str) -> dict[str, Any]:
+        """Fetch one Sigma run's full per-rule results (match counts, statuses, compiled SQL)."""
+        from vestigo.api.deps import get_store
+
+        row = await get_store().get_sigma_run(scope.case_id, run_id)
+        if row is None or row.timeline_id != scope.timeline_id:
+            return {"error": f"no sigma run with id {run_id} in this timeline"}
+        return row.to_dict()
 
     return server
