@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-07-19
+
+### Changed
+
+- **Dependency roundup** — all 20 open Dependabot PRs merged and lockfiles fully
+  refreshed. Backend: fastapi 0.139.2, clickhouse-connect 1.5.0, typer 0.27.0,
+  geoip2 5.3.0, ruff 0.15.22, plus all transitive updates via `uv lock --upgrade`.
+  Frontend: vite 8.1.5, tailwindcss 4.3.3, oxlint 1.74.0, @types/node 26,
+  Radix UI patch releases, @tanstack/react-virtual 3.14.6, lucide-react 1.25.0,
+  @fontsource/inter + jetbrains-mono 5.3.0. CI: docker/* actions and
+  actions/setup-node major bumps. Full backend + frontend suites green on the
+  upgraded set.
+- Frontend `package.json` version now tracks the app version (was stale at 1.1.2).
+
 ## [1.2.0] — 2026-07-19
 
 ### Added

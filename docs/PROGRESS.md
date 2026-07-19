@@ -1,6 +1,25 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-17 (session 63 — W5 Sigma rule runner).
+Last updated: 2026-07-19 (session 64 — v1.2.0 release, dependency roundup, v1.2.1).
+
+## Session 64 — 2026-07-19: v1.2.0 release + dependency roundup (v1.2.1)
+
+- **v1.2.0 released**: PR #133 (Sigma rule runner + review-fix commits) merged to
+  main, signed tag pushed, tag-driven release workflow published image + release.
+  The workflow extracts release notes from the matching `CHANGELOG.md` section
+  and fails without one — the section must be on main *before* tagging.
+- **v1.2.1 dependency roundup**: all 20 open Dependabot PRs merged (backend:
+  fastapi 0.139.2, clickhouse-connect 1.5.0, typer 0.27.0, geoip2 5.3.0,
+  ruff 0.15.22; frontend: vite 8.1.5, tailwindcss 4.3.3, oxlint 1.74.0,
+  @types/node 26, Radix patches, react-virtual 3.14.6; CI: docker/* + setup-node
+  major action bumps), then `uv lock --upgrade` + `npm update` for transitives
+  and the three minors Dependabot hadn't PRed (lucide-react 1.25, fontsource
+  5.3.0). Full backend suite (944 + 8 known live-ClickHouse-only failures,
+  green in CI), frontend typecheck/lint/vitest 272/build all green on the
+  upgraded set. Frontend `package.json` version synced to the app version
+  (was stale at 1.1.2). Note for future syncs: the dev venv needs
+  `uv sync --all-extras` — a plain `uv sync` drops the embeddings extra and
+  fails `test_embeddings_capability`.
 
 ## Session 63 — 2026-07-17: Sigma rule runner (W5)
 
