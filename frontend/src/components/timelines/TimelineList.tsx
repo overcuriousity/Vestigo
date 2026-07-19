@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Clock, Cpu, Merge } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
 import { sourcesApi } from "@/api/sources";
+import { useHealth } from "@/api/health";
 import { fmtRelative } from "@/lib/time";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
@@ -11,6 +12,7 @@ import { DeleteTimelineDialog } from "./DeleteTimelineDialog";
 import { EditFieldMappingsDialog } from "./EditFieldMappingsDialog";
 import { EmbedWizard } from "./EmbedWizard";
 import { EnrichersDialog } from "./EnrichersDialog";
+import { AgentTokensDialog } from "./AgentTokensDialog";
 import type { Source, Timeline } from "@/api/types";
 
 interface Props {
@@ -55,10 +57,12 @@ function TimelineRow({
   caseId,
   tl,
   sourcesById,
+  mcpEnabled,
 }: {
   caseId: string;
   tl: Timeline;
   sourcesById: Map<string, Source>;
+  mcpEnabled: boolean;
 }) {
   return (
     <div
@@ -112,6 +116,7 @@ function TimelineRow({
         {tl.source_ids.length > 0 && (
           <EnrichersDialog caseId={caseId} timeline={tl} />
         )}
+        {mcpEnabled && <AgentTokensDialog caseId={caseId} timeline={tl} />}
         {!tl.is_default && <DeleteTimelineDialog caseId={caseId} timeline={tl} />}
       </div>
     </div>
@@ -132,6 +137,7 @@ export function TimelineList({ caseId }: Props) {
     refetchInterval: 15_000,
   });
   const sourcesById = new Map((sources ?? []).map((s) => [s.id, s]));
+  const { data: health } = useHealth();
 
   return (
     <div>
@@ -159,7 +165,13 @@ export function TimelineList({ caseId }: Props) {
       {timelines && (
         <div className="space-y-2">
           {timelines.map((tl) => (
-            <TimelineRow key={tl.id} caseId={caseId} tl={tl} sourcesById={sourcesById} />
+            <TimelineRow
+              key={tl.id}
+              caseId={caseId}
+              tl={tl}
+              sourcesById={sourcesById}
+              mcpEnabled={health?.mcp_enabled ?? false}
+            />
           ))}
         </div>
       )}

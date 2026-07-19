@@ -867,6 +867,8 @@ export interface HealthResponse {
    * answered the backend's probe — the agent UI renders nothing otherwise.
    */
   agent_available: boolean;
+  /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
+  mcp_enabled: boolean;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */
