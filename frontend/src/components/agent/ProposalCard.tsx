@@ -13,6 +13,7 @@ import { Spinner } from "@/components/ui/Spinner";
 import { agentApi, specToEventFilters, type AgentProposal } from "@/api/agent";
 import { ApiError } from "@/api/client";
 import type { EventFilters } from "@/api/types";
+import { useUserNames } from "@/hooks/useUserNames";
 
 interface Props {
   caseId: string;
@@ -45,13 +46,17 @@ export function ProposalCard({ caseId, conversationId, proposal, onApply }: Prop
 
   const deciding = confirmMutation.isPending || rejectMutation.isPending;
   const skippedCount = confirmMutation.data?.skipped_event_ids.length ?? 0;
+  const userName = useUserNames();
 
   if (proposal.status === "rejected") {
     return (
       <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-2 text-xs text-[var(--color-fg-secondary)]">
         <div className="flex items-center gap-1.5">
           <CircleX size={13} className="shrink-0 text-[var(--color-fg-secondary)]" />
-          <span>Annotation proposal rejected{proposal.decided_by ? ` by ${proposal.decided_by}` : ""}</span>
+          <span>
+            Annotation proposal rejected
+            {proposal.decided_by ? ` by ${userName(proposal.decided_by)}` : ""}
+          </span>
         </div>
       </div>
     );
@@ -86,7 +91,7 @@ export function ProposalCard({ caseId, conversationId, proposal, onApply }: Prop
         <div className="mt-2 flex items-center justify-between gap-2">
           <span className="flex items-center gap-1 text-[var(--color-success)]">
             <CircleCheck size={13} className="shrink-0" />
-            written{proposal.decided_by ? ` by ${proposal.decided_by}` : ""}
+            written{proposal.decided_by ? ` by ${userName(proposal.decided_by)}` : ""}
           </span>
           <Button
             variant="accent"

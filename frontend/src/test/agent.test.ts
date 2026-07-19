@@ -237,6 +237,7 @@ describe("buildUserNameMap", () => {
     ]);
     expect(resolveUserName(map, "user_1")).toBe("Max Mustermann");
     expect(resolveUserName(map, "user_2")).toBe("jdoe");
+    expect(resolveUserName(map, "mmustermann")).toBe("Max Mustermann");
     expect(resolveUserName(map, "legacy-username")).toBe("legacy-username");
     expect(resolveUserName(map, null)).toBe("anonymous");
   });
