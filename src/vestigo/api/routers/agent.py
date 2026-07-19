@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from vestigo.agent.availability import agent_available
+from vestigo.agent.config import resolve_agent_config
 from vestigo.agent.runtime import dump_history, load_history, stream_turn
 from vestigo.agent.tools import build_scope
 from vestigo.api.deps import (
@@ -31,7 +32,6 @@ from vestigo.api.deps import (
     require_case_contribute,
     require_case_read,
 )
-from vestigo.core.config import get_settings
 from vestigo.db.postgres import (
     ANNOTATION_ORIGIN_AGENT,
     AgentConversation,
@@ -96,12 +96,12 @@ async def create_conversation(
     timeline = await store.get_timeline(case_id, payload.timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
-    settings = get_settings()
+    config = await resolve_agent_config()
     conversation = await store.create_agent_conversation(
         case_id,
         payload.timeline_id,
         user.id,
-        model_id=f"{settings.agent_provider}:{settings.agent_model}",
+        model_id=f"{config.provider}:{config.model}",
     )
     return conversation.to_dict()
 

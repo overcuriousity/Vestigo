@@ -15,6 +15,7 @@ import pytest
 
 from tests.conftest import as_admin, login
 from vestigo.agent import availability
+from vestigo.agent.config import config_fingerprint, resolve_agent_config
 from vestigo.agent.tools import AgentScope
 from vestigo.core.config import get_settings
 
@@ -38,29 +39,32 @@ def _configure_agent(monkeypatch, provider: str = "openai"):
 # ---------------------------------------------------------------------------
 
 
-def test_agent_unconfigured_is_not_configured():
+@pytest.mark.asyncio
+async def test_agent_unconfigured_is_not_configured(store):
     get_settings.cache_clear()
-    assert availability.agent_configured() is False
+    config = await resolve_agent_config()
+    assert availability.agent_configured(config) is False
 
 
 @pytest.mark.asyncio
-async def test_agent_available_false_without_config():
+async def test_agent_available_false_without_config(store):
     get_settings.cache_clear()
     assert await availability.agent_available() is False
 
 
 @pytest.mark.asyncio
-async def test_agent_available_requires_probe_success(monkeypatch):
+async def test_agent_available_requires_probe_success(store, monkeypatch):
     _configure_agent(monkeypatch)
-    assert availability.agent_configured() is True
+    config = await resolve_agent_config()
+    assert availability.agent_configured(config) is True
 
-    async def probe_ok(settings):
+    async def probe_ok(config):
         return True
 
     monkeypatch.setattr(availability, "_probe", probe_ok)
     assert await availability.agent_available(force=True) is True
 
-    async def probe_fail(settings):
+    async def probe_fail(config):
         return False
 
     monkeypatch.setattr(availability, "_probe", probe_fail)
@@ -68,11 +72,11 @@ async def test_agent_available_requires_probe_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_probe_result_is_cached(monkeypatch):
+async def test_probe_result_is_cached(store, monkeypatch):
     _configure_agent(monkeypatch)
     calls = {"n": 0}
 
-    async def probe(settings):
+    async def probe(config):
         calls["n"] += 1
         return True
 
@@ -89,18 +93,93 @@ def test_health_reports_agent_available(client):
     assert resp.json()["agent_available"] is False
 
 
-def test_kimi_probe_url_and_headers(monkeypatch):
+@pytest.mark.asyncio
+async def test_kimi_probe_url_and_headers(store, monkeypatch):
     monkeypatch.setenv("VESTIGO_AGENT_MODEL", "kimi-k2.5")
     monkeypatch.setenv("VESTIGO_AGENT_PROVIDER", "anthropic")
     monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "https://api.kimi.com/coding")
     monkeypatch.setenv("VESTIGO_AGENT_USER_AGENT", "claude-code/0.1.0")
     get_settings.cache_clear()
     try:
-        settings = get_settings()
-        assert availability._models_probe_url(settings) == "https://api.kimi.com/coding/v1/models"
-        assert availability.probe_headers(settings)["User-Agent"] == "claude-code/0.1.0"
+        config = await resolve_agent_config()
+        assert availability._models_probe_url(config) == "https://api.kimi.com/coding/v1/models"
+        assert availability.probe_headers(config)["User-Agent"] == "claude-code/0.1.0"
     finally:
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# AgentConfig resolver (A7): env wins per field, DB fills gaps, defaults last.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolver_env_wins_per_field(store, monkeypatch):
+    """Env overrides only the fields it sets; DB fills the rest; unset fields default."""
+    await store.init_schema()
+    await store.update_agent_settings({"model": "db-model", "api_base_url": "http://db"}, "root")
+    monkeypatch.setenv("VESTIGO_AGENT_MODEL", "env-model")
+    get_settings.cache_clear()
+    try:
+        config = await resolve_agent_config()
+        assert config.model == "env-model"
+        assert config.sources["model"] == "env"
+        assert config.api_base_url == "http://db"
+        assert config.sources["api_base_url"] == "db"
+        assert config.provider == "openai"
+        assert config.sources["provider"] == "default"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_probe_cache_invalidates_on_config_change(store, monkeypatch):
+    """A DB-side settings edit changes the fingerprint and bypasses the TTL."""
+    await store.init_schema()
+    _configure_agent(monkeypatch)
+    calls = {"n": 0}
+
+    async def probe(config):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(availability, "_probe", probe)
+    availability.reset_probe_cache()
+    assert await availability.agent_available() is True
+    assert await availability.agent_available() is True
+    assert calls["n"] == 1
+
+    await store.update_agent_settings({"max_turns": 42}, "root")
+    assert await availability.agent_available() is True
+    assert calls["n"] == 2
+
+
+def test_config_fingerprint_ignores_sources():
+    from vestigo.agent.config import AgentConfig
+
+    a = AgentConfig(
+        model="m",
+        provider="openai",
+        api_base_url=None,
+        api_key=None,
+        user_agent=None,
+        extra_headers=None,
+        max_turns=15,
+        reasoning_effort="off",
+        sources={"model": "env"},
+    )
+    b = AgentConfig(
+        model="m",
+        provider="openai",
+        api_base_url=None,
+        api_key=None,
+        user_agent=None,
+        extra_headers=None,
+        max_turns=15,
+        reasoning_effort="off",
+        sources={"model": "db"},
+    )
+    assert config_fingerprint(a) == config_fingerprint(b)
 
 
 # ---------------------------------------------------------------------------

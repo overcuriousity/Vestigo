@@ -45,8 +45,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
+from vestigo.agent.config import AgentConfig, resolve_agent_config
 from vestigo.agent.tools import AgentScope, build_tool_server
-from vestigo.core.config import Settings, get_settings
 
 _LLM_TIMEOUT = 300.0
 
@@ -105,32 +105,29 @@ class KimiAnthropicModel(AnthropicModel):
         return system_prompt, anthropic_messages
 
 
-def build_model(settings: Settings | None = None) -> Model:
-    """Build the pydantic-ai model from ``VESTIGO_AGENT_*`` settings."""
-    settings = settings or get_settings()
-    if not settings.agent_model:
+def build_model(config: AgentConfig) -> Model:
+    """Build the pydantic-ai model from a resolved :class:`AgentConfig`."""
+    if not config.model:
         raise RuntimeError("VESTIGO_AGENT_MODEL is not configured")
-    http_client = httpx.AsyncClient(headers=probe_headers(settings), timeout=_LLM_TIMEOUT)
-    if settings.agent_provider == "anthropic":
+    http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=_LLM_TIMEOUT)
+    if config.provider == "anthropic":
         provider = AnthropicProvider(
-            api_key=settings.agent_api_key,
-            base_url=settings.agent_api_base_url,
+            api_key=config.api_key,
+            base_url=config.api_base_url,
             http_client=http_client,
         )
         model_cls = (
-            KimiAnthropicModel
-            if _is_kimi_coding_endpoint(settings.agent_api_base_url)
-            else AnthropicModel
+            KimiAnthropicModel if _is_kimi_coding_endpoint(config.api_base_url) else AnthropicModel
         )
-        return model_cls(settings.agent_model, provider=provider)
+        return model_cls(config.model, provider=provider)
     provider = OpenAIProvider(
-        base_url=settings.agent_api_base_url,
+        base_url=config.api_base_url,
         # The OpenAI SDK insists on a key even for keyless local endpoints
         # (ollama, vllm) — send a placeholder there.
-        api_key=settings.agent_api_key or "unused",
+        api_key=config.api_key or "unused",
         http_client=http_client,
     )
-    return OpenAIChatModel(settings.agent_model, provider=provider)
+    return OpenAIChatModel(config.model, provider=provider)
 
 
 @dataclass
@@ -178,8 +175,8 @@ async def stream_turn(
     :class:`TurnResult` under ``"turn"`` (consumed by the router, not
     forwarded to the client).
     """
-    settings = get_settings()
-    model = model or build_model(settings)
+    config = await resolve_agent_config()
+    model = model or build_model(config)
     server = build_tool_server(scope)
     toolset = MCPToolset(FastMCPClient(server), id="vestigo")
     agent = Agent(
@@ -187,7 +184,7 @@ async def stream_turn(
         system_prompt=SYSTEM_PROMPT,
         toolsets=[toolset],
     )
-    limits = UsageLimits(request_limit=settings.agent_max_turns)
+    limits = UsageLimits(request_limit=config.max_turns)
 
     context = (
         f"Case: {scope.case_id}. Timeline: {scope.timeline_id} "
