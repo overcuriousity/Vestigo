@@ -1033,6 +1033,53 @@ class AgentMessage(Base):
         }
 
 
+class AgentProposal(Base):
+    """An agent-proposed annotation, pending analyst confirmation (A1).
+
+    The agent resolves the target events at propose time (``events``) and
+    states its reasoning (``rationale``); an analyst then confirms or
+    rejects it. ``status`` starts at ``proposed`` and transitions exactly
+    once via the atomic ``decide_agent_proposal`` update, which is the
+    idempotency backbone for the API's 409-on-redecide behavior.
+    """
+
+    __tablename__ = "agent_proposals"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    events: Mapped[list] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    decided_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the AgentProposal API response."""
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "status": self.status,
+            "tag": self.tag,
+            "comment": self.comment,
+            "rationale": self.rationale,
+            "events": self.events,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "decided_by": self.decided_by,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+
 class AgentToken(Base):
     """A scoped personal access token for the external MCP endpoint (docs/AGENT.md).
 
@@ -3100,6 +3147,85 @@ class PostgresStore:
                 .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
             )
             return list(result.scalars().all())
+
+    # ------------------------------------------------------------------
+    # Agent proposals (A1)
+    # ------------------------------------------------------------------
+
+    async def create_agent_proposal(
+        self,
+        *,
+        case_id: str,
+        timeline_id: str,
+        conversation_id: str,
+        tag: str | None,
+        comment: str | None,
+        rationale: str,
+        events: list,
+    ) -> AgentProposal:
+        """Create a new proposed annotation awaiting analyst decision."""
+        proposal = AgentProposal(
+            id=generate_id("agentprop"),
+            conversation_id=conversation_id,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            status="proposed",
+            tag=tag,
+            comment=comment,
+            rationale=rationale,
+            events=events,
+        )
+        async with self.session_factory() as session:
+            session.add(proposal)
+            await session.commit()
+            await session.refresh(proposal)
+            return proposal
+
+    async def get_agent_proposal(
+        self, conversation_id: str, proposal_id: str
+    ) -> AgentProposal | None:
+        """Return one agent proposal by conversation and proposal IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentProposal).where(
+                    AgentProposal.conversation_id == conversation_id,
+                    AgentProposal.id == proposal_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_agent_proposals(self, conversation_id: str) -> list[AgentProposal]:
+        """Return a conversation's proposals in chronological order."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentProposal)
+                .where(AgentProposal.conversation_id == conversation_id)
+                .order_by(AgentProposal.created_at.asc(), AgentProposal.id.asc())
+            )
+            return list(result.scalars().all())
+
+    async def decide_agent_proposal(
+        self, proposal_id: str, *, status: str, decided_by: str
+    ) -> AgentProposal | None:
+        """Atomically confirm or reject a proposal that is still ``proposed``.
+
+        Returns the updated row, or ``None`` when the proposal was not in
+        ``proposed`` state (already decided) — callers turn that into a 409.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(AgentProposal)
+                .where(AgentProposal.id == proposal_id, AgentProposal.status == "proposed")
+                .values(status=status, decided_by=decided_by, decided_at=datetime.now(UTC))
+            )
+            if result.rowcount == 0:
+                await session.commit()
+                return None
+            await session.commit()
+            row = await session.execute(
+                select(AgentProposal).where(AgentProposal.id == proposal_id)
+            )
+            return row.scalar_one_or_none()
 
     # ------------------------------------------------------------------
     # Agent MCP tokens

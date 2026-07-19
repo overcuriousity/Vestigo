@@ -412,3 +412,23 @@ async def test_agent_message_token_columns(store):
     assert msg.to_dict()["completion_tokens"] == 80
     bare = await store.add_agent_message(conv.id, "user", "q")
     assert bare.to_dict()["prompt_tokens"] is None
+
+
+async def test_agent_proposal_lifecycle(store):
+    await store.init_schema()
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    p = await store.create_agent_proposal(
+        case_id="c1",
+        timeline_id="t1",
+        conversation_id=conv.id,
+        tag="lateral-movement",
+        comment=None,
+        rationale="pattern X",
+        events=[{"source_id": "s1", "event_id": "e1"}],
+    )
+    assert p.status == "proposed"
+    decided = await store.decide_agent_proposal(p.id, status="confirmed", decided_by="alice")
+    assert decided is not None and decided.status == "confirmed"
+    # second decision must not go through
+    assert await store.decide_agent_proposal(p.id, status="rejected", decided_by="bob") is None
+    assert (await store.get_agent_proposal(conv.id, p.id)).status == "confirmed"

@@ -229,6 +229,8 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("DROP TABLE agent_messages"))
         # 0008 adds the scoped MCP token table.
         await conn.execute(text("DROP TABLE agent_tokens"))
+        # 0010 adds the agent-proposed annotation table.
+        await conn.execute(text("DROP TABLE agent_proposals"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
