@@ -153,7 +153,9 @@ async def _message_stream(
     if not conversation.title:
         await store.update_agent_conversation(conversation_id, title=payload.content[:_TITLE_MAX])
 
-    scope = await build_scope(case_id, conversation.timeline_id, user)
+    scope = await build_scope(
+        case_id, conversation.timeline_id, user, conversation_id=conversation.id
+    )
     history = load_history(conversation.history)
     text_parts: list[str] = []
     try:

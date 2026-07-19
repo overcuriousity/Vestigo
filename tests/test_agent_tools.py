@@ -302,6 +302,79 @@ async def test_run_anomaly_detector_rejects_out_of_bounds(store):
         )
 
 
+MAX_PROPOSAL_EVENTS_TEST = 500  # mirror of tools.MAX_PROPOSAL_EVENTS
+
+
+def _scope_with_conversation(case_id: str, timeline_id: str, conversation_id: str) -> AgentScope:
+    s = _scope(case_id, timeline_id)
+    s.conversation_id = conversation_id
+    return s
+
+
+async def test_propose_annotation_records_proposal(store, monkeypatch):
+    await store.init_schema()
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    # ClickHouse resolution is monkeypatched: pretend both ids exist in scope.
+    from vestigo.agent import tools as tools_mod
+
+    async def fake_resolve(scope, event_ids):
+        return {"e1": "s1", "e2": "s1"}, []
+
+    monkeypatch.setattr(tools_mod, "_resolve_event_sources", fake_resolve)
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+    result = await _call(
+        server,
+        "propose_annotation",
+        {"event_ids": ["e1", "e2"], "tag": "suspicious", "rationale": "clustered"},
+    )
+    assert result["status"] == "proposed" and result["event_count"] == 2
+    (p,) = await store.list_agent_proposals(conv.id)
+    assert p.tag == "suspicious" and len(p.events) == 2
+
+
+async def test_propose_annotation_requires_tag_or_comment(store, monkeypatch):
+    await store.init_schema()
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    from vestigo.agent import tools as tools_mod
+
+    async def fake_resolve(scope, event_ids):
+        return {"e1": "s1", "e2": "s1"}, []
+
+    monkeypatch.setattr(tools_mod, "_resolve_event_sources", fake_resolve)
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+    result = await _call(
+        server, "propose_annotation", {"event_ids": ["e1", "e2"], "rationale": "clustered"}
+    )
+    assert "error" in result
+
+
+async def test_propose_annotation_rejects_unknown_ids(store, monkeypatch):
+    await store.init_schema()
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    from vestigo.agent import tools as tools_mod
+
+    async def fake_resolve(scope, event_ids):
+        return {"e1": "s1"}, ["eX"]
+
+    monkeypatch.setattr(tools_mod, "_resolve_event_sources", fake_resolve)
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+    result = await _call(
+        server,
+        "propose_annotation",
+        {"event_ids": ["e1", "eX"], "tag": "suspicious", "rationale": "clustered"},
+    )
+    assert "error" in result
+    assert "eX" in result["error"]
+
+
+async def test_propose_annotation_absent_without_conversation(store):
+    await store.init_schema()
+    server = build_tool_server(_scope("c1", "t1"))  # no conversation_id
+    async with FastMCPClient(server) as client:
+        names = [t.name for t in await client.list_tools()]
+    assert "propose_annotation" not in names
+
+
 async def test_list_sigma_runs_not_starved_by_other_timelines(store):
     await store.init_schema()
     # Create t1 run first (oldest)

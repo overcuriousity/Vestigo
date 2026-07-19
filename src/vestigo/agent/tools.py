@@ -36,6 +36,10 @@ MESSAGE_TRUNCATE = 500
 ATTR_VALUE_TRUNCATE = 200
 MAX_ATTRS_PER_EVENT = 40
 
+# Cap on propose_annotation's event_ids — keeps proposals focused/reviewable
+# and bounds the ClickHouse resolution query.
+MAX_PROPOSAL_EVENTS = 500
+
 
 class FilterSpec(BaseModel):
     """Event filters, mirroring the Explorer's filter shape.
@@ -118,9 +122,12 @@ class AgentScope:
     source_ids: list[str]
     field_mappings: dict[str, list[str]] | None
     source_offsets: dict[str, int] | None
+    conversation_id: str | None = None
 
 
-async def build_scope(case_id: str, timeline_id: str, user: User) -> AgentScope:
+async def build_scope(
+    case_id: str, timeline_id: str, user: User, conversation_id: str | None = None
+) -> AgentScope:
     """Resolve the timeline's source scope once for a conversation turn."""
     from vestigo.api.routers.events import _resolve_timeline_scope
 
@@ -132,6 +139,7 @@ async def build_scope(case_id: str, timeline_id: str, user: User) -> AgentScope:
         source_ids=source_ids,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
+        conversation_id=conversation_id,
     )
 
 
@@ -237,6 +245,19 @@ async def _build_query(
         field_mappings=scope.field_mappings,
         source_offsets=scope.source_offsets,
     )
+
+
+async def _resolve_event_sources(
+    scope: AgentScope, event_ids: list[str]
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve event_id -> source_id within scope; also return unknown ids."""
+    from vestigo.api.routers.events import _get_query_service
+
+    query = await _build_query(scope, FilterSpec(event_ids=event_ids))
+    query.limit = len(event_ids)
+    page = await run_in_threadpool(_get_query_service().query, query)
+    found = {e["event_id"]: e["source_id"] for e in page.events}
+    return found, [i for i in event_ids if i not in found]
 
 
 def build_tool_server(scope: AgentScope) -> FastMCP:
@@ -429,6 +450,54 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         query = await _build_query(scope, spec, limit=1)
         page = await run_in_threadpool(service.query, query)
         return {"accepted": True, "title": title, "total": page.total}
+
+    if scope.conversation_id is not None:
+
+        @server.tool()
+        async def propose_annotation(
+            event_ids: list[str],
+            tag: str | None = None,
+            comment: str | None = None,
+            rationale: str = "",
+        ) -> dict[str, Any]:
+            """Propose tagging/commenting specific events — the analyst must confirm.
+
+            Nothing is written until the analyst clicks Confirm on the proposal
+            card. Provide exact event_ids (max 500) you have inspected via
+            search_events/get_event, at least one of tag/comment, and a short
+            rationale. Annotation is a deliberate act: propose focused,
+            verified sets, not broad sweeps.
+            """
+            from vestigo.api.deps import get_store
+
+            if not tag and not comment:
+                return {"error": "provide at least one of tag or comment"}
+            if not event_ids:
+                return {"error": "event_ids must not be empty"}
+            if len(event_ids) > MAX_PROPOSAL_EVENTS:
+                return {
+                    "error": (
+                        f"too many events ({len(event_ids)} > "
+                        f"{MAX_PROPOSAL_EVENTS}) — narrow the set"
+                    )
+                }
+            found, unknown = await _resolve_event_sources(scope, list(dict.fromkeys(event_ids)))
+            if unknown:
+                return {"error": f"event ids not found in this timeline: {unknown[:20]}"}
+            proposal = await get_store().create_agent_proposal(
+                case_id=scope.case_id,
+                timeline_id=scope.timeline_id,
+                conversation_id=scope.conversation_id,
+                tag=tag,
+                comment=comment,
+                rationale=rationale,
+                events=[{"source_id": s, "event_id": e} for e, s in found.items()],
+            )
+            return {
+                "proposal_id": proposal.id,
+                "status": "proposed",
+                "event_count": len(found),
+            }
 
     @server.tool()
     async def semantic_search(q: str, limit: int = 10) -> dict[str, Any]:
