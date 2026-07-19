@@ -7,6 +7,16 @@
 
 <p align="center"><em>vestigo</em> (Latin) — <em>I follow the tracks; I investigate.</em></p>
 
+<p align="center">
+  <a href="https://github.com/overcuriousity/Vestigo/actions/workflows/ci.yml"><img src="https://github.com/overcuriousity/Vestigo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/overcuriousity/Vestigo/actions/workflows/codeql.yml"><img src="https://github.com/overcuriousity/Vestigo/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
+  <a href="https://github.com/overcuriousity/Vestigo/releases/latest"><img src="https://img.shields.io/github/v/release/overcuriousity/Vestigo?logo=github" alt="Latest release"></a>
+  <a href="https://github.com/overcuriousity/Vestigo/pkgs/container/vestigo"><img src="https://img.shields.io/badge/container-ghcr.io-blue?logo=docker&logoColor=white" alt="Container image"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/overcuriousity/Vestigo" alt="License: GPL-3.0"></a>
+  <img src="https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13">
+  <img src="https://img.shields.io/badge/react-19-61DAFB?logo=react&logoColor=black" alt="React 19">
+</p>
+
 A forensic-grade post-mortem log investigation platform.
 
 Vestigo ingests Timesketch-compatible timelines at scale, lets analysts explore events
