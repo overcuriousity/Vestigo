@@ -224,6 +224,9 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         # 0006 adds the Sigma runner tables.
         await conn.execute(text("DROP TABLE sigma_rules"))
         await conn.execute(text("DROP TABLE sigma_runs"))
+        # 0007 adds the AI-agent conversation tables.
+        await conn.execute(text("DROP TABLE agent_conversations"))
+        await conn.execute(text("DROP TABLE agent_messages"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))

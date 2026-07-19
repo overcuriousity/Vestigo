@@ -1,6 +1,34 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 64 — v1.2.0 release, dependency roundup, v1.2.1).
+Last updated: 2026-07-19 (session 65 — AI investigation agent v1).
+
+## Session 65 — 2026-07-19: AI investigation agent (feat/ai-agent)
+
+- **Optional AI agent embedded in the Explorer** (docs/AGENT.md): chat panel
+  that drives the iterative analysis loop (search → aggregate → detect →
+  refine) and returns findings as one-click-applyable filter sets
+  (sandbox + apply — the agent never mutates the analyst's view).
+- Backend: `src/vestigo/agent/` — read-only tools on a standard MCP server
+  (`tools.py`, scope-bound per conversation, wrapping EventQueryService /
+  StatisticalAnomalyService / SimilarityService), pydantic-ai runtime with
+  streaming (`runtime.py`), availability probe + `/api/health`
+  `agent_available` flag (`availability.py`), SSE router
+  (`api/routers/agent.py`), Postgres persistence (migration 0007:
+  `agent_conversations`/`agent_messages`) with tool calls mirrored into the
+  audit trail (`agent.tool_call`).
+- Feature is invisible unless `VESTIGO_AGENT_*` is configured **and** the
+  endpoint answers a probe. Providers: OpenAI-compatible (ollama/vllm/
+  LocalAI/OpenRouter) and Anthropic-compatible; Kimi coding plan supported
+  out of the box (UA gate via `VESTIGO_AGENT_USER_AGENT`, unsigned-thinking
+  replay shim `KimiAnthropicModel` — endpoint quirks verified against
+  hermes-agent source, see docs/AGENT.md).
+- Frontend: `components/agent/` (AgentPanel, FindingCard), `api/agent.ts`
+  (POST-SSE reader), `stores/agent.ts`; Explorer toolbar gains an "Agent"
+  button gated on the health flag.
+- New deps: `pydantic-ai-slim[openai,anthropic,mcp]`, `mcp`. Tests:
+  `tests/test_agent_api.py` (13), `frontend/src/test/agent.test.ts`.
+- Roadmap: Milestone 8 (agent annotations with `origin: agentic-analysis`,
+  external MCP endpoint with PAT auth).
 
 ## Session 64 — 2026-07-19: v1.2.0 release + dependency roundup (v1.2.1)
 

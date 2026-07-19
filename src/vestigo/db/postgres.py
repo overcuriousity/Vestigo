@@ -940,6 +940,91 @@ class SigmaRun(Base):
         }
 
 
+class AgentConversation(Base):
+    """A persisted AI-agent chat, scoped to one case timeline and one user.
+
+    Forensic reproducibility: the conversation plus its ``AgentMessage`` rows
+    (including every tool call with exact arguments) let an analyst show
+    later how an agent-assisted finding was reached. ``history`` holds the
+    runtime's own serialized message history (pydantic-ai wire format) so
+    follow-up turns replay byte-identical context — including provider
+    quirks like Kimi's reasoning blocks — while the message rows stay the
+    human-readable record.
+    """
+
+    __tablename__ = "agent_conversations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Model identity snapshot (provider + model name) at creation time.
+    model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    history: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the AgentConversation API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "model_id": self.model_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AgentMessage(Base):
+    """One human-readable step of an agent conversation.
+
+    ``role`` is ``user`` | ``assistant`` | ``tool``. Tool rows carry the tool
+    name, its exact arguments and a result summary — the auditable record of
+    what the agent actually queried. Append-only, like ``AuditLog``.
+    """
+
+    __tablename__ = "agent_messages"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tool_args: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    tool_result: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the AgentMessage API response."""
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "role": self.role,
+            "content": self.content,
+            "tool_name": self.tool_name,
+            "tool_args": self.tool_args,
+            "tool_result": self.tool_result,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class User(Base):
     """An analyst or administrator account.
 
@@ -2837,6 +2922,131 @@ class PostgresStore:
                 select(DetectorRun).where(DetectorRun.case_id == case_id, DetectorRun.id == run_id)
             )
             return result.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
+    # Agent conversations
+    # ------------------------------------------------------------------
+
+    async def create_agent_conversation(
+        self,
+        case_id: str,
+        timeline_id: str,
+        user_id: str,
+        title: str = "",
+        model_id: str | None = None,
+    ) -> AgentConversation:
+        """Create a new agent conversation."""
+        conversation = AgentConversation(
+            id=generate_id("agentconv"),
+            case_id=case_id,
+            timeline_id=timeline_id,
+            user_id=user_id,
+            title=title,
+            model_id=model_id,
+        )
+        async with self.session_factory() as session:
+            session.add(conversation)
+            await session.commit()
+            await session.refresh(conversation)
+            return conversation
+
+    async def get_agent_conversation(
+        self, case_id: str, conversation_id: str
+    ) -> AgentConversation | None:
+        """Return one agent conversation by case and conversation IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentConversation).where(
+                    AgentConversation.case_id == case_id,
+                    AgentConversation.id == conversation_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_agent_conversations(
+        self, case_id: str, timeline_id: str | None = None, user_id: str | None = None
+    ) -> list[AgentConversation]:
+        """List agent conversations, newest first."""
+        stmt = select(AgentConversation).where(AgentConversation.case_id == case_id)
+        if timeline_id is not None:
+            stmt = stmt.where(AgentConversation.timeline_id == timeline_id)
+        if user_id is not None:
+            stmt = stmt.where(AgentConversation.user_id == user_id)
+        stmt = stmt.order_by(AgentConversation.updated_at.desc())
+        async with self.session_factory() as session:
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def update_agent_conversation(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        history: list | None = None,
+    ) -> None:
+        """Update a conversation's title and/or replayable history snapshot."""
+        values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if title is not None:
+            values["title"] = title
+        if history is not None:
+            values["history"] = history
+        async with self.session_factory() as session:
+            await session.execute(
+                update(AgentConversation)
+                .where(AgentConversation.id == conversation_id)
+                .values(**values)
+            )
+            await session.commit()
+
+    async def delete_agent_conversation(self, case_id: str, conversation_id: str) -> bool:
+        """Delete a conversation and its messages. Returns False when not found."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(AgentConversation).where(
+                    AgentConversation.case_id == case_id,
+                    AgentConversation.id == conversation_id,
+                )
+            )
+            await session.execute(
+                delete(AgentMessage).where(AgentMessage.conversation_id == conversation_id)
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    async def add_agent_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str = "",
+        tool_name: str | None = None,
+        tool_args: dict | None = None,
+        tool_result: dict | list | None = None,
+    ) -> AgentMessage:
+        """Append one message row to a conversation."""
+        message = AgentMessage(
+            id=generate_id("agentmsg"),
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_result=tool_result,
+        )
+        async with self.session_factory() as session:
+            session.add(message)
+            await session.commit()
+            await session.refresh(message)
+            return message
+
+    async def list_agent_messages(self, conversation_id: str) -> list[AgentMessage]:
+        """Return a conversation's messages in chronological order."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentMessage)
+                .where(AgentMessage.conversation_id == conversation_id)
+                .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
+            )
+            return list(result.scalars().all())
 
     # ------------------------------------------------------------------
     # Sigma rules + runs

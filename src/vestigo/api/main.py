@@ -14,9 +14,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vestigo import __version__
+from vestigo.agent.availability import agent_available
 from vestigo.api.deps import get_store, resolve_user_optional
 from vestigo.api.routers import (
     admin,
+    agent,
     auth,
     baselines,
     cases,
@@ -444,6 +446,10 @@ def create_app() -> FastAPI:
             # remote embedding endpoint is configured — embed jobs and
             # semantic search return 503 in that state.
             "embeddings_available": embeddings_available(),
+            # False unless VESTIGO_AGENT_* is configured and the endpoint
+            # answered the cached probe — the frontend renders no agent UI
+            # at all in that state.
+            "agent_available": await agent_available(),
         }
 
     app.include_router(auth.router)
@@ -458,6 +464,7 @@ def create_app() -> FastAPI:
     app.include_router(sigma.router)
     app.include_router(stream.router)
     app.include_router(converters.router)
+    app.include_router(agent.router)
 
     # Serve the built frontend when frontend/dist exists.
     # Run `npm run build` inside frontend/ once; vestigo-web then serves everything.

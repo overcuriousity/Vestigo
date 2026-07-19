@@ -19,6 +19,7 @@ import {
   BarChart2,
   AreaChart,
   Repeat,
+  Sparkles,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -47,6 +48,9 @@ import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
+import { AgentPanel } from "@/components/agent/AgentPanel";
+import { useAgentStore } from "@/stores/agent";
+import { useHealth } from "@/api/health";
 import { RoutineCollapseStat } from "@/components/explorer/RoutineCollapseStat";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -325,6 +329,11 @@ export function ExplorerPage() {
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
   const investigatePanelOpen = useUiStore((s) => s.investigatePanelOpen);
   const setInvestigatePanelOpen = useUiStore((s) => s.setInvestigatePanelOpen);
+  // Agent panel: only offered when the backend probe says the agent exists —
+  // an unconfigured install renders zero agent UI.
+  const agentAvailable = useHealth().data?.agent_available ?? false;
+  const agentPanelOpen = useAgentStore((s) => s.panelOpen);
+  const setAgentPanelOpen = useAgentStore((s) => s.setPanelOpen);
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const handleExpandEvent = useCallback((event: Event | null) => {
     if (event) tourEvent("event-expanded");
@@ -1044,6 +1053,19 @@ export function ExplorerPage() {
                 Investigate
               </Button>
             </Tooltip>
+
+            {agentAvailable && (
+              <Tooltip content={agentPanelOpen ? "Close Agent panel" : "Ask the AI agent to investigate"}>
+                <Button
+                  variant={agentPanelOpen ? "accent" : "outline"}
+                  size="sm"
+                  onClick={() => setAgentPanelOpen(!agentPanelOpen)}
+                >
+                  <Sparkles size={13} />
+                  Agent
+                </Button>
+              </Tooltip>
+            )}
           </div>
         </div>
 
@@ -1204,6 +1226,17 @@ export function ExplorerPage() {
                     onAnomalyRunId={setAnomalyRunId}
                     onJumpToTime={handleJumpToTime}
                     onTagFilter={handleTagDrill}
+                  />
+                )}
+
+                {/* AI agent panel (sandbox + apply; only when configured) */}
+                {agentAvailable && agentPanelOpen && (
+                  <AgentPanel
+                    caseId={caseId!}
+                    timelineId={timelineId!}
+                    currentFilters={filters}
+                    onApplyFilters={setFilters}
+                    onClose={() => setAgentPanelOpen(false)}
                   />
                 )}
               </div>

@@ -862,6 +862,11 @@ export interface HealthResponse {
   oidc_enabled: boolean;
   /** False when neither local embedding deps nor a remote endpoint are configured. */
   embeddings_available: boolean;
+  /**
+   * True only when VESTIGO_AGENT_* is configured and the LLM endpoint
+   * answered the backend's probe — the agent UI renders nothing otherwise.
+   */
+  agent_available: boolean;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */

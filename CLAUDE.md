@@ -29,6 +29,8 @@ auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/
 - `TECH_STACK.md` — backing-service decision record (*why*, not *what's shipped*).
 - `ANOMALY_DETECTION.md` — reference for every detector actually running (value novelty,
   frequency, semantic similarity). Update alongside any detector change in the same commit.
+- `AGENT.md` — the optional AI investigation agent (design invariants, MCP tools, provider
+  config incl. Kimi coding plan). Update alongside any `src/vestigo/agent/` change.
 - `ROADMAP.md` — **the only open backlog.** Condensed, checkbox-per-item, current phase only.
   Keep it up to date as items land; delete items once fixed rather than marking them done and
   leaving them.

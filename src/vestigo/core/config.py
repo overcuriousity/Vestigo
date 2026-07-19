@@ -239,6 +239,30 @@ class Settings(BaseSettings):
     oidc_scopes: str = "openid email profile"
     oidc_redirect_url: str | None = None
 
+    # AI investigation agent (optional; see docs/AGENT.md). The feature is off
+    # — and invisible in the UI — unless both agent_model and an endpoint are
+    # configured AND the endpoint answers a probe. Independent of
+    # `allow_online` for the same reason as OIDC and the embeddings endpoint:
+    # the operator explicitly points Vestigo at an endpoint they trust.
+    agent_model: str | None = None
+    # Wire protocol of the endpoint: "openai" = OpenAI chat-completions
+    # (ollama, vllm, LocalAI, OpenRouter, api.moonshot.ai/v1), "anthropic" =
+    # Anthropic Messages (Anthropic itself, Kimi coding plan
+    # https://api.kimi.com/coding).
+    agent_provider: str = Field(default="openai", pattern="^(openai|anthropic)$")
+    agent_api_base_url: str | None = None
+    agent_api_key: str | None = None
+    # Some subscription endpoints gate on the client's User-Agent (e.g. Kimi's
+    # /coding endpoint 403s unless the UA identifies a coding agent). Set the
+    # value the endpoint expects; unset sends the SDK default.
+    agent_user_agent: str | None = None
+    # Extra HTTP headers as a JSON object, e.g. '{"X-Custom": "1"}'.
+    agent_extra_headers: dict[str, str] | None = None
+    # Hard cap on model round-trips per user message (tool-call loop bound).
+    agent_max_turns: int = Field(default=15, ge=1, le=100)
+    # Seconds an availability probe result is cached before re-probing.
+    agent_probe_ttl_seconds: float = Field(default=60.0, gt=0)
+
 
 @lru_cache
 def get_settings() -> Settings:

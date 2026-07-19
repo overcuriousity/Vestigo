@@ -39,6 +39,8 @@ dependencies = [
     "pyarrow>=25.0.0",
     "pysigma>=0.11.0,<1.0.0",
     "pyyaml>=6.0",
+    "pydantic-ai-slim[anthropic,mcp,openai]>=2.13.0",
+    "mcp>=1.28.1",
 ]
 
 [project.optional-dependencies]

@@ -257,6 +257,17 @@ Carries over unchanged: provenance chain (Source `file_hash`, per-event
 schema-on-read (W8) gain the new domain for free, auth/RBAC/audit as chain-of-custody
 baseline. In-memory JobStore stays — heavy work lives in converters.
 
+## Milestone 8 — AI investigation agent expansion (v1 shipped 2026-07-19, see docs/AGENT.md)
+
+- [ ] **A1 — Agent annotations with `origin: agentic-analysis`.** Let the agent tag/annotate
+  events (today it is read-only). Requires an explicit analyst confirmation step in the
+  chat UI (propose → confirm → write), a new `Annotation.origin` value alongside
+  `user`/`system`, and audit rows crediting both the analyst and the conversation.
+- [ ] **A2 — External MCP endpoint.** Mount the existing tool server
+  (`agent/tools.py`) over HTTP so external harnesses (Claude Code, hermes-agent, nib)
+  can investigate a case with the analyst's own tooling. Needs personal access tokens
+  (session cookies don't fit headless clients) and per-token case scoping.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
