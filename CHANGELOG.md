@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-07-19
+
+### Added
+
+- **Sigma rule runner** (`docs/ANOMALY_DETECTION.md` §13) — deterministic signature
+  matching of community-standard [Sigma](https://github.com/SigmaHQ/sigma) YAML rules
+  over ClickHouse, deliberately separate from the statistical detectors. Rules come
+  from an admin-managed offline directory (`VESTIGO_SIGMA_RULES_PATH`, a file drop —
+  no restart needed, unchanged files reuse a per-file parse cache) and per-case
+  uploads. Every hit is written as `Annotation(origin=system, annotation_type="sigma")`
+  whose `sigma: <rule title>` label joins the unified tag filter panel.
+- **Custom pySigma → ClickHouse backend**: one boolean SQL expression per rule.
+  Sigma-spec case-insensitive matching (`ILIKE` with `*`/`?` wildcards), `|cased`,
+  `|re` (RE2), `|cidr` (guarded `isIPAddressInRange`), numeric comparisons, null/missing
+  semantics, field-less keywords over `search_blob`. Field names resolve through
+  ruleset `vestigo-fieldmap.yml` → timeline canonical mappings → raw-attribute
+  fallback (tracked and flagged in the UI). All values pass through an audited,
+  adversarially-tested literal-quoting boundary.
+- **Streamed, reproducible runs**: background job per timeline; per rule, hits stream
+  under the shared heavy-scan gate through a bounded queue (no hit cap, no in-memory
+  hit list) into batched annotation writes; re-runs are idempotent per rule and
+  preserve confirmed findings. Persistent `sigma_runs` records (Alembic `0006`)
+  snapshot each rule's YAML content hash, exact compiled SQL, match count, and status.
+- **Sigma tab** in the Investigate panel: rule picker with level/logsource badges,
+  YAML upload, run launch into the job tray, run history with per-rule status,
+  compiled-SQL view, fallback-field warnings, and filter-grid-by-rule.
+- Config: `VESTIGO_SIGMA_RULES_PATH`, `VESTIGO_SIGMA_ANNOTATION_BATCH_SIZE`.
+  Deps: `pysigma`, explicit `pyyaml` (offline — no Sigma code path touches the network).
+
 ## [1.1.0] — 2026-07-13
 
 ### Added
