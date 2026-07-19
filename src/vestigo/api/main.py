@@ -19,6 +19,7 @@ from vestigo.api.deps import get_store, resolve_user_optional
 from vestigo.api.routers import (
     admin,
     agent,
+    agent_tokens,
     auth,
     baselines,
     cases,
@@ -465,6 +466,7 @@ def create_app() -> FastAPI:
     app.include_router(stream.router)
     app.include_router(converters.router)
     app.include_router(agent.router)
+    app.include_router(agent_tokens.router)
 
     # Serve the built frontend when frontend/dist exists.
     # Run `npm run build` inside frontend/ once; vestigo-web then serves everything.
