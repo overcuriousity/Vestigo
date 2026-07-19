@@ -275,7 +275,7 @@ export function AdminAgentPage() {
             <Input
               type="password"
               value={apiKeyInput}
-              disabled={isEnvPinned("api_key") || clearApiKey}
+              disabled={isEnvPinned("api_key") || clearApiKey || data.secret_mode === "env-only"}
               onChange={(e) => {
                 setApiKeyInput(e.target.value);
                 setClearApiKey(false);
@@ -308,7 +308,9 @@ export function AdminAgentPage() {
             )}
           </div>
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-            Leave blank to keep the current key unchanged. Clearing removes any DB-stored key.
+            {data.secret_mode === "env-only"
+              ? "Database key storage is disabled (VESTIGO_AGENT_SECRET_MODE=env-only). Supply the key via VESTIGO_AGENT_API_KEY."
+              : "Leave blank to keep the current key unchanged. Clearing removes any DB-stored key."}
           </p>
         </Field>
 

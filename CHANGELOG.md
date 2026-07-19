@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-07-19
+
+### Added
+
+- **AI investigation agent** (`docs/AGENT.md`) — optional, off-by-default assistant
+  embedded in the Explorer. It drives the iterative analysis loop (search, aggregate,
+  run detectors, refine) in its own sandbox and hands results back as **findings**:
+  filter-set cards the analyst applies with one click — the agent never mutates the
+  analyst's view. Conversations, every tool call with exact arguments, and the
+  replayable runtime history persist in Postgres; every tool call is audited.
+- **Propose→confirm writes**: the agent never writes annotations itself.
+  `propose_annotation` records a proposal; an analyst confirms or rejects in the UI.
+  Confirming re-resolves events against the current scope and writes annotations with
+  `origin="agentic-analysis"`, credited to the confirming analyst and audited.
+- **Full read parity**: tools for events, aggregations, histograms, similarity /
+  semantic search, all statistical detectors (with tuning parameters), detector
+  baselines, dispositions, saved views, annotations, and Sigma rules/runs.
+- **External `/mcp` endpoint** (`VESTIGO_MCP_ENABLED`, default off) — the identical
+  scoped tool server over streamable HTTP for external MCP clients, authenticated by
+  per-timeline scoped tokens (`vgo_…`, shown once at creation). Scope comes from the
+  token, never from the client.
+- **Admin agent settings page** — DB-backed runtime configuration with per-field
+  env-pinning (`VESTIGO_AGENT_*` always wins, pinned fields shown disabled with a
+  badge), masked API key, endpoint test button, and per-provider reasoning-effort
+  translation (`off`–`max`, incl. an experimental Kimi mapping).
+- **Token-usage metering** — measured per turn from the runtime (never estimated;
+  `NULL` when the endpoint reports nothing), shown as per-message chips and a running
+  conversation total.
+- **`VESTIGO_AGENT_SECRET_MODE=env-only`** — refuses DB storage of the LLM API key and
+  ignores any previously stored one, making `VESTIGO_AGENT_API_KEY` the only source.
+- Explorer: agent-provenance badge on annotations; usernames resolve to display names
+  everywhere names render.
+
+### Changed
+
+- `docs/CONCEPT.md` refreshed to match the shipped product: statistical detector suite,
+  Sigma, and the agent in the vision; corrected Qdrant collection naming; out-of-scope
+  list rewritten (streaming ingest, correlation rules, and Stories are now roadmap
+  milestones).
+
 ## [1.2.1] — 2026-07-19
 
 ### Changed

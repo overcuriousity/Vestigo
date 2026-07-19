@@ -1,6 +1,31 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 68 — PR137 review fix batch).
+Last updated: 2026-07-19 (session 69 — Phase 3 kickoff, Step 0 consolidation).
+
+## Session 69 — 2026-07-19: Phase 3 plan + Step 0 consolidation (feat/phase3-step0)
+
+Phase 3 ("investigation depth") decided and specced:
+`docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md` — order is
+W6 template clustering, A9 viz parity, W7 Stories (human-first; agent stays analysis
+companion). D10/M6/M7 parked, with a standing rule that S1+E1 get one joint
+`MODEL_REFINEMENT.md` round when either resumes.
+
+Step 0 executed:
+
+- **PR #137 merged** (AI investigation agent). The CodeQL gate's one alert
+  (`py/weak-sensitive-data-hashing` on `config_fingerprint`) was dismissed as a false
+  positive: sha256 there builds an in-memory probe-cache fingerprint, not password
+  storage, and the key must participate so rotation busts the cache.
+- **A10 — `VESTIGO_AGENT_SECRET_MODE=env-only`**: admin PUT refuses DB storage of the
+  API key (400; clearing stays allowed), the resolver ignores a previously stored key,
+  the settings response carries `secret_mode`, and the admin UI disables the key input
+  with a hint. No envelope encryption (decision in the Phase 3 spec). Tests in
+  `tests/test_admin_api.py`.
+- **CONCEPT.md refresh**: vision line now names the statistical detector suite and the
+  agent; §6 de-MVP'd ("Core Feature Set (shipped)"); §6.2 Qdrant naming corrected to
+  per `(case, embedding-config hash)`; §7 rewritten — streaming/correlation-rules/story
+  builder moved out (now roadmap milestones), agentless + converter-only-parsing
+  boundaries recorded; §11 now points at ROADMAP/PROGRESS instead of a done checklist.
 
 ## Session 68 — 2026-07-19: PR137 pre-merge review fixes (feat/ai-agent)
 

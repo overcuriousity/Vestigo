@@ -252,6 +252,12 @@ class Settings(BaseSettings):
     agent_provider: str = Field(default="openai", pattern="^(openai|anthropic)$")
     agent_api_base_url: str | None = None
     agent_api_key: str | None = None
+    # Where the LLM API key may live (A10). "db" (default): admins may store it
+    # in the agent_settings row (plaintext at rest — acceptable only if Postgres
+    # itself is trusted). "env-only": the admin API refuses to store a key and
+    # the resolver ignores any previously stored one — VESTIGO_AGENT_API_KEY is
+    # then the only way to supply it.
+    agent_secret_mode: str = Field(default="db", pattern="^(db|env-only)$")
     # Some subscription endpoints gate on the client's User-Agent (e.g. Kimi's
     # /coding endpoint 403s unless the UA identifies a coding agent). Set the
     # value the endpoint expects; unset sends the SDK default.

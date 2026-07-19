@@ -377,3 +377,48 @@ def test_agent_settings_put_strips_whitespace(client, admin_bootstrap, store):
     # Whitespace-only degrades to an explicit clear.
     assert effective["model"] is None
     assert effective["api_key_set"] is False
+
+
+def test_agent_settings_env_only_mode_rejects_db_key_storage(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """VESTIGO_AGENT_SECRET_MODE=env-only (A10): the PUT refuses to store the
+    api_key in Postgres (other fields still editable), the response advertises
+    the mode, and a key already stored before the mode was enabled is ignored
+    by the resolver rather than silently used."""
+    import asyncio
+
+    from vestigo.agent.config import resolve_agent_config
+
+    as_admin(client, admin_bootstrap)
+
+    # Key stored while in default "db" mode.
+    resp = client.put("/api/admin/agent-settings", json={"api_key": "sk-stored"})
+    assert resp.status_code == 200
+    assert resp.json()["secret_mode"] == "db"
+
+    monkeypatch.setenv("VESTIGO_AGENT_SECRET_MODE", "env-only")
+    get_settings.cache_clear()
+    try:
+        resp = client.get("/api/admin/agent-settings")
+        assert resp.json()["secret_mode"] == "env-only"
+        # The pre-existing DB key is ignored by the resolver...
+        assert resp.json()["effective"]["api_key_set"] is False
+        config = asyncio.run(resolve_agent_config())
+        assert config.api_key is None
+        assert config.sources["api_key"] == "default"
+
+        # ...and new writes are refused outright.
+        resp = client.put("/api/admin/agent-settings", json={"api_key": "sk-new"})
+        assert resp.status_code == 400
+        assert "VESTIGO_AGENT_API_KEY" in resp.json()["detail"]
+        # Clearing the stored key is still allowed (it's how you clean up).
+        resp = client.put("/api/admin/agent-settings", json={"api_key": None})
+        assert resp.status_code == 200
+        # Non-secret fields stay editable.
+        resp = client.put("/api/admin/agent-settings", json={"model": "qwen3:32b"})
+        assert resp.status_code == 200
+        assert resp.json()["effective"]["model"] == "qwen3:32b"
+    finally:
+        monkeypatch.delenv("VESTIGO_AGENT_SECRET_MODE", raising=False)
+        get_settings.cache_clear()

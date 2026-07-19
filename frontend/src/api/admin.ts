@@ -8,6 +8,8 @@ export interface AgentSettingsResponse {
   effective: Record<string, unknown> & { api_key_set: boolean };
   sources: Record<string, "env" | "db" | "default">;
   env_vars: Record<string, string>;
+  /** A10: "env-only" means the backend refuses to store the API key in the DB. */
+  secret_mode: "db" | "env-only";
 }
 
 export const adminApi = {

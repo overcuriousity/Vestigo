@@ -196,6 +196,7 @@ to server behavior.
 | `VESTIGO_AGENT_MAX_TURNS` | Model round-trip cap per user message (default 15). |
 | `VESTIGO_AGENT_REASONING_EFFORT` | Reasoning-effort enum: `off` (default), `low`, `medium`, `high`, `max`. Admin-editable; see **Reasoning effort** below. |
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
+| `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key and ignore any previously stored one — `VESTIGO_AGENT_API_KEY` becomes the only source (A10). Env-only, not admin-editable. |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` streamable-HTTP endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
 
 ### DB-backed settings and env-wins precedence (A7)
@@ -218,6 +219,10 @@ env-pinned fields as disabled with a `pinned by VESTIGO_AGENT_<FIELD>` badge ins
 silently accepting edits that would never take effect. `api_key` is never round-tripped
 in plaintext through this API — only an `api_key_set` boolean; the UI's password field
 treats an empty submit as "unchanged" and requires an explicit clear action to null it out.
+The DB-stored key is plaintext at rest; `VESTIGO_AGENT_SECRET_MODE=env-only` (A10) makes the
+PUT refuse key storage (400) and the resolver ignore any previously stored key, so
+`VESTIGO_AGENT_API_KEY` is the only source — clearing a leftover stored key stays allowed.
+The response's `secret_mode` field drives the UI's disabled key input in that mode.
 Resolved configs are cached per-fingerprint (hash of the resolved values) so admin edits
 take effect on the next call without a process restart, and `PUT` resets the availability
 probe cache so a following health check re-probes immediately.

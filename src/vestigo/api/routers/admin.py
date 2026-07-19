@@ -563,7 +563,12 @@ async def _agent_settings_response() -> dict[str, Any]:
         for field_name, source in config.sources.items()
         if source == "env"
     }
-    return {"effective": effective, "sources": dict(config.sources), "env_vars": env_vars}
+    return {
+        "effective": effective,
+        "sources": dict(config.sources),
+        "env_vars": env_vars,
+        "secret_mode": get_settings().agent_secret_mode,
+    }
 
 
 @router.get("/agent-settings")
@@ -584,6 +589,21 @@ async def set_agent_settings(
     waiting out the TTL. Audited with field *names* only — values (which may
     include the API key) never enter the audit trail.
     """
+    if (
+        "api_key" in payload.model_fields_set
+        and payload.api_key is not None
+        and get_settings().agent_secret_mode == "env-only"
+    ):
+        # A10: env-only mode keeps the LLM key out of Postgres entirely.
+        # Clearing (null) stays allowed so a key stored before the mode was
+        # enabled can be cleaned up.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "API key storage in the database is disabled "
+                "(VESTIGO_AGENT_SECRET_MODE=env-only); set VESTIGO_AGENT_API_KEY instead"
+            ),
+        )
     store = get_store()
     changed_fields = sorted(payload.model_fields_set)
     if changed_fields:

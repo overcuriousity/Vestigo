@@ -141,7 +141,12 @@ async def resolve_agent_config(settings: Settings | None = None) -> AgentConfig:
             resolved[config_field] = env_value
             sources[config_field] = "env"
             continue
-        db_value = getattr(db_row, db_attr, None) if db_row is not None else None
+        if config_field == "api_key" and settings.agent_secret_mode == "env-only":
+            # A10: a key stored before env-only mode was enabled must not be
+            # silently used — env (handled above) is the only source.
+            db_value = None
+        else:
+            db_value = getattr(db_row, db_attr, None) if db_row is not None else None
         if db_value is not None:
             resolved[config_field] = db_value
             sources[config_field] = "db"
