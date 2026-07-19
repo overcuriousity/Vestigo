@@ -1,6 +1,62 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 65 — AI investigation agent v1).
+Last updated: 2026-07-19 (session 66 — agent read parity + external MCP endpoint).
+
+## Session 66 — 2026-07-19: agent read parity + external MCP endpoint (feat/ai-agent)
+
+Closes the gap between the v1 agent (session 65) and full analyst read
+visibility, and adds a second transport so external MCP clients can reuse
+the same tool server — motivated by agent-analyst parity (the agent
+couldn't see baselines, prior annotations, saved views, or Sigma
+rules/runs, making the temporal detectors effectively unusable to it) and
+by wanting agent-agnostic external access (Claude Code, hermes-agent, nib)
+without duplicating the tool implementation. Design:
+`docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md`.
+
+- **9 new read tools** (`src/vestigo/agent/tools.py`): `list_baselines`,
+  `list_dispositions`, `list_saved_views`, `list_annotations`,
+  `get_event_annotations`, `list_sigma_rules`, `get_sigma_rule`,
+  `list_sigma_runs`, `get_sigma_run` — 20 tools total, same scope-bound
+  closure pattern as the original 11.
+- **FilterSpec extension**: `annotated` (`tag`/`anomaly`),
+  `annotation_tag_value`, `run_id` (detector-run finding membership),
+  `event_ids`, `collapse_routine`. Deliberately no `exclude_event_ids` —
+  the frontend `EventFilters` shape has no exclude-ids field, so such a
+  finding could never be applied via `propose_finding`'s one-click path.
+  Frontend maps `run_id` onto `EventFilters.anomalyRunId`
+  (`frontend/src/api/agent.ts`).
+- **Detector tuning parity**: `run_anomaly_detector` gained `z_threshold`,
+  `min_skew_seconds`, `fdr_q`, `min_ratio`, `ngram_size`, `min_support`,
+  `start`, `end`, with Pydantic bounds identical to the HTTP endpoint's
+  `Query` validation.
+- **`AgentToken` + scoped PAT management**: new Postgres model + Alembic
+  migration 0008, store CRUD methods, and
+  `/api/cases/{case_id}/timelines/{timeline_id}/agent-tokens`
+  (`api/routers/agent_tokens.py`) for create/list/revoke, RBAC-checked so a
+  token grants no more than its creator's own case access. Token UI dialog
+  in the timeline list (`AgentTokensDialog.tsx`), gated on the
+  `mcp_enabled` health flag.
+- **External `/mcp` endpoint** (`agent/mcp_http.py`): MCP Streamable HTTP,
+  Bearer `vgo_*` token auth, per-connect re-check that the token's creator
+  still has case access, scope derived from the token
+  (`build_scope(case, timeline, user)`) never from the model — builds the
+  *identical* tool server the built-in agent uses
+  (`build_tool_server(scope)`), one code path for both transports.
+  `agent.tool_call` audit rows carry the token id and `transport:
+  "mcp_http"`. Gated by `VESTIGO_MCP_ENABLED` (default off, independent of
+  `VESTIGO_AGENT_*`); off means a clean 404. FastMCP's DNS-rebinding host
+  validation disabled here — safe because Bearer auth precedes all
+  dispatch, unlike the browser-ambient-credential threat that protection
+  targets.
+- New tests: `tests/test_agent_tools.py`, `tests/test_agent_tokens.py`,
+  `tests/test_mcp_http.py`.
+- Two reviewer minors noted, not yet fixed (`docs/ROADMAP.md` Milestone 8
+  A3/A4): `list_sigma_runs` applies the store's `limit=50` case-wide before
+  filtering to the current timeline; `/mcp` audit sniffing only recognizes
+  a single JSON-RPC object and relies on the MCP SDK rejecting batch
+  arrays (true today — batching was removed from the 2025-06-18 MCP spec).
+- Roadmap: Milestone 8 A2 (external MCP endpoint) closed; A1 (agent
+  annotations) still open.
 
 ## Session 65 — 2026-07-19: AI investigation agent (feat/ai-agent)
 

@@ -259,14 +259,27 @@ baseline. In-memory JobStore stays — heavy work lives in converters.
 
 ## Milestone 8 — AI investigation agent expansion (v1 shipped 2026-07-19, see docs/AGENT.md)
 
+Read parity + external MCP endpoint shipped 2026-07-19 (session 66): nine new read tools
+(baselines, dispositions, saved views, annotations, Sigma rules/runs), FilterSpec gained
+`annotated`/`annotation_tag_value`/`run_id`/`event_ids`/`collapse_routine`, detector tuning
+params on `run_anomaly_detector`, `AgentToken` scoped PATs, and `/mcp` streamable-HTTP
+exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
+`docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
+
 - [ ] **A1 — Agent annotations with `origin: agentic-analysis`.** Let the agent tag/annotate
   events (today it is read-only). Requires an explicit analyst confirmation step in the
   chat UI (propose → confirm → write), a new `Annotation.origin` value alongside
   `user`/`system`, and audit rows crediting both the analyst and the conversation.
-- [ ] **A2 — External MCP endpoint.** Mount the existing tool server
-  (`agent/tools.py`) over HTTP so external harnesses (Claude Code, hermes-agent, nib)
-  can investigate a case with the analyst's own tooling. Needs personal access tokens
-  (session cookies don't fit headless clients) and per-token case scoping.
+- [ ] **A3 — `list_sigma_runs` case-wide limit.** The tool applies the store's `limit=50`
+  case-wide (`PostgresStore.list_sigma_runs`) before filtering to the current timeline
+  (`agent/tools.py::list_sigma_runs`) — a case with many Sigma runs on other timelines can
+  starve this timeline's run list before the Python-side filter ever sees it. Push the
+  timeline filter into the query, or paginate.
+- [ ] **A4 — `/mcp` audit sniffing depends on no JSON-RPC batching.** `_audit_tool_call`
+  (`agent/mcp_http.py`) only recognizes a single JSON-RPC object; a batched `tools/call`
+  array would silently skip the audit row. Currently safe because the MCP SDK's streamable
+  HTTP transport rejects JSON-RPC batch arrays outright (removed in the 2025-06-18 MCP
+  spec) — revisit if the SDK ever reintroduces batching support.
 
 ## Explicitly out of scope (decided during the audit)
 

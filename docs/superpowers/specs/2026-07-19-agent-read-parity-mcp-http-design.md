@@ -55,7 +55,10 @@ New fields, mirroring the events router:
 - `annotated` — subset of `{"tag","anomaly"}` (router param, `api/routers/events.py:579`)
 - `annotation_tag_value`
 - `run_id` — detector-run finding membership (`events.py:587`)
-- `event_ids` / `exclude_event_ids` (`db/queries.py:152,155`)
+- `event_ids` (`db/queries.py:152`) — **deviation from the original plan**: no
+  `exclude_event_ids`. The frontend `EventFilters` shape
+  (`frontend/src/lib/queryParams.ts`) has no exclude-ids field, so a finding using it could
+  never be applied via `propose_finding`'s one-click path — not worth the FilterSpec surface.
 - `collapse_routine` (`events.py:614`, `queries.py:156-161`)
 
 Resolution reuses the events-router helpers `_resolve_annotated_event_ids`
