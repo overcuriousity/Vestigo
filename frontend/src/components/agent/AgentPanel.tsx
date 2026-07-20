@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   Archive,
   Brain,
   Download,
@@ -38,7 +39,7 @@ import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
 import { ProposalCard } from "./ProposalCard";
-import { NewConversationDialog } from "./NewConversationDialog";
+import { ToolSelectorPopover } from "./ToolSelector";
 import { Markdown } from "./Markdown";
 import type { EventFilters } from "@/api/types";
 
@@ -248,12 +249,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
   const [streaming, setStreaming] = useState(false);
   const [pendingUserText, setPendingUserText] = useState<string | null>(null);
-  const [dialogOpen, setDialogOpen] = useState(false);
+  const [disabledTools, setDisabledTools] = useState<string[]>([]);
   const [createError, setCreateError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Same query key the tool popover uses — dedupes onto one request and
+  // doubles as the source for the always-visible OPSEC notice below.
+  const infoQuery = useQuery({ queryKey: ["agent-info"], queryFn: agentApi.getInfo });
+  const info = infoQuery.data;
 
   const conversationsQuery = useQuery({
     queryKey: ["agent-conversations", caseId, timelineId],
@@ -357,38 +363,33 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     [input, streaming, caseId, timelineId, currentFilters, queryClient],
   );
 
-  // Every new conversation goes through the dialog (OPSEC notice + tool
-  // selection) — there is no silent lazy-create path anymore.
+  // The OPSEC notice lives in the panel's empty state (always visible, no
+  // "don't show again") — starting a conversation no longer needs a
+  // blocking dialog on top of it. Tool selection is a toolbar popover.
+  const [creating, setCreating] = useState(false);
+  const createAndSend = useCallback(async () => {
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const conversation = await agentApi.createConversation(caseId, timelineId, disabledTools);
+      queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
+      setActiveConversation(storeKey, conversation.id);
+      void sendTo(conversation.id);
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : "Could not start the conversation.");
+    } finally {
+      setCreating(false);
+    }
+  }, [caseId, timelineId, disabledTools, storeKey, queryClient, setActiveConversation, sendTo]);
+
   const send = useCallback(() => {
-    if (!input.trim() || streaming) return;
+    if (!input.trim() || streaming || creating) return;
     if (!activeId) {
-      setDialogOpen(true);
+      void createAndSend();
       return;
     }
     void sendTo(activeId);
-  }, [input, streaming, activeId, sendTo]);
-
-  const [creating, setCreating] = useState(false);
-  const handleCreate = useCallback(
-    async (disabledTools: string[]) => {
-      setCreating(true);
-      setCreateError(null);
-      try {
-        const conversation = await agentApi.createConversation(caseId, timelineId, disabledTools);
-        queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
-        setActiveConversation(storeKey, conversation.id);
-        setDialogOpen(false);
-        // A message typed before the dialog opened sends immediately.
-        if (input.trim()) void sendTo(conversation.id);
-      } catch (err) {
-        // Dialog stays open with the error shown; the user can retry or cancel.
-        setCreateError(err instanceof Error ? err.message : "Could not start the conversation.");
-      } finally {
-        setCreating(false);
-      }
-    },
-    [caseId, timelineId, storeKey, queryClient, setActiveConversation, input, sendTo],
-  );
+  }, [input, streaming, creating, activeId, createAndSend, sendTo]);
 
   const exportThread = useCallback(async () => {
     if (!activeId) return;
@@ -445,11 +446,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         <select
           className="ml-1 min-w-0 flex-1 truncate rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-1.5 py-0.5 text-xs"
           value={activeId ?? ""}
-          onChange={(e) => {
-            const id = e.target.value || null;
-            setActiveConversation(storeKey, id);
-            if (!id) setDialogOpen(true);
-          }}
+          onChange={(e) => setActiveConversation(storeKey, e.target.value || null)}
         >
           <option value="">New conversation…</option>
           {conversations.map((c) => (
@@ -459,7 +456,12 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           ))}
         </select>
         <Tooltip content="New conversation">
-          <Button variant="ghost" size="icon" disabled={creating} onClick={() => setDialogOpen(true)}>
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={creating}
+            onClick={() => setActiveConversation(storeKey, null)}
+          >
             <Plus size={13} />
           </Button>
         </Tooltip>
@@ -496,11 +498,25 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto p-2.5">
         {items.length === 0 && !streaming && (
-          <p className="px-2 pt-6 text-center text-xs text-[var(--color-fg-secondary)]">
-            Ask the agent to investigate this timeline — it searches, aggregates
-            and runs detectors on its own, then proposes filters you can apply.
-            It never changes your view by itself.
-          </p>
+          <div className="space-y-3 px-2 pt-6">
+            <p className="text-center text-xs text-[var(--color-fg-secondary)]">
+              Ask the agent to investigate this timeline — it searches, aggregates
+              and runs detectors on its own, then proposes filters you can apply.
+              It never changes your view by itself.
+            </p>
+            <div className="mx-auto flex max-w-xs items-start gap-1.5 rounded-md border border-[var(--color-warning)] bg-[var(--color-warning)]/10 p-2 text-left text-[11px] leading-relaxed">
+              <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--color-warning)]" />
+              <p>
+                <span className="font-semibold">Evidence leaves Vestigo.</span> Messages and tool
+                results are sent to{" "}
+                <span className="break-all font-mono font-semibold">
+                  {info?.api_base_url ?? "the configured LLM endpoint"}
+                </span>{" "}
+                and processed by model{" "}
+                <span className="font-mono font-semibold">{info?.model ?? "(unknown)"}</span>.
+              </p>
+            </div>
+          </div>
         )}
         {items.map((item, i) => {
           if (item.kind === "user") {
@@ -607,12 +623,22 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
       {/* Input */}
       <div className="shrink-0 border-t border-[var(--color-border)] p-2">
+        {!activeId && (
+          <div className="mb-1.5 flex items-center">
+            <ToolSelectorPopover disabledTools={disabledTools} onChange={setDisabledTools} />
+          </div>
+        )}
+        {createError && (
+          <p className="mb-1.5 text-[11px] text-[var(--color-danger)]">
+            Could not start the conversation: {createError}
+          </p>
+        )}
         <div className="flex items-end gap-1.5">
           <textarea
             className="max-h-32 min-h-[3.5rem] flex-1 resize-none rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[var(--color-accent)]"
             placeholder="What should the agent look into?"
             value={input}
-            disabled={streaming}
+            disabled={streaming || creating}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
@@ -629,24 +655,18 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             </Tooltip>
           ) : (
             <Tooltip content="Send (Enter)">
-              <Button variant="accent" size="icon" disabled={!input.trim()} onClick={send}>
-                <Send size={13} />
+              <Button
+                variant="accent"
+                size="icon"
+                disabled={!input.trim() || creating}
+                onClick={send}
+              >
+                {creating ? <Spinner size={13} /> : <Send size={13} />}
               </Button>
             </Tooltip>
           )}
         </div>
       </div>
-
-      <NewConversationDialog
-        open={dialogOpen}
-        onOpenChange={(open) => {
-          setDialogOpen(open);
-          if (!open) setCreateError(null);
-        }}
-        onCreate={handleCreate}
-        creating={creating}
-        error={createError}
-      />
     </div>
   );
 }

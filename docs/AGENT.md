@@ -208,29 +208,36 @@ layer denies it):
    Edited as a checkbox list on `Admin → Agent`.
 2. **Per-user defaults** — `users.preferences["agent_disabled_tools"]`,
    edited via `PUT /api/agent/preferences` ("Save as my defaults" in the
-   new-conversation dialog). Only a default for the dialog's checkboxes.
+   tool-selector popover). Only a default for the popover's checkboxes.
 3. **Per-chat choice** — `agent_conversations.disabled_tools`, frozen at
-   creation from the dialog. Later preference/admin edits never mutate an
-   existing conversation's list (the admin layer still applies at turn
-   time, so an admin deny takes effect everywhere immediately).
+   creation from whatever the popover held at send time. Later
+   preference/admin edits never mutate an existing conversation's list (the
+   admin layer still applies at turn time, so an admin deny takes effect
+   everywhere immediately).
 
 Mechanically, `AgentScope.disabled_tools` carries the union of layers 1+3
 (`/mcp`: layer 1 only) and `build_tool_server` removes those tools
 (`FastMCP.remove_tool`) after registration — a disabled tool is *absent*
 from the tool list and the model's prompt, not an error-returning stub.
 Disabling `propose_finding`/`propose_annotation` degrades the sandbox+apply
-workflow to prose-only; the dialog warns about that but does not prevent it.
+workflow to prose-only; the popover warns about that but does not prevent it.
 
-### New-conversation dialog + OPSEC disclosure
+### OPSEC disclosure + tool selector
 
-Every new conversation goes through
-`frontend/src/components/agent/NewConversationDialog.tsx` — there is no
-silent lazy-create path and deliberately no "don't show again". The dialog
-shows (a) a prominent OPSEC notice with the *actual* configured endpoint
-URL and model name ("evidence leaves Vestigo…"), and (b) the per-chat tool
-checkboxes pre-populated from the user's saved defaults.
+The OPSEC notice ("Evidence leaves Vestigo…", with the *actual* configured
+endpoint URL and model name) is a persistent panel element in
+`frontend/src/components/agent/AgentPanel.tsx`, shown in the empty state
+above the input — not a one-time dialog, so it's visible before every first
+message in a fresh chat rather than gated behind a "new conversation"
+click. There is deliberately no "don't show again".
 
-The data comes from `GET /api/agent/info` (`info_router` in
+Per-chat tool selection is a separate concern, in
+`frontend/src/components/agent/ToolSelector.tsx`: a popover reachable from a
+toolbar button above the input (only shown while no conversation is active
+yet), pre-populated from the user's saved defaults, with "Save as my
+defaults" writing them back.
+
+Both draw from `GET /api/agent/info` (`info_router` in
 `api/routers/agent.py`): model, provider, `api_base_url`,
 `context_window`, `compact_threshold`, the tool catalog with
 `admin_disabled` flags, and the user's saved `user_disabled_tools`. This
