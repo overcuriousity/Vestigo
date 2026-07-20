@@ -60,6 +60,7 @@ import {
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
+import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
 import { CHART_PRESETS } from "@/components/viz/lib/presets";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
@@ -151,12 +152,10 @@ export function VisualizePage() {
         ? { mode: "custom", filters: config.compare.filters }
         : null;
 
-  const topN = Math.min(config.options.topN ?? 10, dataKind === "timeseries" ? 20 : 50);
-  const bins = config.options.bins ?? 30;
-  const buckets = config.options.buckets ?? 60;
-  const limitX = config.options.limitX ?? 10;
-  const limitY = config.options.limitY ?? 10;
-  const sampleLimit = config.options.sampleLimit ?? 5000;
+  // Shared with the agent's ChartProposalCard so a proposed chart and a
+  // hand-built one resolve their defaults identically.
+  const resolved = useMemo(() => resolveChartOptions(config), [config]);
+  const { topN, bins, buckets, limitX, limitY, sampleLimit } = resolved;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Preset strip: open by default on a fresh page (no chart state in the
@@ -283,8 +282,8 @@ export function VisualizePage() {
   });
 
   const timeseriesQuery = useQuery({
-    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, topN],
-    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, 60, topN),
+    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, buckets, topN],
+    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, buckets, topN),
     enabled: !!(caseId && timelineId && field) && dataKind === "timeseries",
   });
 
@@ -987,9 +986,9 @@ export function VisualizePage() {
               <BarChart
                 terms={compareTermsOn ? undefined : termsQuery.data}
                 compare={compareTermsOn ? compareTermsQuery.data : undefined}
-                orientation={config.options.orientation ?? "horizontal"}
-                sort={config.options.sort ?? "count"}
-                logScale={config.options.logScale ?? false}
+                orientation={resolved.orientation}
+                sort={resolved.sort}
+                logScale={resolved.logScale}
                 svgRef={svgRef}
                 onValueClick={handleChartValueClick}
               />
@@ -1003,8 +1002,8 @@ export function VisualizePage() {
             {chartType === "line" && timeseriesQuery.data && (
               <LineChart
                 data={timeseriesQuery.data}
-                seriesMode={config.options.seriesMode ?? "overlay"}
-                showLegend={config.options.legend ?? true}
+                seriesMode={resolved.seriesMode}
+                showLegend={resolved.legend}
                 svgRef={svgRef}
                 onValueClick={handleChartValueClick}
               />
@@ -1014,7 +1013,7 @@ export function VisualizePage() {
                 <NumericHistogram
                   stats={compareNumericOn ? undefined : numericQuery.data}
                   compare={compareNumericOn ? compareNumericQuery.data : undefined}
-                  logScale={config.options.logScale ?? false}
+                  logScale={resolved.logScale}
                   svgRef={svgRef}
                 />
               )}
@@ -1047,7 +1046,7 @@ export function VisualizePage() {
             {chartType === "scatter" && scatterQuery.data && (
               <ScatterChart
                 data={scatterQuery.data}
-                logScale={config.options.logScale ?? false}
+                logScale={resolved.logScale}
                 svgRef={svgRef}
               />
             )}

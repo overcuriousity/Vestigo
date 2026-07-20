@@ -27,12 +27,19 @@ import {
   histogramToCompare,
 } from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
+import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
 import { BarChart } from "@/components/viz/charts/BarChart";
+import { PieChart } from "@/components/viz/charts/PieChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
+import { BoxPlot } from "@/components/viz/charts/BoxPlot";
+import { ViolinPlot } from "@/components/viz/charts/ViolinPlot";
+import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { LineChart } from "@/components/viz/charts/LineChart";
+import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
+import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -60,7 +67,14 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const dataKind = CHART_META[config.chartType].dataKind;
   const compareOn = config.compare.mode !== "off";
   const compareApiSpec: CompareMode | null =
-    config.compare.mode === "custom" ? { mode: "custom", filters: config.compare.filters } : null;
+    config.compare.mode === "baseline"
+      ? { mode: "baseline" }
+      : config.compare.mode === "custom"
+        ? { mode: "custom", filters: config.compare.filters }
+        : null;
+  // Same resolver the Visualize page uses, so a proposed chart and the chart
+  // the analyst gets from "Open in Visualize" are drawn from identical values.
+  const opts = useMemo(() => resolveChartOptions(config), [config]);
 
   // Every kind but time/punchcard needs a field, and pivot/scatter need two.
   // `propose_chart` rejects an incomplete spec before a card is ever shown, so
@@ -88,14 +102,14 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
                 field: config.field!,
                 primary: filters,
                 comparison: compareApiSpec,
-                limit: config.options.topN,
+                limit: opts.topN,
               })) as CompareTermsResponse,
             };
           }
           return {
             kind: "terms" as const,
             compare: false as const,
-            data: await vizApi.fieldTerms(caseId, timelineId, config.field!, filters, config.options.topN),
+            data: await vizApi.fieldTerms(caseId, timelineId, config.field!, filters, opts.topN),
           };
         case "numeric":
           if (compareApiSpec) {
@@ -107,14 +121,14 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
                 field: config.field!,
                 primary: filters,
                 comparison: compareApiSpec,
-                bins: config.options.bins,
+                bins: opts.bins,
               })) as CompareNumericResponse,
             };
           }
           return {
             kind: "numeric" as const,
             compare: false as const,
-            data: await vizApi.fieldNumeric(caseId, timelineId, config.field!, filters, config.options.bins),
+            data: await vizApi.fieldNumeric(caseId, timelineId, config.field!, filters, opts.bins),
           };
         case "timeseries":
           return {
@@ -124,8 +138,8 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
               timelineId,
               config.field!,
               filters,
-              config.options.buckets,
-              config.options.topN,
+              opts.buckets,
+              opts.topN,
             ),
           };
         case "time": {
@@ -134,10 +148,10 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
                 kind: "time",
                 primary: filters,
                 comparison: compareApiSpec,
-                buckets: config.options.buckets,
+                buckets: opts.buckets,
               })) as CompareTimeResponse)
             : histogramToCompare(
-                await eventsApi.histogram(caseId, timelineId, filters, config.options.buckets),
+                await eventsApi.histogram(caseId, timelineId, filters, opts.buckets),
               );
           return { kind: "time" as const, data };
         }
@@ -152,8 +166,8 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
               config.field!,
               config.fieldY!,
               filters,
-              config.options.limitX,
-              config.options.limitY,
+              opts.limitX,
+              opts.limitY,
             ),
           };
         case "scatter":
@@ -165,7 +179,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
               config.field!,
               config.fieldY!,
               filters,
-              config.options.sampleLimit,
+              opts.sampleLimit,
             ),
           };
       }
@@ -201,7 +215,10 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
         </div>
       )}
 
-      <div className="mt-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-2">
+      <div
+        data-testid="agent-chart-canvas"
+        className="mt-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-2"
+      >
         {!specComplete && (
           <p className="py-2 text-[var(--color-fg-muted)]">
             This chart proposal is missing a field, so there is nothing to plot.
@@ -218,24 +235,64 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
             {chartQuery.error instanceof Error ? chartQuery.error.message : "unknown error"}
           </p>
         )}
-        {chartQuery.data?.kind === "terms" && (
+        {/* Keyed on the chart *type*, not the aggregation that fed it: several
+            marks share one dataKind (pie and bar both read terms; box, violin
+            and ecdf all read numeric), so switching on the fetch result is
+            what silently turned a requested pie into a bar. Mirrors the
+            Visualize page's canvas one-for-one, minus click-to-filter — the
+            card is a read-only sandbox and filtering is the page's affordance. */}
+        {chartQuery.data?.kind === "terms" && config.chartType === "bar" && (
           <BarChart
             terms={chartQuery.data.compare ? undefined : chartQuery.data.data}
             compare={chartQuery.data.compare ? chartQuery.data.data : undefined}
+            orientation={opts.orientation}
+            sort={opts.sort}
+            logScale={opts.logScale}
           />
         )}
-        {chartQuery.data?.kind === "numeric" && (
+        {chartQuery.data?.kind === "terms" &&
+          config.chartType === "pie" &&
+          !chartQuery.data.compare && <PieChart terms={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "numeric" && config.chartType === "histogram" && (
           <NumericHistogram
             stats={chartQuery.data.compare ? undefined : chartQuery.data.data}
             compare={chartQuery.data.compare ? chartQuery.data.data : undefined}
+            logScale={opts.logScale}
           />
         )}
-        {chartQuery.data?.kind === "timeseries" && <LineChart data={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "numeric" &&
+          !chartQuery.data.compare &&
+          config.chartType === "box" && <BoxPlot stats={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "numeric" &&
+          !chartQuery.data.compare &&
+          config.chartType === "violin" && <ViolinPlot stats={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "numeric" &&
+          !chartQuery.data.compare &&
+          config.chartType === "ecdf" && <EcdfChart stats={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "timeseries" && config.chartType === "line" && (
+          <LineChart
+            data={chartQuery.data.data}
+            seriesMode={opts.seriesMode}
+            showLegend={opts.legend}
+          />
+        )}
+        {chartQuery.data?.kind === "timeseries" && config.chartType === "heatmap" && (
+          <Heatmap data={chartQuery.data.data} />
+        )}
         {chartQuery.data?.kind === "time" && (
-          <CompareHistogram data={chartQuery.data.data} metric="count" hasComparison={compareOn} />
+          <CompareHistogram
+            data={chartQuery.data.data}
+            metric={config.metric}
+            hasComparison={compareOn}
+          />
         )}
         {chartQuery.data?.kind === "punchcard" && <PunchCard data={chartQuery.data.data} />}
-        {chartQuery.data?.kind === "pivot" && <PivotHeatmap data={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "pivot" && config.chartType === "pivot" && (
+          <PivotHeatmap data={chartQuery.data.data} />
+        )}
+        {chartQuery.data?.kind === "pivot" && config.chartType === "sankey" && (
+          <SankeyFlow data={chartQuery.data.data} />
+        )}
         {chartQuery.data?.kind === "scatter" && <ScatterChart data={chartQuery.data.data} />}
       </div>
 

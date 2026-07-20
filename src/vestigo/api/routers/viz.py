@@ -38,6 +38,7 @@ from vestigo.api.routers.events import (
     _validate_field_regexes,
     _validate_regex,
 )
+from vestigo.db._time_fields import TIME_FIELD_SPECS
 from vestigo.db.field_stats import (
     ensure_source_field_stats,
     merged_field_terms,
@@ -891,9 +892,19 @@ async def list_viz_fields(
     - ``token``    — field token to pass to the viz endpoints' ``field`` param.
     - ``distinct`` — number of distinct non-empty values.
     - ``coverage`` — fraction of events with a non-empty value (0-1).
+    - ``label``    — display name, for virtual fields whose token is not
+      self-explanatory; absent for ordinary data fields.
 
     Sorted by coverage descending, then token — the first entry is the
     frontend's default field pick.
+
+    The virtual ``time:`` fields (:mod:`vestigo.db._time_fields`) are appended
+    **after** that sort rather than merged into it. They are defined for every
+    dated event, so a coverage-ranked merge would put them above every real
+    field and hand the picker's default pick to an hour-of-day axis. They are
+    listed here at all — not just exposed to the agent's charting tools —
+    because the analyst and the agent must be able to name the same fields;
+    anything the agent can chart the analyst has to be able to rebuild by hand.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
@@ -906,4 +917,13 @@ async def list_viz_fields(
         for token, distinct, cov_count in inventory
     ]
     fields.sort(key=lambda f: (-f["coverage"], f["token"]))
+    fields.extend(
+        {
+            "token": token,
+            "distinct": len(spec.domain) if spec.domain else 0,
+            "coverage": 1.0,
+            "label": spec.label,
+        }
+        for token, spec in TIME_FIELD_SPECS.items()
+    )
     return {"fields": fields}

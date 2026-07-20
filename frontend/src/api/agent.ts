@@ -12,6 +12,8 @@
 import { BASE, get, post, put, patch, del, fetchBlobGet, ApiError } from "./client";
 import type { EventFilters, FieldMatchMode } from "./types";
 import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
+import { CHART_META } from "@/components/viz/lib/chartMeta";
+import type { Metric } from "@/components/viz/lib/transforms";
 
 /** Backend FilterSpec shape (snake_case) — what agent tool calls carry. */
 export interface AgentFilterSpec {
@@ -35,12 +37,42 @@ export interface AgentFilterSpec {
 }
 
 /**
- * Backend ChartSpec shape (A9) — carried verbatim on a `propose_chart` tool
- * call's `tool_args`. Backend-opaque like the viz-tool FilterSpec above: the
- * frontend owns the mapping to its own `ChartConfig` (see
- * `specToChartConfig` below), the backend never learns that shape.
+ * Backend ChartSpec shape — carried verbatim on a `propose_chart` tool call's
+ * `tool_args`. Mirrors `ChartConfig` field for field (snake_case), so anything
+ * the analyst can build the agent can propose.
  */
-export interface AgentChartSpec {
+export interface AgentChartSpecV2 {
+  chart_type: ChartType;
+  scale?: ChartConfig["scale"] | null;
+  field?: string | null;
+  field_y?: string | null;
+  metric?: Metric | null;
+  filters?: AgentFilterSpec | null;
+  compare?: {
+    mode: "off" | "baseline" | "custom";
+    filters?: AgentFilterSpec | null;
+  } | null;
+  options?: {
+    orientation?: "horizontal" | "vertical" | null;
+    sort?: "count" | "value" | null;
+    log_scale?: boolean | null;
+    series_mode?: "overlay" | "stacked" | null;
+    legend?: boolean | null;
+    top_n?: number | null;
+    bins?: number | null;
+    buckets?: number | null;
+    limit_x?: number | null;
+    limit_y?: number | null;
+    sample_limit?: number | null;
+  } | null;
+}
+
+/**
+ * The retired spec shape, whose single `kind` fused aggregation + mark +
+ * compare-on. Still parsed because `propose_chart` calls are persisted as
+ * message `tool_args` and old conversations re-render from them.
+ */
+export interface AgentChartSpecLegacy {
   kind:
     | "terms"
     | "numeric"
@@ -61,9 +93,15 @@ export interface AgentChartSpec {
   limit_y?: number | null;
 }
 
+export type AgentChartSpec = AgentChartSpecV2 | AgentChartSpecLegacy;
+
+const isLegacySpec = (spec: AgentChartSpec): spec is AgentChartSpecLegacy =>
+  !("chart_type" in spec);
+
 /** Which `ChartType` (and matching `Scale`, per `CHART_META`) renders each
- * `propose_chart` kind by default. */
-const CHART_TYPE_BY_KIND: Record<AgentChartSpec["kind"], ChartType> = {
+ * retired `propose_chart` kind. Frozen: these pairs are what historical chart
+ * cards rendered as, so changing one rewrites the past. */
+const CHART_TYPE_BY_KIND: Record<AgentChartSpecLegacy["kind"], ChartType> = {
   terms: "bar",
   numeric: "histogram",
   timeseries: "line",
@@ -74,7 +112,7 @@ const CHART_TYPE_BY_KIND: Record<AgentChartSpec["kind"], ChartType> = {
   compare_terms: "bar",
   compare_numeric: "histogram",
 };
-const SCALE_BY_KIND: Record<AgentChartSpec["kind"], ChartConfig["scale"]> = {
+const SCALE_BY_KIND: Record<AgentChartSpecLegacy["kind"], ChartConfig["scale"]> = {
   terms: "nominal",
   numeric: "ratio",
   timeseries: "ratio",
@@ -90,18 +128,60 @@ const SCALE_BY_KIND: Record<AgentChartSpec["kind"], ChartConfig["scale"]> = {
  * Map a `propose_chart` spec onto the Visualize page's `ChartConfig` — the
  * shape every chart component, "Open in Visualize", and "Save" consume.
  * Mirrors `specToEventFilters` above: agent shapes translate to UI shapes at
- * the frontend boundary, the backend never learns either UI shape.
+ * the frontend boundary.
  */
 export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
+  if (isLegacySpec(spec)) return specToChartConfigLegacy(spec);
+
+  const o = spec.options ?? {};
+  const options: ChartConfig["options"] = {};
+  // `!= null` rather than a truthiness check: an explicit 0 is a value the
+  // caller chose, and the old falsy guards silently dropped it.
+  if (o.top_n != null) options.topN = o.top_n;
+  if (o.bins != null) options.bins = o.bins;
+  if (o.buckets != null) options.buckets = o.buckets;
+  if (o.limit_x != null) options.limitX = o.limit_x;
+  if (o.limit_y != null) options.limitY = o.limit_y;
+  if (o.sample_limit != null) options.sampleLimit = o.sample_limit;
+  if (o.orientation != null) options.orientation = o.orientation;
+  if (o.sort != null) options.sort = o.sort;
+  if (o.log_scale != null) options.logScale = o.log_scale;
+  if (o.series_mode != null) options.seriesMode = o.series_mode;
+  if (o.legend != null) options.legend = o.legend;
+
+  const compare = spec.compare;
+  return {
+    v: 1,
+    field: spec.field ?? null,
+    fieldY: spec.field_y ?? null,
+    // An omitted scale takes the chart type's default — the same value the
+    // backend resolved and echoed in `resolved.scale`.
+    scale: spec.scale ?? CHART_META[spec.chart_type].defaultScale,
+    chartType: spec.chart_type,
+    metric: spec.metric ?? "count",
+    compare:
+      compare?.mode === "baseline"
+        ? { mode: "baseline" }
+        : compare?.mode === "custom" && compare.filters
+          ? { mode: "custom", filters: specToEventFilters(compare.filters) }
+          : { mode: "off" },
+    options,
+  };
+}
+
+/**
+ * Frozen translation of the retired `kind` shape. Its job is to reproduce
+ * exactly what a historical chart card rendered — do not "improve" it, and do
+ * not port fixes here from the current path (the overloaded `limit`, the
+ * falsy guards, and `metric` always being "count" are all faithful).
+ */
+function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
   const isCompare = spec.kind.startsWith("compare_");
   const options: ChartConfig["options"] = {};
   if (spec.buckets) options.buckets = spec.buckets;
   if (spec.series_limit) options.topN = spec.series_limit;
-  // `spec.limit` is deliberately overloaded on the backend (see ChartSpec's
-  // field description) — its meaning depends on `kind`, so each kind routes it
-  // to the ChartConfig option its own data path actually reads. Numeric kinds
-  // read `options.bins` (vizApi.fieldNumeric's `bins`, compare's `body.bins`);
-  // routing them to `topN` would silently drop the agent's bin count.
+  // `spec.limit` was overloaded — its meaning depended on `kind`, so each kind
+  // routes it to the ChartConfig option its own data path actually read.
   if (spec.kind === "pivot") {
     if (spec.limit) options.limitX = spec.limit;
     if (spec.limit_y) options.limitY = spec.limit_y;

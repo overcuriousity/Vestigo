@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from vestigo.api.routers import viz
+from vestigo.db._time_fields import TIME_FIELD_PREFIX, TIME_FIELD_SPECS
 
 
 class _FakeStatService:
@@ -59,15 +60,42 @@ async def test_list_viz_fields_sorts_by_coverage_then_token(monkeypatch):
     result = await viz.list_viz_fields("c1", "t1", case=None)
 
     # Coverage descending, token ascending as the tiebreak — and no novelty
-    # filtering: the constant-valued display_name is still listed.
-    assert result == {
-        "fields": [
-            {"token": "artifact", "distinct": 5, "coverage": 1.0},
-            {"token": "attr:status_code", "distinct": 6, "coverage": 1.0},
-            {"token": "display_name", "distinct": 1, "coverage": 0.9},
-        ]
-    }
+    # filtering: the constant-valued display_name is still listed. The virtual
+    # `time:` fields follow the real ones (asserted separately below).
+    real = [f for f in result["fields"] if not f["token"].startswith(TIME_FIELD_PREFIX)]
+    assert real == [
+        {"token": "artifact", "distinct": 5, "coverage": 1.0},
+        {"token": "attr:status_code", "distinct": 6, "coverage": 1.0},
+        {"token": "display_name", "distinct": 1, "coverage": 0.9},
+    ]
     assert calls == [("c1", ["s1", "s2"])]
+
+
+@pytest.mark.asyncio
+async def test_list_viz_fields_appends_virtual_time_fields_last(monkeypatch):
+    """The analyst's picker must offer everything the agent can chart.
+
+    They are appended rather than merged into the coverage sort: they are
+    defined for every dated event, so a coverage-ranked merge would rank them
+    above every real field and hand the picker's default pick — documented as
+    "the first entry" — to an hour-of-day axis.
+    """
+    _fake_inventory(monkeypatch, [("artifact", 5, 1000)], total=1000)
+    monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
+    monkeypatch.setattr(viz, "_resolve_timeline_source_ids", _fake_source_ids)
+
+    fields = (await viz.list_viz_fields("c1", "t1", case=None))["fields"]
+
+    assert fields[0]["token"] == "artifact"
+    trailing = fields[1:]
+    assert [f["token"] for f in trailing] == list(TIME_FIELD_SPECS)
+    hour = next(f for f in trailing if f["token"] == "time:hour_of_day")
+    assert hour == {
+        "token": "time:hour_of_day",
+        "distinct": 24,
+        "coverage": 1.0,
+        "label": "Hour of day (UTC)",
+    }
 
 
 @pytest.mark.asyncio

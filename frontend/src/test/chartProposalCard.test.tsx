@@ -37,6 +37,8 @@ const fieldNumericMock = vi.fn();
 const punchcardMock = vi.fn();
 const savedChartsCreateMock = vi.fn();
 const histogramMock = vi.fn();
+const fieldTimeseriesMock = vi.fn();
+const fieldPivotMock = vi.fn();
 
 vi.mock("@/api/viz", async () => {
   const actual = await vi.importActual<typeof import("@/api/viz")>("@/api/viz");
@@ -46,8 +48,8 @@ vi.mock("@/api/viz", async () => {
       fieldTerms: (...args: unknown[]) => fieldTermsMock(...args),
       fieldNumeric: (...args: unknown[]) => fieldNumericMock(...args),
       punchcard: (...args: unknown[]) => punchcardMock(...args),
-      fieldTimeseries: vi.fn(),
-      fieldPivot: vi.fn(),
+      fieldTimeseries: (...args: unknown[]) => fieldTimeseriesMock(...args),
+      fieldPivot: (...args: unknown[]) => fieldPivotMock(...args),
       fieldScatter: vi.fn(),
       compare: vi.fn(),
     },
@@ -116,6 +118,24 @@ beforeEach(() => {
   punchcardMock.mockResolvedValue({ kind: "punchcard", total: 10, max_count: 5, cells: [] });
   histogramMock.mockResolvedValue(HISTOGRAM);
   savedChartsCreateMock.mockResolvedValue({ chart: { id: "sc1" } });
+  fieldTimeseriesMock.mockResolvedValue({
+    field: "attr:status",
+    series: [{ value: "a", counts: [1, 2] }],
+    interval_seconds: 3600,
+    min: "2026-01-01T00:00:00Z",
+    max: "2026-01-02T00:00:00Z",
+  });
+  fieldPivotMock.mockResolvedValue({
+    kind: "pivot",
+    field_x: "attr:user",
+    field_y: "time:hour_of_day",
+    x_values: ["root"],
+    y_values: ["00", "01"],
+    x_distinct: 1,
+    y_distinct: 24,
+    cells: [{ x: "root", y: "00", count: 3 }],
+    total: 3,
+  });
 });
 
 describe("ChartProposalCard", () => {
@@ -172,5 +192,67 @@ describe("ChartProposalCard", () => {
     expect(href).toContain(`/cases/${CASE}/timelines/${TL}/visualize`);
     expect(href).toContain("c_type=histogram");
     expect(href).toContain("c_field=attr%3Abytes");
+  });
+});
+
+/**
+ * The bug this contract replaced: `propose_chart` could not express "pie", and
+ * even a correct chartType would still have drawn a bar, because the render
+ * switch keyed on the aggregation that fed it rather than the mark.
+ */
+describe("ChartProposalCard renders the requested mark, not the aggregation's default", () => {
+  it("draws a pie — not a bar — for chart_type=pie", async () => {
+    renderCard({ chart_type: "pie", field: "artifact" });
+    // Scoped to the chart box: the card header carries a lucide icon that is
+    // itself an <svg><path>. PieChart emits arc <path>s; BarChart never does.
+    const canvas = screen.getByTestId("agent-chart-canvas");
+    await waitFor(() => expect(canvas.querySelector(".animate-spin")).toBeNull());
+    expect(canvas.querySelector("svg path")).not.toBeNull();
+  });
+
+  it("draws no pie arcs for chart_type=bar over the same aggregation", async () => {
+    // The discriminator is the arc: BarChart lays bars out against a measured
+    // width, which is 0 under jsdom, so asserting on <rect> would be checking
+    // the harness rather than the mark.
+    renderCard({ chart_type: "bar", field: "artifact" });
+    const canvas = screen.getByTestId("agent-chart-canvas");
+    // Wait for the loading spinner to clear — it is itself an <svg><path>.
+    await waitFor(() => expect(canvas.querySelector(".animate-spin")).toBeNull());
+    expect(canvas.querySelector("svg")).not.toBeNull();
+    expect(canvas.querySelector("svg path")).toBeNull();
+  });
+
+  it("draws a sankey for chart_type=sankey, sharing pivot's aggregation", async () => {
+    const { container } = renderCard({
+      chart_type: "sankey",
+      field: "attr:user",
+      field_y: "time:hour_of_day",
+    });
+    await waitFor(() => expect(fieldPivotMock).toHaveBeenCalled());
+    expect(container.querySelector("svg")).not.toBeNull();
+  });
+
+  it("draws a pivot heatmap for a country x hour-of-day proposal", async () => {
+    const { container } = renderCard({
+      chart_type: "pivot",
+      field: "attr:user",
+      field_y: "time:hour_of_day",
+    });
+    await waitFor(() => expect(fieldPivotMock).toHaveBeenCalled());
+    expect(container.querySelector("svg")).not.toBeNull();
+    expect(fieldPivotMock.mock.calls[0][3]).toBe("time:hour_of_day");
+  });
+
+  it("passes the spec's bucket count through instead of a hardcoded 60", async () => {
+    renderCard({
+      chart_type: "line",
+      field: "attr:status",
+      scale: "ratio",
+      options: { buckets: 20, top_n: 5 },
+    });
+    await waitFor(() => expect(fieldTimeseriesMock).toHaveBeenCalled());
+    const call = fieldTimeseriesMock.mock.calls[0];
+    expect(call[4]).toBe(20);
+    expect(call[5]).toBe(5);
   });
 });

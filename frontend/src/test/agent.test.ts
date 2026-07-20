@@ -9,11 +9,15 @@ import {
   specToEventFilters,
   specToChartConfig,
   formatTokenCount,
-  type AgentChartSpec,
+  type AgentChartSpecLegacy,
   type AgentFilterSpec,
   type AgentProposal,
 } from "@/api/agent";
 import { chartConfigToParams, paramsToChartConfig } from "@/components/viz/lib/chartConfig";
+import { CHART_META } from "@/components/viz/lib/chartMeta";
+import type { ChartType } from "@/components/viz/lib/chartConfig";
+
+const CHART_TYPES = Object.keys(CHART_META) as ChartType[];
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import type { EventFilters } from "@/api/types";
@@ -231,9 +235,11 @@ describe("isAnalystAnnotation", () => {
   });
 });
 
-describe("specToChartConfig", () => {
+describe("specToChartConfig (legacy `kind` shape)", () => {
+  // Frozen: these are what historical chart cards rendered as. Persisted
+  // `tool_args` still flow through this path, so a change here rewrites the past.
   it("maps each kind to its chart type, round-tripping through URL params", () => {
-    const cases: [AgentChartSpec["kind"], string][] = [
+    const cases: [AgentChartSpecLegacy["kind"], string][] = [
       ["terms", "bar"],
       ["numeric", "histogram"],
       ["timeseries", "line"],
@@ -355,5 +361,99 @@ describe("buildUserNameMap", () => {
     expect(resolveUserName(map, "mmustermann")).toBe("Max Mustermann");
     expect(resolveUserName(map, "legacy-username")).toBe("legacy-username");
     expect(resolveUserName(map, null)).toBe("anonymous");
+  });
+});
+
+describe("specToChartConfig (current shape)", () => {
+  it("reaches every chart type, including the six the old `kind` enum could not", () => {
+    for (const chartType of CHART_TYPES) {
+      const config = specToChartConfig({ chart_type: chartType, field: "artifact" });
+      expect(config.chartType).toBe(chartType);
+      // Round-trip through the same URL-param path "Open in Visualize" uses.
+      expect(paramsToChartConfig(chartConfigToParams(config)).chartType).toBe(chartType);
+    }
+    for (const previouslyUnreachable of ["pie", "heatmap", "box", "violin", "ecdf", "sankey"]) {
+      expect(CHART_TYPES).toContain(previouslyUnreachable);
+    }
+  });
+
+  it("defaults an omitted scale to the chart type's default", () => {
+    expect(specToChartConfig({ chart_type: "pie", field: "a" }).scale).toBe("nominal");
+    expect(specToChartConfig({ chart_type: "histogram", field: "a" }).scale).toBe("ratio");
+  });
+
+  it("honours an explicit scale", () => {
+    expect(specToChartConfig({ chart_type: "bar", field: "a", scale: "ordinal" }).scale).toBe(
+      "ordinal",
+    );
+  });
+
+  it("carries metric through instead of hardcoding count", () => {
+    expect(specToChartConfig({ chart_type: "time", metric: "rate" }).metric).toBe("rate");
+    expect(specToChartConfig({ chart_type: "bar", field: "a" }).metric).toBe("count");
+  });
+
+  it("maps baseline compare, which the old shape could not express", () => {
+    expect(specToChartConfig({ chart_type: "time", compare: { mode: "baseline" } }).compare).toEqual(
+      { mode: "baseline" },
+    );
+  });
+
+  it("maps a custom compare layer's filters", () => {
+    const config = specToChartConfig({
+      chart_type: "bar",
+      field: "artifact",
+      compare: { mode: "custom", filters: { source_id: "s2" } },
+    });
+    expect(config.compare.mode).toBe("custom");
+    if (config.compare.mode === "custom") expect(config.compare.filters.sourceId).toBe("s2");
+  });
+
+  it("maps every option to its camelCase ChartConfig key", () => {
+    const config = specToChartConfig({
+      chart_type: "bar",
+      field: "a",
+      options: {
+        top_n: 7,
+        bins: 12,
+        buckets: 20,
+        limit_x: 3,
+        limit_y: 4,
+        sample_limit: 900,
+        orientation: "vertical",
+        sort: "value",
+        log_scale: true,
+        series_mode: "stacked",
+        legend: false,
+      },
+    });
+    expect(config.options).toEqual({
+      topN: 7,
+      bins: 12,
+      buckets: 20,
+      limitX: 3,
+      limitY: 4,
+      sampleLimit: 900,
+      orientation: "vertical",
+      sort: "value",
+      logScale: true,
+      seriesMode: "stacked",
+      legend: false,
+    });
+  });
+
+  it("keeps an explicit zero, which the old falsy guards dropped", () => {
+    const config = specToChartConfig({ chart_type: "bar", field: "a", options: { top_n: 0 } });
+    expect(config.options.topN).toBe(0);
+  });
+
+  it("does not collide top_n and buckets on a timeseries chart", () => {
+    const config = specToChartConfig({
+      chart_type: "line",
+      field: "a",
+      options: { top_n: 5, buckets: 20 },
+    });
+    expect(config.options.topN).toBe(5);
+    expect(config.options.buckets).toBe(20);
   });
 });

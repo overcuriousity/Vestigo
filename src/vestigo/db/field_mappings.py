@@ -27,6 +27,7 @@ from collections.abc import Callable
 from typing import Any
 
 from vestigo.db._columns import SYNTHETIC_COLUMN_EXPRESSIONS, TOP_LEVEL_EVENT_COLUMNS
+from vestigo.db._time_fields import TIME_FIELD_PREFIX
 
 # Practical guard rails — a mapping is analyst-curated metadata, not bulk data.
 MAX_CANONICAL_FIELDS = 64
@@ -92,7 +93,8 @@ def validate_field_mappings(
       time, since resolution strips only the incoming field token), must not
       collide with core event columns or with a raw attribute key present in
       the sources (that would silently shadow real data), and must not use
-      the ``attr:`` prefix;
+      the ``attr:`` or reserved ``time:`` prefixes — the latter resolves
+      ahead of mappings, so such a name would be unreachable, not ambiguous;
     - each raw key may appear in at most one mapping (and once per mapping);
     - every raw key must exist in at least one member source — mapping a
       nonexistent field is almost always a typo and would silently coalesce
@@ -120,6 +122,11 @@ def validate_field_mappings(
             )
         if name.startswith("attr:"):
             problems.append(f"'{name}': canonical names must not use the 'attr:' prefix.")
+        if name.lower().startswith(TIME_FIELD_PREFIX):
+            problems.append(
+                f"'{name}': the '{TIME_FIELD_PREFIX}' prefix is reserved for virtual time "
+                "fields (hour of day, weekday, month, ...)."
+            )
         if name.lower() in core_lower:
             problems.append(f"'{name}' collides with a core event column.")
         if available_attribute_keys is not None and name in available_attribute_keys:

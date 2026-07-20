@@ -15,14 +15,28 @@ Explorer must match exactly what the agent saw.
 from __future__ import annotations
 
 import asyncio
+import difflib
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi.concurrency import run_in_threadpool
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from vestigo.agent.chart_meta import (
+    CHART_META,
+    LEGACY_KIND_MAP,
+    METRIC_INFO,
+    ChartType,
+    Metric,
+    Scale,
+    chart_types_for,
+    compare_capable,
+    metric_available,
+    requires_field,
+)
+from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.postgres import User
 from vestigo.db.queries import EventQuery, TagFilter
 from vestigo.models.embeddings import embeddings_available
@@ -72,7 +86,8 @@ class ToolInfo:
 TOOL_REGISTRY: tuple[ToolInfo, ...] = (
     ToolInfo("search_events", "Search events with Explorer-equivalent filters."),
     ToolInfo("get_event", "Fetch a single event by its event_id (full attribute set)."),
-    ToolInfo("list_fields", "List queryable fields: fixed columns and attribute keys."),
+    ToolInfo("list_fields", "List queryable fields: fixed columns, attribute keys, time parts."),
+    ToolInfo("describe_field", "Probe one field: coverage, numeric-ness, suggested scale/charts."),
     ToolInfo("list_artifacts", "List the distinct artifact types present in this timeline."),
     ToolInfo("field_terms", "Top-N value distribution for a field, honoring optional filters."),
     ToolInfo("field_numeric_stats", "Summary stats + histogram for a numeric field."),
@@ -185,38 +200,172 @@ class FilterSpec(BaseModel):
     )
 
 
-class ChartSpec(BaseModel):
-    """Chart spec carried by `propose_chart` — the agent-side equivalent of
-    the Visualize page's ChartConfig, but backend-opaque: the frontend maps
-    this to its own ChartConfig shape for rendering/"Open in Visualize"/
-    "Save", exactly like `SavedChart.config` is opaque JSON server-side.
-    """
+class ChartCompareSpec(BaseModel):
+    """The optional second layer a chart is measured against."""
 
-    kind: str = Field(
+    mode: Literal["off", "baseline", "custom"] = Field(
+        default="off",
         description=(
-            'Chart kind: "terms" | "numeric" | "timeseries" | "punchcard" | '
-            '"pivot" | "scatter" | "compare_time" | "compare_terms" | "compare_numeric".'
-        )
-    )
-    field: str | None = Field(
-        default=None, description="Primary field — required for every kind except punchcard."
-    )
-    field_y: str | None = Field(default=None, description="Second field — pivot/scatter only.")
-    filters: FilterSpec | None = Field(default=None, description="Primary layer filters.")
-    comparison_filters: FilterSpec | None = Field(
-        default=None, description="Comparison layer filters — compare_* kinds only."
-    )
-    buckets: int | None = Field(
-        default=None, description="Bucket count — timeseries/compare_time only."
-    )
-    series_limit: int | None = Field(default=None, description="Series cap — timeseries only.")
-    limit: int | None = Field(
-        default=None,
-        description=(
-            "Top-N terms / bin count / point cap / pivot x-axis top-N, meaning depends on kind."
+            'Comparison layer: "off" (single layer), "baseline" (this timeline\'s '
+            'events with no filters — "the whole" the primary is a part of), or '
+            '"custom" (an explicit second filter set). Only chart_type "time", '
+            '"bar" and "histogram" support a comparison at all.'
         ),
     )
-    limit_y: int | None = Field(default=None, description="Pivot y-axis top-N — pivot only.")
+    filters: FilterSpec | None = Field(
+        default=None, description='Comparison layer filters — required when mode="custom".'
+    )
+
+
+class ChartOptionsSpec(BaseModel):
+    """Presentation and sizing knobs, mirroring the Visualize page's controls.
+
+    Every field is optional; omitting one takes the same default the analyst
+    sees. Each chart type reads only some of these (``reads_options`` in
+    ``agent/chart_meta.py``) — sending one a chart ignores is reported as a
+    warning, never an error.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    orientation: Literal["horizontal", "vertical"] | None = Field(
+        default=None, description="Bar direction — bar only. Default horizontal."
+    )
+    sort: Literal["count", "value"] | None = Field(
+        default=None,
+        description=(
+            'Bar ordering — bar only. "count" (descending, the default) or "value" '
+            "(ascending, which is what you want for an ordinal axis like an hour of day)."
+        ),
+    )
+    log_scale: bool | None = Field(
+        default=None, description="Log-scale the count axis — bar/histogram/scatter."
+    )
+    series_mode: Literal["overlay", "stacked"] | None = Field(
+        default=None, description="Line rendering — line only. Default overlay."
+    )
+    legend: bool | None = Field(default=None, description="Show the legend — line only.")
+    top_n: int | None = Field(
+        default=None, ge=1, description="Top-N values to keep — terms and timeseries charts."
+    )
+    bins: int | None = Field(
+        default=None, ge=2, description="Histogram bin count — numeric charts."
+    )
+    buckets: int | None = Field(
+        default=None, ge=4, description="Time bucket count — time and timeseries charts."
+    )
+    limit_x: int | None = Field(default=None, ge=1, description="X-axis top-N — pivot/sankey.")
+    limit_y: int | None = Field(default=None, ge=1, description="Y-axis top-N — pivot/sankey.")
+    sample_limit: int | None = Field(default=None, ge=1, description="Point cap — scatter only.")
+
+
+class ChartSpec(BaseModel):
+    """A chart, described exactly as the Visualize page describes one.
+
+    This mirrors the frontend's `ChartConfig` field for field, so anything an
+    analyst can build by hand you can propose — and the reasoning steps are
+    the same ones they take: pick a field, learn its scale (`describe_field`),
+    pick a chart_type legal for that scale, optionally add a comparison layer.
+
+    An illegal combination is rejected with a message naming the legal
+    alternatives; that error is your equivalent of the analyst's dropdown
+    refusing to offer an impossible chart. The result echoes back a `resolved`
+    block describing what will actually be drawn — read it, and never assume a
+    chart rendered the way you asked without checking there.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    chart_type: ChartType = Field(
+        description=(
+            "The visual mark to draw. Field-free: "
+            '"time" (events over time), "punchcard" (day x hour). One field: '
+            '"bar", "pie" (nominal/ordinal), "histogram", "box", "violin", "ecdf" '
+            '(numeric), "line", "heatmap" (value over time). Two fields: '
+            '"pivot" (field x field heatmap), "sankey" (flow), "scatter" (numeric x numeric).'
+        )
+    )
+    scale: Scale | None = Field(
+        default=None,
+        description=(
+            "Scale of measurement of `field`: nominal (unordered categories), "
+            "ordinal (ordered categories), interval (numeric, no true zero), "
+            "ratio (numeric with a true zero). Constrains which chart types are "
+            "legal. Omit to accept the chart type's natural default."
+        ),
+    )
+    field: str | None = Field(
+        default=None,
+        description=(
+            'The field to chart. Required except for "time" and "punchcard", which '
+            "chart the whole event count. Use a token from list_fields, including "
+            'the virtual "time:" fields (time:hour_of_day, time:day_of_week, '
+            "time:month, ...) to put a time part on an axis."
+        ),
+    )
+    field_y: str | None = Field(
+        default=None, description="Second field — pivot, sankey and scatter only."
+    )
+    metric: Metric = Field(
+        default="count",
+        description=(
+            "How counts are transformed for display. Anything other than "
+            '"count" needs chart_type="time": delta/rate/cumulative need ordered '
+            'time bins, and "ratio" (% of baseline) additionally needs a comparison layer.'
+        ),
+    )
+    filters: FilterSpec | None = Field(default=None, description="Primary layer filters.")
+    compare: ChartCompareSpec = Field(
+        default_factory=ChartCompareSpec, description="Optional comparison layer."
+    )
+    options: ChartOptionsSpec = Field(
+        default_factory=ChartOptionsSpec, description="Presentation and sizing options."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_kind(cls, data: Any) -> Any:
+        """Translate the retired `kind` enum into the current shape.
+
+        Deliberately invisible in the JSON schema the model reads: a documented
+        alias would double the contract and the old shape would never die. This
+        exists for exactly one case — a conversation in flight across a server
+        restart, whose model still holds the previous tool schema in context —
+        and is deletable once no such conversation can predate the change.
+        """
+        if not isinstance(data, dict):
+            return data
+        kind = data.get("kind")
+        if not kind or data.get("chart_type"):
+            return data
+        mapped = LEGACY_KIND_MAP.get(kind)
+        if mapped is None:
+            return data
+        chart_type, scale = mapped
+        data = dict(data)
+        data["chart_type"] = chart_type
+        data.setdefault("scale", scale)
+        options = dict(data.get("options") or {})
+        # `limit` was overloaded — its meaning depended on `kind`.
+        limit = data.pop("limit", None)
+        if limit is not None:
+            if kind == "pivot":
+                options.setdefault("limit_x", limit)
+            elif kind == "scatter":
+                options.setdefault("sample_limit", limit)
+            elif kind in {"numeric", "compare_numeric"}:
+                options.setdefault("bins", limit)
+            else:
+                options.setdefault("top_n", limit)
+        for old, new in (("limit_y", "limit_y"), ("buckets", "buckets"), ("series_limit", "top_n")):
+            value = data.pop(old, None)
+            if value is not None:
+                options.setdefault(new, value)
+        data["options"] = options
+        if kind.startswith("compare_") and data.get("comparison_filters"):
+            data["compare"] = {"mode": "custom", "filters": data["comparison_filters"]}
+        data.pop("comparison_filters", None)
+        return data
 
 
 @dataclass
@@ -411,6 +560,48 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         _validate_field_regexes(spec.exclusions, spec.exclusion_modes)
         return spec
 
+    # Field vocabulary for chart validation, resolved once per tool server
+    # (it is a per-scope constant) rather than per call.
+    field_vocabulary: set[str] = set()
+
+    async def _known_fields() -> set[str]:
+        """Every token that names real data in this timeline.
+
+        Deliberately the same set ``list_fields`` reports, not the viz picker's
+        inventory: a "no such field" error has to be judged against what the
+        model was actually told exists. A bare attribute key and its explicit
+        ``attr:`` form are both valid, so both are admitted.
+        """
+        if not field_vocabulary:
+            listed = await run_in_threadpool(
+                service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
+            )
+            attrs = listed.get("attributes") or []
+            field_vocabulary.update(listed.get("top_level") or [])
+            field_vocabulary.update(attrs)
+            field_vocabulary.update(f"attr:{key}" for key in attrs)
+            field_vocabulary.update(TIME_FIELD_SPECS)
+        return field_vocabulary
+
+    async def _check_chart_field(token: str | None, label: str) -> None:
+        """Reject a field token that names nothing, with near-miss suggestions.
+
+        An unknown attribute key resolves to an empty Map lookup rather than an
+        error, so without this a typo yields a cheerful ``ok: true`` over zero
+        rows — the same silent-success failure mode as the pie-becomes-bar bug.
+        """
+        if not token:
+            return
+        known = await _known_fields()
+        if token in known:
+            return
+        close = difflib.get_close_matches(token, sorted(known), n=3, cutoff=0.6)
+        hint = f" Closest matches: {', '.join(close)}." if close else ""
+        raise ValueError(
+            f'{label} "{token}" is not a field in this timeline.{hint} '
+            "Call list_fields for the full set."
+        )
+
     @server.tool()
     async def search_events(
         filters: FilterSpec | None = None,
@@ -445,10 +636,112 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
 
     @server.tool()
     async def list_fields() -> dict[str, Any]:
-        """List queryable fields: fixed top-level columns and dynamic attribute keys."""
-        return await run_in_threadpool(
+        """List queryable fields: fixed columns, attribute keys, and time parts.
+
+        `time_fields` are virtual: they are defined for every dated event and
+        let you put a time part on an axis or in a filter (an hour-of-day x
+        country heatmap; "weekends only"). Use `describe_field` before charting
+        a field you have not charted yet — it reports the scale.
+        """
+        listed = await run_in_threadpool(
             service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
         )
+        return {**listed, "time_fields": sorted(TIME_FIELD_SPECS)}
+
+    @server.tool()
+    async def describe_field(field: str, filters: FilterSpec | None = None) -> dict[str, Any]:
+        """Describe one field so you can pick a chart type for it.
+
+        The analyst's Visualize page probes a field the moment they pick it and
+        auto-suggests a scale; this is that probe. Call it before propose_chart
+        for any field you have not charted yet, rather than guessing a scale.
+
+        Returns the field's coverage and distinct count, its numeric stats when
+        it parses as a number (`numeric: null` means categorical), the
+        suggested `scale`, and `suggested_chart_types` — the chart types legal
+        for that scale.
+
+        Costs two scans for a real field, so probe the fields you intend to
+        chart, not every field in the timeline. Virtual `time:` fields are
+        answered from their definition and cost nothing.
+        """
+        time_spec = resolve_time_field(field)
+        if time_spec is not None:
+            domain = list(time_spec.domain) if time_spec.domain else []
+            return {
+                "field": field,
+                "exists": True,
+                "virtual": True,
+                "label": time_spec.label,
+                "coverage": 1.0,
+                "distinct": len(domain),
+                "numeric": None,
+                "top_values": domain[:10],
+                "suggested_scale": time_spec.scale,
+                "suggested_chart_types": chart_types_for(time_spec.scale),
+                "notes": [
+                    "Virtual time field: defined for every dated event, extracted in UTC. "
+                    "Undated (sentinel-timestamp) events are excluded."
+                ]
+                + (
+                    ["Values are a complete, ordered domain — use options.sort='value'."]
+                    if domain
+                    else []
+                ),
+            }
+
+        known = await _known_fields()
+        if field not in known:
+            close = difflib.get_close_matches(field, sorted(known), n=3, cutoff=0.6)
+            return {
+                "field": field,
+                "exists": False,
+                "suggestions": close,
+                "notes": ["Not a field in this timeline. Call list_fields for the full set."],
+            }
+
+        spec = _validated(filters)
+        query = await _build_query(scope, spec)
+        terms, numeric = await asyncio.gather(
+            run_in_threadpool(service.field_terms, query, field, 5),
+            run_in_threadpool(service.field_numeric_stats, query, field),
+        )
+        # `count == 0` is the documented categorical signal (see
+        # EventQueryService.field_numeric_stats) — the same test the Visualize
+        # page's auto-probe uses to pick nominal vs ratio.
+        is_numeric = bool(numeric["count"])
+        scale: Scale = "ratio" if is_numeric else "nominal"
+        notes: list[str] = []
+        if terms["distinct"] == 1:
+            notes.append("Only one distinct value — a chart of it will show a single category.")
+        if not terms["total"]:
+            notes.append("No event has a non-empty value for this field under these filters.")
+        if not is_numeric:
+            notes.append(
+                "Values do not parse as numbers, so numeric charts "
+                "(histogram/box/violin/ecdf/scatter) would render empty."
+            )
+        return {
+            "field": field,
+            "exists": True,
+            "virtual": False,
+            "coverage": terms["total"],
+            "distinct": terms["distinct"],
+            "numeric": (
+                {
+                    "count": numeric["count"],
+                    "min": numeric["min"],
+                    "max": numeric["max"],
+                    "mean": numeric["mean"],
+                }
+                if is_numeric
+                else None
+            ),
+            "top_values": terms["values"],
+            "suggested_scale": scale,
+            "suggested_chart_types": chart_types_for(scale),
+            "notes": notes,
+        }
 
     @server.tool()
     async def list_artifacts() -> list[str]:
@@ -698,127 +991,270 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     async def propose_chart(title: str, description: str, spec: ChartSpec) -> dict[str, Any]:
         """Propose a chart to the analyst.
 
-        Validates `spec` by actually executing the underlying query (same
-        caps as the read-only viz tools) and returns summary stats — this
-        tool never writes anything. The analyst sees a live chart card built
-        from `spec`, with "Open in Visualize" and "Save" — the analyst's
-        click is what persists a saved chart, never this call. On an invalid
-        spec (unknown kind, missing required field) the call errors so you
-        can correct it — no card is shown for a failed proposal.
+        Validates `spec` against the same legality rules the Visualize page
+        enforces through its dropdowns, then by actually executing the
+        underlying query — this tool never writes anything. The analyst sees a
+        live chart card with "Open in Visualize" and "Save"; their click is
+        what persists a saved chart, never this call.
+
+        An illegal spec errors with a message naming the legal alternatives, so
+        you can correct it; no card is shown for a failed proposal. A legal one
+        returns `resolved` — the chart_type, scale, metric, comparison mode and
+        options that will actually be drawn. Read it. Do not report what a chart
+        shows without checking `resolved` matches what you asked for.
+
+        `warnings` lists non-fatal issues: options this chart type ignores, and
+        any limit clamped for the validation query. Those clamps bound *this*
+        call's result size for your context only — the analyst's card is drawn
+        at the full size you asked for.
         """
-        kind = spec.kind
-        compare_kinds = {"compare_time", "compare_terms", "compare_numeric"}
-        field_required = kind in {
-            "terms",
-            "numeric",
-            "timeseries",
-            "pivot",
-            "scatter",
-            "compare_terms",
-            "compare_numeric",
-        }
-        if field_required and not spec.field:
-            raise ValueError(f'kind="{kind}" requires field')
-        if kind in {"pivot", "scatter"} and not spec.field_y:
-            raise ValueError(f'kind="{kind}" requires field_y')
+        chart_type = spec.chart_type
+        meta = CHART_META[chart_type]
+        data_kind = meta.data_kind
+        opts = spec.options
+        warnings: list[str] = []
+
+        # ── legality, before any query ───────────────────────────────────────
+        scale = spec.scale or meta.default_scale
+        if scale not in meta.scales:
+            raise ValueError(
+                f'chart_type="{chart_type}" requires scale in '
+                f"{{{', '.join(chr(34) + s + chr(34) for s in meta.scales)}}}, "
+                f'got "{scale}". Chart types legal for scale="{scale}": '
+                f"{', '.join(chart_types_for(scale))}."
+            )
+
+        if requires_field(chart_type) and not spec.field:
+            raise ValueError(
+                f'chart_type="{chart_type}" requires field. Only chart_type="time" and '
+                '"punchcard" chart the whole event count with no field.'
+            )
+        if meta.requires_second_field and not spec.field_y:
+            raise ValueError(
+                f'chart_type="{chart_type}" requires field_y — it charts '
+                "field x field_y, not a single distribution."
+            )
+        if spec.field_y and not meta.requires_second_field:
+            two_field = [c for c in CHART_META if CHART_META[c].requires_second_field]
+            raise ValueError(
+                f'chart_type="{chart_type}" takes no field_y. '
+                f"Two-field chart types: {', '.join(two_field)}."
+            )
+
+        compare_on = spec.compare.mode != "off"
+        if compare_on and not meta.supports_compare:
+            raise ValueError(
+                f'chart_type="{chart_type}" does not support a comparison layer. '
+                f"Compare-capable chart types: {', '.join(compare_capable())}."
+            )
+        if spec.compare.mode == "custom" and spec.compare.filters is None:
+            raise ValueError(
+                'compare.mode="custom" needs compare.filters. Use mode="baseline" to '
+                "compare against this timeline's whole unfiltered event set."
+            )
+        if not metric_available(spec.metric, chart_type, compare_on):
+            info = METRIC_INFO[spec.metric]
+            if info.requires_compare and not compare_on:
+                raise ValueError(
+                    f'metric="{spec.metric}" ({info.label}) needs a comparison layer — '
+                    'set compare.mode to "baseline" or "custom".'
+                )
+            raise ValueError(
+                f'metric="{spec.metric}" ({info.label}) is only defined on '
+                f'chart_type="time", which is the one chart with ordered time bins. '
+                f"Its formula is {info.formula}."
+            )
+
+        # Options this chart never reads are inert, not fatal — but silence
+        # would leave the model believing it had set something.
+        ignored = sorted(
+            key
+            for key, value in opts.model_dump().items()
+            if value is not None and key not in meta.reads_options
+        )
+        if ignored:
+            reads = ", ".join(meta.reads_options) or "no options"
+            warnings.append(
+                f'options {", ".join(ignored)} ignored by chart_type="{chart_type}" '
+                f"(it reads: {reads})."
+            )
+
+        await _check_chart_field(spec.field, "field")
+        await _check_chart_field(spec.field_y, "field_y")
+
+        def _capped(value: int | None, default: int, cap: int, name: str) -> int:
+            resolved = max(1, min(value or default, cap))
+            if value is not None and resolved != value:
+                warnings.append(
+                    f"options.{name}={value} clamped to {resolved} for this validation "
+                    "query (agent context budget); the analyst's card is not capped."
+                )
+            return resolved
 
         primary_filters = _validated(spec.filters)
         primary_query = await _build_query(scope, primary_filters)
-
-        if kind == "terms":
-            result = await run_in_threadpool(
-                service.field_terms, primary_query, spec.field, max(1, min(spec.limit or 30, 100))
+        comparison_query = None
+        if compare_on:
+            # "baseline" is the timeline's whole event set — the same unfiltered
+            # resolution POST /viz/compare does for mode="baseline".
+            comparison_filters = _validated(
+                spec.compare.filters if spec.compare.mode == "custom" else FilterSpec()
             )
-            return {
-                "ok": True,
-                "total": result["total"],
-                "distinct": result["distinct"],
-                "top_values": result["values"][:5],
-            }
-        if kind == "numeric":
-            result = await run_in_threadpool(service.field_numeric_stats, primary_query, spec.field)
-            return {
-                "ok": True,
-                "count": result["count"],
-                "min": result["min"],
-                "max": result["max"],
-                "mean": result["mean"],
-            }
-        if kind == "timeseries":
+            comparison_query = await _build_query(scope, comparison_filters)
+
+        applied: dict[str, Any] = {}
+
+        # ── execute, dispatching on the aggregation the mark needs ───────────
+        if data_kind == "terms":
+            applied["top_n"] = _capped(opts.top_n, 30, VIZ_COMPARE_MAX_TERMS, "top_n")
+            if comparison_query is not None:
+                result = await run_in_threadpool(
+                    service.compare_field_terms,
+                    primary_query,
+                    comparison_query,
+                    spec.field,
+                    applied["top_n"],
+                )
+                summary = {
+                    "primary_total": result["primary_total"],
+                    "comparison_total": result["comparison_total"],
+                    "distinct": result["distinct"],
+                }
+            else:
+                result = await run_in_threadpool(
+                    service.field_terms, primary_query, spec.field, applied["top_n"]
+                )
+                summary = {
+                    "total": result["total"],
+                    "distinct": result["distinct"],
+                    "top_values": result["values"][:5],
+                }
+        elif data_kind == "numeric":
+            applied["bins"] = _capped(opts.bins, 30, VIZ_COMPARE_MAX_BINS, "bins")
+            if comparison_query is not None:
+                result = await run_in_threadpool(
+                    service.compare_field_numeric,
+                    primary_query,
+                    comparison_query,
+                    spec.field,
+                    applied["bins"],
+                )
+                summary = {
+                    "primary_total": result["primary_total"],
+                    "comparison_total": result["comparison_total"],
+                }
+            else:
+                result = await run_in_threadpool(
+                    service.field_numeric_stats, primary_query, spec.field, applied["bins"]
+                )
+                if not result["count"]:
+                    raise ValueError(
+                        f'field "{spec.field}" has no numeric values under these filters, so '
+                        f'chart_type="{chart_type}" would render empty. Treat it as '
+                        'categorical: chart_type "bar"/"pie"/"heatmap" with scale "nominal".'
+                    )
+                summary = {
+                    "count": result["count"],
+                    "min": result["min"],
+                    "max": result["max"],
+                    "mean": result["mean"],
+                }
+        elif data_kind == "timeseries":
+            applied["buckets"] = min(max(opts.buckets or 30, 4), VIZ_TIMESERIES_MAX_BUCKETS)
+            applied["top_n"] = _capped(opts.top_n, 6, VIZ_TIMESERIES_MAX_SERIES, "top_n")
             result = await run_in_threadpool(
                 service.field_value_timeseries,
                 primary_query,
                 spec.field,
-                min(max(spec.buckets or 30, 4), VIZ_TIMESERIES_MAX_BUCKETS),
-                max(1, min(spec.series_limit or 6, VIZ_TIMESERIES_MAX_SERIES)),
+                applied["buckets"],
+                applied["top_n"],
             )
-            return {
-                "ok": True,
+            summary = {
                 "series_count": len(result["series"]),
                 "interval_seconds": result["interval_seconds"],
             }
-        if kind == "punchcard":
+        elif data_kind == "time":
+            applied["buckets"] = min(max(opts.buckets or 30, 4), VIZ_COMPARE_MAX_BUCKETS)
+            if comparison_query is not None:
+                result = await run_in_threadpool(
+                    service.compare_time_histogram,
+                    primary_query,
+                    comparison_query,
+                    applied["buckets"],
+                )
+                summary = {
+                    "primary_total": result["primary_total"],
+                    "comparison_total": result["comparison_total"],
+                }
+            else:
+                result = await run_in_threadpool(
+                    service.histogram, primary_query, applied["buckets"]
+                )
+                summary = {
+                    "buckets": len(result["buckets"]),
+                    "interval_seconds": result["interval_seconds"],
+                }
+        elif data_kind == "punchcard":
             result = await run_in_threadpool(service.time_punchcard, primary_query)
-            return {"ok": True, "total": result["total"], "max_count": result["max_count"]}
-        if kind == "pivot":
+            summary = {"total": result["total"], "max_count": result["max_count"]}
+        elif data_kind == "pivot":
+            applied["limit_x"] = _capped(opts.limit_x, 8, VIZ_PIVOT_MAX_LIMIT, "limit_x")
+            applied["limit_y"] = _capped(opts.limit_y, 8, VIZ_PIVOT_MAX_LIMIT, "limit_y")
             result = await run_in_threadpool(
                 service.field_pivot,
                 primary_query,
                 spec.field,
                 spec.field_y,
-                max(1, min(spec.limit or 8, VIZ_PIVOT_MAX_LIMIT)),
-                max(1, min(spec.limit_y or 8, VIZ_PIVOT_MAX_LIMIT)),
+                applied["limit_x"],
+                applied["limit_y"],
             )
-            return {
-                "ok": True,
+            summary = {
                 "total": result["total"],
                 "x_distinct": result["x_distinct"],
                 "y_distinct": result["y_distinct"],
             }
-        if kind == "scatter":
+        else:  # scatter
+            applied["sample_limit"] = _capped(
+                opts.sample_limit, 300, VIZ_SCATTER_MAX_POINTS, "sample_limit"
+            )
             result = await run_in_threadpool(
                 service.field_scatter,
                 primary_query,
                 spec.field,
                 spec.field_y,
-                max(1, min(spec.limit or 300, VIZ_SCATTER_MAX_POINTS)),
+                applied["sample_limit"],
             )
-            return {"ok": True, "total": result["total"], "sampled": result["sampled"]}
+            if not result["sampled"]:
+                raise ValueError(
+                    f'no event has numeric values for both "{spec.field}" and '
+                    f'"{spec.field_y}" under these filters, so chart_type="scatter" '
+                    "would render empty. Check both fields with describe_field."
+                )
+            summary = {"total": result["total"], "sampled": result["sampled"]}
 
-        if kind not in compare_kinds:
-            raise ValueError(
-                'kind must be one of "terms", "numeric", "timeseries", "punchcard", '
-                '"pivot", "scatter", "compare_time", "compare_terms", "compare_numeric"'
-            )
-        comparison_filters = _validated(spec.comparison_filters)
-        comparison_query = await _build_query(scope, comparison_filters)
-        if kind == "compare_time":
-            result = await run_in_threadpool(
-                service.compare_time_histogram,
-                primary_query,
-                comparison_query,
-                min(max(spec.buckets or 30, 4), VIZ_COMPARE_MAX_BUCKETS),
-            )
-        elif kind == "compare_terms":
-            result = await run_in_threadpool(
-                service.compare_field_terms,
-                primary_query,
-                comparison_query,
-                spec.field,
-                max(1, min(spec.limit or 20, VIZ_COMPARE_MAX_TERMS)),
-            )
-        else:
-            result = await run_in_threadpool(
-                service.compare_field_numeric,
-                primary_query,
-                comparison_query,
-                spec.field,
-                max(1, min(spec.limit or 20, VIZ_COMPARE_MAX_BINS)),
-            )
+        # Presentation options don't reach the query, but belong in the echo —
+        # they are part of what the analyst will see.
+        for key in meta.reads_options:
+            if key in applied:
+                continue
+            value = getattr(opts, key)
+            if value is not None:
+                applied[key] = value
+
         return {
             "ok": True,
-            "primary_total": result["primary_total"],
-            "comparison_total": result["comparison_total"],
+            "resolved": {
+                "chart_type": chart_type,
+                "scale": scale,
+                "metric": spec.metric,
+                "compare_mode": spec.compare.mode,
+                "data_kind": data_kind,
+                "field": spec.field,
+                "field_y": spec.field_y,
+                "options": applied,
+            },
+            "warnings": warnings,
+            "summary": summary,
         }
 
     if scope.conversation_id is not None:

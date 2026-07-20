@@ -35,6 +35,7 @@ from vestigo.db._offsets import (
     offset_raw_bounds,
 )
 from vestigo.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
+from vestigo.db._time_fields import TimeFieldSpec, resolve_time_field
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
@@ -320,6 +321,7 @@ def _field_column_expr(
     *,
     cast_non_string: bool = True,
     field_mappings: dict[str, list[str]] | None = None,
+    source_offsets: dict[str, int] | None = None,
 ) -> str:
     """Resolve *field_token* to a SQL expression, binding an attribute key if needed.
 
@@ -344,7 +346,17 @@ def _field_column_expr(
     before column/attribute routing, since validation guarantees canonical
     names never collide with core columns or existing raw keys. ``attr:``
     tokens always bypass mappings.
+
+    ``time:`` tokens (:mod:`vestigo.db._time_fields`) resolve first of all, to
+    a date-part expression over the *offset-corrected* timestamp — hence
+    ``source_offsets``, which callers take off the same ``EventQuery`` as
+    ``field_mappings``. Callers must have bound the offset arrays via
+    ``bind_offset_params`` (``effective_ts_sql`` binds nothing itself). The
+    namespace is reserved, so this precedes mappings rather than racing them.
     """
+    time_spec = resolve_time_field(field_token)
+    if time_spec is not None:
+        return time_spec.sql(effective_ts_sql(source_offsets))
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
         return mapping_coalesce_expr(mapped_raws, parameters, param_name)
@@ -365,12 +377,17 @@ class _ParameterizedQueryBuilder:
         self,
         field_mappings: dict[str, list[str]] | None = None,
         *,
+        source_offsets: dict[str, int] | None = None,
         search_blob_ready: bool = False,
     ) -> None:
         self.conditions: list[str] = []
         self.parameters: dict[str, Any] = {}
         self._counter = 0
         self._field_mappings = field_mappings
+        # Only `time:` tokens read this — they bucket the offset-corrected
+        # timestamp, so filtering "hour 02" means the corrected hour, matching
+        # how every other time-derived predicate treats a skewed source (W2).
+        self._source_offsets = source_offsets
         # M22: when the search_blob column + index are materialized
         # (ClickHouseStore.search_blob_ready), broad text search prepends an
         # index-prunable blob pre-filter. Default False keeps generated SQL
@@ -480,6 +497,7 @@ class _ParameterizedQueryBuilder:
             self._param_name,
             cast_non_string=True,
             field_mappings=self._field_mappings,
+            source_offsets=self._source_offsets,
         )
 
     def add_field_filter(self, key: str, values: list[str], mode: str = "exact") -> None:
@@ -686,6 +704,7 @@ class _ParameterizedQueryBuilder:
             self._param_name,
             cast_non_string=False,
             field_mappings=self._field_mappings,
+            source_offsets=self._source_offsets,
         )
 
     def where_clause(self) -> str:
@@ -739,6 +758,7 @@ class EventQueryService:
         """
         builder = _ParameterizedQueryBuilder(
             field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
             search_blob_ready=self.store.search_blob_ready() if query.q else False,
         )
         builder.add_param("case_id = :name", query.case_id)
@@ -1603,7 +1623,11 @@ class EventQueryService:
         where, parameters = self._build_where(query)
         database = self.store.database
         col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
 
         # Single scan: the window aggregates run after GROUP BY but before
@@ -1679,7 +1703,11 @@ class EventQueryService:
         where, parameters = self._build_where(query)
         database = self.store.database
         col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         cast_expr = f"toFloat64OrNull(toString({col_expr}))"
 
@@ -1819,7 +1847,11 @@ class EventQueryService:
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
         col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
 
         fused_result = self.store.client.query(
@@ -2032,7 +2064,11 @@ class EventQueryService:
         """Return per-value counts restricted to *values*, plus the layer's non-empty total."""
         where, parameters = self._build_where(query)
         col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         parameters["cmp_values"] = values
         result = self.store.client.query(
@@ -2116,7 +2152,11 @@ class EventQueryService:
         """Return (count, min, max) of the numeric cast of *field_token* for one layer."""
         where, parameters = self._build_where(query)
         col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         cast_expr = f"toFloat64OrNull(toString({col_expr}))"
         result = self.store.client.query(
@@ -2137,7 +2177,11 @@ class EventQueryService:
         """Return bin-index → count for one layer, bucketed on explicit shared edges."""
         where, parameters = self._build_where(query)
         col_expr = _field_column_expr(
-            field_token, parameters, "field_key", field_mappings=query.field_mappings
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         cast_expr = f"toFloat64OrNull(toString({col_expr}))"
         result = self.store.client.query(
@@ -2299,32 +2343,59 @@ class EventQueryService:
         events where **both** fields are non-empty (the joint-presence subset
         the matrix describes), so captions stay honest about coverage.
         Powers the field×field heatmap and the flow (Sankey) chart.
+
+        A **bounded** ``time:`` axis (hour-of-day, weekday, month, …) skips
+        its terms scan: its domain is known, complete and naturally ordered,
+        so ranking it by count would both reorder the axis and drop the empty
+        slots that make a temporal heatmap readable — an hour with no events
+        is a finding, not a value to hide. Its ``distinct`` is the domain
+        size, which is honest precisely because nothing was cut off. Unbounded
+        ``time:`` parts (date, year-month) keep the top-N path like any other
+        high-cardinality field.
         """
         self.store.init_schema()
-        terms_x, terms_y = self._run_parallel(
-            lambda: self._field_terms_impl(query, field_x, limit=limit_x),
-            lambda: self._field_terms_impl(query, field_y, limit=limit_y),
+        spec_x = resolve_time_field(field_x)
+        spec_y = resolve_time_field(field_y)
+
+        def _axis(
+            field_token: str, spec: TimeFieldSpec | None, limit: int
+        ) -> tuple[list[str], int]:
+            """One axis's ``(values, distinct)`` — domain verbatim, or top-N by count."""
+            if spec is not None and spec.domain is not None:
+                return list(spec.domain), len(spec.domain)
+            terms = self._field_terms_impl(query, field_token, limit=limit)
+            return [v["value"] for v in terms["values"]], terms["distinct"]
+
+        (x_values, x_distinct), (y_values, y_distinct) = self._run_parallel(
+            lambda: _axis(field_x, spec_x, limit_x),
+            lambda: _axis(field_y, spec_y, limit_y),
         )
-        x_values = [v["value"] for v in terms_x["values"]]
-        y_values = [v["value"] for v in terms_y["values"]]
         base = {
             "kind": "pivot",
             "field_x": field_x,
             "field_y": field_y,
             "x_values": x_values,
             "y_values": y_values,
-            "x_distinct": terms_x["distinct"],
-            "y_distinct": terms_y["distinct"],
+            "x_distinct": x_distinct,
+            "y_distinct": y_distinct,
         }
         if not x_values or not y_values:
             return {**base, "cells": [], "total": 0}
 
         where, parameters = self._build_where(query)
         col_x = _field_column_expr(
-            field_x, parameters, "field_key_x", field_mappings=query.field_mappings
+            field_x,
+            parameters,
+            "field_key_x",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         col_y = _field_column_expr(
-            field_y, parameters, "field_key_y", field_mappings=query.field_mappings
+            field_y,
+            parameters,
+            "field_key_y",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         parameters["pivot_x_values"] = x_values
         parameters["pivot_y_values"] = y_values
@@ -2362,10 +2433,18 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         col_x = _field_column_expr(
-            field_x, parameters, "field_key_x", field_mappings=query.field_mappings
+            field_x,
+            parameters,
+            "field_key_x",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         col_y = _field_column_expr(
-            field_y, parameters, "field_key_y", field_mappings=query.field_mappings
+            field_y,
+            parameters,
+            "field_key_y",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
         )
         pairs_subquery = (
             f"SELECT toFloat64OrNull(toString({col_x})) AS vx, "

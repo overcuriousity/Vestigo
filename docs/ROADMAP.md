@@ -307,7 +307,14 @@ thinking capture as first-class messages, and full-thread JSON export — see
   `propose_chart` (`agent/tools.py`, validate-by-execute, no write); frontend `ChartSpec` →
   `ChartConfig` mapping (`specToChartConfig`, `frontend/src/api/agent.ts`) and a live
   `ChartProposalCard.tsx` fetched fresh through `vizApi` with "Open in Visualize"/"Save".
-  See `docs/AGENT.md` "Tools" for the full contract.
+  **Superseded by A9b** — the parity was partial (7 of 13 chart types reachable).
+- ✅ **A9b — Chart-contract isomorphism + virtual `time:` fields** — shipped:
+  `ChartSpec` now mirrors `ChartConfig` (chart_type/scale/metric/compare/options);
+  `agent/chart_meta.py` is the single legality table and generates `chartMeta.ts`
+  (`scripts/gen_chart_meta.py`); errors name the legal alternatives; the result echoes a
+  `resolved` block; new `describe_field`; `db/_time_fields.py` makes time parts
+  (`time:hour_of_day`, …) ordinary field tokens for charts *and* filters.
+  See `docs/AGENT.md` "propose_chart" for the full contract.
 - [ ] **Confirm-proposal crash-gap.** A crash between the atomic proposal-decide and the
   annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
   Single-process tradeoff, deliberate; revisit if it bites.

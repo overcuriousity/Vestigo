@@ -487,6 +487,18 @@ async def test_compare_rejects_unknown_kind(store):
 
 
 class _FakeChartService(_FakeVizService):
+    #: Field vocabulary `propose_chart`/`describe_field` validate against.
+    FIELDS = ["bytes", "latency", "status", "user", "country"]
+
+    #: Set to 0 to exercise the "field is not numeric" rejection.
+    numeric_count = 100
+    #: Set to 0 to exercise the "no numeric pairs" scatter rejection.
+    scatter_sampled = 25
+
+    def list_fields(self, case_id, source_ids, field_mappings=None):
+        self.calls.append(("list_fields", (), {}))
+        return {"top_level": ["artifact", "message"], "attributes": list(self.FIELDS), "mapped": []}
+
     def field_terms(self, query, field, limit):
         self.calls.append(("field_terms", (field, limit), {}))
         return {
@@ -497,9 +509,34 @@ class _FakeChartService(_FakeVizService):
             "values": [{"value": "a", "count": 60}, {"value": "b", "count": 40}],
         }
 
-    def field_numeric_stats(self, query, field):
-        self.calls.append(("field_numeric_stats", (field,), {}))
-        return {"field": field, "count": 100, "min": 0, "max": 99, "mean": 50, "stddev": 10}
+    def field_numeric_stats(self, query, field, bins=30):
+        self.calls.append(("field_numeric_stats", (field, bins), {}))
+        return {
+            "field": field,
+            "count": self.numeric_count,
+            "min": 0,
+            "max": 99,
+            "mean": 50,
+            "stddev": 10,
+        }
+
+    def field_scatter(self, query, field_x, field_y, limit):
+        self.calls.append(("field_scatter", (field_x, field_y, limit), {}))
+        return {"kind": "scatter", "points": [], "total": 0, "sampled": self.scatter_sampled}
+
+    def compare_field_terms(self, primary, comparison, field, limit):
+        self.calls.append(("compare_field_terms", (field, limit), {}))
+        return {
+            "kind": "terms",
+            "field": field,
+            "primary_total": 0,
+            "comparison_total": 0,
+            "distinct": 3,
+        }
+
+    def histogram(self, query, buckets):
+        self.calls.append(("histogram", (buckets,), {}))
+        return {"buckets": [], "interval_seconds": 3600}
 
 
 def _patch_chart_service(monkeypatch) -> _FakeChartService:
@@ -510,121 +547,478 @@ def _patch_chart_service(monkeypatch) -> _FakeChartService:
     return fake
 
 
-async def test_propose_chart_terms(store, monkeypatch):
+def _chart(spec: dict) -> dict:
+    return {"title": "t", "description": "", "spec": spec}
+
+
+def _called(fake: _FakeChartService, name: str) -> tuple:
+    """Args of the first call to *name* — skips the field-vocabulary lookup."""
+    for called_name, args, _ in fake.calls:
+        if called_name == name:
+            return args
+    raise AssertionError(f"{name} was not called; got {[c[0] for c in fake.calls]}")
+
+
+# ── every chart type is reachable ───────────────────────────────────────────
+# The bug this contract replaced: `kind` addressed 7 of 13 marks, so a pie
+# request silently rendered a bar. `pie`/`heatmap`/`box`/`violin`/`ecdf`/
+# `sankey` here are the six that were unreachable.
+
+_CHART_TYPE_CASES = [
+    ("time", {}, "histogram"),
+    ("bar", {"field": "attr:status"}, "field_terms"),
+    ("pie", {"field": "attr:status"}, "field_terms"),
+    ("heatmap", {"field": "attr:status"}, "field_value_timeseries"),
+    ("line", {"field": "attr:bytes", "scale": "ratio"}, "field_value_timeseries"),
+    ("histogram", {"field": "attr:bytes"}, "field_numeric_stats"),
+    ("box", {"field": "attr:bytes"}, "field_numeric_stats"),
+    ("violin", {"field": "attr:bytes"}, "field_numeric_stats"),
+    ("ecdf", {"field": "attr:bytes"}, "field_numeric_stats"),
+    ("punchcard", {}, "time_punchcard"),
+    ("pivot", {"field": "attr:user", "field_y": "attr:status"}, "field_pivot"),
+    ("sankey", {"field": "attr:user", "field_y": "attr:status"}, "field_pivot"),
+    ("scatter", {"field": "attr:bytes", "field_y": "attr:latency"}, "field_scatter"),
+]
+
+
+@pytest.mark.parametrize(("chart_type", "extra", "expected_call"), _CHART_TYPE_CASES)
+async def test_propose_chart_reaches_every_chart_type(
+    store, monkeypatch, chart_type, extra, expected_call
+):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "propose_chart", _chart({"chart_type": chart_type, **extra}))
+    assert result["ok"] is True
+    assert result["resolved"]["chart_type"] == chart_type
+    _called(fake, expected_call)
+
+
+async def test_propose_chart_covers_all_thirteen_types():
+    """Guard against the parametrization drifting behind the table."""
+    from vestigo.agent.chart_meta import CHART_TYPES
+
+    assert {c for c, _, _ in _CHART_TYPE_CASES} == set(CHART_TYPES)
+
+
+# ── the resolved echo ───────────────────────────────────────────────────────
+
+
+async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
+    """The model asked for a pie and was told `ok: true` while a bar rendered.
+    `resolved` is the channel that makes that impossible to miss."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "propose_chart", _chart({"chart_type": "pie", "field": "country"}))
+    assert result["resolved"] == {
+        "chart_type": "pie",
+        "scale": "nominal",  # the chart type's default, since none was given
+        "metric": "count",
+        "compare_mode": "off",
+        "data_kind": "terms",
+        "field": "country",
+        "field_y": None,
+        "options": {"top_n": 30},
+    }
+    assert result["warnings"] == []
+
+
+async def test_clamped_option_is_reported_as_a_warning(store, monkeypatch):
     fake = _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(
         server,
         "propose_chart",
-        {
-            "title": "Top artifacts",
-            "description": "artifact distribution",
-            "spec": {"kind": "terms", "field": "artifact", "limit": 500},
-        },
+        _chart({"chart_type": "bar", "field": "country", "options": {"top_n": 500}}),
     )
-    assert result["ok"] is True
-    assert result["total"] == 100
-    assert len(result["top_values"]) == 2
-    name, args, _ = fake.calls[0]
-    assert name == "field_terms"
-    assert args == ("artifact", 100)  # limit clamped to field_terms' own 100 cap
+    assert result["resolved"]["options"]["top_n"] == 30
+    assert any("clamped" in w and "not capped" in w for w in result["warnings"])
+    assert _called(fake, "field_terms") == ("country", 30)
 
 
-async def test_propose_chart_numeric(store, monkeypatch):
+async def test_option_the_chart_ignores_warns_but_still_succeeds(store, monkeypatch):
+    """A stray cosmetic option must not cost the analyst a chart — but silence
+    would leave the model believing it had set something."""
     _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(
         server,
         "propose_chart",
-        {
-            "title": "Bytes",
-            "description": "bytes distribution",
-            "spec": {"kind": "numeric", "field": "attr:bytes"},
-        },
+        _chart({"chart_type": "bar", "field": "country", "options": {"bins": 12}}),
     )
     assert result["ok"] is True
-    assert result["mean"] == 50
+    assert any("bins" in w and "ignored" in w for w in result["warnings"])
 
 
-async def test_propose_chart_timeseries(store, monkeypatch):
+async def test_presentation_options_reach_the_resolved_echo(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "bar",
+                "field": "country",
+                "options": {"orientation": "vertical", "sort": "value", "log_scale": True},
+            }
+        ),
+    )
+    assert result["resolved"]["options"]["orientation"] == "vertical"
+    assert result["resolved"]["options"]["sort"] == "value"
+    assert result["resolved"]["options"]["log_scale"] is True
+
+
+# ── legality rules; each error must name the legal alternative ──────────────
+
+
+async def _reject(server, spec: dict) -> str:
+    with pytest.raises(ToolError) as excinfo:
+        await _call(server, "propose_chart", _chart(spec))
+    return str(excinfo.value)
+
+
+async def test_scale_illegal_for_chart_type_lists_the_alternatives(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "pie", "field": "country", "scale": "ratio"})
+    assert '"nominal"' in message
+    # ...and names what *is* legal at that scale, so the model can retry.
+    assert "histogram" in message
+
+
+async def test_missing_field_names_the_field_free_charts(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "bar"})
+    assert "requires field" in message
+    assert "punchcard" in message
+
+
+async def test_missing_field_y_says_why_it_is_needed(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "sankey", "field": "user"})
+    assert "field_y" in message
+
+
+async def test_field_y_on_a_one_field_chart_is_rejected_not_dropped(store, monkeypatch):
+    """Silently ignoring it would teach the model nothing."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "bar", "field": "user", "field_y": "status"})
+    assert "takes no field_y" in message
+    assert "pivot, sankey, scatter" in message
+
+
+async def test_compare_on_an_unsupported_chart_lists_the_capable_ones(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "pie", "field": "country", "compare": {"mode": "baseline"}}
+    )
+    assert "time, bar, histogram" in message
+
+
+async def test_custom_compare_without_filters_points_at_baseline(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "time", "compare": {"mode": "custom"}})
+    assert "baseline" in message
+
+
+async def test_time_bucketed_metric_outside_the_time_chart_is_rejected(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "bar", "field": "country", "metric": "rate"})
+    assert 'chart_type="time"' in message
+    # The formula is quoted so the model learns what the metric means.
+    assert "bucket_interval_seconds" in message
+
+
+async def test_ratio_metric_without_a_comparison_layer_is_rejected(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "time", "metric": "ratio"})
+    assert "comparison layer" in message
+
+
+async def test_rate_metric_on_the_time_chart_is_accepted(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "propose_chart", _chart({"chart_type": "time", "metric": "rate"}))
+    assert result["resolved"]["metric"] == "rate"
+
+
+async def test_unknown_field_is_rejected_with_near_misses(store, monkeypatch):
+    """An unknown attribute key resolves to an empty Map lookup, so without
+    this check a typo returns a cheerful `ok: true` over zero rows."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "bar", "field": "attr:countyr"})
+    assert "not a field in this timeline" in message
+    assert "country" in message
+
+
+async def test_numeric_chart_over_a_categorical_field_is_rejected(store, monkeypatch):
+    """`count == 0` is the documented categorical signal. It used to return
+    `ok: true` — a validated-looking success for an unrenderable chart."""
+    fake = _patch_chart_service(monkeypatch)
+    fake.numeric_count = 0
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "histogram", "field": "user"})
+    assert "no numeric values" in message
+    assert '"bar"' in message
+
+
+async def test_scatter_with_no_numeric_pairs_is_rejected(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    fake.scatter_sampled = 0
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "scatter", "field": "user", "field_y": "status"})
+    assert "describe_field" in message
+
+
+# ── option routing, incl. the bugs the old overloaded `limit` caused ────────
+
+
+async def test_bins_reach_the_numeric_scan(store, monkeypatch):
+    """`propose_chart` used to drop the bin count entirely."""
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "histogram", "field": "bytes", "options": {"bins": 12}}),
+    )
+    assert _called(fake, "field_numeric_stats") == ("bytes", 12)
+
+
+async def test_top_n_and_buckets_no_longer_collide_on_timeseries(store, monkeypatch):
+    """Both used to land on `topN`, so whichever was written last won."""
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "line",
+                "field": "bytes",
+                "scale": "ratio",
+                "options": {"top_n": 5, "buckets": 20},
+            }
+        ),
+    )
+    assert _called(fake, "field_value_timeseries") == ("bytes", 20, 5)
+
+
+async def test_compare_baseline_is_reachable(store, monkeypatch):
+    """Unreachable under the old contract, though the viz endpoint supported it."""
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "time", "compare": {"mode": "baseline"}})
+    )
+    assert result["resolved"]["compare_mode"] == "baseline"
+    _called(fake, "compare_time_histogram")
+
+
+async def test_compare_on_a_bar_chart_uses_the_compare_terms_scan(store, monkeypatch):
     fake = _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(
         server,
         "propose_chart",
-        {
-            "title": "Status over time",
-            "description": "",
-            "spec": {"kind": "timeseries", "field": "attr:status", "buckets": 999},
-        },
+        _chart({"chart_type": "bar", "field": "country", "compare": {"mode": "baseline"}}),
     )
-    assert result["ok"] is True
-    name, args, _ = fake.calls[0]
-    assert name == "field_value_timeseries"
-    assert args == ("attr:status", 60, 6)  # buckets clamped, default series_limit
+    assert result["summary"]["comparison_total"] == 0
+    _called(fake, "compare_field_terms")
 
 
-async def test_propose_chart_pivot_requires_field_y(store):
+async def test_unknown_option_key_is_rejected(store, monkeypatch):
+    """`ChartOptionsSpec` is a small closed set, so a typo should error rather
+    than vanish — the warning path only covers *known* but inert keys."""
+    _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    with pytest.raises(ToolError):
-        await _call(
-            server,
-            "propose_chart",
-            {"title": "t", "description": "", "spec": {"kind": "pivot", "field": "attr:user"}},
-        )
+    await _reject(server, {"chart_type": "bar", "field": "country", "options": {"topn": 5}})
 
 
-async def test_propose_chart_scatter(store, monkeypatch):
+# ── virtual time fields as chart axes ───────────────────────────────────────
+
+
+async def test_country_by_hour_of_day_pivot(store, monkeypatch):
+    """The chart the temporal-heatmap work exists for."""
     fake = _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(
         server,
         "propose_chart",
-        {
-            "title": "t",
-            "description": "",
-            "spec": {
+        _chart({"chart_type": "pivot", "field": "country", "field_y": "time:hour_of_day"}),
+    )
+    assert result["ok"] is True
+    assert _called(fake, "field_pivot")[:2] == ("country", "time:hour_of_day")
+
+
+async def test_time_field_passes_field_validation(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "bar", "field": "time:day_of_week"})
+    )
+    assert result["resolved"]["field"] == "time:day_of_week"
+
+
+# ── back-compat: persisted conversations still resolve ──────────────────────
+# The retired `kind` enum is absent from the model-facing schema but still
+# understood, for a conversation in flight across a server restart.
+
+
+async def test_propose_chart_legacy_kind_terms(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"kind": "terms", "field": "artifact", "limit": 500})
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["chart_type"] == "bar"
+    assert result["summary"]["total"] == 100
+    assert len(result["summary"]["top_values"]) == 2
+    assert _called(fake, "field_terms") == ("artifact", 30)
+
+
+async def test_propose_chart_legacy_kind_numeric(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"kind": "numeric", "field": "attr:bytes"})
+    )
+    assert result["resolved"]["chart_type"] == "histogram"
+    assert result["summary"]["mean"] == 50
+
+
+async def test_propose_chart_legacy_kind_timeseries(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"kind": "timeseries", "field": "attr:status", "buckets": 999}),
+    )
+    assert result["resolved"]["chart_type"] == "line"
+    assert _called(fake, "field_value_timeseries") == ("attr:status", 60, 6)
+
+
+async def test_propose_chart_legacy_kind_scatter_demuxes_limit(store, monkeypatch):
+    """`limit` meant a different option per kind — here, the point cap."""
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
                 "kind": "scatter",
                 "field": "attr:bytes",
                 "field_y": "attr:latency",
                 "limit": 50000,
-            },
-        },
+            }
+        ),
     )
-    assert result["ok"] is True
-    name, args, _ = fake.calls[0]
-    assert args == ("attr:bytes", "attr:latency", 1000)  # clamped to VIZ_SCATTER_MAX_POINTS
+    assert _called(fake, "field_scatter") == ("attr:bytes", "attr:latency", 1000)
 
 
-async def test_propose_chart_compare_time(store, monkeypatch):
+async def test_propose_chart_legacy_kind_compare_time_with_filters(store, monkeypatch):
     fake = _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(
         server,
         "propose_chart",
-        {"title": "t", "description": "", "spec": {"kind": "compare_time", "buckets": 999}},
+        _chart(
+            {
+                "kind": "compare_time",
+                "buckets": 999,
+                "comparison_filters": {"source_id": "s2"},
+            }
+        ),
     )
-    assert result["ok"] is True
-    assert "primary_total" in result and "comparison_total" in result
-    name, args, _ = fake.calls[0]
-    assert name == "compare_time_histogram"
-    assert args == (60,)
+    assert result["resolved"]["chart_type"] == "time"
+    assert result["resolved"]["compare_mode"] == "custom"
+    assert _called(fake, "compare_time_histogram") == (60,)
 
 
-async def test_propose_chart_unknown_kind(store):
+async def test_propose_chart_legacy_compare_without_filters_matches_the_old_card(
+    store, monkeypatch
+):
+    """`specToChartConfig` emitted `{mode: "off"}` when `comparison_filters`
+    was absent, so the analyst's card drew a single-layer histogram even though
+    the old backend validated it as a comparison. The card is the artifact, so
+    the translation follows the card."""
+    fake = _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    with pytest.raises(ToolError):
-        await _call(
-            server, "propose_chart", {"title": "t", "description": "", "spec": {"kind": "bogus"}}
-        )
+    result = await _call(server, "propose_chart", _chart({"kind": "compare_time"}))
+    assert result["resolved"]["compare_mode"] == "off"
+    _called(fake, "histogram")
 
 
-async def test_propose_chart_missing_required_field(store):
+async def test_propose_chart_legacy_kind_pivot_requires_field_y(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    with pytest.raises(ToolError):
-        await _call(
-            server, "propose_chart", {"title": "t", "description": "", "spec": {"kind": "terms"}}
-        )
+    await _reject(server, {"kind": "pivot", "field": "user"})
+
+
+async def test_propose_chart_unknown_chart_type(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _reject(server, {"chart_type": "bogus"})
+
+
+async def test_propose_chart_unknown_legacy_kind(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _reject(server, {"kind": "bogus"})
+
+
+# ── describe_field: the agent's equivalent of the page's auto-probe ─────────
+
+
+async def test_describe_field_suggests_ratio_for_a_numeric_field(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "describe_field", {"field": "bytes"})
+    assert result["exists"] is True
+    assert result["suggested_scale"] == "ratio"
+    assert "histogram" in result["suggested_chart_types"]
+    assert result["numeric"]["mean"] == 50
+
+
+async def test_describe_field_suggests_nominal_when_values_are_not_numeric(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    fake.numeric_count = 0
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "describe_field", {"field": "user"})
+    assert result["suggested_scale"] == "nominal"
+    assert result["numeric"] is None
+    assert "bar" in result["suggested_chart_types"]
+    assert any("do not parse as numbers" in n for n in result["notes"])
+
+
+async def test_describe_field_reports_an_unknown_field_with_suggestions(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "describe_field", {"field": "countyr"})
+    assert result["exists"] is False
+    assert "country" in result["suggestions"]
+
+
+async def test_describe_field_answers_time_fields_without_scanning(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "describe_field", {"field": "time:hour_of_day"})
+    assert result["virtual"] is True
+    assert result["suggested_scale"] == "ordinal"
+    assert result["distinct"] == 24
+    assert result["top_values"][:3] == ["00", "01", "02"]
+    assert not [c for c in fake.calls if c[0] in {"field_terms", "field_numeric_stats"}]
 
 
 MAX_PROPOSAL_EVENTS_TEST = 500  # mirror of tools.MAX_PROPOSAL_EVENTS
