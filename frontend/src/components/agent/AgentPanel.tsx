@@ -158,7 +158,13 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     ? [...s.items, { kind: "assistant", content: s.liveText }]
     : s.items;
   if (e.type === "compaction") {
-    return { ...s, items: [...flushed, { kind: "compaction", summary: e.summary }], liveText: "" };
+    // A compaction mid-turn means the failed attempt is being retried — its
+    // partial thinking will be re-streamed, so drop the stale deltas too.
+    return {
+      items: [...flushed, { kind: "compaction", summary: e.summary }],
+      liveText: "",
+      liveThinking: "",
+    };
   }
   if (e.type === "tool_call") {
     if (e.tool === "propose_finding") {
@@ -243,7 +249,9 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const [streaming, setStreaming] = useState(false);
   const [pendingUserText, setPendingUserText] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -364,6 +372,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const handleCreate = useCallback(
     async (disabledTools: string[]) => {
       setCreating(true);
+      setCreateError(null);
       try {
         const conversation = await agentApi.createConversation(caseId, timelineId, disabledTools);
         queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
@@ -371,8 +380,9 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         setDialogOpen(false);
         // A message typed before the dialog opened sends immediately.
         if (input.trim()) void sendTo(conversation.id);
-      } catch {
-        // Dialog stays open; the user can retry or cancel.
+      } catch (err) {
+        // Dialog stays open with the error shown; the user can retry or cancel.
+        setCreateError(err instanceof Error ? err.message : "Could not start the conversation.");
       } finally {
         setCreating(false);
       }
@@ -383,10 +393,16 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const exportThread = useCallback(async () => {
     if (!activeId) return;
     setExporting(true);
+    setExportError(null);
     try {
       const blob = await agentApi.exportConversation(caseId, activeId);
-      const title = conversationQuery.data?.title || activeId;
-      triggerDownload(blob, `agent-${title}.json`);
+      // Titles are free user text — keep only filename-safe characters.
+      const title = (conversationQuery.data?.title || activeId)
+        .replace(/[^\p{L}\p{N}._-]+/gu, "_")
+        .slice(0, 60);
+      triggerDownload(blob, `agent-${title || activeId}.json`);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Export failed.");
     } finally {
       setExporting(false);
     }
@@ -470,6 +486,12 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           <X size={14} />
         </Button>
       </div>
+
+      {exportError && (
+        <p className="border-b border-[var(--color-border)] px-2.5 py-1 text-[11px] text-[var(--color-danger)]">
+          Export failed: {exportError}
+        </p>
+      )}
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto p-2.5">
@@ -617,9 +639,13 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
       <NewConversationDialog
         open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        onOpenChange={(open) => {
+          setDialogOpen(open);
+          if (!open) setCreateError(null);
+        }}
         onCreate={handleCreate}
         creating={creating}
+        error={createError}
       />
     </div>
   );

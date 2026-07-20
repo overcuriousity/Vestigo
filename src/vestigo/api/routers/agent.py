@@ -228,16 +228,30 @@ def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
 
 
-_CONTEXT_OVERFLOW_RE = re.compile(r"context|token|length|too (?:long|large)|maximum", re.IGNORECASE)
+# Known overflow phrasings: OpenAI-protocol "maximum context length is N
+# tokens" / code "context_length_exceeded"; Anthropic "prompt is too long" /
+# "input is too long"; generic "context window" / "token limit" variants.
+# Deliberately NOT bare "token"/"maximum"/"length": those also appear in
+# unrelated 400s ("invalid token", "max_tokens must be ...") and a false
+# positive here burns a summarizer LLM call and surfaces a misleading
+# "start a new conversation" error.
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"context[ _-]?(?:length|window|limit)"
+    r"|maximum context"
+    r"|prompt is too long"
+    r"|input is too long"
+    r"|too many tokens"
+    r"|token (?:count )?limit",
+    re.IGNORECASE,
+)
 
 
 def _is_context_overflow(exc: ModelHTTPError) -> bool:
     """Best-effort detection of a context-window overflow across providers.
 
-    There is no standard error code — OpenAI-protocol endpoints answer 400
-    with "maximum context length"-style bodies, others vary — so this is a
-    heuristic: a 400/413 whose body mentions context/token/length terms.
-    False negatives just surface the generic model_error message.
+    There is no standard error code — this is a heuristic: a 400/413 whose
+    body matches a known overflow phrasing. False negatives just surface the
+    generic model_error message.
     """
     return exc.status_code in (400, 413) and bool(_CONTEXT_OVERFLOW_RE.search(str(exc.body or "")))
 
@@ -290,7 +304,7 @@ async def _message_stream_inner(
     last_prompt, last_completion = await store.get_last_agent_usage(conversation_id)
 
     async def _run_compaction(
-        current: list[Any], reason: str
+        current: list[Any], reason: str, keep_turns: int
     ) -> tuple[list[Any], dict[str, Any]] | None:
         """Compact, persist the forensic record, return (new_history, sse_event).
 
@@ -299,7 +313,7 @@ async def _message_stream_inner(
         its error path.
         """
         try:
-            outcome = await compact_history(config, current)
+            outcome = await compact_history(config, current, keep_turns=keep_turns)
         except Exception:
             logger.exception("History compaction failed (conversation %s)", conversation_id)
             return None
@@ -317,6 +331,7 @@ async def _message_stream_inner(
             outcome.summary,
             tool_result={
                 "reason": reason,
+                "keep_turns": keep_turns,
                 "messages_summarized": outcome.messages_summarized,
                 "estimated_tokens_before": estimated,
                 "pre_compaction_history": dump_history(current),
@@ -339,17 +354,21 @@ async def _message_stream_inner(
             "reason": reason,
         }
 
-    compacted = False
+    # Escalation schedule: the first compaction keeps 2 recent turns
+    # verbatim; if the model still overflows, a second folds down to 1; a
+    # third overflow gives up with the friendly context_overflow error.
+    keep_schedule = (2, 1)
+    compactions = 0
     estimated = estimate_next_prompt_tokens(last_prompt, last_completion, history, payload.content)
     if should_compact(config, estimated):
-        compaction = await _run_compaction(history, "threshold")
+        compaction = await _run_compaction(history, "threshold", keep_schedule[0])
         if compaction is not None:
             history, compaction_event = compaction
-            compacted = True
+            compactions = 1
             yield _sse(compaction_event)
 
     text_parts: list[str] = []
-    for attempt in (0, 1):
+    for attempt in range(len(keep_schedule) + 1):
         text_parts = []
         try:
             async for event in stream_turn(
@@ -396,13 +415,19 @@ async def _message_stream_inner(
                     # GET-style reads leave no middleware audit rows, so agent
                     # tool calls get explicit ones — the custody trail must show
                     # what the agent queried on whose behalf.
+                    # Retried attempts re-execute tool calls; the attempt tag
+                    # lets the custody trail distinguish the re-runs from the
+                    # first pass instead of looking like duplicates.
+                    audit_detail = {"tool": event["tool"], "args": event["args"]}
+                    if attempt > 0:
+                        audit_detail["attempt"] = attempt
                     await store.record_audit(
                         action="agent.tool_call",
                         actor=user,
                         case_id=case_id,
                         target_type="agent_conversation",
                         target_id=conversation_id,
-                        detail={"tool": event["tool"], "args": event["args"]},
+                        detail=audit_detail,
                     )
                 elif event["type"] == "tool_result":
                     await store.add_agent_message(
@@ -415,14 +440,15 @@ async def _message_stream_inner(
             return
         except ModelHTTPError as exc:
             overflow = _is_context_overflow(exc)
-            if overflow and attempt == 0 and not compacted:
+            if overflow and compactions < len(keep_schedule):
                 # The threshold estimate lagged behind (tool-heavy turn) —
-                # compact now and retry once. Tool rows already persisted by
-                # this attempt stay: the record shows what actually ran.
-                compaction = await _run_compaction(history, "overflow")
+                # compact and retry, escalating down the keep schedule on a
+                # repeat overflow. Tool rows already persisted by this
+                # attempt stay: the record shows what actually ran.
+                compaction = await _run_compaction(history, "overflow", keep_schedule[compactions])
                 if compaction is not None:
                     history, compaction_event = compaction
-                    compacted = True
+                    compactions += 1
                     yield _sse(compaction_event)
                     continue
             logger.exception("Agent turn failed (conversation %s)", conversation_id)

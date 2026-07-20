@@ -310,22 +310,31 @@ UI — explicit opt-in, since the right number is model-specific),
   back to serialized-history-chars/4 when usage was never reported). At
   `compact_threshold × context_window` it compacts first.
 - **Overflow backstop.** Tool-output sizes make the estimate lag one turn,
-  so a provider 400/413 whose body matches context/token/length wording
-  (`_is_context_overflow`, best-effort across providers) triggers one
-  compact-then-retry — this path works even without a configured window.
-  If nothing is old enough to fold, the client gets a friendly
-  `error{code="context_overflow"}` instead of the generic failure.
+  so a provider 400/413 whose body matches a known overflow phrasing
+  (`_is_context_overflow` — deliberately narrow patterns like "maximum
+  context", "prompt is too long", so unrelated 400s such as "invalid token"
+  never trigger it) compacts and retries — this path works even without a
+  configured window. The retry escalates: the first compaction keeps 2
+  recent turns verbatim, a repeat overflow folds down to 1, a third
+  overflow (or nothing left to fold) yields a friendly
+  `error{code="context_overflow"}` instead of the generic failure. Tool
+  calls re-executed by a retry carry an `attempt` field on their
+  `agent.tool_call` audit rows so the custody trail distinguishes re-runs
+  from duplicates.
 - **What compaction does.** `split_history` cuts at *user-turn boundaries
   only* (never between a tool_use and its tool_result), keeping the last
-  `KEEP_RECENT_TURNS=2` turns verbatim; the older head is summarized by a
-  toolset-less agent run against the same configured model (forensic
-  summary prompt: goals, findings with exact event_ids/filters, open
-  hypotheses, failed approaches). The new history = a stub user/assistant
-  message *pair* carrying the summary (pair, so strict user/assistant
-  alternation survives Anthropic-protocol replay) + the kept tail.
+  `KEEP_RECENT_TURNS=2` turns verbatim (1 on the escalated retry); the
+  older head is summarized by a toolset-less agent run against the same
+  configured model (forensic summary prompt: goals, findings with exact
+  event_ids/filters, open hypotheses, failed approaches). The new history =
+  a stub user/assistant message *pair* carrying the summary (pair, so
+  strict user/assistant alternation survives Anthropic-protocol replay) +
+  the kept tail. Usage measured before a compaction is ignored by the next
+  turn's estimate — it describes the pre-compaction size and would
+  otherwise re-trigger compaction on the already-compacted history.
 - **Forensic trail.** Compaction never destroys the record: an append-only
   `role="compaction"` message row stores the summary as content and
-  `{reason, messages_summarized, estimated_tokens_before,
+  `{reason, keep_turns, messages_summarized, estimated_tokens_before,
   pre_compaction_history}` (the exact pre-compaction wire blob) in
   `tool_result`, plus an `agent.compaction` audit row. The chat shows a
   visible "older turns were summarized" item (SSE `compaction` event), and

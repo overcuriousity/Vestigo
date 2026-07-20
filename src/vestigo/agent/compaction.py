@@ -4,8 +4,9 @@ The runtime replays the full pydantic-ai history every turn, so a long
 investigation eventually overflows the model's context window and the
 provider answers 400. When the operator configures ``context_window`` (and
 optionally ``compact_threshold``), the router calls :func:`should_compact`
-before each turn — and retries once after a detected overflow — replacing
-the older turns with an LLM-written summary via :func:`compact_history`.
+before each turn — and retries after a detected overflow, escalating from
+keeping 2 recent turns down to 1 before giving up — replacing the older
+turns with an LLM-written summary via :func:`compact_history`.
 
 Design constraints:
 
@@ -46,7 +47,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 
-from vestigo.agent.config import AgentConfig
+from vestigo.agent.config import DEFAULT_COMPACT_THRESHOLD, AgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ def should_compact(config: AgentConfig, estimated_tokens: int) -> bool:
     """Whether the estimated next prompt crosses the compaction threshold."""
     if not config.context_window:
         return False
-    threshold = config.compact_threshold or 0.85
+    threshold = config.compact_threshold or DEFAULT_COMPACT_THRESHOLD
     return estimated_tokens >= threshold * config.context_window
 
 
@@ -186,17 +187,19 @@ async def compact_history(
     config: AgentConfig,
     history: list[ModelMessage],
     *,
+    keep_turns: int = KEEP_RECENT_TURNS,
     model: Model | None = None,
 ) -> CompactionOutcome | None:
     """Summarize older turns and return the compacted history, or None.
 
     None means there is nothing old enough to fold (see
     :func:`split_history`) — the caller degrades to a friendly error if it
-    got here via a context overflow. When ``model`` is not injected (tests
-    inject one), the call builds and owns its own HTTP client, mirroring
-    ``stream_turn``.
+    got here via a context overflow. ``keep_turns`` lets the router escalate
+    (fold down to a single verbatim turn) when a first compaction still
+    overflows. When ``model`` is not injected (tests inject one), the call
+    builds and owns its own HTTP client, mirroring ``stream_turn``.
     """
-    split = split_history(history)
+    split = split_history(history, keep_turns=keep_turns)
     if split is None:
         return None
     head, tail = split

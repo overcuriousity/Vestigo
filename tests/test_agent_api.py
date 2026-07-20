@@ -1301,14 +1301,16 @@ def test_export_conversation(client, admin_bootstrap, agent_on, store, monkeypat
     ).status_code == 404
 
 
-def _seed_long_history(store, conversation_id: str, *, last_prompt_tokens: int | None = None):
-    """Three user turns of replayable history (+ optionally a measured assistant row)."""
+def _seed_long_history(
+    store, conversation_id: str, *, last_prompt_tokens: int | None = None, turns: int = 3
+):
+    """``turns`` user turns of replayable history (+ optionally a measured assistant row)."""
     from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
     from vestigo.agent.runtime import dump_history
 
     history = []
-    for i in range(3):
+    for i in range(turns):
         history.append(ModelRequest(parts=[UserPromptPart(content=f"question {i}")]))
         history.append(ModelResponse(parts=[TextPart(content=f"answer {i}")]))
 
@@ -1326,10 +1328,10 @@ def _seed_long_history(store, conversation_id: str, *, last_prompt_tokens: int |
     asyncio.run(_seed())
 
 
-def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None):
+def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None, fail_count: int = 1):
     """Patch build_model with a FunctionModel serving both the turn (stream)
-    and the compaction summarizer (non-stream). Optionally the first stream
-    call raises ModelHTTPError with the given body."""
+    and the compaction summarizer (non-stream). Optionally the first
+    ``fail_count`` stream calls raise ModelHTTPError with the given body."""
     from mcp.server.fastmcp import FastMCP
     from pydantic_ai.exceptions import ModelHTTPError
     from pydantic_ai.messages import ModelResponse, TextPart
@@ -1342,7 +1344,7 @@ def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None):
 
     async def model_stream(messages, info):
         calls["stream"] += 1
-        if fail_first_stream is not None and calls["stream"] == 1:
+        if fail_first_stream is not None and calls["stream"] <= fail_count:
             raise ModelHTTPError(status_code=400, model_name="m", body=fail_first_stream)
         yield "post-compaction answer"
 
@@ -1448,3 +1450,114 @@ def test_send_message_overflow_with_nothing_to_compact(
     assert error["code"] == "context_overflow"
     assert "context window" in error["detail"]
     assert not any(e["type"] == "compaction" for e in events)
+
+
+def test_is_context_overflow_matches_known_phrasings_only():
+    """The overflow heuristic must not fire on unrelated 400s — a false
+    positive burns a summarizer call and shows a misleading error."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from vestigo.api.routers.agent import _is_context_overflow
+
+    def _exc(body: str, status: int = 400) -> ModelHTTPError:
+        return ModelHTTPError(status_code=status, model_name="m", body=body)
+
+    # Real overflow phrasings across providers.
+    assert _is_context_overflow(_exc("This model's maximum context length is 8192 tokens"))
+    assert _is_context_overflow(_exc("prompt is too long: 210000 tokens > 200000 maximum"))
+    assert _is_context_overflow(_exc('{"code": "context_length_exceeded"}'))
+    assert _is_context_overflow(_exc("input is too long for requested model", status=413))
+    assert _is_context_overflow(_exc("request exceeds the token limit"))
+    # Unrelated 400s that share individual words.
+    assert not _is_context_overflow(_exc("Invalid token provided"))
+    assert not _is_context_overflow(_exc("max_tokens must be greater than 0"))
+    assert not _is_context_overflow(_exc("maximum temperature is 2.0"))
+    assert not _is_context_overflow(_exc("field 'length' is required"))
+    # Overflow wording on a non-overflow status stays a model_error.
+    assert not _is_context_overflow(_exc("maximum context length exceeded", status=500))
+
+
+def test_send_message_second_overflow_folds_to_one_turn(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """Overflow → compact keeping 2 turns → overflow again → compact keeping
+    1 turn → success. Both compactions land on the record with their
+    keep_turns, and re-run tool audit rows would carry the attempt tag."""
+    calls = _thinking_free_model(
+        monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=2
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"], turns=4)
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    compactions = [e for e in events if e["type"] == "compaction"]
+    assert [e["reason"] for e in compactions] == ["overflow", "overflow"]
+    done = next(e for e in events if e["type"] == "done")
+    assert done["content"] == "post-compaction answer"
+    assert calls["stream"] == 3
+
+    async def _rows():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_rows()) if m.role == "compaction"]
+    assert [r.tool_result["keep_turns"] for r in rows] == [2, 1]
+
+
+def test_send_message_third_overflow_gives_up(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """After both escalation steps the turn fails with the friendly
+    context_overflow error instead of retrying forever."""
+    calls = _thinking_free_model(
+        monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=3
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"], turns=4)
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert sum(e["type"] == "compaction" for e in events) == 2
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "context_overflow"
+    assert calls["stream"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_last_agent_usage_ignores_pre_compaction_rows(store):
+    """Usage measured before a compaction describes the pre-compaction
+    history size — trusting it would re-compact an already-small history."""
+    await store.init_schema()
+    await store.create_case("c1", "Case 1")
+    conv = await store.create_agent_conversation("c1", "t1", "u1")
+
+    await store.add_agent_message(
+        conv.id, "assistant", "big answer", prompt_tokens=150_000, completion_tokens=900
+    )
+    assert await store.get_last_agent_usage(conv.id) == (150_000, 900)
+
+    await store.add_agent_message(conv.id, "compaction", "summary", tool_result={"reason": "x"})
+    assert await store.get_last_agent_usage(conv.id) == (None, None)
+
+    await store.add_agent_message(
+        conv.id, "assistant", "small answer", prompt_tokens=4_000, completion_tokens=200
+    )
+    assert await store.get_last_agent_usage(conv.id) == (4_000, 200)

@@ -155,7 +155,10 @@ class MCPEndpoint:
 
         try:
             # Only the admin hard-deny layer applies here — per-user/per-chat
-            # tool preferences are an in-app concept.
+            # tool preferences are an in-app concept. Resolved per request on
+            # purpose: an admin deny must apply to the next /mcp call, not
+            # after some cache TTL. One small Postgres read per request is
+            # fine at this deployment's scale.
             config = await resolve_agent_config()
             agent_scope = await build_scope(
                 token_row.case_id,

@@ -59,6 +59,9 @@ def is_kimi_coding_endpoint(base_url: str | None) -> bool:
 _DEFAULT_PROVIDER = "openai"
 _DEFAULT_MAX_TURNS = 15
 _DEFAULT_REASONING_EFFORT = "off"
+# Shared with agent/compaction.py's should_compact fallback — one constant so
+# the resolver default and the runtime fallback can never drift apart.
+DEFAULT_COMPACT_THRESHOLD = 0.85
 
 # (AgentConfig field, Settings attribute, AgentSettingsRow attribute)
 _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
@@ -86,7 +89,7 @@ _DEFAULTS: dict[str, Any] = {
     "reasoning_effort": _DEFAULT_REASONING_EFFORT,
     # None = auto-compaction off; the right window is model-specific.
     "context_window": None,
-    "compact_threshold": 0.85,
+    "compact_threshold": DEFAULT_COMPACT_THRESHOLD,
     "disabled_tools": None,
 }
 

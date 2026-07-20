@@ -20,6 +20,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
     delete,
     func,
     insert,
@@ -3269,21 +3270,39 @@ class PostgresStore:
         """Return the latest assistant row's measured (prompt, completion) tokens.
 
         (None, None) when no assistant row has measured usage yet — the
-        compaction estimator then falls back to a size-based heuristic.
+        compaction estimator then falls back to a size-based heuristic. Usage
+        measured *before* the latest compaction is ignored the same way: it
+        describes the pre-compaction history size, and trusting it would
+        re-trigger the threshold check on an already-compacted conversation
+        (folding the summary stub into a summary-of-a-summary).
         """
         async with self.session_factory() as session:
             result = await session.execute(
-                select(AgentMessage.prompt_tokens, AgentMessage.completion_tokens)
+                select(
+                    AgentMessage.role,
+                    AgentMessage.prompt_tokens,
+                    AgentMessage.completion_tokens,
+                )
                 .where(
                     AgentMessage.conversation_id == conversation_id,
-                    AgentMessage.role == "assistant",
-                    AgentMessage.prompt_tokens.is_not(None),
+                    or_(
+                        AgentMessage.role == "compaction",
+                        and_(
+                            AgentMessage.role == "assistant",
+                            AgentMessage.prompt_tokens.is_not(None),
+                        ),
+                    ),
                 )
-                .order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc())
+                # One row per turn and microsecond timestamps — created_at
+                # alone is a sufficient order here (ids are UUIDs, not
+                # chronological, so they'd be a misleading tiebreaker).
+                .order_by(AgentMessage.created_at.desc())
                 .limit(1)
             )
             row = result.first()
-            return (row[0], row[1]) if row is not None else (None, None)
+            if row is None or row[0] == "compaction":
+                return (None, None)
+            return (row[1], row[2])
 
     # ------------------------------------------------------------------
     # Agent proposals (A1)

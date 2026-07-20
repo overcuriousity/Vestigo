@@ -118,6 +118,15 @@ def test_split_keeps_recent_turns_verbatim():
     assert tail[0].parts[0].content == "two"
 
 
+def test_split_keep_one_turn_folds_everything_older():
+    """The escalated retry (keep_turns=1) folds all but the last user turn —
+    including a previous compaction's stub pair."""
+    history = _user_turn("one", "1") + _user_turn("two", "2")
+    head, tail = split_history(history, keep_turns=1)
+    assert len(head) == 2 and len(tail) == 2
+    assert tail[0].parts[0].content == "two"
+
+
 def test_split_never_orphans_tool_returns():
     """A tool-return-only request is not a boundary — the cut lands on the
     user turn before it, keeping tool_use/tool_result adjacent in the tail."""

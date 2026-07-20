@@ -26,6 +26,8 @@ interface Props {
   /** Called with the tools the user unchecked (the per-chat deny list). */
   onCreate: (disabledTools: string[]) => void;
   creating?: boolean;
+  /** Create-conversation failure from the parent, shown inline. */
+  error?: string | null;
 }
 
 /** Tools whose absence changes the sandbox+apply workflow, not just coverage. */
@@ -78,7 +80,7 @@ function ToolRow({
   );
 }
 
-export function NewConversationDialog({ open, onOpenChange, onCreate, creating }: Props) {
+export function NewConversationDialog({ open, onOpenChange, onCreate, creating, error }: Props) {
   const infoQuery = useQuery({
     queryKey: ["agent-info"],
     queryFn: agentApi.getInfo,
@@ -162,6 +164,15 @@ export function NewConversationDialog({ open, onOpenChange, onCreate, creating }
               </div>
             )}
           </div>
+
+          {error && (
+            <p className="text-xs text-[var(--color-danger)]">
+              Could not start the conversation: {error}
+            </p>
+          )}
+          {savePrefs.isError && (
+            <p className="text-xs text-[var(--color-danger)]">Saving your defaults failed.</p>
+          )}
 
           <div className="flex items-center justify-between gap-2">
             <Button

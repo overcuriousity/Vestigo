@@ -782,8 +782,14 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # closures stay uniform above, and the intersection guards names that
         # were never registered for this scope (propose_annotation outside a
         # conversation). A removed tool is absent from tools/list, so it never
-        # enters the model's prompt.
-        registered = {t.name for t in server._tool_manager.list_tools()}
+        # enters the model's prompt. The registered set derives from
+        # TOOL_REGISTRY (parity-tested against the actual registrations)
+        # rather than FastMCP internals.
+        registered = {
+            t.name
+            for t in TOOL_REGISTRY
+            if not t.requires_conversation or scope.conversation_id is not None
+        }
         for name in scope.disabled_tools & registered:
             server.remove_tool(name)
 

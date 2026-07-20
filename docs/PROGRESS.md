@@ -37,6 +37,18 @@ Four user-requested agent improvements, shipped together (migration `0012_agent_
 Tests: new `tests/test_agent_compaction.py`; agent-v2 sections in `test_agent_api.py`
 (49 pass), `test_agent_tools.py`, `test_mcp_http.py`, admin round-trips.
 
+Review pass (same PR, same day): tightened `_is_context_overflow` to known overflow
+phrasings only (bare "token"/"maximum" false-positived on unrelated 400s); overflow
+retry now escalates — first compaction keeps 2 turns, a second overflow folds to 1,
+a third gives up with `context_overflow` (`keep_turns` recorded on the compaction row,
+re-run tool audit rows tagged with `attempt`); `get_last_agent_usage` ignores usage
+measured before the latest compaction (stale big numbers re-triggered the threshold);
+tool removal derives the registered set from `TOOL_REGISTRY` instead of FastMCP's
+private `_tool_manager`; frontend: compaction SSE clears in-flight thinking, export
+errors surfaced + filename sanitized, create/save-defaults failures shown in the
+dialog; shared `DEFAULT_COMPACT_THRESHOLD` constant; `/mcp` per-request config
+resolve documented as deliberate (admin deny applies immediately).
+
 ## Session 69 — 2026-07-19: Phase 3 plan + Step 0 consolidation (feat/phase3-step0)
 
 Phase 3 ("investigation depth") decided and specced:
