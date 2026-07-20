@@ -53,11 +53,16 @@ from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
 from vestigo.agent.config import AgentConfig, is_kimi_coding_endpoint, resolve_agent_config
-from vestigo.agent.tools import AgentScope, build_tool_server
+from vestigo.agent.tools import (
+    RESULT_FORMAT_NOTE,
+    SPEC_REFERENCE,
+    AgentScope,
+    build_tool_server,
+)
 
 LLM_TIMEOUT = 300.0
 
-SYSTEM_PROMPT = """\
+_BASE_SYSTEM_PROMPT = """\
 You are a forensic log-investigation assistant embedded in Vestigo, working on
 one case timeline. You have read-only MCP tools to search events, inspect
 field distributions and time series, compare filtered layers, run statistical
@@ -166,6 +171,13 @@ and belongs in the answer. If the tools return nothing conclusive, say so and
 name what data would be needed; never fill the gap with plausible
 reconstruction.
 """
+
+# The result-format note and the shared spec models' per-field prose are both
+# stripped from / absent in the tool schemas, where the prose was being resent
+# a dozen times per request, and paid once here instead (A13). Both are
+# generated from the tool layer (see agent/schema_slim.py) and shared verbatim
+# with the external /mcp instructions, so the two surfaces cannot diverge.
+SYSTEM_PROMPT = f"{_BASE_SYSTEM_PROMPT}\n{RESULT_FORMAT_NOTE}\n{SPEC_REFERENCE}"
 
 
 class KimiAnthropicModel(AnthropicModel):

@@ -270,6 +270,9 @@ export interface AgentToolInfo {
   requires_conversation: boolean;
   /** Hard-denied by the admin — cannot be re-enabled per user/chat. */
   admin_disabled: boolean;
+  /** "core" tools form the lean preset for small-context models (A13).
+   * Optional so an older backend still parses. */
+  tier?: "core" | "extended";
 }
 
 /**

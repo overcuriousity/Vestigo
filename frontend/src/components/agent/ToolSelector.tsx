@@ -9,7 +9,11 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { Check, Settings2 } from "lucide-react";
 
 import { agentApi } from "@/api/agent";
-import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
+import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from "@/components/ui/Popover";
 import { Button } from "@/components/ui/Button";
 import { Checkbox } from "@/components/ui/Checkbox";
 import { Spinner } from "@/components/ui/Spinner";
@@ -35,7 +39,10 @@ export function ToolSelectorPopover({
   seedFromDefaults = true,
 }: Props) {
   const [open, setOpen] = useState(false);
-  const infoQuery = useQuery({ queryKey: ["agent-info"], queryFn: agentApi.getInfo });
+  const infoQuery = useQuery({
+    queryKey: ["agent-info"],
+    queryFn: agentApi.getInfo,
+  });
   const info = infoQuery.data;
 
   // Seed the deny list from the user's saved defaults exactly once per mount
@@ -45,7 +52,9 @@ export function ToolSelectorPopover({
     if (!info || seededRef.current || !seedFromDefaults) return;
     seededRef.current = true;
     const initial = info.tools
-      .filter((t) => !t.admin_disabled && info.user_disabled_tools.includes(t.name))
+      .filter(
+        (t) => !t.admin_disabled && info.user_disabled_tools.includes(t.name),
+      )
       .map((t) => t.name);
     if (initial.length > 0) onChange(initial);
   }, [info, onChange, seedFromDefaults]);
@@ -55,26 +64,88 @@ export function ToolSelectorPopover({
   });
 
   const toggle = (name: string, checked: boolean) => {
-    onChange(checked ? disabledTools.filter((t) => t !== name) : [...disabledTools, name]);
+    onChange(
+      checked
+        ? disabledTools.filter((t) => t !== name)
+        : [...disabledTools, name],
+    );
   };
 
+  /**
+   * Presets (A13). Tool schemas are resent with every model request, so on a
+   * small-context local model the full catalog can eat half the window before
+   * the conversation starts. "Core" keeps the tools the investigation cycle
+   * needs and denies the rest — a disabled tool is removed from the request
+   * entirely, so this reclaims context rather than just tidying the list.
+   *
+   * Admin-disabled tools are left out of the deny list: they are already
+   * denied server-side, and naming them here would be redundant state.
+   *
+   * There is deliberately no "none" preset — an agent with no tools cannot
+   * measure anything, and every claim it made would violate the evidence
+   * rule in the system prompt. Individual tools stay togglable below.
+   */
+  const applyPreset = (preset: "core" | "all") => {
+    if (!info) return;
+    if (preset === "all") return onChange([]);
+    onChange(
+      info.tools
+        .filter((t) => !t.admin_disabled && t.tier !== "core")
+        .map((t) => t.name),
+    );
+  };
+
+  // Only offer "Core" if the backend actually tiers its catalog.
+  const hasTiers = !!info?.tools.some((t) => t.tier === "core");
+
   const enabledCount = info
-    ? info.tools.filter((t) => !t.admin_disabled && !disabledTools.includes(t.name)).length
+    ? info.tools.filter(
+        (t) => !t.admin_disabled && !disabledTools.includes(t.name),
+      ).length
     : 0;
-  const totalCount = info ? info.tools.filter((t) => !t.admin_disabled).length : 0;
+  const totalCount = info
+    ? info.tools.filter((t) => !t.admin_disabled).length
+    : 0;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <Button variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px]">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 gap-1 px-1.5 text-[11px]"
+        >
           <Settings2 size={12} />
           Tools{info ? ` (${enabledCount}/${totalCount})` : ""}
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-72 space-y-2 p-2.5">
-        <p className="text-[11px] font-semibold text-[var(--color-fg-primary)]">
-          Tools for the next conversation
-        </p>
+        <div className="flex items-baseline justify-between gap-2">
+          <p className="text-[11px] font-semibold text-[var(--color-fg-primary)]">
+            Tools for the next conversation
+          </p>
+          {info && (
+            <div className="flex items-center gap-1">
+              {hasTiers && (
+                <button
+                  type="button"
+                  onClick={() => applyPreset("core")}
+                  title="Just the tools the investigation cycle needs — smaller prompt, for small-context models"
+                  className="rounded px-1 py-px text-[10px] text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
+                >
+                  Core
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => applyPreset("all")}
+                className="rounded px-1 py-px text-[10px] text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
+              >
+                All
+              </button>
+            </div>
+          )}
+        </div>
         {infoQuery.isLoading && (
           <div className="flex items-center gap-2 px-1 py-3 text-xs text-[var(--color-fg-secondary)]">
             <Spinner size={13} /> Loading tool catalog…
@@ -88,7 +159,8 @@ export function ToolSelectorPopover({
         {info && (
           <div className="max-h-56 space-y-0.5 overflow-y-auto rounded border border-[var(--color-border)] p-1.5">
             {info.tools.map((t) => {
-              const checked = !t.admin_disabled && !disabledTools.includes(t.name);
+              const checked =
+                !t.admin_disabled && !disabledTools.includes(t.name);
               return (
                 <label
                   key={t.name}
@@ -117,13 +189,17 @@ export function ToolSelectorPopover({
                     <span className="block text-[11px] text-[var(--color-fg-secondary)]">
                       {t.description}
                     </span>
-                    {WORKFLOW_TOOLS.has(t.name) && !checked && !t.admin_disabled && (
-                      <span className="block text-[11px] text-[var(--color-warning)]">
-                        Disabling this removes the{" "}
-                        {t.name === "propose_finding" ? "finding" : "annotation"} proposal cards
-                        from this chat.
-                      </span>
-                    )}
+                    {WORKFLOW_TOOLS.has(t.name) &&
+                      !checked &&
+                      !t.admin_disabled && (
+                        <span className="block text-[11px] text-[var(--color-warning)]">
+                          Disabling this removes the{" "}
+                          {t.name === "propose_finding"
+                            ? "finding"
+                            : "annotation"}{" "}
+                          proposal cards from this chat.
+                        </span>
+                      )}
                   </span>
                 </label>
               );
@@ -131,7 +207,9 @@ export function ToolSelectorPopover({
           </div>
         )}
         {savePrefs.isError && (
-          <p className="text-xs text-[var(--color-danger)]">Saving your defaults failed.</p>
+          <p className="text-xs text-[var(--color-danger)]">
+            Saving your defaults failed.
+          </p>
         )}
         <Button
           variant="ghost"

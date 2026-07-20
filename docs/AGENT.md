@@ -333,7 +333,7 @@ to server behavior.
 
 `TOOL_REGISTRY` (`agent/tools.py`) is the single source of truth for the
 tool catalog (name, one-line description, `embeddings_gated`,
-`requires_conversation`); a registry-parity test keeps it in sync with the
+`requires_conversation`, `tier`); a registry-parity test keeps it in sync with the
 actual `@server.tool()` registrations. Every tool is toggleable — none are
 hard-wired on. Three deny layers compose (a tool is available only if *no*
 layer denies it):
@@ -357,6 +357,12 @@ Mechanically, `AgentScope.disabled_tools` carries the union of layers 1+3
 from the tool list and the model's prompt, not an error-returning stub.
 Disabling `propose_finding`/`propose_annotation` degrades the sandbox+apply
 workflow to prose-only; the popover warns about that but does not prevent it.
+
+The popover's **Core / All** presets (A13) are just deny-list
+generators over layer 2/3 — "Core" denies everything tagged
+`tier="extended"` in `TOOL_REGISTRY`, leaving the 11 tools the investigation
+cycle needs. Admin-denied tools are never named in a generated deny list:
+they are already denied server-side.
 
 ### OPSEC disclosure + tool selector
 
@@ -490,6 +496,110 @@ parsing the `{"data": [{"id": ...}]}` shape both protocols return.
 Resolved configs are cached per-fingerprint (hash of the resolved values) so admin edits
 take effect on the next call without a process restart, and `PUT` resets the availability
 probe cache so a following health check re-probes immediately.
+
+### Per-request context budget (A13)
+
+Tool schemas and the system prompt are **resent with every model request**, so
+their size is a per-request tax, not a one-off. Before A13 the 28 tool schemas
+serialized to 69,382 chars (~17.3k tokens) — over half a 32k local-model
+window before the analyst typed anything. Three levers, all landed in 1.4.1:
+
+**(a) Schema slimming + prose relocation** — `agent/schema_slim.py`, applied by
+`_apply_schema_slimming` at the end of `build_tool_server`. Two transforms:
+`slim_schema` drops pydantic's generated `title`, the `{"type":"null"}` arm of
+optional fields, and `default: null`; `strip_def_descriptions` removes per-field
+prose from the repeated `$defs` (`FilterSpec` alone is 3.8k chars re-serialized
+into 12 tools; `ChartSpec` adds 10k more). That prose is **relocated, not
+deleted** — `spec_reference_block` renders it into `SYSTEM_PROMPT` once per
+request instead of twelve times, generated from the models' own
+`Field(description=...)` values so it cannot drift.
+
+The rewrite targets `Tool.parameters` (what `tools/list` advertises) and never
+`Tool.fn_metadata` (what FastMCP validates against): **we advertise slim and
+validate full**. It sits here rather than in a pydantic-ai schema transformer so
+it applies identically across providers — the OpenAI profile already strips
+`title`, the Anthropic profile strips nothing — and to the external `/mcp`
+surface too.
+
+The null arm is dropped only on *optional* fields. On a field named in
+`required`, `anyOf[T, null]` is the whole statement that an explicit null is
+admissible, and removing it would advertise a contract narrower than the one
+pydantic validates — which a provider that enforces the advertised schema
+client-side would act on. Nothing required is nullable today; the carve-out
+keeps it that way by construction rather than by luck.
+
+| | chars | ~tokens |
+|---|---|---|
+| 28 tool schemas, before | 69,382 | 17,345 |
+| after mechanical slimming | 53,511 | 13,377 |
+| after prose relocation | **32,863** | **8,216** |
+| system prompt (incl. the 5,348-char spec reference and the 649-char result-format note) | 11,916 | 2,979 |
+| **fixed overhead, all tools** | **44,779** | **11,195** |
+| **fixed overhead, core profile** | **27,141** | **6,785** |
+
+**(b) Tool profiles** — `ToolInfo.tier` (`"core"` | `"extended"`) tags the
+registry and is surfaced on `GET /api/agent/info`. The tool-selector popover
+offers Core / All presets that compute a deny list and flow through the
+existing per-user-defaults path — no new state, no migration. Because a
+disabled tool is *removed* from the request (see the three deny layers above),
+"Core" reclaims context directly: 11 tools, 15,225 chars (~3.8k tokens), enough
+to run the investigation cycle end to end.
+
+**(c) Compact tool-result encoding** — `agent/encoding.py`. Results live in the
+history and are resent every subsequent turn, and dict-per-row lists repeat
+every key name once per row. `columnar`/`columnar_auto` state the keys once and
+return rows positionally; `_compact_timeseries` additionally hoists the shared
+time axis into `bucket_starts` so 8 series stop repeating the same 60
+timestamps. Every value passes through **byte-identical** — this is a reshaping,
+not a summarisation, and the existing `MAX_*` caps remain the only lossy step.
+Measured on payloads at their caps:
+
+| result | before | after |
+|---|---|---|
+| `field_terms` (100 rows) | 5,583 | 3,824 (−32%) |
+| `field_timeseries` (8×60) | 26,054 | 4,175 (−84%) |
+| `field_pivot` (144 cells) | 6,261 | 3,567 (−44%) |
+| `time_punchcard` (168 cells) | 6,167 | 2,182 (−65%) |
+| `search_events` (50 events) | 11,842 | 8,190 (−31%) |
+| `histogram` (48 buckets) | 2,597 | 1,774 (−32%) |
+
+Each result carries its own `columns` legend rather than relying on a
+convention stated once in the prompt: persisted history is replayed verbatim
+with no migration step, so one conversation can legitimately hold both
+old dict-shaped and new columnar results, and every result must be readable on
+its own terms. The re-encoding happens at the agent boundary (`_columnize` in
+`agent/tools.py`), never inside `db/queries.py` — those methods also serve the
+Explorer and Visualize HTTP APIs, whose response shapes the frontend depends
+on. The frontend reads exactly two tool-result keys (`propose_annotation`'s
+`proposal_id` and `propose_chart`'s `ok`), both left untouched. Two results are
+columnized only on their way out: `run_anomaly_detector` reshapes the copy it
+returns *after* `_persist_detector_run` has stored the dict-row payload the
+Analysis page reads back, and `compare` reshapes whichever of `buckets` /
+`values` / `bins` its `kind` produced.
+
+The metadata list tools (`list_baselines`, `list_saved_views`,
+`list_annotations`, `get_event_annotations`, `list_dispositions`,
+`list_sigma_rules`, `list_sigma_runs`) were previously unbounded and now go
+through `_listing`, which caps at `MAX_LIST_ROWS` and reports **`returned`
+alongside `total`**. Reporting only `total` would hand the model 200 rows under
+a count of 5,000 with nothing to mark the difference — a silently partial set it
+would then reason over as whole, which is exactly what the system prompt's
+evidence rule forbids.
+
+**Both relocations reach the external `/mcp` surface too.** `mcp_http.py` builds
+its server with the same `build_tool_server`, so an external client sees the
+same prose-free `$defs` and the same columnar results as the in-app agent —
+and `FastMCP(instructions=...)` is the only channel that can tell it how to read
+either. `SPEC_REFERENCE` and `RESULT_FORMAT_NOTE` are therefore appended to
+those instructions, sharing the exact strings `runtime.SYSTEM_PROMPT` composes
+from, so the two surfaces cannot describe the wire format differently. (pydantic-ai's
+`MCPToolset` does not forward instructions — it needs `include_instructions=True`
+— so this costs the in-app path nothing.) Slimming the schemas without this
+would leave external clients with strictly *less* guidance than before A13.
+
+`tests/test_agent_schema.py` holds a **budget guard** asserting the serialized
+tool list stays under 40,000 chars. If a change trips it, that is a real context
+regression — re-measure and update this table rather than raising the ceiling.
 
 ### Auto-compaction (context-window awareness)
 

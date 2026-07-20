@@ -863,6 +863,8 @@ async def agent_info(user: User = Depends(get_current_user)) -> dict[str, Any]:
                 "embeddings_gated": t.embeddings_gated,
                 "requires_conversation": t.requires_conversation,
                 "admin_disabled": t.name in admin_disabled,
+                # Drives the tool-selector's "Core" preset (A13).
+                "tier": t.tier,
             }
             for t in TOOL_REGISTRY
         ],

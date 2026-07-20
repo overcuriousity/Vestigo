@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-07-20
+
+### Changed
+
+- **The agent fits a small context window again** — tool definitions are resent
+  to the model on every request, and they had grown to roughly half of a 32k
+  local-model window before the conversation even started. They are now
+  advertised in a compact form (~52% smaller) with no loss of guidance: the
+  shared filter/chart field documentation moved into the system prompt, where
+  it is sent once instead of once per tool. Nothing about what the agent can
+  do, or how strictly its arguments are checked, has changed.
+- **Tabular tool results are compact** — search hits, value distributions,
+  pivots, comparisons, detector findings and time series are handed to the
+  model with their column names stated once instead of repeated on every row,
+  and a time series no longer repeats its time axis per series (−84% on a full
+  one). Every value is preserved exactly; this is a reshaping, not a summary,
+  so results stay reproducible. Because results are replayed on every later
+  turn, this compounds over a long investigation.
+- **The agent's metadata list tools are capped** at 200 rows (baselines, saved
+  views, annotations, dispositions, Sigma rules and runs). They were unbounded,
+  so a long-running case could push an arbitrarily large payload into the
+  conversation history. Each one now reports how many rows it returned
+  alongside how many exist, so a capped list can never be mistaken for a
+  complete one.
+- **The external `/mcp` tool surface changes shape with it.** Clients of the
+  `/mcp` endpoint get the same slimmed schemas and the same column-header-once
+  results as the built-in agent, rather than a second encoding maintained in
+  parallel. The server's MCP `instructions` now carry the filter/chart field
+  reference and the result-format legend, so an external client has everything
+  it needs to read either. Any client that parsed the old row-per-dict results
+  needs updating; Vestigo has no external MCP consumers in the field, so this
+  is called out for completeness rather than as a migration.
+
 ### Added
 
+- **Core / All presets in the agent tool selector** — "Core" keeps the
+  eleven tools an investigation cycle actually needs and turns off the rest,
+  cutting the per-request tool overhead to about a fifth of the full catalog.
+  Useful when running a small local model. Disabled tools are removed from the
+  request entirely, so this reclaims context rather than just tidying the list.
 - **Stop a running agent turn** — a turn that is still running when you close
   the panel or navigate away is now visible when you come back, with a Stop
   button that actually cancels it server-side instead of only dropping your
