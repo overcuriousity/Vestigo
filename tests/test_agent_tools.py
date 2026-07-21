@@ -15,12 +15,21 @@ import pytest
 from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
 
+from vestigo.agent.fidelity import Fidelity
 from vestigo.agent.tools import AgentScope, build_tool_server
 from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
 
-def _scope(case_id: str, timeline_id: str, source_ids: list[str] | None = None) -> AgentScope:
+def _scope(
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str] | None = None,
+    fidelity: Fidelity = Fidelity.MESSAGE,
+) -> AgentScope:
+    # MESSAGE rather than the deployment default (FULL): these tests assert the
+    # reshaping the agent boundary applies, and FULL is the tier that applies
+    # none. Tier selection itself lives in tests/test_agent_fidelity.py.
     return AgentScope(
         case_id=case_id,
         timeline_id=timeline_id,
@@ -28,6 +37,7 @@ def _scope(case_id: str, timeline_id: str, source_ids: list[str] | None = None) 
         source_ids=source_ids or [],
         field_mappings=None,
         source_offsets=None,
+        fidelity=fidelity,
     )
 
 
@@ -156,6 +166,28 @@ async def test_annotations_tools(store):
     single = await _call(server, "get_event_annotations", {"source_id": "s1", "event_id": "e2"})
     assert single["total"] == 1
     assert _rows(single["annotations"])[0]["created_by"] == "bob"
+
+
+async def test_list_annotations_truncates_content_harder_than_detail_tool(store):
+    """The bulk list is a scan resent every turn (200 rows of long CVE bodies
+    was ~7k tokens); it truncates the body tighter than get_event_annotations,
+    which is the one-event detail tool and keeps the fuller text."""
+    from vestigo.agent.tools import ANNOTATION_LIST_CONTENT_TRUNCATE, MESSAGE_TRUNCATE
+
+    await store.init_schema()
+    body = "CVE-2024-4577 " + "detail " * 100  # ~700 chars, over both caps
+    await store.create_annotation("c1", "s1", "e1", "a1", "comment", body, created_by="alice")
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+
+    listed = _rows((await _call(server, "list_annotations"))["annotations"])[0]
+    assert len(listed["content"]) <= ANNOTATION_LIST_CONTENT_TRUNCATE + 1  # +1 for the ellipsis
+    detail = _rows(
+        (await _call(server, "get_event_annotations", {"source_id": "s1", "event_id": "e1"}))[
+            "annotations"
+        ]
+    )[0]
+    assert len(detail["content"]) > ANNOTATION_LIST_CONTENT_TRUNCATE
+    assert len(detail["content"]) <= MESSAGE_TRUNCATE + 1
 
 
 async def test_sigma_rules_tools(store, monkeypatch):
@@ -361,15 +393,35 @@ async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_anomaly_detector_findings_are_columnar(store, monkeypatch):
+async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, monkeypatch):
     """One run is one detector, so its findings share their keys — the same
-    header-once win as the other tabular results. The *persisted* payload keeps
-    its dict rows; only the model's copy is reshaped."""
+    header-once win as the other tabular results. The model's copy also reduces
+    each finding's heavy inline `event` to its `message` line, which was ~85% of
+    a finding's size and overflowed a 64k model across a seven-detector sweep.
+    The *persisted* payload keeps its full dict rows; only the model's copy is
+    reshaped."""
     import vestigo.api.routers.events as events_router
 
+    big_event = {"event_id": "e1", "message": "login as svc-a", "attr": {"k": "y" * 8000}}
     findings = [
-        {"type": "value_novelty", "field": "user", "value": "svc-a", "count": 1},
-        {"type": "value_novelty", "field": "user", "value": "svc-b", "count": 2},
+        {
+            "type": "value_novelty",
+            "field": "user",
+            "value": "svc-a",
+            "count": 1,
+            "event_id": "e1",
+            "event": big_event,
+            "details": {"surprise": 12.7},
+        },
+        {
+            "type": "value_novelty",
+            "field": "user",
+            "value": "svc-b",
+            "count": 2,
+            "event_id": "e2",
+            "event": {"event_id": "e2", "message": "login as svc-b"},
+            "details": {"surprise": 9.1},
+        },
     ]
     persisted: dict[str, Any] = {}
 
@@ -390,8 +442,184 @@ async def test_run_anomaly_detector_findings_are_columnar(store, monkeypatch):
 
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(server, "run_anomaly_detector", {"detector": "value_novelty"})
-    assert _rows(result["results"]) == findings
-    assert persisted["payload"]["results"] == findings  # the stored copy is untouched
+    model_rows = _rows(result["results"])
+    # event_id + message + details survive; the fat attribute bag is gone.
+    assert [r["event_id"] for r in model_rows] == ["e1", "e2"]
+    assert [r["message"] for r in model_rows] == ["login as svc-a", "login as svc-b"]
+    assert all("event" not in r for r in model_rows)
+    assert model_rows[0]["details"] == {"surprise": 12.7}
+    assert "get_event" in result["note"]
+    assert "columns" in result["results"] and "event" not in result["results"]["columns"]
+    # The persisted record is untouched — the full event stays reproducible.
+    assert persisted["payload"]["results"][0]["event"] == big_event
+
+    # ...and at the deployment default the model gets the whole event, since
+    # an operator who declared no context constraint is assumed to have room.
+    full_server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.FULL))
+    full = await _call(full_server, "run_anomaly_detector", {"detector": "value_novelty"})
+    assert _rows(full["results"])[0]["event"] == big_event
+    # Nothing was dropped, so no note — but the tier is still on the record,
+    # or an export could not tell "ran at full" from "predates the setting".
+    assert full["fidelity"] == "full"
+    assert "note" not in full
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [0, 2])
+async def test_a_detector_run_from_a_retried_turn_says_so(store, monkeypatch, attempt):
+    """The overflow ladder re-runs a turn by re-executing its tools, so one
+    analyst question can persist the same scan more than once. The runs are not
+    suppressed — they really happened, and hiding a re-execution is what the
+    marker rows exist to prevent — but a superseded re-run must be
+    distinguishable from an analyst scanning twice."""
+    import vestigo.api.routers.events as events_router
+
+    await store.init_schema()
+    await store.create_case("c1", "Case 1")
+
+    async def fake_run(case_id, timeline_id, source_ids, **kwargs):
+        class R:
+            status = "ok"
+
+        return R(), {}
+
+    monkeypatch.setattr(events_router, "_run_stat_detector", fake_run)
+    monkeypatch.setattr(
+        events_router,
+        "_serialize_stat_result",
+        lambda result: {"status": result.status, "results": []},
+    )
+
+    scope = _scope("c1", "t1", ["s1"])
+    scope.attempt = attempt
+    result = await _call(
+        build_tool_server(scope), "run_anomaly_detector", {"detector": "frequency"}
+    )
+
+    run = await store.get_detector_run("c1", result["run_id"])
+    assert run is not None
+    if attempt:
+        assert run.params["agent_retry_attempt"] == attempt
+    else:
+        # Every non-agent run keeps its existing params shape.
+        assert "agent_retry_attempt" not in run.params
+
+
+def _fat_event() -> dict[str, Any]:
+    return {
+        "event_id": "e1",
+        "timestamp": "2026-07-20T10:00:00Z",
+        "source_id": "s1",
+        "artifact": "auth",
+        "message": "login attempt [svc-a/rock] succeeded",
+        "attributes": {"user": "svc-a", "ip": "10.0.0.9"},
+    }
+
+
+def _one_event_service(monkeypatch) -> None:
+    """Point every query tool at a single fat event."""
+    import vestigo.api.routers.events as events_router
+
+    class _Page:
+        total = 1
+        events = [_fat_event()]
+
+    class _Service:
+        def query(self, query):
+            return _Page()
+
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: _Service())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tier", "has_attributes", "has_message"),
+    [
+        (Fidelity.FULL, True, True),
+        (Fidelity.MESSAGE, False, True),
+        (Fidelity.MINIMAL, False, False),
+    ],
+)
+async def test_search_events_honours_the_deployment_tier(
+    store, monkeypatch, tier, has_attributes, has_message
+):
+    """A broad search is as capable of overflowing a small window as a
+    detector sweep, so it spends the same tier."""
+    _one_event_service(monkeypatch)
+
+    server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=tier))
+    result = await _call(server, "search_events", {})
+    row = _rows(result["events"])[0]
+
+    assert result["fidelity"] == tier.value
+    assert ("attributes" in row) is has_attributes
+    assert ("message" in row) is has_message
+    # The handles back to the full record survive every reduction.
+    assert row["event_id"] == "e1" and row["source_id"] == "s1"
+    if tier is Fidelity.FULL:
+        assert "note" not in result
+    else:
+        assert "get_event" in result["note"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["semantic_search", "similar_events"])
+async def test_similarity_tools_honour_the_deployment_tier(store, monkeypatch, tool):
+    import vestigo.api.routers.events as events_router
+
+    class _Hit:
+        event_id = "e1"
+        score = 0.93
+        event = _fat_event()
+
+    class _Result:
+        status = "ok"
+        results = [_Hit()]
+
+    class _Similarity:
+        def find_similar_by_text(self, *a, **kw):
+            return _Result()
+
+        def find_similar(self, *a, **kw):
+            return _Result()
+
+    monkeypatch.setattr(events_router, "_get_similarity_service", lambda: _Similarity())
+    monkeypatch.setattr("vestigo.agent.tools.embeddings_available", lambda: True)
+
+    server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.MINIMAL))
+    args = {"q": "brute force"} if tool == "semantic_search" else {"event_id": "e1"}
+    result = await _call(server, tool, args)
+    hit = result["results"][0]
+
+    assert result["fidelity"] == "minimal"
+    assert hit["event"] == {
+        "event_id": "e1",
+        "timestamp": "2026-07-20T10:00:00Z",
+        "source_id": "s1",
+        "artifact": "auth",
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_escape_hatches_are_exempt_from_the_tier(store, monkeypatch):
+    """`get_event` and `get_event_annotations` are what every reduced payload
+    tells the model to call. Tiering them would leave it looping on a
+    reduction it has no way to undo, so they answer in full at every tier."""
+    _one_event_service(monkeypatch)
+    await store.init_schema()
+    await store.create_annotation("c1", "s1", "e1", "a-fid", "comment", "looked at")
+
+    server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.MINIMAL))
+
+    event = await _call(server, "get_event", {"event_id": "e1"})
+    assert event["attributes"] == {"user": "svc-a", "ip": "10.0.0.9"}
+    assert event["message"] == "login attempt [svc-a/rock] succeeded"
+    assert "fidelity" not in event
+
+    annotations = await _call(
+        server, "get_event_annotations", {"source_id": "s1", "event_id": "e1"}
+    )
+    assert _rows(annotations["annotations"])[0]["content"] == "looked at"
 
 
 @pytest.mark.asyncio
@@ -814,6 +1042,22 @@ async def test_missing_field_y_says_why_it_is_needed(store, monkeypatch):
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     message = await _reject(server, {"chart_type": "sankey", "field": "user"})
     assert "field_y" in message
+    # ...and names the one-field alternative, in case that was the intent.
+    assert '"heatmap"' in message
+
+
+async def test_heatmap_with_field_y_is_pointed_at_pivot(store, monkeypatch):
+    """The naming trap that cost a real turn (2026-07-20): our `heatmap` is one
+    field x time, and the field x field grid an analyst also calls a heatmap is
+    `pivot`. Enumerating the two-field types was not enough — the model spent
+    both retries on the same rejection, so the message names the fix."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "heatmap", "field": "country", "field_y": "time:hour_of_day"}
+    )
+    assert "takes no field_y" in message
+    assert 'chart_type="pivot"' in message
 
 
 async def test_field_y_on_a_one_field_chart_is_rejected_not_dropped(store, monkeypatch):

@@ -36,6 +36,10 @@ auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/
   leaving them.
 - `PROGRESS.md` — append-only chronological session log ("what changed and why"), newest entry
   on top. Not a plan — don't add TODOs here, that's `ROADMAP.md`'s job.
+- `superpowers/specs/` + `superpowers/plans/` — dated per-feature design rounds and the
+  execution plans that followed them (`YYYY-MM-DD-<slug>.md`). Point-in-time records of *why a
+  shape was chosen*, referenced from `ROADMAP.md`/`PROGRESS.md`; the shipped behavior lives in
+  the reference docs above, so update those rather than editing an old spec.
 - `archive/` — completed roadmap phases (`ROADMAP_PHASE{N}.md`) and point-in-time PR review
   findings (`PR{N}_REVIEW_FINDINGS.md`, one file per reviewed PR, full unrestricted finding
   set). Write a new `PR{N}_REVIEW_FINDINGS.md` when a review surfaces more than can fit as a

@@ -276,6 +276,11 @@ class Settings(BaseSettings):
     agent_context_window: int | None = Field(default=None, ge=1024)
     # Fraction of the context window at which older turns get summarized.
     agent_compact_threshold: float | None = Field(default=None, gt=0.1, lt=1.0)
+    # How much of an example record tool results carry: full | message |
+    # minimal | auto (derive from agent_context_window). Unset = full, i.e. a
+    # deployment that has declared no constraint is assumed to have room.
+    # Keep in sync with agent/fidelity.py::FIDELITY_VALUES.
+    agent_tool_fidelity: str | None = Field(default=None, pattern="^(full|message|minimal|auto)$")
     # Admin hard-deny tool list as a JSON array, e.g. '["semantic_search"]'.
     # Removed from the tool server for the in-app agent AND the external
     # /mcp transport; per-user/per-chat toggles can only restrict further.

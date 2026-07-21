@@ -15,6 +15,7 @@ import {
   Archive,
   Brain,
   Download,
+  Minimize2,
   Plus,
   Send,
   Sparkles,
@@ -31,6 +32,7 @@ import {
   type AgentFilterSpec,
   type AgentMessage,
   type AgentProposal,
+  type AgentFidelity,
   type AgentStreamEvent,
 } from "@/api/agent";
 import { useAgentStore } from "@/stores/agent";
@@ -67,6 +69,7 @@ type ChatItem =
   | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
   | { kind: "thinking"; content: string; streaming?: boolean }
   | { kind: "compaction"; summary: string }
+  | { kind: "fidelity"; fidelity: AgentFidelity }
   | {
       kind: "finding";
       title: string;
@@ -100,6 +103,11 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       if (m.content) items.push({ kind: "thinking", content: m.content });
     } else if (m.role === "compaction") {
       items.push({ kind: "compaction", summary: m.content });
+    } else if (m.role === "fidelity") {
+      // The tier the turn was re-run at — the drop row's `to`, same value the
+      // live SSE `fidelity` event carried.
+      const drop = m.tool_result as { to?: AgentFidelity } | null;
+      if (drop?.to) items.push({ kind: "fidelity", fidelity: drop.to });
     } else if (m.role === "assistant") {
       if (m.content) {
         items.push({
@@ -207,6 +215,16 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     return {
       ...s,
       items: [...flushed, { kind: "compaction", summary: e.summary }],
+      liveText: "",
+      liveThinking: "",
+    };
+  }
+  if (e.type === "fidelity") {
+    // Same shape as a compaction: the attempt that overflowed is being
+    // retried, so its partial text/thinking will be re-streamed.
+    return {
+      ...s,
+      items: [...flushed, { kind: "fidelity", fidelity: e.fidelity }],
       liveText: "",
       liveThinking: "",
     };
@@ -751,6 +769,22 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 </summary>
                 <div className="mt-1 whitespace-pre-wrap break-words">{item.summary}</div>
               </details>
+            );
+          }
+          if (item.kind === "fidelity") {
+            return (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+              >
+                {/* Not the compaction Archive: nothing was folded away here —
+                    the same tools ran again, handing back less per record. */}
+                <Minimize2 size={11} className="shrink-0" />
+                <span>
+                  Results did not fit the model's context window — retried with less
+                  detail per event ({item.fidelity}).
+                </span>
+              </div>
             );
           }
           if (item.kind === "finding") {

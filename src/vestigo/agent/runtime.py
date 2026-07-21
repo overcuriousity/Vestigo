@@ -156,7 +156,9 @@ Build a chart the way the analyst does, in this order:
 2. Call `describe_field` for its scale, rather than guessing. It reports the
    suggested scale and the chart types legal for it.
 3. Pick a `chart_type` legal for that scale. An illegal combination is
-   rejected with a message naming the alternatives — read it and retry.
+   rejected with a message naming the alternatives — read it and retry. Watch
+   the two grids: `heatmap` is one field over time and takes no `field_y`;
+   the field x field heatmap is `pivot`.
 4. Add a comparison layer only if you need one; only "time", "bar" and
    "histogram" support it. `compare.mode="baseline"` measures the filtered
    set against the whole timeline.
@@ -345,11 +347,20 @@ async def stream_turn(
     try:
         server = build_tool_server(scope)
         toolset = MCPToolset(FastMCPClient(server), id="vestigo")
+        # retries: a rejected tool call is the agent's version of the Visualize
+        # page's dropdown refusing an impossible chart — the error names the
+        # legal alternative and is meant to be acted on. pydantic-ai's default
+        # of 1 gave a small model one correction attempt, after which the whole
+        # turn died with UnexpectedModelBehavior (a propose_chart heatmap/pivot
+        # mix-up cost a real turn on 2026-07-20). Three, not more: every retry
+        # is also a model request against the `request_limit` below, so a tool
+        # the model cannot get right must not eat the investigation's budget.
         agent = Agent(
             model,
             system_prompt=SYSTEM_PROMPT,
             toolsets=[toolset],
             model_settings=effort_model_settings(config),
+            retries=3,
         )
         limits = UsageLimits(request_limit=config.max_turns)
 

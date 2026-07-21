@@ -1,6 +1,76 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 79 — PR144 review round).
+Last updated: 2026-07-21 (session 80 — PR145/146 review round).
+
+## Session 80 — 2026-07-21: PR145/146 review — the degradation that left no trace
+
+Review of the tool-result fidelity branch. The feature held up — the overflow
+ladder's attempt bound is exactly tight (two tier drops plus two compactions,
+so no interleaving can exit the loop without a terminal event), and the
+determinism property is real and tested. Six fixes landed.
+
+**A fidelity drop was invisible the moment the page reloaded.** Compaction
+writes a message row *and* an `agent.compaction` audit row; the tier drop only
+yielded an SSE event. So a reopened conversation showed a thinner investigation
+with nothing in it explaining why — the reader would have had to know the
+deployment's `tool_fidelity` at the time of the turn to reconstruct it, which is
+exactly the inference the forensic requirement exists to remove. A drop now
+writes a `role="fidelity"` row (`tool_result = {from, to, attempt, reason}`) and
+an `agent.fidelity_drop` audit row. No migration — `AgentMessage.role` is free
+text. The row also settles the second finding: in the *message* log, marker rows
+(`compaction`, `fidelity`) are what separate a retry's re-executed tool rows
+from the attempt before them, the job `attempt` already does on the audit side.
+
+**A `note` claimed a reduction that had not happened.** The event-returning
+tools passed `reduced=bool(page.events)`, so any non-`full` tier told the model
+"attributes are omitted" even for events that had none — an untruth in an
+exported record, and the same failure mode `_listing` avoids by reporting
+`returned` beside `total`. `_event_reduced` now answers per event: attributes
+dropped, message dropped, or message truncated.
+
+Three consistency fixes: `FIDELITY_TIERED_TOOLS` moved from `tools.py` to
+`fidelity.py` (it is a policy fact, and it was forcing a function-body import to
+dodge the cycle); the tier is now a required argument on `_deflate_findings` and
+`_slim_event`, so `get_event` states its exemption at the call site instead of
+inheriting it from a default; and the two deflators no longer disagree about
+what an omitted tier means. Doc corrections: the design spec's Files table
+listed a `docs/ROADMAP.md` item that was never added, and `CLAUDE.md`'s `docs/`
+map had no line for `docs/superpowers/`.
+
+**Second review pass, same branch — five more.** The honesty rule the first pass
+applied to the event-returning tools had not reached the anomaly path:
+`_deflate_findings` treated the mere *presence* of an `event` key as a
+reduction, so a finding whose example event was `None` (resolution failed) or
+held nothing but a short `message` still carried the "call get_event for the
+full record" note. `_finding_event_reduced` now answers it properly — and it is
+a different question from `_event_reduced`, because a finding loses the whole
+event object rather than just its attribute bag, so a bare timestamp going
+already counts.
+
+`auto` was a two-way switch on one threshold, which gave an 8k model and a 64k
+model identical treatment and made `auto` with no configured window
+indistinguishable from picking `message`. It is now a graded ladder (≥100k
+`full`, ≥32k `message`, below that `minimal`, unset `message`), with the second
+threshold taken from the same measurement as the first: the seven-detector
+sweep's ~34k tokens of payload *is* a 32k window.
+
+**A retried turn's writes were unexplained.** Re-running a turn re-executes its
+tools, and two of them write — so a sweep that overflows twice can leave three
+`DetectorRun` rows for one analyst question, indistinguishable in the Analysis
+page from an analyst scanning three times. They are not suppressed (the scans
+really ran; hiding a re-execution is what the marker rows exist to prevent) but
+tagged: `AgentScope.attempt` rides into `_persist_detector_run`, which records
+`params["agent_retry_attempt"]` when non-zero. Duplicate annotation proposals
+stay plain — each is an action the analyst decides individually, and the marker
+row above them already explains the pair.
+
+`get_last_agent_usage` discarded usage measured before a `compaction` but not
+before a `fidelity` row, though a tier drop invalidates a measurement for the
+same reason: every tool result from there on is smaller, so the next turn's
+estimate ran high and could spend a summarizer call the drop had already made
+unnecessary. Both marker roles now count (`_AGENT_MARKER_ROLES`). Finally,
+`FINDING_MESSAGE_TRUNCATE` became `SLIM_MESSAGE_TRUNCATE`: since the first pass
+it also caps ordinary search hits, not just findings.
 
 ## Session 79 — 2026-07-20: PR144 review — what the relocation forgot to relocate
 

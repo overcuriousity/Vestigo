@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
@@ -26,7 +26,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior, UsageLimitExceeded
 
 from vestigo import __version__
 from vestigo.agent.availability import agent_available
@@ -36,6 +36,7 @@ from vestigo.agent.compaction import (
     should_compact,
 )
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
+from vestigo.agent.fidelity import MAX_FIDELITY_DROPS, next_tier, resolve_fidelity
 from vestigo.agent.runtime import LLM_TIMEOUT, dump_history, load_history, stream_turn
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
 from vestigo.api.deps import (
@@ -201,8 +202,8 @@ async def export_conversation(
 ) -> Response:
     """Export the full conversation as a JSON attachment.
 
-    Contains every message row (user/assistant/tool/thinking/compaction,
-    with tool args/results and measured token usage), the proposals, and
+    Contains every message row (user/assistant/tool/thinking/compaction/
+    fidelity, with tool args/results and measured token usage), the proposals, and
     ``raw_history`` — the provider-wire pydantic-ai blob, the only place
     thinking signatures and provider quirks live. Deliberately not gated on
     ``_require_agent``: the record must stay exportable while the LLM
@@ -466,6 +467,7 @@ async def _message_stream_inner(
         user,
         conversation_id=conversation.id,
         disabled_tools=disabled_tools,
+        fidelity=resolve_fidelity(config.tool_fidelity, config.context_window),
     )
     history = load_history(conversation.history)
     last_prompt, last_completion = await store.get_last_agent_usage(conversation_id)
@@ -521,10 +523,23 @@ async def _message_stream_inner(
             "reason": reason,
         }
 
-    # Escalation schedule: the first compaction keeps 2 recent turns
-    # verbatim; if the model still overflows, a second folds down to 1; a
-    # third overflow gives up with the friendly context_overflow error.
+    # Escalation on overflow, cheapest lever first:
+    #
+    #   1. drop one tool-result fidelity tier and re-run the turn. No LLM call,
+    #      and it is the only lever that helps a *single* broad turn — the case
+    #      that actually overflowed a 64k model (2026-07-20). The turn is
+    #      re-run through a fresh `build_tool_server`, so nothing already in
+    #      history is rewritten and the record never diverges from what the
+    #      model saw. Skipped when the attempt called no tier-honouring tool
+    #      (`fidelity.next_tier`) — a drop that cannot change the prompt is not
+    #      a lever, just a wasted round trip.
+    #   2. compact: the first keeps 2 recent turns verbatim, a second folds
+    #      down to 1. Costs a summarizer call, and can only help when there is
+    #      an older turn to fold.
+    #   3. give up with the friendly context_overflow error.
     keep_schedule = (2, 1)
+    # Every fidelity drop (full -> message -> minimal) at most, then compaction.
+    max_attempts = MAX_FIDELITY_DROPS + len(keep_schedule) + 1
     compactions = 0
     estimated = estimate_next_prompt_tokens(last_prompt, last_completion, history, payload.content)
     if should_compact(config, estimated):
@@ -538,14 +553,21 @@ async def _message_stream_inner(
         return reservation is not None and reservation.cancel.is_set()
 
     text_parts: list[str] = []
-    for attempt in range(len(keep_schedule) + 1):
+    for attempt in range(max_attempts):
         text_parts = []
+        tools_used: set[str] = set()
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return
         try:
             async for event in stream_turn(
-                scope,
+                # The attempt number rides the scope so the two tools that
+                # *write* can stamp it: a re-run turn re-executes every tool the
+                # model calls, and a second DetectorRun for one analyst question
+                # has to be distinguishable from a second scan. Both retry paths
+                # (fidelity drop and compaction) go through here, so neither can
+                # forget it.
+                replace(scope, attempt=attempt),
                 user_text=payload.content,
                 history=history,
                 view_filters=payload.view_filters,
@@ -620,6 +642,9 @@ async def _message_stream_inner(
                         detail=audit_detail,
                     )
                 elif event["type"] == "tool_result":
+                    # Which tools actually returned data this attempt decides
+                    # whether a fidelity drop could change anything at all.
+                    tools_used.add(event["tool"])
                     await store.add_agent_message(
                         conversation_id,
                         "tool",
@@ -630,6 +655,43 @@ async def _message_stream_inner(
             return
         except ModelHTTPError as exc:
             overflow = _is_context_overflow(exc)
+            if overflow and (lower := next_tier(scope.fidelity, tools_used)) is not None:
+                # Cheapest lever: hand the model less of each example record
+                # and re-run. Skipped when this attempt called no tool that
+                # honours the tier — re-sending a byte-identical request would
+                # only delay the compaction that can actually help. Tool rows
+                # already persisted by this attempt stay — the record shows what
+                # actually ran, and each row states the tier that produced it.
+                previous = scope.fidelity
+                scope = replace(scope, fidelity=lower)
+                # Persisted like a compaction, and for the same reason: an SSE
+                # event alone is gone on reload, and the case file has to answer
+                # "why is there less here than there" from itself. The row is
+                # also the marker that separates this attempt's tool rows from
+                # the re-run's.
+                drop = {
+                    "from": previous.value,
+                    "to": lower.value,
+                    "attempt": attempt,
+                    "reason": "overflow",
+                }
+                await store.add_agent_message(
+                    conversation_id,
+                    "fidelity",
+                    f"Tool results did not fit the model's context window — reduced from "
+                    f"{previous.value} to {lower.value} per event record and the turn re-run.",
+                    tool_result=drop,
+                )
+                await store.record_audit(
+                    action="agent.fidelity_drop",
+                    actor=user,
+                    case_id=case_id,
+                    target_type="agent_conversation",
+                    target_id=conversation_id,
+                    detail=drop,
+                )
+                yield _sse({"type": "fidelity", "fidelity": lower.value, "reason": "overflow"})
+                continue
             if overflow and compactions < len(keep_schedule):
                 # The threshold estimate lagged behind (tool-heavy turn) —
                 # compact and retry, escalating down the keep schedule on a
@@ -660,6 +722,29 @@ async def _message_stream_inner(
                     "detail": detail,
                 }
             )
+            return
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
+            # Two ways a turn ends that the analyst can act on: a tool the
+            # model never called correctly within its retry budget, and a turn
+            # that spent every request `UsageLimits` allows. Both used to fall
+            # into the generic branch below and surface as "Agent turn failed —
+            # see server logs", which says nothing about whether to rephrase,
+            # to narrow the question, or to fetch an admin.
+            logger.exception("Agent turn ended early (conversation %s)", conversation_id)
+            if text_parts:
+                await store.add_agent_message(
+                    conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
+                )
+            if isinstance(exc, UsageLimitExceeded):
+                code = "turn_limit_reached"
+                detail = (
+                    f"The agent used every step allowed for one turn ({exc}). Ask a narrower "
+                    "question, or raise the agent's max_turns setting."
+                )
+            else:
+                code = "tool_retry_exhausted"
+                detail = f"The agent could not call a tool correctly: {exc}"
+            yield _sse({"type": "error", "code": code, "detail": detail})
             return
         except Exception:
             logger.exception("Agent turn failed (conversation %s)", conversation_id)

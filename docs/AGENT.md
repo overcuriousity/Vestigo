@@ -227,6 +227,17 @@ force-reset metric. The agent gets them as validation errors that name the
 legal alternatives, e.g. `chart_type="pie" requires scale in {"nominal"}, got
 "ratio". Chart types legal for scale="ratio": …`. The error *is* the dropdown.
 
+**Two marks are called "heatmap" in analyst speech, and only one is here.**
+`heatmap` is *one field × time*; the field × field grid is `pivot` (they differ
+in `data_kind`, so they are not interchangeable). A model reaching for the word
+alone sends `chart_type="heatmap"` with a `field_y` and gets rejected — which
+cost a real turn on 2026-07-20, because merely *enumerating* the two-field
+types left it guessing and it spent its whole retry budget on the same
+mistake. The rejection therefore names the fix (`use chart_type="pivot"`), and
+the same distinction is stated in the `chart_type` field description and in the
+system prompt's charting steps. General rule for this tool: an error the model
+is expected to recover from should say what to do, not only what is wrong.
+
 Rejections happen before any query: illegal scale/chart_type pair, missing or
 superfluous `field`/`field_y`, unsupported comparison, illegal metric, and an
 unknown field token (with `difflib` near-miss suggestions — an unknown
@@ -439,6 +450,7 @@ header.
 | `VESTIGO_AGENT_REASONING_EFFORT` | Reasoning-effort enum: `off` (default), `low`, `medium`, `high`, `max`. Admin-editable; see **Reasoning effort** below. |
 | `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset (default) = auto-compaction off. See **Auto-compaction** below. |
 | `VESTIGO_AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (0.1–1 exclusive, default 0.85). |
+| `VESTIGO_AGENT_TOOL_FIDELITY` | How much of an example record tool results carry: `full` (default) \| `message` \| `minimal` \| `auto`. See **Tool-result fidelity** below. |
 | `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`), e.g. `["semantic_search"]`. |
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
 | `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key and ignore any previously stored one — `VESTIGO_AGENT_API_KEY` becomes the only source (A10). Env-only, not admin-editable. |
@@ -601,6 +613,129 @@ would leave external clients with strictly *less* guidance than before A13.
 tool list stays under 40,000 chars. If a change trips it, that is a real context
 regression — re-measure and update this table rather than raising the ceiling.
 
+**(d) Bounding one turn's tool payload.** (a)–(c) bound the *fixed* overhead and
+the *replayed* history; neither bounds what a single broad turn pulls in. A
+"find anomalies and visualise" ask ran seven detectors in one turn and
+overflowed a 65,536-token model at 74,673 — a case auto-compaction structurally
+cannot fix, because there is only one turn and nothing older to fold.
+
+The cost was that every finding embedded its full resolved example event: the
+whole attribute bag, `source_file`, byte offsets, raw message. Measured on that
+turn, the inline `event` was ~85% of a finding's size (one `value_novelty`
+result was 37,431 chars, 31,677 of it `event`); seven detectors piled up ~18k
+tokens of them. `_deflate_findings` (`agent/tools.py`) reduces each finding in
+the **model's copy** to `event_id` + the event's `message`, truncated at
+`SLIM_MESSAGE_TRUNCATE`; `_serialize_finding` is untouched, so the persisted
+`DetectorRun` and the Analysis page keep the full event. Applied after
+persistence, at the same agent boundary as `_columnize`. On the failing turn:
+tool payload 33,731 → 15,718 tokens.
+
+The `message` survives deliberately, and the reasoning generalises to any
+future slimming here. For the value-shaped detectors the message *is* the
+finding: "username=gitlab-prometheus seen once" is not actionable, while "login
+attempt [gitlab-prometheus/rock] **succeeded**" is, and succeeded-vs-failed is
+invisible without it. Dropping it would also invert the saving — `get_event`
+returns the *full* attribute set, more than the inline event it replaced — and
+each such follow-up spends one of the turn's `request_limit` model requests, so
+a 25-finding sweep that followed up honestly would trade the overflow for a
+turn-limit crash. Keeping one line costs ~5% of what the event cost.
+
+The reduced payload carries a `note` saying the events were reduced and naming
+`get_event` as the way back to the full record, for the same reason `_listing`
+reports `returned` alongside `total`: a silently partial result the model
+reasons over as whole is exactly what the evidence rule forbids.
+
+The bulk `list_annotations` scan (up to `MAX_LIST_ROWS` rows, resent every
+turn) truncates bodies at `ANNOTATION_LIST_CONTENT_TRUNCATE` (160), while
+`get_event_annotations` — one event's detail, fetched deliberately — keeps the
+fuller `MESSAGE_TRUNCATE`.
+
+### Tool-result fidelity
+
+*How far* to reduce is one decision, in `agent/fidelity.py`, expressed as three
+named tiers rather than a pile of per-call byte counts:
+
+| tier | an event record carries | for |
+|---|---|---|
+| `full` | the whole event inline — message at 500, attributes (what the Analysis page shows) | large windows |
+| `message` | identity fields + `message`, truncated at 200; no attributes | ~64k local models |
+| `minimal` | identity fields alone (`event_id`, `timestamp`, `source_id`, …) | the last resort before failing |
+
+`tool_fidelity` is an operator setting on the usual env-wins-per-field path
+(`VESTIGO_AGENT_TOOL_FIDELITY`, admin UI, DB row), with a fourth value `auto`
+that derives the tier from `context_window` instead of naming one:
+
+| `context_window` | `auto` resolves to |
+|---|---|
+| unset | `message` |
+| ≥ `AUTO_FULL_MIN_WINDOW` (100k) | `full` |
+| ≥ `AUTO_MESSAGE_MIN_WINDOW` (32k) | `message` |
+| below 32k | `minimal` |
+
+The thresholds come from the measured payload: a seven-detector sweep carrying
+inline events was ~34k tokens (2026-07-20), so a 32k window has no room for even
+the reduced shape alongside history and an answer. `auto` with no window
+resolves to `message`, *not* to the `full` default — there is nothing to derive
+from, and an admin who picked `auto` asked to be kept inside a window rather
+than assumed to have room. Leaving `tool_fidelity` unset entirely is how a
+deployment declares no constraint.
+
+It applies to the in-app agent and to the external `/mcp` transport alike — it
+describes what the deployment can afford to hand a model, and an external client
+is driving one just the same.
+
+**Which tools honour it:** `FIDELITY_TIERED_TOOLS` in `agent/fidelity.py` (a
+policy fact, so it lives beside the tiers it selects rather than in `tools.py`) —
+`search_events`, `semantic_search`, `similar_events` (through `_slim_event`)
+and `run_anomaly_detector` (through `_deflate_findings`). Those are the tools
+that return *many* event records, where a tier is the difference between
+fitting and not.
+
+Three deliberate exemptions:
+
+- **`get_event`** — the escape hatch every reduced payload's `note` names.
+  Tiering it would leave the model looping on a reduction it has no way to
+  undo. One record fetched on purpose is the cheapest call in the turn.
+- **`get_event_annotations`** — same reasoning; one event's detail, fetched
+  deliberately. This is the split `ANNOTATION_LIST_CONTENT_TRUNCATE` vs
+  `MESSAGE_TRUNCATE` already draws.
+- **`list_annotations`** — annotation bodies are analyst-written evidence, not
+  an illustrative record; reducing them deletes findings rather than trimming
+  an example. Already bounded by `MAX_LIST_ROWS` × 160.
+
+Every tiered result carries `fidelity`, at `full` too: a result with no marker
+cannot be told apart from one produced before the setting existed. The
+accompanying `note` appears only when the tier actually dropped something
+(`_event_reduced` for the event-returning tools, `_finding_event_reduced` for
+the anomaly path, which loses the *whole* event object rather than just its
+attribute bag) — an event with no attributes and a short message survives
+`message` intact, and saying otherwise would put an untruth in the export for
+the sake of a uniform shape.
+
+**The default is `full`**, decided 2026-07-21: unset means the operator has
+declared no constraint, which is assumed to be a cloud model with room, and the
+overflow ladder below costs a retry rather than the turn. An admin running a
+small local model sets `message` or `auto`. The tradeoff is real and worth
+naming — *a broad turn on an unconfigured small model overflows on attempt 0
+and succeeds on the retry* — and it is the price of not silently starving
+capable deployments.
+
+Per-event attribute caps (`MAX_ATTRS_PER_EVENT`, `ATTR_VALUE_TRUNCATE`) are
+deliberately **not** tiered: they guard against a single pathological event (a
+megabyte of JSON in one attribute), an input-shape risk unrelated to the
+model's window, and have never been implicated in an overflow.
+
+**Determinism is the constraint that shaped this.** The tier is a function of
+static configuration and the retry attempt — never of what already ran in the
+turn. The more adaptive design (a running per-turn budget spent down as tools
+are called) would make identical calls return different data depending on call
+order, with nothing in the exported conversation to explain the difference.
+Forensic reproducibility means replaying a conversation's tool calls under the
+same configuration must produce byte-identical results, so `fidelity.py` holds
+no state, and any future work here must keep that property. A reduced result
+carries its `fidelity` alongside the `note`, so the export states what produced
+it rather than leaving the reader to infer it from config they may not have.
+
 ### Auto-compaction (context-window awareness)
 
 The runtime replays the full conversation `history` every turn, so long
@@ -617,14 +752,44 @@ UI — explicit opt-in, since the right number is model-specific),
   so a provider 400/413 whose body matches a known overflow phrasing
   (`_is_context_overflow` — deliberately narrow patterns like "maximum
   context", "prompt is too long", so unrelated 400s such as "invalid token"
-  never trigger it) compacts and retries — this path works even without a
-  configured window. The retry escalates: the first compaction keeps 2
-  recent turns verbatim, a repeat overflow folds down to 1, a third
-  overflow (or nothing left to fold) yields a friendly
-  `error{code="context_overflow"}` instead of the generic failure. Tool
+  never trigger it) retries — this path works even without a configured
+  window. The retry escalates **cheapest lever first**: drop one tool-result
+  fidelity tier and re-run (no LLM call, and the only lever that helps a
+  single broad turn — compaction has nothing older to fold), *if* the
+  attempt actually called a tier-honouring tool — a drop that cannot change
+  the prompt is skipped rather than spent (`fidelity.next_tier`); then the
+  first compaction keeping 2 recent turns verbatim; then a second folding down to
+  1; then a friendly `error{code="context_overflow"}` instead of the generic
+  failure. A tier drop emits an SSE `fidelity` event, the sibling of
+  `compaction`, so the analyst sees that results were thinned rather than
+  silently getting a shallower investigation — and, for the same reason
+  compaction does, persists an append-only `role="fidelity"` message row
+  (`tool_result = {from, to, attempt, reason}`) plus an
+  `agent.fidelity_drop` audit row: an SSE event alone is gone on reload, and
+  the case file has to answer "why is there less here than there" from
+  itself. Because the retry re-enters
+  `stream_turn` with `replace(scope, fidelity=...)` and **re-executes the
+  tools**, nothing already in history is rewritten — the record never
+  diverges from what the model saw. Tool
   calls re-executed by a retry carry an `attempt` field on their
   `agent.tool_call` audit rows so the custody trail distinguishes re-runs
-  from duplicates.
+  from duplicates; in the *message* log that job belongs to the marker rows —
+  `compaction` and `fidelity` both delimit attempts, so a tool row repeating
+  after one is that call re-executed, not a duplicate.
+- **A retry re-runs the tools, and two of them write.** Re-executing is what
+  keeps the record honest, but it is not free: `run_anomaly_detector` persists
+  another `DetectorRun` and `propose_annotation` another proposal, and the
+  ladder allows up to four retries (two tier drops, two compactions). A broad
+  sweep that overflows twice can therefore leave three sets of detector runs
+  for one analyst question, plus their ClickHouse cost. They are not
+  suppressed — the scans really did run, and hiding a re-execution is the
+  failure the marker rows exist to prevent — but they are *tagged*:
+  `AgentScope.attempt` rides into `_persist_detector_run`, which records
+  `params["agent_retry_attempt"]` when non-zero, so the Analysis page's
+  superseded re-runs are distinguishable from an analyst scanning twice.
+  Duplicate annotation proposals are left plain: each is an action the analyst
+  decides individually, nothing is written until they confirm, and the
+  preceding marker row already explains the pair.
 - **What compaction does.** `split_history` cuts at *user-turn boundaries
   only* (never between a tool_use and its tool_result), keeping the last
   `KEEP_RECENT_TURNS=2` turns verbatim (1 on the escalated retry); the
@@ -643,6 +808,31 @@ UI — explicit opt-in, since the right number is model-specific),
   `tool_result`, plus an `agent.compaction` audit row. The chat shows a
   visible "older turns were summarized" item (SSE `compaction` event), and
   the JSON export carries everything.
+
+### How a turn can end early
+
+Every terminal SSE `error` carries a `code`, because "Agent turn failed — see
+server logs" leaves the analyst unable to tell whether to rephrase, narrow, or
+call an admin:
+
+| `code` | Raised by | Means |
+|---|---|---|
+| `context_overflow` | `ModelHTTPError` matching `_is_context_overflow`, nothing left to compact | Start a new conversation |
+| `model_error` | any other 4xx/5xx from the endpoint | Endpoint/config problem — server logs |
+| `tool_retry_exhausted` | `UnexpectedModelBehavior` | The model could not call one tool correctly within its retry budget |
+| `turn_limit_reached` | `UsageLimitExceeded` | The turn spent all `max_turns` requests — ask something narrower or raise the setting |
+
+The retry budget behind `tool_retry_exhausted` is `Agent(..., retries=3)` in
+`stream_turn`. A tool-legality error is the agent's equivalent of the Visualize
+page's dropdown refusing an impossible chart — it names the legal alternative
+and is *meant* to be acted on, so pydantic-ai's default of one correction
+attempt was too tight (a small model burned both attempts on the same
+`propose_chart` heatmap/pivot mix-up and lost the turn). Not more than three:
+every retry is also a model request counted against `UsageLimits(request_limit=
+max_turns)`, so a tool the model cannot get right must not eat the
+investigation's budget. Whatever streamed before any of these is persisted with
+an ` [interrupted]` marker — the record stays truthful about how far the turn
+got.
 
 ### Reasoning effort
 

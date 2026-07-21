@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-07-21
+
+### Added
+
+- **Tool-result detail is now an agent setting (`tool_fidelity`).** How much of
+  each event record the agent gets back from searches, similarity lookups and
+  anomaly findings — `full` (the whole event), `message` (the one line that
+  distinguishes a succeeded login from a failed one), `minimal` (just the
+  identity fields), or `auto` (derive it from the configured context window:
+  100k and up gets `full`, 32k and up `message`, anything smaller `minimal`, and
+  an unconfigured window `message`).
+  The default is `full`: an unset context window means the operator has declared
+  no constraint, which is assumed to be a cloud model with room. Admins running
+  a small local model should set `message` or `auto`. `get_event` always answers
+  in full — it is the escape hatch the reduced results point at.
+  **Note for `/mcp` users:** the setting applies to the external transport too,
+  so setting anything but `full` changes what existing MCP clients receive from
+  `search_events`, `semantic_search`, `similar_events` and `run_anomaly_detector`
+  — each such result names its tier in a `fidelity` field.
+- **An overflow now costs a slower turn, not a shallower one.** When a turn
+  overflows the model's context window, the agent first re-runs it handing the
+  model less of each event record — no summarizer call, and unlike compaction
+  it works on a single broad turn, which has no older turns to fold. It is
+  skipped when the turn fetched no event records, since there would be nothing
+  to give up; only once it is exhausted does the agent compact. Each such drop
+  is recorded the way a compaction is — a message row in the conversation and an
+  audit entry — so it survives a reload and reaches the JSON export, and each
+  tool result records the detail level that produced it. An exported
+  conversation states every degradation that was applied to it.
+
 ### Security
 
 - **Path traversal in the frontend catch-all (unauthenticated arbitrary file
@@ -28,6 +58,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phrasing, so an overflow against a proxied local model skipped the
   compact-and-retry escalation entirely and surfaced as a generic model error,
   losing the turn.
+- **A single broad investigation turn no longer overflows a small model.** Each
+  anomaly finding handed to the agent embedded the full resolved example event
+  (~85% of the finding's size); a "find anomalies and visualise" ask that ran
+  seven detectors in one turn piled up ~18k tokens of duplicated event bodies
+  and overflowed a 64k model — a case compaction cannot fix, since there is only
+  one turn to fold. The agent's copy of a finding now carries the example's
+  `event_id` and its `message` line — the part that distinguishes a succeeded
+  login from a failed one — instead of the whole event, with `get_event` for the
+  full record and a note saying so; and the bulk `list_annotations` scan
+  truncates long bodies harder than the per-event detail tool. The persisted
+  detector run and the Analysis page keep the full data. On the turn that
+  failed, this cut the tool payload from ~34k to ~16k tokens.
+- **The agent gets more than one attempt to correct a rejected tool call.** Tool
+  legality errors name the legal alternative and exist to be acted on, but the
+  retry budget was one, so a second wrong guess killed the whole turn. A
+  `propose_chart` call asking for a `heatmap` with two fields did exactly that.
+  The budget is now three, and that particular rejection names the fix
+  (`chart_type="pivot"` is the field × field heatmap; `heatmap` is one field over
+  time) rather than only listing the two-field chart types.
+- **A turn that ends early says why.** Exhausting a tool's retries or the turn's
+  step budget surfaced as "Agent turn failed — see server logs", which does not
+  tell the analyst whether to rephrase, narrow the question, or call an admin.
+  Both now end with a named error (`tool_retry_exhausted`, `turn_limit_reached`)
+  carrying the underlying reason.
+- **A reduced tool result no longer claims to have dropped something it kept.**
+  An anomaly finding whose example event could not be resolved, or held nothing
+  but a short message, still came back with "call get_event for the full
+  record" attached — an untruth in an exported conversation. The note now
+  appears only when the detail level actually removed something.
+- **A degraded turn is legible in the case record.** A turn re-run at a lower
+  detail level re-executes its tools, so one analyst question could leave
+  several identical detector runs on the Analysis page with nothing to tell them
+  apart; re-runs now carry the attempt that produced them. The estimate that
+  decides whether to summarize older turns also ignores token counts measured
+  before a detail drop, the way it already ignored counts measured before a
+  summarization — they describe a request the conversation no longer sends.
 
 ## [1.4.1] — 2026-07-20
 

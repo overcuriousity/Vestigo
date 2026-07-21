@@ -252,7 +252,10 @@ export interface AgentConversation {
 export interface AgentMessage {
   id: string;
   conversation_id: string;
-  role: "user" | "assistant" | "tool" | "thinking" | "compaction";
+  /** `compaction` and `fidelity` are marker rows: one degradation the runtime
+   * applied mid-turn before re-running it. They also separate a retry's
+   * re-executed tool rows from the attempt before it. */
+  role: "user" | "assistant" | "tool" | "thinking" | "compaction" | "fidelity";
   content: string;
   tool_name: string | null;
   tool_args: Record<string, unknown> | null;
@@ -290,11 +293,16 @@ export interface AgentInfo {
   user_disabled_tools: string[];
 }
 
+/** The tiers `src/vestigo/agent/fidelity.py::Fidelity` can retry down to.
+ * `auto` is a resolution mode, not a tier, so it never reaches the stream. */
+export type AgentFidelity = "full" | "message" | "minimal";
+
 export type AgentStreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "thinking_delta"; text: string }
   | { type: "thinking"; text: string }
   | { type: "compaction"; summary: string; reason?: string }
+  | { type: "fidelity"; fidelity: AgentFidelity; reason?: string }
   | { type: "tool_call"; tool_call_id: string; tool: string; args: Record<string, unknown> }
   | { type: "tool_result"; tool_call_id: string; tool: string; result: unknown }
   | {
