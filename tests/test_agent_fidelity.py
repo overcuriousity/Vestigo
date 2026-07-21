@@ -16,11 +16,29 @@ import pytest
 from vestigo.agent.fidelity import (
     DEFAULT_FIDELITY,
     FIDELITY_VALUES,
+    MAX_FIDELITY_DROPS,
     Fidelity,
     degrade,
+    next_tier,
     resolve_fidelity,
 )
-from vestigo.agent.tools import _deflate_findings
+from vestigo.agent.tools import (
+    FIDELITY_TIERED_TOOLS,
+    TOOL_NAMES,
+    _deflate_findings,
+    _slim_event,
+)
+
+
+def _event() -> dict:
+    return {
+        "event_id": "e1",
+        "timestamp": "2026-07-20T10:00:00Z",
+        "source_id": "s1",
+        "artifact": "auth",
+        "message": "login attempt [svc-a/rock] succeeded",
+        "attributes": {"user": "svc-a", "ip": "10.0.0.9"},
+    }
 
 
 def _payload() -> dict:
@@ -82,12 +100,50 @@ def test_degrade_walks_down_once_and_bottoms_out():
     assert degrade(Fidelity.MINIMAL) is None
 
 
+def test_max_drops_matches_the_tier_table():
+    """The router sizes its retry budget from this rather than a literal."""
+    assert len(list(Fidelity)) - 1 == MAX_FIDELITY_DROPS
+
+
+# --- when a drop is worth an attempt ---------------------------------------
+
+
+def test_next_tier_drops_when_a_tiered_tool_ran():
+    assert next_tier(Fidelity.FULL, {"list_fields", "search_events"}) is Fidelity.MESSAGE
+    assert next_tier(Fidelity.MESSAGE, {"run_anomaly_detector"}) is Fidelity.MINIMAL
+
+
+def test_next_tier_refuses_when_a_drop_cannot_change_the_prompt():
+    """An overflow on a turn that fetched no event records is a history
+    problem: re-sending a byte-identical request only delays the compaction
+    that can actually help."""
+    assert next_tier(Fidelity.FULL, set()) is None
+    assert next_tier(Fidelity.FULL, {"list_fields", "get_event", "list_annotations"}) is None
+
+
+def test_next_tier_bottoms_out_even_with_tiered_tools():
+    assert next_tier(Fidelity.MINIMAL, {"search_events"}) is None
+
+
+def test_tiered_tools_are_real_tools():
+    """A typo here would silently disable the cheapest overflow lever."""
+    assert FIDELITY_TIERED_TOOLS <= TOOL_NAMES
+    # The escape hatch the reduced payloads point at must never be tiered.
+    assert "get_event" not in FIDELITY_TIERED_TOOLS
+    assert "get_event_annotations" not in FIDELITY_TIERED_TOOLS
+
+
 # --- deflation per tier ----------------------------------------------------
 
 
-def test_full_is_a_noop():
-    payload = _payload()
-    assert _deflate_findings(payload, Fidelity.FULL) == payload
+def test_full_keeps_every_event_and_still_names_its_tier():
+    """A result with no marker cannot be told apart from one produced before
+    tiers existed, so `full` stamps too — it just drops nothing and says
+    nothing about missing data."""
+    out = _deflate_findings(_payload(), Fidelity.FULL)
+    assert out["results"] == _payload()["results"]
+    assert out["fidelity"] == "full"
+    assert "note" not in out
 
 
 def test_message_keeps_the_line_that_carries_the_verdict():
@@ -126,6 +182,42 @@ def test_tiers_are_ordered_by_size():
 def test_deflation_is_idempotent():
     once = _deflate_findings(_payload(), Fidelity.MESSAGE)
     assert _deflate_findings(once, Fidelity.MESSAGE) == once
+
+
+# --- whole-event payloads (search, semantic_search, similar_events) --------
+
+
+def test_slim_event_full_keeps_the_attribute_bag():
+    out = _slim_event(_event(), Fidelity.FULL)
+    assert out["attributes"] == {"user": "svc-a", "ip": "10.0.0.9"}
+    assert out["message"] == "login attempt [svc-a/rock] succeeded"
+
+
+def test_slim_event_message_drops_attributes_only():
+    out = _slim_event(_event(), Fidelity.MESSAGE)
+    assert "attributes" not in out
+    assert out["message"] == "login attempt [svc-a/rock] succeeded"
+
+
+def test_slim_event_minimal_keeps_identity_only():
+    out = _slim_event(_event(), Fidelity.MINIMAL)
+    assert "attributes" not in out and "message" not in out
+    assert out["event_id"] == "e1"
+
+
+@pytest.mark.parametrize("tier", list(Fidelity))
+def test_slim_event_never_strips_the_means_of_un_reducing_it(tier):
+    """`event_id` reaches get_event and `source_id` reaches
+    get_event_annotations — a reduction that removed either would be a dead
+    end rather than a pointer."""
+    out = _slim_event(_event(), tier)
+    assert out["event_id"] == "e1"
+    assert out["source_id"] == "s1"
+
+
+def test_slim_event_tiers_are_ordered_by_size():
+    sizes = [len(json.dumps(_slim_event(_event(), tier))) for tier in Fidelity]
+    assert sizes == sorted(sizes, reverse=True)
 
 
 def test_the_same_call_at_the_same_tier_is_byte_identical():

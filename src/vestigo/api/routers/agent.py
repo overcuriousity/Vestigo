@@ -36,7 +36,7 @@ from vestigo.agent.compaction import (
     should_compact,
 )
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
-from vestigo.agent.fidelity import degrade, resolve_fidelity
+from vestigo.agent.fidelity import MAX_FIDELITY_DROPS, next_tier, resolve_fidelity
 from vestigo.agent.runtime import LLM_TIMEOUT, dump_history, load_history, stream_turn
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
 from vestigo.api.deps import (
@@ -530,14 +530,16 @@ async def _message_stream_inner(
     #      that actually overflowed a 64k model (2026-07-20). The turn is
     #      re-run through a fresh `build_tool_server`, so nothing already in
     #      history is rewritten and the record never diverges from what the
-    #      model saw.
+    #      model saw. Skipped when the attempt called no tier-honouring tool
+    #      (`fidelity.next_tier`) — a drop that cannot change the prompt is not
+    #      a lever, just a wasted round trip.
     #   2. compact: the first keeps 2 recent turns verbatim, a second folds
     #      down to 1. Costs a summarizer call, and can only help when there is
     #      an older turn to fold.
     #   3. give up with the friendly context_overflow error.
     keep_schedule = (2, 1)
-    # Two fidelity drops (full → message → minimal) at most, then compaction.
-    max_attempts = 2 + len(keep_schedule) + 1
+    # Every fidelity drop (full -> message -> minimal) at most, then compaction.
+    max_attempts = MAX_FIDELITY_DROPS + len(keep_schedule) + 1
     compactions = 0
     estimated = estimate_next_prompt_tokens(last_prompt, last_completion, history, payload.content)
     if should_compact(config, estimated):
@@ -553,6 +555,7 @@ async def _message_stream_inner(
     text_parts: list[str] = []
     for attempt in range(max_attempts):
         text_parts = []
+        tools_used: set[str] = set()
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return
@@ -633,6 +636,9 @@ async def _message_stream_inner(
                         detail=audit_detail,
                     )
                 elif event["type"] == "tool_result":
+                    # Which tools actually returned data this attempt decides
+                    # whether a fidelity drop could change anything at all.
+                    tools_used.add(event["tool"])
                     await store.add_agent_message(
                         conversation_id,
                         "tool",
@@ -643,11 +649,13 @@ async def _message_stream_inner(
             return
         except ModelHTTPError as exc:
             overflow = _is_context_overflow(exc)
-            if overflow and (lower := degrade(scope.fidelity)) is not None:
+            if overflow and (lower := next_tier(scope.fidelity, tools_used)) is not None:
                 # Cheapest lever: hand the model less of each example record
-                # and re-run. Tool rows already persisted by this attempt stay
-                # — the record shows what actually ran, and each row states the
-                # tier that produced it.
+                # and re-run. Skipped when this attempt called no tool that
+                # honours the tier — re-sending a byte-identical request would
+                # only delay the compaction that can actually help. Tool rows
+                # already persisted by this attempt stay — the record shows what
+                # actually ran, and each row states the tier that produced it.
                 scope = replace(scope, fidelity=lower)
                 yield _sse({"type": "fidelity", "fidelity": lower.value, "reason": "overflow"})
                 continue

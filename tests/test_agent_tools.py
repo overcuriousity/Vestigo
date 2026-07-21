@@ -458,7 +458,127 @@ async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, mo
     full_server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.FULL))
     full = await _call(full_server, "run_anomaly_detector", {"detector": "value_novelty"})
     assert _rows(full["results"])[0]["event"] == big_event
-    assert "note" not in full and "fidelity" not in full
+    # Nothing was dropped, so no note — but the tier is still on the record,
+    # or an export could not tell "ran at full" from "predates the setting".
+    assert full["fidelity"] == "full"
+    assert "note" not in full
+
+
+def _fat_event() -> dict[str, Any]:
+    return {
+        "event_id": "e1",
+        "timestamp": "2026-07-20T10:00:00Z",
+        "source_id": "s1",
+        "artifact": "auth",
+        "message": "login attempt [svc-a/rock] succeeded",
+        "attributes": {"user": "svc-a", "ip": "10.0.0.9"},
+    }
+
+
+def _one_event_service(monkeypatch) -> None:
+    """Point every query tool at a single fat event."""
+    import vestigo.api.routers.events as events_router
+
+    class _Page:
+        total = 1
+        events = [_fat_event()]
+
+    class _Service:
+        def query(self, query):
+            return _Page()
+
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: _Service())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tier", "has_attributes", "has_message"),
+    [
+        (Fidelity.FULL, True, True),
+        (Fidelity.MESSAGE, False, True),
+        (Fidelity.MINIMAL, False, False),
+    ],
+)
+async def test_search_events_honours_the_deployment_tier(
+    store, monkeypatch, tier, has_attributes, has_message
+):
+    """A broad search is as capable of overflowing a small window as a
+    detector sweep, so it spends the same tier."""
+    _one_event_service(monkeypatch)
+
+    server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=tier))
+    result = await _call(server, "search_events", {})
+    row = _rows(result["events"])[0]
+
+    assert result["fidelity"] == tier.value
+    assert ("attributes" in row) is has_attributes
+    assert ("message" in row) is has_message
+    # The handles back to the full record survive every reduction.
+    assert row["event_id"] == "e1" and row["source_id"] == "s1"
+    if tier is Fidelity.FULL:
+        assert "note" not in result
+    else:
+        assert "get_event" in result["note"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["semantic_search", "similar_events"])
+async def test_similarity_tools_honour_the_deployment_tier(store, monkeypatch, tool):
+    import vestigo.api.routers.events as events_router
+
+    class _Hit:
+        event_id = "e1"
+        score = 0.93
+        event = _fat_event()
+
+    class _Result:
+        status = "ok"
+        results = [_Hit()]
+
+    class _Similarity:
+        def find_similar_by_text(self, *a, **kw):
+            return _Result()
+
+        def find_similar(self, *a, **kw):
+            return _Result()
+
+    monkeypatch.setattr(events_router, "_get_similarity_service", lambda: _Similarity())
+    monkeypatch.setattr("vestigo.agent.tools.embeddings_available", lambda: True)
+
+    server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.MINIMAL))
+    args = {"q": "brute force"} if tool == "semantic_search" else {"event_id": "e1"}
+    result = await _call(server, tool, args)
+    hit = result["results"][0]
+
+    assert result["fidelity"] == "minimal"
+    assert hit["event"] == {
+        "event_id": "e1",
+        "timestamp": "2026-07-20T10:00:00Z",
+        "source_id": "s1",
+        "artifact": "auth",
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_escape_hatches_are_exempt_from_the_tier(store, monkeypatch):
+    """`get_event` and `get_event_annotations` are what every reduced payload
+    tells the model to call. Tiering them would leave it looping on a
+    reduction it has no way to undo, so they answer in full at every tier."""
+    _one_event_service(monkeypatch)
+    await store.init_schema()
+    await store.create_annotation("c1", "s1", "e1", "a-fid", "comment", "looked at")
+
+    server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.MINIMAL))
+
+    event = await _call(server, "get_event", {"event_id": "e1"})
+    assert event["attributes"] == {"user": "svc-a", "ip": "10.0.0.9"}
+    assert event["message"] == "login attempt [svc-a/rock] succeeded"
+    assert "fidelity" not in event
+
+    annotations = await _call(
+        server, "get_event_annotations", {"source_id": "s1", "event_id": "e1"}
+    )
+    assert _rows(annotations["annotations"])[0]["content"] == "looked at"
 
 
 @pytest.mark.asyncio

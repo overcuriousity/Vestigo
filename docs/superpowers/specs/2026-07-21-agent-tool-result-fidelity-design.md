@@ -1,7 +1,9 @@
 # Budget-aware tool-result fidelity (agent)
 
 Design round for the item `docs/ROADMAP.md` §Milestone 3 records after PR145.
-Status: **design, not yet implemented.**
+Status: **implemented** (PR146). Shipped shape and the two decisions taken
+during review are recorded under *Decisions* at the end; `docs/AGENT.md`
+§Tool-result fidelity is the reference for what runs today.
 
 ## Problem
 
@@ -172,3 +174,27 @@ explaining why.
    tier — they guard against a single pathological event (a megabyte of JSON in
    one attribute), which is an input-shape risk unrelated to window size, and
    they have never been implicated in an overflow.
+
+## Decisions taken during review (2026-07-21, PR146)
+
+3. **The tier governs every multi-record event payload, not just findings.**
+   The first implementation wired `scope.fidelity` into `run_anomaly_detector`
+   alone, which made decision 2 above read narrower than it should: a broad
+   `search_events` or `similar_events` result overflows a small window just as
+   readily. `_slim_event` — the shared choke point for `search_events`,
+   `semantic_search` and `similar_events` — now takes the tier too, and
+   `FIDELITY_TIERED_TOOLS` names the set. `get_event`,
+   `get_event_annotations` and `list_annotations` are exempt, for the reasons
+   in `docs/AGENT.md` §Tool-result fidelity.
+4. **A drop that cannot change the prompt is not spent.** The escalation in
+   §4 assumed every overflow has tool payloads to give up. An overflow on a
+   turn that fetched no event records — a long conversation, no tiered tool
+   called — would otherwise burn two byte-identical provider round trips
+   before reaching the compaction that can actually help. `next_tier` takes
+   the attempt's tool names and returns `None` when none of them honours the
+   tier. This keeps the determinism property: the input is what the attempt
+   *ran*, which the transcript records, not a running budget.
+5. **Every tiered result stamps `fidelity`, `full` included.** A result with
+   no marker at all cannot be told apart from one produced before the setting
+   existed, which an exported conversation has to be able to do. `note` still
+   appears only when something was actually dropped.

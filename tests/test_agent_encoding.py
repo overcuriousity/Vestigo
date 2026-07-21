@@ -225,8 +225,11 @@ def test_deflate_findings_ignores_unexpected_shapes():
     assert _deflate_findings({"results": "nope"}) == {"results": "nope"}
     assert _deflate_findings({"status": "skipped"}) == {"status": "skipped"}
     assert _deflate_findings("not a dict") == "not a dict"
-    # a finding with no event is passed through unchanged
-    assert _deflate_findings({"results": [{"event_id": "e1"}]}) == {"results": [{"event_id": "e1"}]}
+    # a finding with no event keeps its rows — only the tier stamp is added,
+    # and no note, since nothing was actually dropped
+    passthrough = _deflate_findings({"results": [{"event_id": "e1"}]})
+    assert passthrough["results"] == [{"event_id": "e1"}]
+    assert passthrough["fidelity"] == "message" and "note" not in passthrough
     # an event without a message still loses the event, and says so
     out = _deflate_findings({"results": [{"event_id": "e1", "event": {"blob": "z"}}]})
     assert out["results"] == [{"event_id": "e1"}]

@@ -10,19 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Tool-result detail is now an agent setting (`tool_fidelity`).** How much of
-  an example event the agent gets with each anomaly finding — `full` (the whole
-  event), `message` (the one line that distinguishes a succeeded login from a
-  failed one), `minimal` (just the id), or `auto` (derive it from the configured
-  context window). The default is `full`: an unset context window means the
-  operator has declared no constraint, which is assumed to be a cloud model with
-  room. Admins running a small local model should set `message` or `auto`.
+  each event record the agent gets back from searches, similarity lookups and
+  anomaly findings — `full` (the whole event), `message` (the one line that
+  distinguishes a succeeded login from a failed one), `minimal` (just the
+  identity fields), or `auto` (derive it from the configured context window).
+  The default is `full`: an unset context window means the operator has declared
+  no constraint, which is assumed to be a cloud model with room. Admins running
+  a small local model should set `message` or `auto`. Applies to the external
+  `/mcp` transport too. `get_event` always answers in full — it is the escape
+  hatch the reduced results point at.
 - **An overflow now costs a slower turn, not a shallower one.** When a turn
   overflows the model's context window, the agent first re-runs it handing the
-  model less of each example record — no summarizer call, and unlike compaction
-  it works on a single broad turn, which has no older turns to fold. Only if
-  that is exhausted does it compact. The chat shows when this happened, and each
-  tool result records the detail level that produced it, so an exported
-  conversation stays explainable.
+  model less of each event record — no summarizer call, and unlike compaction
+  it works on a single broad turn, which has no older turns to fold. It is
+  skipped when the turn fetched no event records, since there would be nothing
+  to give up; only once it is exhausted does the agent compact. The chat shows
+  when this happened, and each tool result records the detail level that
+  produced it, so an exported conversation stays explainable.
 
 ### Security
 

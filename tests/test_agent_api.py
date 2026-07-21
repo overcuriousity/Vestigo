@@ -1670,6 +1670,54 @@ def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None, f
     return calls
 
 
+def _tool_calling_model(monkeypatch, *, overflow_body: str, fail_count: int):
+    """A model whose turn actually calls a fidelity-tiered tool.
+
+    The tier drop is only a lever when the attempt fetched event records
+    through one of ``FIDELITY_TIERED_TOOLS`` — with `_thinking_free_model`'s
+    tool-free stub the router correctly refuses to spend a retry on it. Each
+    attempt here runs the same two requests: one that calls
+    ``run_anomaly_detector``, then one that either overflows or answers.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolReturnPart
+    from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    server = FastMCP("stub")
+
+    @server.tool()
+    def run_anomaly_detector(detector: str = "value_novelty") -> dict:
+        return {"status": "ok", "results": [], "fidelity": "full"}
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: server)
+    calls = {"stream": 0, "failures": 0}
+
+    def _tool_ran(messages) -> bool:
+        return any(
+            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+        )
+
+    async def model_stream(messages, info):
+        calls["stream"] += 1
+        if not _tool_ran(messages):
+            yield {0: DeltaToolCall(name="run_anomaly_detector", json_args="{}")}
+            return
+        if calls["failures"] < fail_count:
+            calls["failures"] += 1
+            raise ModelHTTPError(status_code=400, model_name="m", body=overflow_body)
+        yield "answer after the retry"
+
+    async def model_call(messages, info):
+        return ModelResponse(parts=[TextPart(content="a dense summary of turns 0-1")])
+
+    model = FunctionModel(model_call, stream_function=model_stream)
+    monkeypatch.setattr(runtime, "build_model", lambda config=None, http_client=None: model)
+    return calls
+
+
 def test_send_message_compacts_at_threshold(client, admin_bootstrap, agent_on, store, monkeypatch):
     from vestigo.agent.compaction import COMPACTION_MARKER
 
@@ -1720,11 +1768,9 @@ def test_send_message_overflow_compacts_and_retries(
     """A provider 400 mentioning context length triggers compact-then-retry —
     even without a configured context_window.
 
-    Pinned at the lowest fidelity so there is no cheaper lever left: the tier
-    drop is tried first (see the escalation test below), and this exercises
-    what happens once it is exhausted."""
-    monkeypatch.setenv("VESTIGO_AGENT_TOOL_FIDELITY", "minimal")
-    get_settings.cache_clear()
+    The stub turn calls no tool, so the tier drop is not a lever here (see
+    test_overflow_without_a_tiered_tool_goes_straight_to_compaction) and
+    compaction is the first thing tried."""
     calls = _thinking_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
 
     as_admin(client, admin_bootstrap)
@@ -1756,7 +1802,9 @@ def test_overflow_drops_fidelity_before_spending_a_summarizer_call(
     — the case that actually overflowed a 64k model (2026-07-20). Handing the
     model less of each example record can, costs no LLM call, and re-runs the
     tools through a fresh server rather than rewriting anything in history."""
-    calls = _thinking_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+    calls = _tool_calling_model(
+        monkeypatch, overflow_body="maximum context length exceeded", fail_count=1
+    )
 
     as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)
@@ -1778,7 +1826,37 @@ def test_overflow_drops_fidelity_before_spending_a_summarizer_call(
     assert fidelity["fidelity"] == "message"
     assert fidelity["reason"] == "overflow"
     assert not any(e["type"] == "compaction" for e in events)
-    assert next(e for e in events if e["type"] == "done")["content"] == "post-compaction answer"
+    assert next(e for e in events if e["type"] == "done")["content"] == "answer after the retry"
+    # Two requests per attempt (tool call, then answer) across two attempts.
+    assert calls["stream"] == 4
+
+
+def test_overflow_without_a_tiered_tool_goes_straight_to_compaction(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A drop that cannot change the prompt is not a lever.
+
+    When the overflowed attempt fetched no event records, re-sending a
+    byte-identical request would only delay the compaction that can actually
+    help — so no `fidelity` event is emitted at all, even from the default
+    `full`."""
+    calls = _thinking_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert not any(e["type"] == "fidelity" for e in events)
+    assert next(e for e in events if e["type"] == "compaction")["reason"] == "overflow"
     assert calls["stream"] == 2
 
 
@@ -1786,9 +1864,8 @@ def test_send_message_overflow_with_nothing_to_compact(
     client, admin_bootstrap, agent_on, store, monkeypatch
 ):
     """Overflow on an already-short conversation degrades to a specific,
-    friendly error — not the generic 'see server logs'."""
-    monkeypatch.setenv("VESTIGO_AGENT_TOOL_FIDELITY", "minimal")
-    get_settings.cache_clear()
+    friendly error — not the generic 'see server logs'. The stub turn calls no
+    tool, so there is no fidelity lever to spend either."""
     _thinking_free_model(monkeypatch, fail_first_stream="prompt is too long: maximum tokens")
 
     as_admin(client, admin_bootstrap)
@@ -1849,10 +1926,8 @@ def test_send_message_second_overflow_folds_to_one_turn(
     1 turn → success. Both compactions land on the record with their
     keep_turns, and re-run tool audit rows would carry the attempt tag.
 
-    Pinned at the lowest fidelity: the tier drop is the first lever tried, and
-    this test is about what the compaction schedule does after it."""
-    monkeypatch.setenv("VESTIGO_AGENT_TOOL_FIDELITY", "minimal")
-    get_settings.cache_clear()
+    The stub turn calls no tool, so the compaction schedule is the whole
+    ladder here; the tier drops are covered by the escalation test below."""
     calls = _thinking_free_model(
         monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=2
     )
@@ -1889,11 +1964,9 @@ def test_send_message_third_overflow_gives_up(
     """After every escalation step the turn fails with the friendly
     context_overflow error instead of retrying forever.
 
-    Pinned at the lowest fidelity so only the compaction steps remain; the
-    full ladder (two tier drops, then two compactions) is covered by
+    The stub turn calls no tool, so only the compaction steps remain; the full
+    ladder (two tier drops, then two compactions) is covered by
     test_overflow_exhausts_every_lever_in_order."""
-    monkeypatch.setenv("VESTIGO_AGENT_TOOL_FIDELITY", "minimal")
-    get_settings.cache_clear()
     calls = _thinking_free_model(
         monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=3
     )
@@ -1923,8 +1996,8 @@ def test_overflow_exhausts_every_lever_in_order(
     """From the default `full`: two tier drops (no LLM call each), then the
     two compactions, then the friendly error — cheapest lever first, and the
     turn is never lost to a raw crash."""
-    calls = _thinking_free_model(
-        monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=5
+    calls = _tool_calling_model(
+        monkeypatch, overflow_body="maximum context length exceeded", fail_count=5
     )
 
     as_admin(client, admin_bootstrap)
@@ -1944,7 +2017,8 @@ def test_overflow_exhausts_every_lever_in_order(
     assert ladder == ["fidelity", "fidelity", "compaction", "compaction", "error"]
     assert [e["fidelity"] for e in events if e["type"] == "fidelity"] == ["message", "minimal"]
     assert next(e for e in events if e["type"] == "error")["code"] == "context_overflow"
-    assert calls["stream"] == 5
+    # Five attempts, each spending a tool-call request and an answer request.
+    assert calls["stream"] == 10
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,12 @@ const PROVIDERS = ["openai", "anthropic"] as const;
 const EFFORTS = ["off", "low", "medium", "high", "max"] as const;
 const FIDELITIES = ["full", "message", "minimal", "auto"] as const;
 
+/** Radix cannot carry an empty `value`, so "back to unset" needs a sentinel.
+ * `set()` maps it to "" and `buildPatch` already sends `null` for that — which
+ * is what clears the DB row and restores the default. */
+const UNSET = "__unset__";
+const unsetValue = (v: string) => (v === UNSET ? "" : v);
+
 /** Local editable form state, mirroring the DB-editable AgentSettingsUpdate fields
  * (see `src/vestigo/api/routers/admin.py::AgentSettingsUpdate`). `apiKey` and
  * `clearApiKey` are handled separately since the backend never returns the
@@ -480,12 +486,13 @@ export function AdminAgentPage() {
           <Select
             value={form.reasoning_effort || undefined}
             disabled={isEnvPinned("reasoning_effort")}
-            onValueChange={(v) => set("reasoning_effort")(v)}
+            onValueChange={(v) => set("reasoning_effort")(unsetValue(v))}
           >
             <SelectTrigger disabled={isEnvPinned("reasoning_effort")}>
               <SelectValue placeholder="Select effort" />
             </SelectTrigger>
             <SelectContent>
+              <SelectItem value={UNSET}>(unset)</SelectItem>
               {EFFORTS.map((e) => (
                 <SelectItem key={e} value={e}>
                   {e}
@@ -530,12 +537,13 @@ export function AdminAgentPage() {
           <Select
             value={form.tool_fidelity || undefined}
             disabled={isEnvPinned("tool_fidelity")}
-            onValueChange={(v) => set("tool_fidelity")(v)}
+            onValueChange={(v) => set("tool_fidelity")(unsetValue(v))}
           >
             <SelectTrigger disabled={isEnvPinned("tool_fidelity")}>
               <SelectValue placeholder="Select detail level" />
             </SelectTrigger>
             <SelectContent>
+              <SelectItem value={UNSET}>(unset)</SelectItem>
               {FIDELITIES.map((f) => (
                 <SelectItem key={f} value={f}>
                   {f}
@@ -544,7 +552,8 @@ export function AdminAgentPage() {
             </SelectContent>
           </Select>
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-            How much of an example event the agent gets with each anomaly finding.
+            How much of each event record the agent gets back from searches, similarity
+            lookups and anomaly findings.
             <strong> full</strong> assumes a large window (the default) —{" "}
             <strong>message</strong> or <strong>auto</strong> suit a small local model.
             On an overflow the agent retries one level down automatically, so this

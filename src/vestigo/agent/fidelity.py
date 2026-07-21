@@ -5,17 +5,23 @@ Tool results are slimmed before they reach the agent (``docs/AGENT.md``
 as three named tiers rather than a pile of per-call byte counts:
 
 ``FULL``
-    The example event stays inline. What the Analysis page shows.
+    The event stays inline whole. What the Analysis page shows.
 ``MESSAGE``
-    ``event_id`` plus the event's ``message`` line — enough to tell a
-    succeeded login from a failed one, at ~5% of the size.
+    Identity fields plus the event's ``message`` line — enough to tell a
+    succeeded login from a failed one, at a fraction of the size.
 ``MINIMAL``
-    ``event_id`` alone. The model calls ``get_event`` for anything more.
+    Identity fields alone. The model calls ``get_event`` for anything more.
+
+The tier governs the tools that return *many* event records
+(``FIDELITY_TIERED_TOOLS`` in ``agent/tools.py``). The single-record fetches it
+points at — ``get_event``, ``get_event_annotations`` — are deliberately exempt:
+they are the escape hatch every reduced payload names, and tiering them would
+leave the model looping on a reduction it cannot undo.
 
 The per-event attribute caps (``MAX_ATTRS_PER_EVENT``, ``ATTR_VALUE_TRUNCATE``)
-are deliberately *not* tiered: they guard against a single pathological event
-(a megabyte of JSON in one attribute), which is an input-shape risk unrelated
-to the model's window, and they have never been implicated in an overflow.
+are deliberately *not* tiered either: they guard against a single pathological
+event (a megabyte of JSON in one attribute), which is an input-shape risk
+unrelated to the model's window, and have never been implicated in an overflow.
 
 **Determinism is the design constraint.** The tier is a function of static
 configuration and the retry attempt number — never of what already ran in this
@@ -30,9 +36,21 @@ See ``docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md``.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Collection
 from enum import StrEnum
 
-__all__ = ["Fidelity", "FIDELITY_VALUES", "DEFAULT_FIDELITY", "resolve_fidelity", "degrade"]
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "Fidelity",
+    "FIDELITY_VALUES",
+    "DEFAULT_FIDELITY",
+    "MAX_FIDELITY_DROPS",
+    "resolve_fidelity",
+    "degrade",
+    "next_tier",
+]
 
 
 class Fidelity(StrEnum):
@@ -62,6 +80,11 @@ AUTO_FULL_MIN_WINDOW = 100_000
 
 _ORDER = (Fidelity.FULL, Fidelity.MESSAGE, Fidelity.MINIMAL)
 
+#: How many times :func:`degrade` can drop before bottoming out — the overflow
+#: ladder's share of the retry budget, derived here so the router's attempt
+#: bound cannot drift from the tier table.
+MAX_FIDELITY_DROPS = len(_ORDER) - 1
+
 
 def resolve_fidelity(setting: str | None, context_window: int | None) -> Fidelity:
     """The tier a turn starts at, from configuration alone.
@@ -79,6 +102,13 @@ def resolve_fidelity(setting: str | None, context_window: int | None) -> Fidelit
     try:
         return Fidelity(setting)
     except ValueError:
+        if setting is not None:
+            # The Settings pattern rejects a bad env value and the admin schema
+            # rejects a bad write, so reaching here means a row predating one of
+            # them — worth a line in the log rather than a silent downgrade.
+            logger.warning(
+                "Unrecognised tool_fidelity %r — falling back to %s", setting, DEFAULT_FIDELITY
+            )
         return DEFAULT_FIDELITY
 
 
@@ -92,3 +122,20 @@ def degrade(tier: Fidelity) -> Fidelity | None:
     """
     index = _ORDER.index(tier)
     return _ORDER[index + 1] if index + 1 < len(_ORDER) else None
+
+
+def next_tier(current: Fidelity, tools_used: Collection[str]) -> Fidelity | None:
+    """The tier to retry an overflowed attempt at, or None to stop trying.
+
+    ``tools_used`` is the set of tools that actually returned a result during
+    the attempt that overflowed. A drop only changes the prompt if one of them
+    honours the tier (``FIDELITY_TIERED_TOOLS``), so an overflow on a turn that
+    called none — a long conversation with no event payloads in it — must fall
+    straight through to compaction rather than burning two provider round trips
+    re-sending a byte-identical request.
+    """
+    from vestigo.agent.tools import FIDELITY_TIERED_TOOLS
+
+    if not FIDELITY_TIERED_TOOLS.intersection(tools_used):
+        return None
+    return degrade(current)

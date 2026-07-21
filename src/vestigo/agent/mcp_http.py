@@ -151,6 +151,7 @@ class MCPEndpoint:
             return await receive()
 
         from vestigo.agent.config import resolve_agent_config
+        from vestigo.agent.fidelity import resolve_fidelity
         from vestigo.agent.tools import build_scope, build_tool_server
 
         try:
@@ -159,12 +160,19 @@ class MCPEndpoint:
             # purpose: an admin deny must apply to the next /mcp call, not
             # after some cache TTL. One small Postgres read per request is
             # fine at this deployment's scale.
+            #
+            # `tool_fidelity` applies here too: it describes how much detail the
+            # deployment can afford to hand a model, and an external client is
+            # driving one just the same. There is no overflow backstop on this
+            # path — the client owns its own retries — so the configured tier is
+            # simply the tier.
             config = await resolve_agent_config()
             agent_scope = await build_scope(
                 token_row.case_id,
                 token_row.timeline_id,
                 user,
                 disabled_tools=frozenset(config.disabled_tools or ()),
+                fidelity=resolve_fidelity(config.tool_fidelity, config.context_window),
             )
         except HTTPException as exc:
             await JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})(

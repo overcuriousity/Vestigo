@@ -192,6 +192,57 @@ def test_mcp_end_to_end_tool_call(mcp_client, admin_bootstrap):
     assert '"total"' in called.text
 
 
+def test_mcp_tool_results_honour_tool_fidelity(mcp_client, admin_bootstrap, monkeypatch):
+    """`tool_fidelity` describes what the deployment can afford to hand a
+    model, and an external client is driving one just the same — so the
+    external transport spends the configured tier rather than always `full`."""
+    import vestigo.api.routers.events as events_router
+
+    class _Page:
+        total = 1
+        events = [
+            {
+                "event_id": "e1",
+                "source_id": "s1",
+                "message": "login attempt [svc-a/rock] succeeded",
+                "attributes": {"user": "svc-a"},
+            }
+        ]
+
+    class _Service:
+        def query(self, query):
+            return _Page()
+
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: _Service())
+    monkeypatch.setenv("VESTIGO_AGENT_TOOL_FIDELITY", "minimal")
+    get_settings.cache_clear()
+    try:
+        as_admin(mcp_client, admin_bootstrap)
+        case_id, tl_id, token = _setup_token(mcp_client)
+        assert _rpc_initialize(mcp_client, token).status_code == 200
+        called = mcp_client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "search_events", "arguments": {}},
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        assert called.status_code == 200, called.text
+        assert "minimal" in called.text
+        # The reduction is real, not just declared.
+        assert "svc-a" not in called.text
+    finally:
+        monkeypatch.delenv("VESTIGO_AGENT_TOOL_FIDELITY", raising=False)
+        get_settings.cache_clear()
+
+
 def test_mcp_tools_list_respects_admin_disabled(mcp_client, admin_bootstrap, monkeypatch):
     """The admin hard-deny list applies to the external transport too."""
     monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["list_baselines"]')

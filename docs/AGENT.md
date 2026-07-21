@@ -655,15 +655,39 @@ fuller `MESSAGE_TRUNCATE`.
 *How far* to reduce is one decision, in `agent/fidelity.py`, expressed as three
 named tiers rather than a pile of per-call byte counts:
 
-| tier | an anomaly finding carries | for |
+| tier | an event record carries | for |
 |---|---|---|
-| `full` | the example event inline (what the Analysis page shows) | large windows |
-| `message` | `event_id` + the event's `message`, truncated at 200 | ~64k local models |
-| `minimal` | `event_id` alone | the last resort before failing |
+| `full` | the whole event inline — message at 500, attributes (what the Analysis page shows) | large windows |
+| `message` | identity fields + `message`, truncated at 200; no attributes | ~64k local models |
+| `minimal` | identity fields alone (`event_id`, `timestamp`, `source_id`, …) | the last resort before failing |
 
 `tool_fidelity` is an operator setting on the usual env-wins-per-field path
 (`VESTIGO_AGENT_TOOL_FIDELITY`, admin UI, DB row), with a fourth value `auto`
-that derives the tier from `context_window` (`>= 100k` → `full`).
+that derives the tier from `context_window` (`>= 100k` → `full`). It applies to
+the in-app agent and to the external `/mcp` transport alike — it describes what
+the deployment can afford to hand a model, and an external client is driving
+one just the same.
+
+**Which tools honour it:** `FIDELITY_TIERED_TOOLS` in `agent/tools.py` —
+`search_events`, `semantic_search`, `similar_events` (through `_slim_event`)
+and `run_anomaly_detector` (through `_deflate_findings`). Those are the tools
+that return *many* event records, where a tier is the difference between
+fitting and not.
+
+Three deliberate exemptions:
+
+- **`get_event`** — the escape hatch every reduced payload's `note` names.
+  Tiering it would leave the model looping on a reduction it has no way to
+  undo. One record fetched on purpose is the cheapest call in the turn.
+- **`get_event_annotations`** — same reasoning; one event's detail, fetched
+  deliberately. This is the split `ANNOTATION_LIST_CONTENT_TRUNCATE` vs
+  `MESSAGE_TRUNCATE` already draws.
+- **`list_annotations`** — annotation bodies are analyst-written evidence, not
+  an illustrative record; reducing them deletes findings rather than trimming
+  an example. Already bounded by `MAX_LIST_ROWS` × 160.
+
+Every tiered result carries `fidelity`, at `full` too: a result with no marker
+cannot be told apart from one produced before the setting existed.
 
 **The default is `full`**, decided 2026-07-21: unset means the operator has
 declared no constraint, which is assumed to be a cloud model with room, and the
@@ -708,8 +732,10 @@ UI — explicit opt-in, since the right number is model-specific),
   never trigger it) retries — this path works even without a configured
   window. The retry escalates **cheapest lever first**: drop one tool-result
   fidelity tier and re-run (no LLM call, and the only lever that helps a
-  single broad turn — compaction has nothing older to fold); then the first
-  compaction keeping 2 recent turns verbatim; then a second folding down to
+  single broad turn — compaction has nothing older to fold), *if* the
+  attempt actually called a tier-honouring tool — a drop that cannot change
+  the prompt is skipped rather than spent (`fidelity.next_tier`); then the
+  first compaction keeping 2 recent turns verbatim; then a second folding down to
   1; then a friendly `error{code="context_overflow"}` instead of the generic
   failure. A tier drop emits an SSE `fidelity` event, the sibling of
   `compaction`, so the analyst sees that results were thinned rather than
