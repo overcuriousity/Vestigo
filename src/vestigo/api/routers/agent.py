@@ -623,6 +623,7 @@ async def _message_stream_inner(
                         "tool",
                         tool_name=event["tool"],
                         tool_args=event["args"],
+                        tool_call_id=event["tool_call_id"],
                     )
                     # GET-style reads leave no middleware audit rows, so agent
                     # tool calls get explicit ones — the custody trail must show
@@ -650,6 +651,7 @@ async def _message_stream_inner(
                         "tool",
                         tool_name=event["tool"],
                         tool_result=event["result"],
+                        tool_call_id=event["tool_call_id"],
                     )
                 yield _sse(event)
             return

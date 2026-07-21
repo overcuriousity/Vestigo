@@ -1,6 +1,29 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-21 (session 82 — #147 blast radius: the charts that ignored the mute).
+Last updated: 2026-07-21 (session 83 — agent chart proposals lost on parallel tool calls).
+
+## Session 83 — 2026-07-21: agent chart cards lost when the model batches tool calls
+
+An exported Kimi conversation showed 14 `propose_chart` calls all validating
+`ok: true` while the analyst saw exactly one card — mispaired at that (last
+call's title with the first call's result). `AgentPanel.tsx` paired call and
+result rows through a single `pendingChart` buffer that assumed strict
+call→result adjacency; Kimi batches parallel tool calls, so the transcript
+persists N call rows followed by N result rows and every call overwrote the
+buffer. Both render paths had it (`itemsFromMessages` and the live
+`foldStreamEvent`).
+
+FIFO pairing alone would still be wrong: parallel tool calls execute
+concurrently, so result events arrive in *completion* order. The provider's
+`tool_call_id` was already on the SSE events (`runtime.py`) but dropped at
+persistence. Fix: new nullable `agent_messages.tool_call_id` column (migration
+`0014`), threaded through `add_agent_message` and both persistence sites in
+`api/routers/agent.py`; the panel now buffers pending charts in a Map keyed by
+`tool_call_id` (FIFO fallback for pre-migration rows), a failed validation
+consumes its own entry without shifting batch siblings, and unrelated tool
+calls no longer clear the buffer. Tests: batch-of-N, completion-order results,
+failed-sibling, and legacy-FIFO cases in `agentPanelChart.test.tsx`; backend
+round-trip in `test_agent_api.py`.
 
 ## Session 82 — 2026-07-21: #147 blast radius — viz endpoints, the Visualize page, and the first-render flash
 

@@ -89,13 +89,24 @@ interface ProposeChartArgs {
   spec?: AgentChartSpec;
 }
 
+interface PendingChart {
+  title: string;
+  description: string;
+  spec: AgentChartSpec;
+}
+
 function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   const items: ChatItem[] = [];
   // propose_chart needs both its call row (title/description/spec) and its
   // paired result row (ok — no card on a failed validation) — buffered here
   // since the two arrive as separate rows, same pairing propose_annotation
   // resolves the other way (result-only, no buffering needed there).
-  let pendingChart: { title: string; description: string; spec: AgentChartSpec } | null = null;
+  // Keyed by tool_call_id: models that batch parallel tool calls persist N
+  // call rows followed by N result rows in *completion* order, so adjacency
+  // pairing mislabels one card and drops the other N-1. Rows written before
+  // the tool_call_id migration fall back to FIFO order.
+  const pendingCharts = new Map<string, PendingChart>();
+  const pendingChartFifo: PendingChart[] = [];
   for (const m of messages) {
     if (m.role === "user") {
       items.push({ kind: "user", content: m.content });
@@ -129,10 +140,17 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
     } else if (m.role === "tool" && m.tool_name === "propose_chart" && !m.tool_args) {
       // Result row: only a successful validation ("ok": true) gets a card —
       // a failed spec (bad kind, missing field) produced a tool error, no
-      // proposal to show.
+      // proposal to show. A failed one still consumes its buffered call so
+      // it cannot shift the pairing for its batch siblings.
       const result = m.tool_result as { ok?: boolean } | null;
-      if (result?.ok && pendingChart) items.push({ kind: "chart", ...pendingChart });
-      pendingChart = null;
+      let chart: PendingChart | undefined;
+      if (m.tool_call_id) {
+        chart = pendingCharts.get(m.tool_call_id);
+        pendingCharts.delete(m.tool_call_id);
+      } else {
+        chart = pendingChartFifo.shift();
+      }
+      if (result?.ok && chart) items.push({ kind: "chart", ...chart });
     } else if (m.role === "tool" && m.tool_args) {
       // Tool rows come in pairs (call with args, then result); render on the
       // call row and let the result row pass silently.
@@ -150,17 +168,20 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         });
       } else if (m.tool_name === "propose_chart") {
         const args = m.tool_args as ProposeChartArgs;
-        pendingChart = args.spec
-          ? {
-              title: args.title ?? "Chart",
-              description: args.description ?? "",
-              spec: args.spec,
-            }
-          : null;
+        if (args.spec) {
+          const chart: PendingChart = {
+            title: args.title ?? "Chart",
+            description: args.description ?? "",
+            spec: args.spec,
+          };
+          if (m.tool_call_id) pendingCharts.set(m.tool_call_id, chart);
+          else pendingChartFifo.push(chart);
+        }
       } else if (m.tool_name) {
-        // Clearing here too: a propose_chart call whose result row is absent
-        // (tool error) must not pair its args with a later call's result.
-        pendingChart = null;
+        // Unrelated call rows no longer clear the buffer: in a parallel batch
+        // an intervening call between a chart's call row and its result row
+        // is normal. An orphaned entry (result row never persisted) just
+        // stays buffered and renders nothing.
         items.push({ kind: "tool", tool: m.tool_name, args: m.tool_args });
       }
     }
@@ -178,16 +199,19 @@ interface StreamState {
   liveText: string;
   /** In-flight thinking segment; finalized by the terminal "thinking" event. */
   liveThinking: string;
-  /** propose_chart's call args, buffered until the paired result's `ok`
-   * lands — see itemsFromMessages' matching comment. */
-  pendingChart: { title: string; description: string; spec: AgentChartSpec } | null;
+  /** propose_chart call args keyed by tool_call_id, buffered until each
+   * paired result's `ok` lands — see itemsFromMessages' matching comment.
+   * A Map because parallel tool-call batches keep several in flight, with
+   * results arriving in completion order. Never mutated in place — folds
+   * copy on change, so EMPTY_STREAM's instance stays shared safely. */
+  pendingCharts: ReadonlyMap<string, PendingChart>;
 }
 
 const EMPTY_STREAM: StreamState = {
   items: [],
   liveText: "",
   liveThinking: "",
-  pendingChart: null,
+  pendingCharts: new Map(),
 };
 
 function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
@@ -257,25 +281,25 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     }
     if (e.tool === "propose_chart") {
       // Buffered until the paired tool_result reports ok — a failed spec
-      // shows no card, same contract as itemsFromMessages.
+      // shows no card, same contract as itemsFromMessages. Keyed by
+      // tool_call_id: parallel batches keep several proposals in flight.
       const args = e.args as { title?: string; description?: string; spec?: AgentChartSpec };
-      return {
-        ...s,
-        items: flushed,
-        liveText: "",
-        pendingChart: args.spec
-          ? { title: args.title ?? "Chart", description: args.description ?? "", spec: args.spec }
-          : null,
-      };
+      let pendingCharts = s.pendingCharts;
+      if (args.spec) {
+        const next = new Map(s.pendingCharts);
+        next.set(e.tool_call_id, {
+          title: args.title ?? "Chart",
+          description: args.description ?? "",
+          spec: args.spec,
+        });
+        pendingCharts = next;
+      }
+      return { ...s, items: flushed, liveText: "", pendingCharts };
     }
-    // Any other tool call clears the buffer: a propose_chart whose result
-    // never arrives (tool error) must not have its args pair with some later
-    // call's result.
     return {
       ...s,
       items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }],
       liveText: "",
-      pendingChart: null,
     };
   }
   if (e.type === "tool_result") {
@@ -293,13 +317,21 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
       };
     }
     if (e.tool === "propose_chart") {
+      // A failed validation still consumes its entry so it cannot shift the
+      // pairing for its batch siblings; an orphaned result renders nothing.
       const result = e.result as { ok?: boolean } | null;
-      const chart = s.pendingChart;
+      const chart = s.pendingCharts.get(e.tool_call_id);
+      let pendingCharts = s.pendingCharts;
+      if (chart) {
+        const next = new Map(s.pendingCharts);
+        next.delete(e.tool_call_id);
+        pendingCharts = next;
+      }
       return {
         ...s,
         items: result?.ok && chart ? [...flushed, { kind: "chart", ...chart }] : flushed,
         liveText: "",
-        pendingChart: null,
+        pendingCharts,
       };
     }
     return s;
@@ -490,7 +522,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             items: prev.items.filter((i) => i.kind === "error"),
             liveText: "",
             liveThinking: "",
-            pendingChart: null,
+            pendingCharts: new Map(),
           }));
         } else {
           setStream(EMPTY_STREAM);

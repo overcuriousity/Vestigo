@@ -260,6 +260,10 @@ export interface AgentMessage {
   tool_name: string | null;
   tool_args: Record<string, unknown> | null;
   tool_result: unknown;
+  /** Provider-issued id shared by a tool call row and its result row — the
+   * pairing key when a model batches parallel tool calls (results land in
+   * completion order, not call order). Null on pre-migration rows. */
+  tool_call_id?: string | null;
   created_at: string | null;
   prompt_tokens?: number | null;
   completion_tokens?: number | null;

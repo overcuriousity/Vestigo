@@ -1105,6 +1105,11 @@ class AgentMessage(Base):
     tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     tool_args: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tool_result: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    # Provider-issued tool-call id, shared by a call row and its result row.
+    # Models that batch parallel tool calls persist N call rows followed by
+    # N result rows in *completion* order, so this id is the only reliable
+    # way to pair them back up. NULL on pre-migration rows.
+    tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Measured LLM usage for this turn (assistant rows only). NULL = not
     # measured (pre-metering rows, or the endpoint reported no usage) —
     # never an estimate.
@@ -1126,6 +1131,7 @@ class AgentMessage(Base):
             "tool_name": self.tool_name,
             "tool_args": self.tool_args,
             "tool_result": self.tool_result,
+            "tool_call_id": self.tool_call_id,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -3261,6 +3267,7 @@ class PostgresStore:
         tool_name: str | None = None,
         tool_args: dict | None = None,
         tool_result: dict | list | None = None,
+        tool_call_id: str | None = None,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
     ) -> AgentMessage:
@@ -3273,6 +3280,7 @@ class PostgresStore:
             tool_name=tool_name,
             tool_args=tool_args,
             tool_result=tool_result,
+            tool_call_id=tool_call_id,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )

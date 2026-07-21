@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.3] — 2026-07-21
+## [1.4.4] — 2026-07-21
+
+### Fixed
+
+- **Agent chart proposals no longer vanish when the model batches tool calls.**
+  A model issuing parallel `propose_chart` calls (Kimi does this routinely)
+  persists N call rows followed by N result rows, but the agent panel paired
+  them through a single buffer that assumed call→result adjacency — so a batch
+  of 14 validated charts rendered as one card, and even that one carried the
+  wrong title. Tool call and result rows now persist the provider's
+  `tool_call_id` (migration `0014`) and the panel pairs by it, with FIFO
+  fallback for conversations recorded before the migration. A chart that fails
+  validation consumes only its own slot instead of shifting its batch
+  siblings, in both the live stream and the reloaded transcript.
 
 ### Fixed
 

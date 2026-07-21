@@ -785,6 +785,35 @@ def test_send_message_persists_and_streams_token_usage(
     assert assistant.completion_tokens and assistant.completion_tokens > 0
 
 
+@pytest.mark.asyncio
+async def test_tool_call_id_round_trips_through_persistence(store):
+    """Call and result rows keep the provider's tool_call_id — it is the only
+    reliable pairing key when a model batches parallel tool calls (results
+    persist in completion order, not call order)."""
+    await store.init_schema()
+    conversation = await store.create_agent_conversation("case1", "tl1", "u1", model_id="m")
+    call = await store.add_agent_message(
+        conversation.id,
+        "tool",
+        tool_name="propose_chart",
+        tool_args={"title": "t"},
+        tool_call_id="tc_abc",
+    )
+    result = await store.add_agent_message(
+        conversation.id,
+        "tool",
+        tool_name="propose_chart",
+        tool_result={"ok": True},
+        tool_call_id="tc_abc",
+    )
+    assert call.tool_call_id == result.tool_call_id == "tc_abc"
+    rows = await store.list_agent_messages(conversation.id)
+    assert [r.to_dict()["tool_call_id"] for r in rows] == ["tc_abc", "tc_abc"]
+    # Pre-migration rows carry NULL, which the UI pairs by FIFO fallback.
+    legacy = await store.add_agent_message(conversation.id, "tool", tool_name="search_events")
+    assert legacy.to_dict()["tool_call_id"] is None
+
+
 def _reserve_turn(agent_router, conversation_id: str, *, age: float = 0.0):
     """Fake the reservation `send_message` makes, optionally already aged."""
     from time import monotonic
