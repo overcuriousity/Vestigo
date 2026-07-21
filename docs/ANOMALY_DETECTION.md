@@ -1560,8 +1560,14 @@ count_at_mute}` as the audit record). Unlike sequence_motif, **no occurrence
 materialization job runs** — template membership is a direct predicate on
 the materialized `template_hash` column (`template_hash IN (...)`), so there
 is no aux table to populate and no 500k-row cap to hit; muting takes effect
-immediately. The Explorer's *Collapse routine* toggle excludes muted
-templates' events via `template_hash NOT IN (...)` alongside the existing
+immediately. Collapse is **derived from the disposition set, not opted into**:
+a mute is a filter, so the grid applies it the moment it exists (`#147` — it
+used to sit behind a default-off toggle, so muting appeared to do nothing).
+The top-bar control is a *reveal* override that un-hides routine events
+temporarily; it is stamped with the disposition-set signature it was made
+against and expires when that set changes, so a reveal cannot silently defeat
+every later mute (`frontend/src/lib/routineCollapse.ts`). Collapse excludes
+muted templates' events via `template_hash NOT IN (...)` alongside the existing
 `motif_occurrences` anti-join, and `routine_collapsed_count` reports the
 *union* of both mechanisms' covered events (not a naive sum — an event
 covered by both a routine motif and a muted template must not be
@@ -1569,6 +1575,15 @@ double-counted; computed via one `UNION ALL ... uniqExact` query,
 `ClickHouseStore.count_routine_collapsed`). As with motifs, muting is
 presentation-only and never enters `dispositions_hash`; deleting the
 disposition restores the events immediately.
+
+**Every filter-driven endpoint must resolve the same scope.** `list_events`,
+`get_histogram`, `export_events` *and* `bulk_annotate_by_filter` all call
+`_resolve_routine_collapse` and pass its scope into their `EventQuery`. The
+bulk-annotate path is the load-bearing one: it writes durable annotations, so
+a missing `collapse_routine` there stamps forensic records onto events the
+analyst never saw while the confirm dialog's count comes from the collapsed
+query (`#147`). A new filter-driven endpoint that skips this resolution is a
+bug of that shape, not a missing feature.
 
 **Asymmetry, v1.** Muting only supports `field == "message"` (the indexed
 column the mute predicate binds to) — browsing is field-agnostic, muting

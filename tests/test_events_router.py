@@ -330,6 +330,50 @@ async def test_bulk_annotate_by_filter_honors_annotated_restriction(patched_stor
     assert fake_service.last_query.event_ids == ["flagged-evt"]
 
 
+@pytest.mark.asyncio
+async def test_bulk_annotate_by_filter_honors_routine_collapse(patched_store, monkeypatch):
+    """Bulk-tagging must act on the set the grid shows, not its uncollapsed
+    superset (#147). `list_events`, `get_histogram` and `export_events` all
+    resolve the routine-collapse scope; this endpoint did not, so "select all →
+    tag" wrote annotations onto muted events the analyst could never see —
+    durable forensic records for events outside the displayed set, with a
+    confirm-dialog count taken from the collapsed query.
+
+    Same failure shape as the `annotated` regression above: a filter field the
+    request model simply did not carry.
+    """
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+    await patched_store.create_disposition(
+        case_id="c1",
+        timeline_id="t1",
+        kind="routine",
+        detector="log_template",
+        field="template_id",
+        value="4736",
+    )
+
+    fake_service = _FakeQueryService(refs=[("evt", "s1")])
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
+
+    body = events.BulkAnnotateByFilterRequest(
+        annotation_type="tag",
+        content="reviewed",
+        collapse_routine=True,
+    )
+    await events.bulk_annotate_by_filter("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+
+    assert fake_service.last_query.exclude_template_hashes == [4736]
+
+    # And without the flag the muted events stay in scope — collapse is the
+    # caller's decision, exactly as on the other three endpoints.
+    plain = events.BulkAnnotateByFilterRequest(annotation_type="tag", content="reviewed")
+    await events.bulk_annotate_by_filter("c1", "t1", plain, case=Case(id="c1"), user=_fake_user())
+
+    assert fake_service.last_query.exclude_template_hashes is None
+
+
 # ---------------------------------------------------------------------------
 # _index_annotations_by_event (export enrichment)
 # ---------------------------------------------------------------------------

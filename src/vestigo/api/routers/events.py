@@ -795,6 +795,15 @@ class BulkAnnotateByFilterRequest(BaseModel):
         default=None,
         description="Narrow the 'tag' annotation type to a specific tag value.",
     )
+    collapse_routine: bool = Field(
+        default=False,
+        description=(
+            "Exclude events covered by an active routine disposition (muted "
+            "templates, motifs marked routine), matching what the grid shows. "
+            "Must mirror the flag the caller's event list was rendered with — "
+            "otherwise the write lands on events the analyst never saw."
+        ),
+    )
     run_id: str | None = Field(
         default=None,
         description=(
@@ -846,6 +855,14 @@ async def bulk_annotate_by_filter(
         ids=body.ids,
     )
 
+    # The write must cover exactly the set the grid displayed (#147) — a bulk
+    # annotation on a collapsed-away event is a durable forensic record for
+    # something the analyst never saw, and the confirm-dialog count comes from
+    # the collapsed query.
+    routine_scope = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, body.collapse_routine
+    )
+
     service = _get_query_service()
     # Blocking ClickHouse scan — threadpool, same as list_events.
     refs = await _run_regex_guarded(
@@ -854,6 +871,8 @@ async def bulk_annotate_by_filter(
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
+            exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+            exclude_template_hashes=routine_scope.template_hashes,
             q=body.q,
             q_regex=body.q_regex,
             artifact=body.artifact,

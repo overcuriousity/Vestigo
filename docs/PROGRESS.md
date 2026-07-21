@@ -1,6 +1,47 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-21 (session 80 — PR145/146 review round).
+Last updated: 2026-07-21 (session 81 — issue #147, muting that muted nothing).
+
+## Session 81 — 2026-07-21: #147 — the filter that was recorded but never applied
+
+An analyst muted three templates in Templates → Mute, watched all three land in
+"Muted templates (3)" with their counts, and saw the grid keep showing every one
+of their events. The plumbing was never broken: the disposition was written, and
+`_resolve_routine_collapse` → `template_hash NOT IN (...)` was correct and
+tested. The gate was `ExplorerPage`'s `collapseRoutine`, a session `useState`
+defaulting to `false` and flipped only by an unlabeled toggle in the top bar.
+Muting never touched it. So a mute recorded a verdict and changed nothing, while
+the UI copy promised its events "disappear from the grid immediately".
+
+**Mute is a filter, and filters apply on creation.** Collapse is now derived
+from the routine-disposition set rather than opted into; the toggle became a
+*reveal* override. The override is stamped with the disposition-set signature it
+was made against and expires when that set changes — without that stamp, an
+analyst who revealed routine events once would silently defeat every subsequent
+mute, which is the same symptom one step removed. Precedence lives in
+`frontend/src/lib/routineCollapse.ts` (unit tested) rather than inline in the
+page, because the agent's "apply to Explorer" seam depends on it: an agent
+finding that ran *without* collapse must still reproduce uncollapsed when mutes
+exist, so agent applies write an explicit override. The copy needed no
+weakening — the fix made both claims true. Empty scope always resolves to
+`false`, so unmuting the last template cannot leave a stat claiming zero
+collapsed events.
+
+**The sibling this exposed, which was the more serious bug.**
+`bulk_annotate_by_filter` was the only filter-driven endpoint that never
+resolved the routine scope — `list_events`, `get_histogram` and `export_events`
+all did. So Explorer → select all → Tag wrote annotations onto muted events the
+analyst could not see, while the confirm dialog's count came from the collapsed
+query. Durable forensic records for events outside the displayed set. The
+frontend had been correct all along: `BulkActionBar` receives `effectiveFilters`
+and `serializeEventFilterFields` emits `collapse_routine` — pydantic's default
+`extra="ignore"` silently dropped it, so the caller got no error and no effect.
+Latent before (collapse was default-off, few users had a divergence), routine
+after the #147 fix, which is why the two ship together. Exactly the failure
+shape as the earlier `annotated` regression on the same endpoint, so the
+regression test is written as its sibling. `ANOMALY_DETECTION.md` now states the
+invariant: a filter-driven endpoint that skips this resolution is a bug, not a
+missing feature.
 
 ## Session 80 — 2026-07-21: PR145/146 review — the degradation that left no trace
 
