@@ -1073,6 +1073,13 @@ class AgentConversation(Base):
         }
 
 
+#: The ``AgentMessage.role`` values that mark a mid-turn degradation rather
+#: than a step of the conversation. Both invalidate any usage measured before
+#: them (see :meth:`PostgresStore.get_last_agent_usage`), because the request
+#: that follows is a different size than that measurement describes.
+_AGENT_MARKER_ROLES = ("compaction", "fidelity")
+
+
 class AgentMessage(Base):
     """One human-readable step of an agent conversation.
 
@@ -3290,10 +3297,14 @@ class PostgresStore:
 
         (None, None) when no assistant row has measured usage yet — the
         compaction estimator then falls back to a size-based heuristic. Usage
-        measured *before* the latest compaction is ignored the same way: it
-        describes the pre-compaction history size, and trusting it would
-        re-trigger the threshold check on an already-compacted conversation
-        (folding the summary stub into a summary-of-a-summary).
+        measured *before* a marker row (``compaction`` or ``fidelity``) is
+        ignored the same way, because a marker means the next request is a
+        different size than the measurement describes: a compaction shrank the
+        history, and a fidelity drop shrank every tool result the turn will
+        carry. Trusting a stale measurement re-triggers the threshold check on
+        an already-degraded conversation — folding a summary stub into a
+        summary-of-a-summary, or spending a summarizer call the tier drop had
+        already made unnecessary.
         """
         async with self.session_factory() as session:
             result = await session.execute(
@@ -3305,7 +3316,7 @@ class PostgresStore:
                 .where(
                     AgentMessage.conversation_id == conversation_id,
                     or_(
-                        AgentMessage.role == "compaction",
+                        AgentMessage.role.in_(_AGENT_MARKER_ROLES),
                         and_(
                             AgentMessage.role == "assistant",
                             AgentMessage.prompt_tokens.is_not(None),
@@ -3319,7 +3330,7 @@ class PostgresStore:
                 .limit(1)
             )
             row = result.first()
-            if row is None or row[0] == "compaction":
+            if row is None or row[0] in _AGENT_MARKER_ROLES:
                 return (None, None)
             return (row[1], row[2])
 

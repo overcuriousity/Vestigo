@@ -99,6 +99,13 @@ DEFAULT_FIDELITY = Fidelity.FULL
 #: (2026-07-20), which a 64k window cannot hold alongside history and an answer.
 AUTO_FULL_MIN_WINDOW = 100_000
 
+#: Below this many tokens, ``auto`` stops serving the ``message`` line too. The
+#: same sweep's ~34k tokens of payload *is* a 32k window, so even the reduced
+#: shape leaves no room for history and an answer; below that only the identity
+#: fields fit, and the model reaches for ``get_event`` on the few findings it
+#: actually pursues.
+AUTO_MESSAGE_MIN_WINDOW = 32_000
+
 _ORDER = (Fidelity.FULL, Fidelity.MESSAGE, Fidelity.MINIMAL)
 
 #: How many times :func:`degrade` can drop before bottoming out — the overflow
@@ -112,14 +119,35 @@ def resolve_fidelity(setting: str | None, context_window: int | None) -> Fidelit
 
     ``setting`` is the resolved ``tool_fidelity`` value (env > db > default).
     ``"auto"`` derives the tier from ``context_window`` for operators who would
-    rather configure the window once and let this follow; an unrecognised
-    value falls back to the default rather than raising, since a tier is not
-    worth failing a turn over (the admin schema validates it at write time).
+    rather configure the window once and let this follow:
+
+    ============================ =================
+    ``context_window``           tier
+    ============================ =================
+    unset                        ``MESSAGE``
+    >= ``AUTO_FULL_MIN_WINDOW``  ``FULL``
+    >= ``AUTO_MESSAGE_MIN_WINDOW`` ``MESSAGE``
+    below that                   ``MINIMAL``
+    ============================ =================
+
+    An unset window under ``auto`` resolves to ``MESSAGE`` rather than the
+    ``FULL`` default: there is nothing to derive from, and an admin who picked
+    ``auto`` asked to be kept inside a window rather than assumed to have room.
+    (Leaving ``tool_fidelity`` unset entirely is the way to declare no
+    constraint — see :data:`DEFAULT_FIDELITY`.)
+
+    An unrecognised value falls back to the default rather than raising, since
+    a tier is not worth failing a turn over (the admin schema validates it at
+    write time).
     """
     if setting == "auto":
-        if context_window and context_window >= AUTO_FULL_MIN_WINDOW:
+        if not context_window:
+            return Fidelity.MESSAGE
+        if context_window >= AUTO_FULL_MIN_WINDOW:
             return Fidelity.FULL
-        return Fidelity.MESSAGE
+        if context_window >= AUTO_MESSAGE_MIN_WINDOW:
+            return Fidelity.MESSAGE
+        return Fidelity.MINIMAL
     try:
         return Fidelity(setting)
     except ValueError:

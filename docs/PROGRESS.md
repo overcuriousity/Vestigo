@@ -37,6 +37,41 @@ what an omitted tier means. Doc corrections: the design spec's Files table
 listed a `docs/ROADMAP.md` item that was never added, and `CLAUDE.md`'s `docs/`
 map had no line for `docs/superpowers/`.
 
+**Second review pass, same branch — five more.** The honesty rule the first pass
+applied to the event-returning tools had not reached the anomaly path:
+`_deflate_findings` treated the mere *presence* of an `event` key as a
+reduction, so a finding whose example event was `None` (resolution failed) or
+held nothing but a short `message` still carried the "call get_event for the
+full record" note. `_finding_event_reduced` now answers it properly — and it is
+a different question from `_event_reduced`, because a finding loses the whole
+event object rather than just its attribute bag, so a bare timestamp going
+already counts.
+
+`auto` was a two-way switch on one threshold, which gave an 8k model and a 64k
+model identical treatment and made `auto` with no configured window
+indistinguishable from picking `message`. It is now a graded ladder (≥100k
+`full`, ≥32k `message`, below that `minimal`, unset `message`), with the second
+threshold taken from the same measurement as the first: the seven-detector
+sweep's ~34k tokens of payload *is* a 32k window.
+
+**A retried turn's writes were unexplained.** Re-running a turn re-executes its
+tools, and two of them write — so a sweep that overflows twice can leave three
+`DetectorRun` rows for one analyst question, indistinguishable in the Analysis
+page from an analyst scanning three times. They are not suppressed (the scans
+really ran; hiding a re-execution is what the marker rows exist to prevent) but
+tagged: `AgentScope.attempt` rides into `_persist_detector_run`, which records
+`params["agent_retry_attempt"]` when non-zero. Duplicate annotation proposals
+stay plain — each is an action the analyst decides individually, and the marker
+row above them already explains the pair.
+
+`get_last_agent_usage` discarded usage measured before a `compaction` but not
+before a `fidelity` row, though a tier drop invalidates a measurement for the
+same reason: every tool result from there on is smaller, so the next turn's
+estimate ran high and could spend a summarizer call the drop had already made
+unnecessary. Both marker roles now count (`_AGENT_MARKER_ROLES`). Finally,
+`FINDING_MESSAGE_TRUNCATE` became `SLIM_MESSAGE_TRUNCATE`: since the first pass
+it also caps ordinary search hits, not just findings.
+
 ## Session 79 — 2026-07-20: PR144 review — what the relocation forgot to relocate
 
 Review of the A13 branch before merge. The three levers held up; five fixes

@@ -561,7 +561,13 @@ async def _message_stream_inner(
             return
         try:
             async for event in stream_turn(
-                scope,
+                # The attempt number rides the scope so the two tools that
+                # *write* can stamp it: a re-run turn re-executes every tool the
+                # model calls, and a second DetectorRun for one analyst question
+                # has to be distinguishable from a second scan. Both retry paths
+                # (fidelity drop and compaction) go through here, so neither can
+                # forget it.
+                replace(scope, attempt=attempt),
                 user_text=payload.content,
                 history=history,
                 view_filters=payload.view_filters,

@@ -13,8 +13,8 @@ import json
 from vestigo.agent.encoding import columnar, columnar_auto
 from vestigo.agent.fidelity import Fidelity
 from vestigo.agent.tools import (
-    FINDING_MESSAGE_TRUNCATE,
     MAX_LIST_ROWS,
+    SLIM_MESSAGE_TRUNCATE,
     _columnize,
     _compact_timeseries,
     _deflate_findings,
@@ -197,18 +197,26 @@ def test_deflate_findings_keeps_the_message_and_drops_the_rest_of_the_event():
 def test_deflate_findings_truncates_a_long_message():
     payload = {"results": [{"event_id": "e1", "event": {"message": "m" * 5000}}]}
     message = _deflate_findings(payload, Fidelity.MESSAGE)["results"][0]["message"]
-    assert len(message) == FINDING_MESSAGE_TRUNCATE + 1  # + the ellipsis
+    assert len(message) == SLIM_MESSAGE_TRUNCATE + 1  # + the ellipsis
     assert message.endswith("…")
 
 
 def test_deflate_findings_admits_the_omission():
     """The model must never believe it saw the whole record."""
     out = _deflate_findings(
-        {"results": [{"event_id": "e1", "event": {"message": "m"}}]}, Fidelity.MESSAGE
+        {"results": [{"event_id": "e1", "event": {"message": "m", "attributes": {"k": "v"}}}]},
+        Fidelity.MESSAGE,
     )
     assert "get_event" in out["note"]
-    # nothing dropped, nothing claimed
+    # nothing dropped, nothing claimed — neither for a finding that carried no
+    # event at all, nor for one whose event held only the line that survives.
     assert "note" not in _deflate_findings({"results": [{"event_id": "e1"}]}, Fidelity.MESSAGE)
+    assert "note" not in _deflate_findings(
+        {"results": [{"event_id": "e1", "event": {"message": "m"}}]}, Fidelity.MESSAGE
+    )
+    assert "note" not in _deflate_findings(
+        {"results": [{"event_id": "e1", "event": None}]}, Fidelity.MESSAGE
+    )
 
 
 def test_deflate_findings_saves_the_bulk_of_the_bytes():

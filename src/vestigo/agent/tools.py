@@ -53,9 +53,12 @@ MESSAGE_TRUNCATE = 500
 # Tighter body cap for the bulk annotation *list* (200 rows resent every turn);
 # get_event_annotations keeps the fuller MESSAGE_TRUNCATE for one event's detail.
 ANNOTATION_LIST_CONTENT_TRUNCATE = 160
-# The one line of an anomaly finding's example event the agent keeps in place
-# of the whole event object (see `_deflate_findings`).
-FINDING_MESSAGE_TRUNCATE = 200
+# The message cap below Fidelity.FULL — the one line that survives when an
+# event record is reduced, whether it is an anomaly finding's example event
+# (`_deflate_findings`) or a search/similarity hit (`_slim_event`). Tighter than
+# MESSAGE_TRUNCATE because it is carried tens of rows at a time by exactly the
+# tools a small window cannot afford at full detail.
+SLIM_MESSAGE_TRUNCATE = 200
 ATTR_VALUE_TRUNCATE = 200
 MAX_ATTRS_PER_EVENT = 40
 
@@ -464,6 +467,15 @@ class AgentScope:
     # the router rebuilds the scope with `replace(scope, fidelity=...)` rather
     # than rewriting anything already in history.
     fidelity: Fidelity = DEFAULT_FIDELITY
+    # Which run of *this* turn the tool server belongs to: 0 for the first, 1+
+    # for each re-run the overflow ladder ordered (a fidelity drop or a
+    # compaction, `api/routers/agent.py`). A re-run re-executes every tool the
+    # model calls again, including the two that write — `run_anomaly_detector`
+    # persists another DetectorRun, `propose_annotation` another proposal — so
+    # the number is stamped on those rows to tell a superseded re-run apart from
+    # a genuine second scan. Not part of the conversation's identity: the router
+    # passes `replace(scope, attempt=...)` per attempt.
+    attempt: int = 0
 
 
 async def build_scope(
@@ -612,11 +624,11 @@ def _deflate_findings(payload: Any, fidelity: Fidelity) -> Any:
         if not isinstance(row, dict) or "event" not in row:
             rows.append(row)
             continue
-        deflated = True
         event = row["event"]
+        deflated = deflated or _finding_event_reduced(event, fidelity)
         slim = {k: v for k, v in row.items() if k != "event"}
         if fidelity is Fidelity.MESSAGE and isinstance(event, dict) and event.get("message"):
-            slim["message"] = _truncate(event["message"], FINDING_MESSAGE_TRUNCATE)
+            slim["message"] = _truncate(event["message"], SLIM_MESSAGE_TRUNCATE)
         rows.append(slim)
 
     out = dict(payload)
@@ -703,7 +715,7 @@ def _slim_event(event: dict[str, Any], fidelity: Fidelity) -> dict[str, Any]:
 
     ``FULL`` is the shape every caller had before tiers existed. ``MESSAGE``
     drops the attribute bag and truncates the message to the tighter
-    ``FINDING_MESSAGE_TRUNCATE``; ``MINIMAL`` keeps identity fields only.
+    ``SLIM_MESSAGE_TRUNCATE``; ``MINIMAL`` keeps identity fields only.
 
     The tier is required rather than defaulted: an exempt caller
     (``get_event``) states its exemption at the call site, where a reader can
@@ -721,7 +733,7 @@ def _slim_event(event: dict[str, Any], fidelity: Fidelity) -> dict[str, Any]:
     if fidelity is Fidelity.MINIMAL:
         return slim
     if event.get("message"):
-        limit = MESSAGE_TRUNCATE if fidelity is Fidelity.FULL else FINDING_MESSAGE_TRUNCATE
+        limit = MESSAGE_TRUNCATE if fidelity is Fidelity.FULL else SLIM_MESSAGE_TRUNCATE
         slim["message"] = _truncate(event["message"], limit)
     if fidelity is not Fidelity.FULL:
         return slim
@@ -758,7 +770,29 @@ def _event_reduced(event: dict[str, Any], fidelity: Fidelity) -> bool:
         return False
     if fidelity is Fidelity.MINIMAL:
         return True
-    return len(str(message)) > FINDING_MESSAGE_TRUNCATE
+    return len(str(message)) > SLIM_MESSAGE_TRUNCATE
+
+
+def _finding_event_reduced(event: Any, fidelity: Fidelity) -> bool:
+    """Whether *fidelity* actually drops anything from a finding's example event.
+
+    :func:`_event_reduced`'s sibling for the anomaly path, where the *whole*
+    event object goes rather than just its attribute bag — so a finding whose
+    event carries a timestamp or a source_id loses something even at
+    ``MESSAGE``, while one with nothing but a short ``message`` loses nothing at
+    all. Claiming otherwise would put the same untruth in the exported record
+    that ``_event_reduced`` exists to keep out of the search results.
+    """
+    if fidelity is Fidelity.FULL:
+        return False
+    if not isinstance(event, dict) or not event:
+        return False
+    if fidelity is Fidelity.MINIMAL:
+        return True
+    if any(key != "message" for key in event):
+        return True
+    message = event.get("message")
+    return bool(message) and len(str(message)) > SLIM_MESSAGE_TRUNCATE
 
 
 async def _build_query(
@@ -1364,6 +1398,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 payload=payload,
                 resolution=resolution,
                 source_offsets=scope.source_offsets,
+                # Non-zero when the overflow ladder re-ran this turn: the same
+                # scan is being persisted a second time, and the analyst opening
+                # the Analysis page has to be able to tell that from two scans.
+                agent_retry_attempt=scope.attempt,
             )
         payload["run_id"] = run_id
         # Slim then columnize the model's copy only, and only *after*

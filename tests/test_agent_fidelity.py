@@ -14,6 +14,8 @@ import json
 import pytest
 
 from vestigo.agent.fidelity import (
+    AUTO_FULL_MIN_WINDOW,
+    AUTO_MESSAGE_MIN_WINDOW,
     DEFAULT_FIDELITY,
     FIDELITY_TIERED_TOOLS,
     FIDELITY_VALUES,
@@ -24,10 +26,11 @@ from vestigo.agent.fidelity import (
     resolve_fidelity,
 )
 from vestigo.agent.tools import (
-    FINDING_MESSAGE_TRUNCATE,
+    SLIM_MESSAGE_TRUNCATE,
     TOOL_NAMES,
     _deflate_findings,
     _event_reduced,
+    _finding_event_reduced,
     _slim_event,
 )
 
@@ -78,10 +81,30 @@ def test_explicit_setting_wins_over_any_window(value):
 
 @pytest.mark.parametrize(
     ("window", "expected"),
-    [(None, Fidelity.MESSAGE), (65_536, Fidelity.MESSAGE), (200_000, Fidelity.FULL)],
+    [
+        # Unset: nothing to derive from, and an admin who picked `auto` asked
+        # to be kept inside a window rather than assumed to have room.
+        (None, Fidelity.MESSAGE),
+        (0, Fidelity.MESSAGE),
+        (8_192, Fidelity.MINIMAL),
+        (AUTO_MESSAGE_MIN_WINDOW - 1, Fidelity.MINIMAL),
+        (AUTO_MESSAGE_MIN_WINDOW, Fidelity.MESSAGE),
+        (65_536, Fidelity.MESSAGE),
+        (AUTO_FULL_MIN_WINDOW - 1, Fidelity.MESSAGE),
+        (AUTO_FULL_MIN_WINDOW, Fidelity.FULL),
+        (200_000, Fidelity.FULL),
+    ],
 )
 def test_auto_derives_from_the_window(window, expected):
     assert resolve_fidelity("auto", window) is expected
+
+
+def test_auto_never_skips_a_tier_as_the_window_shrinks():
+    """The ladder is monotone: a smaller window never gets *more* detail."""
+    tiers = [resolve_fidelity("auto", w) for w in (200_000, 100_000, 64_000, 32_000, 8_000)]
+    order = [Fidelity.FULL, Fidelity.MESSAGE, Fidelity.MINIMAL]
+    positions = [order.index(t) for t in tiers]
+    assert positions == sorted(positions)
 
 
 def test_unknown_setting_degrades_to_the_default_rather_than_raising():
@@ -240,8 +263,52 @@ def test_a_bare_event_survives_message_intact():
 def test_dropped_attributes_and_dropped_lines_are_reductions():
     assert _event_reduced(_event(), Fidelity.MESSAGE) is True  # attributes go
     assert _event_reduced({"message": "x"}, Fidelity.MINIMAL) is True  # the line goes
-    long = {"message": "m" * (FINDING_MESSAGE_TRUNCATE + 1)}
+    long = {"message": "m" * (SLIM_MESSAGE_TRUNCATE + 1)}
     assert _event_reduced(long, Fidelity.MESSAGE) is True  # truncated
+
+
+def test_a_finding_whose_event_carried_nothing_claims_no_reduction():
+    """The anomaly path's version of the same rule: an `event` key that held
+    nothing (or nothing but a short line) loses nothing when it goes."""
+    assert _finding_event_reduced({}, Fidelity.MESSAGE) is False
+    assert _finding_event_reduced(None, Fidelity.MINIMAL) is False
+    assert _finding_event_reduced({"message": "short line"}, Fidelity.MESSAGE) is False
+
+
+def test_a_finding_that_loses_the_event_object_admits_it():
+    """Unlike a search hit, a finding loses the *whole* event object — so a
+    timestamp or a source_id going is already a reduction at MESSAGE."""
+    assert _finding_event_reduced({"timestamp": "2026-07-20T10:00:00Z"}, Fidelity.MESSAGE) is True
+    assert _finding_event_reduced({"message": "short"}, Fidelity.MINIMAL) is True
+    long = {"message": "m" * (SLIM_MESSAGE_TRUNCATE + 1)}
+    assert _finding_event_reduced(long, Fidelity.MESSAGE) is True
+    assert _finding_event_reduced({"message": "short"}, Fidelity.FULL) is False
+
+
+def test_a_payload_that_lost_nothing_carries_no_note():
+    """The `note` says "call get_event for the full record"; on a payload
+    where the event held only the line the model already has, that is an
+    untruth in the export — the failure `_listing` avoids by reporting
+    `returned` beside `total`."""
+    payload = {
+        "status": "ok",
+        "results": [{"type": "frequency", "event_id": "e1", "event": {"message": "short line"}}],
+    }
+    out = _deflate_findings(payload, Fidelity.MESSAGE)
+    assert out["fidelity"] == "message"  # the tier is still stated
+    assert "note" not in out  # ...but nothing was dropped
+    assert out["results"][0]["message"] == "short line"
+
+
+def test_one_reduced_finding_is_enough_for_the_note():
+    payload = {
+        "status": "ok",
+        "results": [
+            {"type": "frequency", "event_id": "e1", "event": {"message": "short line"}},
+            {"type": "frequency", "event_id": "e2", "event": {"attributes": {"k": "v"}}},
+        ],
+    }
+    assert "get_event" in _deflate_findings(payload, Fidelity.MESSAGE)["note"]
 
 
 def test_the_same_call_at_the_same_tier_is_byte_identical():

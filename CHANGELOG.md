@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each event record the agent gets back from searches, similarity lookups and
   anomaly findings — `full` (the whole event), `message` (the one line that
   distinguishes a succeeded login from a failed one), `minimal` (just the
-  identity fields), or `auto` (derive it from the configured context window).
+  identity fields), or `auto` (derive it from the configured context window:
+  100k and up gets `full`, 32k and up `message`, anything smaller `minimal`, and
+  an unconfigured window `message`).
   The default is `full`: an unset context window means the operator has declared
   no constraint, which is assumed to be a cloud model with room. Admins running
   a small local model should set `message` or `auto`. `get_event` always answers

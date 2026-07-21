@@ -2192,6 +2192,7 @@ async def _persist_detector_run(
     resolution: dict[str, Any],
     min_skew_seconds: float | None = None,
     source_offsets: dict[str, int] | None = None,
+    agent_retry_attempt: int = 0,
 ) -> str:
     """Persist a detector scan's request params + serialized result, return the run_id.
 
@@ -2199,6 +2200,12 @@ async def _persist_detector_run(
     (resolved baseline id, window ranges + hash, dispositions hash + count) so
     a persisted run stays fully self-describing even after the baseline
     definition or dispositions are later edited or deleted.
+
+    *agent_retry_attempt* is non-zero only when the agent's overflow ladder
+    re-ran a turn (``AgentScope.attempt``): the same scan then lands twice, and
+    the tag is what tells a superseded re-run apart from an analyst genuinely
+    scanning twice. Recorded only when non-zero, so every non-agent run keeps
+    its existing params shape.
     """
     store = get_store()
     run = await store.create_detector_run(
@@ -2230,6 +2237,7 @@ async def _persist_detector_run(
             # windows/timestamps (None when none was active), so the run stays
             # reproducible even if a source's offset is later changed.
             "source_offsets": source_offsets or None,
+            **({"agent_retry_attempt": agent_retry_attempt} if agent_retry_attempt else {}),
         },
         result=payload,
     )

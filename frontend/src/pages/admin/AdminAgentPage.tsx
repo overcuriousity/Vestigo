@@ -556,8 +556,10 @@ export function AdminAgentPage() {
             lookups and anomaly findings.
             <strong> full</strong> assumes a large window (the default) —{" "}
             <strong>message</strong> or <strong>auto</strong> suit a small local model.
-            On an overflow the agent retries one level down automatically, so this
-            costs a slower turn rather than a failed one.
+            <strong> auto</strong> follows the context window above: 100k and up gets
+            full, 32k and up message, anything smaller minimal — and message when no
+            window is configured. On an overflow the agent retries one level down
+            automatically, so this costs a slower turn rather than a failed one.
           </p>
         </Field>
 

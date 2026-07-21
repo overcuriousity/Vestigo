@@ -464,6 +464,47 @@ async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, mo
     assert "note" not in full
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [0, 2])
+async def test_a_detector_run_from_a_retried_turn_says_so(store, monkeypatch, attempt):
+    """The overflow ladder re-runs a turn by re-executing its tools, so one
+    analyst question can persist the same scan more than once. The runs are not
+    suppressed — they really happened, and hiding a re-execution is what the
+    marker rows exist to prevent — but a superseded re-run must be
+    distinguishable from an analyst scanning twice."""
+    import vestigo.api.routers.events as events_router
+
+    await store.init_schema()
+    await store.create_case("c1", "Case 1")
+
+    async def fake_run(case_id, timeline_id, source_ids, **kwargs):
+        class R:
+            status = "ok"
+
+        return R(), {}
+
+    monkeypatch.setattr(events_router, "_run_stat_detector", fake_run)
+    monkeypatch.setattr(
+        events_router,
+        "_serialize_stat_result",
+        lambda result: {"status": result.status, "results": []},
+    )
+
+    scope = _scope("c1", "t1", ["s1"])
+    scope.attempt = attempt
+    result = await _call(
+        build_tool_server(scope), "run_anomaly_detector", {"detector": "frequency"}
+    )
+
+    run = await store.get_detector_run("c1", result["run_id"])
+    assert run is not None
+    if attempt:
+        assert run.params["agent_retry_attempt"] == attempt
+    else:
+        # Every non-agent run keeps its existing params shape.
+        assert "agent_retry_attempt" not in run.params
+
+
 def _fat_event() -> dict[str, Any]:
     return {
         "event_id": "e1",

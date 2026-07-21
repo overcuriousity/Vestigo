@@ -625,7 +625,7 @@ turn, the inline `event` was ~85% of a finding's size (one `value_novelty`
 result was 37,431 chars, 31,677 of it `event`); seven detectors piled up ~18k
 tokens of them. `_deflate_findings` (`agent/tools.py`) reduces each finding in
 the **model's copy** to `event_id` + the event's `message`, truncated at
-`FINDING_MESSAGE_TRUNCATE`; `_serialize_finding` is untouched, so the persisted
+`SLIM_MESSAGE_TRUNCATE`; `_serialize_finding` is untouched, so the persisted
 `DetectorRun` and the Analysis page keep the full event. Applied after
 persistence, at the same agent boundary as `_columnize`. On the failing turn:
 tool payload 33,731 → 15,718 tokens.
@@ -663,10 +663,26 @@ named tiers rather than a pile of per-call byte counts:
 
 `tool_fidelity` is an operator setting on the usual env-wins-per-field path
 (`VESTIGO_AGENT_TOOL_FIDELITY`, admin UI, DB row), with a fourth value `auto`
-that derives the tier from `context_window` (`>= 100k` → `full`). It applies to
-the in-app agent and to the external `/mcp` transport alike — it describes what
-the deployment can afford to hand a model, and an external client is driving
-one just the same.
+that derives the tier from `context_window` instead of naming one:
+
+| `context_window` | `auto` resolves to |
+|---|---|
+| unset | `message` |
+| ≥ `AUTO_FULL_MIN_WINDOW` (100k) | `full` |
+| ≥ `AUTO_MESSAGE_MIN_WINDOW` (32k) | `message` |
+| below 32k | `minimal` |
+
+The thresholds come from the measured payload: a seven-detector sweep carrying
+inline events was ~34k tokens (2026-07-20), so a 32k window has no room for even
+the reduced shape alongside history and an answer. `auto` with no window
+resolves to `message`, *not* to the `full` default — there is nothing to derive
+from, and an admin who picked `auto` asked to be kept inside a window rather
+than assumed to have room. Leaving `tool_fidelity` unset entirely is how a
+deployment declares no constraint.
+
+It applies to the in-app agent and to the external `/mcp` transport alike — it
+describes what the deployment can afford to hand a model, and an external client
+is driving one just the same.
 
 **Which tools honour it:** `FIDELITY_TIERED_TOOLS` in `agent/fidelity.py` (a
 policy fact, so it lives beside the tiers it selects rather than in `tools.py`) —
@@ -690,7 +706,9 @@ Three deliberate exemptions:
 Every tiered result carries `fidelity`, at `full` too: a result with no marker
 cannot be told apart from one produced before the setting existed. The
 accompanying `note` appears only when the tier actually dropped something
-(`_event_reduced`) — an event with no attributes and a short message survives
+(`_event_reduced` for the event-returning tools, `_finding_event_reduced` for
+the anomaly path, which loses the *whole* event object rather than just its
+attribute bag) — an event with no attributes and a short message survives
 `message` intact, and saying otherwise would put an untruth in the export for
 the sake of a uniform shape.
 
@@ -758,6 +776,20 @@ UI — explicit opt-in, since the right number is model-specific),
   from duplicates; in the *message* log that job belongs to the marker rows —
   `compaction` and `fidelity` both delimit attempts, so a tool row repeating
   after one is that call re-executed, not a duplicate.
+- **A retry re-runs the tools, and two of them write.** Re-executing is what
+  keeps the record honest, but it is not free: `run_anomaly_detector` persists
+  another `DetectorRun` and `propose_annotation` another proposal, and the
+  ladder allows up to four retries (two tier drops, two compactions). A broad
+  sweep that overflows twice can therefore leave three sets of detector runs
+  for one analyst question, plus their ClickHouse cost. They are not
+  suppressed — the scans really did run, and hiding a re-execution is the
+  failure the marker rows exist to prevent — but they are *tagged*:
+  `AgentScope.attempt` rides into `_persist_detector_run`, which records
+  `params["agent_retry_attempt"]` when non-zero, so the Analysis page's
+  superseded re-runs are distinguishable from an analyst scanning twice.
+  Duplicate annotation proposals are left plain: each is an action the analyst
+  decides individually, nothing is written until they confirm, and the
+  preceding marker row already explains the pair.
 - **What compaction does.** `split_history` cuts at *user-turn boundaries
   only* (never between a tool_use and its tool_result), keeping the last
   `KEEP_RECENT_TURNS=2` turns verbatim (1 on the escalated retry); the

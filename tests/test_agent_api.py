@@ -2069,3 +2069,27 @@ async def test_get_last_agent_usage_ignores_pre_compaction_rows(store):
         conv.id, "assistant", "small answer", prompt_tokens=4_000, completion_tokens=200
     )
     assert await store.get_last_agent_usage(conv.id) == (4_000, 200)
+
+
+@pytest.mark.asyncio
+async def test_get_last_agent_usage_ignores_pre_fidelity_drop_rows(store):
+    """A tier drop invalidates a measurement for the same reason a compaction
+    does: the next request is a different size than the number describes —
+    every tool result from here on carries less. Trusting it would spend a
+    summarizer call the drop had already made unnecessary."""
+    await store.init_schema()
+    await store.create_case("c1", "Case 1")
+    conv = await store.create_agent_conversation("c1", "t1", "u1")
+
+    await store.add_agent_message(
+        conv.id, "assistant", "big answer", prompt_tokens=60_000, completion_tokens=400
+    )
+    assert await store.get_last_agent_usage(conv.id) == (60_000, 400)
+
+    await store.add_agent_message(
+        conv.id,
+        "fidelity",
+        "reduced from full to message",
+        tool_result={"from": "full", "to": "message", "attempt": 0, "reason": "overflow"},
+    )
+    assert await store.get_last_agent_usage(conv.id) == (None, None)
