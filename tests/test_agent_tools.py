@@ -15,12 +15,21 @@ import pytest
 from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
 
+from vestigo.agent.fidelity import Fidelity
 from vestigo.agent.tools import AgentScope, build_tool_server
 from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
 
-def _scope(case_id: str, timeline_id: str, source_ids: list[str] | None = None) -> AgentScope:
+def _scope(
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str] | None = None,
+    fidelity: Fidelity = Fidelity.MESSAGE,
+) -> AgentScope:
+    # MESSAGE rather than the deployment default (FULL): these tests assert the
+    # reshaping the agent boundary applies, and FULL is the tier that applies
+    # none. Tier selection itself lives in tests/test_agent_fidelity.py.
     return AgentScope(
         case_id=case_id,
         timeline_id=timeline_id,
@@ -28,6 +37,7 @@ def _scope(case_id: str, timeline_id: str, source_ids: list[str] | None = None) 
         source_ids=source_ids or [],
         field_mappings=None,
         source_offsets=None,
+        fidelity=fidelity,
     )
 
 
@@ -442,6 +452,13 @@ async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, mo
     assert "columns" in result["results"] and "event" not in result["results"]["columns"]
     # The persisted record is untouched — the full event stays reproducible.
     assert persisted["payload"]["results"][0]["event"] == big_event
+
+    # ...and at the deployment default the model gets the whole event, since
+    # an operator who declared no context constraint is assumed to have room.
+    full_server = build_tool_server(_scope("c1", "t1", ["s1"], fidelity=Fidelity.FULL))
+    full = await _call(full_server, "run_anomaly_detector", {"detector": "value_novelty"})
+    assert _rows(full["results"])[0]["event"] == big_event
+    assert "note" not in full and "fidelity" not in full
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
@@ -36,6 +36,7 @@ from vestigo.agent.compaction import (
     should_compact,
 )
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
+from vestigo.agent.fidelity import degrade, resolve_fidelity
 from vestigo.agent.runtime import LLM_TIMEOUT, dump_history, load_history, stream_turn
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
 from vestigo.api.deps import (
@@ -466,6 +467,7 @@ async def _message_stream_inner(
         user,
         conversation_id=conversation.id,
         disabled_tools=disabled_tools,
+        fidelity=resolve_fidelity(config.tool_fidelity, config.context_window),
     )
     history = load_history(conversation.history)
     last_prompt, last_completion = await store.get_last_agent_usage(conversation_id)
@@ -521,10 +523,21 @@ async def _message_stream_inner(
             "reason": reason,
         }
 
-    # Escalation schedule: the first compaction keeps 2 recent turns
-    # verbatim; if the model still overflows, a second folds down to 1; a
-    # third overflow gives up with the friendly context_overflow error.
+    # Escalation on overflow, cheapest lever first:
+    #
+    #   1. drop one tool-result fidelity tier and re-run the turn. No LLM call,
+    #      and it is the only lever that helps a *single* broad turn — the case
+    #      that actually overflowed a 64k model (2026-07-20). The turn is
+    #      re-run through a fresh `build_tool_server`, so nothing already in
+    #      history is rewritten and the record never diverges from what the
+    #      model saw.
+    #   2. compact: the first keeps 2 recent turns verbatim, a second folds
+    #      down to 1. Costs a summarizer call, and can only help when there is
+    #      an older turn to fold.
+    #   3. give up with the friendly context_overflow error.
     keep_schedule = (2, 1)
+    # Two fidelity drops (full → message → minimal) at most, then compaction.
+    max_attempts = 2 + len(keep_schedule) + 1
     compactions = 0
     estimated = estimate_next_prompt_tokens(last_prompt, last_completion, history, payload.content)
     if should_compact(config, estimated):
@@ -538,7 +551,7 @@ async def _message_stream_inner(
         return reservation is not None and reservation.cancel.is_set()
 
     text_parts: list[str] = []
-    for attempt in range(len(keep_schedule) + 1):
+    for attempt in range(max_attempts):
         text_parts = []
         if _cancelled():
             yield _sse({"type": "cancelled"})
@@ -630,6 +643,14 @@ async def _message_stream_inner(
             return
         except ModelHTTPError as exc:
             overflow = _is_context_overflow(exc)
+            if overflow and (lower := degrade(scope.fidelity)) is not None:
+                # Cheapest lever: hand the model less of each example record
+                # and re-run. Tool rows already persisted by this attempt stay
+                # — the record shows what actually ran, and each row states the
+                # tier that produced it.
+                scope = replace(scope, fidelity=lower)
+                yield _sse({"type": "fidelity", "fidelity": lower.value, "reason": "overflow"})
+                continue
             if overflow and compactions < len(keep_schedule):
                 # The threshold estimate lagged behind (tool-heavy turn) —
                 # compact and retry, escalating down the keep schedule on a

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from vestigo.agent.availability import list_models, reset_probe_cache
 from vestigo.agent.config import EFFORT_VALUES, resolve_agent_config
+from vestigo.agent.fidelity import FIDELITY_VALUES
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
 from vestigo.api.deps import get_store, require_admin
 from vestigo.api.uploads import receive_upload_to_tmp
@@ -36,6 +37,7 @@ _AGENT_SETTINGS_FIELDS: tuple[str, ...] = (
     "reasoning_effort",
     "context_window",
     "compact_threshold",
+    "tool_fidelity",
     "disabled_tools",
 )
 
@@ -527,6 +529,7 @@ class AgentSettingsUpdate(BaseModel):
     reasoning_effort: str | None = None
     context_window: int | None = Field(default=None, ge=1024, le=10_000_000)
     compact_threshold: float | None = Field(default=None, gt=0.1, lt=1.0)
+    tool_fidelity: str | None = None
     disabled_tools: list[str] | None = None
 
     @field_validator(
@@ -536,6 +539,7 @@ class AgentSettingsUpdate(BaseModel):
         "api_key",
         "user_agent",
         "reasoning_effort",
+        "tool_fidelity",
         mode="before",
     )
     @classmethod
@@ -552,6 +556,13 @@ class AgentSettingsUpdate(BaseModel):
     def _validate_reasoning_effort(cls, value: str | None) -> str | None:
         if value is not None and value not in EFFORT_VALUES:
             raise ValueError(f"reasoning_effort must be one of {EFFORT_VALUES}")
+        return value
+
+    @field_validator("tool_fidelity")
+    @classmethod
+    def _validate_tool_fidelity(cls, value: str | None) -> str | None:
+        if value is not None and value not in FIDELITY_VALUES:
+            raise ValueError(f"tool_fidelity must be one of {FIDELITY_VALUES}")
         return value
 
     @field_validator("disabled_tools")

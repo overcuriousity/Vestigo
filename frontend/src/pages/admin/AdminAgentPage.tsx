@@ -13,6 +13,7 @@ import { Spinner } from "@/components/ui/Spinner";
 
 const PROVIDERS = ["openai", "anthropic"] as const;
 const EFFORTS = ["off", "low", "medium", "high", "max"] as const;
+const FIDELITIES = ["full", "message", "minimal", "auto"] as const;
 
 /** Local editable form state, mirroring the DB-editable AgentSettingsUpdate fields
  * (see `src/vestigo/api/routers/admin.py::AgentSettingsUpdate`). `apiKey` and
@@ -28,6 +29,7 @@ interface FormState {
   reasoning_effort: string;
   context_window: string;
   compact_threshold: string;
+  tool_fidelity: string;
   /** Sorted tool names the admin has hard-denied. */
   disabled_tools: string[];
 }
@@ -42,6 +44,7 @@ const EMPTY_FORM: FormState = {
   reasoning_effort: "",
   context_window: "",
   compact_threshold: "",
+  tool_fidelity: "",
   disabled_tools: [],
 };
 
@@ -60,6 +63,7 @@ function toFormState(effective: Record<string, unknown>): FormState {
     reasoning_effort: str(effective.reasoning_effort),
     context_window: str(effective.context_window),
     compact_threshold: str(effective.compact_threshold),
+    tool_fidelity: str(effective.tool_fidelity),
     disabled_tools: Array.isArray(effective.disabled_tools)
       ? [...(effective.disabled_tools as string[])].sort()
       : [],
@@ -110,6 +114,9 @@ function buildPatch(
     }
   }
 
+  if (form.tool_fidelity !== baseline.tool_fidelity) {
+    patch.tool_fidelity = form.tool_fidelity || null;
+  }
   if (form.compact_threshold !== baseline.compact_threshold) {
     if (form.compact_threshold === "") {
       patch.compact_threshold = null;
@@ -516,6 +523,32 @@ export function AdminAgentPage() {
           />
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
             Compaction triggers when the estimated prompt reaches threshold × context window.
+          </p>
+        </Field>
+
+        <Field label="Tool result detail" pinnedBadge={pinnedBadge("tool_fidelity")}>
+          <Select
+            value={form.tool_fidelity || undefined}
+            disabled={isEnvPinned("tool_fidelity")}
+            onValueChange={(v) => set("tool_fidelity")(v)}
+          >
+            <SelectTrigger disabled={isEnvPinned("tool_fidelity")}>
+              <SelectValue placeholder="Select detail level" />
+            </SelectTrigger>
+            <SelectContent>
+              {FIDELITIES.map((f) => (
+                <SelectItem key={f} value={f}>
+                  {f}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            How much of an example event the agent gets with each anomaly finding.
+            <strong> full</strong> assumes a large window (the default) —{" "}
+            <strong>message</strong> or <strong>auto</strong> suit a small local model.
+            On an overflow the agent retries one level down automatically, so this
+            costs a slower turn rather than a failed one.
           </p>
         </Field>
 

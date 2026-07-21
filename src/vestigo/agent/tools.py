@@ -37,6 +37,7 @@ from vestigo.agent.chart_meta import (
     requires_field,
 )
 from vestigo.agent.encoding import columnar, columnar_auto
+from vestigo.agent.fidelity import DEFAULT_FIDELITY, Fidelity
 from vestigo.agent.schema_slim import slim_tool_schema, spec_reference_block
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.postgres import User
@@ -455,6 +456,11 @@ class AgentScope:
     # Tools removed from the server after registration (admin hard-deny plus
     # any per-chat restriction) — invisible to the model, not error stubs.
     disabled_tools: frozenset[str] = frozenset()
+    # How much of an example record tool results carry (see agent/fidelity.py).
+    # A deployment property, and on a retry after an overflow one tier lower —
+    # the router rebuilds the scope with `replace(scope, fidelity=...)` rather
+    # than rewriting anything already in history.
+    fidelity: Fidelity = DEFAULT_FIDELITY
 
 
 async def build_scope(
@@ -463,6 +469,7 @@ async def build_scope(
     user: User,
     conversation_id: str | None = None,
     disabled_tools: frozenset[str] = frozenset(),
+    fidelity: Fidelity = DEFAULT_FIDELITY,
 ) -> AgentScope:
     """Resolve the timeline's source scope once for a conversation turn."""
     from vestigo.api.routers.events import _resolve_timeline_scope
@@ -477,6 +484,7 @@ async def build_scope(
         source_offsets=source_offsets,
         conversation_id=conversation_id,
         disabled_tools=disabled_tools,
+        fidelity=fidelity,
     )
 
 
@@ -521,25 +529,34 @@ def _columnize(result: Any, *keys: str) -> Any:
 # more than the inline event it replaced — and every such follow-up spends one
 # of the turn's `request_limit` model requests, so a 25-finding sweep that
 # followed up honestly would trade the overflow for a turn-limit crash.
-_FINDING_NOTE = (
-    "Each finding's example event is reduced to its `message`; call get_event(event_id) "
-    "for the full record (attributes, offsets) before reasoning about one in detail."
-)
+#
+# How far to reduce is `agent/fidelity.py`'s decision, not this function's.
+_FINDING_NOTE = {
+    Fidelity.MESSAGE: (
+        "Each finding's example event is reduced to its `message`; call get_event(event_id) "
+        "for the full record (attributes, offsets) before reasoning about one in detail."
+    ),
+    Fidelity.MINIMAL: (
+        "Each finding's example event is omitted entirely (the model's context is tight); "
+        "call get_event(event_id) for any finding you intend to reason about."
+    ),
+}
 
 
-def _deflate_findings(payload: Any) -> Any:
-    """Reduce each finding's inline `event` to its truncated `message`.
+def _deflate_findings(payload: Any, fidelity: Fidelity = Fidelity.MESSAGE) -> Any:
+    """Reduce each finding's inline `event` to what *fidelity* admits.
 
     The model's copy only — persistence has already stored the full payload by
     the time this runs (see ``run_anomaly_detector``). ``event_id`` and
-    ``details`` stay: the id is the handle for ``get_event``, and ``details``
-    is small and carries the surprise/allowlist/method the model reasons on.
+    ``details`` always stay: the id is the handle for ``get_event``, and
+    ``details`` is small and carries the surprise/allowlist/method the model
+    reasons on. ``Fidelity.FULL`` is a no-op.
 
     Adds ``note`` when anything was actually reduced, so the model never
     believes it saw the whole record — the same self-admitting-truncation
     contract as :func:`_listing`'s ``returned``/``total``.
     """
-    if not isinstance(payload, dict):
+    if fidelity is Fidelity.FULL or not isinstance(payload, dict):
         return payload
     findings = payload.get("results")
     if not isinstance(findings, list):
@@ -554,14 +571,17 @@ def _deflate_findings(payload: Any) -> Any:
         deflated = True
         event = row["event"]
         slim = {k: v for k, v in row.items() if k != "event"}
-        if isinstance(event, dict) and event.get("message"):
+        if fidelity is Fidelity.MESSAGE and isinstance(event, dict) and event.get("message"):
             slim["message"] = _truncate(event["message"], FINDING_MESSAGE_TRUNCATE)
         rows.append(slim)
 
     out = dict(payload)
     out["results"] = rows
     if deflated:
-        out["note"] = _FINDING_NOTE
+        out["note"] = _FINDING_NOTE[fidelity]
+        # The tier is config + attempt, so an exported conversation states what
+        # produced each result rather than leaving the reader to infer it.
+        out["fidelity"] = fidelity.value
     return out
 
 
@@ -1204,9 +1224,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
         (sequence_motif), start/end (sequence_motif mining window).
         Returns findings plus a persisted run_id the analyst can open. Each
-        finding carries the example's `event_id` and its `message` line, not
-        the full event — call get_event on the id when you need the record's
-        attributes.
+        finding carries an example `event_id`; how much of that event comes
+        with it depends on the deployment, and the result's `fidelity`/`note`
+        say which. Call get_event on the id for the full record.
 
         The virtual `time:` fields from list_fields are **not** detector
         fields — they are for charting and filtering only. Passing one is
@@ -1257,7 +1277,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # `event` (the model keeps `event_id` + `get_event`); `_columnize` then
         # states the shared keys once. Together they take a seven-detector
         # sweep from tens of thousands of tokens back inside a small window.
-        return _columnize(_deflate_findings(payload), "results")
+        return _columnize(_deflate_findings(payload, scope.fidelity), "results")
 
     @server.tool()
     async def propose_finding(title: str, description: str, filters: FilterSpec) -> dict[str, Any]:

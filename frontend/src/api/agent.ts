@@ -295,6 +295,7 @@ export type AgentStreamEvent =
   | { type: "thinking_delta"; text: string }
   | { type: "thinking"; text: string }
   | { type: "compaction"; summary: string; reason?: string }
+  | { type: "fidelity"; fidelity: string; reason?: string }
   | { type: "tool_call"; tool_call_id: string; tool: string; args: Record<string, unknown> }
   | { type: "tool_result"; tool_call_id: string; tool: string; result: unknown }
   | {

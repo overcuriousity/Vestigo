@@ -450,6 +450,7 @@ header.
 | `VESTIGO_AGENT_REASONING_EFFORT` | Reasoning-effort enum: `off` (default), `low`, `medium`, `high`, `max`. Admin-editable; see **Reasoning effort** below. |
 | `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset (default) = auto-compaction off. See **Auto-compaction** below. |
 | `VESTIGO_AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (0.1–1 exclusive, default 0.85). |
+| `VESTIGO_AGENT_TOOL_FIDELITY` | How much of an example record tool results carry: `full` (default) \| `message` \| `minimal` \| `auto`. See **Tool-result fidelity** below. |
 | `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`), e.g. `["semantic_search"]`. |
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
 | `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key and ignore any previously stored one — `VESTIGO_AGENT_API_KEY` becomes the only source (A10). Env-only, not admin-editable. |
@@ -649,8 +650,44 @@ turn) truncates bodies at `ANNOTATION_LIST_CONTENT_TRUNCATE` (160), while
 `get_event_annotations` — one event's detail, fetched deliberately — keeps the
 fuller `MESSAGE_TRUNCATE`.
 
-Still open, and deliberately not done here: fidelity is a static choice, not a
-budget-aware one. See `docs/ROADMAP.md` for the pre-flight version.
+### Tool-result fidelity
+
+*How far* to reduce is one decision, in `agent/fidelity.py`, expressed as three
+named tiers rather than a pile of per-call byte counts:
+
+| tier | an anomaly finding carries | for |
+|---|---|---|
+| `full` | the example event inline (what the Analysis page shows) | large windows |
+| `message` | `event_id` + the event's `message`, truncated at 200 | ~64k local models |
+| `minimal` | `event_id` alone | the last resort before failing |
+
+`tool_fidelity` is an operator setting on the usual env-wins-per-field path
+(`VESTIGO_AGENT_TOOL_FIDELITY`, admin UI, DB row), with a fourth value `auto`
+that derives the tier from `context_window` (`>= 100k` → `full`).
+
+**The default is `full`**, decided 2026-07-21: unset means the operator has
+declared no constraint, which is assumed to be a cloud model with room, and the
+overflow ladder below costs a retry rather than the turn. An admin running a
+small local model sets `message` or `auto`. The tradeoff is real and worth
+naming — *a broad turn on an unconfigured small model overflows on attempt 0
+and succeeds on the retry* — and it is the price of not silently starving
+capable deployments.
+
+Per-event attribute caps (`MAX_ATTRS_PER_EVENT`, `ATTR_VALUE_TRUNCATE`) are
+deliberately **not** tiered: they guard against a single pathological event (a
+megabyte of JSON in one attribute), an input-shape risk unrelated to the
+model's window, and have never been implicated in an overflow.
+
+**Determinism is the constraint that shaped this.** The tier is a function of
+static configuration and the retry attempt — never of what already ran in the
+turn. The more adaptive design (a running per-turn budget spent down as tools
+are called) would make identical calls return different data depending on call
+order, with nothing in the exported conversation to explain the difference.
+Forensic reproducibility means replaying a conversation's tool calls under the
+same configuration must produce byte-identical results, so `fidelity.py` holds
+no state, and any future work here must keep that property. A reduced result
+carries its `fidelity` alongside the `note`, so the export states what produced
+it rather than leaving the reader to infer it from config they may not have.
 
 ### Auto-compaction (context-window awareness)
 
@@ -668,11 +705,18 @@ UI — explicit opt-in, since the right number is model-specific),
   so a provider 400/413 whose body matches a known overflow phrasing
   (`_is_context_overflow` — deliberately narrow patterns like "maximum
   context", "prompt is too long", so unrelated 400s such as "invalid token"
-  never trigger it) compacts and retries — this path works even without a
-  configured window. The retry escalates: the first compaction keeps 2
-  recent turns verbatim, a repeat overflow folds down to 1, a third
-  overflow (or nothing left to fold) yields a friendly
-  `error{code="context_overflow"}` instead of the generic failure. Tool
+  never trigger it) retries — this path works even without a configured
+  window. The retry escalates **cheapest lever first**: drop one tool-result
+  fidelity tier and re-run (no LLM call, and the only lever that helps a
+  single broad turn — compaction has nothing older to fold); then the first
+  compaction keeping 2 recent turns verbatim; then a second folding down to
+  1; then a friendly `error{code="context_overflow"}` instead of the generic
+  failure. A tier drop emits an SSE `fidelity` event, the sibling of
+  `compaction`, so the analyst sees that results were thinned rather than
+  silently getting a shallower investigation. Because the retry re-enters
+  `stream_turn` with `replace(scope, fidelity=...)` and **re-executes the
+  tools**, nothing already in history is rewritten — the record never
+  diverges from what the model saw. Tool
   calls re-executed by a retry carry an `attempt` field on their
   `agent.tool_call` audit rows so the custody trail distinguishes re-runs
   from duplicates.

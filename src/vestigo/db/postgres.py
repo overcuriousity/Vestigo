@@ -363,6 +363,8 @@ class AgentSettingsRow(Base):
     # and the fraction of it at which history gets summarized.
     context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
     compact_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # How much of an example record tool results carry (agent/fidelity.py).
+    tool_fidelity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Admin hard-deny tool list — removed from the tool server for the in-app
     # agent AND the external /mcp transport; users cannot re-enable these.
     disabled_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
@@ -391,6 +393,7 @@ class AgentSettingsRow(Base):
             "reasoning_effort": self.reasoning_effort,
             "context_window": self.context_window,
             "compact_threshold": self.compact_threshold,
+            "tool_fidelity": self.tool_fidelity,
             "disabled_tools": self.disabled_tools,
             "updated_by": self.updated_by,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

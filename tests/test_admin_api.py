@@ -454,6 +454,24 @@ def test_agent_settings_put_rejects_invalid_values(client, admin_bootstrap, stor
     )
     assert client.put("/api/admin/agent-settings", json={"max_turns": 0}).status_code == 422
     assert client.put("/api/admin/agent-settings", json={"max_turns": 101}).status_code == 422
+    assert (
+        client.put("/api/admin/agent-settings", json={"tool_fidelity": "lots"}).status_code == 422
+    )
+
+
+def test_agent_settings_tool_fidelity_round_trips(client, admin_bootstrap, store):
+    """Unset resolves to `full`: a deployment that declared no context
+    constraint is assumed to have room (agent/fidelity.py)."""
+    as_admin(client, admin_bootstrap)
+    assert client.get("/api/admin/agent-settings").json()["effective"]["tool_fidelity"] == "full"
+
+    resp = client.put("/api/admin/agent-settings", json={"tool_fidelity": "auto"})
+    assert resp.status_code == 200
+    assert resp.json()["effective"]["tool_fidelity"] == "auto"
+    assert resp.json()["sources"]["tool_fidelity"] == "db"
+
+    cleared = client.put("/api/admin/agent-settings", json={"tool_fidelity": None})
+    assert cleared.json()["effective"]["tool_fidelity"] == "full"
 
 
 def test_agent_settings_put_triggers_reprobe(client, admin_bootstrap, store, monkeypatch):

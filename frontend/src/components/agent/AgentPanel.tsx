@@ -67,6 +67,7 @@ type ChatItem =
   | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
   | { kind: "thinking"; content: string; streaming?: boolean }
   | { kind: "compaction"; summary: string }
+  | { kind: "fidelity"; fidelity: string }
   | {
       kind: "finding";
       title: string;
@@ -207,6 +208,16 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     return {
       ...s,
       items: [...flushed, { kind: "compaction", summary: e.summary }],
+      liveText: "",
+      liveThinking: "",
+    };
+  }
+  if (e.type === "fidelity") {
+    // Same shape as a compaction: the attempt that overflowed is being
+    // retried, so its partial text/thinking will be re-streamed.
+    return {
+      ...s,
+      items: [...flushed, { kind: "fidelity", fidelity: e.fidelity }],
       liveText: "",
       liveThinking: "",
     };
@@ -751,6 +762,20 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 </summary>
                 <div className="mt-1 whitespace-pre-wrap break-words">{item.summary}</div>
               </details>
+            );
+          }
+          if (item.kind === "fidelity") {
+            return (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+              >
+                <Archive size={11} className="shrink-0" />
+                <span>
+                  Results did not fit the model's context window — retried with less
+                  detail per event ({item.fidelity}).
+                </span>
+              </div>
             );
           }
           if (item.kind === "finding") {

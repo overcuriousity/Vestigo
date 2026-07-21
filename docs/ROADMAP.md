@@ -50,17 +50,6 @@ round — the data model migrates once, not twice.
   to replace the hand-mirrored finding/response types in `frontend/src/api/types.ts`
   (~1240 lines, ~90 types) — eliminates the per-detector backend↔frontend type duplication
   wholesale instead of special-casing single detectors (PR109 review follow-up).
-- [ ] **Budget-aware tool-result fidelity (agent).** Today every tool result is slimmed to a
-  fixed shape (`docs/AGENT.md` §A13(d)) chosen for the smallest supported window, so large
-  windows pay for caution they do not need and a broad turn can still overshoot a small one.
-  `build_tool_server(scope)` is already constructed per turn in `stream_turn`, so a per-turn
-  byte budget derived from `config.context_window` could serve full fidelity while budget
-  remains and degrade (event → message → id) once it runs out, telling the model it happened
-  and to narrow. Pre-flight, not 400-triggered: retrying after the overflow means rewriting
-  the `ToolReturnPart` in history, which makes the persisted record diverge from what the
-  model saw — a forensic-trail cost needing its own design round. While here, reorder the
-  overflow backstop to strip the *current* turn's tool payloads before spending a summarizer
-  call on compaction, which cannot fix a single turn.
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 

@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+from vestigo.agent.fidelity import DEFAULT_FIDELITY
 from vestigo.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("reasoning_effort", "agent_reasoning_effort", "reasoning_effort"),
     ("context_window", "agent_context_window", "context_window"),
     ("compact_threshold", "agent_compact_threshold", "compact_threshold"),
+    ("tool_fidelity", "agent_tool_fidelity", "tool_fidelity"),
     ("disabled_tools", "agent_disabled_tools", "disabled_tools"),
 )
 
@@ -90,6 +92,9 @@ _DEFAULTS: dict[str, Any] = {
     # None = auto-compaction off; the right window is model-specific.
     "context_window": None,
     "compact_threshold": DEFAULT_COMPACT_THRESHOLD,
+    # Assume the deployment has room unless the admin says otherwise; the
+    # overflow backstop costs a retry, not the turn. See agent/fidelity.py.
+    "tool_fidelity": DEFAULT_FIDELITY.value,
     "disabled_tools": None,
 }
 
@@ -114,6 +119,7 @@ class AgentConfig:
     reasoning_effort: str
     context_window: int | None = None
     compact_threshold: float | None = None
+    tool_fidelity: str = DEFAULT_FIDELITY.value
     disabled_tools: list[str] | None = None
     sources: dict[str, str] = field(default_factory=dict)
 
@@ -178,6 +184,7 @@ async def resolve_agent_config(settings: Settings | None = None) -> AgentConfig:
         reasoning_effort=resolved["reasoning_effort"],
         context_window=resolved["context_window"],
         compact_threshold=resolved["compact_threshold"],
+        tool_fidelity=resolved["tool_fidelity"],
         disabled_tools=resolved["disabled_tools"],
         sources=sources,
     )
@@ -201,6 +208,7 @@ def config_fingerprint(config: AgentConfig) -> str:
         "reasoning_effort": config.reasoning_effort,
         "context_window": config.context_window,
         "compact_threshold": config.compact_threshold,
+        "tool_fidelity": config.tool_fidelity,
         "disabled_tools": config.disabled_tools,
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
