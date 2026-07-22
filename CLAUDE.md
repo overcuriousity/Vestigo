@@ -31,11 +31,15 @@ auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/
   frequency, semantic similarity). Update alongside any detector change in the same commit.
 - `AGENT.md` — the optional AI investigation agent (design invariants, MCP tools, provider
   config incl. Kimi coding plan). Update alongside any `src/vestigo/agent/` change.
+- `DEPLOYMENT.md` — operator guide: reference compose stack, containerized app, airgapped
+  install, TLS reverse proxy (`nginx-tls.conf`), stability/upgrade guarantees.
+- `INPUT_FORMATS.md` — CSV/JSONL/Parquet field-level normalization spec for ingestion.
 - `ROADMAP.md` — **the only open backlog.** Condensed, checkbox-per-item, current phase only.
   Keep it up to date as items land; delete items once fixed rather than marking them done and
   leaving them.
 - `PROGRESS.md` — append-only chronological session log ("what changed and why"), newest entry
-  on top. Not a plan — don't add TODOs here, that's `ROADMAP.md`'s job.
+  on top. Not a plan — don't add TODOs here, that's `ROADMAP.md`'s job. Old sessions are
+  periodically split out to `archive/PROGRESS_SESSIONS_*.md` to keep the live file readable.
 - `superpowers/specs/` + `superpowers/plans/` — dated per-feature design rounds and the
   execution plans that followed them (`YYYY-MM-DD-<slug>.md`). Point-in-time records of *why a
   shape was chosen*, referenced from `ROADMAP.md`/`PROGRESS.md`; the shipped behavior lives in
