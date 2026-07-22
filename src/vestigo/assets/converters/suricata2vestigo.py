@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import contextlib
 import datetime
 import gzip
 import hashlib
@@ -65,7 +66,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "suricata2vestigo"
-CONVERTER_VERSION = "1.1.0"
+CONVERTER_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Vestigo Parquet interchange format v1 — embedded copy of the spec in
@@ -172,18 +173,16 @@ def _parse_timestamp(value: str) -> datetime.datetime:
     value = value.strip()
     iso = value.replace("Z", "+00:00")
     dt = None
-    try:
+    with contextlib.suppress(ValueError):
         dt = datetime.datetime.fromisoformat(iso)
-    except ValueError:
-        pass
     if dt is None:
         try:
             dt = datetime.datetime.strptime(value, "%m/%d/%Y-%H:%M:%S.%f")
         except ValueError:
             raise SuricataParseError(f"Unrecognised timestamp format: {value}") from None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.astimezone(datetime.timezone.utc)
+        dt = dt.replace(tzinfo=datetime.UTC)
+    return dt.astimezone(datetime.UTC)
 
 
 def _flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
@@ -618,7 +617,7 @@ def find_chunk_boundaries(
                 boundaries.append(found)
             candidate = found + approx
     boundaries.append(size)
-    return list(zip(boundaries, boundaries[1:]))
+    return list(zip(boundaries, boundaries[1:], strict=False))
 
 
 def _parse_chunk(
@@ -723,13 +722,130 @@ def _convert_file_parallel(
 # ---------------------------------------------------------------------------
 
 
-def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
+# ---------------------------------------------------------------------------
+# Output splitting (ported from the 2timesketch converter suite's --split)
+# ---------------------------------------------------------------------------
+
+_RE_SPLIT_SIZE = re.compile(r"^(\d+)\s*([KMG])(?:I?B)?$", re.IGNORECASE)
+
+# Upper bound on the row-batch granularity when rotating parts by size; the
+# actual batch is scaled down for small size limits (see split_parquet).
+_SPLIT_SIZE_BATCH_ROWS = 8192
+
+
+def parse_split_spec(value: str) -> tuple[str, int]:
+    """Parse a ``--split`` specification.
+
+    Returns ``("parts", n)`` for a bare integer (split into ``n`` parts with
+    an equal number of rows) or ``("size", nbytes)`` for a size specification
+    such as ``"512K"``, ``"4M"``, or ``"1GiB"`` (suffixes are KiB/MiB/GiB,
+    i.e. 1024-based).
+    """
+    text = value.strip()
+    if text.isdigit():
+        n = int(text)
+        if n < 1:
+            raise SystemExit(
+                f"error: invalid --split value {value!r}: number of parts must be at least 1"
+            )
+        return ("parts", n)
+    m = _RE_SPLIT_SIZE.match(text)
+    if m:
+        amount = int(m.group(1))
+        if amount < 1:
+            raise SystemExit(f"error: invalid --split value {value!r}: size must be at least 1")
+        factor = {"K": 1024, "M": 1024**2, "G": 1024**3}[m.group(2).upper()]
+        return ("size", amount * factor)
+    raise SystemExit(
+        f"error: invalid --split value {value!r}: use N (number of parts) or "
+        "NK/NM/NG (part size in KiB/MiB/GiB, e.g. 4M)"
+    )
+
+
+def _part_path(output: str, index: int) -> Path:
+    """Return the output path for part ``index`` (1-based)."""
+    out = Path(output)
+    return out.with_name(f"{out.stem}.part{index:03d}{out.suffix}")
+
+
+def split_parquet(src: Path, output: str, spec: tuple[str, int], verbose: bool) -> list[Path]:
+    """Repartition the single-file conversion at ``src`` into part files.
+
+    ``("parts", n)`` distributes the rows into at most ``n`` parts of
+    ``ceil(total / n)`` rows each; ``("size", nbytes)`` rotates to a new part
+    once the current one reaches ``nbytes``, checked at row-batch granularity
+    so a part may overshoot by up to one batch. Rows keep their original
+    order, are never duplicated across parts, and every part carries the full
+    interchange schema and provenance metadata, so each part is independently
+    ingestible.
+    """
+    mode, amount = spec
+    pf = pq.ParquetFile(src)
+    schema = pf.schema_arrow
+    total = pf.metadata.num_rows
+    if mode == "parts":
+        rows_per_part = -(-total // amount) if total else 0
+        batch_rows = max(1, min(BATCH_ROWS, rows_per_part or 1))
+    else:
+        rows_per_part = 0
+        # The batch is the rotation granularity (a part may overshoot the
+        # limit by up to one batch), so scale it to the limit; the 128 B/row
+        # divisor keeps the overshoot small even for well-compressing rows.
+        batch_rows = max(64, min(_SPLIT_SIZE_BATCH_ROWS, amount // 128))
+
+    parts: list[Path] = []
+    writer: pq.ParquetWriter | None = None
+    part_rows = 0
+
+    def open_next() -> pq.ParquetWriter:
+        nonlocal writer, part_rows
+        if writer is not None:
+            writer.close()
+        path = _part_path(output, len(parts) + 1)
+        parts.append(path)
+        part_rows = 0
+        writer = pq.ParquetWriter(str(path), schema, compression="zstd")
+        return writer
+
+    try:
+        for batch in pf.iter_batches(batch_size=batch_rows):
+            while batch.num_rows:
+                if (
+                    writer is None
+                    or (mode == "parts" and part_rows >= rows_per_part)
+                    or (mode == "size" and part_rows > 0 and parts[-1].stat().st_size >= amount)
+                ):
+                    open_next()
+                take = batch.num_rows
+                if mode == "parts":
+                    take = min(take, rows_per_part - part_rows)
+                writer.write_batch(batch.slice(0, take))
+                part_rows += take
+                batch = batch.slice(take)
+        if writer is None:
+            # Zero rows: still produce a first (empty, schema-only) part.
+            open_next()
+    finally:
+        if writer is not None:
+            writer.close()
+    if verbose:
+        for path in parts:
+            sys.stderr.write(f"  wrote {path}\n")
+    return parts
+
+
+def convert(
+    input_path: str, output: str, workers: int, verbose: bool, split: str | None = None
+) -> int:
     """Convert Suricata logs at ``input_path`` into ``output`` (.parquet)."""
     if not output.lower().endswith(".parquet"):
         raise SystemExit(
             f"error: output path must end with .parquet (got: {output}) — the "
             "Vestigo server detects the ingest parser strictly by file extension."
         )
+
+    split_spec = parse_split_spec(split) if split else None
+    write_target = output if split_spec is None else f"{output}.tmp"
 
     files = find_log_files(input_path)
 
@@ -752,7 +868,7 @@ def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
     parsed_total = 0
     skipped_total = 0
     schema = PARQUET_EVENT_SCHEMA.with_metadata(metadata)
-    with pq.ParquetWriter(output, schema, compression="zstd") as writer:
+    with pq.ParquetWriter(write_target, schema, compression="zstd") as writer:
         buffer = _BatchBuffer(writer)
         for path in files:
             if verbose:
@@ -772,10 +888,21 @@ def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
             skipped_total += skipped
         buffer.flush()
 
-    sys.stderr.write(
-        f"{CONVERTER_NAME}: wrote {parsed_total} events to {output} "
-        f"({skipped_total} unparseable lines skipped)\n"
-    )
+    if split_spec is not None:
+        try:
+            parts = split_parquet(Path(write_target), output, split_spec, verbose)
+        finally:
+            Path(write_target).unlink(missing_ok=True)
+        sys.stderr.write(
+            f"{CONVERTER_NAME}: wrote {parsed_total} events to {len(parts)} part "
+            f"file(s) [{parts[0].name} .. {parts[-1].name}] "
+            f"({skipped_total} unparseable lines skipped)\n"
+        )
+    else:
+        sys.stderr.write(
+            f"{CONVERTER_NAME}: wrote {parsed_total} events to {output} "
+            f"({skipped_total} unparseable lines skipped)\n"
+        )
     return 0 if parsed_total > 0 else 1
 
 
@@ -798,9 +925,17 @@ def main() -> int:
         default=min(getattr(os, "process_cpu_count", os.cpu_count)() or 4, DEFAULT_MAX_WORKERS),
         help="parallel parser processes for large plain files (default: min(CPU count, %(default)s))",
     )
+    parser.add_argument(
+        "--split",
+        metavar="N|SIZE",
+        help="split the output into multiple .parquet files: N = N parts with "
+        "an equal number of rows (e.g. 4); SIZE = rotate to a new part once "
+        "it reaches SIZE, with a K/M/G suffix meaning KiB/MiB/GiB (e.g. "
+        "512M). Parts are named <name>.partNNN.parquet.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="progress on stderr")
     args = parser.parse_args()
-    return convert(args.input, args.output, max(1, args.workers), args.verbose)
+    return convert(args.input, args.output, max(1, args.workers), args.verbose, split=args.split)
 
 
 if __name__ == "__main__":

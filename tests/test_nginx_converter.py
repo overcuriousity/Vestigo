@@ -226,3 +226,74 @@ class TestDeterminism:
         pf1 = _convert(converter, DATA / "nginx_access.log", tmp_path / "a.parquet")
         pf2 = _convert(converter, DATA / "nginx_access.log", tmp_path / "b.parquet")
         assert pf1.read().to_pylist() == pf2.read().to_pylist()
+
+
+class TestSplit:
+    def test_parse_split_spec(self, converter):
+        assert converter.parse_split_spec("4") == ("parts", 4)
+        assert converter.parse_split_spec("512K") == ("size", 512 * 1024)
+        assert converter.parse_split_spec("4M") == ("size", 4 * 1024**2)
+        assert converter.parse_split_spec("1GiB") == ("size", 1024**3)
+        assert converter.parse_split_spec(" 2g ") == ("size", 2 * 1024**3)
+        for bad in ("0", "-1", "abc", "4T", "M4", ""):
+            with pytest.raises(SystemExit, match="--split"):
+                converter.parse_split_spec(bad)
+
+    def test_parts_mode_distributes_rows_in_order(self, converter, tmp_path):
+        out = tmp_path / "out.parquet"
+        rc = converter.convert(str(DATA / "nginx_access.log"), str(out), 1, False, split="2")
+        assert rc == 0
+        # Only part files remain — no single output, no leftover temp.
+        assert not out.exists()
+        assert not Path(str(out) + ".tmp").exists()
+        p1 = tmp_path / "out.part001.parquet"
+        p2 = tmp_path / "out.part002.parquet"
+        assert p1.exists() and p2.exists()
+        rows1 = pq.ParquetFile(p1).read().to_pylist()
+        rows2 = pq.ParquetFile(p2).read().to_pylist()
+        # 3 rows into 2 parts: ceil(3/2) = 2, then the remainder.
+        assert (len(rows1), len(rows2)) == (2, 1)
+        ref = _convert(converter, DATA / "nginx_access.log", tmp_path / "ref.parquet")
+        assert rows1 + rows2 == ref.read().to_pylist()
+
+    def test_more_parts_than_rows(self, converter, tmp_path):
+        out = tmp_path / "out.parquet"
+        rc = converter.convert(str(DATA / "nginx_access.log"), str(out), 1, False, split="10")
+        assert rc == 0
+        parts = sorted(tmp_path.glob("out.part*.parquet"))
+        # 3 rows, ceil(3/10) = 1 row per part -> exactly 3 parts.
+        assert len(parts) == 3
+        assert all(pq.ParquetFile(p).metadata.num_rows == 1 for p in parts)
+
+    def test_each_part_validates_against_server_spec(self, converter, tmp_path):
+        out = tmp_path / "out.parquet"
+        converter.convert(str(DATA / "nginx_access.log"), str(out), 1, False, split="2")
+        for part in sorted(tmp_path.glob("out.part*.parquet")):
+            pf = pq.ParquetFile(part)
+            meta = parquet_format.validate_parquet_source(pf.schema_arrow, pf.schema_arrow.metadata)
+            assert meta.converter_name == "nginx2vestigo"
+            assert meta.converter_version == converter.CONVERTER_VERSION
+            assert len(meta.original_files) == 1
+
+    def test_size_mode_rotates(self, converter, tmp_path):
+        line = (
+            '192.168.1.10 - alice [25/Jun/2026:09:46:41 +0200] '
+            '"GET /page-{i:04d}.html HTTP/1.1" 200 1024 "-" "curl/8.0"\n'
+        )
+        src = tmp_path / "access.log"
+        src.write_text("".join(line.format(i=i) for i in range(400)))
+        out = tmp_path / "out.parquet"
+        rc = converter.convert(str(src), str(out), 1, False, split="4K")
+        assert rc == 0
+        parts = sorted(tmp_path.glob("out.part*.parquet"))
+        assert len(parts) >= 2
+        rows = [r for p in parts for r in pq.ParquetFile(p).read().to_pylist()]
+        assert len(rows) == 400
+        ref = _convert(converter, src, tmp_path / "ref.parquet")
+        assert rows == ref.read().to_pylist()
+
+    def test_invalid_split_fails_before_writing(self, converter, tmp_path):
+        out = tmp_path / "out.parquet"
+        with pytest.raises(SystemExit, match="--split"):
+            converter.convert(str(DATA / "nginx_access.log"), str(out), 1, False, split="nope")
+        assert list(tmp_path.iterdir()) == []

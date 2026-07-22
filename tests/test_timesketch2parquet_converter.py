@@ -265,3 +265,20 @@ class TestDeterminism:
         pf1 = _convert(converter, DATA / "timesketch_generic.csv", tmp_path / "a.parquet")
         pf2 = _convert(converter, DATA / "timesketch_generic.csv", tmp_path / "b.parquet")
         assert pf1.read().to_pylist() == pf2.read().to_pylist()
+
+
+class TestSplit:
+    def test_parts_mode_smoke(self, converter, tmp_path):
+        out = tmp_path / "out.parquet"
+        rc = converter.convert(str(DATA / "timesketch_generic.csv"), str(out), 1, False, split="2")
+        assert rc == 0
+        assert not out.exists()
+        parts = sorted(tmp_path.glob("out.part*.parquet"))
+        assert len(parts) == 2
+        rows = [r for p in parts for r in pq.ParquetFile(p).read().to_pylist()]
+        ref = _convert(converter, DATA / "timesketch_generic.csv", tmp_path / "ref.parquet")
+        assert rows == ref.read().to_pylist()
+        for p in parts:
+            pf = pq.ParquetFile(p)
+            meta = parquet_format.validate_parquet_source(pf.schema_arrow, pf.schema_arrow.metadata)
+            assert meta.converter_name == "timesketch2parquet"

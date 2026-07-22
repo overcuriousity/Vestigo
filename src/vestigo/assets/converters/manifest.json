@@ -48,8 +48,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 23124,
-      "sha256": "66c964d5e9edf224b9626a74a08ef49541a93d104f9c5bd8180d110b7129c26c"
+      "size_bytes": 28586,
+      "sha256": "521a00fdd59043ba9f824514dfc281a3354b3a75e01d80ed093cbaf622100d30"
     },
     {
       "name": "cowrie2timesketch",
@@ -96,8 +96,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 28904,
-      "sha256": "9cef34765cdd7cb5957cd4d2d2fcfdbceb68ce4811d1a9e9fa44d30af357faea"
+      "size_bytes": 34345,
+      "sha256": "2ffe77eb9fc993ecebea5f1435e757cbcbb174c02b22ce6563cf6895f112e76d"
     },
     {
       "name": "journal2timesketch",
@@ -132,8 +132,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 24107,
-      "sha256": "a23c6c52a4bf4a361393732e085f20f76ed1bc4c79cd06cbc9fc1a7fb7ebae16"
+      "size_bytes": 29439,
+      "sha256": "f5a7f7fc22289fdd230cc172b8a52741f3224cdb783ec948006ef3433fd83361"
     },
     {
       "name": "pcap2timesketch",
@@ -158,8 +158,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 37928,
-      "sha256": "0c9ec93a649227b5ff9daf9828b73864ef0ed8d84287bce3932df9a1efbd80e7"
+      "size_bytes": 43522,
+      "sha256": "2cebb5bbaa7412b671c277558a22730f25e2a2be0cc2d2af18096a1a38901c3e"
     },
     {
       "name": "suricata2timesketch",
@@ -186,8 +186,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 29473,
-      "sha256": "5202a62977dd0a1500fdd19013d2b2d77f12c11c465a3cf27f7b26419f1b6e73"
+      "size_bytes": 34912,
+      "sha256": "8b7a6d471f98a15a548284782f53330dacaf61200a0c787fdfacdf5af1acfd73"
     },
     {
       "name": "syslog2timesketch",
@@ -215,8 +215,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 30185,
-      "sha256": "2f7b520af9e9c370722350fe785fe1142863407be235c18080189ceb90c14617"
+      "size_bytes": 35535,
+      "sha256": "04383d2ef99320176608367b5f8c9cd522f426a64c3dee4ef700399b0e23df49"
     },
     {
       "name": "webhoneypot2timesketch",

@@ -1,9 +1,26 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 87 — docs cleanup + 2timesketch re-vendor).
+Last updated: 2026-07-22 (session 88 — --split ported to native Parquet converters).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 88 — 2026-07-22: --split ported to native Parquet converters
+
+Ported the upstream 2timesketch `--split N|SIZE` flag (vendored in session 87) to all
+six native Parquet converters (`*2vestigo.py` + `timesketch2parquet.py`), each bumped
+1.1.0 → 1.2.0. Parquet adaptation: the conversion writes a single `<output>.tmp` file
+as before, then `split_parquet()` repartitions it into `<name>.partNNN.parquet` parts —
+parts mode (`--split 4`) slices record batches for an exact `ceil(total/N)`-row
+distribution, size mode (`--split 512M`) rotates on the part file's on-disk size after
+each flushed row batch (batch scaled to the limit, so a part overshoots by at most one
+batch). Every part carries the full interchange schema + provenance metadata and is
+independently ingestible; row order is preserved. `manifest.json` hashes regenerated.
+
+Also un-excluded the native converters from ruff (exclusion narrowed to the vendored
+`*2timesketch.py` files, which `scripts/vendor_converters.py` regenerates verbatim) and
+fixed the resulting findings (import sorting, `datetime.UTC`, `zip(strict=False)`,
+`contextlib.suppress`, one justified `noqa: SIM115`).
 
 ## Session 87 — 2026-07-22: docs cleanup + 2timesketch re-vendor
 
