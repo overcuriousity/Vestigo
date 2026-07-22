@@ -12,6 +12,14 @@ Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_F
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
 resolved.
 
+**Priority order** (verified against the codebase 2026-07-22): the active phase comes
+first — Phase 3 Step 3 (W7 Stories) is the next major feature. Behind it, roughly by
+payoff-per-effort: A12 local transform tools (low friction, no design round needed),
+A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
+D10 correlation rules (heaviest lift, last of the detector line). Milestones 6 (streaming
+ingest) and 7 (forensic examination) are future phases gated on a joint data-model design
+round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up opportunistically.
+
 ## Phase 3 — investigation depth (active, decided 2026-07-19)
 
 Analyst-depth phase; full rationale in
@@ -161,9 +169,11 @@ baseline. In-memory JobStore stays — heavy work lives in converters.
 
 ## Milestone 8 — AI investigation agent expansion
 
-Agent v1 (read parity + external `/mcp` endpoint) and v2 (compaction, three-layer tool
-toggles, OPSEC disclosure, thinking capture, JSON export) shipped 2026-07-19/20 — see
-`docs/AGENT.md` and `docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md`.
+Agent v1 (read parity + external `/mcp` endpoint) and v2 (three-layer tool toggles,
+OPSEC disclosure, thinking capture, JSON export) shipped 2026-07-19/20; context
+management was reworked in 1.5.0 — a sliding context window replaced the earlier
+compaction + fidelity-ladder approach (PR #152). See `docs/AGENT.md` and
+`docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md`.
 
 - [ ] **A8 — External MCP toolsets (web research / OSINT / user-pluggable tools).** Do NOT
   build bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
