@@ -1,6 +1,70 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 84 — #150 locate-in-timeline regression from routine-collapse).
+Last updated: 2026-07-22 (session 86 — PR #152 review fixes).
+
+## Session 86 — 2026-07-22: sliding-window review fixes (PR #152)
+
+Review of PR #152 found no blockers but five real defects; all folded into the
+unreleased 1.5.0.
+
+**Truncation pass.** A single tool result larger than the whole budget was
+reducible by neither pass — elision protects the newest request, turn dropping
+cannot reach inside it — so the turn overflowed, retried identically and died:
+the exact failure shape the window was built for, one degree worse. Pass 3
+(`_truncate_newest`) now cuts the newest request's returns to a leading slice
+(`{"truncated": true, note, head}`, floor `MIN_KEEP_CHARS = 500`) rather than
+stubbing them, so the model keeps the shape of its own result. When even that
+leaves the history over budget, `apply_window` warns — the analyst-facing
+`context_overflow` error reads as "conversation too long", which that case is
+not.
+
+**A learned budget outlives its turn.** The reactive budget was a local, so a
+deployment with no `context_window` burned a failed provider round trip *every*
+turn. `PostgresStore.get_last_window_budget` reads the newest
+`reason="overflow"` window row and seeds the next turn; a budget that overflows
+again is tightened and re-persisted, so it converges. Configuration still wins.
+
+**Honest stats.** `make_window_processor` kept per-field maxima, which could
+pair one request's `estimated_before` with another's `estimated_after` — a
+delta that never happened, in a record meant to stand up as evidence. It now
+keeps the single largest-reduction request wholesale. Also: `_drop_turns`
+measured a span as a sum of per-message estimates (each re-serialized with its
+own JSON brackets) instead of one slice estimate; and `.env.example` still
+documented the retired `VESTIGO_AGENT_COMPACT_THRESHOLD`.
+
+## Session 85 — 2026-07-22: sliding context window replaces fidelity ladder + compaction (1.5.0)
+
+Driven by a real failure: an exported conversation (`ornith:9b`, 64k window)
+overflowed **twice inside its first turn** — the fidelity ladder dropped a tier
+and re-ran the whole turn (the model re-issued the same broad plan, doubling
+the work), compaction had nothing to fold (first turn), and the analyst got
+`[interrupted]` instead of a report. The failing class is *mid-turn* overflow:
+tool results accumulating inside one `agent.run`, which neither mechanism
+addressed.
+
+New `agent/window.py`: a deterministic sliding window applied via pydantic-ai's
+`ProcessHistory` capability before **every model request** (mid-turn included).
+Pass 1 elides the oldest `ToolReturnPart` contents to `{"elided": true, note}`
+stubs (structure untouched — tool pairing/alternation survive all protocols);
+pass 2 replaces the oldest whole user turns with one marker pair. Protected:
+first user request (case context), the newest request's returns, the last turn,
+all assistant prose. Pure function of (messages, budget) — replay under the
+same config elides the same bytes; the stored history blob stays complete
+(window applies at send time). Transparent to the model: stubs are visible and
+the system prompt explains recovery (`get_event`, narrower re-runs).
+
+Retired: the fidelity overflow ladder (`degrade`/`next_tier` — static
+`tool_fidelity` shaping stays) and `agent/compaction.py` entirely (summarizer
+ran on the same weak model, nondeterministic output, and its niche is covered
+by pass 2 + "start a new conversation"); `compact_threshold` dropped everywhere
+(migration 0015), `get_last_agent_usage` deleted. Router: proactive budget from
+`context_window` (`×0.8 − est(system prompt)`); on overflow one reactive retry
+(derive budget ×0.8 from the failed request, or tighten ×0.6 if already
+windowed), then the friendly `context_overflow` error. Forensics: one
+`role="window"` row + `agent.window` audit per reduced turn (reasons `fit` /
+`overflow`); old `compaction`/`fidelity` rows still render read-only in the
+panel. Version 1.5.0; net-negative LOC in `src/`. Spec:
+`docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md`.
 
 ## Session 84 — 2026-07-22: "locate this event in timeline" no longer scrolled (#150)
 

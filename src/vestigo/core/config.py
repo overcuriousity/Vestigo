@@ -271,11 +271,10 @@ class Settings(BaseSettings):
     agent_reasoning_effort: str | None = Field(default=None, pattern="^(off|low|medium|high|max)$")
     # Seconds an availability probe result is cached before re-probing.
     agent_probe_ttl_seconds: float = Field(default=60.0, gt=0)
-    # Model context window in tokens. Unset = history auto-compaction off
-    # (the right number is model-specific, so it's an explicit opt-in).
+    # Model context window in tokens. Unset = no proactive sliding window
+    # (the right number is model-specific, so it's an explicit opt-in; an
+    # overflow still enables the window reactively for one retry).
     agent_context_window: int | None = Field(default=None, ge=1024)
-    # Fraction of the context window at which older turns get summarized.
-    agent_compact_threshold: float | None = Field(default=None, gt=0.1, lt=1.0)
     # How much of an example record tool results carry: full | message |
     # minimal | auto (derive from agent_context_window). Unset = full, i.e. a
     # deployment that has declared no constraint is assumed to have room.

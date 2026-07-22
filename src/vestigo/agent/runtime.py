@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 from fastmcp.client import Client as FastMCPClient
 from pydantic_ai import Agent, AgentRunResultEvent
+from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -59,6 +60,7 @@ from vestigo.agent.tools import (
     AgentScope,
     build_tool_server,
 )
+from vestigo.agent.window import WindowStats, make_window_processor
 
 LLM_TIMEOUT = 300.0
 
@@ -172,6 +174,15 @@ Be concise. State negative results — a falsified hypothesis is a real result
 and belongs in the answer. If the tools return nothing conclusive, say so and
 name what data would be needed; never fill the gap with plausible
 reconstruction.
+
+## Context window
+
+Older tool results in this conversation may be replaced by elision stubs
+(`{"elided": true, ...}`) to fit the model's context window; whole older turns
+may be replaced by a drop marker. Do not treat an elided result as missing
+data — re-run the tool with narrower filters or use get_event for the specific
+records you still need, and prefer aggregation tools over bulk event listing so
+results stay small.
 """
 
 # The result-format note and the shared spec models' per-field prose are both
@@ -330,12 +341,18 @@ async def stream_turn(
     history: list[ModelMessage],
     view_filters: dict[str, Any] | None = None,
     model: Model | None = None,
+    window_budget: int | None = None,
+    window_stats: WindowStats | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding SSE-ready event dicts.
 
     The final yielded event has ``type="result"`` and carries the
     :class:`TurnResult` under ``"turn"`` (consumed by the router, not
     forwarded to the client).
+
+    ``window_budget`` enables the sliding context window (``agent/window.py``)
+    on every model request of the turn; the caller's ``window_stats`` collects
+    what it did so the router can persist one row per turn.
     """
     config = await resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
@@ -355,12 +372,21 @@ async def stream_turn(
         # mix-up cost a real turn on 2026-07-20). Three, not more: every retry
         # is also a model request against the `request_limit` below, so a tool
         # the model cannot get right must not eat the investigation's budget.
+        # The sliding window rides as a ProcessHistory capability: it rewrites
+        # what each model request carries (mid-turn included) while the run's
+        # recorded history — and therefore the stored blob — stays complete.
+        capabilities = []
+        if window_budget is not None:
+            capabilities.append(
+                ProcessHistory(make_window_processor(window_budget, window_stats or WindowStats()))
+            )
         agent = Agent(
             model,
             system_prompt=SYSTEM_PROMPT,
             toolsets=[toolset],
             model_settings=effort_model_settings(config),
             retries=3,
+            capabilities=capabilities,
         )
         limits = UsageLimits(request_limit=config.max_turns)
 

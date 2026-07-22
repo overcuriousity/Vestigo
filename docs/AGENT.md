@@ -93,7 +93,7 @@ frontend AgentPanel ──POST /messages (SSE)──► api/routers/agent.py
   the built-in loop consumes it in-process. The same server is also served
   over HTTP for external harnesses — see **External MCP endpoint** below.
 - Streaming is SSE over the POST response (`text_delta`, `thinking_delta`,
-  `thinking`, `compaction`, `tool_call`, `tool_result`, `done`, `error` —
+  `thinking`, `window`, `tool_call`, `tool_result`, `done`, `error` —
   `error` may carry a machine-readable `code`, currently `context_overflow`
   or `model_error`); the frontend reads it via fetch + ReadableStream
   (`frontend/src/api/agent.ts`).
@@ -418,7 +418,7 @@ to live in the audit trail for the record to stay readable afterwards.
 
 Both draw from `GET /api/agent/info` (`info_router` in
 `api/routers/agent.py`): model, provider, `api_base_url`,
-`context_window`, `compact_threshold`, the tool catalog with
+`context_window`, the tool catalog with
 `admin_disabled` flags, and the user's saved `user_disabled_tools`. This
 deliberately discloses model + base URL to **all authenticated users**
 (that disclosure *is* the OPSEC feature); the API key is never included.
@@ -430,7 +430,7 @@ audited as `agent.conversation_export`, *not* gated on agent availability —
 the record must stay exportable while the LLM endpoint is down) returns the
 whole thread as a JSON attachment: `export_version`, exporter/timestamps,
 the conversation row (incl. `model_id` and `disabled_tools`), every
-`agent_messages` row (user/assistant/tool/thinking/compaction, with tool
+`agent_messages` row (user/assistant/tool/thinking/window, with tool
 args/results and measured token usage), the proposals, and `raw_history` —
 the provider-wire pydantic-ai history blob (the only place thinking
 signatures and provider quirks live). Download button in the AgentPanel
@@ -448,8 +448,7 @@ header.
 | `VESTIGO_AGENT_EXTRA_HEADERS` | JSON object of extra HTTP headers. |
 | `VESTIGO_AGENT_MAX_TURNS` | Model round-trip cap per user message (default 15). |
 | `VESTIGO_AGENT_REASONING_EFFORT` | Reasoning-effort enum: `off` (default), `low`, `medium`, `high`, `max`. Admin-editable; see **Reasoning effort** below. |
-| `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset (default) = auto-compaction off. See **Auto-compaction** below. |
-| `VESTIGO_AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (0.1–1 exclusive, default 0.85). |
+| `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset (default) = the sliding window only engages reactively after an overflow. See **Sliding context window** below. |
 | `VESTIGO_AGENT_TOOL_FIDELITY` | How much of an example record tool results carry: `full` (default) \| `message` \| `minimal` \| `auto`. See **Tool-result fidelity** below. |
 | `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`), e.g. `["semantic_search"]`. |
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
@@ -616,8 +615,9 @@ regression — re-measure and update this table rather than raising the ceiling.
 **(d) Bounding one turn's tool payload.** (a)–(c) bound the *fixed* overhead and
 the *replayed* history; neither bounds what a single broad turn pulls in. A
 "find anomalies and visualise" ask ran seven detectors in one turn and
-overflowed a 65,536-token model at 74,673 — a case auto-compaction structurally
-cannot fix, because there is only one turn and nothing older to fold.
+overflowed a 65,536-token model at 74,673 — a case that only the sliding
+window (below) or up-front slimming can address, because there is only one
+turn and nothing older to fold.
 
 The cost was that every finding embedded its full resolved example event: the
 whole attribute bag, `source_file`, byte offsets, raw message. Measured on that
@@ -714,11 +714,11 @@ the sake of a uniform shape.
 
 **The default is `full`**, decided 2026-07-21: unset means the operator has
 declared no constraint, which is assumed to be a cloud model with room, and the
-overflow ladder below costs a retry rather than the turn. An admin running a
-small local model sets `message` or `auto`. The tradeoff is real and worth
-naming — *a broad turn on an unconfigured small model overflows on attempt 0
-and succeeds on the retry* — and it is the price of not silently starving
-capable deployments.
+sliding window below costs at worst a retry rather than the turn. An admin
+running a small local model sets `message` or `auto`. The tradeoff is real and
+worth naming — *a broad turn on an unconfigured small model overflows on
+attempt 0 and succeeds on the retry* — and it is the price of not silently
+starving capable deployments.
 
 Per-event attribute caps (`MAX_ATTRS_PER_EVENT`, `ATTR_VALUE_TRUNCATE`) are
 deliberately **not** tiered: they guard against a single pathological event (a
@@ -726,8 +726,7 @@ megabyte of JSON in one attribute), an input-shape risk unrelated to the
 model's window, and have never been implicated in an overflow.
 
 **Determinism is the constraint that shaped this.** The tier is a function of
-static configuration and the retry attempt — never of what already ran in the
-turn. The more adaptive design (a running per-turn budget spent down as tools
+static configuration alone — never of what already ran in the turn. The more adaptive design (a running per-turn budget spent down as tools
 are called) would make identical calls return different data depending on call
 order, with nothing in the exported conversation to explain the difference.
 Forensic reproducibility means replaying a conversation's tool calls under the
@@ -736,78 +735,101 @@ no state, and any future work here must keep that property. A reduced result
 carries its `fidelity` alongside the `note`, so the export states what produced
 it rather than leaving the reader to infer it from config they may not have.
 
-### Auto-compaction (context-window awareness)
+### Sliding context window
 
-The runtime replays the full conversation `history` every turn, so long
-investigations eventually overflow the model's context window and the
-provider answers 400. When the operator sets `context_window` (env or admin
-UI — explicit opt-in, since the right number is model-specific),
-`agent/compaction.py` keeps conversations under it:
+The runtime replays the full conversation `history` every turn, and a single
+broad turn piles tool results into its own requests — either can overflow the
+model's context window (the provider answers 400). `agent/window.py` is the
+one mechanism for both, replacing the earlier fidelity *overflow ladder* (a
+tier drop plus full turn re-run) and LLM history compaction
+(`agent/compaction.py`, retired — its summarizer ran on the same
+possibly-small model and its output was nondeterministic). Decision record:
+`docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md`.
 
-- **Pre-turn check.** Before each turn the router estimates the next prompt
-  from the last measured usage (`prompt + completion + new input`; falls
-  back to serialized-history-chars/4 when usage was never reported). At
-  `compact_threshold × context_window` it compacts first.
-- **Overflow backstop.** Tool-output sizes make the estimate lag one turn,
-  so a provider 400/413 whose body matches a known overflow phrasing
-  (`_is_context_overflow` — deliberately narrow patterns like "maximum
-  context", "prompt is too long", so unrelated 400s such as "invalid token"
-  never trigger it) retries — this path works even without a configured
-  window. The retry escalates **cheapest lever first**: drop one tool-result
-  fidelity tier and re-run (no LLM call, and the only lever that helps a
-  single broad turn — compaction has nothing older to fold), *if* the
-  attempt actually called a tier-honouring tool — a drop that cannot change
-  the prompt is skipped rather than spent (`fidelity.next_tier`); then the
-  first compaction keeping 2 recent turns verbatim; then a second folding down to
-  1; then a friendly `error{code="context_overflow"}` instead of the generic
-  failure. A tier drop emits an SSE `fidelity` event, the sibling of
-  `compaction`, so the analyst sees that results were thinned rather than
-  silently getting a shallower investigation — and, for the same reason
-  compaction does, persists an append-only `role="fidelity"` message row
-  (`tool_result = {from, to, attempt, reason}`) plus an
-  `agent.fidelity_drop` audit row: an SSE event alone is gone on reload, and
-  the case file has to answer "why is there less here than there" from
-  itself. Because the retry re-enters
-  `stream_turn` with `replace(scope, fidelity=...)` and **re-executes the
-  tools**, nothing already in history is rewritten — the record never
-  diverges from what the model saw. Tool
-  calls re-executed by a retry carry an `attempt` field on their
-  `agent.tool_call` audit rows so the custody trail distinguishes re-runs
-  from duplicates; in the *message* log that job belongs to the marker rows —
-  `compaction` and `fidelity` both delimit attempts, so a tool row repeating
-  after one is that call re-executed, not a duplicate.
+- **Mechanism.** A pydantic-ai `ProcessHistory` capability runs
+  `apply_window(messages, budget)` before **every model request — mid-turn
+  included**, which is what the failing case needed: the 2026-07-21 export
+  overflowed twice inside its first turn, where compaction had nothing to
+  fold and the tier-drop re-run just re-issued the same broad plan. Three
+  passes, cheapest first:
+  1. *Elide*: oldest-first, each `ToolReturnPart`'s content is replaced with
+     `{"elided": true, "note": …}` until the estimate fits. Message structure
+     is untouched, so tool pairing and role alternation survive on every
+     provider protocol.
+  2. *Drop turns*: if elision is not enough, the oldest user turns are
+     replaced with one marker pair. Cuts land on user-turn boundaries only —
+     never between a tool_use and its tool_result.
+  3. *Truncate the newest returns*: last resort, and the only pass that
+     touches the request the model is about to reason over. One tool result
+     larger than the whole budget is invisible to the first two passes —
+     elision protects that request, turn dropping cannot reach inside it — so
+     without this the turn overflows, retries identically and dies. The
+     content becomes `{"truncated": true, "note": …, "head": …}`, keeping a
+     leading slice (never below `MIN_KEEP_CHARS`, 500) so the model can see
+     what the tool answered and narrow the re-run itself.
+
+  Never elided: the first user request (case/timeline context), the most
+  recent request's tool returns (pass 3 may still truncate them), the last
+  user turn, and all assistant prose (the findings narrative). The budget is
+  `context_window × 0.8 − est(system prompt)`; estimates are chars/4. When
+  even all three passes leave the history over budget, `apply_window` logs a
+  warning naming the residual — the analyst-facing `context_overflow` error
+  reads as "conversation too long", which that case is not.
+- **Transparent to the model.** The stubs sit in the replayed history and the
+  system prompt explains them, so the model can adapt — re-run a tool with
+  narrower filters, or `get_event` for the records it still needs — instead
+  of reasoning over a silent gap.
+- **Deterministic, applied at send time.** `apply_window` is a pure function
+  of (messages, budget); replaying a conversation under the same
+  configuration elides the same bytes — the same constraint that shaped the
+  fidelity tiers. The stored history blob stays complete: the window rewrites
+  the outgoing request, never the record.
+- **Reactive backstop.** With `context_window` unset there is no proactive
+  window; a provider 400/413 matching `_is_context_overflow` (deliberately
+  narrow phrasings — "maximum context", "prompt is too long" — so unrelated
+  400s never trigger it) enables the window and re-runs the turn **once**.
+  The budget comes from the best source available: when the error body names
+  the model's window (`_overflow_window_hint` — OpenAI's "maximum context
+  length is N tokens", Anthropic's "X tokens > N maximum", llama.cpp's
+  "available context size (N tokens)"), the budget is `budget_for(N)`;
+  otherwise it falls back to the estimated size of the pre-turn history +
+  prompts (×0.8) — conservative by necessity, since the mid-turn tool results
+  that actually overflowed live inside `agent.run` and are invisible to the
+  router. If the window was already active, the retry tightens the budget
+  (×0.6) instead. A second overflow surfaces the friendly
+  `error{code="context_overflow"}`. One retry, not a ladder.
+- **A learned budget outlives its turn.** With no `context_window` configured,
+  the next turn of the same conversation starts from the budget the last
+  overflow derived (`PostgresStore.get_last_window_budget`, reading the newest
+  `reason="overflow"` window row) instead of repeating the failed round trip
+  every turn. A seeded budget that overflows again is tightened and
+  re-persisted, so the value converges. Configuration always wins: an operator
+  who set `context_window` has said what the model is.
+- **Forensic trail.** A turn the window reduced persists one append-only
+  `role="window"` message row — `tool_result = {reason: "fit", attempt,
+  budget, results_elided, results_truncated, turns_dropped, estimated_before,
+  estimated_after}`, the turn's single largest reduction rather than
+  field-wise maxima (which would pair one request's `estimated_before` with
+  another's `estimated_after` — a delta that never happened)
+  — plus an `agent.window` audit row; the reactive retry persists the same
+  pair with `reason: "overflow"` (and `window_hint` when the provider named
+  its window) before re-running. The row is written on *every* exit — done,
+  stop, overflow retry, error — so even a turn that never finished explains
+  its reduced requests. The chat renders both
+  (SSE `window` event), because an SSE event alone is gone on reload and the
+  case file has to answer "why is there less here than there" from itself.
+  Historical transcripts may still carry `compaction`/`fidelity` marker rows
+  from the retired mechanisms; the panel still renders those read-only.
 - **A retry re-runs the tools, and two of them write.** Re-executing is what
-  keeps the record honest, but it is not free: `run_anomaly_detector` persists
-  another `DetectorRun` and `propose_annotation` another proposal, and the
-  ladder allows up to four retries (two tier drops, two compactions). A broad
-  sweep that overflows twice can therefore leave three sets of detector runs
-  for one analyst question, plus their ClickHouse cost. They are not
-  suppressed — the scans really did run, and hiding a re-execution is the
-  failure the marker rows exist to prevent — but they are *tagged*:
+  keeps the record honest, but `run_anomaly_detector` persists another
+  `DetectorRun` and `propose_annotation` another proposal. They are not
+  suppressed — the scans really did run — but they are *tagged*:
   `AgentScope.attempt` rides into `_persist_detector_run`, which records
   `params["agent_retry_attempt"]` when non-zero, so the Analysis page's
-  superseded re-runs are distinguishable from an analyst scanning twice.
-  Duplicate annotation proposals are left plain: each is an action the analyst
-  decides individually, nothing is written until they confirm, and the
-  preceding marker row already explains the pair.
-- **What compaction does.** `split_history` cuts at *user-turn boundaries
-  only* (never between a tool_use and its tool_result), keeping the last
-  `KEEP_RECENT_TURNS=2` turns verbatim (1 on the escalated retry); the
-  older head is summarized by a toolset-less agent run against the same
-  configured model (forensic summary prompt: goals, findings with exact
-  event_ids/filters, open hypotheses, failed approaches). The new history =
-  a stub user/assistant message *pair* carrying the summary (pair, so
-  strict user/assistant alternation survives Anthropic-protocol replay) +
-  the kept tail. Usage measured before a compaction is ignored by the next
-  turn's estimate — it describes the pre-compaction size and would
-  otherwise re-trigger compaction on the already-compacted history.
-- **Forensic trail.** Compaction never destroys the record: an append-only
-  `role="compaction"` message row stores the summary as content and
-  `{reason, keep_turns, messages_summarized, estimated_tokens_before,
-  pre_compaction_history}` (the exact pre-compaction wire blob) in
-  `tool_result`, plus an `agent.compaction` audit row. The chat shows a
-  visible "older turns were summarized" item (SSE `compaction` event), and
-  the JSON export carries everything.
+  superseded re-runs are distinguishable from an analyst scanning twice. The
+  `role="window"` overflow marker also delimits the attempts in the message
+  log, so a tool row repeating after it is that call re-executed, not a
+  duplicate.
 
 ### How a turn can end early
 
@@ -817,7 +839,7 @@ call an admin:
 
 | `code` | Raised by | Means |
 |---|---|---|
-| `context_overflow` | `ModelHTTPError` matching `_is_context_overflow`, nothing left to compact | Start a new conversation |
+| `context_overflow` | `ModelHTTPError` matching `_is_context_overflow`, after the windowed retry | Start a new conversation |
 | `model_error` | any other 4xx/5xx from the endpoint | Endpoint/config problem — server logs |
 | `tool_retry_exhausted` | `UnexpectedModelBehavior` | The model could not call one tool correctly within its retry budget |
 | `turn_limit_reached` | `UsageLimitExceeded` | The turn spent all `max_turns` requests — ask something narrower or raise the setting |
@@ -934,14 +956,13 @@ the annotated-event filter, and deletion. Frontend:
 `frontend/src/test/agent.test.ts` (FilterSpec → EventFilters mapping,
 including the new fields).
 
-Agent-v2 additions: `tests/test_agent_compaction.py` (turn-boundary
-splitting never orphans tool returns, threshold math, compacted-history
-shape with an injected `FunctionModel`); `tests/test_agent_api.py` (the
-three new resolver fields, admin toggles round-trip + 422 on unknown tool
-names, `/api/agent/info` shape + key-never-leaks, preference round-trip,
-thinking-event mapping via `DeltaThinkingPart` + persisted `thinking` rows,
-the export endpoint incl. owner-only 404 + audit, threshold- and
-overflow-triggered compaction end-to-end, friendly `context_overflow`
-error); `tests/test_agent_tools.py` (registry parity, disabled tools absent
+Agent-v2 additions: `tests/test_agent_window.py` (elision order, protected
+regions, turn-dropping never orphans tool returns, purity and determinism);
+`tests/test_agent_api.py` (the resolver fields, admin toggles round-trip +
+422 on unknown tool names, `/api/agent/info` shape + key-never-leaks,
+preference round-trip, thinking-event mapping via `DeltaThinkingPart` +
+persisted `thinking` rows, the export endpoint incl. owner-only 404 + audit,
+mid-turn elision end-to-end, the reactive overflow retry, friendly
+`context_overflow` error); `tests/test_agent_tools.py` (registry parity, disabled tools absent
 from `list_tools` and erroring on call); `tests/test_mcp_http.py` (admin
 deny list applies to the external `tools/list`).

@@ -60,9 +60,6 @@ def is_kimi_coding_endpoint(base_url: str | None) -> bool:
 _DEFAULT_PROVIDER = "openai"
 DEFAULT_MAX_TURNS = 15
 _DEFAULT_REASONING_EFFORT = "off"
-# Shared with agent/compaction.py's should_compact fallback — one constant so
-# the resolver default and the runtime fallback can never drift apart.
-DEFAULT_COMPACT_THRESHOLD = 0.85
 
 # (AgentConfig field, Settings attribute, AgentSettingsRow attribute)
 _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
@@ -75,7 +72,6 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("max_turns", "agent_max_turns", "max_turns"),
     ("reasoning_effort", "agent_reasoning_effort", "reasoning_effort"),
     ("context_window", "agent_context_window", "context_window"),
-    ("compact_threshold", "agent_compact_threshold", "compact_threshold"),
     ("tool_fidelity", "agent_tool_fidelity", "tool_fidelity"),
     ("disabled_tools", "agent_disabled_tools", "disabled_tools"),
 )
@@ -89,11 +85,12 @@ _DEFAULTS: dict[str, Any] = {
     "extra_headers": None,
     "max_turns": DEFAULT_MAX_TURNS,
     "reasoning_effort": _DEFAULT_REASONING_EFFORT,
-    # None = auto-compaction off; the right window is model-specific.
+    # None = no proactive sliding window; the right window is model-specific.
+    # An overflow then still enables the window reactively for one retry
+    # (api/routers/agent.py).
     "context_window": None,
-    "compact_threshold": DEFAULT_COMPACT_THRESHOLD,
     # Assume the deployment has room unless the admin says otherwise; the
-    # overflow backstop costs a retry, not the turn. See agent/fidelity.py.
+    # sliding window costs a retry at worst, not the turn. See agent/window.py.
     "tool_fidelity": DEFAULT_FIDELITY.value,
     "disabled_tools": None,
 }
@@ -118,7 +115,6 @@ class AgentConfig:
     max_turns: int
     reasoning_effort: str
     context_window: int | None = None
-    compact_threshold: float | None = None
     tool_fidelity: str = DEFAULT_FIDELITY.value
     disabled_tools: list[str] | None = None
     sources: dict[str, str] = field(default_factory=dict)
@@ -183,7 +179,6 @@ async def resolve_agent_config(settings: Settings | None = None) -> AgentConfig:
         max_turns=resolved["max_turns"],
         reasoning_effort=resolved["reasoning_effort"],
         context_window=resolved["context_window"],
-        compact_threshold=resolved["compact_threshold"],
         tool_fidelity=resolved["tool_fidelity"],
         disabled_tools=resolved["disabled_tools"],
         sources=sources,
@@ -207,7 +202,6 @@ def config_fingerprint(config: AgentConfig) -> str:
         "max_turns": config.max_turns,
         "reasoning_effort": config.reasoning_effort,
         "context_window": config.context_window,
-        "compact_threshold": config.compact_threshold,
         "tool_fidelity": config.tool_fidelity,
         "disabled_tools": config.disabled_tools,
     }

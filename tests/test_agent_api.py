@@ -976,7 +976,7 @@ async def test_cancelled_turn_persists_what_streamed(store, monkeypatch):
 
     turn = _reserve_turn(agent_router, conversation.id)
 
-    async def fake_stream_turn(scope, *, user_text, history, view_filters=None):
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None, **kwargs):
         yield {"type": "text_delta", "text": "partial "}
         yield {"type": "text_delta", "text": "answer"}
         turn.cancel.set()  # analyst hits Stop mid-turn
@@ -1014,7 +1014,7 @@ async def _turn_ending_with(store, monkeypatch, exc: Exception) -> tuple[list[di
         case.id, timeline.id, user.id, model_id="stub:stub"
     )
 
-    async def fake_stream_turn(scope, *, user_text, history, view_filters=None):
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None, **kwargs):
         yield {"type": "text_delta", "text": "partial answer"}
         raise exc
 
@@ -1360,7 +1360,7 @@ async def test_delete_conversation_removes_proposals(store):
 
 @pytest.mark.asyncio
 async def test_resolver_agent_v2_fields(store, monkeypatch):
-    """context_window / compact_threshold / disabled_tools resolve env→db→default."""
+    """context_window / disabled_tools resolve env→db→default."""
     monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "200000")
     monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["histogram"]')
     get_settings.cache_clear()
@@ -1370,9 +1370,6 @@ async def test_resolver_agent_v2_fields(store, monkeypatch):
         assert config.sources["context_window"] == "env"
         assert config.disabled_tools == ["histogram"]
         assert config.sources["disabled_tools"] == "env"
-        # No env/db value: threshold falls back to its hardcoded default.
-        assert config.compact_threshold == 0.85
-        assert config.sources["compact_threshold"] == "default"
     finally:
         get_settings.cache_clear()
 
@@ -1391,14 +1388,12 @@ def test_admin_agent_settings_toggles_roundtrip(client, admin_bootstrap, store):
         json={
             "disabled_tools": ["semantic_search", "similar_events"],
             "context_window": 128000,
-            "compact_threshold": 0.5,
         },
     )
     assert put.status_code == 200, put.text
     effective = put.json()["effective"]
     assert effective["disabled_tools"] == ["semantic_search", "similar_events"]
     assert effective["context_window"] == 128000
-    assert effective["compact_threshold"] == 0.5
 
     bad = client.put("/api/admin/agent-settings", json={"disabled_tools": ["not_a_tool"]})
     assert bad.status_code == 422
@@ -1644,10 +1639,8 @@ def test_export_conversation(client, admin_bootstrap, agent_on, store, monkeypat
     ).status_code == 404
 
 
-def _seed_long_history(
-    store, conversation_id: str, *, last_prompt_tokens: int | None = None, turns: int = 3
-):
-    """``turns`` user turns of replayable history (+ optionally a measured assistant row)."""
+def _seed_long_history(store, conversation_id: str, *, turns: int = 3):
+    """``turns`` user turns of replayable history."""
     from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
     from vestigo.agent.runtime import dump_history
@@ -1659,25 +1652,17 @@ def _seed_long_history(
 
     async def _seed():
         await store.update_agent_conversation(conversation_id, history=dump_history(history))
-        if last_prompt_tokens is not None:
-            await store.add_agent_message(
-                conversation_id,
-                "assistant",
-                "prior answer",
-                prompt_tokens=last_prompt_tokens,
-                completion_tokens=10,
-            )
 
     asyncio.run(_seed())
 
 
-def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None, fail_count: int = 1):
-    """Patch build_model with a FunctionModel serving both the turn (stream)
-    and the compaction summarizer (non-stream). Optionally the first
-    ``fail_count`` stream calls raise ModelHTTPError with the given body."""
+def _tool_free_model(monkeypatch, *, fail_first_stream: str | None = None, fail_count: int = 1):
+    """Patch build_model with a FunctionModel whose turn calls no tool.
+
+    Optionally the first ``fail_count`` stream calls raise ModelHTTPError with
+    the given body."""
     from mcp.server.fastmcp import FastMCP
     from pydantic_ai.exceptions import ModelHTTPError
-    from pydantic_ai.messages import ModelResponse, TextPart
     from pydantic_ai.models.function import FunctionModel
 
     from vestigo.agent import runtime
@@ -1689,28 +1674,23 @@ def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None, f
         calls["stream"] += 1
         if fail_first_stream is not None and calls["stream"] <= fail_count:
             raise ModelHTTPError(status_code=400, model_name="m", body=fail_first_stream)
-        yield "post-compaction answer"
+        yield "answer after the retry"
 
-    async def model_call(messages, info):
-        return ModelResponse(parts=[TextPart(content="a dense summary of turns 0-1")])
-
-    model = FunctionModel(model_call, stream_function=model_stream)
-    monkeypatch.setattr(runtime, "build_model", lambda config=None, http_client=None: model)
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
     return calls
 
 
-def _tool_calling_model(monkeypatch, *, overflow_body: str, fail_count: int):
-    """A model whose turn actually calls a fidelity-tiered tool.
+def _big_tool_model(monkeypatch, *, result_chars: int, tool_calls: int = 2):
+    """A model whose turn issues ``tool_calls`` bulky tool exchanges, then answers.
 
-    The tier drop is only a lever when the attempt fetched event records
-    through one of ``FIDELITY_TIERED_TOOLS`` — with `_thinking_free_model`'s
-    tool-free stub the router correctly refuses to spend a retry on it. Each
-    attempt here runs the same two requests: one that calls
-    ``run_anomaly_detector``, then one that either overflows or answers.
-    """
+    Each stream call's incoming messages are captured in ``seen`` so tests can
+    assert what the window actually handed the model."""
     from mcp.server.fastmcp import FastMCP
-    from pydantic_ai.exceptions import ModelHTTPError
-    from pydantic_ai.messages import ModelResponse, TextPart, ToolReturnPart
+    from pydantic_ai.messages import ToolReturnPart
     from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
     from vestigo.agent import runtime
@@ -1719,211 +1699,87 @@ def _tool_calling_model(monkeypatch, *, overflow_body: str, fail_count: int):
 
     @server.tool()
     def run_anomaly_detector(detector: str = "value_novelty") -> dict:
-        return {"status": "ok", "results": [], "fidelity": "full"}
+        return {"status": "ok", "blob": "x" * result_chars}
 
     monkeypatch.setattr(runtime, "build_tool_server", lambda scope: server)
-    calls = {"stream": 0, "failures": 0}
-
-    def _tool_ran(messages) -> bool:
-        return any(
-            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
-        )
+    seen: list[list] = []
 
     async def model_stream(messages, info):
-        calls["stream"] += 1
-        if not _tool_ran(messages):
+        seen.append(messages)
+        returns = sum(
+            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+        )
+        if returns < tool_calls:
             yield {0: DeltaToolCall(name="run_anomaly_detector", json_args="{}")}
             return
-        if calls["failures"] < fail_count:
-            calls["failures"] += 1
-            raise ModelHTTPError(status_code=400, model_name="m", body=overflow_body)
-        yield "answer after the retry"
+        yield "windowed answer"
 
-    async def model_call(messages, info):
-        return ModelResponse(parts=[TextPart(content="a dense summary of turns 0-1")])
-
-    model = FunctionModel(model_call, stream_function=model_stream)
-    monkeypatch.setattr(runtime, "build_model", lambda config=None, http_client=None: model)
-    return calls
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+    return seen
 
 
-def test_send_message_compacts_at_threshold(client, admin_bootstrap, agent_on, store, monkeypatch):
-    from vestigo.agent.compaction import COMPACTION_MARKER
-
-    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "2048")
+def test_configured_window_elides_mid_turn(client, admin_bootstrap, agent_on, store, monkeypatch):
+    """With context_window set, a broad turn shrinks as it grows: by the time
+    the second bulky tool result lands, the first one is elided from what the
+    model sees — mid-turn, before any provider 400. The reduction is persisted
+    as a role="window" row plus an audit row, and streamed as a window event."""
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
     get_settings.cache_clear()
-    _thinking_free_model(monkeypatch)
+    # ~2000 estimated tokens per result against a ~3400-token budget.
+    seen = _big_tool_model(monkeypatch, result_chars=8000, tool_calls=2)
 
     as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)
     conversation = client.post(
         f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
     ).json()
-    # Last measured prompt already far beyond 0.85 × 2048.
-    _seed_long_history(store, conversation["id"], last_prompt_tokens=5000)
 
     resp = client.post(
         f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
-        json={"content": "keep going"},
+        json={"content": "find anomalies"},
     )
     assert resp.status_code == 200
     events = _sse_events(resp)
-    compaction = next(e for e in events if e["type"] == "compaction")
-    assert compaction["reason"] == "threshold"
-    assert "summary" in compaction and compaction["summary"]
-    assert any(e["type"] == "done" for e in events)
+    assert next(e for e in events if e["type"] == "done")["content"] == "windowed answer"
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "fit"
+    assert window["stats"]["results_elided"] >= 1
 
-    async def _state():
-        conv = await store.get_agent_conversation(case_id, conversation["id"])
-        msgs = await store.list_agent_messages(conversation["id"])
-        audit = await store.query_audit(case_id=case_id)
-        return conv, msgs, audit
+    # Transparency: the model's last request carried the elision stub.
+    from pydantic_ai.messages import ToolReturnPart
 
-    conv, msgs, audit = asyncio.run(_state())
-    row = next(m for m in msgs if m.role == "compaction")
-    assert row.content == "a dense summary of turns 0-1"
-    assert row.tool_result["reason"] == "threshold"
-    # 3 user turns, 2 kept: only the first turn's 2 messages get folded.
-    assert row.tool_result["messages_summarized"] == 2
-    # Forensic trail: the exact pre-compaction wire blob rides on the row.
-    assert len(row.tool_result["pre_compaction_history"]) == 6
-    assert COMPACTION_MARKER in json.dumps(conv.history)
-    assert any(a.action == "agent.compaction" for a in audit)
-
-
-def test_send_message_overflow_compacts_and_retries(
-    client, admin_bootstrap, agent_on, store, monkeypatch
-):
-    """A provider 400 mentioning context length triggers compact-then-retry —
-    even without a configured context_window.
-
-    The stub turn calls no tool, so the tier drop is not a lever here (see
-    test_overflow_without_a_tiered_tool_goes_straight_to_compaction) and
-    compaction is the first thing tried."""
-    calls = _thinking_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
-
-    as_admin(client, admin_bootstrap)
-    case_id, timeline_id = _make_case_and_timeline(client)
-    conversation = client.post(
-        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
-    ).json()
-    _seed_long_history(store, conversation["id"])
-
-    resp = client.post(
-        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
-        json={"content": "keep going"},
-    )
-    assert resp.status_code == 200
-    events = _sse_events(resp)
-    compaction = next(e for e in events if e["type"] == "compaction")
-    assert compaction["reason"] == "overflow"
-    done = next(e for e in events if e["type"] == "done")
-    assert done["content"] == "post-compaction answer"
-    assert calls["stream"] == 2
-
-
-def test_overflow_drops_fidelity_before_spending_a_summarizer_call(
-    client, admin_bootstrap, agent_on, store, monkeypatch
-):
-    """Cheapest lever first.
-
-    Compaction summarizes *older* turns, so it cannot help a single broad turn
-    — the case that actually overflowed a 64k model (2026-07-20). Handing the
-    model less of each example record can, costs no LLM call, and re-runs the
-    tools through a fresh server rather than rewriting anything in history."""
-    calls = _tool_calling_model(
-        monkeypatch, overflow_body="maximum context length exceeded", fail_count=1
-    )
-
-    as_admin(client, admin_bootstrap)
-    case_id, timeline_id = _make_case_and_timeline(client)
-    conversation = client.post(
-        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
-    ).json()
-    # Long enough that compaction *would* have been possible — the point is
-    # that it is not what gets tried first.
-    _seed_long_history(store, conversation["id"])
-
-    resp = client.post(
-        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
-        json={"content": "keep going"},
-    )
-    assert resp.status_code == 200
-    events = _sse_events(resp)
-    fidelity = next(e for e in events if e["type"] == "fidelity")
-    # Default is "full", so one drop lands on "message".
-    assert fidelity["fidelity"] == "message"
-    assert fidelity["reason"] == "overflow"
-    assert not any(e["type"] == "compaction" for e in events)
-    assert next(e for e in events if e["type"] == "done")["content"] == "answer after the retry"
-    # Two requests per attempt (tool call, then answer) across two attempts.
-    assert calls["stream"] == 4
-
-    # The SSE event is gone on reload, so the drop is persisted the way a
-    # compaction is: a marker row (which also separates the re-run's tool rows
-    # from the failed attempt's) plus an audit row.
-    async def _record():
-        return (
-            await store.list_agent_messages(conversation["id"]),
-            await store.query_audit(case_id=case_id, action="agent.fidelity_drop"),
-        )
-
-    messages, audit = asyncio.run(_record())
-    markers = [m for m in messages if m.role == "fidelity"]
-    assert [m.tool_result for m in markers] == [
-        {"from": "full", "to": "message", "attempt": 0, "reason": "overflow"}
+    last_contents = [
+        part.content
+        for message in seen[-1]
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
     ]
-    assert "context window" in markers[0].content
-    assert [row.detail for row in audit] == [markers[0].tool_result]
+    assert any(isinstance(c, dict) and c.get("elided") is True for c in last_contents)
 
-
-def test_overflow_without_a_tiered_tool_goes_straight_to_compaction(
-    client, admin_bootstrap, agent_on, store, monkeypatch
-):
-    """A drop that cannot change the prompt is not a lever.
-
-    When the overflowed attempt fetched no event records, re-sending a
-    byte-identical request would only delay the compaction that can actually
-    help — so no `fidelity` event is emitted at all, even from the default
-    `full`."""
-    calls = _thinking_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
-
-    as_admin(client, admin_bootstrap)
-    case_id, timeline_id = _make_case_and_timeline(client)
-    conversation = client.post(
-        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
-    ).json()
-    _seed_long_history(store, conversation["id"])
-
-    resp = client.post(
-        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
-        json={"content": "keep going"},
-    )
-    assert resp.status_code == 200
-    events = _sse_events(resp)
-    assert not any(e["type"] == "fidelity" for e in events)
-    assert next(e for e in events if e["type"] == "compaction")["reason"] == "overflow"
-    assert calls["stream"] == 2
-
-    # A drop that never happened must not leave a record saying it did.
     async def _record():
         return (
             await store.list_agent_messages(conversation["id"]),
-            await store.query_audit(case_id=case_id, action="agent.fidelity_drop"),
+            await store.query_audit(case_id=case_id, action="agent.window"),
         )
 
     messages, audit = asyncio.run(_record())
-    assert not [m for m in messages if m.role == "fidelity"]
-    assert audit == []
+    rows = [m for m in messages if m.role == "window"]
+    assert len(rows) == 1
+    assert rows[0].tool_result["results_elided"] >= 1
+    assert rows[0].tool_result["reason"] == "fit"
+    assert "context window" in rows[0].content
+    assert [a.detail for a in audit] == [rows[0].tool_result]
 
 
-def test_send_message_overflow_with_nothing_to_compact(
+def test_no_window_and_no_overflow_leaves_no_trace(
     client, admin_bootstrap, agent_on, store, monkeypatch
 ):
-    """Overflow on an already-short conversation degrades to a specific,
-    friendly error — not the generic 'see server logs'. The stub turn calls no
-    tool, so there is no fidelity lever to spend either."""
-    _thinking_free_model(monkeypatch, fail_first_stream="prompt is too long: maximum tokens")
+    """Unset context_window + a turn that fits: no window events, no rows."""
+    _tool_free_model(monkeypatch)
 
     as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)
@@ -1937,15 +1793,243 @@ def test_send_message_overflow_with_nothing_to_compact(
     )
     assert resp.status_code == 200
     events = _sse_events(resp)
+    assert not any(e["type"] == "window" for e in events)
+
+    async def _record():
+        return (
+            await store.list_agent_messages(conversation["id"]),
+            await store.query_audit(case_id=case_id, action="agent.window"),
+        )
+
+    messages, audit = asyncio.run(_record())
+    assert not [m for m in messages if m.role == "window"]
+    assert audit == []
+
+
+def test_overflow_without_configured_window_retries_with_derived_budget(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A provider 400 mentioning context length with no context_window set:
+    the router derives a budget from the failed request's size, enables the
+    window, and re-runs the turn once."""
+    calls = _tool_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "overflow"
+    assert window["budget"] > 0
+    assert next(e for e in events if e["type"] == "done")["content"] == "answer after the retry"
+    assert calls["stream"] == 2
+
+    # The SSE event is gone on reload, so the retry is persisted: a marker row
+    # (which also separates the re-run's tool rows from the failed attempt's)
+    # plus an audit row.
+    async def _record():
+        return (
+            await store.list_agent_messages(conversation["id"]),
+            await store.query_audit(case_id=case_id, action="agent.window"),
+        )
+
+    messages, audit = asyncio.run(_record())
+    rows = [m for m in messages if m.role == "window"]
+    assert len(rows) == 1
+    assert rows[0].tool_result["reason"] == "overflow"
+    assert rows[0].tool_result["attempt"] == 0
+    assert rows[0].tool_result["budget"] == window["budget"]
+    assert "context window" in rows[0].content
+    assert [a.detail for a in audit] == [rows[0].tool_result]
+
+
+def test_overflow_with_configured_window_retries_tighter(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """When the window was already active and the provider still overflowed
+    (the estimate was too generous), the retry runs with a tighter budget."""
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "100000")
+    get_settings.cache_clear()
+    calls = _tool_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    from vestigo.agent.runtime import SYSTEM_PROMPT
+    from vestigo.agent.window import budget_for
+
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "overflow"
+    assert window["budget"] < budget_for(100000, SYSTEM_PROMPT)
+    assert any(e["type"] == "done" for e in events)
+    assert calls["stream"] == 2
+
+
+def test_second_overflow_gives_up_with_friendly_error(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """One reactive retry, not a ladder: a second overflow surfaces the
+    friendly context_overflow error instead of retrying forever."""
+    calls = _tool_free_model(
+        monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=2
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert sum(e["type"] == "window" for e in events) == 1
     error = next(e for e in events if e["type"] == "error")
     assert error["code"] == "context_overflow"
     assert "context window" in error["detail"]
-    assert not any(e["type"] == "compaction" for e in events)
+    assert calls["stream"] == 2
+
+
+def test_oversized_newest_result_is_truncated_not_lost(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A single tool result larger than the whole budget sits in the request
+    the window may not elide — it is truncated to a leading slice instead, so
+    the turn finishes rather than overflowing twice."""
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    get_settings.cache_clear()
+    seen = _big_tool_model(monkeypatch, result_chars=60_000, tool_calls=1)
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "find anomalies"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert next(e for e in events if e["type"] == "done")["content"] == "windowed answer"
+    window = next(e for e in events if e["type"] == "window")
+    assert window["stats"]["results_truncated"] >= 1
+
+    # The model saw the beginning of its own result, not a bare stub.
+    from pydantic_ai.messages import ToolReturnPart
+
+    contents = [
+        part.content
+        for message in seen[-1]
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    truncated = [c for c in contents if isinstance(c, dict) and c.get("truncated") is True]
+    assert truncated and truncated[0]["head"]
+
+    async def _rows():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_rows()) if m.role == "window"]
+    assert rows[0].tool_result["results_truncated"] >= 1
+    assert "truncated" in rows[0].content
+
+
+def test_learned_budget_is_reused_by_the_next_turn(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """With no context_window configured, the budget an overflow taught the
+    first turn seeds the next one — otherwise every turn repeats the same
+    failed round trip."""
+    calls = _tool_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+
+    budgets: list[int | None] = []
+    from vestigo.api.routers import agent as agent_router
+
+    real_stream_turn = agent_router.stream_turn
+
+    def _spy(*args, window_budget=None, **kwargs):
+        budgets.append(window_budget)
+        return real_stream_turn(*args, window_budget=window_budget, **kwargs)
+
+    monkeypatch.setattr(agent_router, "stream_turn", _spy)
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages"
+    first = _sse_events(client.post(url, json={"content": "keep going"}))
+    learned = next(e for e in first if e["type"] == "window")["budget"]
+
+    second = _sse_events(client.post(url, json={"content": "and again"}))
+    assert any(e["type"] == "done" for e in second)
+    # No second failed round trip: the retry attempt happened only in turn one.
+    assert calls["stream"] == 3
+    assert not any(e["type"] == "window" and e["reason"] == "overflow" for e in second)
+    # Turn 1 started unwindowed, retried with the derived budget, and turn 2
+    # started from that same budget.
+    assert budgets == [None, learned, learned]
+
+
+def test_get_last_window_budget_reads_only_overflow_rows(client, admin_bootstrap, agent_on, store):
+    """``fit`` rows report what a known budget did; only an ``overflow`` row
+    carries a budget learned from the provider."""
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    async def _exercise():
+        conversation_id = conversation["id"]
+        assert await store.get_last_window_budget(conversation_id) is None
+        await store.add_agent_message(
+            conversation_id, "window", "fit", tool_result={"reason": "fit", "budget": 999}
+        )
+        assert await store.get_last_window_budget(conversation_id) is None
+        await store.add_agent_message(
+            conversation_id, "window", "overflow", tool_result={"reason": "overflow", "budget": 100}
+        )
+        await store.add_agent_message(
+            conversation_id, "window", "overflow", tool_result={"reason": "overflow", "budget": 60}
+        )
+        # Newest overflow wins — the budget converges downwards as it retries.
+        return await store.get_last_window_budget(conversation_id)
+
+    assert asyncio.run(_exercise()) == 60
 
 
 def test_is_context_overflow_matches_known_phrasings_only():
     """The overflow heuristic must not fire on unrelated 400s — a false
-    positive burns a summarizer call and shows a misleading error."""
+    positive burns a retry and shows a misleading error."""
     from pydantic_ai.exceptions import ModelHTTPError
 
     from vestigo.api.routers.agent import _is_context_overflow
@@ -1960,7 +2044,7 @@ def test_is_context_overflow_matches_known_phrasings_only():
     assert _is_context_overflow(_exc("input is too long for requested model", status=413))
     assert _is_context_overflow(_exc("request exceeds the token limit"))
     # LiteLLM proxy wording, observed against a local model 2026-07-20. This
-    # one was a miss: it skipped compact-and-retry and lost the turn.
+    # one was a miss: it skipped the retry and lost the turn.
     assert _is_context_overflow(
         _exc(
             "litellm.BadRequestError: Custom_openaiException - request (81855 tokens) "
@@ -1976,17 +2060,48 @@ def test_is_context_overflow_matches_known_phrasings_only():
     assert not _is_context_overflow(_exc("maximum context length exceeded", status=500))
 
 
-def test_send_message_second_overflow_folds_to_one_turn(
+def test_overflow_window_hint_parses_provider_phrasings():
+    """The reactive budget's best source is the window the provider names in
+    its overflow error — per-provider phrasings, garbage numbers ignored."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from vestigo.api.routers.agent import _overflow_window_hint
+
+    def _exc(body: str) -> ModelHTTPError:
+        return ModelHTTPError(status_code=400, model_name="m", body=body)
+
+    # OpenAI / vLLM.
+    assert _overflow_window_hint(_exc("This model's maximum context length is 8192 tokens")) == 8192
+    # Anthropic.
+    assert (
+        _overflow_window_hint(_exc("prompt is too long: 210000 tokens > 200000 maximum")) == 200000
+    )
+    # llama.cpp behind LiteLLM (2026-07-20 phrasing).
+    assert (
+        _overflow_window_hint(
+            _exc(
+                "litellm.BadRequestError: Custom_openaiException - request (81855 tokens) "
+                "exceeds the available context size (65536 tokens), try increasing it."
+            )
+        )
+        == 65536
+    )
+    # No number in the body: no hint.
+    assert _overflow_window_hint(_exc("maximum context length exceeded")) is None
+    # A hint below the config floor is garbage, not a window.
+    assert _overflow_window_hint(_exc("This model's maximum context length is 12 tokens")) is None
+
+
+def test_overflow_with_provider_hint_derives_budget_from_reported_window(
     client, admin_bootstrap, agent_on, store, monkeypatch
 ):
-    """Overflow → compact keeping 2 turns → overflow again → compact keeping
-    1 turn → success. Both compactions land on the record with their
-    keep_turns, and re-run tool audit rows would carry the attempt tag.
-
-    The stub turn calls no tool, so the compaction schedule is the whole
-    ladder here; the tier drops are covered by the escalation test below."""
-    calls = _thinking_free_model(
-        monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=2
+    """When the overflow error names the model's window, the retry budget
+    comes from it (budget_for), not from the much smaller pre-turn history."""
+    calls = _tool_free_model(
+        monkeypatch,
+        fail_first_stream=(
+            "request (81855 tokens) exceeds the available context size (65536 tokens)"
+        ),
     )
 
     as_admin(client, admin_bootstrap)
@@ -1994,7 +2109,7 @@ def test_send_message_second_overflow_folds_to_one_turn(
     conversation = client.post(
         f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
     ).json()
-    _seed_long_history(store, conversation["id"], turns=4)
+    _seed_long_history(store, conversation["id"])
 
     resp = client.post(
         f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
@@ -2002,30 +2117,62 @@ def test_send_message_second_overflow_folds_to_one_turn(
     )
     assert resp.status_code == 200
     events = _sse_events(resp)
-    compactions = [e for e in events if e["type"] == "compaction"]
-    assert [e["reason"] for e in compactions] == ["overflow", "overflow"]
-    done = next(e for e in events if e["type"] == "done")
-    assert done["content"] == "post-compaction answer"
-    assert calls["stream"] == 3
+    from vestigo.agent.runtime import SYSTEM_PROMPT
+    from vestigo.agent.window import budget_for
 
-    async def _rows():
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "overflow"
+    assert window["budget"] == budget_for(65536, SYSTEM_PROMPT)
+    assert any(e["type"] == "done" for e in events)
+    assert calls["stream"] == 2
+
+    async def _record():
         return await store.list_agent_messages(conversation["id"])
 
-    rows = [m for m in asyncio.run(_rows()) if m.role == "compaction"]
-    assert [r.tool_result["keep_turns"] for r in rows] == [2, 1]
+    rows = [m for m in asyncio.run(_record()) if m.role == "window"]
+    assert len(rows) == 1
+    assert rows[0].tool_result["window_hint"] == 65536
+    assert rows[0].tool_result["budget"] == budget_for(65536, SYSTEM_PROMPT)
 
 
-def test_send_message_third_overflow_gives_up(
+def test_interrupted_turn_still_persists_window_row(
     client, admin_bootstrap, agent_on, store, monkeypatch
 ):
-    """After every escalation step the turn fails with the friendly
-    context_overflow error instead of retrying forever.
+    """A turn whose requests were reduced but that then dies mid-turn must
+    still leave the role="window" row — the case file has to answer "why is
+    there less here" even for turns that never finished."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.messages import ToolReturnPart
+    from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
-    The stub turn calls no tool, so only the compaction steps remain; the full
-    ladder (two tier drops, then two compactions) is covered by
-    test_overflow_exhausts_every_lever_in_order."""
-    calls = _thinking_free_model(
-        monkeypatch, fail_first_stream="maximum context length exceeded", fail_count=3
+    from vestigo.agent import runtime
+
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    get_settings.cache_clear()
+
+    server = FastMCP("stub")
+
+    @server.tool()
+    def run_anomaly_detector(detector: str = "value_novelty") -> dict:
+        return {"status": "ok", "blob": "x" * 8000}
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: server)
+
+    async def model_stream(messages, info):
+        returns = sum(
+            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+        )
+        if returns < 2:
+            yield {0: DeltaToolCall(name="run_anomaly_detector", json_args="{}")}
+            return
+        # By now the window has elided the first bulky result — then the turn
+        # dies on something unrelated to context.
+        raise RuntimeError("model backend fell over")
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
     )
 
     as_admin(client, admin_bootstrap)
@@ -2033,92 +2180,22 @@ def test_send_message_third_overflow_gives_up(
     conversation = client.post(
         f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
     ).json()
-    _seed_long_history(store, conversation["id"], turns=4)
 
     resp = client.post(
         f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
-        json={"content": "keep going"},
+        json={"content": "find anomalies"},
     )
     assert resp.status_code == 200
     events = _sse_events(resp)
-    assert sum(e["type"] == "compaction" for e in events) == 2
-    error = next(e for e in events if e["type"] == "error")
-    assert error["code"] == "context_overflow"
-    assert calls["stream"] == 3
+    assert any(e["type"] == "error" for e in events)
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "fit"
+    assert window["stats"]["results_elided"] >= 1
 
+    async def _record():
+        return await store.list_agent_messages(conversation["id"])
 
-def test_overflow_exhausts_every_lever_in_order(
-    client, admin_bootstrap, agent_on, store, monkeypatch
-):
-    """From the default `full`: two tier drops (no LLM call each), then the
-    two compactions, then the friendly error — cheapest lever first, and the
-    turn is never lost to a raw crash."""
-    calls = _tool_calling_model(
-        monkeypatch, overflow_body="maximum context length exceeded", fail_count=5
-    )
-
-    as_admin(client, admin_bootstrap)
-    case_id, timeline_id = _make_case_and_timeline(client)
-    conversation = client.post(
-        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
-    ).json()
-    _seed_long_history(store, conversation["id"], turns=4)
-
-    resp = client.post(
-        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
-        json={"content": "keep going"},
-    )
-    assert resp.status_code == 200
-    events = _sse_events(resp)
-    ladder = [e["type"] for e in events if e["type"] in {"fidelity", "compaction", "error"}]
-    assert ladder == ["fidelity", "fidelity", "compaction", "compaction", "error"]
-    assert [e["fidelity"] for e in events if e["type"] == "fidelity"] == ["message", "minimal"]
-    assert next(e for e in events if e["type"] == "error")["code"] == "context_overflow"
-    # Five attempts, each spending a tool-call request and an answer request.
-    assert calls["stream"] == 10
-
-
-@pytest.mark.asyncio
-async def test_get_last_agent_usage_ignores_pre_compaction_rows(store):
-    """Usage measured before a compaction describes the pre-compaction
-    history size — trusting it would re-compact an already-small history."""
-    await store.init_schema()
-    await store.create_case("c1", "Case 1")
-    conv = await store.create_agent_conversation("c1", "t1", "u1")
-
-    await store.add_agent_message(
-        conv.id, "assistant", "big answer", prompt_tokens=150_000, completion_tokens=900
-    )
-    assert await store.get_last_agent_usage(conv.id) == (150_000, 900)
-
-    await store.add_agent_message(conv.id, "compaction", "summary", tool_result={"reason": "x"})
-    assert await store.get_last_agent_usage(conv.id) == (None, None)
-
-    await store.add_agent_message(
-        conv.id, "assistant", "small answer", prompt_tokens=4_000, completion_tokens=200
-    )
-    assert await store.get_last_agent_usage(conv.id) == (4_000, 200)
-
-
-@pytest.mark.asyncio
-async def test_get_last_agent_usage_ignores_pre_fidelity_drop_rows(store):
-    """A tier drop invalidates a measurement for the same reason a compaction
-    does: the next request is a different size than the number describes —
-    every tool result from here on carries less. Trusting it would spend a
-    summarizer call the drop had already made unnecessary."""
-    await store.init_schema()
-    await store.create_case("c1", "Case 1")
-    conv = await store.create_agent_conversation("c1", "t1", "u1")
-
-    await store.add_agent_message(
-        conv.id, "assistant", "big answer", prompt_tokens=60_000, completion_tokens=400
-    )
-    assert await store.get_last_agent_usage(conv.id) == (60_000, 400)
-
-    await store.add_agent_message(
-        conv.id,
-        "fidelity",
-        "reduced from full to message",
-        tool_result={"from": "full", "to": "message", "attempt": 0, "reason": "overflow"},
-    )
-    assert await store.get_last_agent_usage(conv.id) == (None, None)
+    rows = [m for m in asyncio.run(_record()) if m.role == "window"]
+    assert len(rows) == 1
+    assert rows[0].tool_result["reason"] == "fit"
+    assert rows[0].tool_result["results_elided"] >= 1

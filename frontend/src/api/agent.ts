@@ -252,10 +252,13 @@ export interface AgentConversation {
 export interface AgentMessage {
   id: string;
   conversation_id: string;
-  /** `compaction` and `fidelity` are marker rows: one degradation the runtime
-   * applied mid-turn before re-running it. They also separate a retry's
-   * re-executed tool rows from the attempt before it. */
-  role: "user" | "assistant" | "tool" | "thinking" | "compaction" | "fidelity";
+  /** `window` is a marker row: what the sliding context window did to the
+   * turn (results elided / turns dropped), or that an overflowed turn was
+   * re-run under a derived budget — the overflow marker also separates a
+   * retry's re-executed tool rows from the attempt before it. `compaction`
+   * and `fidelity` are historical marker rows from the retired mechanisms it
+   * replaced; old transcripts still carry them. */
+  role: "user" | "assistant" | "tool" | "thinking" | "window" | "compaction" | "fidelity";
   content: string;
   tool_name: string | null;
   tool_args: Record<string, unknown> | null;
@@ -292,21 +295,31 @@ export interface AgentInfo {
   provider: string;
   api_base_url: string | null;
   context_window: number | null;
-  compact_threshold: number | null;
   tools: AgentToolInfo[];
   user_disabled_tools: string[];
 }
 
-/** The tiers `src/vestigo/agent/fidelity.py::Fidelity` can retry down to.
- * `auto` is a resolution mode, not a tier, so it never reaches the stream. */
-export type AgentFidelity = "full" | "message" | "minimal";
+/** What the sliding context window did across one turn's requests
+ * (`src/vestigo/agent/window.py::WindowStats`). */
+export interface AgentWindowStats {
+  budget: number;
+  results_elided: number;
+  /** Newest-request results cut to a leading slice — the last-resort pass. */
+  results_truncated: number;
+  turns_dropped: number;
+  estimated_before: number;
+  estimated_after: number;
+}
 
 export type AgentStreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "thinking_delta"; text: string }
   | { type: "thinking"; text: string }
-  | { type: "compaction"; summary: string; reason?: string }
-  | { type: "fidelity"; fidelity: AgentFidelity; reason?: string }
+  /** reason "fit": the window elided older results mid-turn (stats attached).
+   * reason "overflow": the provider still overflowed and the turn is being
+   * re-run under the given budget. */
+  | { type: "window"; reason: "fit"; stats: AgentWindowStats }
+  | { type: "window"; reason: "overflow"; budget: number }
   | { type: "tool_call"; tool_call_id: string; tool: string; args: Record<string, unknown> }
   | { type: "tool_result"; tool_call_id: string; tool: string; result: unknown }
   | {

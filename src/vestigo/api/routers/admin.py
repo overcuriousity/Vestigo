@@ -36,7 +36,6 @@ _AGENT_SETTINGS_FIELDS: tuple[str, ...] = (
     "max_turns",
     "reasoning_effort",
     "context_window",
-    "compact_threshold",
     "tool_fidelity",
     "disabled_tools",
 )
@@ -528,7 +527,6 @@ class AgentSettingsUpdate(BaseModel):
     max_turns: int | None = Field(default=None, ge=1, le=100)
     reasoning_effort: str | None = None
     context_window: int | None = Field(default=None, ge=1024, le=10_000_000)
-    compact_threshold: float | None = Field(default=None, gt=0.1, lt=1.0)
     tool_fidelity: str | None = None
     disabled_tools: list[str] | None = None
 

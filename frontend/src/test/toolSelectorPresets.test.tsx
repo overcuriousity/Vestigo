@@ -74,7 +74,6 @@ describe("ToolSelectorPopover presets", () => {
       provider: "openai",
       api_base_url: "http://x",
       context_window: 32000,
-      compact_threshold: 0.8,
       tools: TOOLS,
       user_disabled_tools: [],
     });
@@ -115,7 +114,6 @@ describe("ToolSelectorPopover presets", () => {
       provider: "openai",
       api_base_url: "http://x",
       context_window: 32000,
-      compact_threshold: 0.8,
       tools: TOOLS.map(({ tier: _tier, ...t }) => t),
       user_disabled_tools: [],
     });

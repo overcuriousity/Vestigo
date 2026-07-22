@@ -24,20 +24,23 @@ event (a megabyte of JSON in one attribute), which is an input-shape risk
 unrelated to the model's window, and have never been implicated in an overflow.
 
 **Determinism is the design constraint.** The tier is a function of static
-configuration and the retry attempt number — never of what already ran in this
-turn. A running per-turn budget would be more adaptive and would make identical
+configuration alone — never of what already ran in this turn. A running per-turn budget would be more adaptive and would make identical
 calls return different data depending on call order, with nothing in the
 exported conversation to explain the difference. Forensic reproducibility
 (``CLAUDE.md``) means replaying a conversation's tool calls under the same
 configuration must produce byte-identical results, so this module has no state.
 
-See ``docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md``.
+The tier is static per conversation: overflow handling is the sliding
+window's job (``agent/window.py``), which elides old results in place instead
+of re-running the turn at a lower tier (the retired "overflow ladder").
+
+See ``docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md``
+and ``docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md``.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection
 from enum import StrEnum
 
 logger = logging.getLogger(__name__)
@@ -47,10 +50,7 @@ __all__ = [
     "FIDELITY_TIERED_TOOLS",
     "FIDELITY_VALUES",
     "DEFAULT_FIDELITY",
-    "MAX_FIDELITY_DROPS",
     "resolve_fidelity",
-    "degrade",
-    "next_tier",
 ]
 
 
@@ -63,10 +63,7 @@ class Fidelity(StrEnum):
 
 
 #: The tools whose payloads honour ``AgentScope.fidelity`` — those that return
-#: *many* event records, where a tier drop actually shrinks the prompt. The
-#: router consults this before spending an overflow retry on a drop
-#: (:func:`next_tier`): an overflow on a turn that called none of these cannot
-#: be helped by one, and must fall through to compaction instead.
+#: *many* event records, where the tier meaningfully shrinks the prompt.
 #:
 #: ``get_event`` and ``get_event_annotations`` are deliberately absent. They
 #: fetch one record on purpose, and they are the escape hatch every reduced
@@ -89,9 +86,9 @@ FIDELITY_VALUES = (*(f.value for f in Fidelity), "auto")
 
 #: Unset means "no constraint declared". An operator who has not told us the
 #: model is small is assumed to be on a cloud model with a large window, and
-#: gets the richest results; the overflow backstop (a retry one tier down,
-#: costing a round trip rather than the turn) catches the ones who were wrong.
-#: `"message"` or `"auto"` are the settings for a small local model.
+#: gets the richest results; the sliding window (``agent/window.py``) and its
+#: reactive overflow retry catch the ones who were wrong. `"message"` or
+#: `"auto"` are the settings for a small local model.
 DEFAULT_FIDELITY = Fidelity.FULL
 
 #: Below this many tokens, ``auto`` stops serving inline example events. A
@@ -105,13 +102,6 @@ AUTO_FULL_MIN_WINDOW = 100_000
 #: fields fit, and the model reaches for ``get_event`` on the few findings it
 #: actually pursues.
 AUTO_MESSAGE_MIN_WINDOW = 32_000
-
-_ORDER = (Fidelity.FULL, Fidelity.MESSAGE, Fidelity.MINIMAL)
-
-#: How many times :func:`degrade` can drop before bottoming out — the overflow
-#: ladder's share of the retry budget, derived here so the router's attempt
-#: bound cannot drift from the tier table.
-MAX_FIDELITY_DROPS = len(_ORDER) - 1
 
 
 def resolve_fidelity(setting: str | None, context_window: int | None) -> Fidelity:
@@ -159,30 +149,3 @@ def resolve_fidelity(setting: str | None, context_window: int | None) -> Fidelit
                 "Unrecognised tool_fidelity %r — falling back to %s", setting, DEFAULT_FIDELITY
             )
         return DEFAULT_FIDELITY
-
-
-def degrade(tier: Fidelity) -> Fidelity | None:
-    """The next tier down, or None when there is nothing left to give up.
-
-    Drives the overflow backstop: dropping a tier and re-running the turn costs
-    a round trip and no summarizer call, so it is tried before compaction —
-    which cannot help a single-turn overflow at all, having nothing older to
-    fold.
-    """
-    index = _ORDER.index(tier)
-    return _ORDER[index + 1] if index + 1 < len(_ORDER) else None
-
-
-def next_tier(current: Fidelity, tools_used: Collection[str]) -> Fidelity | None:
-    """The tier to retry an overflowed attempt at, or None to stop trying.
-
-    ``tools_used`` is the set of tools that actually returned a result during
-    the attempt that overflowed. A drop only changes the prompt if one of them
-    honours the tier (:data:`FIDELITY_TIERED_TOOLS`), so an overflow on a turn
-    that called none — a long conversation with no event payloads in it — must
-    fall straight through to compaction rather than burning two provider round
-    trips re-sending a byte-identical request.
-    """
-    if not FIDELITY_TIERED_TOOLS.intersection(tools_used):
-        return None
-    return degrade(current)

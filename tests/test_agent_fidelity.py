@@ -1,9 +1,9 @@
 """Tool-result fidelity: tier resolution, deflation per tier, determinism.
 
 The design constraint under test is reproducibility (`CLAUDE.md`): the tier is
-a function of static configuration and the retry attempt, never of what already
-ran in the turn, so replaying a conversation's tool calls under the same config
-returns byte-identical payloads. See
+a function of static configuration alone, never of what already ran in the
+turn, so replaying a conversation's tool calls under the same config returns
+byte-identical payloads. See
 `docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md`.
 """
 
@@ -19,10 +19,7 @@ from vestigo.agent.fidelity import (
     DEFAULT_FIDELITY,
     FIDELITY_TIERED_TOOLS,
     FIDELITY_VALUES,
-    MAX_FIDELITY_DROPS,
     Fidelity,
-    degrade,
-    next_tier,
     resolve_fidelity,
 )
 from vestigo.agent.tools import (
@@ -119,39 +116,8 @@ def test_every_accepted_setting_resolves():
         assert isinstance(resolve_fidelity(value, 128_000), Fidelity)
 
 
-def test_degrade_walks_down_once_and_bottoms_out():
-    assert degrade(Fidelity.FULL) is Fidelity.MESSAGE
-    assert degrade(Fidelity.MESSAGE) is Fidelity.MINIMAL
-    assert degrade(Fidelity.MINIMAL) is None
-
-
-def test_max_drops_matches_the_tier_table():
-    """The router sizes its retry budget from this rather than a literal."""
-    assert len(list(Fidelity)) - 1 == MAX_FIDELITY_DROPS
-
-
-# --- when a drop is worth an attempt ---------------------------------------
-
-
-def test_next_tier_drops_when_a_tiered_tool_ran():
-    assert next_tier(Fidelity.FULL, {"list_fields", "search_events"}) is Fidelity.MESSAGE
-    assert next_tier(Fidelity.MESSAGE, {"run_anomaly_detector"}) is Fidelity.MINIMAL
-
-
-def test_next_tier_refuses_when_a_drop_cannot_change_the_prompt():
-    """An overflow on a turn that fetched no event records is a history
-    problem: re-sending a byte-identical request only delays the compaction
-    that can actually help."""
-    assert next_tier(Fidelity.FULL, set()) is None
-    assert next_tier(Fidelity.FULL, {"list_fields", "get_event", "list_annotations"}) is None
-
-
-def test_next_tier_bottoms_out_even_with_tiered_tools():
-    assert next_tier(Fidelity.MINIMAL, {"search_events"}) is None
-
-
 def test_tiered_tools_are_real_tools():
-    """A typo here would silently disable the cheapest overflow lever."""
+    """A typo here would silently exempt a bulky tool from the tier."""
     assert FIDELITY_TIERED_TOOLS <= TOOL_NAMES
     # The escape hatch the reduced payloads point at must never be tiered.
     assert "get_event" not in FIDELITY_TIERED_TOOLS

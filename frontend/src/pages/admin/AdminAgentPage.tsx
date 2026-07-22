@@ -34,7 +34,6 @@ interface FormState {
   max_turns: string;
   reasoning_effort: string;
   context_window: string;
-  compact_threshold: string;
   tool_fidelity: string;
   /** Sorted tool names the admin has hard-denied. */
   disabled_tools: string[];
@@ -49,7 +48,6 @@ const EMPTY_FORM: FormState = {
   max_turns: "",
   reasoning_effort: "",
   context_window: "",
-  compact_threshold: "",
   tool_fidelity: "",
   disabled_tools: [],
 };
@@ -68,7 +66,6 @@ function toFormState(effective: Record<string, unknown>): FormState {
     max_turns: str(effective.max_turns),
     reasoning_effort: str(effective.reasoning_effort),
     context_window: str(effective.context_window),
-    compact_threshold: str(effective.compact_threshold),
     tool_fidelity: str(effective.tool_fidelity),
     disabled_tools: Array.isArray(effective.disabled_tools)
       ? [...(effective.disabled_tools as string[])].sort()
@@ -123,18 +120,6 @@ function buildPatch(
   if (form.tool_fidelity !== baseline.tool_fidelity) {
     patch.tool_fidelity = form.tool_fidelity || null;
   }
-  if (form.compact_threshold !== baseline.compact_threshold) {
-    if (form.compact_threshold === "") {
-      patch.compact_threshold = null;
-    } else {
-      const n = Number(form.compact_threshold);
-      if (!Number.isFinite(n) || n <= 0.1 || n >= 1) {
-        return { patch: {}, error: "Compaction threshold must be between 0.1 and 1 (exclusive)." };
-      }
-      patch.compact_threshold = n;
-    }
-  }
-
   if (JSON.stringify(form.disabled_tools) !== JSON.stringify(baseline.disabled_tools)) {
     patch.disabled_tools = form.disabled_tools.length > 0 ? form.disabled_tools : null;
   }
@@ -509,27 +494,13 @@ export function AdminAgentPage() {
             value={form.context_window}
             disabled={isEnvPinned("context_window")}
             onChange={(e) => set("context_window")(e.target.value)}
-            placeholder="e.g. 200000 — empty disables auto-compaction"
+            placeholder="e.g. 65536 — empty = reactive-only"
           />
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-            The model's context window. When set, long conversations are automatically
-            summarized ("compacted") before they overflow it. Empty = compaction off.
-          </p>
-        </Field>
-
-        <Field label="Compaction threshold" pinnedBadge={pinnedBadge("compact_threshold")}>
-          <Input
-            type="number"
-            min={0.11}
-            max={0.99}
-            step={0.05}
-            value={form.compact_threshold}
-            disabled={isEnvPinned("compact_threshold")}
-            onChange={(e) => set("compact_threshold")(e.target.value)}
-            placeholder="0.85"
-          />
-          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-            Compaction triggers when the estimated prompt reaches threshold × context window.
+            The model's context window. When set, older tool results are elided from what the
+            model sees before a request can overflow it (the full transcript is always
+            preserved). Empty = the window only engages after an overflow, costing one failed
+            round trip.
           </p>
         </Field>
 

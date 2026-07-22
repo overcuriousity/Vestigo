@@ -32,7 +32,6 @@ import {
   type AgentFilterSpec,
   type AgentMessage,
   type AgentProposal,
-  type AgentFidelity,
   type AgentStreamEvent,
 } from "@/api/agent";
 import { useAgentStore } from "@/stores/agent";
@@ -68,8 +67,19 @@ type ChatItem =
     }
   | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
   | { kind: "thinking"; content: string; streaming?: boolean }
+  /** Historical marker rows from the retired compaction/fidelity mechanisms —
+   * old transcripts still carry them, so they still render. */
   | { kind: "compaction"; summary: string }
-  | { kind: "fidelity"; fidelity: AgentFidelity }
+  | { kind: "fidelity"; fidelity: string }
+  /** The sliding context window acted: elided older results mid-turn ("fit")
+   * or re-ran an overflowed turn under a derived budget ("overflow"). */
+  | {
+      kind: "window";
+      reason: "fit" | "overflow";
+      resultsElided: number;
+      resultsTruncated: number;
+      turnsDropped: number;
+    }
   | {
       kind: "finding";
       title: string;
@@ -115,10 +125,24 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
     } else if (m.role === "compaction") {
       items.push({ kind: "compaction", summary: m.content });
     } else if (m.role === "fidelity") {
-      // The tier the turn was re-run at — the drop row's `to`, same value the
-      // live SSE `fidelity` event carried.
-      const drop = m.tool_result as { to?: AgentFidelity } | null;
+      // Historical rows: the tier the turn was re-run at (drop row's `to`).
+      const drop = m.tool_result as { to?: string } | null;
       if (drop?.to) items.push({ kind: "fidelity", fidelity: drop.to });
+    } else if (m.role === "window") {
+      const stats = m.tool_result as {
+        reason?: "fit" | "overflow";
+        results_elided?: number;
+        results_truncated?: number;
+        turns_dropped?: number;
+      } | null;
+      items.push({
+        kind: "window",
+        reason: stats?.reason === "overflow" ? "overflow" : "fit",
+        resultsElided: stats?.results_elided ?? 0,
+        // Absent on rows written before the truncation pass existed.
+        resultsTruncated: stats?.results_truncated ?? 0,
+        turnsDropped: stats?.turns_dropped ?? 0,
+      });
     } else if (m.role === "assistant") {
       if (m.content) {
         items.push({
@@ -233,24 +257,41 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
   const flushed: ChatItem[] = s.liveText
     ? [...s.items, { kind: "assistant", content: s.liveText }]
     : s.items;
-  if (e.type === "compaction") {
-    // A compaction mid-turn means the failed attempt is being retried — its
-    // partial thinking will be re-streamed, so drop the stale deltas too.
+  if (e.type === "window") {
+    if (e.reason === "overflow") {
+      // The overflowed attempt is being re-run — its partial text/thinking
+      // will be re-streamed, so drop the stale deltas.
+      return {
+        ...s,
+        items: [
+          ...flushed,
+          {
+            kind: "window",
+            reason: "overflow",
+            resultsElided: 0,
+            resultsTruncated: 0,
+            turnsDropped: 0,
+          },
+        ],
+        liveText: "",
+        liveThinking: "",
+      };
+    }
+    // "fit": informational — the turn continued and this arrives just before
+    // done, so nothing streamed gets dropped.
     return {
       ...s,
-      items: [...flushed, { kind: "compaction", summary: e.summary }],
+      items: [
+        ...flushed,
+        {
+          kind: "window",
+          reason: "fit",
+          resultsElided: e.stats.results_elided,
+          resultsTruncated: e.stats.results_truncated ?? 0,
+          turnsDropped: e.stats.turns_dropped,
+        },
+      ],
       liveText: "",
-      liveThinking: "",
-    };
-  }
-  if (e.type === "fidelity") {
-    // Same shape as a compaction: the attempt that overflowed is being
-    // retried, so its partial text/thinking will be re-streamed.
-    return {
-      ...s,
-      items: [...flushed, { kind: "fidelity", fidelity: e.fidelity }],
-      liveText: "",
-      liveThinking: "",
     };
   }
   if (e.type === "tool_call") {
@@ -815,6 +856,21 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 <span>
                   Results did not fit the model's context window — retried with less
                   detail per event ({item.fidelity}).
+                </span>
+              </div>
+            );
+          }
+          if (item.kind === "window") {
+            return (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+              >
+                <Minimize2 size={11} className="shrink-0" />
+                <span>
+                  {item.reason === "overflow"
+                    ? "The request exceeded the model's context window — retrying with older tool results elided."
+                    : `Older tool results were elided to fit the model's context window (${item.resultsElided} elided${item.resultsTruncated ? `, ${item.resultsTruncated} truncated` : ""}${item.turnsDropped ? `, ${item.turnsDropped} turns dropped` : ""}). The full record is preserved in the transcript.`}
                 </span>
               </div>
             );

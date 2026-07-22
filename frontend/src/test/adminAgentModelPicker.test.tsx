@@ -37,7 +37,6 @@ function settings(over: Record<string, unknown> = {}) {
       max_turns: 15,
       reasoning_effort: "off",
       context_window: null,
-      compact_threshold: null,
       disabled_tools: [],
       ...over,
     },

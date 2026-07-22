@@ -14,7 +14,6 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
-    Float,
     ForeignKey,
     Index,
     Integer,
@@ -359,10 +358,9 @@ class AgentSettingsRow(Base):
     extra_headers: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     max_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # Auto-compaction: model context window in tokens (None = compaction off)
-    # and the fraction of it at which history gets summarized.
+    # Model context window in tokens, driving the sliding window
+    # (agent/window.py; None = reactive-only).
     context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    compact_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
     # How much of an example record tool results carry (agent/fidelity.py).
     tool_fidelity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Admin hard-deny tool list — removed from the tool server for the in-app
@@ -392,7 +390,6 @@ class AgentSettingsRow(Base):
             "max_turns": self.max_turns,
             "reasoning_effort": self.reasoning_effort,
             "context_window": self.context_window,
-            "compact_threshold": self.compact_threshold,
             "tool_fidelity": self.tool_fidelity,
             "disabled_tools": self.disabled_tools,
             "updated_by": self.updated_by,
@@ -1073,27 +1070,23 @@ class AgentConversation(Base):
         }
 
 
-#: The ``AgentMessage.role`` values that mark a mid-turn degradation rather
-#: than a step of the conversation. Both invalidate any usage measured before
-#: them (see :meth:`PostgresStore.get_last_agent_usage`), because the request
-#: that follows is a different size than that measurement describes.
-_AGENT_MARKER_ROLES = ("compaction", "fidelity")
-
-
 class AgentMessage(Base):
     """One human-readable step of an agent conversation.
 
     ``role`` is ``user`` | ``assistant`` | ``tool`` | ``thinking`` |
-    ``compaction`` | ``fidelity``. Tool rows carry the tool name, its exact
-    arguments and a result summary — the auditable record of what the agent
-    actually queried. Append-only, like ``AuditLog``.
+    ``window``. Tool rows carry the tool name, its exact arguments and a
+    result summary — the auditable record of what the agent actually queried.
+    Append-only, like ``AuditLog``.
 
-    ``compaction`` and ``fidelity`` are *marker* rows: each records one
-    degradation the runtime applied mid-turn before re-running it
-    (``api/routers/agent.py``). They also delimit attempts — a tool row
-    repeating after a marker is that same call re-executed by the retry, not a
-    duplicate, which is the distinction the ``attempt`` tag draws on the
-    matching ``agent.tool_call`` audit rows.
+    ``window`` is a *marker* row: it records what the sliding context window
+    did to a turn's requests (results elided / turns dropped), or that an
+    overflowed turn was re-run under a derived budget
+    (``api/routers/agent.py``). An overflow marker also delimits attempts — a
+    tool row repeating after it is that same call re-executed by the retry,
+    not a duplicate, which is the distinction the ``attempt`` tag draws on the
+    matching ``agent.tool_call`` audit rows. (Historical transcripts may still
+    carry ``compaction`` and ``fidelity`` marker rows from the retired
+    mechanisms these replaced.)
     """
 
     __tablename__ = "agent_messages"
@@ -1598,7 +1591,7 @@ class PostgresStore:
 
     async def list_cases_for_user(self, user_id: str, team_ids: list[str]) -> list[Case]:
         """Return cases visible to a non-admin user: their own, plus their teams'."""
-        from sqlalchemy import and_, or_, select
+        from sqlalchemy import or_, select
 
         # Owner match only applies to personal (team-less) cases — a team
         # case is governed entirely by current membership (see
@@ -3300,47 +3293,37 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
-    async def get_last_agent_usage(self, conversation_id: str) -> tuple[int | None, int | None]:
-        """Return the latest assistant row's measured (prompt, completion) tokens.
+    async def get_last_window_budget(self, conversation_id: str) -> int | None:
+        """The budget an earlier turn learned from a provider context overflow.
 
-        (None, None) when no assistant row has measured usage yet — the
-        compaction estimator then falls back to a size-based heuristic. Usage
-        measured *before* a marker row (``compaction`` or ``fidelity``) is
-        ignored the same way, because a marker means the next request is a
-        different size than the measurement describes: a compaction shrank the
-        history, and a fidelity drop shrank every tool result the turn will
-        carry. Trusting a stale measurement re-triggers the threshold check on
-        an already-degraded conversation — folding a summary stub into a
-        summary-of-a-summary, or spending a summarizer call the tier drop had
-        already made unnecessary.
+        Only ``reason="overflow"`` window rows carry a learned budget — a
+        ``"fit"`` row just reports what an already-known budget did. Returning
+        the newest one lets a deployment that configured no ``context_window``
+        pay the failed round trip once per conversation instead of once per
+        turn (``api/routers/agent.py``); a budget that overflowed again is
+        itself tightened and re-persisted, so the value converges.
+
+        The reason lives inside a JSON column, and JSON-path predicates are not
+        portable across Postgres and the SQLite the tests run on, so a bounded
+        slice of recent window rows is filtered here instead.
         """
         async with self.session_factory() as session:
             result = await session.execute(
-                select(
-                    AgentMessage.role,
-                    AgentMessage.prompt_tokens,
-                    AgentMessage.completion_tokens,
-                )
+                select(AgentMessage.tool_result)
                 .where(
                     AgentMessage.conversation_id == conversation_id,
-                    or_(
-                        AgentMessage.role.in_(_AGENT_MARKER_ROLES),
-                        and_(
-                            AgentMessage.role == "assistant",
-                            AgentMessage.prompt_tokens.is_not(None),
-                        ),
-                    ),
+                    AgentMessage.role == "window",
                 )
-                # One row per turn and microsecond timestamps — created_at
-                # alone is a sufficient order here (ids are UUIDs, not
-                # chronological, so they'd be a misleading tiebreaker).
-                .order_by(AgentMessage.created_at.desc())
-                .limit(1)
+                .order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc())
+                .limit(20)
             )
-            row = result.first()
-            if row is None or row[0] in _AGENT_MARKER_ROLES:
-                return (None, None)
-            return (row[1], row[2])
+            for (detail,) in result.all():
+                if not isinstance(detail, dict) or detail.get("reason") != "overflow":
+                    continue
+                budget = detail.get("budget")
+                if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+                    return budget
+            return None
 
     # ------------------------------------------------------------------
     # Agent proposals (A1)

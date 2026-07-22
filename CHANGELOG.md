@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-07-22
+
+### Added
+
+- **Sliding context window for the AI agent** (`src/vestigo/agent/window.py`).
+  Applied before *every* model request — mid-turn included — via pydantic-ai's
+  `ProcessHistory` capability: oldest tool-result contents are replaced by
+  visible elision stubs until the estimated prompt fits the budget, then whole
+  oldest turns are replaced by a marker pair, and — last resort — the newest
+  request's oversized results are truncated to a leading slice, the one case
+  neither other pass can touch. Deterministic (pure function of
+  history + budget, so replays reproduce it exactly), transparent to the model
+  (the system prompt explains recovery via `get_event` / narrower re-runs),
+  and applied at send time only — the stored transcript stays complete.
+  Driven by `context_window`; with it unset, a provider overflow enables the
+  window reactively and re-runs the turn once — the budget comes from the
+  window the provider names in its error body when present (OpenAI /
+  Anthropic / llama.cpp phrasings), else from the estimated pre-turn history
+  size. A budget learned that way is reused by the conversation's next turn
+  (`PostgresStore.get_last_window_budget`), so an unconfigured deployment pays
+  the failed round trip once rather than every turn. Every reduced turn —
+  finished, stopped, or interrupted — persists a `role="window"` transcript
+  row plus an `agent.window` audit row, carrying the turn's single largest
+  reduction.
+
+### Removed
+
+- **LLM history compaction** (`agent/compaction.py`) and the
+  `compact_threshold` setting (env `VESTIGO_AGENT_COMPACT_THRESHOLD`, admin
+  field, DB column — migration `0015`). The summarizer ran on the same
+  possibly-small investigation model and its output was nondeterministic;
+  the window's turn-dropping covers its niche.
+- **The fidelity overflow ladder** (drop a tier, re-run the whole turn). The
+  static `tool_fidelity` setting (`full`/`message`/`minimal`/`auto`) stays —
+  it still shapes tool results up front; overflow handling is now the
+  window's job alone. Historical `compaction`/`fidelity` transcript rows from
+  both retired mechanisms still render read-only in the agent panel.
+
 ## [1.4.5] — 2026-07-22
 
 ### Fixed
