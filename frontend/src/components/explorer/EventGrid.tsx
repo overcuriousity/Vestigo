@@ -74,7 +74,10 @@ interface Props {
    * A "located" event that is only present because the user jumped to it — the
    * current view (routine/mute collapse or an active filter) would otherwise
    * hide it. Rendered visually distinct so the analyst sees it is normally
-   * hidden here. `null` when the located event is a normal, visible row.
+   * hidden here — deliberately independent of the expanded/selected states,
+   * since a jump auto-expands its target and the marker must not disappear
+   * exactly when it matters most. `null` when the located event is a normal,
+   * visible row.
    */
   locatedHiddenId?: string | null;
 }
@@ -898,11 +901,15 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                         : "hover:bg-[var(--color-bg-hover)]",
                   hasAnomaly && !isSelected && !isExpanded &&
                     "border-l-2 border-l-[var(--color-anomaly)]/50",
-                  // "Normally hidden" located row: a dashed edge + faint tint
-                  // marks it as an exception to the current view. Kept subtle
-                  // so it doesn't compete with the expanded/selection styling.
-                  isLocatedHidden && !isExpanded && !isSelected &&
-                    "border-l-2 border-dashed border-l-[var(--color-fg-muted)] bg-[var(--color-fg-muted)]/10",
+                  // "Normally hidden" located row: a dashed edge + inset ring
+                  // marks it as an exception to the current view. Deliberately
+                  // *not* gated on !isExpanded/!isSelected — a jump auto-expands
+                  // its target, so gating would hide the marker at the one
+                  // moment it matters. A ring layers over any row background
+                  // instead of competing with it, and the right padding keeps
+                  // the last column's text out from under the pill below.
+                  isLocatedHidden &&
+                    "border-l-2 border-dashed border-l-[var(--color-fg-muted)] ring-1 ring-inset ring-[var(--color-fg-muted)]/40 pr-20",
                 )}
               >
                 {isLocatedHidden && (

@@ -21,9 +21,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct position and rendered visually distinct as "normally hidden". The
   same seek path drove the "preserve scroll position when adding a filter"
   soft-anchor, which silently reset the grid to the top under collapse for the
-  same reason — both now compose the seed key through the shared
-  `computeEffectiveFilters` helper. Analysis-panel jump-to-time shares the new
-  behaviour.
+  same reason — both now compose the seed key the way the live query does:
+  URL-round-tripped filters through the shared `computeEffectiveFilters`
+  helper, never a hand-rolled object. Analysis-panel jump-to-time shares the
+  new behaviour.
+
+  Follow-up review hardened the same seam:
+  - **Applying an agent finding keeps your scroll position.** The finding's
+    filter set carries `ids`/`collapseRoutine`, which the URL deliberately
+    drops and which are set in the same React batch as the filter change, so
+    the soft anchor seeded a key the grid never read and the timeline snapped
+    to the top. The overlays are now threaded into `setFilters` explicitly.
+  - **"Locate" no longer loses its target to a late soft anchor.** Both paths
+    now seed the same query key, so a scroll-preserving fetch still in flight
+    could land after the located page and overwrite it.
+  - **The "normally hidden" marker expires with the view that hid it** —
+    revealing routine events (or any other overlay change) clears it instead of
+    leaving a row asserting something no longer true — and it stays visible
+    while the located row is expanded or selected, which is exactly when a jump
+    leaves it.
+  - Clearing your last filter chip now preserves scroll position like every
+    other filter change, and the "back to filtered view" breadcrumb describes
+    what actually produces it (a context query, not a jump).
 
 ## [1.4.4] — 2026-07-21
 
