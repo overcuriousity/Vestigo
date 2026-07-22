@@ -8,7 +8,7 @@
  */
 import type { ChartType, Scale } from "./chartConfig";
 
-export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter";
+export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr";
 
 export const CHART_META: Record<
   ChartType,
@@ -23,6 +23,13 @@ export const CHART_META: Record<
     supportsCompare: boolean;
     /** Two-field charts (pivot/sankey/scatter) need a second field picked. */
     requiresSecondField: boolean;
+    /** Single-field charts that ALSO accept an optional grouping field
+     * (box/violin: numeric response × categorical group). */
+    acceptsSecondField: boolean;
+    /** Charts a LIST of fields (correlation matrix) instead of field/fieldY. */
+    multiField: boolean;
+    /** Can be drawn once per value of a categorical field (small multiples). */
+    supportsFacet: boolean;
   }
 > = {
   // Event count over time needs no field, so it is meaningful whatever scale the
@@ -35,6 +42,9 @@ export const CHART_META: Record<
     readsOptions: ["buckets"],
     supportsCompare: true,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: true,
   },
   bar: {
     label: "Bar",
@@ -44,6 +54,9 @@ export const CHART_META: Record<
     readsOptions: ["topN", "orientation", "sort", "logScale"],
     supportsCompare: true,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: true,
   },
   // pie/box/violin/ecdf have no honest two-layer encoding, so they are left without
   // supportsCompare — the rail hides Compare for them.
@@ -55,6 +68,23 @@ export const CHART_META: Record<
     readsOptions: ["topN"],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: true,
+  },
+  // Same terms aggregation as bar/pie — switching between them refetches nothing. Preferred
+  // over pie once there are five or more categories: counting cells beats judging angles.
+  waffle: {
+    label: "Waffle (10×10 share grid)",
+    scales: ["nominal"],
+    dataKind: "terms",
+    defaultScale: "nominal",
+    readsOptions: ["topN"],
+    supportsCompare: false,
+    requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: true,
   },
   heatmap: {
     label: "Heatmap (value × time)",
@@ -64,42 +94,61 @@ export const CHART_META: Record<
     readsOptions: ["topN", "buckets"],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: false,
   },
+  // show_points marks the actual measured buckets. Graphical integrity (Tufte): a line between
+  // two points asserts values that were never measured — markers show where the data really is.
   line: {
     label: "Line / Area (value × time)",
     scales: ["interval", "ratio"],
     dataKind: "timeseries",
     defaultScale: "ratio",
-    readsOptions: ["topN", "buckets", "seriesMode", "legend"],
+    readsOptions: ["topN", "buckets", "seriesMode", "legend", "showPoints"],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: false,
   },
   histogram: {
     label: "Histogram",
     scales: ["interval", "ratio"],
     dataKind: "numeric",
     defaultScale: "ratio",
-    readsOptions: ["bins", "logScale"],
+    readsOptions: ["bins", "logScale", "showDensity"],
     supportsCompare: true,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: true,
   },
+  // box/violin accept an OPTIONAL second field (accepts_second_field): a categorical grouping
+  // variable, giving one box/violin per top group.
   box: {
     label: "Box plot",
     scales: ["ratio"],
     dataKind: "numeric",
     defaultScale: "ratio",
-    readsOptions: ["bins"],
+    readsOptions: ["bins", "groups", "showPoints"],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: true,
+    multiField: false,
+    supportsFacet: true,
   },
   violin: {
     label: "Violin plot",
     scales: ["ratio"],
     dataKind: "numeric",
     defaultScale: "ratio",
-    readsOptions: ["bins"],
+    readsOptions: ["bins", "groups", "showPoints"],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: true,
+    multiField: false,
+    supportsFacet: true,
   },
   ecdf: {
     label: "ECDF",
@@ -109,6 +158,9 @@ export const CHART_META: Record<
     readsOptions: ["bins"],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: true,
   },
   // Field-free like `time` — meaningful whatever the picked field's scale is.
   punchcard: {
@@ -119,6 +171,9 @@ export const CHART_META: Record<
     readsOptions: [],
     supportsCompare: false,
     requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: false,
   },
   // pivot and sankey are two marks over the SAME field×field aggregation — switching between
   // them refetches nothing.
@@ -130,6 +185,9 @@ export const CHART_META: Record<
     readsOptions: ["limitX", "limitY"],
     supportsCompare: false,
     requiresSecondField: true,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: false,
   },
   sankey: {
     label: "Flow / Sankey (field × field)",
@@ -139,6 +197,9 @@ export const CHART_META: Record<
     readsOptions: ["limitX", "limitY"],
     supportsCompare: false,
     requiresSecondField: true,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: false,
   },
   scatter: {
     label: "Scatter (numeric × numeric)",
@@ -148,10 +209,33 @@ export const CHART_META: Record<
     readsOptions: ["sampleLimit", "logScale"],
     supportsCompare: false,
     requiresSecondField: true,
+    acceptsSecondField: false,
+    multiField: false,
+    supportsFacet: false,
+  },
+  // Takes `fields` (2-8 numeric tokens) instead of field/field_y — the one mark that charts
+  // more than two fields at once. Preferred over reading scatter plots one pair at a time past
+  // three or four quantitative variables.
+  corr: {
+    label: "Correlation matrix (numeric fields)",
+    scales: ["nominal", "ordinal", "interval", "ratio"],
+    dataKind: "corr",
+    defaultScale: "ratio",
+    readsOptions: [],
+    supportsCompare: false,
+    requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: true,
+    supportsFacet: false,
   },
 };
 
 export const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
+
+// Above this many slices a pie stops being readable — angle comparison is the least accurate
+// visual cue there is, and small differences between neighbouring slices become invisible. Past
+// it, offer bar or waffle.
+export const PIE_COMFORTABLE_MAX = 4;
 
 export const chartTypesFor = (s: Scale): ChartType[] =>
   (Object.keys(CHART_META) as ChartType[]).filter((c) =>

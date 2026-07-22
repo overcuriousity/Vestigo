@@ -92,6 +92,13 @@
   --viz-sequential-500: #256abf;
   --viz-sequential-700: #0d366b;
 
+  /* Diverging ramp for signed quantities (correlation −1…+1). Blue↔orange,
+     not red/green: the pair stays distinguishable under both common forms of
+     colour-vision deficiency, and the neutral midpoint reads as "no effect". */
+  --viz-diverging-neg: #1f5fa8;
+  --viz-diverging-mid: #f2f0ec;
+  --viz-diverging-pos: #c1521d;
+
   /* Chart chrome */
   --viz-grid: var(--color-border-subtle);
   --viz-axis: var(--color-border-strong);
@@ -162,6 +169,10 @@
   --viz-sequential-300: #256abf;
   --viz-sequential-500: #5598e7;
   --viz-sequential-700: #cde2fb;
+
+  --viz-diverging-neg: #5598e7;
+  --viz-diverging-mid: #3a3a38;
+  --viz-diverging-pos: #e8834a;
 
   --viz-grid: var(--color-border-subtle);
   --viz-axis: var(--color-border-strong);

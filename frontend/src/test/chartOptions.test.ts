@@ -23,7 +23,10 @@ describe("resolveChartOptions", () => {
   it("fills every option with the analyst-facing default", () => {
     expect(resolveChartOptions(config({ chartType: "bar" }))).toEqual({
       topN: 10,
-      bins: 30,
+      bins: null,
+      showDensity: true,
+      groups: 6,
+      showPoints: false,
       buckets: 60,
       limitX: 10,
       limitY: 10,

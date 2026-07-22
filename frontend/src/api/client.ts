@@ -72,19 +72,29 @@ async function checkResponse(res: Response, path: string): Promise<void> {
   }
 }
 
+/** Query-string values a request may carry; arrays repeat the key. */
+export type QueryParams = Record<
+  string,
+  string | number | boolean | string[] | undefined | null
+>;
+
 async function request<T>(
   method: string,
   path: string,
   opts?: {
     body?: unknown;
-    params?: Record<string, string | number | boolean | undefined | null>;
+    params?: QueryParams;
     signal?: AbortSignal;
   },
 ): Promise<T> {
   const url = new URL(BASE + path, window.location.href);
   if (opts?.params) {
     for (const [k, v] of Object.entries(opts.params)) {
-      if (v != null && v !== "") {
+      // An array becomes a repeated param (`?fields=a&fields=b`), which is
+      // how FastAPI reads a `list[str]` query parameter.
+      if (Array.isArray(v)) {
+        for (const item of v) url.searchParams.append(k, String(item));
+      } else if (v != null && v !== "") {
         url.searchParams.set(k, String(v));
       }
     }
@@ -116,7 +126,7 @@ async function request<T>(
 // Convenience verbs
 export const get = <T>(
   path: string,
-  params?: Record<string, string | number | boolean | undefined | null>,
+  params?: QueryParams,
   signal?: AbortSignal,
 ) => request<T>("GET", path, { params, signal });
 

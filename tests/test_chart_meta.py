@@ -31,28 +31,24 @@ from vestigo.agent.chart_meta import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: Every key `ChartOptionsSpec` will expose. `reads_options` entries must come
-#: from this set, or a chart claims to read an option nothing can send.
-KNOWN_OPTION_KEYS = {
-    "orientation",
-    "sort",
-    "log_scale",
-    "series_mode",
-    "legend",
-    "top_n",
-    "bins",
-    "buckets",
-    "limit_x",
-    "limit_y",
-    "sample_limit",
-}
+
+def _known_option_keys() -> set[str]:
+    """Every key `ChartOptionsSpec` exposes — derived, not hand-listed, so a
+    new option only has to be added in tools.py to be legal in
+    `reads_options`. A chart claiming an option nothing can send still fails."""
+    from vestigo.agent.tools import ChartOptionsSpec
+
+    return set(ChartOptionsSpec.model_fields)
+
+
+KNOWN_OPTION_KEYS = _known_option_keys()
 
 
 # ── table integrity ──────────────────────────────────────────────────────────
 
 
 def test_table_covers_every_chart_type_exactly_once() -> None:
-    assert len(CHART_TYPES) == 13
+    assert len(CHART_TYPES) == 15
     assert set(CHART_META) == set(CHART_TYPES)
 
 
@@ -190,12 +186,15 @@ def test_default_scale_matches_the_legacy_scale_for_every_old_kind() -> None:
         assert CHART_META[chart_type].default_scale == scale
 
 
-def test_six_chart_types_were_unreachable_before() -> None:
-    """The bug this whole change exists for: `kind` could address only 7 of
-    13 marks, so a requested pie silently became a bar."""
+def test_marks_unreachable_through_the_legacy_kind_enum() -> None:
+    """The bug this whole change exists for: `kind` could address only 7
+    marks, so a requested pie silently became a bar. Newer marks (waffle)
+    were never in the retired enum either and must stay out of it."""
     reachable = {c for c, _ in LEGACY_KIND_MAP.values()}
     assert set(CHART_TYPES) - reachable == {
         "pie",
+        "waffle",
+        "corr",
         "heatmap",
         "box",
         "violin",

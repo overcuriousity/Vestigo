@@ -52,6 +52,17 @@ round — the data model migrates once, not twice.
   record-boundary chunking, CSV intra-file record-boundary chunking (a logical CSV
   record can span physical lines via quoted embedded newlines, unsafe to newline-chunk).
 
+- [ ] **Choropleth / geographic charts** — the one chart family from the
+  "Datenanalyse und -visualisierung" lecture set left unimplemented in the 2026-07-22 viz
+  round (everything else — correlation matrix, grouped box/violin, facetting, waffle,
+  distribution statistics — shipped). Deliberately deferred, not forgotten: `geoip2` is
+  already a dependency, but an offline-by-default deployment also needs vendored basemap
+  geometry (world/country boundary GeoJSON) with a licence that permits redistribution,
+  plus an honest binning story for geo-aggregates (count per country is a choropleth;
+  count per city is a proportional-symbol map, and using the wrong one misleads by area).
+  Needs its own design round covering the offline asset, the projection, and the
+  rate/count normalization rule.
+
 ## Milestone 3 — polish
 
 - [ ] Evaluate OpenAPI-generated frontend API types (`openapi-typescript` over `/openapi.json`)

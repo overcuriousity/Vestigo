@@ -115,6 +115,8 @@ export function FieldHistogramModal({
       v: 1,
       field: fieldKey,
       fieldY: null,
+    fields: null,
+    facet: null,
       scale: "nominal",
       chartType: "time",
       metric: "count",

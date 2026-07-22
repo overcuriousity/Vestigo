@@ -87,6 +87,32 @@ export const CHART_PRESETS: ChartPreset[] = [
     },
   },
   {
+    id: "distribution-by-group",
+    label: "Compare a distribution across groups",
+    question:
+      "Do response times / byte counts differ per user, host or status — and is one group's spread unlike the rest?",
+    config: {
+      chartType: "box",
+      scale: "ratio",
+      metric: "count",
+      compare: { mode: "off" },
+      options: { showPoints: true },
+    },
+  },
+  {
+    id: "numeric-correlations",
+    label: "Which numeric fields move together?",
+    question:
+      "Across several numeric fields at once, which pairs are related — and which apparent link disappears under a rank correlation?",
+    config: {
+      chartType: "corr",
+      scale: "ratio",
+      metric: "count",
+      compare: { mode: "off" },
+      options: {},
+    },
+  },
+  {
     id: "field-relationship",
     label: "How do two fields relate?",
     question:

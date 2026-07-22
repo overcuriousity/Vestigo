@@ -43,6 +43,7 @@ ChartType = Literal[
     "time",
     "bar",
     "pie",
+    "waffle",
     "heatmap",
     "line",
     "histogram",
@@ -53,10 +54,13 @@ ChartType = Literal[
     "pivot",
     "sankey",
     "scatter",
+    "corr",
 ]
 Scale = Literal["nominal", "ordinal", "interval", "ratio"]
 Metric = Literal["count", "delta", "rate", "ratio", "cumulative"]
-DataKind = Literal["time", "terms", "numeric", "timeseries", "punchcard", "pivot", "scatter"]
+DataKind = Literal[
+    "time", "terms", "numeric", "timeseries", "punchcard", "pivot", "scatter", "corr"
+]
 
 CHART_TYPES: tuple[ChartType, ...] = get_args(ChartType)
 SCALES: tuple[Scale, ...] = get_args(Scale)
@@ -64,6 +68,13 @@ METRICS: tuple[Metric, ...] = get_args(Metric)
 
 #: Chart types that chart the whole event count and take no field at all.
 FIELD_FREE_DATA_KINDS: frozenset[DataKind] = frozenset({"time", "punchcard"})
+
+#: Above this many slices a pie stops being readable — angle comparison is the
+#: least accurate visual cue there is (Cleveland & McGill 1985), and small
+#: differences between neighbouring slices become invisible. Both the analyst's
+#: chart and ``propose_chart`` warn past it and point at bar/waffle. Emitted
+#: into the generated TypeScript so one number governs both sides.
+PIE_COMFORTABLE_MAX = 4
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,18 @@ class ChartMeta:
     reads_options: tuple[str, ...] = ()
     supports_compare: bool = False
     requires_second_field: bool = False
+    #: Charts a LIST of fields (``fields``) rather than field/field_y — the
+    #: correlation matrix. Mutually exclusive with the two flags below.
+    multi_field: bool = False
+    #: Can be drawn once per value of a categorical field (small multiples).
+    #: Restricted to the cheap single-layer aggregations: a facet grid runs
+    #: one query per facet value, so a mark whose single query is already a
+    #: heavy multi-scan would multiply that cost by the facet count.
+    supports_facet: bool = False
+    #: Single-field chart that ALSO accepts an optional grouping field
+    #: (box/violin: numeric response × categorical group via ``field_y``).
+    #: Mutually exclusive with ``requires_second_field``.
+    accepts_second_field: bool = False
     #: Design rationale carried into the generated TypeScript as a comment.
     note: str = ""
 
@@ -97,6 +120,7 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal", "ordinal", "interval", "ratio"),
         data_kind="time",
         default_scale="nominal",
+        supports_facet=True,
         reads_options=("buckets",),
         supports_compare=True,
         note=(
@@ -109,6 +133,7 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal", "ordinal"),
         data_kind="terms",
         default_scale="nominal",
+        supports_facet=True,
         reads_options=("top_n", "orientation", "sort", "log_scale"),
         supports_compare=True,
     ),
@@ -117,10 +142,24 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal",),
         data_kind="terms",
         default_scale="nominal",
+        supports_facet=True,
         reads_options=("top_n",),
         note=(
             "pie/box/violin/ecdf have no honest two-layer encoding, so they are "
             "left without supportsCompare — the rail hides Compare for them."
+        ),
+    ),
+    "waffle": ChartMeta(
+        label="Waffle (10×10 share grid)",
+        scales=("nominal",),
+        data_kind="terms",
+        default_scale="nominal",
+        supports_facet=True,
+        reads_options=("top_n",),
+        note=(
+            "Same terms aggregation as bar/pie — switching between them refetches "
+            "nothing. Preferred over pie once there are five or more categories: "
+            "counting cells beats judging angles."
         ),
     ),
     "heatmap": ChartMeta(
@@ -135,14 +174,20 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("interval", "ratio"),
         data_kind="timeseries",
         default_scale="ratio",
-        reads_options=("top_n", "buckets", "series_mode", "legend"),
+        reads_options=("top_n", "buckets", "series_mode", "legend", "show_points"),
+        note=(
+            "show_points marks the actual measured buckets. Graphical integrity "
+            "(Tufte): a line between two points asserts values that were never "
+            "measured — markers show where the data really is."
+        ),
     ),
     "histogram": ChartMeta(
         label="Histogram",
         scales=("interval", "ratio"),
         data_kind="numeric",
         default_scale="ratio",
-        reads_options=("bins", "log_scale"),
+        supports_facet=True,
+        reads_options=("bins", "log_scale", "show_density"),
         supports_compare=True,
     ),
     "box": ChartMeta(
@@ -150,20 +195,29 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("ratio",),
         data_kind="numeric",
         default_scale="ratio",
-        reads_options=("bins",),
+        supports_facet=True,
+        reads_options=("bins", "groups", "show_points"),
+        accepts_second_field=True,
+        note=(
+            "box/violin accept an OPTIONAL second field (accepts_second_field): a "
+            "categorical grouping variable, giving one box/violin per top group."
+        ),
     ),
     "violin": ChartMeta(
         label="Violin plot",
         scales=("ratio",),
         data_kind="numeric",
         default_scale="ratio",
-        reads_options=("bins",),
+        supports_facet=True,
+        reads_options=("bins", "groups", "show_points"),
+        accepts_second_field=True,
     ),
     "ecdf": ChartMeta(
         label="ECDF",
         scales=("ratio",),
         data_kind="numeric",
         default_scale="ratio",
+        supports_facet=True,
         reads_options=("bins",),
     ),
     "punchcard": ChartMeta(
@@ -200,6 +254,23 @@ CHART_META: dict[ChartType, ChartMeta] = {
         default_scale="ratio",
         reads_options=("sample_limit", "log_scale"),
         requires_second_field=True,
+    ),
+    "corr": ChartMeta(
+        label="Correlation matrix (numeric fields)",
+        # Available under every scale like the field-free marks: this chart
+        # ignores the currently-picked field entirely (its own `fields` list
+        # is what it charts), so the picked field's scale says nothing about
+        # whether it is legal.
+        scales=("nominal", "ordinal", "interval", "ratio"),
+        data_kind="corr",
+        default_scale="ratio",
+        multi_field=True,
+        note=(
+            "Takes `fields` (2-8 numeric tokens) instead of field/field_y — the "
+            "one mark that charts more than two fields at once. Preferred over "
+            "reading scatter plots one pair at a time past three or four "
+            "quantitative variables."
+        ),
     ),
 }
 

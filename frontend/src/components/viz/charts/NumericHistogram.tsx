@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { scaleLinear, scaleLog } from "d3-scale";
 import { format as formatNum } from "d3-format";
+import { line as d3line, curveMonotoneX } from "d3-shape";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
-import { numericDomain } from "@/components/viz/lib/stats";
+import { kdeFromBins, numericDomain } from "@/components/viz/lib/stats";
 import type { CompareNumericResponse, FieldNumericResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -24,6 +25,13 @@ interface NumericHistogramProps {
   color?: string;
   /** Log-scaled count axis — zero-count bins render as zero-height bars. */
   logScale?: boolean;
+  /** Density (KDE) curve overlay — single-layer mode only; the curve is a
+   * smoothed reading of the same bins, so it never disagrees with the bars. */
+  showDensity?: boolean;
+  /** Dashed mean + solid median marker lines (single-layer mode only). */
+  showMarkers?: boolean;
+  /** Pin the count axis to a shared maximum — see `BarChart.countMax`. */
+  countMax?: number;
 }
 
 /** Fixed-width value histogram for a numeric (interval/ratio) field —
@@ -35,6 +43,9 @@ export function NumericHistogram({
   height = 220,
   color = "var(--color-accent)",
   logScale = false,
+  showDensity = false,
+  showMarkers = false,
+  countMax,
 }: NumericHistogramProps) {
   const [hover, setHover] = useState<{
     x: number;
@@ -62,9 +73,19 @@ export function NumericHistogram({
 
   const maxCount = Math.max(
     1,
+    countMax ?? 0,
     ...bins.map((b) => b.count),
     ...bins.map((b) => b.comparison ?? 0),
   );
+
+  // Density curve + markers are single-layer readings of `stats`; both are
+  // suppressed in compare mode (two overlaid curves would be unreadable) and
+  // the curve additionally under log scale (a density shape drawn against a
+  // log count axis misrepresents area).
+  const density = showDensity && !compare && !logScale && stats ? kdeFromBins(stats.bins) : [];
+  const maxDensity = Math.max(1e-9, ...density.map((d) => d.density));
+  const mean = !compare && showMarkers ? stats?.mean : null;
+  const median = !compare && showMarkers ? (stats?.quantiles["0.5"] ?? null) : null;
 
   return (
     <div className="flex flex-col gap-2">
@@ -140,6 +161,57 @@ export function NumericHistogram({
                     </g>
                   );
                 })}
+                {density.length > 1 && (
+                  <path
+                    d={
+                      d3line<{ x: number; density: number }>()
+                        .curve(curveMonotoneX)
+                        .x((d) => x(d.x))
+                        .y((d) => y((d.density / maxDensity) * maxCount))(density) ?? undefined
+                    }
+                    fill="none"
+                    stroke="var(--viz-ink-primary)"
+                    strokeWidth={1.5}
+                    opacity={0.75}
+                    pointerEvents="none"
+                  />
+                )}
+                {median != null && (
+                  <g pointerEvents="none">
+                    <line
+                      x1={x(median)}
+                      x2={x(median)}
+                      y1={0}
+                      y2={innerHeight}
+                      stroke="var(--viz-ink-primary)"
+                      strokeWidth={1.5}
+                    />
+                    <text
+                      x={x(median) + 4}
+                      y={10}
+                      fontSize={10}
+                      fill="var(--viz-ink-primary)"
+                    >
+                      median {fmtValue(median)}
+                    </text>
+                  </g>
+                )}
+                {mean != null && (
+                  <g pointerEvents="none">
+                    <line
+                      x1={x(mean)}
+                      x2={x(mean)}
+                      y1={0}
+                      y2={innerHeight}
+                      stroke="var(--viz-ink-primary)"
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                    <text x={x(mean) + 4} y={22} fontSize={10} fill="var(--viz-ink-muted)">
+                      mean {fmtValue(mean)}
+                    </text>
+                  </g>
+                )}
               </>
             );
           }}

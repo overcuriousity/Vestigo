@@ -17,7 +17,7 @@
  */
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, ExternalLink, Save } from "lucide-react";
 import { vizApi, savedChartsApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
@@ -30,9 +30,11 @@ import { CHART_META } from "@/components/viz/lib/chartMeta";
 import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
+import { WaffleChart } from "@/components/viz/charts/WaffleChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
 import { BoxPlot } from "@/components/viz/charts/BoxPlot";
 import { ViolinPlot } from "@/components/viz/charts/ViolinPlot";
+import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
@@ -41,14 +43,20 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
+import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
+import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
+import { FacetGrid } from "@/components/viz/FacetGrid";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { Markdown } from "./Markdown";
 import { specToChartConfig, specToEventFilters, type AgentChartSpec } from "@/api/agent";
 import { filtersToParams } from "@/lib/queryParams";
+import { applyFieldEntries } from "@/lib/fieldFilters";
 import type {
   CompareNumericResponse,
+  FieldNumericResponse,
+  FieldTermsResponse,
   CompareTermsResponse,
   CompareTimeResponse,
 } from "@/api/types";
@@ -65,6 +73,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const config = useMemo(() => specToChartConfig(spec), [spec]);
   const filters = useMemo(() => specToEventFilters(spec.filters ?? {}), [spec]);
   const dataKind = CHART_META[config.chartType].dataKind;
+  const groupedOn = !!CHART_META[config.chartType].acceptsSecondField && !!config.fieldY;
   const compareOn = config.compare.mode !== "off";
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
@@ -84,9 +93,52 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const specComplete =
     dataKind === "time" || dataKind === "punchcard"
       ? true
-      : dataKind === "pivot" || dataKind === "scatter"
-        ? !!(config.field && config.fieldY)
-        : !!config.field;
+      : dataKind === "corr"
+        ? (config.fields?.length ?? 0) >= 2
+        : dataKind === "pivot" || dataKind === "scatter"
+          ? !!(config.field && config.fieldY)
+          : !!config.field;
+
+  // A facetted proposal is orchestrated exactly as on the Visualize page:
+  // one terms query names the panels, then each panel re-runs the mark's own
+  // endpoint with an added equality filter. Without this the card would draw
+  // the unfacetted chart under a title promising panels — the silent-wrong-
+  // chart failure this whole contract exists to prevent.
+  const facet = CHART_META[config.chartType].supportsFacet ? config.facet : null;
+  const facetValuesQuery = useQuery({
+    queryKey: ["agent-facet-values", caseId, timelineId, facet?.field, filters, facet?.limit],
+    queryFn: () => vizApi.fieldTerms(caseId, timelineId, facet!.field, filters, facet!.limit),
+    enabled: !!facet && specComplete,
+  });
+  const facetValues = facetValuesQuery.data?.values ?? [];
+  const facetPanelQueries = useQueries({
+    queries: facetValues.map((v) => {
+      const panelFilters = applyFieldEntries(filters, [[facet!.field, v.value]], true);
+      return {
+        queryKey: ["agent-facet-panel", caseId, timelineId, config, panelFilters],
+        queryFn: async () => {
+          switch (dataKind) {
+            case "terms":
+              return vizApi.fieldTerms(caseId, timelineId, config.field!, panelFilters, opts.topN);
+            case "numeric":
+              return vizApi.fieldNumeric(
+                caseId,
+                timelineId,
+                config.field!,
+                panelFilters,
+                opts.bins,
+                opts.showPoints,
+              );
+            default:
+              return histogramToCompare(
+                await eventsApi.histogram(caseId, timelineId, panelFilters, opts.buckets),
+              );
+          }
+        },
+        enabled: !!facet,
+      };
+    }),
+  });
 
   const chartQuery = useQuery({
     queryKey: ["agent-chart", caseId, timelineId, config, filters],
@@ -112,6 +164,23 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
             data: await vizApi.fieldTerms(caseId, timelineId, config.field!, filters, opts.topN),
           };
         case "numeric":
+          // A grouping field on box/violin switches to the grouped
+          // aggregation — same rule the Visualize page applies.
+          if (groupedOn) {
+            return {
+              kind: "numeric_grouped" as const,
+              data: await vizApi.fieldNumericGrouped(
+                caseId,
+                timelineId,
+                config.field!,
+                config.fieldY!,
+                filters,
+                opts.groups,
+                opts.bins ?? 30,
+                opts.showPoints,
+              ),
+            };
+          }
           if (compareApiSpec) {
             return {
               kind: "numeric" as const,
@@ -121,14 +190,21 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
                 field: config.field!,
                 primary: filters,
                 comparison: compareApiSpec,
-                bins: opts.bins,
+                bins: opts.bins ?? 30,
               })) as CompareNumericResponse,
             };
           }
           return {
             kind: "numeric" as const,
             compare: false as const,
-            data: await vizApi.fieldNumeric(caseId, timelineId, config.field!, filters, opts.bins),
+            data: await vizApi.fieldNumeric(
+              caseId,
+              timelineId,
+              config.field!,
+              filters,
+              opts.bins,
+              opts.showPoints,
+            ),
           };
         case "timeseries":
           return {
@@ -170,6 +246,16 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
               opts.limitY,
             ),
           };
+        case "corr":
+          return {
+            kind: "corr" as const,
+            data: await vizApi.fieldCorrelation(
+              caseId,
+              timelineId,
+              config.fields ?? [],
+              filters,
+            ),
+          };
         case "scatter":
           return {
             kind: "scatter" as const,
@@ -184,7 +270,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
           };
       }
     },
-    enabled: specComplete,
+    enabled: specComplete && !facet,
   });
 
   const qc = useQueryClient();
@@ -224,6 +310,72 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
             This chart proposal is missing a field, so there is nothing to plot.
           </p>
         )}
+        {facet && (
+          <FacetGrid
+            field={facet.field}
+            omittedValues={Math.max(
+              0,
+              (facetValuesQuery.data?.distinct ?? 0) - facetValues.length,
+            )}
+            omittedCount={facetValuesQuery.data?.other_count}
+            panels={facetValues.map((v, i) => {
+              const panel = facetPanelQueries[i];
+              const data = panel?.data;
+              return {
+                value: v.value,
+                count: v.count,
+                isLoading: !!panel?.isLoading,
+                chart:
+                  data == null ? null : dataKind === "terms" ? (
+                    config.chartType === "pie" ? (
+                      <PieChart terms={data as FieldTermsResponse} height={160} />
+                    ) : config.chartType === "waffle" ? (
+                      <WaffleChart terms={data as FieldTermsResponse} height={160} />
+                    ) : (
+                      <BarChart
+                        terms={data as FieldTermsResponse}
+                        height={160}
+                        orientation={opts.orientation}
+                        sort={opts.sort}
+                        logScale={opts.logScale}
+                      />
+                    )
+                  ) : dataKind === "numeric" ? (
+                    config.chartType === "box" ? (
+                      <BoxPlot
+                        stats={data as FieldNumericResponse}
+                        height={160}
+                        showPoints={opts.showPoints}
+                      />
+                    ) : config.chartType === "violin" ? (
+                      <ViolinPlot
+                        stats={data as FieldNumericResponse}
+                        height={160}
+                        showPoints={opts.showPoints}
+                      />
+                    ) : config.chartType === "ecdf" ? (
+                      <EcdfChart stats={data as FieldNumericResponse} height={160} />
+                    ) : (
+                      <NumericHistogram
+                        stats={data as FieldNumericResponse}
+                        height={160}
+                        logScale={opts.logScale}
+                        showDensity={opts.showDensity}
+                        showMarkers
+                      />
+                    )
+                  ) : (
+                    <CompareHistogram
+                      data={data as CompareTimeResponse}
+                      height={160}
+                      metric={config.metric}
+                      hasComparison={false}
+                    />
+                  ),
+              };
+            })}
+          />
+        )}
         {chartQuery.isLoading && (
           <div className="flex items-center justify-center py-6">
             <Spinner size={16} />
@@ -253,19 +405,36 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
         {chartQuery.data?.kind === "terms" &&
           config.chartType === "pie" &&
           !chartQuery.data.compare && <PieChart terms={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "terms" &&
+          config.chartType === "waffle" &&
+          !chartQuery.data.compare && <WaffleChart terms={chartQuery.data.data} />}
         {chartQuery.data?.kind === "numeric" && config.chartType === "histogram" && (
           <NumericHistogram
             stats={chartQuery.data.compare ? undefined : chartQuery.data.data}
             compare={chartQuery.data.compare ? chartQuery.data.data : undefined}
             logScale={opts.logScale}
+            showDensity={opts.showDensity}
+            showMarkers
           />
         )}
+        {chartQuery.data?.kind === "numeric_grouped" &&
+          (config.chartType === "box" || config.chartType === "violin") && (
+            <GroupedDistribution
+              data={chartQuery.data.data}
+              mark={config.chartType}
+              showPoints={opts.showPoints}
+            />
+          )}
         {chartQuery.data?.kind === "numeric" &&
           !chartQuery.data.compare &&
-          config.chartType === "box" && <BoxPlot stats={chartQuery.data.data} />}
+          config.chartType === "box" && (
+            <BoxPlot stats={chartQuery.data.data} showPoints={opts.showPoints} />
+          )}
         {chartQuery.data?.kind === "numeric" &&
           !chartQuery.data.compare &&
-          config.chartType === "violin" && <ViolinPlot stats={chartQuery.data.data} />}
+          config.chartType === "violin" && (
+            <ViolinPlot stats={chartQuery.data.data} showPoints={opts.showPoints} />
+          )}
         {chartQuery.data?.kind === "numeric" &&
           !chartQuery.data.compare &&
           config.chartType === "ecdf" && <EcdfChart stats={chartQuery.data.data} />}
@@ -273,6 +442,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
           <LineChart
             data={chartQuery.data.data}
             seriesMode={opts.seriesMode}
+            showPoints={config.options.showPoints ?? true}
             showLegend={opts.legend}
           />
         )}
@@ -293,7 +463,15 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
         {chartQuery.data?.kind === "pivot" && config.chartType === "sankey" && (
           <SankeyFlow data={chartQuery.data.data} />
         )}
-        {chartQuery.data?.kind === "scatter" && <ScatterChart data={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "corr" && <CorrMatrix data={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "scatter" && (
+          <>
+            <ScatterChart data={chartQuery.data.data} />
+            {chartQuery.data.data.stats && (
+              <ScatterStatsPanel stats={chartQuery.data.data.stats} />
+            )}
+          </>
+        )}
       </div>
 
       <div className="mt-2 flex items-center justify-between gap-2">

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
+from vestigo import stats as stats_helpers
 from vestigo.db._buckets import (
     aligned_bucket_starts,
     bucket_interval_seconds,
@@ -65,6 +67,94 @@ _NULL_TIMESTAMP_SENTINEL_ISO = NULL_TS_SENTINEL_ISO
 _MIN_EVENT_ID = "00000000-0000-0000-0000-000000000000"
 
 _logger = logging.getLogger(__name__)
+
+
+def _nan_to_none(value: float | None) -> float | None:
+    """Map NaN/inf to None for JSON-safe responses.
+
+    ClickHouse aggregates like ``corr``, ``rankCorr`` and ``skewPop`` return
+    NaN on degenerate input (zero variance, n < 2); ``float('nan')`` breaks
+    strict JSON parsers, so every such value is nulled at the boundary.
+    """
+    if value is None or not math.isfinite(value):
+        return None
+    return value
+
+
+def _scatter_stats(
+    total: int,
+    pearson_r: float | None,
+    spearman_rho: float | None,
+    regression: tuple[float, float] | list[float] | dict[str, float] | None,
+    sample_points: list[list[float]],
+) -> dict[str, Any]:
+    """Assemble the scatter statistics block from ClickHouse aggregates.
+
+    Pearson/Spearman/regression arrive from the full-data scan; Kendall and
+    Shapiro–Wilk are computed here over the drawn sample (their exact
+    algorithms have no ClickHouse aggregate) and say so via ``basis``.
+    Every coefficient is nullable — degenerate inputs null the affected
+    entries instead of failing the chart.
+    """
+    r = _nan_to_none(pearson_r)
+    rho = _nan_to_none(spearman_rho)
+
+    # clickhouse-connect returns simpleLinearRegression's named tuple as a
+    # dict ({'k': slope, 'b': intercept}) on a live server; the fakes in
+    # tests use plain pairs. Accept both.
+    slope = intercept = None
+    if isinstance(regression, dict):
+        slope = _nan_to_none(float(regression["k"])) if "k" in regression else None
+        intercept = _nan_to_none(float(regression["b"])) if "b" in regression else None
+    elif regression is not None and len(regression) == 2:
+        slope = _nan_to_none(float(regression[0]))
+        intercept = _nan_to_none(float(regression[1]))
+    regression_block = (
+        {
+            "slope": slope,
+            "intercept": intercept,
+            # R² = r² holds exactly for a simple linear regression.
+            "r_squared": r * r if r is not None else None,
+        }
+        if slope is not None and intercept is not None
+        else None
+    )
+
+    xs = [p[0] for p in sample_points]
+    ys = [p[1] for p in sample_points]
+    tau, tau_p = stats_helpers.kendall_tau(xs, ys)
+    sw_x = stats_helpers.shapiro_wilk(xs)
+    sw_y = stats_helpers.shapiro_wilk(ys)
+
+    def _sw_block(sw: tuple[float | None, float | None]) -> dict[str, Any] | None:
+        w, p = sw
+        return {"w": w, "p": p} if w is not None else None
+
+    both_normal = (
+        sw_x[1] is not None and sw_y[1] is not None and sw_x[1] >= 0.05 and sw_y[1] >= 0.05
+    )
+    recommendation = "pearson" if both_normal else "spearman"
+
+    return {
+        "n": total,
+        "basis": "full",
+        "pearson": {"r": r, "p": stats_helpers.pearson_p(r, total) if r is not None else None},
+        "spearman": {
+            "rho": rho,
+            "p": stats_helpers.spearman_p(rho, total) if rho is not None else None,
+        },
+        "kendall": (
+            {"tau": tau, "p": tau_p, "basis": "sample", "n": len(xs)} if tau is not None else None
+        ),
+        "regression": regression_block,
+        "shapiro": {
+            "x": _sw_block(sw_x),
+            "y": _sw_block(sw_y),
+            "basis": "sample",
+            "n": len(xs),
+        },
+        "recommendation": recommendation,
+    }
 
 
 def _guard_encoder(
@@ -1676,9 +1766,19 @@ class EventQueryService:
     # outlier burst cares about (0.01/0.05/0.95/0.99).
     _NUMERIC_QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
 
+    #: Clamp for the Freedman–Diaconis automatic bin count — mirrors the UI's
+    #: manual bins range so "auto" can never produce a histogram the analyst
+    #: could not have requested by hand.
+    _FD_BIN_RANGE = (5, 60)
+
     @_gated_scan
     def field_numeric_stats(
-        self, query: EventQuery, field_token: str, bins: int = 30
+        self,
+        query: EventQuery,
+        field_token: str,
+        bins: int | None = None,
+        points: bool = False,
+        points_limit: int = 1000,
     ) -> dict[str, Any]:
         """Return summary statistics and a fixed-width histogram for a numeric field.
 
@@ -1687,6 +1787,12 @@ class EventQueryService:
         dropped from the cast (become NULL) rather than erroring. ``count ==
         0`` is the signal callers use to fall back to treating the field as
         categorical instead.
+
+        ``bins=None`` selects the bin count automatically with the
+        Freedman–Diaconis rule (width = 2·IQR·n^(−1/3)), computed from the
+        first scan's quantiles and clamped to ``_FD_BIN_RANGE``; the response
+        reports the decision as ``bin_rule: "fd" | "manual"`` plus the
+        resolved ``bin_width`` so captions can state it verbatim.
 
         Bins are **fixed-width** (evenly spaced across ``[min, max]``), not
         ClickHouse's adaptive ``histogram()`` function — reproducibility (the
@@ -1715,7 +1821,7 @@ class EventQueryService:
         stats_result = self.store.client.query(
             f"""
             SELECT count(v) AS n, min(v) AS mn, max(v) AS mx, avg(v) AS mean,
-                   stddevPop(v) AS sd, {quantile_exprs}
+                   stddevPop(v) AS sd, skewPop(v) AS skew, {quantile_exprs}
             FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
             {HEAVY_SCAN_SETTINGS}
@@ -1732,19 +1838,31 @@ class EventQueryService:
             "max": None,
             "mean": None,
             "stddev": None,
+            "skewness": None,
             "quantiles": {},
             "bins": [],
+            "bin_rule": "manual" if bins is not None else "fd",
+            "bin_width": None,
+            "points": None,
         }
         if not count:
             return empty
 
-        mn, mx, mean, sd, *quantile_values = row[1:]
+        mn, mx, mean, sd, skew, *quantile_values = row[1:]
         quantiles = dict(
             zip((str(q) for q in self._NUMERIC_QUANTILES), quantile_values, strict=True)
         )
 
-        bin_count = max(1, int(bins))
         span = mx - mn
+        if bins is not None:
+            bin_count = max(1, int(bins))
+            bin_rule = "manual"
+        else:
+            iqr = quantiles["0.75"] - quantiles["0.25"]
+            fd = stats_helpers.fd_bin_count(iqr, count, span)
+            lo, hi = self._FD_BIN_RANGE
+            bin_count = max(lo, min(hi, fd)) if fd is not None else 30
+            bin_rule = "fd"
         bin_width = span / bin_count if span > 0 else 1.0
 
         hist_result = self.store.client.query(
@@ -1770,15 +1888,317 @@ class EventQueryService:
             for i in range(bin_count)
         ]
 
+        points_block = None
+        if points:
+            sample_result = self.store.client.query(
+                f"""
+                SELECT v
+                FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
+                WHERE v IS NOT NULL
+                ORDER BY rand()
+                LIMIT {int(points_limit)}
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters=parameters,
+            )
+            values = [float(r[0]) for r in sample_result.result_rows]
+            points_block = {"total": count, "shown": len(values), "values": values}
+
         return {
             "field": field_token,
             "count": count,
             "min": mn,
             "max": mx,
             "mean": mean,
-            "stddev": sd,
+            "stddev": _nan_to_none(sd),
+            "skewness": _nan_to_none(skew),
             "quantiles": quantiles,
             "bins": bins_out,
+            "bin_rule": bin_rule,
+            "bin_width": bin_width,
+            "points": points_block,
+        }
+
+    #: Upper bound on fields in one correlation matrix. 8 fields = 28 pairs =
+    #: 84 aggregate expressions in a single scan, and a lower-triangle grid
+    #: past that stops being readable anyway.
+    CORRELATION_MAX_FIELDS = 8
+
+    @_gated_scan
+    def field_correlation(self, query: EventQuery, field_tokens: list[str]) -> dict[str, Any]:
+        """Pairwise correlation matrix over several numeric fields.
+
+        One scan computes, for every unordered pair, ClickHouse's ``corr``
+        (Pearson) and ``rankCorr`` (Spearman) plus the **pairwise-complete**
+        count — the number of events where both fields cast to a number.
+        Pairwise completeness is deliberate and is why this does not use
+        ``corrMatrix``: a row missing one field would otherwise drop out of
+        every pair (listwise deletion), silently shrinking correlations the
+        analyst never asked to restrict. ClickHouse's multi-argument
+        aggregates skip a row when any argument is NULL, which gives each
+        pair its own exclusion set for free; the ``countIf`` beside each pair
+        reports the ``n`` its coefficients were actually computed over.
+
+        p-values come from :mod:`vestigo.stats` (ClickHouse has no aggregate
+        for them). Fields with no numeric values at all are reported in
+        ``dropped_fields`` rather than filling the grid with nulls.
+        """
+        self.store.init_schema()
+        if len(field_tokens) < 2:
+            raise ValueError("a correlation matrix needs at least two fields")
+        if len(field_tokens) > self.CORRELATION_MAX_FIELDS:
+            raise ValueError(f"at most {self.CORRELATION_MAX_FIELDS} fields per correlation matrix")
+        where, parameters = self._build_where(query)
+        database = self.store.database
+
+        casts = []
+        for i, token in enumerate(field_tokens):
+            col = _field_column_expr(
+                token,
+                parameters,
+                f"corr_field_{i}",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            casts.append(f"toFloat64OrNull(toString({col})) AS v{i}")
+        values_subquery = f"SELECT {', '.join(casts)} FROM {database}.events WHERE {where}"
+
+        selects = ["count() AS total"]
+        selects += [f"countIf(v{i} IS NOT NULL)" for i in range(len(field_tokens))]
+        pairs = [(a, b) for a in range(len(field_tokens)) for b in range(a + 1, len(field_tokens))]
+        for a, b in pairs:
+            # Multi-argument aggregates skip a row when ANY argument is NULL,
+            # which is exactly pairwise-complete deletion — the `countIf`
+            # alongside reports the n each coefficient was computed over.
+            # (Do NOT "fix" the Nullable arguments with assumeNotNull: that
+            # turns NULL into 0.0 and folds non-numeric rows into the
+            # correlation. Verified against ClickHouse in
+            # tests/test_viz_stats_clickhouse.py.)
+            ok = f"(v{a} IS NOT NULL AND v{b} IS NOT NULL)"
+            selects += [
+                f"countIf({ok})",
+                f"corr(v{a}, v{b})",
+                f"rankCorr(v{a}, v{b})",
+            ]
+
+        result = self.store.client.query(
+            f"""
+            SELECT {", ".join(selects)}
+            FROM ({values_subquery}) AS t
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        row = list(result.result_rows[0]) if result.result_rows else []
+        base = {"kind": "corr", "fields": list(field_tokens)}
+        if not row:
+            return {**base, "total": 0, "pairs": [], "dropped_fields": []}
+
+        total = int(row[0])
+        numeric_counts = [int(c) for c in row[1 : 1 + len(field_tokens)]]
+        dropped = [
+            {"field": token, "reason": "non_numeric"}
+            for token, count in zip(field_tokens, numeric_counts, strict=True)
+            if count == 0
+        ]
+
+        pair_rows = []
+        offset = 1 + len(field_tokens)
+        for idx, (a, b) in enumerate(pairs):
+            n, pearson, spearman = row[offset + idx * 3 : offset + idx * 3 + 3]
+            n = int(n)
+            r = _nan_to_none(pearson)
+            rho = _nan_to_none(spearman)
+            pair_rows.append(
+                {
+                    "x": field_tokens[a],
+                    "y": field_tokens[b],
+                    "n": n,
+                    "pearson": r,
+                    "p_pearson": stats_helpers.pearson_p(r, n) if r is not None else None,
+                    "spearman": rho,
+                    "p_spearman": (stats_helpers.spearman_p(rho, n) if rho is not None else None),
+                }
+            )
+
+        return {
+            **base,
+            "total": total,
+            "numeric_counts": dict(zip(field_tokens, numeric_counts, strict=True)),
+            "pairs": pair_rows,
+            "dropped_fields": dropped,
+        }
+
+    @_gated_scan
+    def field_numeric_grouped(
+        self,
+        query: EventQuery,
+        field_token: str,
+        group_field: str,
+        groups: int = 8,
+        bins: int = 30,
+        points: bool = False,
+        points_limit: int = 1000,
+    ) -> dict[str, Any]:
+        """Per-group numeric distributions: one field split by a categorical field.
+
+        Powers grouped box/violin plots (numeric response × categorical
+        grouping variable). Groups are the top-N *group_field* values by
+        numeric-value count; everything else is **omitted, not rolled up** —
+        an "Other" box would be a distribution of unrelated things — and the
+        omission is reported (``omitted_groups`` / ``omitted_count``) so
+        captions can state it.
+
+        Per-group histogram bins share the **global** ``[min, max]`` so the
+        violin silhouettes are directly comparable across groups. The
+        optional ``points`` scan draws one uniform random sample across all
+        kept groups (``ORDER BY rand() LIMIT``), not per-group quotas —
+        so dense groups show proportionally more points, which is the honest
+        reading.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr = _field_column_expr(
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        group_expr = _field_column_expr(
+            group_field,
+            parameters,
+            "group_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        pairs_subquery = (
+            f"SELECT toString({group_expr}) AS g, toFloat64OrNull(toString({col_expr})) AS v "
+            f"FROM {database}.events WHERE {where}"
+        )
+        member_where = "v IS NOT NULL AND g != ''"
+
+        global_result = self.store.client.query(
+            f"""
+            SELECT count(v), min(v), max(v), uniqExact(g)
+            FROM ({pairs_subquery}) AS t
+            WHERE {member_where}
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        grow = global_result.result_rows[0] if global_result.result_rows else None
+        total = int(grow[0]) if grow and grow[0] else 0
+        base = {"kind": "numeric_grouped", "field": field_token, "group_field": group_field}
+        if not total:
+            return {
+                **base,
+                "total": 0,
+                "min": None,
+                "max": None,
+                "distinct_groups": 0,
+                "omitted_groups": 0,
+                "omitted_count": 0,
+                "groups": [],
+                "points": None,
+            }
+        mn, mx, distinct_groups = grow[1], grow[2], int(grow[3])
+
+        quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
+        groups_result = self.store.client.query(
+            f"""
+            SELECT g, count(v) AS c, min(v), max(v), avg(v), stddevPop(v), skewPop(v),
+                   {quantile_exprs}
+            FROM ({pairs_subquery}) AS t
+            WHERE {member_where}
+            GROUP BY g
+            ORDER BY c DESC, g ASC
+            LIMIT {int(groups)}
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters=parameters,
+        )
+        kept_values = [row[0] for row in groups_result.result_rows]
+
+        bin_count = max(1, int(bins))
+        span = mx - mn
+        bin_width = span / bin_count if span > 0 else 1.0
+        bins_result = self.store.client.query(
+            f"""
+            SELECT g, greatest(0, least({bin_count - 1},
+                   toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
+                   count() AS c
+            FROM ({pairs_subquery}) AS t
+            WHERE {member_where} AND g IN {{kept:Array(String)}}
+            GROUP BY g, bin_idx
+            ORDER BY g, bin_idx
+            {HEAVY_SCAN_SETTINGS}
+            """,
+            parameters={**parameters, "mn": mn, "bw": bin_width, "kept": kept_values},
+        )
+        bin_counts: dict[str, dict[int, int]] = {}
+        for g, bin_idx, c in bins_result.result_rows:
+            bin_counts.setdefault(g, {})[int(bin_idx)] = int(c)
+
+        groups_out = []
+        for row in groups_result.result_rows:
+            g, c, g_mn, g_mx, g_mean, g_sd, g_skew, *quantile_values = row
+            per_group = bin_counts.get(g, {})
+            groups_out.append(
+                {
+                    "value": g,
+                    "count": int(c),
+                    "min": g_mn,
+                    "max": g_mx,
+                    "mean": g_mean,
+                    "stddev": _nan_to_none(g_sd),
+                    "skewness": _nan_to_none(g_skew),
+                    "quantiles": dict(
+                        zip(
+                            (str(q) for q in self._NUMERIC_QUANTILES),
+                            quantile_values,
+                            strict=True,
+                        )
+                    ),
+                    "bins": [
+                        {
+                            "x0": mn + i * bin_width,
+                            "x1": mn + (i + 1) * bin_width,
+                            "count": per_group.get(i, 0),
+                        }
+                        for i in range(bin_count)
+                    ],
+                }
+            )
+
+        kept_count = sum(g["count"] for g in groups_out)
+        points_block = None
+        if points and kept_values:
+            sample_result = self.store.client.query(
+                f"""
+                SELECT g, v
+                FROM ({pairs_subquery}) AS t
+                WHERE {member_where} AND g IN {{kept:Array(String)}}
+                ORDER BY rand()
+                LIMIT {int(points_limit)}
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters={**parameters, "kept": kept_values},
+            )
+            values = [[r[0], float(r[1])] for r in sample_result.result_rows]
+            points_block = {"total": kept_count, "shown": len(values), "values": values}
+
+        return {
+            **base,
+            "total": total,
+            "min": mn,
+            "max": mx,
+            "distinct_groups": distinct_groups,
+            "omitted_groups": max(0, distinct_groups - len(groups_out)),
+            "omitted_count": max(0, total - kept_count),
+            "groups": groups_out,
+            "points": points_block,
         }
 
     @_gated_scan
@@ -2437,6 +2857,17 @@ class EventQueryService:
         table sampling isn't available). Only events where **both** casts
         are numeric participate; ``total == 0`` signals the caller to fall
         back to categorical treatment, mirroring ``field_numeric_stats``.
+
+        The first scan also computes the correlation/regression block with
+        ClickHouse natives — ``corr`` (Pearson), ``rankCorr`` (Spearman) and
+        ``simpleLinearRegression`` — over the **full** pairwise-complete data,
+        never the sample. Python (:mod:`vestigo.stats`) adds only what
+        ClickHouse has no aggregate for: p-values from the coefficients,
+        Kendall's tau-b and the Shapiro–Wilk normality checks, the latter two
+        over the drawn sample (labelled ``"basis": "sample"`` in the
+        response). The Pearson-vs-Spearman ``recommendation`` follows the
+        Shapiro–Wilk verdict: Pearson only when neither axis rejects
+        normality at p < 0.05.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
@@ -2459,9 +2890,17 @@ class EventQueryService:
             f"toFloat64OrNull(toString({col_y})) AS vy "
             f"FROM {self.store.database}.events WHERE {where}"
         )
+        # assumeNotNull under the IS NOT NULL guard is load-bearing, not
+        # cosmetic: Nullable arguments to the tuple-returning
+        # simpleLinearRegression corrupt clickhouse-connect's native-format
+        # parsing (observed on ClickHouse 26.6 — garbage coefficients or a
+        # UnicodeDecodeError mid-response).
         stats_result = self.store.client.query(
             f"""
-            SELECT count(), min(vx), max(vx), min(vy), max(vy)
+            SELECT count(), min(vx), max(vx), min(vy), max(vy),
+                   corr(assumeNotNull(vx), assumeNotNull(vy)),
+                   rankCorr(assumeNotNull(vx), assumeNotNull(vy)),
+                   simpleLinearRegression(assumeNotNull(vx), assumeNotNull(vy))
             FROM ({pairs_subquery}) AS t
             WHERE vx IS NOT NULL AND vy IS NOT NULL
             {HEAVY_SCAN_SETTINGS}
@@ -2481,6 +2920,7 @@ class EventQueryService:
                 "y_min": None,
                 "y_max": None,
                 "points": [],
+                "stats": None,
             }
 
         sample_result = self.store.client.query(
@@ -2504,4 +2944,5 @@ class EventQueryService:
             "y_min": row[3],
             "y_max": row[4],
             "points": points,
+            "stats": _scatter_stats(total, row[5], row[6], row[7], points),
         }

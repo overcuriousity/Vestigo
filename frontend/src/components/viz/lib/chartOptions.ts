@@ -59,7 +59,8 @@ export function defaultChartTypeForScale(scale: Scale, field: string | null = nu
 
 export interface ResolvedChartOptions {
   topN: number;
-  bins: number;
+  /** null = automatic bin count (server-side Freedman–Diaconis). */
+  bins: number | null;
   buckets: number;
   limitX: number;
   limitY: number;
@@ -69,6 +70,9 @@ export interface ResolvedChartOptions {
   logScale: boolean;
   seriesMode: NonNullable<ChartOptions["seriesMode"]>;
   legend: boolean;
+  showDensity: boolean;
+  groups: number;
+  showPoints: boolean;
 }
 
 export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
@@ -78,7 +82,7 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     // Value-over-time charts draw one line per value, so they cap lower than
     // a bar chart's axis does.
     topN: Math.min(options.topN ?? 10, dataKind === "timeseries" ? 20 : 50),
-    bins: options.bins ?? 30,
+    bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,
@@ -88,5 +92,9 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     logScale: options.logScale ?? false,
     seriesMode: options.seriesMode ?? "overlay",
     legend: options.legend ?? true,
+    // Grouped box/violin cap mirrors the backend's VIZ_GROUPS_MAX.
+    groups: Math.min(options.groups ?? 6, 8),
+    showDensity: options.showDensity ?? true,
+    showPoints: options.showPoints ?? false,
   };
 }

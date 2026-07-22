@@ -13,6 +13,8 @@ const fullConfig: ChartConfig = {
   v: 1,
   field: "attr:src_ip",
   fieldY: null,
+  fields: null,
+  facet: null,
   scale: "nominal",
   chartType: "time",
   metric: "ratio",
@@ -156,5 +158,41 @@ describe("stored (saved chart) round-trip", () => {
     const parsed = parseStoredChartConfig(stored);
     expect(parsed).not.toBeNull();
     expect(parsed?.chartType).toBe(DEFAULT_CHART_CONFIG.chartType);
+  });
+});
+
+describe("facet and multi-field serialization", () => {
+  it("round-trips a facet spec through the URL", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+      facet: { field: "attr:status", limit: 4 },
+    };
+    const params = chartConfigToParams(config);
+    expect(params.get("c_facet")).toBe("attr:status");
+    expect(paramsToChartConfig(params).facet).toEqual({ field: "attr:status", limit: 4 });
+  });
+
+  it("clamps a facet panel count arriving from a hand-edited URL", () => {
+    const params = new URLSearchParams({ c_type: "bar", c_facet: "attr:user", c_facet_n: "99" });
+    expect(paramsToChartConfig(params).facet).toEqual({ field: "attr:user", limit: 12 });
+  });
+
+  it("round-trips a correlation field list, commas and all", () => {
+    const fields = ["attr:bytes", "attr:weird,name", "attr:latency"];
+    const params = chartConfigToParams({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "corr",
+      scale: "ratio",
+      fields,
+    });
+    expect(paramsToChartConfig(params).fields).toEqual(fields);
+  });
+
+  it("ignores a malformed field list instead of throwing", () => {
+    const params = new URLSearchParams({ c_type: "corr", c_fields: "{not json" });
+    expect(paramsToChartConfig(params).fields).toBeNull();
   });
 });

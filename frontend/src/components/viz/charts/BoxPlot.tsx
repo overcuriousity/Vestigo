@@ -1,6 +1,7 @@
 import { format as formatNum } from "d3-format";
 import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { NumericPlotFrame } from "@/components/viz/primitives/NumericPlotFrame";
+import { BoxMark, PointStrip } from "@/components/viz/charts/distributionMarks";
 import { boxPlotStats } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
@@ -12,12 +13,26 @@ interface BoxPlotProps {
   svgRef?: React.RefObject<SVGSVGElement | null>;
   height?: number;
   color?: string;
+  /** Overlay the response's sampled raw values as a jittered strip — only
+   * drawn when the request asked for `points` (see `vizApi.fieldNumeric`). */
+  showPoints?: boolean;
+  /** Pin the value axis to a shared [min, max]. Facet panels pass the range
+   * across all panels, so a box drawn higher really does mean larger values
+   * rather than a differently-scaled axis. */
+  domain?: [number, number];
 }
 
 /** Vertical box plot (five-number summary) for a numeric field — median,
  * quartile box, and 1.5*IQR whiskers. Built from the server's quantiles, so
- * no raw values are shipped to the client. */
-export function BoxPlot({ stats, svgRef, height = 260, color = "var(--color-accent)" }: BoxPlotProps) {
+ * only an optional random sample of raw values ever reaches the client. */
+export function BoxPlot({
+  stats,
+  svgRef,
+  height = 260,
+  color = "var(--color-accent)",
+  showPoints = false,
+  domain,
+}: BoxPlotProps) {
   const box = boxPlotStats(stats);
   if (!box) {
     return (
@@ -31,83 +46,30 @@ export function BoxPlot({ stats, svgRef, height = 260, color = "var(--color-acce
     <NumericPlotFrame
       svgRef={svgRef}
       height={height}
-      min={box.min}
-      max={box.max}
+      min={domain?.[0] ?? box.min}
+      max={domain?.[1] ?? box.max}
       yTickFormat={(v) => fmtValue(v)}
     >
-      {({ cx, margin, y, setHover }) => {
-        const boxTop = y(box.q3);
-        const boxBottom = y(box.q1);
-
-        const show = (label: string, value: number, py: number) => () =>
-          setHover({ x: cx + margin.left, y: py + margin.top, label: `${label}: ${fmtValue(value)}` });
-
-        return (
-          <>
-            {/* Whiskers */}
-            <line
-              x1={cx}
-              x2={cx}
-              y1={y(box.whiskerHigh)}
-              y2={boxTop}
-              stroke="var(--viz-axis)"
-              strokeWidth={1.5}
-            />
-            <line
-              x1={cx}
-              x2={cx}
-              y1={boxBottom}
-              y2={y(box.whiskerLow)}
-              stroke="var(--viz-axis)"
-              strokeWidth={1.5}
-            />
-            <line
-              x1={cx - BOX_WIDTH / 4}
-              x2={cx + BOX_WIDTH / 4}
-              y1={y(box.whiskerHigh)}
-              y2={y(box.whiskerHigh)}
-              stroke="var(--viz-axis)"
-              strokeWidth={1.5}
-              onMouseEnter={show("Upper whisker", box.whiskerHigh, y(box.whiskerHigh))}
-              onMouseLeave={() => setHover(null)}
-            />
-            <line
-              x1={cx - BOX_WIDTH / 4}
-              x2={cx + BOX_WIDTH / 4}
-              y1={y(box.whiskerLow)}
-              y2={y(box.whiskerLow)}
-              stroke="var(--viz-axis)"
-              strokeWidth={1.5}
-              onMouseEnter={show("Lower whisker", box.whiskerLow, y(box.whiskerLow))}
-              onMouseLeave={() => setHover(null)}
-            />
-            {/* Box (Q1-Q3) */}
-            <rect
-              x={cx - BOX_WIDTH / 2}
-              y={boxTop}
-              width={BOX_WIDTH}
-              height={Math.max(1, boxBottom - boxTop)}
-              fill={color}
-              fillOpacity={0.25}
-              stroke={color}
-              strokeWidth={1.5}
-              onMouseEnter={show("Q1–Q3", box.q1, (boxTop + boxBottom) / 2)}
-              onMouseLeave={() => setHover(null)}
-            />
-            {/* Median */}
-            <line
-              x1={cx - BOX_WIDTH / 2}
-              x2={cx + BOX_WIDTH / 2}
-              y1={y(box.median)}
-              y2={y(box.median)}
-              stroke={color}
-              strokeWidth={2.5}
-              onMouseEnter={show("Median", box.median, y(box.median))}
-              onMouseLeave={() => setHover(null)}
-            />
-          </>
-        );
-      }}
+      {({ margin, y, cx, setHover }) => (
+        <>
+          <BoxMark
+            dist={stats}
+            cx={cx}
+            width={BOX_WIDTH}
+            y={y}
+            color={color}
+            fmt={fmtValue}
+            hover={{
+              onHover: (label, atY) =>
+                setHover({ x: cx + margin.left, y: atY + margin.top, label }),
+              onLeave: () => setHover(null),
+            }}
+          />
+          {showPoints && stats.points && (
+            <PointStrip values={stats.points.values} cx={cx} spread={BOX_WIDTH / 2} y={y} />
+          )}
+        </>
+      )}
     </NumericPlotFrame>
   );
 }

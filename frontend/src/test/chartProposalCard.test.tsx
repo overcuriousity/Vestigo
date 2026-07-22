@@ -51,6 +51,8 @@ vi.mock("@/api/viz", async () => {
       fieldTimeseries: (...args: unknown[]) => fieldTimeseriesMock(...args),
       fieldPivot: (...args: unknown[]) => fieldPivotMock(...args),
       fieldScatter: vi.fn(),
+      fieldCorrelation: vi.fn(),
+      fieldNumericGrouped: vi.fn(),
       compare: vi.fn(),
     },
     savedChartsApi: {
@@ -83,6 +85,10 @@ const NUMERIC: FieldNumericResponse = {
   max: 100,
   mean: 50,
   stddev: 20,
+  skewness: 0,
+  points: null,
+  bin_rule: "manual",
+  bin_width: 50,
   quantiles: {},
   bins: [{ x0: 0, x1: 50, count: 60 }],
 };
@@ -254,5 +260,44 @@ describe("ChartProposalCard renders the requested mark, not the aggregation's de
     const call = fieldTimeseriesMock.mock.calls[0];
     expect(call[4]).toBe(20);
     expect(call[5]).toBe(5);
+  });
+});
+
+describe("facetted proposals", () => {
+  it("draws one panel per facet value instead of the unfacetted chart", async () => {
+    // The panel list comes from a terms query on the facet field; each panel
+    // then re-runs the mark's own endpoint with the value applied as a filter.
+    fieldTermsMock.mockImplementation((_c, _t, field) =>
+      Promise.resolve(
+        field === "attr:user"
+          ? {
+              field: "attr:user",
+              total: 100,
+              distinct: 5,
+              other_count: 12,
+              values: [
+                { value: "alice", count: 60 },
+                { value: "bob", count: 28 },
+              ],
+            }
+          : TERMS,
+      ),
+    );
+    renderCard({
+      chart_type: "bar",
+      field: "artifact",
+      facet: { field: "attr:user", limit: 2 },
+    } as AgentChartSpec);
+
+    await waitFor(() => expect(screen.getByText(/attr:user = alice/)).toBeTruthy());
+    expect(screen.getByText(/attr:user = bob/)).toBeTruthy();
+    // The omission is stated, not merged into an "Other" panel.
+    expect(screen.getByText(/3 further values/)).toBeTruthy();
+    // Each panel's own query carried the facet value as a filter.
+    const panelCalls = fieldTermsMock.mock.calls.filter((c) => c[2] === "artifact");
+    expect(panelCalls.length).toBe(2);
+    expect(
+      panelCalls.every((c) => JSON.stringify(c[3]).includes("alice") || JSON.stringify(c[3]).includes("bob")),
+    ).toBe(true);
   });
 });

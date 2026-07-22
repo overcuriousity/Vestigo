@@ -10,6 +10,10 @@ function makeStats(overrides: Partial<FieldNumericResponse> = {}): FieldNumericR
     max: 100,
     mean: 50,
     stddev: 20,
+    skewness: 0,
+    points: null,
+    bin_rule: "manual",
+    bin_width: 25,
     quantiles: { "0.25": 25, "0.5": 50, "0.75": 75 },
     bins: [
       { x0: 0, x1: 25, count: 25 },

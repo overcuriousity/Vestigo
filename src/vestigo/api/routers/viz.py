@@ -46,7 +46,7 @@ from vestigo.db.field_stats import (
     merged_inventory,
 )
 from vestigo.db.postgres import Case, User, generate_id
-from vestigo.db.queries import EventQuery
+from vestigo.db.queries import EventQuery, EventQueryService
 
 router = APIRouter(prefix="/api/cases", tags=["viz"])
 
@@ -292,7 +292,9 @@ async def get_field_numeric_stats(
     case_id: str,
     timeline_id: str,
     field: str = Query(..., description="Field token, e.g. 'attr:bytes_sent'"),
-    bins: int = Query(default=30, ge=1, le=200),
+    bins: int | None = Query(default=None, ge=1, le=200),
+    points: bool = Query(default=False, description="Include a random raw-value sample"),
+    points_limit: int = Query(default=1000, ge=10, le=1000),
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -320,6 +322,9 @@ async def get_field_numeric_stats(
     ``count == 0`` in the response means the field has no numeric values in
     the current filter set — the Visualization page falls back to treating
     it as categorical. Powers histogram/box/violin/ECDF chart types.
+
+    ``bins`` omitted selects the Freedman–Diaconis automatic bin count; the
+    response's ``bin_rule`` records which path was taken.
     """
     query = await _resolve_event_query(
         case_id,
@@ -352,6 +357,169 @@ async def get_field_numeric_stats(
         query,
         field,
         bins,
+        points,
+        points_limit,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/field-correlation")
+async def get_field_correlation(
+    case_id: str,
+    timeline_id: str,
+    fields: list[str] = Query(  # noqa: B008
+        ..., description="2–8 numeric field tokens; repeat the param per field"
+    ),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Pairwise Pearson/Spearman correlations across several numeric fields.
+
+    Powers the correlation-matrix chart. Each pair reports the number of
+    events where **both** fields are numeric (pairwise-complete), so a field
+    with sparse coverage cannot silently shrink the other pairs. 422 on
+    fewer than two or more than eight fields, or on duplicates.
+    """
+    unique = list(dict.fromkeys(fields))
+    if len(unique) != len(fields):
+        raise HTTPException(status_code=422, detail="fields must be distinct")
+    if not 2 <= len(unique) <= EventQueryService.CORRELATION_MAX_FIELDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "a correlation matrix needs between 2 and "
+                f"{EventQueryService.CORRELATION_MAX_FIELDS} fields"
+            ),
+        )
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_correlation,
+        query,
+        unique,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/field-numeric-grouped")
+async def get_field_numeric_grouped(
+    case_id: str,
+    timeline_id: str,
+    field: str = Query(..., description="Numeric field token, e.g. 'attr:bytes_sent'"),
+    group_field: str = Query(..., description="Categorical grouping field token"),
+    groups: int = Query(default=8, ge=2, le=8),
+    bins: int = Query(default=30, ge=1, le=200),
+    points: bool = Query(default=False, description="Include a random raw-value sample"),
+    points_limit: int = Query(default=1000, ge=10, le=1000),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Per-group numeric distributions — grouped box/violin plots.
+
+    One numeric response field split by a categorical grouping field: top-N
+    groups by numeric-value count, per-group quantiles + fixed-width bins
+    over the global value range, honest omission counts, and an optional
+    uniform random point sample. 422 when the two fields are the same.
+    """
+    if field == group_field:
+        raise HTTPException(
+            status_code=422, detail="field and group_field must differ for a grouped chart"
+        )
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_numeric_grouped,
+        query,
+        field,
+        group_field,
+        groups,
+        bins,
+        points,
+        points_limit,
     )
 
 

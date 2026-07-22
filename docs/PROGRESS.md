@@ -1,9 +1,66 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 88 — --split ported to native Parquet converters).
+Last updated: 2026-07-22 (session 89 — lecture-grade statistical visualizations).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 89 — 2026-07-22: lecture-grade statistical visualizations
+
+Audited the visualization stack against the HS Mittweida "Datenanalyse und -visualisierung"
+lecture set (anatomy of a graphic, histograms, box/violin, bar, pie/waffle, line, scatter,
+correlation/multipanel, descriptive statistics) and closed every identified gap except
+geographic charts (deferred with its blockers named in `ROADMAP.md` Milestone 2). The
+existing core held up: Stevens-scale legality per mark, zero-baseline bars, no dual-axis
+charts anywhere, and captions that state top-N capping and sampling. What was missing was
+analysis depth, so this round added it — for the analyst and the agent in the same commit,
+since `agent/chart_meta.py` generates the frontend's table.
+
+**New statistics, computed server-side.** `src/vestigo/stats.py` is a new pure-Python
+inference module (no scipy — airgapped installs stay slim): regularized incomplete beta →
+Student-t survival → Pearson/Spearman p-values, Kendall's tau-b with tie correction,
+Shapiro–Wilk after Royston (1995) AS R94, and the Freedman–Diaconis bin rule. It is pinned
+against scipy-computed reference constants committed as `tests/data/stats_reference_scipy.json`.
+Everything ClickHouse *can* do is left to ClickHouse (`corr`, `rankCorr`,
+`simpleLinearRegression`, `skewPop`, `quantile`) over the full filtered data; Python only
+fills the gaps, and the response labels which numbers came from a sample.
+
+Two ClickHouse behaviours were settled empirically against the live dev server (26.6) and
+are now pinned by `tests/test_viz_stats_clickhouse.py`: multi-argument aggregates skip a
+row when *any* argument is NULL, which is exactly pairwise-complete deletion and is why the
+correlation matrix does not use `corrMatrix` (listwise) — and `assumeNotNull` must **not**
+be used to "fix" the Nullable arguments, because it turns NULL into 0.0 and folds
+non-numeric rows into the coefficient. `simpleLinearRegression` is the exception: its
+tuple return corrupts clickhouse-connect's native parsing with Nullable inputs, so it (and
+only it) gets `assumeNotNull` under an `IS NOT NULL` guard.
+
+**New marks and aggregations.** Correlation matrix (`corr`, new `field_correlation`
+aggregation + endpoint + agent tool; lower-triangle diverging grid, per-cell coefficient,
+click-through to the pair's scatter); grouped box/violin (`field_numeric_grouped`: top-N
+groups by count, per-group quantiles binned over the *global* range so silhouettes compare,
+omitted groups reported and never merged into an "Other" box); waffle chart (reuses the
+terms aggregation, largest-remainder allocation so cells sum to exactly 100 and no existing
+category rounds to zero); facetting (client-orchestrated small multiples — one terms query
+names the panels, each panel re-runs the same endpoint with an added equality filter, so no
+new server aggregation and no new failure mode).
+
+**Honesty fixes the lectures are blunt about.** Violin/box gained an optional jittered
+overlay of sampled raw values (deterministic jitter, so an export reproduces the strip)
+— a violin without points implies data it never measured. Pie gained a readability warning
+past four slices or when two slices differ by under 10%, offering bar/waffle instead;
+advisory, never a refusal, and the same rule runs in `propose_chart`. Line charts mark
+their actual measured buckets (Tufte's graphical integrity). Histograms default to
+Freedman–Diaconis bin widths with a manual override, and carry a density curve, mean/median
+markers and skewness with its plain-language reading.
+
+**Teaching mode.** `viz/lib/explainers.ts` is a single copy module and
+`ExplainerPopover.tsx` its one renderer: every statistic gets *what it is / how to read it /
+when to distrust it* plus the formula, and every chart type a one-line "how to read this".
+The distrust section is mandatory (a test enforces it) — a statistic explained without its
+failure mode teaches overconfidence, which is worse than not explaining it.
+
+`docs/AGENT.md` documents the new tools, the field-slot rules (`field_y` required vs.
+optional, `fields`, `facet`), and the statistics contract.
 
 ## Session 88 — 2026-07-22: --split ported to native Parquet converters
 

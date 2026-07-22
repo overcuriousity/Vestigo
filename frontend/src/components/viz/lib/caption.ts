@@ -5,7 +5,7 @@
  * exactly what a report reader sees. Includes the truthfulness warnings
  * (top-N capping, undefined metric bins) forensic rigor demands.
  */
-import type { EventFilters } from "@/api/types";
+import type { EventFilters, ScatterStats } from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
 import { METRIC_INFO } from "./transforms";
 
@@ -23,6 +23,10 @@ export interface CaptionFacts {
   binCount?: number;
   valueMin?: number | null;
   valueMax?: number | null;
+  /** kind=numeric: how the bin count was chosen ("fd" = Freedman–Diaconis). */
+  binRule?: "fd" | "manual";
+  /** kind=numeric: population skewness g₁ (null when degenerate). */
+  skewness?: number | null;
   /** Single focused value (e.g. the field-histogram modal's `field = value`
    * drill-down) — takes over the kind=time field line instead of the
    * generic "event count over time" phrasing. */
@@ -35,6 +39,29 @@ export interface CaptionFacts {
   /** kind=scatter: sample-size truthfulness. */
   sampledPoints?: number;
   totalPoints?: number;
+  /** kind=scatter: server-computed correlation/regression block. */
+  scatterStats?: ScatterStats | null;
+  /** Grouped box/violin: grouping field and top-N truthfulness. */
+  groupField?: string;
+  groupsShown?: number;
+  groupsOmitted?: number;
+  groupOmittedCount?: number;
+  /** box/violin raw-value strip overlay: sample truthfulness. */
+  overlayShown?: number;
+  overlayTotal?: number;
+  /** Mark-choice caution (e.g. a pie with too many/near-equal slices). */
+  readabilityWarning?: string;
+  /** Facet grid: the splitting field and its top-N truthfulness. */
+  facetField?: string;
+  facetPanels?: number;
+  facetOmittedValues?: number;
+  facetOmittedCount?: number;
+  /** kind=corr: which fields were correlated, and over how many events. */
+  corrFields?: string[];
+  corrPairs?: number;
+  corrDropped?: string[];
+  corrMinPairN?: number;
+  corrMaxPairN?: number;
 }
 
 const fmtInt = (n: number) => n.toLocaleString("en-US");
@@ -131,9 +158,25 @@ export function buildCaptionLines(args: {
     lines.push(`${describeInterval(facts.intervalSeconds)} buckets, UTC`);
   }
   if (facts.binCount != null && facts.valueMin != null && facts.valueMax != null) {
+    const rule =
+      facts.binRule === "fd"
+        ? " (Freedman–Diaconis automatic width)"
+        : facts.binRule === "manual"
+          ? " (manual)"
+          : "";
     lines.push(
-      `${facts.binCount} fixed-width bins over [${facts.valueMin.toLocaleString()}, ${facts.valueMax.toLocaleString()}]`,
+      `${facts.binCount} fixed-width bins over [${facts.valueMin.toLocaleString()}, ${facts.valueMax.toLocaleString()}]${rule}`,
     );
+  }
+  if (facts.skewness != null) {
+    const g1 = facts.skewness;
+    const reading =
+      Math.abs(g1) < 0.5
+        ? "approximately symmetric"
+        : g1 > 0
+          ? "right-skewed (long upper tail; mode < median < mean)"
+          : "left-skewed (long lower tail; mean < median < mode)";
+    lines.push(`skewness g₁ = ${g1.toFixed(2)} — ${reading}`);
   }
 
   // Truthfulness warnings.
@@ -168,6 +211,66 @@ export function buildCaptionLines(args: {
       `showing ${fmtInt(facts.sampledPoints)} of ${fmtInt(facts.totalPoints)} points (uniform random sample; axes span full data)`,
     );
   }
+  if (facts.groupField != null && facts.groupsShown != null) {
+    lines.push(
+      `grouped by ${facts.groupField}: ${fmtInt(facts.groupsShown)} group${facts.groupsShown === 1 ? "" : "s"} shown` +
+        (facts.groupsOmitted
+          ? `; ${fmtInt(facts.groupsOmitted)} smaller group${facts.groupsOmitted === 1 ? "" : "s"} omitted (${fmtInt(facts.groupOmittedCount ?? 0)} events), not merged into an "Other" group`
+          : "") +
+        " — all groups binned over the same value range",
+    );
+  }
+  if (facts.overlayShown != null && facts.overlayTotal != null) {
+    lines.push(
+      facts.overlayShown < facts.overlayTotal
+        ? `point overlay: showing ${fmtInt(facts.overlayShown)} of ${fmtInt(facts.overlayTotal)} values (uniform random sample)`
+        : `point overlay: all ${fmtInt(facts.overlayShown)} values shown`,
+    );
+  }
+  if (facts.scatterStats) {
+    const s = facts.scatterStats;
+    const fmtC = (v: number | null) => (v == null ? "n/a" : v.toFixed(3));
+    lines.push(
+      `Pearson r = ${fmtC(s.pearson.r)}, Spearman ρ = ${fmtC(s.spearman.rho)} over all ${s.n.toLocaleString("en-US")} pairs (ClickHouse)` +
+        (s.regression?.slope != null && s.regression.intercept != null
+          ? `; regression y ≈ ${s.regression.slope.toPrecision(4)}·x + ${s.regression.intercept.toPrecision(4)}, R² = ${fmtC(s.regression.r_squared)}`
+          : ""),
+    );
+    lines.push(
+      `recommended coefficient: ${s.recommendation === "pearson" ? "Pearson r" : "Spearman ρ"} (Shapiro–Wilk normality check on the ${s.shapiro.n.toLocaleString("en-US")}-point sample)`,
+    );
+  }
+  if (facts.facetField != null && facts.facetPanels != null) {
+    lines.push(
+      `split into ${fmtInt(facts.facetPanels)} panel${facts.facetPanels === 1 ? "" : "s"} by ${facts.facetField}` +
+        (facts.facetOmittedValues
+          ? `; ${fmtInt(facts.facetOmittedValues)} further value${facts.facetOmittedValues === 1 ? "" : "s"}` +
+            (facts.facetOmittedCount
+              ? ` (${fmtInt(facts.facetOmittedCount)} events)`
+              : "") +
+            ' omitted, not merged into an "Other" panel'
+          : ""),
+    );
+  }
+  if (facts.corrFields?.length) {
+    lines.push(
+      `${facts.corrPairs ?? 0} field pairs over ${facts.corrFields.length} fields: ${facts.corrFields.join(", ")}`,
+    );
+    if (facts.corrMinPairN != null && facts.corrMaxPairN != null) {
+      lines.push(
+        facts.corrMinPairN === facts.corrMaxPairN
+          ? `each pair computed over ${fmtInt(facts.corrMinPairN)} events with both values (pairwise-complete)`
+          : `pairs computed over ${fmtInt(facts.corrMinPairN)}–${fmtInt(facts.corrMaxPairN)} events with both values (pairwise-complete)`,
+      );
+    }
+    if (facts.corrDropped?.length) {
+      lines.push(
+        `no numeric values under these filters: ${facts.corrDropped.join(", ")} — their cells are empty`,
+      );
+    }
+    lines.push("correlation is not causation; a coefficient near 0 rules out only the relationship it measures");
+  }
+  if (facts.readabilityWarning) lines.push(`readability: ${facts.readabilityWarning}`);
   if (metric === "delta") lines.push("first bin omitted (Δ undefined)");
   if (metric === "ratio") lines.push("bins with a zero-count comparison layer omitted (ratio undefined)");
 

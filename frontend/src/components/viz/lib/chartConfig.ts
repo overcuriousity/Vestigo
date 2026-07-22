@@ -17,6 +17,7 @@ export type ChartType =
   | "time"
   | "bar"
   | "pie"
+  | "waffle"
   | "heatmap"
   | "line"
   | "histogram"
@@ -26,7 +27,8 @@ export type ChartType =
   | "punchcard"
   | "pivot"
   | "sankey"
-  | "scatter";
+  | "scatter"
+  | "corr";
 
 export type CompareSpec =
   | { mode: "off" }
@@ -40,25 +42,47 @@ export interface ChartOptions {
   seriesMode?: "overlay" | "stacked";
   legend?: boolean;
   topN?: number;
+  /** Histogram bin count; omitted = automatic Freedman–Diaconis width. */
   bins?: number;
+  /** Histogram: smoothed density (KDE) curve overlay. Default on. */
+  showDensity?: boolean;
   buckets?: number;
   /** pivot/sankey: per-axis top-N caps. */
   limitX?: number;
   limitY?: number;
   /** scatter: server-side sample size. */
   sampleLimit?: number;
+  /** box/violin: top-N cap when a grouping field (fieldY) is set. */
+  groups?: number;
+  /** box/violin: jittered raw-value strip overlay; line: point markers. */
+  showPoints?: boolean;
+}
+
+/** Small multiples: one panel per top value of a categorical field. */
+export interface FacetSpec {
+  field: string;
+  /** Panels to draw (top values by event count). Clamped to 2–12. */
+  limit: number;
 }
 
 export interface ChartConfig {
   v: 1;
   /** Field token, or null for pure event-count charts ("time"/"punchcard"). */
   field: string | null;
-  /** Second field token for two-field charts (pivot/sankey/scatter), else null. */
+  /** Second field token for two-field charts (pivot/sankey/scatter), or the
+   * optional categorical grouping field for box/violin; else null. */
   fieldY: string | null;
+  /** Field list for the correlation matrix (2–8 numeric tokens), else null.
+   * JSON-encoded in the URL rather than comma-joined: attribute tokens are
+   * user data and may legitimately contain a comma. */
+  fields: string[] | null;
   scale: Scale;
   chartType: ChartType;
   metric: Metric;
   compare: CompareSpec;
+  /** Facet grid, or null. Mutually exclusive with a comparison layer: one
+   * splits the data into panels, the other overlays two layers in one. */
+  facet: FacetSpec | null;
   options: ChartOptions;
 }
 
@@ -66,6 +90,7 @@ export const DEFAULT_CHART_CONFIG: ChartConfig = {
   v: 1,
   field: null,
   fieldY: null,
+  fields: null,
   scale: "nominal",
   // Events-over-time is the fresh-load default: it needs no field, runs on the
   // already-optimized single-pass histogram, and never lands on an empty canvas
@@ -73,6 +98,7 @@ export const DEFAULT_CHART_CONFIG: ChartConfig = {
   chartType: "time",
   metric: "count",
   compare: { mode: "off" },
+  facet: null,
   options: {},
 };
 
@@ -80,6 +106,7 @@ const CHART_TYPES: ChartType[] = [
   "time",
   "bar",
   "pie",
+  "waffle",
   "heatmap",
   "line",
   "histogram",
@@ -90,6 +117,7 @@ const CHART_TYPES: ChartType[] = [
   "pivot",
   "sankey",
   "scatter",
+  "corr",
 ];
 const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
@@ -110,12 +138,17 @@ export function chartConfigToParams(
   params.set("c_scale", config.scale);
   if (config.field) params.set("c_field", config.field);
   if (config.fieldY) params.set("c_field_y", config.fieldY);
+  if (config.fields?.length) params.set("c_fields", JSON.stringify(config.fields));
   if (config.metric !== "count") params.set("c_metric", config.metric);
   if (config.compare.mode !== "off") {
     params.set("c_compare", config.compare.mode);
     if (config.compare.mode === "custom") {
       params.set("c_compare_filters", JSON.stringify(filtersToViewPayload(config.compare.filters)));
     }
+  }
+  if (config.facet) {
+    params.set("c_facet", config.facet.field);
+    params.set("c_facet_n", String(config.facet.limit));
   }
   if (Object.keys(config.options).length > 0) {
     params.set("c_opts", JSON.stringify(config.options));
@@ -136,6 +169,17 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
   if (scale && (SCALES as string[]).includes(scale)) config.scale = scale as Scale;
   config.field = params.get("c_field") || null;
   config.fieldY = params.get("c_field_y") || null;
+  const rawFields = params.get("c_fields");
+  if (rawFields) {
+    try {
+      const parsed = JSON.parse(rawFields);
+      if (Array.isArray(parsed) && parsed.every((f) => typeof f === "string")) {
+        config.fields = parsed;
+      }
+    } catch {
+      // malformed field list — chart falls back to no selection
+    }
+  }
   const metric = params.get("c_metric");
   if (metric && (METRICS as string[]).includes(metric)) config.metric = metric as Metric;
 
@@ -149,6 +193,15 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
     } catch {
       config.compare = { mode: "off" };
     }
+  }
+
+  const facetField = params.get("c_facet");
+  if (facetField) {
+    const limit = Number(params.get("c_facet_n"));
+    config.facet = {
+      field: facetField,
+      limit: Number.isFinite(limit) ? Math.min(12, Math.max(2, limit)) : 6,
+    };
   }
 
   const rawOpts = params.get("c_opts");
@@ -186,6 +239,9 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   if (typeof raw.field === "string" && raw.field) config.field = raw.field;
   // Additive v1 field — absent in older saved configs, which load as null.
   if (typeof raw.fieldY === "string" && raw.fieldY) config.fieldY = raw.fieldY;
+  if (Array.isArray(raw.fields) && raw.fields.every((f) => typeof f === "string")) {
+    config.fields = raw.fields as string[];
+  }
   if (typeof raw.metric === "string" && (METRICS as string[]).includes(raw.metric)) {
     config.metric = raw.metric as Metric;
   }
@@ -196,6 +252,14 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
     config.compare = {
       mode: "custom",
       filters: viewPayloadToFilters(compare.filters as Record<string, unknown>),
+    };
+  }
+  const facet = raw.facet as Record<string, unknown> | undefined;
+  if (facet && typeof facet.field === "string" && facet.field) {
+    const limit = Number(facet.limit);
+    config.facet = {
+      field: facet.field,
+      limit: Number.isFinite(limit) ? Math.min(12, Math.max(2, limit)) : 6,
     };
   }
   if (raw.options && typeof raw.options === "object") {

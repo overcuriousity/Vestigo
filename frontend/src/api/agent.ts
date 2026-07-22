@@ -46,6 +46,8 @@ export interface AgentChartSpecV2 {
   scale?: ChartConfig["scale"] | null;
   field?: string | null;
   field_y?: string | null;
+  fields?: string[] | null;
+  facet?: { field: string; limit?: number | null } | null;
   metric?: Metric | null;
   filters?: AgentFilterSpec | null;
   compare?: {
@@ -64,6 +66,9 @@ export interface AgentChartSpecV2 {
     limit_x?: number | null;
     limit_y?: number | null;
     sample_limit?: number | null;
+    groups?: number | null;
+    show_points?: boolean | null;
+    show_density?: boolean | null;
   } | null;
 }
 
@@ -148,12 +153,17 @@ export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
   if (o.log_scale != null) options.logScale = o.log_scale;
   if (o.series_mode != null) options.seriesMode = o.series_mode;
   if (o.legend != null) options.legend = o.legend;
+  if (o.groups != null) options.groups = o.groups;
+  if (o.show_points != null) options.showPoints = o.show_points;
+  if (o.show_density != null) options.showDensity = o.show_density;
 
   const compare = spec.compare;
   return {
     v: 1,
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
+    fields: spec.fields ?? null,
+    facet: spec.facet ? { field: spec.facet.field, limit: spec.facet.limit ?? 6 } : null,
     // An omitted scale takes the chart type's default — the same value the
     // backend resolved and echoed in `resolved.scale`.
     scale: spec.scale ?? CHART_META[spec.chart_type].defaultScale,
@@ -201,6 +211,9 @@ function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
     v: 1,
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
+    // The retired shape had no multi-field chart and no facetting.
+    fields: null,
+    facet: null,
     scale: SCALE_BY_KIND[spec.kind],
     chartType: CHART_TYPE_BY_KIND[spec.kind],
     metric: "count",

@@ -19,6 +19,9 @@ interface ScatterChartProps {
   /** Log-scale both axes (falls back to linear per-axis when the axis's
    * full-data extent includes zero or negatives — log is undefined there). */
   logScale?: boolean;
+  /** Draw the server-computed least-squares regression line (linear axes
+   * only — a straight line is a curve in log space and would mislead). */
+  showRegression?: boolean;
 }
 
 /**
@@ -28,7 +31,13 @@ interface ScatterChartProps {
  * is drawn — the caption states "showing N of M points". Point hover
  * reports the exact pair.
  */
-export function ScatterChart({ data, svgRef, height = 320, logScale = false }: ScatterChartProps) {
+export function ScatterChart({
+  data,
+  svgRef,
+  height = 320,
+  logScale = false,
+  showRegression = true,
+}: ScatterChartProps) {
   const [hover, setHover] = useState<{ x: number; y: number; px: number; py: number } | null>(
     null,
   );
@@ -53,6 +62,7 @@ export function ScatterChart({ data, svgRef, height = 320, logScale = false }: S
             marginLeft={margin.left}
             marginTop={margin.top}
             logScale={logScale}
+            showRegression={showRegression}
             setHover={setHover}
           />
         )}
@@ -100,6 +110,7 @@ function ScatterBody({
   marginLeft,
   marginTop,
   logScale,
+  showRegression,
   setHover,
 }: {
   data: FieldScatterResponse;
@@ -108,6 +119,7 @@ function ScatterBody({
   marginLeft: number;
   marginTop: number;
   logScale: boolean;
+  showRegression: boolean;
   setHover: (h: { x: number; y: number; px: number; py: number } | null) => void;
 }) {
   const x = useMemo(
@@ -128,6 +140,45 @@ function ScatterBody({
         tickFormat={(v) => fmtVal(v as number)}
       />
       <AxisLeft scale={y} innerWidth={innerWidth} tickFormat={fmtVal} />
+      {showRegression &&
+        !logScale &&
+        data.stats?.regression?.slope != null &&
+        data.stats.regression.intercept != null &&
+        data.x_min != null &&
+        data.x_max != null &&
+        (() => {
+          const { slope, intercept } = data.stats.regression;
+          // Clip the segment to the data's bounding box so a steep line
+          // cannot draw outside the plot area (the scales extrapolate).
+          const yAt = (vx: number) => slope! * vx + intercept!;
+          const [yLo, yHi] = [
+            Math.min(data.y_min ?? -Infinity, data.y_max ?? Infinity),
+            Math.max(data.y_min ?? -Infinity, data.y_max ?? Infinity),
+          ];
+          let vx1 = data.x_min;
+          let vx2 = data.x_max;
+          if (slope !== 0) {
+            const xAt = (vy: number) => (vy - intercept!) / slope!;
+            const cand = [xAt(yLo), xAt(yHi)].sort((a, b) => a - b);
+            vx1 = Math.max(vx1, cand[0]);
+            vx2 = Math.min(vx2, cand[1]);
+          } else if (yAt(vx1) < yLo || yAt(vx1) > yHi) {
+            return null;
+          }
+          if (!(vx1 < vx2)) return null;
+          return (
+            <line
+              x1={x(vx1)}
+              y1={y(yAt(vx1))}
+              x2={x(vx2)}
+              y2={y(yAt(vx2))}
+              stroke="var(--viz-ink-primary)"
+              strokeWidth={1.5}
+              strokeDasharray="6 4"
+              pointerEvents="none"
+            />
+          );
+        })()}
       {data.points.map(([px, py], i) => (
         <circle
           key={i}

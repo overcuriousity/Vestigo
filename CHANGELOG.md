@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-07-22
+
+### Added
+
+- **Statistical visualization depth** — the visualization stack was audited
+  against a data-analysis-and-visualization lecture set and every identified
+  gap closed except geographic charts (deferred with its blockers named in
+  `ROADMAP.md`). Five new capabilities, each available to the analyst and to
+  the AI agent from the same legality table:
+  - **Correlation matrix** (`corr`): pairwise Pearson and Spearman across 2–8
+    numeric fields as a lower-triangle diverging grid with the coefficient
+    printed in every cell, and a click-through to the pair's scatter plot.
+    New `field_correlation` aggregation, endpoint and agent tool. Correlations
+    are **pairwise-complete** — each pair reports the `n` it was computed over,
+    so a field with sparse numeric coverage shrinks only the pairs it takes
+    part in.
+  - **Grouped box/violin plots**: `box`/`violin` now accept an optional
+    categorical `field_y`, giving one distribution per top group. Per-group
+    quantiles are binned over the *global* value range so the silhouettes are
+    directly comparable; groups outside the top-N are reported as omitted and
+    never merged into an "Other" box.
+  - **Small multiples (facetting)**: any single-layer mark can be drawn once
+    per top value of a categorical field. Panels share one scale — a bar twice
+    as tall really does mean twice the count — and the omitted values are
+    stated under the grid. Mutually exclusive with the comparison layer.
+  - **Waffle chart**: shares of a whole as a 10×10 grid of countable cells,
+    allocated by largest remainder so the cells sum to exactly 100 and no
+    existing category ever rounds away to zero.
+  - **Scatter statistics**: Pearson r, Spearman ρ, Kendall τ-b, their
+    p-values, a least-squares regression line with R², and Shapiro–Wilk
+    normality checks that decide which coefficient the panel recommends.
+- **`vestigo.stats`** — a pure-Python inference module (regularized incomplete
+  beta, Student-t survival, correlation p-values, Kendall τ-b, Shapiro–Wilk
+  after Royston 1995, the Freedman–Diaconis bin rule), pinned against
+  scipy-computed reference constants. scipy is deliberately not a dependency;
+  everything ClickHouse has an aggregate for (`corr`, `rankCorr`,
+  `simpleLinearRegression`, `skewPop`, quantiles) is computed there over the
+  full filtered data, and the response labels which numbers came from a sample.
+- **Teaching explainers throughout the visualization UI** — every statistic
+  and chart concept carries a popover with what it is, how to read it, when to
+  distrust it, and its formula; every chart type carries a one-line reading
+  aid. The "when to distrust it" section is mandatory (enforced by test): a
+  statistic explained without its failure mode teaches overconfidence.
+
+### Changed
+
+- **Histograms** default to Freedman–Diaconis bin widths (manual override
+  retained) and gained a density curve, mean/median markers, and skewness with
+  its plain-language reading. The response reports `bin_rule` and `bin_width`,
+  and the caption states which rule produced the bins.
+- **Box and violin plots** can overlay a uniform random sample of the raw
+  values as a jittered strip — a violin drawn without its points implies data
+  it never measured. The jitter is deterministic, so an SVG/PNG export
+  reproduces exactly what was on screen.
+- **Line charts** mark their actually-measured buckets, so the line is no
+  longer read as an assertion about values between them.
+- **Pie charts** warn when they stop being readable — more than four slices,
+  or two slices within 10% of each other — and offer bar or waffle instead.
+  Advisory, never a refusal, and `propose_chart` applies the identical rule.
+- `propose_chart` gained `fields` (correlation matrix), `facet`, and the
+  `groups`/`show_points`/`show_density` options; `field_y` is now optional on
+  box/violin. New agent data tools: `field_correlation`,
+  `field_numeric_grouped`.
+- Chart captions — which are also the SVG/PNG export captions — carry the new
+  truthfulness lines: bin rule, skewness reading, grouped/facet omissions,
+  point-overlay sample size, correlation basis, and the
+  correlation-is-not-causation caveat.
+
 ## [1.5.0] — 2026-07-22
 
 ### Added

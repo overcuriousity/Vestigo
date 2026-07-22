@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from vestigo.agent.chart_meta import (  # noqa: E402
     CHART_META,
     CHART_TYPES,
+    PIE_COMFORTABLE_MAX,
     SCALES,
     DataKind,
 )
@@ -110,6 +111,13 @@ def render_chart_meta() -> str:
         "    supportsCompare: boolean;\n"
         "    /** Two-field charts (pivot/sankey/scatter) need a second field picked. */\n"
         "    requiresSecondField: boolean;\n"
+        "    /** Single-field charts that ALSO accept an optional grouping field\n"
+        "     * (box/violin: numeric response × categorical group). */\n"
+        "    acceptsSecondField: boolean;\n"
+        "    /** Charts a LIST of fields (correlation matrix) instead of field/fieldY. */\n"
+        "    multiField: boolean;\n"
+        "    /** Can be drawn once per value of a categorical field (small multiples). */\n"
+        "    supportsFacet: boolean;\n"
         "  }\n"
         "> = {\n",
     ]
@@ -126,10 +134,22 @@ def render_chart_meta() -> str:
             f"    readsOptions: {_ts_string_array([_camel(o) for o in meta.reads_options])},\n"
             f"    supportsCompare: {str(meta.supports_compare).lower()},\n"
             f"    requiresSecondField: {str(meta.requires_second_field).lower()},\n"
+            f"    acceptsSecondField: {str(meta.accepts_second_field).lower()},\n"
+            f"    multiField: {str(meta.multi_field).lower()},\n"
+            f"    supportsFacet: {str(meta.supports_facet).lower()},\n"
             f"  }},\n"
         )
     out.append("};\n\n")
     out.append(f"export const SCALES: Scale[] = {_ts_string_array(SCALES)};\n\n")
+    out.append(
+        _wrap_comment(
+            "Above this many slices a pie stops being readable — angle comparison is "
+            "the least accurate visual cue there is, and small differences between "
+            "neighbouring slices become invisible. Past it, offer bar or waffle.",
+            "",
+        )
+        + f"export const PIE_COMFORTABLE_MAX = {PIE_COMFORTABLE_MAX};\n\n"
+    )
     out.append(
         "export const chartTypesFor = (s: Scale): ChartType[] =>\n"
         "  (Object.keys(CHART_META) as ChartType[]).filter((c) =>\n"

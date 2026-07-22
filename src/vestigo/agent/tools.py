@@ -28,6 +28,7 @@ from vestigo.agent.chart_meta import (
     CHART_META,
     LEGACY_KIND_MAP,
     METRIC_INFO,
+    PIE_COMFORTABLE_MAX,
     ChartType,
     Metric,
     Scale,
@@ -85,6 +86,10 @@ VIZ_SCATTER_MAX_POINTS = 1000
 VIZ_MAX_BUCKETS = 60
 VIZ_MAX_TERMS = 30
 VIZ_MAX_BINS = 30
+VIZ_GROUPS_MAX = 8
+VIZ_CORR_MAX_FIELDS = 8
+VIZ_FACET_MAX = 12
+VIZ_POINTS_OVERLAY_MAX = 1000
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,14 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         tier="core",
     ),
     ToolInfo("field_numeric_stats", "Summary stats + histogram for a numeric field."),
+    ToolInfo(
+        "field_correlation",
+        "Pairwise Pearson/Spearman correlations across several numeric fields.",
+    ),
+    ToolInfo(
+        "field_numeric_grouped",
+        "Per-group numeric distributions — one numeric field split by a categorical field.",
+    ),
     ToolInfo("histogram", "Time-bucketed event counts — the timeline's shape.", tier="core"),
     ToolInfo(
         "field_timeseries", "Per-value event counts bucketed over time for a field.", tier="core"
@@ -270,6 +283,23 @@ class ChartCompareSpec(BaseModel):
     )
 
 
+class ChartFacetSpec(BaseModel):
+    """Small multiples: draw the chart once per value of a categorical field.
+
+    Tufte's small-multiple layout — the same mark repeated across subsets, so
+    differences between subsets are read as position rather than remembered
+    across chart switches. The facet values are the field's top *limit*
+    values by event count; the rest are reported as omitted, never merged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(description="Categorical field token to facet by.")
+    limit: int = Field(
+        default=6, ge=2, description="How many top values to draw panels for (max 12)."
+    )
+
+
 class ChartOptionsSpec(BaseModel):
     """Presentation and sizing knobs, mirroring the Visualize page's controls.
 
@@ -302,7 +332,16 @@ class ChartOptionsSpec(BaseModel):
         default=None, ge=1, description="Top-N values to keep — terms and timeseries charts."
     )
     bins: int | None = Field(
-        default=None, ge=2, description="Histogram bin count — numeric charts."
+        default=None,
+        ge=2,
+        description=(
+            "Histogram bin count — numeric charts. Omit for the automatic "
+            "Freedman–Diaconis bin width (the default)."
+        ),
+    )
+    show_density: bool | None = Field(
+        default=None,
+        description="Smoothed density (KDE) curve over the histogram — histogram only. Default on.",
     )
     buckets: int | None = Field(
         default=None, ge=4, description="Time bucket count — time and timeseries charts."
@@ -310,6 +349,21 @@ class ChartOptionsSpec(BaseModel):
     limit_x: int | None = Field(default=None, ge=1, description="X-axis top-N — pivot/sankey.")
     limit_y: int | None = Field(default=None, ge=1, description="Y-axis top-N — pivot/sankey.")
     sample_limit: int | None = Field(default=None, ge=1, description="Point cap — scatter only.")
+    groups: int | None = Field(
+        default=None,
+        ge=2,
+        description=(
+            "Top-N grouping-value cap when box/violin get a categorical field_y "
+            "(grouped distributions). Default 8."
+        ),
+    )
+    show_points: bool | None = Field(
+        default=None,
+        description=(
+            "Overlay a uniform random sample of raw data points — box/violin "
+            "(jittered strip) and line (markers at real data points)."
+        ),
+    )
 
 
 class ChartSpec(BaseModel):
@@ -333,10 +387,14 @@ class ChartSpec(BaseModel):
         description=(
             "The visual mark to draw. Field-free: "
             '"time" (events over time), "punchcard" (day x hour). One field: '
-            '"bar", "pie" (nominal/ordinal), "histogram", "box", "violin", "ecdf" '
-            '(numeric), "line", "heatmap" (one field over time — NOT field x field). '
+            '"bar", "pie", "waffle" (shares of a whole as a 10x10 cell grid — '
+            'prefer it over "pie" past four categories), "histogram", "box", '
+            '"violin", "ecdf" (numeric), "line", "heatmap" (one field over time '
+            "— NOT field x field). "
             'Two fields: "pivot" (the field x field heatmap grid), "sankey" (flow), '
-            '"scatter" (numeric x numeric).'
+            '"scatter" (numeric x numeric). "box"/"violin" additionally take an '
+            "OPTIONAL categorical field_y to split the distribution into one "
+            "box/violin per group."
         )
     )
     scale: Scale | None = Field(
@@ -358,7 +416,19 @@ class ChartSpec(BaseModel):
         ),
     )
     field_y: str | None = Field(
-        default=None, description="Second field — pivot, sankey and scatter only."
+        default=None,
+        description=(
+            "Second field — required for pivot, sankey and scatter; optional on "
+            "box and violin, where it is a CATEGORICAL grouping variable that "
+            "splits the distribution into one box/violin per top group."
+        ),
+    )
+    fields: list[str] | None = Field(
+        default=None,
+        description=(
+            'Field list for chart_type="corr" only: 2-8 numeric field tokens '
+            "whose pairwise correlations form the matrix."
+        ),
     )
     metric: Metric = Field(
         default="count",
@@ -371,6 +441,14 @@ class ChartSpec(BaseModel):
     filters: FilterSpec | None = Field(default=None, description="Primary layer filters.")
     compare: ChartCompareSpec = Field(
         default_factory=ChartCompareSpec, description="Optional comparison layer."
+    )
+    facet: ChartFacetSpec | None = Field(
+        default=None,
+        description=(
+            "Draw one panel per value of a categorical field (small multiples). "
+            "Not combinable with `compare`, and only on the single-layer marks "
+            "(time, bar, pie, waffle, histogram, box, violin, ecdf)."
+        ),
     )
     options: ChartOptionsSpec = Field(
         default_factory=ChartOptionsSpec, description="Presentation and sizing options."
@@ -873,6 +951,32 @@ async def _resolve_event_sources(
     return found, [i for i in event_ids if i not in found]
 
 
+def _pie_readability_warning(terms: dict[str, Any]) -> str | None:
+    """Warn when a pie's slices stop being readable — same rule as the UI.
+
+    Mirrors ``frontend/src/components/viz/lib/pieReadability.ts``: too many
+    slices, or two slices within 10% of each other, and angle comparison
+    stops carrying the information the chart claims to show. Advisory —
+    the chart still validates, the model just learns a better mark exists.
+    """
+    counts = [v["count"] for v in terms.get("values", []) if v.get("count")]
+    slices = len(counts) + (1 if terms.get("other_count") else 0)
+    if slices > PIE_COMFORTABLE_MAX:
+        return (
+            f"{slices} slices — past about {PIE_COMFORTABLE_MAX}, judging angles gets "
+            'unreliable. chart_type="bar" (length) or "waffle" (countable cells) reads '
+            "more accurately."
+        )
+    ordered = sorted(counts, reverse=True)
+    for bigger, smaller in zip(ordered, ordered[1:], strict=False):
+        if bigger and (bigger - smaller) / bigger < 0.1:
+            return (
+                "Two slices differ by less than 10% — that gap is not readable as an "
+                'angle. chart_type="bar" compares them by length instead.'
+            )
+    return None
+
+
 def build_tool_server(scope: AgentScope) -> FastMCP:
     """Build an MCP server whose tools are bound to *scope*.
 
@@ -1183,6 +1287,53 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         return _columnize(result, "bins")
 
     @server.tool()
+    async def field_correlation(
+        fields: list[str], filters: FilterSpec | None = None
+    ) -> dict[str, Any]:
+        """Pairwise Pearson/Spearman correlations across 2-8 numeric fields.
+
+        Each pair reports the number of events where BOTH fields are numeric
+        (pairwise-complete), so a sparse field cannot silently shrink the
+        other pairs. Correlation is not causation, and a coefficient near 0
+        only rules out the relationship it measures (Pearson: straight-line;
+        Spearman: monotonic).
+        """
+        spec_f = _validated(filters)
+        query = await _build_query(scope, spec_f)
+        chosen = list(dict.fromkeys(fields))[:VIZ_CORR_MAX_FIELDS]
+        for token in chosen:
+            await _check_chart_field(token, "fields")
+        return await run_in_threadpool(service.field_correlation, query, chosen)
+
+    @server.tool()
+    async def field_numeric_grouped(
+        field: str,
+        group_field: str,
+        filters: FilterSpec | None = None,
+        groups: int = 8,
+    ) -> dict[str, Any]:
+        """Per-group numeric distributions: one numeric field split by a categorical field.
+
+        Powers grouped box/violin plots. Groups are the top-N group_field
+        values by numeric-value count; the rest are omitted (reported via
+        omitted_groups/omitted_count, never rolled into an "Other" group).
+        """
+        spec_f = _validated(filters)
+        query = await _build_query(scope, spec_f)
+        result = await run_in_threadpool(
+            service.field_numeric_grouped,
+            query,
+            field,
+            group_field,
+            min(max(groups, 2), VIZ_GROUPS_MAX),
+        )
+        # Bins per group are card-rendering detail; the model reads the
+        # quantile summaries.
+        for g in result.get("groups", []):
+            g.pop("bins", None)
+        return result
+
+    @server.tool()
     async def histogram(filters: FilterSpec | None = None, buckets: int = 48) -> dict[str, Any]:
         """Time-bucketed event counts honoring optional filters — the timeline's shape."""
         spec = _validated(filters)
@@ -1465,7 +1616,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 f"{', '.join(chart_types_for(scale))}."
             )
 
-        if requires_field(chart_type) and not spec.field:
+        if requires_field(chart_type) and not meta.multi_field and not spec.field:
             raise ValueError(
                 f'chart_type="{chart_type}" requires field. Only chart_type="time" and '
                 '"punchcard" chart the whole event count with no field.'
@@ -1476,7 +1627,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "field x field_y, not a single distribution. For one field over "
                 'time use chart_type="heatmap" instead.'
             )
-        if spec.field_y and not meta.requires_second_field:
+        if spec.field_y and not meta.requires_second_field and not meta.accepts_second_field:
             # Naming trap worth spelling out rather than only enumerating: our
             # "heatmap" is one field x time, and the field x field grid an
             # analyst also calls a heatmap is "pivot". A model that reached for
@@ -1492,6 +1643,38 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 f'chart_type="{chart_type}" takes no field_y. '
                 f"Two-field chart types: {', '.join(two_field)}.{hint}"
             )
+
+        if meta.multi_field:
+            if not spec.fields or len(spec.fields) < 2:
+                raise ValueError(
+                    f'chart_type="{chart_type}" needs `fields`: 2-'
+                    f"{VIZ_CORR_MAX_FIELDS} numeric field tokens to correlate. "
+                    "`field`/`field_y` are not used by this chart."
+                )
+            if len(set(spec.fields)) != len(spec.fields):
+                raise ValueError("`fields` must not repeat a field token.")
+        elif spec.fields:
+            multi = [c for c in CHART_META if CHART_META[c].multi_field]
+            raise ValueError(
+                f'chart_type="{chart_type}" takes no `fields` list. '
+                f"Charts that do: {', '.join(multi)}."
+            )
+
+        if spec.facet is not None:
+            if not meta.supports_facet:
+                faceted = [c for c in CHART_META if CHART_META[c].supports_facet]
+                raise ValueError(
+                    f'chart_type="{chart_type}" cannot be facetted. Facettable '
+                    f"chart types: {', '.join(faceted)}."
+                )
+            if spec.compare.mode != "off":
+                raise ValueError(
+                    "facet and compare cannot both be set — one splits the data into "
+                    "panels, the other overlays two layers in one panel. Pick one."
+                )
+            # A virtual `time:` token is a perfectly good facet (one panel
+            # per weekday), so unlike the detectors this does not reject them.
+            await _check_chart_field(spec.facet.field, "facet.field")
 
         compare_on = spec.compare.mode != "off"
         if compare_on and not meta.supports_compare:
@@ -1533,6 +1716,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
 
         await _check_chart_field(spec.field, "field")
         await _check_chart_field(spec.field_y, "field_y")
+        for token in spec.fields or []:
+            await _check_chart_field(token, "fields")
 
         def _capped(value: int | None, default: int, cap: int, name: str, floor: int = 1) -> int:
             resolved = max(floor, min(value or default, cap))
@@ -1585,9 +1770,45 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "distinct": result["distinct"],
                     "top_values": result["values"][:5],
                 }
-        elif data_kind == "numeric":
+                if chart_type == "pie":
+                    readability = _pie_readability_warning(result)
+                    if readability:
+                        warnings.append(readability)
+        elif data_kind == "numeric" and spec.field_y and meta.accepts_second_field:
+            # Grouped box/violin: numeric response × categorical grouping field.
+            applied["groups"] = _capped(opts.groups, 8, VIZ_GROUPS_MAX, "groups", floor=2)
             applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
+            result = await run_in_threadpool(
+                service.field_numeric_grouped,
+                primary_query,
+                spec.field,
+                spec.field_y,
+                applied["groups"],
+                applied["bins"],
+                bool(opts.show_points),
+                VIZ_POINTS_OVERLAY_MAX,
+            )
+            if not result["total"]:
+                raise ValueError(
+                    f'field "{spec.field}" has no numeric values under these filters, so '
+                    f'chart_type="{chart_type}" would render empty. Treat it as '
+                    'categorical: chart_type "bar"/"pie"/"heatmap" with scale "nominal".'
+                )
+            summary = {
+                "total": result["total"],
+                "groups": [
+                    {"value": g["value"], "count": g["count"], "median": g["quantiles"]["0.5"]}
+                    for g in result["groups"]
+                ],
+                "omitted_groups": result["omitted_groups"],
+                "omitted_count": result["omitted_count"],
+            }
+        elif data_kind == "numeric":
             if comparison_query is not None:
+                # The comparison aggregation has no auto-bin path (shared bin
+                # edges are negotiated between the two layers), so an omitted
+                # bins falls back to the manual default.
+                applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
                 result = await run_in_threadpool(
                     service.compare_field_numeric,
                     primary_query,
@@ -1600,9 +1821,16 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "comparison_total": result["comparison_total"],
                 }
             else:
-                result = await run_in_threadpool(
-                    service.field_numeric_stats, primary_query, spec.field, applied["bins"]
+                # bins omitted → the service picks Freedman–Diaconis; echo the
+                # resolved count so the model knows what will be drawn.
+                bins_arg = (
+                    _capped(opts.bins, 30, VIZ_MAX_BINS, "bins") if opts.bins is not None else None
                 )
+                result = await run_in_threadpool(
+                    service.field_numeric_stats, primary_query, spec.field, bins_arg
+                )
+                applied["bins"] = len(result["bins"]) or None
+                applied["bin_rule"] = result.get("bin_rule", "manual")
                 if not result["count"]:
                     raise ValueError(
                         f'field "{spec.field}" has no numeric values under these filters, so '
@@ -1614,6 +1842,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "min": result["min"],
                     "max": result["max"],
                     "mean": result["mean"],
+                    "skewness": result.get("skewness"),
                 }
         elif data_kind == "timeseries":
             applied["buckets"] = _capped(
@@ -1697,6 +1926,31 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 # time axis is its whole domain rather than a limit.
                 "matrix_size": len(result["x_values"]) * len(result["y_values"]),
             }
+        elif data_kind == "corr":
+            fields = (spec.fields or [])[:VIZ_CORR_MAX_FIELDS]
+            if len(fields) < len(spec.fields or []):
+                warnings.append(f"fields truncated to the first {VIZ_CORR_MAX_FIELDS} tokens.")
+            result = await run_in_threadpool(service.field_correlation, primary_query, fields)
+            dropped = [d["field"] for d in result["dropped_fields"]]
+            if dropped:
+                warnings.append(
+                    f"no numeric values for {', '.join(dropped)} under these filters — "
+                    "their row/column will be empty. Check them with describe_field."
+                )
+            summary = {
+                "total": result["total"],
+                "pairs": [
+                    {
+                        "x": p["x"],
+                        "y": p["y"],
+                        "n": p["n"],
+                        "pearson": p["pearson"],
+                        "spearman": p["spearman"],
+                    }
+                    for p in result["pairs"]
+                ],
+                "dropped_fields": dropped,
+            }
         else:  # scatter
             applied["sample_limit"] = _capped(
                 opts.sample_limit, 300, VIZ_SCATTER_MAX_POINTS, "sample_limit"
@@ -1715,6 +1969,43 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "would render empty. Check both fields with describe_field."
                 )
             summary = {"total": result["total"], "sampled": result["sampled"]}
+            stats_block = result.get("stats")
+            if stats_block:
+                # The correlation verdict, compressed for the model — full
+                # detail renders on the analyst's card from the same response.
+                summary["stats"] = {
+                    "pearson_r": stats_block["pearson"]["r"],
+                    "pearson_p": stats_block["pearson"]["p"],
+                    "spearman_rho": stats_block["spearman"]["rho"],
+                    "spearman_p": stats_block["spearman"]["p"],
+                    "regression": stats_block["regression"],
+                    "recommendation": stats_block["recommendation"],
+                }
+
+        # Facet panels: enumerate the values the grid will draw. Only the
+        # value list is fetched here, not one aggregation per panel — the
+        # analyst's card re-queries every panel itself, and running K heavy
+        # scans to validate a proposal would spend the scan budget K times
+        # over for a number the model never reads. The single aggregation
+        # above already proves the mark works against these filters.
+        if spec.facet is not None:
+            facet_limit = _capped(spec.facet.limit, 6, VIZ_FACET_MAX, "facet.limit", floor=2)
+            facet_terms = await run_in_threadpool(
+                service.field_terms, primary_query, spec.facet.field, facet_limit
+            )
+            shown = [v["value"] for v in facet_terms["values"]]
+            summary["facet"] = {
+                "field": spec.facet.field,
+                "panels": shown,
+                "distinct": facet_terms["distinct"],
+                "omitted_values": max(0, facet_terms["distinct"] - len(shown)),
+                "omitted_count": facet_terms["other_count"],
+            }
+            if not shown:
+                raise ValueError(
+                    f'facet field "{spec.facet.field}" has no values under these '
+                    "filters, so the facet grid would be empty."
+                )
 
         # Presentation options don't reach the query, but belong in the echo —
         # they are part of what the analyst will see.
@@ -1735,6 +2026,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "data_kind": data_kind,
                 "field": spec.field,
                 "field_y": spec.field_y,
+                "fields": spec.fields,
+                "facet": (
+                    {"field": spec.facet.field, "limit": spec.facet.limit} if spec.facet else None
+                ),
                 "options": applied,
             },
             "warnings": warnings,

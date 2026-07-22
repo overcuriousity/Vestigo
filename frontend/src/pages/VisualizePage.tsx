@@ -15,7 +15,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { ArrowLeft, HelpCircle, Lightbulb, Repeat, RotateCcw, X } from "lucide-react";
 import { vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
@@ -40,13 +40,16 @@ import {
 import { ExportControls } from "@/components/viz/ExportControls";
 import { CompareFilterEditor } from "@/components/viz/CompareFilterEditor";
 import { SavedChartsRail } from "@/components/viz/SavedChartsRail";
+import { FacetGrid } from "@/components/viz/FacetGrid";
 import { ChartActionPopover } from "@/components/viz/ChartActionPopover";
 import type { ChartValueClick } from "@/components/viz/lib/interaction";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
+import { WaffleChart } from "@/components/viz/charts/WaffleChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
 import { BoxPlot } from "@/components/viz/charts/BoxPlot";
 import { ViolinPlot } from "@/components/viz/charts/ViolinPlot";
+import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
 import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
@@ -55,6 +58,7 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
+import { CorrMatrix, type CorrMethod } from "@/components/viz/charts/CorrMatrix";
 import {
   chartConfigToParams,
   filterParamsPreservingChartConfig,
@@ -75,9 +79,16 @@ import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
 import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
 import { CHART_PRESETS } from "@/components/viz/lib/presets";
+import { pieReadabilityWarning } from "@/components/viz/lib/pieReadability";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
+import { ExplainerPopover } from "@/components/viz/primitives/ExplainerPopover";
+import { CHART_HOW_TO_READ } from "@/components/viz/lib/explainers";
+import { NumericStatStrip } from "@/components/viz/NumericStatStrip";
+import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import type {
   CompareNumericResponse,
+  FieldNumericResponse,
+  FieldTermsResponse,
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
@@ -104,6 +115,10 @@ const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
 };
 
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
+
+/** Radix Select forbids an empty-string item value, so "no grouping" needs a
+ * sentinel that cannot collide with a real field token. */
+const CLEAR_GROUP = "__viz_no_group__";
 
 /** One field picker option: display name plus a muted qualifier.
  *
@@ -205,6 +220,18 @@ export function VisualizePage() {
   const { field, fieldY, scale, chartType, metric } = config;
   const dataKind = CHART_META[chartType].dataKind;
   const requiresSecondField = !!CHART_META[chartType].requiresSecondField;
+  // box/violin take an OPTIONAL second field: a categorical grouping
+  // variable turning one distribution into one per group.
+  const acceptsSecondField = !!CHART_META[chartType].acceptsSecondField;
+  // The correlation matrix charts a LIST of fields instead of field/fieldY.
+  const multiField = !!CHART_META[chartType].multiField;
+  const supportsFacet = !!CHART_META[chartType].supportsFacet;
+  // Facet and compare are mutually exclusive (one splits into panels, the
+  // other overlays layers), so a chart type that lost facet support drops
+  // the spec rather than rendering a grid it cannot draw.
+  const facet = supportsFacet ? config.facet : null;
+  const selectedFields = config.fields ?? [];
+  const groupedOn = acceptsSecondField && !!fieldY;
   // "time" and "punchcard" chart the whole event count — no field involved.
   const fieldFree = dataKind === "time" || dataKind === "punchcard";
   const compareOn = config.compare.mode !== "off";
@@ -219,11 +246,15 @@ export function VisualizePage() {
   // Shared with the agent's ChartProposalCard so a proposed chart and a
   // hand-built one resolve their defaults identically.
   const resolved = useMemo(() => resolveChartOptions(config), [config]);
-  const { topN, bins, buckets, limitX, limitY, sampleLimit } = resolved;
+  const { topN, bins, buckets, limitX, limitY, sampleLimit, groups, showPoints } = resolved;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Preset strip: open by default on a fresh page (no chart state in the
   // URL yet); a URL that already describes a chart skips the guidance.
+  // Which coefficient fills the matrix cells. Purely a client-side read of
+  // the same response — both coefficients always ship, so switching never
+  // refetches (same reasoning as pivot↔sankey).
+  const [corrMethod, setCorrMethod] = useState<CorrMethod>("pearson");
   const [presetsOpen, setPresetsOpen] = useState(() => !searchParams.has("c_type"));
 
   const applyPreset = (preset: (typeof CHART_PRESETS)[number]) => {
@@ -268,8 +299,9 @@ export function VisualizePage() {
   // instead of collecting this (wrong) explanation.
   const chartTypeUnplottable = fieldIsTime && (dataKind === "numeric" || dataKind === "scatter");
   const numericQuery = useQuery({
-    queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins],
-    queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
+    queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins, showPoints],
+    queryFn: () =>
+      vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins, showPoints),
     // Run only when a numeric chart actually needs the data, or when a
     // *field-dependent* chart needs its one-time scale probe. The field-free
     // charts (time, punchcard) never need it, and the two-field charts have
@@ -283,6 +315,8 @@ export function VisualizePage() {
       scopeReady &&
       !!field &&
       !fieldIsTime &&
+      !multiField &&
+      !groupedOn &&
       (dataKind === "numeric" ||
         (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
   });
@@ -296,10 +330,10 @@ export function VisualizePage() {
     // Advance the ref even when the early-return below fires: it means "this
     // field's one-shot suggestion is spent", not "we fetched something".
     autoProbedField.current = field;
-    if (fieldFree || requiresSecondField) return;
+    if (fieldFree || requiresSecondField || multiField) return;
     const scale = TIME_FIELDS[field].scale;
     updateConfig({ scale, chartType: defaultChartTypeForScale(scale, field) });
-  }, [field, fieldIsTime, fieldFree, requiresSecondField, updateConfig]);
+  }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig]);
 
   useEffect(() => {
     if (!field || field === autoProbedField.current) return;
@@ -310,13 +344,21 @@ export function VisualizePage() {
     autoProbedField.current = field;
     // Don't yank the analyst off the field-independent charts (time,
     // punchcard) or a deliberately-picked two-field chart.
-    if (fieldFree || requiresSecondField) return;
+    if (fieldFree || requiresSecondField || multiField) return;
     const isNumeric = numericQuery.data.count > 0;
     updateConfig({
       scale: isNumeric ? "ratio" : "nominal",
       chartType: isNumeric ? "histogram" : "bar",
     });
-  }, [field, fieldIsTime, numericQuery.data, fieldFree, requiresSecondField, updateConfig]);
+  }, [
+    field,
+    fieldIsTime,
+    numericQuery.data,
+    fieldFree,
+    requiresSecondField,
+    multiField,
+    updateConfig,
+  ]);
 
   // Keep chartType valid when the analyst switches scale — clamped at event
   // time rather than in an effect, so there is never a render with an
@@ -376,9 +418,46 @@ export function VisualizePage() {
         field: field!,
         primary: filters,
         comparison: compareApiSpec!,
-        bins,
+        // The comparison aggregation negotiates shared bin edges between the
+        // two layers and has no auto path — fall back to the manual default.
+        bins: bins ?? 30,
       })) as CompareNumericResponse,
     enabled: scopeReady && !!field && compareNumericOn,
+  });
+
+  // Grouped box/violin: one distribution per top-N value of the grouping
+  // field, all binned over the same global range (server-side) so the
+  // silhouettes are comparable.
+  const groupedQuery = useQuery({
+    queryKey: [
+      "viz-field-numeric-grouped",
+      caseId,
+      timelineId,
+      field,
+      fieldY,
+      filters,
+      groups,
+      bins,
+      showPoints,
+    ],
+    queryFn: () =>
+      vizApi.fieldNumericGrouped(
+        caseId!,
+        timelineId!,
+        field!,
+        fieldY!,
+        filters,
+        groups,
+        bins ?? 30,
+        showPoints,
+      ),
+    enabled: scopeReady && !!field && !!fieldY && groupedOn,
+  });
+
+  const correlationQuery = useQuery({
+    queryKey: ["viz-field-correlation", caseId, timelineId, selectedFields, filters],
+    queryFn: () => vizApi.fieldCorrelation(caseId!, timelineId!, selectedFields, filters),
+    enabled: scopeReady && multiField && selectedFields.length >= 2,
   });
 
   const timeseriesQuery = useQuery({
@@ -427,6 +506,95 @@ export function VisualizePage() {
 
   const availableChartTypes = chartTypesForField(scale, field);
 
+  // ── facetting (small multiples) ───────────────────────────────────────
+  // Client-orchestrated: one terms query names the panels, then each panel
+  // re-runs the SAME endpoint with an added equality filter. No new server
+  // aggregation, and each panel's data is the honest answer to "this chart,
+  // restricted to this value" — which is exactly what the grid claims.
+  const facetValuesQuery = useQuery({
+    queryKey: ["viz-facet-values", caseId, timelineId, facet?.field, filters, facet?.limit],
+    queryFn: () =>
+      vizApi.fieldTerms(caseId!, timelineId!, facet!.field, filters, facet!.limit),
+    enabled: scopeReady && !!facet,
+  });
+  const facetValues = facetValuesQuery.data?.values ?? [];
+
+  const facetPanelQueries = useQueries({
+    queries: facetValues.map((v) => {
+      const panelFilters = applyFieldEntries(filters, [[facet!.field, v.value]], true);
+      return {
+        queryKey: [
+          "viz-facet-panel",
+          caseId,
+          timelineId,
+          chartType,
+          field,
+          panelFilters,
+          topN,
+          bins,
+          buckets,
+          showPoints,
+        ],
+        queryFn: async () => {
+          switch (dataKind) {
+            case "terms":
+              return vizApi.fieldTerms(caseId!, timelineId!, field!, panelFilters, topN);
+            case "numeric":
+              return vizApi.fieldNumeric(
+                caseId!,
+                timelineId!,
+                field!,
+                panelFilters,
+                bins,
+                showPoints,
+              );
+            default:
+              return histogramToCompare(
+                await eventsApi.histogram(caseId!, timelineId!, panelFilters, buckets),
+              );
+          }
+        },
+        enabled: scopeReady && !!facet && (fieldFree || !!field),
+      };
+    }),
+  });
+
+  // Small multiples are only comparable if every panel shares a scale —
+  // otherwise two bars of equal height mean different counts, which is the
+  // one failure a facet grid must not have. Computed across the loaded
+  // panels and passed down; each panel still draws its own axis.
+  const facetPanelData = facetPanelQueries.map((q) => q.data);
+  const facetCountMax = facet
+    ? Math.max(
+        1,
+        ...facetPanelData.flatMap((d) => {
+          if (d == null) return [];
+          if ("values" in d) return d.values.map((v) => v.count);
+          if ("bins" in d && Array.isArray(d.bins)) {
+            return (d.bins as { count?: number; primary?: number }[]).map(
+              (b) => b.count ?? b.primary ?? 0,
+            );
+          }
+          if ("buckets" in d) {
+            return (d.buckets as { primary: number }[]).map((b) => b.primary);
+          }
+          return [];
+        }),
+      )
+    : undefined;
+  const facetValueDomain: [number, number] | undefined = (() => {
+    if (!facet || dataKind !== "numeric") return undefined;
+    const mins = facetPanelData.flatMap((d) =>
+      d != null && "min" in d && typeof d.min === "number" ? [d.min] : [],
+    );
+    const maxes = facetPanelData.flatMap((d) =>
+      d != null && "max" in d && typeof d.max === "number" ? [d.max] : [],
+    );
+    return mins.length && maxes.length
+      ? [Math.min(...mins), Math.max(...maxes)]
+      : undefined;
+  })();
+
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
   const facts: CaptionFacts = {};
@@ -455,10 +623,28 @@ export function VisualizePage() {
       facts.valueMin = compareNumericQuery.data.min;
       facts.valueMax = compareNumericQuery.data.max;
     } else if (numericQuery.data) {
+      facts.overlayShown = numericQuery.data.points?.shown;
+      facts.overlayTotal = numericQuery.data.points?.total;
       facts.primaryTotal = numericQuery.data.count;
       facts.binCount = numericQuery.data.bins.length;
       facts.valueMin = numericQuery.data.min;
       facts.valueMax = numericQuery.data.max;
+      facts.binRule = numericQuery.data.bin_rule;
+      facts.skewness = numericQuery.data.skewness;
+    }
+    if (groupedOn && groupedQuery.data) {
+      facts.primaryTotal = groupedQuery.data.total;
+      facts.groupField = groupedQuery.data.group_field;
+      facts.groupsShown = groupedQuery.data.groups.length;
+      facts.groupsOmitted = groupedQuery.data.omitted_groups;
+      facts.groupOmittedCount = groupedQuery.data.omitted_count;
+      facts.valueMin = groupedQuery.data.min;
+      facts.valueMax = groupedQuery.data.max;
+      facts.binCount = undefined;
+      facts.binRule = undefined;
+      facts.skewness = undefined;
+      facts.overlayShown = groupedQuery.data.points?.shown;
+      facts.overlayTotal = groupedQuery.data.points?.total;
     }
   } else if (dataKind === "timeseries" && timeseriesQuery.data) {
     facts.shownValues = timeseriesQuery.data.series.length;
@@ -475,11 +661,39 @@ export function VisualizePage() {
     facts.xShown = pivotQuery.data.x_values.length;
     facts.yDistinct = pivotQuery.data.y_bounded ? undefined : pivotQuery.data.y_distinct;
     facts.yShown = pivotQuery.data.y_values.length;
+  } else if (dataKind === "corr" && correlationQuery.data) {
+    facts.primaryTotal = correlationQuery.data.total;
+    facts.corrFields = correlationQuery.data.fields;
+    facts.corrPairs = correlationQuery.data.pairs.length;
+    facts.corrDropped = correlationQuery.data.dropped_fields.map((d) => d.field);
+    facts.corrMinPairN = correlationQuery.data.pairs.length
+      ? Math.min(...correlationQuery.data.pairs.map((p) => p.n))
+      : undefined;
+    facts.corrMaxPairN = correlationQuery.data.pairs.length
+      ? Math.max(...correlationQuery.data.pairs.map((p) => p.n))
+      : undefined;
   } else if (dataKind === "scatter" && scatterQuery.data) {
     facts.primaryTotal = scatterQuery.data.total;
     facts.sampledPoints = scatterQuery.data.sampled;
     facts.totalPoints = scatterQuery.data.total;
+    facts.scatterStats = scatterQuery.data.stats;
   }
+
+  if (facet) {
+    facts.facetField = facet.field;
+    facts.facetPanels = facetValues.length;
+    facts.facetOmittedValues = Math.max(
+      0,
+      (facetValuesQuery.data?.distinct ?? 0) - facetValues.length,
+    );
+    facts.facetOmittedCount = facetValuesQuery.data?.other_count;
+  }
+
+  // Advisory only — the pie still renders; the same rule runs in
+  // `propose_chart`, so an agent proposal carries the identical caution.
+  const pieWarning =
+    chartType === "pie" && termsQuery.data ? pieReadabilityWarning(termsQuery.data) : null;
+  if (pieWarning) facts.readabilityWarning = pieWarning;
 
   const captionLines = buildCaptionLines({
     caseId,
@@ -498,7 +712,8 @@ export function VisualizePage() {
     (dataKind === "timeseries" && timeseriesQuery.isLoading) ||
     (dataKind === "punchcard" && punchcardQuery.isLoading) ||
     (dataKind === "pivot" && pivotQuery.isLoading) ||
-    (dataKind === "scatter" && scatterQuery.isLoading);
+    (dataKind === "scatter" && scatterQuery.isLoading) ||
+    (dataKind === "corr" && correlationQuery.isLoading);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -524,8 +739,9 @@ export function VisualizePage() {
           </button>
         </div>
 
-        {/* Field picker */}
-        <div>
+        {/* Field picker — hidden for the correlation matrix, which charts a
+            list of fields instead (its own picker is below). */}
+        <div className={multiField ? "hidden" : undefined}>
           <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             {requiresSecondField ? "Field (X)" : "Field"}
           </label>
@@ -549,20 +765,94 @@ export function VisualizePage() {
           )}
         </div>
 
-        {/* Second field picker — pivot/sankey/scatter chart both axes */}
-        {requiresSecondField && (
+        {/* Field list — the correlation matrix charts 2–8 fields at once */}
+        {multiField && (
           <div>
             <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Field (Y)
+              Fields to correlate ({selectedFields.length}/8){" "}
+              <ExplainerPopover id="correlationMatrix" />
+            </label>
+            <div className="mb-1 flex flex-wrap gap-1">
+              {selectedFields.map((token) => (
+                <button
+                  key={token}
+                  type="button"
+                  onClick={() =>
+                    updateConfig({ fields: selectedFields.filter((f) => f !== token) })
+                  }
+                  className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-0.5 text-xs text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
+                  title="Remove from the matrix"
+                >
+                  {fieldTokenLabel(token)} <X size={10} />
+                </button>
+              ))}
+              {selectedFields.length === 0 && (
+                <span className="text-xs text-[var(--color-fg-muted)]">
+                  Pick at least two numeric fields.
+                </span>
+              )}
+            </div>
+            <div className="mb-1 flex gap-1">
+              {(["pearson", "spearman"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setCorrMethod(m)}
+                  className={`flex-1 rounded border px-2 py-1 text-xs ${
+                    corrMethod === m
+                      ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-fg-primary)]"
+                      : "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
+                  }`}
+                >
+                  {m === "pearson" ? "Pearson r" : "Spearman ρ"}
+                </button>
+              ))}
+              <ExplainerPopover id={corrMethod === "pearson" ? "pearson" : "spearman"} />
+            </div>
+            <Select
+              value={undefined}
+              onValueChange={(v) =>
+                updateConfig({ fields: [...selectedFields, v].slice(0, 8) })
+              }
+            >
+              <SelectTrigger className="text-sm">
+                <SelectValue placeholder="Add a field…" />
+              </SelectTrigger>
+              <SelectContent>
+                {(fieldsQuery.data?.fields ?? [])
+                  .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))
+                  .map((f) => (
+                    <SelectItem key={f.token} value={f.token}>
+                      {fieldOptionText(f)}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+
+        {/* Second field picker — pivot/sankey/scatter chart both axes;
+            box/violin use it optionally as a grouping variable */}
+        {(requiresSecondField || acceptsSecondField) && (
+          <div>
+            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+              {acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
             </label>
             <Select
               value={fieldY ?? undefined}
-              onValueChange={(v) => updateConfig({ fieldY: v })}
+              onValueChange={(v) => updateConfig({ fieldY: v === CLEAR_GROUP ? null : v })}
             >
               <SelectTrigger className="text-sm">
-                <SelectValue placeholder="Choose a second field…" />
+                <SelectValue
+                  placeholder={
+                    acceptsSecondField ? "No grouping" : "Choose a second field…"
+                  }
+                />
               </SelectTrigger>
               <SelectContent>
+                {acceptsSecondField && (
+                  <SelectItem value={CLEAR_GROUP}>No grouping</SelectItem>
+                )}
                 {(fieldsQuery.data?.fields ?? [])
                   .filter((f) => f.token !== field)
                   .map((f) => (
@@ -624,6 +914,9 @@ export function VisualizePage() {
               ))}
             </SelectContent>
           </Select>
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            {CHART_HOW_TO_READ[chartType]}
+          </p>
         </div>
 
         {/* Compare — time histogram, bar (grouped), numeric histogram (overlay).
@@ -672,6 +965,9 @@ export function VisualizePage() {
                         opt.mode === "custom"
                           ? { mode: "custom", filters: {} }
                           : { mode: opt.mode },
+                      // Comparison and facetting are mutually exclusive —
+                      // turning one on clears the other, in both directions.
+                      ...(opt.mode !== "off" ? { facet: null } : {}),
                     })
                   }
                   className="accent-[var(--color-accent)]"
@@ -683,6 +979,12 @@ export function VisualizePage() {
           {!compareSupported && (
             <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
               {compareUnavailableReason(chartType)}
+            </p>
+          )}
+          {compareSupported && facet && (
+            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+              Turning on a comparison layer clears the panel split — one overlays two
+              layers in a single chart, the other splits the data across charts.
             </p>
           )}
           {compareSupported && config.compare.mode === "custom" && (
@@ -863,29 +1165,166 @@ export function VisualizePage() {
                     />
                     Show legend
                   </label>
+                  <label className="flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+                    <input
+                      type="checkbox"
+                      checked={config.options.showPoints ?? true}
+                      onChange={(e) =>
+                        updateConfig({
+                          options: { ...config.options, showPoints: e.target.checked },
+                        })
+                      }
+                      className="accent-[var(--color-accent)]"
+                    />
+                    Mark measured points
+                  </label>
                 </>
               )}
             </div>
           </details>
         )}
 
+        {/* Facet — small multiples */}
+        {supportsFacet && (
+          <div>
+            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+              Split into panels by (optional)
+            </label>
+            <Select
+              value={facet?.field ?? undefined}
+              onValueChange={(v) =>
+                updateConfig(
+                  v === CLEAR_GROUP
+                    ? { facet: null }
+                    : // A facet grid and a comparison layer are mutually
+                      // exclusive, so picking one clears the other.
+                      { facet: { field: v, limit: facet?.limit ?? 6 }, compare: { mode: "off" } },
+                )
+              }
+            >
+              <SelectTrigger className="text-sm">
+                <SelectValue placeholder="No panels" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={CLEAR_GROUP}>No panels</SelectItem>
+                {(fieldsQuery.data?.fields ?? [])
+                  .filter((f) => f.token !== field)
+                  .map((f) => (
+                    <SelectItem key={f.token} value={f.token}>
+                      {fieldOptionText(f)}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+            {facet && (
+              <div className="mt-1">
+                <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                  Panels: {facet.limit}
+                </label>
+                <input
+                  type="range"
+                  min={2}
+                  max={12}
+                  step={1}
+                  value={facet.limit}
+                  onChange={(e) =>
+                    updateConfig({ facet: { ...facet, limit: Number(e.target.value) } })
+                  }
+                  className="w-full accent-[var(--color-accent)]"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Options */}
         {dataKind === "numeric" && (
           <div>
             <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Bins: {bins}
+              Bins: {bins ?? `auto (${numericQuery.data?.bins.length ?? "…"})`}{" "}
+              <ExplainerPopover id="fdRule" />
             </label>
-            <input
-              type="range"
-              min={5}
-              max={100}
-              step={5}
-              value={bins}
-              onChange={(e) =>
-                updateConfig({ options: { ...config.options, bins: Number(e.target.value) } })
-              }
-              className="w-full accent-[var(--color-accent)]"
-            />
+            <label className="mb-1 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+              <input
+                type="checkbox"
+                checked={bins == null}
+                onChange={(e) =>
+                  updateConfig({
+                    options: {
+                      ...config.options,
+                      bins: e.target.checked ? undefined : (numericQuery.data?.bins.length ?? 30),
+                    },
+                  })
+                }
+                className="accent-[var(--color-accent)]"
+              />
+              Automatic bin width (Freedman–Diaconis)
+            </label>
+            {(chartType === "box" || chartType === "violin") && (
+              <>
+                <label className="mb-1 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+                  <input
+                    type="checkbox"
+                    checked={showPoints}
+                    onChange={(e) =>
+                      updateConfig({
+                        options: { ...config.options, showPoints: e.target.checked },
+                      })
+                    }
+                    className="accent-[var(--color-accent)]"
+                  />
+                  Overlay data points <ExplainerPopover id="sampledPoints" />
+                </label>
+                {groupedOn && (
+                  <div className="mb-1">
+                    <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+                      Groups: {groups}
+                    </label>
+                    <input
+                      type="range"
+                      min={2}
+                      max={8}
+                      step={1}
+                      value={groups}
+                      onChange={(e) =>
+                        updateConfig({
+                          options: { ...config.options, groups: Number(e.target.value) },
+                        })
+                      }
+                      className="w-full accent-[var(--color-accent)]"
+                    />
+                  </div>
+                )}
+              </>
+            )}
+            {chartType === "histogram" && (
+              <label className="mb-1 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+                <input
+                  type="checkbox"
+                  checked={resolved.showDensity}
+                  onChange={(e) =>
+                    updateConfig({
+                      options: { ...config.options, showDensity: e.target.checked },
+                    })
+                  }
+                  className="accent-[var(--color-accent)]"
+                />
+                Density curve (KDE) <ExplainerPopover id="kde" />
+              </label>
+            )}
+            {bins != null && (
+              <input
+                type="range"
+                min={5}
+                max={100}
+                step={5}
+                value={bins}
+                onChange={(e) =>
+                  updateConfig({ options: { ...config.options, bins: Number(e.target.value) } })
+                }
+                className="w-full accent-[var(--color-accent)]"
+              />
+            )}
           </div>
         )}
         {(dataKind === "terms" || dataKind === "timeseries") && (
@@ -1084,7 +1523,11 @@ export function VisualizePage() {
             </div>
           </div>
         )}
-        {!fieldFree && !field ? (
+        {multiField && selectedFields.length < 2 ? (
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--color-fg-muted)]">
+            Pick at least two numeric fields to correlate.
+          </div>
+        ) : !fieldFree && !multiField && !field ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
             {fieldsQuery.isLoading ? (
               <>
@@ -1137,7 +1580,29 @@ export function VisualizePage() {
               />
             )}
             {chartType === "pie" && termsQuery.data && (
-              <PieChart terms={termsQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
+              <>
+                {pieWarning && (
+                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-subtle)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
+                    <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
+                    {pieWarning}{" "}
+                    <button
+                      type="button"
+                      className="underline hover:text-[var(--color-accent)]"
+                      onClick={() => updateConfig({ chartType: "waffle" })}
+                    >
+                      Switch to waffle
+                    </button>
+                  </div>
+                )}
+                <PieChart terms={termsQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
+              </>
+            )}
+            {chartType === "waffle" && termsQuery.data && (
+              <WaffleChart
+                terms={termsQuery.data}
+                svgRef={svgRef}
+                onValueClick={handleChartValueClick}
+              />
             )}
             {chartType === "heatmap" && timeseriesQuery.data && (
               <Heatmap data={timeseriesQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
@@ -1146,6 +1611,11 @@ export function VisualizePage() {
               <LineChart
                 data={timeseriesQuery.data}
                 seriesMode={resolved.seriesMode}
+                // Line markers default ON (Tufte: show where data actually
+                // is); the shared resolver defaults showPoints off because
+                // box/violin overlays cost an extra scan, so read the raw
+                // option here instead of the resolved one.
+                showPoints={config.options.showPoints ?? true}
                 showLegend={resolved.legend}
                 svgRef={svgRef}
                 onValueClick={handleChartValueClick}
@@ -1157,14 +1627,50 @@ export function VisualizePage() {
                   stats={compareNumericOn ? undefined : numericQuery.data}
                   compare={compareNumericOn ? compareNumericQuery.data : undefined}
                   logScale={resolved.logScale}
+                  showDensity={resolved.showDensity}
+                  showMarkers
                   svgRef={svgRef}
                 />
               )}
-            {chartType === "box" && numericQuery.data && (
-              <BoxPlot stats={numericQuery.data} svgRef={svgRef} />
+            {chartType === "histogram" && !compareNumericOn && numericQuery.data && (
+              <NumericStatStrip stats={numericQuery.data} />
             )}
-            {chartType === "violin" && numericQuery.data && (
-              <ViolinPlot stats={numericQuery.data} svgRef={svgRef} />
+            {groupedOn && (chartType === "box" || chartType === "violin") && groupedQuery.data && (
+              <GroupedDistribution
+                data={groupedQuery.data}
+                mark={chartType}
+                showPoints={showPoints}
+                svgRef={svgRef}
+                onValueClick={handleChartValueClick}
+              />
+            )}
+            {(chartType === "box" || chartType === "violin") && (
+              <div className="mb-1 flex flex-wrap items-center gap-3 text-xs text-[var(--color-fg-muted)]">
+                <span className="flex items-center gap-1">
+                  Median <ExplainerPopover id="median" />
+                </span>
+                <span className="flex items-center gap-1">
+                  Quartiles <ExplainerPopover id="quartiles" />
+                </span>
+                <span className="flex items-center gap-1">
+                  IQR <ExplainerPopover id="iqr" />
+                </span>
+                {chartType === "box" ? (
+                  <span className="flex items-center gap-1">
+                    Whiskers <ExplainerPopover id="whiskers" />
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1">
+                    Density shape <ExplainerPopover id="kde" />
+                  </span>
+                )}
+              </div>
+            )}
+            {!groupedOn && chartType === "box" && numericQuery.data && (
+              <BoxPlot stats={numericQuery.data} showPoints={showPoints} svgRef={svgRef} />
+            )}
+            {!groupedOn && chartType === "violin" && numericQuery.data && (
+              <ViolinPlot stats={numericQuery.data} showPoints={showPoints} svgRef={svgRef} />
             )}
             {chartType === "ecdf" && numericQuery.data && (
               <EcdfChart stats={numericQuery.data} svgRef={svgRef} />
@@ -1186,12 +1692,97 @@ export function VisualizePage() {
                 onValueClick={handleChartValueClick}
               />
             )}
-            {chartType === "scatter" && scatterQuery.data && (
-              <ScatterChart
-                data={scatterQuery.data}
-                logScale={resolved.logScale}
-                svgRef={svgRef}
+            {facet ? (
+              <FacetGrid
+                field={facet.field}
+                omittedValues={Math.max(
+                  0,
+                  (facetValuesQuery.data?.distinct ?? 0) - facetValues.length,
+                )}
+                omittedCount={facetValuesQuery.data?.other_count}
+                panels={facetValues.map((v, i) => {
+                  const panel = facetPanelQueries[i];
+                  const data = panel?.data;
+                  return {
+                    value: v.value,
+                    count: v.count,
+                    isLoading: !!panel?.isLoading,
+                    chart:
+                      data == null ? null : dataKind === "terms" ? (
+                        chartType === "pie" ? (
+                          <PieChart terms={data as FieldTermsResponse} height={180} />
+                        ) : chartType === "waffle" ? (
+                          <WaffleChart terms={data as FieldTermsResponse} height={180} />
+                        ) : (
+                          <BarChart
+                            terms={data as FieldTermsResponse}
+                            height={180}
+                            countMax={facetCountMax}
+                            orientation={resolved.orientation}
+                            sort={resolved.sort}
+                            logScale={resolved.logScale}
+                          />
+                        )
+                      ) : dataKind === "numeric" ? (
+                        chartType === "box" ? (
+                          <BoxPlot
+                            stats={data as FieldNumericResponse}
+                            height={180}
+                            showPoints={showPoints}
+                            domain={facetValueDomain}
+                          />
+                        ) : chartType === "violin" ? (
+                          <ViolinPlot
+                            stats={data as FieldNumericResponse}
+                            height={180}
+                            showPoints={showPoints}
+                            domain={facetValueDomain}
+                          />
+                        ) : chartType === "ecdf" ? (
+                          <EcdfChart stats={data as FieldNumericResponse} height={180} />
+                        ) : (
+                          <NumericHistogram
+                            stats={data as FieldNumericResponse}
+                            height={180}
+                            logScale={resolved.logScale}
+                            showDensity={resolved.showDensity}
+                            showMarkers
+                            countMax={facetCountMax}
+                          />
+                        )
+                      ) : (
+                        <CompareHistogram
+                          data={data as CompareTimeResponse}
+                          height={180}
+                          metric={metric}
+                          hasComparison={false}
+                        />
+                      ),
+                  };
+                })}
               />
+            ) : null}
+            {!facet && multiField && correlationQuery.data && (
+              <CorrMatrix
+                data={correlationQuery.data}
+                method={corrMethod}
+                svgRef={svgRef}
+                onPairClick={(x, y) =>
+                  updateConfig({ chartType: "scatter", field: x, fieldY: y, scale: "ratio" })
+                }
+              />
+            )}
+            {chartType === "scatter" && scatterQuery.data && (
+              <>
+                <ScatterChart
+                  data={scatterQuery.data}
+                  logScale={resolved.logScale}
+                  svgRef={svgRef}
+                />
+                {scatterQuery.data.stats && (
+                  <ScatterStatsPanel stats={scatterQuery.data.stats} />
+                )}
+              </>
             )}
             <ChartCaption lines={captionLines} />
           </div>

@@ -277,7 +277,7 @@ class TestSplit:
 
     def test_size_mode_rotates(self, converter, tmp_path):
         line = (
-            '192.168.1.10 - alice [25/Jun/2026:09:46:41 +0200] '
+            "192.168.1.10 - alice [25/Jun/2026:09:46:41 +0200] "
             '"GET /page-{i:04d}.html HTTP/1.1" 200 1024 "-" "curl/8.0"\n'
         )
         src = tmp_path / "access.log"

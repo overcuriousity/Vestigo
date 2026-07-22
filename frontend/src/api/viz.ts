@@ -5,6 +5,8 @@ import type {
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
+  FieldCorrelationResponse,
+  FieldNumericGroupedResponse,
   FieldNumericResponse,
   FieldPivotResponse,
   FieldScatterResponse,
@@ -51,13 +53,51 @@ export const vizApi = {
     timelineId: string,
     field: string,
     filters: EventFilters = {},
-    bins = 30,
+    bins: number | null = null,
+    points = false,
   ): Promise<FieldNumericResponse> =>
     get<FieldNumericResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-numeric`, {
       ...serializeEventFilterParams(filters),
       field,
-      bins,
+      // bins omitted → server picks Freedman–Diaconis automatically.
+      ...(bins != null ? { bins } : {}),
+      ...(points ? { points: true } : {}),
     }),
+
+  /** Pairwise correlations across 2–8 numeric fields. */
+  fieldCorrelation: (
+    caseId: string,
+    timelineId: string,
+    fields: string[],
+    filters: EventFilters = {},
+  ): Promise<FieldCorrelationResponse> =>
+    get<FieldCorrelationResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/viz/field-correlation`,
+      { ...serializeEventFilterParams(filters), fields },
+    ),
+
+  /** Per-group numeric distributions — grouped box/violin plots. */
+  fieldNumericGrouped: (
+    caseId: string,
+    timelineId: string,
+    field: string,
+    groupField: string,
+    filters: EventFilters = {},
+    groups = 8,
+    bins = 30,
+    points = false,
+  ): Promise<FieldNumericGroupedResponse> =>
+    get<FieldNumericGroupedResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/viz/field-numeric-grouped`,
+      {
+        ...serializeEventFilterParams(filters),
+        field,
+        group_field: groupField,
+        groups,
+        bins,
+        ...(points ? { points: true } : {}),
+      },
+    ),
 
   /** Per-value event counts bucketed over time (top values only). */
   fieldTimeseries: (

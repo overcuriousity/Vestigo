@@ -6,7 +6,7 @@
  * helpers only do presentation-layer derivations from that response (a
  * smoothed density curve for the violin plot, box-plot whisker geometry).
  */
-import type { FieldNumericBin, FieldNumericResponse } from "@/api/types";
+import type { FieldNumericBin } from "@/api/types";
 
 /**
  * Pad a `[min, max]` domain when it's degenerate (`min === max`, e.g. every
@@ -33,12 +33,25 @@ export interface BoxPlotStats {
 }
 
 /**
+ * The distribution shape both the whole-field response and one group of a
+ * grouped response satisfy — so box/violin geometry is derived by the same
+ * code whether or not a grouping field is set.
+ */
+export interface DistributionLike {
+  count: number;
+  min: number | null;
+  max: number | null;
+  quantiles: Record<string, number>;
+  bins: FieldNumericBin[];
+}
+
+/**
  * Derive box-plot five-number-summary + whiskers from a numeric field
  * response. Whiskers use the classic 1.5*IQR rule, but since the backend
  * doesn't return raw values (only quantiles + binned counts), the "low/high
  * outlier" points aren't individually plotted — only the whisker extent.
  */
-export function boxPlotStats(resp: FieldNumericResponse): BoxPlotStats | null {
+export function boxPlotStats(resp: DistributionLike): BoxPlotStats | null {
   const q1 = resp.quantiles["0.25"];
   const median = resp.quantiles["0.5"];
   const q3 = resp.quantiles["0.75"];

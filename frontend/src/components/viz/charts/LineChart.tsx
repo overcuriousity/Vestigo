@@ -31,6 +31,10 @@ interface LineChartProps {
    * areas — reads as composition of the total rather than per-series shape. */
   seriesMode?: "overlay" | "stacked";
   showLegend?: boolean;
+  /** Mark the actual measured buckets. Graphical integrity (Tufte): the line
+   * between two points asserts values that were never measured — markers show
+   * where the data really is. Auto-suppressed on dense series. */
+  showPoints?: boolean;
   /** Click-to-filter: clicking a legend entry reports its field=value pair. */
   onValueClick?: ChartValueClickHandler;
 }
@@ -46,6 +50,7 @@ export function LineChart({
   svgRef,
   height = 260,
   seriesMode = "overlay",
+  showPoints = true,
   showLegend = true,
   onValueClick,
 }: LineChartProps) {
@@ -149,13 +154,28 @@ export function LineChart({
                     />
                   ))
                 : data.series.map((s) => (
-                    <path
-                      key={s.value}
-                      d={lineGen(s.buckets) ?? undefined}
-                      fill="none"
-                      stroke={colorMap.get(s.value) ?? "var(--color-accent)"}
-                      strokeWidth={1.75}
-                    />
+                    <g key={s.value}>
+                      <path
+                        d={lineGen(s.buckets) ?? undefined}
+                        fill="none"
+                        stroke={colorMap.get(s.value) ?? "var(--color-accent)"}
+                        strokeWidth={1.75}
+                      />
+                      {/* Markers only while they stay legible — past ~120
+                          buckets per series they merge into the line anyway. */}
+                      {showPoints &&
+                        s.buckets.length <= 120 &&
+                        s.buckets.map((b, i) => (
+                          <circle
+                            key={i}
+                            cx={x(new Date(b.start))}
+                            cy={y(b.count)}
+                            r={2}
+                            fill={colorMap.get(s.value) ?? "var(--color-accent)"}
+                            pointerEvents="none"
+                          />
+                        ))}
+                    </g>
                   ))}
               {hoverIdx != null && (
                 <line

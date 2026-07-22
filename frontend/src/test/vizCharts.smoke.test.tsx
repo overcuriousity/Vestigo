@@ -26,7 +26,13 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
+import { WaffleChart } from "@/components/viz/charts/WaffleChart";
+import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
+import { FacetGrid } from "@/components/viz/FacetGrid";
+import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
 import type {
+  FieldCorrelationResponse,
+  FieldNumericGroupedResponse,
   FieldNumericResponse,
   FieldPivotResponse,
   FieldScatterResponse,
@@ -56,6 +62,10 @@ const NUMERIC: FieldNumericResponse = {
   max: 100,
   mean: 50,
   stddev: 20,
+  skewness: 0,
+  points: null,
+  bin_rule: "manual",
+  bin_width: 25,
   quantiles: { "0.25": 25, "0.5": 50, "0.75": 75 },
   bins: [
     { x0: 0, x1: 50, count: 60 },
@@ -121,6 +131,16 @@ const SCATTER: FieldScatterResponse = {
   kind: "scatter",
   field_x: "attr:bytes",
   field_y: "attr:latency",
+  stats: {
+    n: 1000,
+    basis: "full",
+    pearson: { r: 0.8, p: 1e-9 },
+    spearman: { rho: 0.75, p: 1e-8 },
+    kendall: { tau: 0.6, p: 0.001, basis: "sample", n: 3 },
+    regression: { slope: 0.5, intercept: 2, r_squared: 0.64 },
+    shapiro: { x: { w: 0.98, p: 0.3 }, y: { w: 0.97, p: 0.2 }, basis: "sample", n: 3 },
+    recommendation: "pearson",
+  },
   total: 1000,
   sampled: 3,
   x_min: 0,
@@ -462,5 +482,200 @@ describe("time-field labelling", () => {
       ["time:hour_of_day", "09"],
       ["artifact", "FILE"],
     ]);
+  });
+});
+
+describe("lecture-driven marks", () => {
+  const GROUPED: FieldNumericGroupedResponse = {
+    kind: "numeric_grouped",
+    field: "attr:latency_ms",
+    group_field: "attr:user",
+    total: 100,
+    min: 0,
+    max: 100,
+    distinct_groups: 5,
+    omitted_groups: 3,
+    omitted_count: 30,
+    groups: [
+      {
+        value: "alice",
+        count: 40,
+        min: 0,
+        max: 90,
+        mean: 25,
+        stddev: 8,
+        skewness: 0.3,
+        quantiles: { "0.25": 10, "0.5": 20, "0.75": 30 },
+        bins: [
+          { x0: 0, x1: 50, count: 35 },
+          { x0: 50, x1: 100, count: 5 },
+        ],
+      },
+      {
+        value: "bob",
+        count: 30,
+        min: 5,
+        max: 100,
+        mean: 50,
+        stddev: 9,
+        skewness: -0.2,
+        quantiles: { "0.25": 40, "0.5": 50, "0.75": 60 },
+        bins: [
+          { x0: 0, x1: 50, count: 12 },
+          { x0: 50, x1: 100, count: 18 },
+        ],
+      },
+    ],
+    points: {
+      total: 70,
+      shown: 4,
+      values: [
+        ["alice", 12],
+        ["alice", 22],
+        ["bob", 48],
+        ["bob", 61],
+      ],
+    },
+  };
+
+  it("renders a waffle grid of exactly 100 cells", () => {
+    const { container } = render(<WaffleChart terms={TERMS} />);
+    // 100 cells + the legend swatches, so count only the SVG rects.
+    expect(container.querySelectorAll("svg rect")).toHaveLength(100);
+  });
+
+  it("renders grouped box and violin marks with a point overlay", () => {
+    for (const mark of ["box", "violin"] as const) {
+      const { container } = render(
+        <GroupedDistribution data={GROUPED} mark={mark} showPoints />,
+      );
+      expect(container.querySelector("svg")).toBeTruthy();
+      // One jittered dot per sampled value.
+      expect(container.querySelectorAll("svg circle")).toHaveLength(4);
+    }
+  });
+
+  it("grouped charts report an empty state instead of throwing", () => {
+    const { container } = render(
+      <GroupedDistribution
+        data={{ ...GROUPED, total: 0, groups: [], points: null }}
+        mark="box"
+      />,
+    );
+    expect(container.textContent).toContain("No numeric values");
+  });
+
+  it("histogram draws density curve and mean/median markers", () => {
+    const { container } = render(
+      <NumericHistogram stats={NUMERIC} showDensity showMarkers />,
+    );
+    expect(container.querySelector("svg path")).toBeTruthy();
+    expect(container.textContent).toContain("median");
+    expect(container.textContent).toContain("mean");
+  });
+
+  it("scatter draws the server-computed regression line", () => {
+    const { container } = render(<ScatterChart data={SCATTER} showRegression />);
+    const dashed = [...container.querySelectorAll("line")].filter(
+      (l) => l.getAttribute("stroke-dasharray") === "6 4",
+    );
+    expect(dashed).toHaveLength(1);
+  });
+});
+
+describe("correlation matrix", () => {
+  const CORR: FieldCorrelationResponse = {
+    kind: "corr",
+    fields: ["attr:bytes", "attr:latency", "attr:retries"],
+    total: 1000,
+    numeric_counts: { "attr:bytes": 1000, "attr:latency": 900, "attr:retries": 0 },
+    pairs: [
+      {
+        x: "attr:bytes",
+        y: "attr:latency",
+        n: 900,
+        pearson: 0.82,
+        p_pearson: 1e-9,
+        spearman: 0.75,
+        p_spearman: 1e-8,
+      },
+      {
+        x: "attr:bytes",
+        y: "attr:retries",
+        n: 0,
+        pearson: null,
+        p_pearson: null,
+        spearman: null,
+        p_spearman: null,
+      },
+      {
+        x: "attr:latency",
+        y: "attr:retries",
+        n: 0,
+        pearson: null,
+        p_pearson: null,
+        spearman: null,
+        p_spearman: null,
+      },
+    ],
+    dropped_fields: [{ field: "attr:retries", reason: "non_numeric" }],
+  };
+
+  it("draws only the lower triangle and prints each coefficient", () => {
+    const { container } = render(<CorrMatrix data={CORR} />);
+    // 3 fields -> 3 lower-triangle cells (the diagonal is never drawn).
+    expect(container.querySelectorAll("svg rect")).toHaveLength(3);
+    expect(container.textContent).toContain("+0.82");
+    // A pair with no shared numeric events renders as an explicit gap.
+    expect(container.textContent).toContain("—");
+  });
+
+  it("switches the filled coefficient without refetching", () => {
+    const { container } = render(<CorrMatrix data={CORR} method="spearman" />);
+    expect(container.textContent).toContain("+0.75");
+    expect(container.textContent).toContain("Spearman");
+  });
+
+  it("reports an empty state when there is nothing to correlate", () => {
+    const { container } = render(
+      <CorrMatrix data={{ ...CORR, fields: ["attr:bytes"], pairs: [] }} />,
+    );
+    expect(container.textContent).toContain("No field pairs");
+  });
+
+  it("opens a pair as a scatter plot on click", () => {
+    const opened: [string, string][] = [];
+    const { container } = render(
+      <CorrMatrix data={CORR} onPairClick={(x, y) => opened.push([x, y])} />,
+    );
+    // The first cell is the (bytes, latency) pair; click its group, not the
+    // frame's margin <g>.
+    fireEvent.click(container.querySelector("svg rect")!.parentElement!);
+    expect(opened).toEqual([["attr:bytes", "attr:latency"]]);
+  });
+});
+
+describe("FacetGrid", () => {
+  it("draws one panel per value and states what was left out", () => {
+    render(
+      <FacetGrid
+        field="attr:status"
+        omittedValues={3}
+        omittedCount={120}
+        panels={[
+          { value: "200", count: 90, isLoading: false, chart: <div>panel-200</div> },
+          { value: "500", count: 10, isLoading: false, chart: <div>panel-500</div> },
+        ]}
+      />,
+    );
+    expect(screen.getByText("panel-200")).toBeTruthy();
+    expect(screen.getByText("panel-500")).toBeTruthy();
+    expect(screen.getByText(/3 further values/)).toBeTruthy();
+    expect(screen.getByText(/not merged into an "Other" panel/)).toBeTruthy();
+  });
+
+  it("says so when no value matches instead of drawing an empty grid", () => {
+    render(<FacetGrid field="attr:status" panels={[]} />);
+    expect(screen.getByText(/No values of/)).toBeTruthy();
   });
 });
