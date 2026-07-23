@@ -271,6 +271,47 @@ class FilterSpec(BaseModel):
         description="Hide events belonging to analyst-marked routine motifs (kind='routine' dispositions).",
     )
 
+    @model_validator(mode="after")
+    def _reject_empty_selections(self) -> FilterSpec:
+        """Refuse a filter key whose value selects nothing.
+
+        ``{"src_ip": []}`` reads like "group by src_ip" and does nothing: an
+        empty value list is an absent filter, so the tool answers with the
+        whole unfiltered timeline. A small model that believes otherwise keeps
+        asking, and each answer is a full-size result — on 2026-07-23 three
+        such calls in one assistant turn returned byte-identical 34 KB payloads
+        and consumed two thirds of the model's context.
+
+        Rejected rather than ignored, and the message names the tool that
+        answers the question actually being asked. This is the same contract as
+        the chart-legality errors: an error the model is meant to act on, with
+        ``retries=3`` (``agent/runtime.py``) giving it room to.
+        """
+        empty_maps = [
+            (name, key)
+            for name, mapping in (("filters", self.filters), ("exclusions", self.exclusions))
+            for key, values in mapping.items()
+            if not values
+        ]
+        if empty_maps:
+            where = ", ".join(f'{name}["{key}"]' for name, key in empty_maps)
+            raise ValueError(
+                f"{where} is an empty list, which filters nothing. Omit the key to "
+                "leave the field unfiltered, list the values you want to match, or "
+                "call field_terms to see a field's value distribution."
+            )
+        empty_lists = [
+            name
+            for name in ("artifacts", "tags_include", "tags_exclude", "annotated", "event_ids")
+            if getattr(self, name) == []
+        ]
+        if empty_lists:
+            raise ValueError(
+                f"{', '.join(empty_lists)} is an empty list, which selects nothing. "
+                "Omit the field entirely to leave it unconstrained."
+            )
+        return self
+
 
 class ChartCompareSpec(BaseModel):
     """The optional second layer a chart is measured against."""
