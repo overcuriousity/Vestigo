@@ -2993,23 +2993,50 @@ class EventQueryService:
             f"{_finite_float_cast(col_y)} AS vy "
             f"FROM {self.store.database}.events WHERE {where}"
         )
+
         # assumeNotNull under the IS NOT NULL guard is load-bearing, not
         # cosmetic: Nullable arguments to the tuple-returning
         # simpleLinearRegression corrupt clickhouse-connect's native-format
         # parsing (observed on ClickHouse 26.6 — garbage coefficients or a
         # UnicodeDecodeError mid-response).
-        stats_result = self.store.client.query(
-            f"""
-            SELECT count(), min(vx), max(vx), min(vy), max(vy),
-                   corr(assumeNotNull(vx), assumeNotNull(vy)),
-                   rankCorr(assumeNotNull(vx), assumeNotNull(vy)),
-                   simpleLinearRegression(assumeNotNull(vx), assumeNotNull(vy))
-            FROM ({pairs_subquery}) AS t
-            WHERE vx IS NOT NULL AND vy IS NOT NULL
-            {HEAVY_SCAN_SETTINGS}
-            """,
-            parameters=parameters,
-        )
+        #
+        # ``rankCorr`` is the one aggregate here that does not degrade
+        # gracefully on a zero-variance axis: older ClickHouse (e.g. 24.10)
+        # raises BAD_ARGUMENTS ("All numbers in both samples are identical")
+        # at finalize instead of returning a value, and a wrapping ``if`` does
+        # not help because the aggregate is still finalized. Newer ClickHouse
+        # (26.6) instead returns a *bogus* finite ρ for a constant axis. Both
+        # are handled below: the throw is caught and retried without rankCorr,
+        # and a degenerate axis nulls the whole coefficient block regardless of
+        # what the server returned (see ``degenerate`` after the query).
+        def _run_stats(with_rank: bool) -> Any:
+            rank_expr = (
+                "rankCorr(assumeNotNull(vx), assumeNotNull(vy))"
+                if with_rank
+                else "CAST(NULL, 'Nullable(Float64)')"
+            )
+            return self.store.client.query(
+                f"""
+                SELECT count(), min(vx), max(vx), min(vy), max(vy),
+                       corr(assumeNotNull(vx), assumeNotNull(vy)),
+                       {rank_expr},
+                       simpleLinearRegression(assumeNotNull(vx), assumeNotNull(vy))
+                FROM ({pairs_subquery}) AS t
+                WHERE vx IS NOT NULL AND vy IS NOT NULL
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters=parameters,
+            )
+
+        try:
+            stats_result = _run_stats(with_rank=True)
+        except Exception as exc:  # noqa: BLE001 — narrowed by code/message below
+            # Only swallow the specific zero-variance rankCorr failure; anything
+            # else is a real error and must propagate.
+            code = getattr(exc, "code", None)
+            if code != 36 and "identical" not in str(exc):
+                raise
+            stats_result = _run_stats(with_rank=False)
         row = stats_result.result_rows[0] if stats_result.result_rows else None
         total = int(row[0]) if row and row[0] else 0
         base = {"kind": "scatter", "field_x": field_x, "field_y": field_y}
@@ -3025,6 +3052,17 @@ class EventQueryService:
                 "points": [],
                 "stats": None,
             }
+
+        # A constant axis (min == max) has no variance, so Pearson/Spearman/
+        # regression are undefined. corr/simpleLinearRegression already yield
+        # NaN there (nulled downstream), but rankCorr may return a bogus finite
+        # ρ on newer servers or was skipped entirely on the retry above — so
+        # null the entire coefficient block explicitly when either axis is
+        # degenerate, rather than trusting the server's per-aggregate behavior.
+        degenerate = row[1] == row[2] or row[3] == row[4]
+        pearson_r = None if degenerate else row[5]
+        spearman_rho = None if degenerate else row[6]
+        regression = None if degenerate else row[7]
 
         # The sample repeats the casts rather than reusing `pairs_subquery`:
         # the ordering key has to be projected alongside them, and only this
@@ -3055,5 +3093,5 @@ class EventQueryService:
             "y_min": row[3],
             "y_max": row[4],
             "points": points,
-            "stats": _scatter_stats(total, row[5], row[6], row[7], points),
+            "stats": _scatter_stats(total, pearson_r, spearman_rho, regression, points),
         }

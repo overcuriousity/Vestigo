@@ -49,6 +49,10 @@ class TestSpecParity:
         assert converter.META_CONVERTER_NAME == parquet_format.META_CONVERTER_NAME
         assert converter.META_CONVERTER_VERSION == parquet_format.META_CONVERTER_VERSION
         assert converter.META_ORIGINAL_FILES == parquet_format.META_ORIGINAL_FILES
+        assert converter.META_CONVERTED_AT == parquet_format.META_CONVERTED_AT
+        assert converter.META_ROW_COUNTS == parquet_format.META_ROW_COUNTS
+        assert converter.META_TIMEZONE_ASSUMPTION == parquet_format.META_TIMEZONE_ASSUMPTION
+        assert converter.META_PARSE_DECISIONS == parquet_format.META_PARSE_DECISIONS
         assert converter.PARQUET_EVENT_SCHEMA == parquet_format.PARQUET_EVENT_SCHEMA
 
     def test_output_validates_against_server_spec(self, converter, tmp_path):
@@ -118,9 +122,13 @@ class TestParsing:
         expected = hashlib.sha256(src.read_bytes()).hexdigest()
         meta = {k.decode(): v.decode() for k, v in pf.schema_arrow.metadata.items()}
         originals = json.loads(meta[parquet_format.META_ORIGINAL_FILES])
-        assert originals == [
-            {"name": "suricata.log", "sha256": expected, "size_bytes": src.stat().st_size}
-        ]
+        assert len(originals) == 1
+        entry = originals[0]
+        assert entry["name"] == "suricata.log"
+        assert entry["sha256"] == expected
+        assert entry["size_bytes"] == src.stat().st_size
+        assert entry["path"] == str(src.resolve())
+        assert entry["mtime"]  # ISO-8601 file mtime present (converter >= 1.3.0)
         for row in pf.read().to_pylist():
             assert row["file_hash"] == expected
             assert row["source_file"] == "suricata.log"
@@ -221,3 +229,34 @@ class TestSplit:
             pf = pq.ParquetFile(p)
             meta = parquet_format.validate_parquet_source(pf.schema_arrow, pf.schema_arrow.metadata)
             assert meta.converter_name == "suricata2vestigo"
+
+
+def test_time_window_filter(converter, tmp_path):
+    """--since/--until drop out-of-window rows and record honest counts."""
+    src = DATA / "suricata.log"
+
+    # A far-future --since drops every timestamped row by time.
+    dropped = tmp_path / "dropped.parquet"
+    converter.convert(str(src), str(dropped), 1, False, since="2099-01-01T00:00:00Z")
+    pf = pq.ParquetFile(dropped)
+    footer = {
+        k.decode(): v.decode() for k, v in pf.metadata.metadata.items() if k != b"ARROW:schema"
+    }
+    counts = json.loads(footer["vestigo.row_counts"])
+    assert counts["skipped_by_time"] > 0
+    assert counts["parsed"] == pf.metadata.num_rows
+    assert footer["vestigo.converted_at"]
+    assert footer["vestigo.timezone_assumption"]
+
+    # A wide-open window keeps exactly what the unfiltered run keeps.
+    ref = _convert(converter, src, tmp_path / "all.parquet")
+    wide = tmp_path / "wide.parquet"
+    converter.convert(
+        str(src),
+        str(wide),
+        1,
+        False,
+        since="1970-01-01T00:00:00Z",
+        until="2099-01-01T00:00:00Z",
+    )
+    assert pq.ParquetFile(wide).metadata.num_rows == ref.metadata.num_rows

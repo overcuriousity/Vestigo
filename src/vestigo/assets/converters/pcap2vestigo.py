@@ -72,7 +72,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "pcap2vestigo"
-CONVERTER_VERSION = "1.2.0"
+CONVERTER_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Vestigo Parquet interchange format v1 — embedded copy of the spec in
@@ -85,6 +85,11 @@ META_FORMAT_VERSION = "vestigo.format_version"
 META_CONVERTER_NAME = "vestigo.converter_name"
 META_CONVERTER_VERSION = "vestigo.converter_version"
 META_ORIGINAL_FILES = "vestigo.original_files"
+# Additive forensic footer metadata (Tier 1). Ignored by older readers.
+META_CONVERTED_AT = "vestigo.converted_at"
+META_ROW_COUNTS = "vestigo.row_counts"
+META_TIMEZONE_ASSUMPTION = "vestigo.timezone_assumption"
+META_PARSE_DECISIONS = "vestigo.parse_decisions"
 
 PARQUET_EVENT_SCHEMA = pa.schema(
     [
@@ -804,22 +809,39 @@ class _BatchBuffer:
         self._columns = {name: [] for name in PARQUET_EVENT_SCHEMA.names}
 
 
-def _convert_file(
-    path: Path, source_file: str, file_hash: str, buffer: _BatchBuffer
-) -> tuple[int, int]:
-    """Parse one capture file into the buffer. Returns ``(parsed, skipped)``.
+def _parse_since_until(value: str | None) -> datetime.datetime | None:
+    """Parse an ISO 8601 ``--since``/``--until`` value to a UTC-aware datetime."""
+    if not value:
+        return None
+    dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.UTC)
+    return dt.astimezone(datetime.UTC)
 
-    Never raises for corrupt/truncated data at the file level — it is
-    reported to stderr instead, so one bad file doesn't abort the run.
+
+def _convert_file(
+    path: Path,
+    source_file: str,
+    file_hash: str,
+    buffer: _BatchBuffer,
+    since_dt: datetime.datetime | None = None,
+    until_dt: datetime.datetime | None = None,
+) -> tuple[int, int, int]:
+    """Parse one capture file into the buffer.
+
+    Returns ``(parsed, skipped, skipped_by_time)``. Never raises for
+    corrupt/truncated data at the file level — it is reported to stderr
+    instead, so one bad file doesn't abort the run.
     """
     parsed = 0
     skipped = 0
+    skipped_by_time = 0
 
     try:
         fh = open(path, "rb")  # noqa: SIM115 — closed in the finally below; only the open is OSError-guarded
     except OSError as exc:
         sys.stderr.write(f"warning: cannot open {path}: {exc}\n")
-        return parsed, skipped
+        return parsed, skipped, skipped_by_time
 
     try:
         magic = fh.read(4)
@@ -829,7 +851,7 @@ def _convert_file(
             header_rest = fh.read(20)
             if len(header_rest) < 20:
                 sys.stderr.write(f"warning: truncated pcap global header, skipping: {path}\n")
-                return parsed, skipped
+                return parsed, skipped, skipped_by_time
             _, _, _, _, _, network = struct.unpack(byte_order + "HHiIII", header_rest)
             link_type = _LINK_TYPE_NAMES.get(network)
             packet_source = _iter_pcap_classic(fh, byte_order, nanosecond, link_type)
@@ -838,7 +860,7 @@ def _convert_file(
             packet_source = _iter_pcap_ng(fh)
         else:
             sys.stderr.write(f"warning: unrecognized capture format, skipping: {path}\n")
-            return parsed, skipped
+            return parsed, skipped, skipped_by_time
 
         for (
             ts_us,
@@ -860,6 +882,15 @@ def _convert_file(
             except _MalformedPacket:
                 skipped += 1
                 continue
+            ts = row["timestamp"]
+            if ts is not None:
+                if since_dt is not None and ts < since_dt:
+                    skipped_by_time += 1
+                    continue
+                if until_dt is not None and ts > until_dt:
+                    skipped_by_time += 1
+                    continue
+            # ts is None (unparseable/missing) → keep, matching upstream behavior.
             buffer.append(source_file, file_hash, record_offset, record_bytes, row)
             parsed += 1
 
@@ -870,10 +901,15 @@ def _convert_file(
     finally:
         fh.close()
 
-    return parsed, skipped
+    return parsed, skipped, skipped_by_time
 
 
-def _parse_file_worker(path_str: str, file_hash: str) -> tuple[bytes, int, int]:
+def _parse_file_worker(
+    path_str: str,
+    file_hash: str,
+    since_dt: datetime.datetime | None = None,
+    until_dt: datetime.datetime | None = None,
+) -> tuple[bytes, int, int, int]:
     """Worker: parse one capture file, return Arrow IPC bytes + counts."""
     sink = io.BytesIO()
     writer_ipc = pa.ipc.new_stream(sink, PARQUET_EVENT_SCHEMA)
@@ -889,10 +925,12 @@ def _parse_file_worker(path_str: str, file_hash: str) -> tuple[bytes, int, int]:
 
     path = Path(path_str)
     buffer = _IpcBuffer()
-    parsed, skipped = _convert_file(path, path.name, file_hash, buffer)
+    parsed, skipped, skipped_by_time = _convert_file(
+        path, path.name, file_hash, buffer, since_dt=since_dt, until_dt=until_dt
+    )
     buffer.flush()
     writer_ipc.close()
-    return sink.getvalue(), parsed, skipped
+    return sink.getvalue(), parsed, skipped, skipped_by_time
 
 
 # ---------------------------------------------------------------------------
@@ -976,6 +1014,19 @@ def split_parquet(src: Path, output: str, spec: tuple[str, int], verbose: bool) 
     mode, amount = spec
     pf = pq.ParquetFile(src)
     schema = pf.schema_arrow
+    # Carry footer key-value metadata added after the write loop (e.g.
+    # vestigo.row_counts via add_key_value_metadata) into every part, so each
+    # part keeps the full provenance. schema_arrow.metadata only holds keys set
+    # at writer-open time; the rest live in the file's FileMetaData KV.
+    extra = {
+        k: v
+        for k, v in (pf.metadata.metadata or {}).items()
+        if k != b"ARROW:schema" and k not in (schema.metadata or {})
+    }
+    if extra:
+        merged = dict(schema.metadata or {})
+        merged.update(extra)
+        schema = schema.with_metadata(merged)
     total = pf.metadata.num_rows
     if mode == "parts":
         rows_per_part = -(-total // amount) if total else 0
@@ -1029,7 +1080,13 @@ def split_parquet(src: Path, output: str, spec: tuple[str, int], verbose: bool) 
 
 
 def convert(
-    input_path: str, output: str, workers: int, verbose: bool, split: str | None = None
+    input_path: str,
+    output: str,
+    workers: int,
+    verbose: bool,
+    split: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
 ) -> int:
     """Convert pcap/pcapng captures at ``input_path`` into ``output`` (.parquet)."""
     import json
@@ -1039,6 +1096,9 @@ def convert(
             f"error: output path must end with .parquet (got: {output}) — the "
             "Vestigo server detects the ingest parser strictly by file extension."
         )
+
+    since_dt = _parse_since_until(since)
+    until_dt = _parse_since_until(until)
 
     split_spec = parse_split_spec(split) if split else None
     write_target = output if split_spec is None else f"{output}.tmp"
@@ -1052,17 +1112,30 @@ def convert(
     for path in files:
         digest, size = hash_file(path)
         hashes[path] = digest
-        provenance.append({"name": path.name, "sha256": digest, "size_bytes": size})
+        stat = path.stat()
+        provenance.append(
+            {
+                "name": path.name,
+                "sha256": digest,
+                "size_bytes": size,
+                "path": str(path.resolve()),
+                "mtime": datetime.datetime.fromtimestamp(stat.st_mtime, datetime.UTC).isoformat(),
+            }
+        )
 
     metadata = {
         META_FORMAT_VERSION: FORMAT_VERSION,
         META_CONVERTER_NAME: CONVERTER_NAME,
         META_CONVERTER_VERSION: CONVERTER_VERSION,
         META_ORIGINAL_FILES: json.dumps(provenance, sort_keys=True),
+        META_CONVERTED_AT: datetime.datetime.now(datetime.UTC).isoformat(),
+        META_TIMEZONE_ASSUMPTION: "packet capture timestamps are UTC (epoch-derived)",
+        META_PARSE_DECISIONS: json.dumps({"since": since, "until": until}, sort_keys=True),
     }
 
     parsed_total = 0
     skipped_total = 0
+    skipped_by_time_total = 0
     schema = PARQUET_EVENT_SCHEMA.with_metadata(metadata)
     with pq.ParquetWriter(write_target, schema, compression="zstd") as writer:
         buffer = _BatchBuffer(writer)
@@ -1095,16 +1168,21 @@ def convert(
 
                 def _submit_next() -> None:
                     for path in file_iter:
-                        pending.append(pool.submit(_parse_file_worker, str(path), hashes[path]))
+                        pending.append(
+                            pool.submit(
+                                _parse_file_worker, str(path), hashes[path], since_dt, until_dt
+                            )
+                        )
                         return
 
                 for _ in range(workers * 2):
                     _submit_next()
                 while pending:
-                    ipc_bytes, parsed, skipped = pending.popleft().result()
+                    ipc_bytes, parsed, skipped, skipped_by_time = pending.popleft().result()
                     _submit_next()
                     parsed_total += parsed
                     skipped_total += skipped
+                    skipped_by_time_total += skipped_by_time
                     reader = pa.ipc.open_stream(ipc_bytes)
                     for batch in reader:
                         if batch.num_rows:
@@ -1113,12 +1191,27 @@ def convert(
             for path in files:
                 if verbose:
                     sys.stderr.write(f"parsing {path}...\n")
-                parsed, skipped = _convert_file(path, path.name, hashes[path], buffer)
+                parsed, skipped, skipped_by_time = _convert_file(
+                    path, path.name, hashes[path], buffer, since_dt=since_dt, until_dt=until_dt
+                )
                 parsed_total += parsed
                 skipped_total += skipped
+                skipped_by_time_total += skipped_by_time
 
         buffer.flush()
+        writer.add_key_value_metadata(
+            {
+                META_ROW_COUNTS: json.dumps(
+                    {
+                        "parsed": parsed_total,
+                        "skipped_malformed": skipped_total,
+                        "skipped_by_time": skipped_by_time_total,
+                    }
+                )
+            }
+        )
 
+    time_note = f", {skipped_by_time_total} outside --since/--until" if (since or until) else ""
     if split_spec is not None:
         try:
             parts = split_parquet(Path(write_target), output, split_spec, verbose)
@@ -1127,12 +1220,12 @@ def convert(
         sys.stderr.write(
             f"{CONVERTER_NAME}: wrote {parsed_total} events to {len(parts)} part "
             f"file(s) [{parts[0].name} .. {parts[-1].name}] "
-            f"({skipped_total} packets skipped)\n"
+            f"({skipped_total} packets skipped{time_note})\n"
         )
     else:
         sys.stderr.write(
             f"{CONVERTER_NAME}: wrote {parsed_total} events to {output} "
-            f"({skipped_total} packets skipped)\n"
+            f"({skipped_total} packets skipped{time_note})\n"
         )
     return 0 if parsed_total > 0 else 1
 
@@ -1165,9 +1258,27 @@ def main() -> int:
         "it reaches SIZE, with a K/M/G suffix meaning KiB/MiB/GiB (e.g. "
         "512M). Parts are named <name>.partNNN.parquet.",
     )
+    parser.add_argument(
+        "--since",
+        help="Only packets at or after this ISO 8601 timestamp "
+        "(e.g. 2026-07-01T00:00:00Z). Packets with no parseable timestamp are kept.",
+    )
+    parser.add_argument(
+        "--until",
+        help="Only packets at or before this ISO 8601 timestamp "
+        "(e.g. 2026-07-01T23:59:59Z). Packets with no parseable timestamp are kept.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="progress on stderr")
     args = parser.parse_args()
-    return convert(args.input, args.output, max(1, args.workers), args.verbose, split=args.split)
+    return convert(
+        args.input,
+        args.output,
+        max(1, args.workers),
+        args.verbose,
+        split=args.split,
+        since=args.since,
+        until=args.until,
+    )
 
 
 if __name__ == "__main__":

@@ -33,9 +33,23 @@ FORMAT_VERSION = "1"
 META_FORMAT_VERSION = "vestigo.format_version"
 META_CONVERTER_NAME = "vestigo.converter_name"
 META_CONVERTER_VERSION = "vestigo.converter_version"
-# JSON array of {"name": str, "sha256": str, "size_bytes": int} — one entry
-# per original raw input file (directory inputs yield several).
+# JSON array of {"name": str, "sha256": str, "size_bytes": int, "path": str,
+# "mtime": str} — one entry per original raw input file (directory inputs yield
+# several). `path` (absolute source path) and `mtime` (ISO-8601 UTC) are
+# additive since converter 1.3.0; `OriginalFile` ignores them.
 META_ORIGINAL_FILES = "vestigo.original_files"
+
+# Additive forensic footer metadata written by converters >= 1.3.0. The reader
+# does not require these (validate_parquet_source ignores them); they are
+# self-documenting chain-of-custody data readable from the Parquet footer.
+# `converted_at`: ISO-8601 UTC timestamp of the conversion run.
+# `row_counts`: JSON {"parsed", "skipped_malformed", "skipped_by_time"}.
+# `timezone_assumption`: free-text note on any tz/year guess the parser made.
+# `parse_decisions`: JSON of format-specific parsing choices.
+META_CONVERTED_AT = "vestigo.converted_at"
+META_ROW_COUNTS = "vestigo.row_counts"
+META_TIMEZONE_ASSUMPTION = "vestigo.timezone_assumption"
+META_PARSE_DECISIONS = "vestigo.parse_decisions"
 
 # Files written by converters from before the TraceSignal→Vestigo rename use
 # this key prefix; the reader accepts them transparently.

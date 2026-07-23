@@ -1,9 +1,58 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 90 — review fixes on the statistical visualizations).
+Last updated: 2026-07-23 (session 91 — converter time-window filtering + forensic footer metadata).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 91 — 2026-07-23: `--since`/`--until` for native converters + forensic footer metadata
+
+**Why.** Ingestion does no dedup (plain `MergeTree`, a fresh `source_id` per run), so
+re-ingesting an rsynced log directory daily re-inserts every rotated + growing log —
+duplicate rows, skewed anomaly baselines, polluted embeddings. The vendored `*2timesketch`
+converters already ship `--since`/`--until` window filters that drop out-of-window rows
+before output; the Vestigo-native Parquet-path converters lacked them.
+
+**What.** Added `--since`/`--until` ISO-8601 time-window filtering to all six native
+converters (`cloudtrail2vestigo`, `filterlog2vestigo`, `nginx2vestigo`, `pcap2vestigo`,
+`suricata2vestigo`, `timesketch2parquet`). Parsing via a ported `_parse_since_until`
+(handles trailing `Z`, naive→UTC, normalized to UTC); a per-row datetime compare guards the
+single `_BatchBuffer.append` emit site in each script; the since/until datetimes are threaded
+through into the worker entry points so the parallel paths filter correctly under `spawn`.
+Rows with an unparseable/missing timestamp are **kept** (matches upstream `_filter_by_time`;
+never silently drop undatable evidence). Each converter bumped `1.2.0 → 1.3.0` (feature; the
+version rides into `parser_version` → `derive_event_id`, so `1.3.0` events get distinct ids,
+which is correct — it records a real change in the producing tool).
+
+**Forensic footer metadata (Tier 1).** Additive Parquet footer keys, no schema/column change,
+tolerated by older readers: `vestigo.converted_at`, `vestigo.row_counts`
+(`{parsed, skipped_malformed, skipped_by_time}` — the `--since` honesty story),
+`vestigo.timezone_assumption`, `vestigo.parse_decisions`; `original_files` entries gained
+`path` (absolute) + `mtime`. `row_counts` is written post-write-loop via
+`ParquetWriter.add_key_value_metadata`, and `split_parquet` now merges footer KV so parts keep
+it. Constants mirrored in `src/vestigo/ingestion/parquet_format.py`.
+
+**Upstream.** `browser2timesketch` is the one vendored converter still missing the window
+filter — it is `do-not-edit` (vendored from `overcuriousity/2timesketch`), so filed
+[overcuriousity/2timesketch#4](https://github.com/overcuriousity/2timesketch/issues/4) for
+upstream parity rather than hand-editing.
+
+**Tests.** Per-converter `test_time_window_filter` (out-of-window dropped, wide-open window ==
+unfiltered, footer `row_counts`/`converted_at` asserted; timesketch2parquet parametrized over
+CSV + JSONL). Updated the `test_file_provenance` and embedded-spec-parity tests for the new
+`original_files` keys and META constants; refreshed the native entries in
+`converters/manifest.json`. Deferred to a later round: `line_number`/`raw_line` columns and
+opt-in operator/host capture (touch schema + `parquet_reader` + `event_id`).
+
+**Also — scatter degenerate-axis fix (`field_scatter`).** Upstream CI (ClickHouse 24.10) was
+red on `test_scatter_degenerate_axis_nulls_coefficients`: a constant-value axis made
+`rankCorr` raise `BAD_ARGUMENTS` ("All numbers in both samples are identical") at finalize —
+and a wrapping `if` doesn't help because the aggregate is still finalized. Newer ClickHouse
+(26.6) instead returns a *bogus* finite ρ for the same input. Fixed both: the stats query is
+retried without `rankCorr` when that specific error is caught, and a degenerate axis
+(`min == max` on either side) now nulls the entire Pearson/Spearman/regression block
+explicitly rather than trusting per-aggregate server behavior. Common (non-degenerate) path
+still one scan. Unrelated to the converter work but on the same branch at the user's request.
 
 ## Session 90 — 2026-07-22: review fixes on the statistical visualizations
 

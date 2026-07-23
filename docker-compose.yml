@@ -55,9 +55,12 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-    # Uncomment to require an API key (must match VESTIGO_QDRANT_API_KEY on `app`):
-    # environment:
-    #   QDRANT__SERVICE__API_KEY: change-me
+    environment:
+      # Disable Qdrant's anonymized usage telemetry — Vestigo is offline-by-default
+      # (docs/TECH_STACK.md §6) and this backing service must not phone home.
+      QDRANT__TELEMETRY_DISABLED: "true"
+      # Uncomment to require an API key (must match VESTIGO_QDRANT_API_KEY on `app`):
+      # QDRANT__SERVICE__API_KEY: change-me
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333 && echo -e 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
       interval: 5s
@@ -87,8 +90,20 @@ services:
 #      VESTIGO_EMBEDDING_MODEL: all-MiniLM-L6-v2
 #      VESTIGO_EMBEDDING_DEVICE: cpu
 #      VESTIGO_EMBEDDING_BATCH_SIZE: 64
+#      # Remote OpenAI-compatible embeddings instead of the local model:
+#      # VESTIGO_EMBEDDING_API_BASE_URL: https://api.openai.com/v1
+#      # VESTIGO_EMBEDDING_API_KEY: ""
 #      VESTIGO_INGEST_BATCH_SIZE: 20000
+#      VESTIGO_ENRICHMENT_BATCH_SIZE: 20000
 #      VESTIGO_MAX_UPLOAD_BYTES: 10737418240
+#      # Detector heavy-scan guardrails (see .env.example for the full rationale):
+#      VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES: 0
+#      VESTIGO_STAT_SCAN_MEMORY_RATIO: 0.8
+#      VESTIGO_STAT_SCAN_CONCURRENCY: 2
+#      # Offline Sigma rule drop (empty/unset disables the global set):
+#      # VESTIGO_SIGMA_RULES_PATH: /opt/sigma-rules
+#      # External MCP endpoint over /mcp (off by default):
+#      # VESTIGO_MCP_ENABLED: "true"
 #      # Change this before any real/shared deployment — it's a one-time
 #      # bootstrap credential; the admin is forced to rotate it on first login.
 #      VESTIGO_ADMIN_USERNAME: admin
@@ -104,6 +119,10 @@ services:
 #      VESTIGO_AUTH_COOKIE_SAMESITE: lax
 #      VESTIGO_AUDIT_ENABLED: "true"
 #      VESTIGO_OIDC_ENABLED: "false"
+#      # The optional AI investigation agent (VESTIGO_AGENT_*), the full OIDC
+#      # settings (issuer/client/secret/scopes/redirect), and the remote
+#      # embeddings endpoint are all documented in .env.example — copy the
+#      # relevant block here when enabling them.
 #    depends_on:
 #      postgres:
 #        condition: service_healthy
