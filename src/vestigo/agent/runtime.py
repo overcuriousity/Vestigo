@@ -60,7 +60,7 @@ from vestigo.agent.tools import (
     AgentScope,
     build_tool_server,
 )
-from vestigo.agent.window import WindowStats, make_window_processor
+from vestigo.agent.window import CHARS_PER_TOKEN_DEFAULT, WindowStats, make_window_processor
 
 LLM_TIMEOUT = 300.0
 
@@ -343,6 +343,7 @@ async def stream_turn(
     model: Model | None = None,
     window_budget: int | None = None,
     window_stats: WindowStats | None = None,
+    chars_per_token: float = CHARS_PER_TOKEN_DEFAULT,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding SSE-ready event dicts.
 
@@ -353,6 +354,9 @@ async def stream_turn(
     ``window_budget`` enables the sliding context window (``agent/window.py``)
     on every model request of the turn; the caller's ``window_stats`` collects
     what it did so the router can persist one row per turn.
+    ``chars_per_token`` is the estimator's divisor — the default, or a ratio a
+    previous overflow measured against the provider's own token count. Fixed
+    for the whole turn, so every request reduces the same way.
     """
     config = await resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
@@ -378,7 +382,11 @@ async def stream_turn(
         capabilities = []
         if window_budget is not None:
             capabilities.append(
-                ProcessHistory(make_window_processor(window_budget, window_stats or WindowStats()))
+                ProcessHistory(
+                    make_window_processor(
+                        window_budget, window_stats or WindowStats(), chars_per_token
+                    )
+                )
             )
         agent = Agent(
             model,

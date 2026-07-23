@@ -7,8 +7,10 @@ determinism. No LLM, no router.
 from __future__ import annotations
 
 import copy
+import json
 
 from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -17,7 +19,14 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from tests.data.agent_payload_shape import (
+    OVERFLOW_CHARS_PER_TOKEN,
+    OVERFLOW_REQUEST_CHARS,
+    payload_of_size,
+)
 from vestigo.agent.window import (
+    CHARS_PER_TOKEN_DEFAULT,
+    ELISION_NOTE,
     MIN_KEEP_CHARS,
     TURN_DROP_MARKER,
     WindowStats,
@@ -54,6 +63,27 @@ def _big_turn(question: str, cycles: int, prefix: str) -> list:
     return messages
 
 
+def _budget_forcing_elisions(history: list, n: int) -> int:
+    """A budget that makes exactly ``n`` of ``history``'s tool results elide.
+
+    Derived rather than hardcoded: these tests are about *which* results get
+    elided and in what order, not about the estimator's divisor, and a literal
+    tuned to one chars-per-token value silently re-breaks whenever that value
+    moves (it did, when 4 became 3).
+
+    Lands midway between the estimate after ``n`` elisions and after ``n-1``,
+    so which side of ``_elide``'s ``running <= budget`` check it falls on is
+    unambiguous whatever divisor is in force.
+    """
+    full = estimate_tokens(history)
+    stub = int(len(json.dumps({"elided": True, "note": ELISION_NOTE})) / CHARS_PER_TOKEN_DEFAULT)
+    savings = [
+        int(len(json.dumps(part.content)) / CHARS_PER_TOKEN_DEFAULT) - stub
+        for part in _tool_returns(history)
+    ]
+    return (2 * full - sum(savings[:n]) - sum(savings[: n - 1])) // 2
+
+
 def _elided(part: ToolReturnPart) -> bool:
     return isinstance(part.content, dict) and part.content.get("elided") is True
 
@@ -85,7 +115,58 @@ def test_estimate_tokens_scales_with_content():
 
 
 def test_budget_for_reserves_headroom_and_system_prompt():
-    assert budget_for(10_000, "s" * 4000) == 8_000 - 1_000
+    system_tokens = int(4000 / CHARS_PER_TOKEN_DEFAULT)
+    assert budget_for(10_000, "s" * 4000) == 8_000 - system_tokens
+
+
+# ---------------------------------------------------------------------------
+# estimate: realistic payloads (the 2026-07-23 overflow)
+#
+# Every test above builds its payloads from ASCII filler, where chars/4 is
+# roughly right — which is exactly why a 1.7x under-estimate on real tool
+# results survived the suite. These hold the estimator to a measured provider
+# token count instead.
+# ---------------------------------------------------------------------------
+
+
+def test_default_divisor_is_conservative_for_real_payloads():
+    """chars/4 was calibrated against prose. Tool results are not prose."""
+    assert CHARS_PER_TOKEN_DEFAULT <= 3.0
+
+
+def test_estimate_does_not_underestimate_a_realistic_payload():
+    """A payload of the failing request's size must not estimate below what the
+    provider actually counted for it.
+
+    The default divisor alone does not get there — 178896/3 = 59632 against a
+    real 75967 — so this asserts the calibrated path, which is the point of
+    learning the ratio at all. Fails on main: `estimate_tokens` takes no ratio.
+    """
+    payload = payload_of_size(OVERFLOW_REQUEST_CHARS)
+    messages = _tool_cycle("search_events", payload, "big")
+    estimate = estimate_tokens(messages, chars_per_token=OVERFLOW_CHARS_PER_TOKEN)
+    dumped = len(ModelMessagesTypeAdapter.dump_json(messages))
+    assert estimate >= dumped / OVERFLOW_CHARS_PER_TOKEN * 0.99
+    assert estimate > estimate_tokens(messages)  # calibrated is stricter than default
+
+
+def test_budget_for_reserves_the_advertised_tool_schemas():
+    """The tools array ships with every request but rides outside `messages`,
+    so nothing in the budget path could see it. 14 inlined copies of FilterSpec
+    is what pushed the failing request over. Fails on main: no such parameter.
+    """
+    without = budget_for(65_536, "s" * 4000)
+    with_tools = budget_for(65_536, "s" * 4000, tool_schema_chars=60_000)
+    assert with_tools < without
+    assert without - with_tools == int(60_000 / CHARS_PER_TOKEN_DEFAULT)
+
+
+def test_budget_for_floor_warning_names_the_tool_schema_share(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="vestigo.agent.window"):
+        assert budget_for(4096, "s" * 4000, tool_schema_chars=200_000) == 1
+    assert "tool schema" in caplog.text.lower()
 
 
 def test_budget_for_clamps_to_floor_and_warns(caplog):
@@ -114,7 +195,7 @@ def test_under_budget_is_untouched():
 def test_elides_oldest_tool_results_first():
     history = _big_turn("q1", cycles=4, prefix="a")
     # Room for roughly two big results: the two oldest go, the newest stays.
-    out, stats = apply_window(history, budget=3_600)
+    out, stats = apply_window(history, budget=_budget_forcing_elisions(history, 2))
     returns = _tool_returns(out)
     assert len(returns) == 4
     assert _elided(returns[0]) and _elided(returns[1])
@@ -308,9 +389,10 @@ def test_truncation_is_pure_and_deterministic():
 
 
 def test_processor_applies_window_and_keeps_the_largest_reduction():
-    stats = WindowStats(budget=3_600)
-    processor = make_window_processor(3_600, stats)
     history = _big_turn("q1", cycles=4, prefix="a")
+    budget = _budget_forcing_elisions(history, 2)
+    stats = WindowStats(budget=budget)
+    processor = make_window_processor(budget, stats)
     out = processor(history)
     assert stats.results_elided == 2
     assert _tool_returns(out)[0].content["elided"] is True

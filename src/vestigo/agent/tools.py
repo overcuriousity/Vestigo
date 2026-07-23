@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Literal
 
 from fastapi.concurrency import run_in_threadpool
@@ -2322,6 +2324,71 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     _apply_schema_slimming(server)
 
     return server
+
+
+def advertised_schema_chars(server: FastMCP) -> int:
+    """Serialized size of everything the tool list costs, in characters.
+
+    The tools array ships with *every* model request but rides outside the
+    message history, so the sliding window's processor cannot see it — which is
+    why ``budget_for`` has to be told. Measured here, from the schemas actually
+    advertised for this scope, because the size is scope-dependent:
+    ``disabled_tools`` removes tools, and a conversation-less scope never
+    registers ``propose_annotation``.
+
+    Counts name, description and parameters — the three fields a provider puts
+    on the wire per tool — plus a small per-tool allowance for the JSON
+    envelope (``{"type": "function", "function": {...}}`` and its separators).
+    An estimate that ran low here would reintroduce the very gap it exists to
+    close, so it rounds up rather than down.
+    """
+    total = 0
+    for tool in server._tool_manager.list_tools():
+        total += len(tool.name)
+        total += len(tool.description or "")
+        total += len(json.dumps(tool.parameters, default=str))
+        total += _TOOL_ENVELOPE_CHARS
+    return total
+
+
+#: Per-tool JSON envelope the provider wraps each schema in, plus separators.
+#: `{"type":"function","function":{"name":"","description":"","parameters":}}`
+#: is ~70 chars; 96 leaves margin, since under-reserving here is the failure
+#: mode this whole measurement exists to prevent.
+_TOOL_ENVELOPE_CHARS = 96
+
+
+@lru_cache(maxsize=32)
+def _schema_chars_for(disabled: frozenset[str], with_conversation: bool) -> int:
+    """Measure the advertised tool list for one *shape* of scope.
+
+    The tool set depends on exactly two things — which tools are disabled, and
+    whether the scope has a conversation (``propose_annotation`` is only
+    registered when it does) — so the measurement is cached on that pair
+    rather than recomputed per turn. Nothing case-specific enters the key,
+    because nothing case-specific changes the schemas.
+    """
+    probe = AgentScope(
+        case_id="_measure",
+        timeline_id="_measure",
+        user=None,  # type: ignore[arg-type]
+        source_ids=[],
+        field_mappings=None,
+        source_offsets=None,
+        conversation_id="_measure" if with_conversation else None,
+        disabled_tools=disabled,
+    )
+    return advertised_schema_chars(build_tool_server(probe))
+
+
+def schema_chars_for_scope(scope: AgentScope) -> int:
+    """Characters the tool list costs for *scope*, for ``window.budget_for``.
+
+    The number the sliding window was missing: on 2026-07-23 an unmeasured
+    tool list (30 tools, ~12.9k tokens) was the difference between a budget
+    that fit and a provider 400.
+    """
+    return _schema_chars_for(scope.disabled_tools, scope.conversation_id is not None)
 
 
 def _apply_schema_slimming(server: FastMCP) -> None:
