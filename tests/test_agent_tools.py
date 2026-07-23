@@ -861,8 +861,8 @@ class _FakeChartService(_FakeVizService):
         "status",
         "user",
         "country",
-        # Extra numeric-ish tokens so the correlation cap (8 fields) can be
-        # exercised with a vocabulary the field check accepts.
+        # Extra numeric-ish tokens so the >8-field correlation rejection can
+        # be exercised with a vocabulary the field check accepts.
         "duration",
         "retries",
         "size",
@@ -1965,21 +1965,28 @@ async def test_grouped_chart_warns_about_omission_and_identifier_like_groups(sto
     assert any("identifier" in w for w in result["warnings"])
 
 
-async def test_corr_field_list_is_capped(store, monkeypatch):
+async def test_corr_field_list_refuses_rather_than_truncates(store, monkeypatch):
+    """propose_chart rejects >8 correlation fields, matching field_correlation.
+
+    Both agent entry points must apply the identical rule — silently charting
+    the first eight answers a question the model never asked.
+    """
     fake = _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    result = await _call(
-        server,
-        "propose_chart",
-        _chart(
-            {
-                "chart_type": "corr",
-                "fields": [f"attr:{f}" for f in _FakeChartService.FIELDS],
-            }
-        ),
-    )
-    assert len(_called(fake, "field_correlation")[0]) == 8
-    assert any("truncated" in w for w in result["warnings"])
+    with pytest.raises(ToolError) as too_many:
+        await _call(
+            server,
+            "propose_chart",
+            _chart(
+                {
+                    "chart_type": "corr",
+                    "fields": [f"attr:{f}" for f in _FakeChartService.FIELDS],
+                }
+            ),
+        )
+    assert "between 2 and 8 fields" in str(too_many.value)
+    # Rejected before any scan — the service is never called with a subset.
+    assert not any(name == "field_correlation" for name, _, _ in fake.calls)
 
 
 # ── retired facet spec ──────────────────────────────────────────────────────

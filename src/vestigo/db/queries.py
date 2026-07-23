@@ -2102,7 +2102,9 @@ class EventQueryService:
         numeric-value count; everything else is **omitted, not rolled up** —
         an "Other" box would be a distribution of unrelated things — and the
         omission is reported (``omitted_groups`` / ``omitted_count``) so
-        captions can state it.
+        captions can state it. The empty-string group value is treated as
+        absent (no group label at all, not a category named ""), so its rows
+        are excluded from every group and from ``omitted_count`` alike.
 
         Per-group histogram bins share the **global** ``[min, max]`` so the
         violin silhouettes are directly comparable across groups. The

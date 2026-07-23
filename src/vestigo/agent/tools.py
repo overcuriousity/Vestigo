@@ -1643,6 +1643,16 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 )
             if len(set(spec.fields)) != len(spec.fields):
                 raise ValueError("`fields` must not repeat a field token.")
+            # Reject, don't truncate: silently charting the first eight would
+            # answer a question the model never asked and label it the answer
+            # to the one it did — the same rule (and wording) as the
+            # field_correlation tool and the HTTP endpoint's 422.
+            if len(spec.fields) > VIZ_CORR_MAX_FIELDS:
+                raise ValueError(
+                    f"a correlation matrix needs between 2 and {VIZ_CORR_MAX_FIELDS} fields, "
+                    f"got {len(spec.fields)}. Correlate the most promising ones, or run "
+                    "several matrices."
+                )
         elif spec.fields:
             multi = [c for c in CHART_META if CHART_META[c].multi_field]
             raise ValueError(
@@ -1920,9 +1930,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "matrix_size": len(result["x_values"]) * len(result["y_values"]),
             }
         elif data_kind == "corr":
-            fields = (spec.fields or [])[:VIZ_CORR_MAX_FIELDS]
-            if len(fields) < len(spec.fields or []):
-                warnings.append(f"fields truncated to the first {VIZ_CORR_MAX_FIELDS} tokens.")
+            # `fields` is already validated (2–VIZ_CORR_MAX_FIELDS, distinct)
+            # by the multi_field guard above, so no capping happens here.
+            fields = spec.fields or []
             result = await run_in_threadpool(service.field_correlation, primary_query, fields)
             dropped = [d["field"] for d in result["dropped_fields"]]
             if dropped:

@@ -8,9 +8,14 @@
  * Keyboard: ↓/↑ to highlight, Enter to accept highlight or submit free text,
  * Escape to close dropdown / cancel.
  */
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 import { Input } from "@/components/ui/Input";
 import { cn } from "@/lib/cn";
+
+/** Max dropdown height in px — must match the `max-h-48` (12rem) below. */
+const DROPDOWN_MAX_HEIGHT = 192;
+const DROPDOWN_GAP = 2;
 
 interface Props {
   value: string;
@@ -45,6 +50,10 @@ export function TagInput({
   const [open, setOpen] = useState(false);
   const [focused, setFocused] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  // Fixed viewport coordinates for the portaled dropdown, so it escapes any
+  // scrolling/overflow-clipping ancestor and can flip above/below to fit.
+  const [pos, setPos] = useState<{ left: number; top: number; width: number } | null>(null);
 
   // Filter suggestions by substring match; with openOnFocus, an empty input
   // offers the full list while focused (e.g. browse available field names).
@@ -65,6 +74,34 @@ export function TagInput({
   useEffect(() => {
     setOpen(filtered.length > 0);
   }, [filtered.length]);
+
+  // Anchor the portaled dropdown to the input, flipping above when there is
+  // no room below (honouring `dropUp` only as the initial preference). Runs
+  // after layout and on any scroll/resize while open.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const anchor = containerRef.current?.getBoundingClientRect();
+      if (!anchor) return;
+      const listHeight = Math.min(listRef.current?.scrollHeight ?? 0, DROPDOWN_MAX_HEIGHT);
+      const roomBelow = window.innerHeight - anchor.bottom;
+      const roomAbove = anchor.top;
+      const placeUp = dropUp
+        ? roomAbove >= listHeight || roomAbove > roomBelow
+        : roomBelow < listHeight && roomAbove > roomBelow;
+      const top = placeUp
+        ? anchor.top - DROPDOWN_GAP - listHeight
+        : anchor.bottom + DROPDOWN_GAP;
+      setPos({ left: anchor.left, top, width: anchor.width });
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, dropUp, filtered.length]);
 
   function accept(tag: string) {
     onSubmit(tag);
@@ -113,30 +150,40 @@ export function TagInput({
           if (filtered.length > 0 || (openOnFocus && suggestions.length > 0)) setOpen(true);
         }}
       />
-      {open && (
-        <ul className={cn(
-          "absolute z-50 w-full min-w-[10rem] max-h-48 overflow-y-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] shadow-lg text-xs",
-          dropUp ? "bottom-full mb-0.5" : "top-full mt-0.5",
-        )}>
-          {filtered.map((tag, i) => (
-            <li
-              key={tag}
-              onMouseDown={(e) => {
-                e.preventDefault(); // keep focus on Input
-                accept(tag);
-              }}
-              className={cn(
-                "cursor-pointer px-2.5 py-1.5 truncate transition-colors",
-                i === highlightIdx
-                  ? "bg-[var(--color-accent)] text-white"
-                  : "text-[var(--color-fg-primary)] hover:bg-[var(--color-bg-hover)]",
-              )}
-            >
-              {tag}
-            </li>
-          ))}
-        </ul>
-      )}
+      {open &&
+        createPortal(
+          <ul
+            ref={listRef}
+            style={{
+              left: pos?.left ?? 0,
+              top: pos?.top ?? 0,
+              width: pos?.width ?? undefined,
+            }}
+            className={cn(
+              "fixed z-50 min-w-[10rem] max-h-48 overflow-y-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] shadow-lg text-xs",
+              pos ? "" : "invisible",
+            )}
+          >
+            {filtered.map((tag, i) => (
+              <li
+                key={tag}
+                onMouseDown={(e) => {
+                  e.preventDefault(); // keep focus on Input
+                  accept(tag);
+                }}
+                className={cn(
+                  "cursor-pointer px-2.5 py-1.5 truncate transition-colors",
+                  i === highlightIdx
+                    ? "bg-[var(--color-accent)] text-white"
+                    : "text-[var(--color-fg-primary)] hover:bg-[var(--color-bg-hover)]",
+                )}
+              >
+                {tag}
+              </li>
+            ))}
+          </ul>,
+          document.body,
+        )}
     </div>
   );
 }

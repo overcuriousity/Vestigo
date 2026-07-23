@@ -62,6 +62,16 @@ describe("allocateWaffleCells", () => {
     expect(allocated.reduce((s, r) => s + r.count, 0)).toBe(total);
   });
 
+  it("gives exactly one cell each at the capacity boundary", () => {
+    // WAFFLE_CELLS categories reserve every cell up front, leaving none to
+    // distribute — each must end with exactly one, still summing to 100.
+    const counts = Array.from({ length: WAFFLE_CELLS }, (_, i) => WAFFLE_CELLS - i);
+    const allocated = allocateWaffleCells(rows(...counts));
+    expect(allocated).toHaveLength(WAFFLE_CELLS);
+    expect(allocated.every((r) => r.cells === 1)).toBe(true);
+    expect(allocated.reduce((s, r) => s + r.cells, 0)).toBe(WAFFLE_CELLS);
+  });
+
   it("merges the overflow into an existing Other row rather than adding a second", () => {
     const counts = Array.from({ length: 150 }, () => 10);
     // The largest row IS the Other bucket, so it survives the cut and the
