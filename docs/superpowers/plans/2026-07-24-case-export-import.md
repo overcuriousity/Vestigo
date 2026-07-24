@@ -51,7 +51,7 @@
 
 **Files:**
 - Modify: `pyproject.toml` (`[tool.pytest.ini_options]`)
-- Modify: `tests/test_arrow_insert_clickhouse.py`, `tests/test_clickhouse_store.py`, `tests/test_compare_baseline_cache_clickhouse.py`, `tests/test_field_mappings_clickhouse.py`, `tests/test_novelty_batched_clickhouse.py`, `tests/test_pagination_completeness_clickhouse.py`, `tests/test_search_blob_clickhouse.py`, `tests/test_template_clickhouse.py`, `tests/test_time_fields_clickhouse.py`, `tests/test_viz_stats_clickhouse.py`, `tests/test_viz_timeseries_fused_clickhouse.py`, `tests/test_field_stats.py`
+- Modify: `tests/test_arrow_insert_clickhouse.py`, `tests/test_compare_baseline_cache_clickhouse.py`, `tests/test_field_mappings_clickhouse.py`, `tests/test_novelty_batched_clickhouse.py`, `tests/test_pagination_completeness_clickhouse.py`, `tests/test_search_blob_clickhouse.py`, `tests/test_template_clickhouse.py`, `tests/test_time_fields_clickhouse.py`, `tests/test_viz_stats_clickhouse.py`, `tests/test_viz_timeseries_fused_clickhouse.py`, `tests/test_field_stats.py`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -80,7 +80,7 @@ markers = [
 ]
 ```
 
-- [ ] **Step 2: Apply `pytestmark` to all twelve files**
+- [ ] **Step 2: Apply `pytestmark` to all eleven files**
 
 In each listed file, add immediately after the last import line:
 
@@ -88,12 +88,12 @@ In each listed file, add immediately after the last import line:
 pytestmark = pytest.mark.clickhouse
 ```
 
-(All twelve already `import pytest`. `tests/test_field_stats.py` belongs in this set: it seeds fixture events into a live ClickHouse in its `ch_store` module fixture.)
+(All eleven already `import pytest`. `tests/test_field_stats.py` belongs in this set: it seeds fixture events into a live ClickHouse in its `ch_store` module fixture. `tests/test_clickhouse_store.py` is deliberately NOT marked — it is pure unit tests over SQL construction with no live-ClickHouse skip fixture, so marking it would wrongly deselect fast tests.)
 
 - [ ] **Step 3: Verify selection works**
 
 Run: `uv run pytest --collect-only -q -m clickhouse 2>&1 | grep -c "::"`
-Expected: a number equal to the total test count of the twelve files (only those files collected).
+Expected: a number equal to the total test count of the eleven files (only those files collected).
 
 Run: `uv run pytest --collect-only -q -m "not clickhouse" 2>&1 | grep "clickhouse" | wc -l`
 Expected: `0` (no `test_*_clickhouse` items collected).
@@ -101,12 +101,12 @@ Expected: `0` (no `test_*_clickhouse` items collected).
 - [ ] **Step 4: Run the suite without ClickHouse to confirm nothing broke**
 
 Run: `uv run pytest -m "not clickhouse" -q`
-Expected: PASS (the twelve files skip inside their fixtures exactly as before; marker changes collection only).
+Expected: PASS (the eleven files skip inside their fixtures exactly as before; marker changes collection only).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pyproject.toml tests/test_arrow_insert_clickhouse.py tests/test_clickhouse_store.py tests/test_compare_baseline_cache_clickhouse.py tests/test_field_mappings_clickhouse.py tests/test_novelty_batched_clickhouse.py tests/test_pagination_completeness_clickhouse.py tests/test_search_blob_clickhouse.py tests/test_template_clickhouse.py tests/test_time_fields_clickhouse.py tests/test_viz_stats_clickhouse.py tests/test_viz_timeseries_fused_clickhouse.py tests/test_field_stats.py
+git add pyproject.toml tests/test_arrow_insert_clickhouse.py tests/test_compare_baseline_cache_clickhouse.py tests/test_field_mappings_clickhouse.py tests/test_novelty_batched_clickhouse.py tests/test_pagination_completeness_clickhouse.py tests/test_search_blob_clickhouse.py tests/test_template_clickhouse.py tests/test_time_fields_clickhouse.py tests/test_viz_stats_clickhouse.py tests/test_viz_timeseries_fused_clickhouse.py tests/test_field_stats.py
 git commit -m "test: register clickhouse marker and apply to all CH-dependent test files"
 ```
 

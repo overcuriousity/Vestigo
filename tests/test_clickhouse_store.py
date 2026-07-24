@@ -18,8 +18,6 @@ from vestigo.db.clickhouse import (
 from vestigo.db.postgres import generate_id
 from vestigo.models.event import Event
 
-pytestmark = pytest.mark.clickhouse
-
 
 class _FakeResult:
     def __init__(self, rows):
