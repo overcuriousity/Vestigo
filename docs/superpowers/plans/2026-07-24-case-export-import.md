@@ -422,6 +422,7 @@ git commit -m "feat(transfer): .vestigo archive format reader/writer with member
 **Files:**
 - Create: `src/vestigo/core/retention.py`
 - Modify: `src/vestigo/api/routers/cases.py` (import move only — delete the three helper defs at lines ~137–167, import them instead)
+- Create: `tests/transfer_fakes.py` (shared test doubles: `_fill`, `_add`, `FakeClickHouse`, `_event_rows` — used by both transfer test files)
 - Create: `src/vestigo/transfer/exporter.py`
 - Test: `tests/test_transfer_export.py`
 
@@ -472,31 +473,21 @@ In `src/vestigo/api/routers/cases.py`: delete the old `_retention_dir` / `_reten
 Run: `uv run pytest tests/test_admin_api.py tests/test_agent_api.py -q` plus `uv run pytest -q -k source_upload`
 Expected: PASS (import move breaks nothing).
 
-- [ ] **Step 2: Write the failing exporter tests**
+- [ ] **Step 2: Write the shared test doubles + the failing exporter tests**
 
-`tests/test_transfer_export.py`:
+`tests/transfer_fakes.py` (imported by both transfer test files — single home for the fakes):
 
 ```python
-"""Exporter tests: Postgres snapshot completeness + archive assembly.
+"""Shared test doubles for the transfer (X1) test suite.
 
-Uses the SQLite `store` fixture from conftest and a fake ClickHouse — no live
-services. The generic `_add` helper fills unknown non-nullable columns so the
-test survives model churn.
+`_add` fills unknown non-nullable columns so tests survive model churn;
+`FakeClickHouse` stands in for ClickHouseStore keyed by (case_id, source_id).
 """
 
 from __future__ import annotations
 
 import uuid
-import zipfile
 from datetime import UTC, datetime
-
-import pytest
-from sqlalchemy import select
-
-from vestigo.core.retention import retention_path
-from vestigo.db import postgres as pg
-from vestigo.transfer.archive import FORMAT_VERSION, ArchiveReader
-from vestigo.transfer.exporter import export_case
 
 
 def _fill(col):
@@ -514,7 +505,7 @@ def _fill(col):
         return []
     if t is datetime:
         return datetime.now(UTC)
-    raise AssertionError(f"unhandled column type {col} ")
+    raise AssertionError(f"unhandled column type {col}")
 
 
 async def _add(store, model, **overrides):
@@ -586,6 +577,26 @@ def _event_rows(case_id, source_id, n=2):
         }
         for i in range(n)
     ]
+```
+
+`tests/test_transfer_export.py`:
+
+```python
+"""Exporter tests: Postgres snapshot completeness + archive assembly.
+
+Uses the SQLite `store` fixture from conftest and the shared FakeClickHouse
+from tests/transfer_fakes.py — no live services.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from vestigo.core.retention import retention_path
+from vestigo.db import postgres as pg
+from vestigo.transfer.archive import FORMAT_VERSION, ArchiveReader
+from vestigo.transfer.exporter import export_case
+from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
 
 
 async def _rich_case(store, owner_id):
@@ -1009,7 +1020,7 @@ Expected: PASS (4 tests)
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/vestigo/core/retention.py src/vestigo/api/routers/cases.py src/vestigo/transfer/exporter.py tests/test_transfer_export.py
+git add src/vestigo/core/retention.py src/vestigo/api/routers/cases.py tests/transfer_fakes.py src/vestigo/transfer/exporter.py tests/test_transfer_export.py
 git commit -m "feat(transfer): case exporter — PG snapshot, Arrow event stream, optional blobs"
 ```
 
@@ -1282,18 +1293,15 @@ git commit -m "feat(api): case export endpoints (job-based) with startup temp sw
 ```python
 """Importer tests: remap integrity, secrets exclusion, tamper abort, cleanup.
 
-Round-trips through the real exporter against the SQLite store fixture and a
-fake ClickHouse. `_add` / `FakeClickHouse` / `_event_rows` are copied from
-tests/test_transfer_export.py (kept independent on purpose).
+Round-trips through the real exporter against the SQLite store fixture and
+the shared fakes from tests/transfer_fakes.py.
 """
 
 from __future__ import annotations
 
 import json
-import uuid
 import zipfile
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
@@ -1302,92 +1310,7 @@ from vestigo.db import postgres as pg
 from vestigo.transfer.archive import ArchiveFormatError
 from vestigo.transfer.exporter import export_case
 from vestigo.transfer.importer import import_case
-
-
-def _fill(col):
-    t = col.type.python_type
-    if t is str:
-        return "x"
-    if t is int:
-        return 0
-    if t is bool:
-        return False
-    if t is dict:
-        return {}
-    if t is list:
-        return []
-    if t is datetime:
-        return datetime.now(UTC)
-    raise AssertionError(f"unhandled column type {col}")
-
-
-async def _add(store, model, **overrides):
-    values = {}
-    for col in model.__table__.columns:
-        if col.name in overrides:
-            values[col.name] = overrides.pop(col.name)
-        elif col.primary_key:
-            values[col.name] = f"{model.__tablename__}-{uuid.uuid4().hex[:8]}"
-        elif col.nullable or col.default is not None or col.server_default is not None:
-            continue
-        else:
-            values[col.name] = _fill(col)
-    assert not overrides, f"unknown columns for {model.__tablename__}: {overrides}"
-    async with store.session_factory() as session:
-        obj = model(**values)
-        session.add(obj)
-        await session.commit()
-        await session.refresh(obj)
-        return obj
-
-
-class FakeClickHouse:
-    def __init__(self, rows=None):
-        self.rows = rows or {}
-        self.inserted = {}
-        self.deleted = []
-
-    def iter_source_events(self, case_id, source_id, batch_size):
-        rows = self.rows.get((case_id, source_id), [])
-        for i in range(0, len(rows), batch_size):
-            yield rows[i : i + batch_size]
-
-    def insert_events_arrow(self, batch):
-        for r in batch.to_pylist():
-            self.inserted.setdefault((r["case_id"], r["source_id"]), []).append(r)
-        return batch.num_rows
-
-    def delete_source_events(self, case_id, source_id):
-        self.deleted.append((case_id, source_id))
-
-
-def _event_rows(case_id, source_id, n=2):
-    return [
-        {
-            "event_id": uuid.uuid4(),
-            "case_id": case_id,
-            "source_id": source_id,
-            "source_file": "demo.log",
-            "byte_offset": i * 100,
-            "line_number": i,
-            "content_hash": (f"{i:064d}").encode(),
-            "file_hash": b"ab" * 32,
-            "parser_name": "demo",
-            "parser_version": "1",
-            "ingest_time": "2026-07-24T10:00:00+00:00",
-            "message": f"line {i}",
-            "timestamp": f"2026-07-24T09:00:0{i}+00:00",
-            "timestamp_desc": "parsed",
-            "artifact": "x",
-            "artifact_long": "y",
-            "display_name": "d",
-            "tags": ["t1"],
-            "attributes": {"k": "v"},
-            "embedding_model": "",
-            "embedding_config_hash": "",
-        }
-        for i in range(n)
-    ]
+from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
 
 
 async def _rich_case(store, owner_id):
