@@ -6,11 +6,13 @@ from tests/transfer_fakes.py — no live services.
 
 from __future__ import annotations
 
+import pyarrow as pa
 import pytest
 
 from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
 from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
+from vestigo.db._dt import NULL_TS_SENTINEL
 from vestigo.transfer.archive import FORMAT_VERSION, ArchiveReader
 from vestigo.transfer.exporter import export_case
 
@@ -54,7 +56,7 @@ async def _rich_case(store, owner_id):
     return case, src, tl
 
 
-async def test_export_roundtrip_all_entities(store, tmp_path, monkeypatch):
+async def test_export_roundtrip_all_entities(store, tmp_path):
     owner = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
     case, src, tl = await _rich_case(store, owner.id)
     fake_ch = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id)})
@@ -178,3 +180,33 @@ async def test_export_missing_blob_warns_not_fails(store, tmp_path, monkeypatch)
         assert result.counts["blobs"] == 0
     finally:
         get_settings.cache_clear()
+
+
+async def test_export_event_null_timestamp_and_nul_padded_hash(store, tmp_path):
+    """Rows without a parseable timestamp re-encode as NULL_TS_SENTINEL;
+    FixedString NUL padding is stripped from hash fields (ClickHouse dtypes)."""
+    owner = await _add(store, pg.User, username="erin", is_admin=False, is_active=True)
+    case = await _add(store, pg.Case, name="Edge", owner_id=owner.id)
+    src = await _add(store, pg.Source, case_id=case.id, name="s", file_hash="ab" * 32)
+    row = _event_rows(case.id, src.id, n=1)[0]
+    row["timestamp"] = None
+    row["content_hash"] = b"abc" + b"\x00" * 61
+    fake_ch = FakeClickHouse({(case.id, src.id): [row]})
+
+    result = await export_case(
+        store,
+        lambda: fake_ch,
+        case.id,
+        include_blobs=False,
+        exported_by="erin",
+        dest_dir=tmp_path,
+    )
+
+    reader = ArchiveReader(result.path)
+    with reader.open_member(f"events/{src.id}.arrow") as f:
+        table = pa.ipc.open_stream(f).read_all()
+    reader.close()
+    assert table.num_rows == 1
+    out = table.to_pylist()[0]
+    assert out["timestamp"] == NULL_TS_SENTINEL
+    assert out["content_hash"] == "abc"

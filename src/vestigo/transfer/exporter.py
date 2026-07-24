@@ -252,14 +252,20 @@ async def export_case(
                 dest.unlink(missing_ok=True)
         if include_blobs:
             _progress("blobs")
+            seen: set[str] = set()
             for source in sources:
-                blob = retention_path(source["file_hash"])
+                file_hash = source["file_hash"]
+                if file_hash in seen:
+                    # Content-addressed: two sources can share a blob; emit once.
+                    continue
+                seen.add(file_hash)
+                blob = retention_path(file_hash)
                 if blob.exists():
-                    writer.add_file(f"blobs/{source['file_hash']}", blob)
+                    writer.add_file(f"blobs/{file_hash}", blob)
                     counts["blobs"] += 1
                 else:
                     warnings.append(
-                        f"source blob missing on disk: {source['name']} ({source['file_hash'][:12]}…)"
+                        f"source blob missing on disk: {source['name']} ({file_hash[:12]}…)"
                     )
 
     _progress("manifest")
