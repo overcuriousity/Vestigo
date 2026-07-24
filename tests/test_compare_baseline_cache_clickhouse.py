@@ -23,6 +23,8 @@ from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.queries import EventQuery, EventQueryService
 from vestigo.models.event import Event
 
+pytestmark = pytest.mark.clickhouse
+
 CASE_ID = f"tc-cmpcache-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-cmpcache"
 TOKEN = (CASE_ID, ((SOURCE_ID, "2026-01-01T00:00:00+00:00", 40),))

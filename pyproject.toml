@@ -169,3 +169,6 @@ indent-style = "space"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "--cov=vestigo --cov-report=term-missing"
+markers = [
+    "clickhouse: requires a reachable ClickHouse (dev compose stack); skipped otherwise",
+]

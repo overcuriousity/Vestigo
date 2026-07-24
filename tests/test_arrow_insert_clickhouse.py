@@ -17,6 +17,8 @@ import pytest
 from vestigo.db.clickhouse import ClickHouseStore, _events_to_record_batch
 from vestigo.models.event import Event
 
+pytestmark = pytest.mark.clickhouse
+
 CASE_ID = f"tc-arrow-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-arrow"
 
