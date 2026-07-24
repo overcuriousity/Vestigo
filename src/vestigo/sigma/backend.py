@@ -190,7 +190,10 @@ class VestigoClickHouseBackend(TextQueryBackend):
     ) -> str:
         field = self.escape_and_quote_field(cond.field)
         flags = "".join(char for flag, char in _RE_FLAG_CHARS.items() if flag in cond.value.flags)
-        regex = (f"(?{flags})" if flags else "") + cond.value.regexp
+        # pysigma >=1.0 exposes ``regexp`` as a SigmaString; ``.original`` is the raw
+        # regex source (0.11 returned a plain str, which has no ``.original``).
+        raw = getattr(cond.value.regexp, "original", cond.value.regexp)
+        regex = (f"(?{flags})" if flags else "") + raw
         return f"match({field}, {quote_ch_string(regex)})"
 
     def convert_condition_field_eq_val_cidr(
