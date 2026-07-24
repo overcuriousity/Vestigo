@@ -70,6 +70,13 @@ class TestRejection:
         with pytest.raises(ArchiveFormatError, match="format_version"):
             ArchiveReader(path)
 
+    def test_non_dict_manifest_rejected(self, tmp_path):
+        path = tmp_path / "listmanifest.vestigo"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("manifest.json", "[1, 2, 3]")
+        with pytest.raises(ArchiveFormatError, match="manifest"):
+            ArchiveReader(path)
+
     def test_tampered_member_detected(self, tmp_path):
         path = tmp_path / "demo.vestigo"
         _write_sample(path)
@@ -98,7 +105,7 @@ def test_temp_root_and_archive_path(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     import tempfile
 
-    tempfile.tempdir = None  # force re-evaluation of TMPDIR
+    monkeypatch.setattr(tempfile, "tempdir", None)  # force re-evaluation of TMPDIR
     root = temp_root()
     assert root.is_dir()
     p = new_archive_path("job123")

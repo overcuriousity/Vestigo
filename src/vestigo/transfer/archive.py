@@ -97,6 +97,9 @@ class ArchiveReader:
         except json.JSONDecodeError as exc:
             self._zip.close()
             raise ArchiveFormatError(f"manifest is not valid JSON: {exc}") from exc
+        if not isinstance(self.manifest, dict):
+            self._zip.close()
+            raise ArchiveFormatError("manifest is not a JSON object")
         version = self.manifest.get("format_version")
         if not isinstance(version, int) or version < 1:
             self._zip.close()
