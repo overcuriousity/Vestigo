@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +29,8 @@ from vestigo.core.config import get_settings
 from vestigo.core.eta import ThroughputMeter
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.core.jobs import JobStore, get_job_store
+from vestigo.core.retention import retain_file as _retain_file
+from vestigo.core.retention import retention_path as _retention_path
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import validate_field_mappings
 from vestigo.db.field_stats import (
@@ -132,39 +132,6 @@ class SourceUploadResponse(BaseModel):
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
-
-
-def _retention_dir() -> Path:
-    """Return the directory used for content-addressed source file retention."""
-    path = Path(get_settings().source_retention_path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _retention_path(file_hash: str) -> Path:
-    """Return the content-addressed path for a retained source file."""
-    # Shard by the first two hash characters to avoid huge flat directories.
-    return _retention_dir() / file_hash[:2] / file_hash
-
-
-def _retain_file(tmp_path: Path, retention_path: Path) -> None:
-    """Retain an uploaded file at its content-addressed path without a data copy.
-
-    The retention path is content-addressed by hash, so an existing file there
-    is guaranteed byte-identical — short-circuit. Otherwise hardlink
-    (metadata-only; the ingestion job keeps reading and finally unlinking
-    ``tmp_path``, which leaves the retained link untouched), falling back to a
-    full copy when the OS temp dir and VESTIGO_SOURCE_RETENTION_PATH live on
-    different filesystems.
-    """
-    if retention_path.exists():
-        return
-    retention_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(tmp_path, retention_path)
-    except OSError:
-        # EXDEV (cross-device) or a filesystem without hardlink support.
-        shutil.copy2(tmp_path, retention_path)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

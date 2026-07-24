@@ -1,0 +1,180 @@
+"""Exporter tests: Postgres snapshot completeness + archive assembly.
+
+Uses the SQLite `store` fixture from conftest and the shared FakeClickHouse
+from tests/transfer_fakes.py — no live services.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
+from vestigo.core.retention import retention_path
+from vestigo.db import postgres as pg
+from vestigo.transfer.archive import FORMAT_VERSION, ArchiveReader
+from vestigo.transfer.exporter import export_case
+
+
+@pytest.fixture(autouse=True)
+async def _schema(store):
+    """The conftest store is a bare SQLite file; bring it to Alembic head."""
+    await store.init_schema()
+
+
+async def _rich_case(store, owner_id):
+    """A case with one of every exported entity."""
+    case = await _add(store, pg.Case, name="Export Me", owner_id=owner_id)
+    src = await _add(store, pg.Source, case_id=case.id, name="src", file_hash="ab" * 32)
+    tl = await _add(store, pg.Timeline, case_id=case.id, name="tl", is_default=True)
+    await _add(store, pg.TimelineSource, timeline_id=tl.id, source_id=src.id)
+    await _add(store, pg.TimelineEnricher, timeline_id=tl.id)
+    await _add(store, pg.View, case_id=case.id, name="v", query="", view_filter={})
+    await _add(store, pg.SavedChart, case_id=case.id, timeline_id=tl.id)
+    await _add(store, pg.BaselineDefinition, case_id=case.id, timeline_id=tl.id)
+    await _add(store, pg.DetectorRun, case_id=case.id, timeline_id=tl.id)
+    await _add(store, pg.FindingDisposition, case_id=case.id, timeline_id=tl.id)
+    await _add(
+        store,
+        pg.Annotation,
+        case_id=case.id,
+        source_id=src.id,
+        event_id="evt-1",
+        annotation_type="comment",
+        content="note",
+    )
+    await _add(store, pg.SigmaRule, case_id=case.id)
+    await _add(store, pg.SigmaRun, case_id=case.id, timeline_id=tl.id)
+    await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=src.id)
+    conv = await _add(
+        store, pg.AgentConversation, case_id=case.id, timeline_id=tl.id, user_id=owner_id
+    )
+    await _add(store, pg.AgentMessage, conversation_id=conv.id)
+    await _add(store, pg.AgentProposal, case_id=case.id, conversation_id=conv.id)
+    await _add(store, pg.AuditLog, case_id=case.id)
+    return case, src, tl
+
+
+async def test_export_roundtrip_all_entities(store, tmp_path, monkeypatch):
+    owner = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+    case, src, tl = await _rich_case(store, owner.id)
+    fake_ch = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id)})
+
+    result = await export_case(
+        store,
+        lambda: fake_ch,
+        case.id,
+        include_blobs=False,
+        exported_by="alice",
+        dest_dir=tmp_path,
+    )
+
+    assert result.path.exists() and result.bytes > 0
+    reader = ArchiveReader(result.path)
+    m = reader.manifest
+    assert m["format_version"] == FORMAT_VERSION
+    assert m["case"] == {"id": case.id, "name": "Export Me"}
+    assert m["exported_by"] == "alice"
+    assert m["include_blobs"] is False
+    reader.verify_members()
+    for stem in (
+        "sources",
+        "timelines",
+        "timeline_sources",
+        "timeline_enrichers",
+        "views",
+        "saved_charts",
+        "baseline_definitions",
+        "detector_runs",
+        "finding_dispositions",
+        "annotations",
+        "sigma_rules",
+        "sigma_runs",
+        "source_enrichments",
+        "agent_conversations",
+        "agent_messages",
+        "agent_proposals",
+        "audit_log",
+    ):
+        rows = reader.read_ndjson(f"postgres/{stem}.ndjson")
+        assert len(rows) == 1, f"{stem}: expected 1 row, got {len(rows)}"
+    assert reader.read_json("postgres/case.json")["name"] == "Export Me"
+    assert reader.read_json("postgres/user_refs.json")["users"] == {owner.id: "alice"}
+    # Events: one Arrow member with both rows, hashes as plain strings.
+    names = reader.member_names()
+    assert f"events/{src.id}.arrow" in names
+    assert result.counts["events"] == 2
+    reader.close()
+
+
+async def test_export_without_sources_never_touches_clickhouse(store, tmp_path):
+    owner = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+    case = await _add(store, pg.Case, name="Empty", owner_id=owner.id)
+
+    def _forbidden():
+        raise AssertionError("ClickHouse factory must not be called")
+
+    result = await export_case(
+        store,
+        _forbidden,
+        case.id,
+        include_blobs=True,
+        exported_by="bob",
+        dest_dir=tmp_path,
+    )
+    assert result.counts["sources"] == 0
+    assert result.counts["events"] == 0
+
+
+async def test_export_blobs(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+    from vestigo.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        owner = await _add(store, pg.User, username="carol", is_admin=False, is_active=True)
+        file_hash = "cd" * 32
+        case = await _add(store, pg.Case, name="Blobs", owner_id=owner.id)
+        src = await _add(store, pg.Source, case_id=case.id, name="s", file_hash=file_hash)
+        blob = retention_path(file_hash)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"original file bytes")
+        fake_ch = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id, n=1)})
+
+        result = await export_case(
+            store,
+            lambda: fake_ch,
+            case.id,
+            include_blobs=True,
+            exported_by="carol",
+            dest_dir=tmp_path / "out",
+        )
+        reader = ArchiveReader(result.path)
+        assert f"blobs/{file_hash}" in reader.member_names()
+        reader.verify_members()
+        reader.close()
+        assert result.counts["blobs"] == 1
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_export_missing_blob_warns_not_fails(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+    from vestigo.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        owner = await _add(store, pg.User, username="dave", is_admin=False, is_active=True)
+        case = await _add(store, pg.Case, name="NoBlob", owner_id=owner.id)
+        await _add(store, pg.Source, case_id=case.id, name="s", file_hash="ef" * 32)
+        result = await export_case(
+            store,
+            lambda: FakeClickHouse(),
+            case.id,
+            include_blobs=True,
+            exported_by="dave",
+            dest_dir=tmp_path / "out",
+        )
+        assert len(result.warnings) == 1
+        assert result.counts["blobs"] == 0
+    finally:
+        get_settings.cache_clear()
