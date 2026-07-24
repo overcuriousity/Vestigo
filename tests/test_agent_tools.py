@@ -2017,3 +2017,45 @@ async def test_stale_facet_key_is_ignored_and_absent_from_the_resolved_echo(stor
     assert result["ok"] is True
     assert "facet" not in result["resolved"]
     assert "facet" not in result["summary"]
+
+
+# ---------------------------------------------------------------------------
+# No-op filter rejection (2026-07-23 context overflow)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"filters": {"src_ip": []}},
+        {"exclusions": {"status_code": []}},
+        {"artifacts": []},
+        {"tags_include": []},
+        {"event_ids": []},
+    ],
+)
+def test_empty_selections_are_rejected(payload):
+    """An empty value list is an absent filter, so the tool would answer with
+    the whole unfiltered timeline — a full-size result for a question the model
+    did not mean to ask. Three such calls in one turn (`{"src_ip": []}`,
+    `{"user_agent": []}`, `{"remote_user": []}`) returned byte-identical 34 KB
+    payloads and consumed two thirds of a 65k context window.
+    """
+    from pydantic import ValidationError
+
+    from vestigo.agent.tools import FilterSpec
+
+    with pytest.raises(ValidationError) as exc:
+        FilterSpec(**payload)
+    message = str(exc.value)
+    # The error has to name a way forward, not just refuse.
+    assert "Omit" in message
+    assert "field_terms" in message or "unconstrained" in message
+
+
+def test_populated_and_absent_filters_still_validate():
+    """The rejection must not catch either legitimate shape."""
+    from vestigo.agent.tools import FilterSpec
+
+    assert FilterSpec().filters == {}
+    assert FilterSpec(filters={"src_ip": ["203.0.113.1"]}).filters == {"src_ip": ["203.0.113.1"]}

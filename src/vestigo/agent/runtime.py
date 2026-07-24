@@ -22,6 +22,7 @@ that function's docstring for the wire-field verification).
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -50,6 +51,7 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.toolsets import WrapperToolset
 from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
@@ -60,9 +62,19 @@ from vestigo.agent.tools import (
     AgentScope,
     build_tool_server,
 )
-from vestigo.agent.window import WindowStats, make_window_processor
+from vestigo.agent.window import CHARS_PER_TOKEN_DEFAULT, WindowStats, make_window_processor
+
+logger = logging.getLogger(__name__)
 
 LLM_TIMEOUT = 300.0
+
+#: Fraction of the token budget one model request's tool returns may occupy
+#: before the request guard starts reducing them. The sliding window reserves
+#: the rest for history, the system prompt and the model's own answer; a single
+#: turn that fills the whole budget with tool output (three byte-identical
+#: ``search_events`` returns did exactly that on 2026-07-23) leaves no room to
+#: reason. Half is generous — most turns never approach it.
+_TOOL_RETURN_BUDGET_FRACTION = 0.5
 
 _BASE_SYSTEM_PROMPT = """\
 You are a forensic log-investigation assistant embedded in Vestigo, working on
@@ -334,6 +346,86 @@ def _view_context(view_filters: dict[str, Any] | None) -> str:
     )
 
 
+class _RequestGuardToolset(WrapperToolset):
+    """Per-model-request tool defenses, scoped to one ``run_step``.
+
+    Two things one assistant turn can do that the sliding window cannot undo
+    (it only rewrites *older* messages; the newest tool returns are exactly the
+    ones it protects):
+
+    * **Duplicate calls.** Three ``search_events`` calls with byte-identical
+      arguments returned three byte-identical ~34 KB payloads on 2026-07-23 —
+      ~100 KB of pure duplicate in one request. An identical ``(name, args)``
+      already answered this request comes back as a back-reference instead.
+    * **Runaway total.** Once this request's returns pass a byte ceiling
+      derived from the budget, further returns come back reduced with a pointer
+      to ``get_event`` and narrower filters.
+
+    Determinism holds: the cache is keyed on canonical arguments and reset when
+    ``run_step`` advances, so the same call sequence always produces the same
+    results. Both actions are counted on the turn's :class:`WindowStats`, so the
+    persisted window row records that they happened — and the reduced/duplicate
+    return is itself a ``tool_result`` row in the export.
+    """
+
+    def __init__(self, wrapped: Any, *, byte_ceiling: int, stats: WindowStats) -> None:
+        super().__init__(wrapped)
+        self._byte_ceiling = byte_ceiling
+        self._stats = stats
+        self._step: int | None = None
+        self._seen: dict[tuple[str, str], str] = {}
+        self._bytes = 0
+
+    def _reset_for_step(self, step: int) -> None:
+        if step != self._step:
+            self._step = step
+            self._seen = {}
+            self._bytes = 0
+
+    async def call_tool(self, name, tool_args, ctx, tool):  # noqa: ANN001 - match base
+        self._reset_for_step(ctx.run_step)
+        key = (name, json.dumps(tool_args, sort_keys=True, default=str))
+        if (first_id := self._seen.get(key)) is not None:
+            self._stats.duplicate_calls += 1
+            logger.info("Deduped identical %s call within one request", name)
+            return {
+                "duplicate_of": first_id,
+                "note": (
+                    f"An identical {name} call was already made this turn — its result "
+                    "stands. Change the arguments, or read a specific record with get_event, "
+                    "rather than repeating the call."
+                ),
+            }
+        # Only a successful call is cached: a rejected one raises before this
+        # line, so the model's corrected retry re-runs rather than being deduped
+        # against a call that never produced a result.
+        result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
+        self._seen[key] = ctx.tool_call_id or key[1]
+
+        size = len(json.dumps(result, default=str))
+        # Never reduce the first return of a request — a lone oversized payload
+        # is the sliding window's job (truncate), not this guard's; the ceiling
+        # is about the *sum* running away across many calls.
+        if self._byte_ceiling and self._bytes > 0 and self._bytes + size > self._byte_ceiling:
+            self._stats.results_capped += 1
+            logger.info(
+                "Capped %s return: request already at %d bytes, ceiling %d",
+                name,
+                self._bytes,
+                self._byte_ceiling,
+            )
+            return {
+                "reduced": True,
+                "note": (
+                    "This turn's tool output already fills its share of the context window, "
+                    "so this result was withheld. Narrow the filters, aggregate first "
+                    "(field_terms / histogram), or fetch a specific record with get_event."
+                ),
+            }
+        self._bytes += size
+        return result
+
+
 async def stream_turn(
     scope: AgentScope,
     *,
@@ -343,6 +435,7 @@ async def stream_turn(
     model: Model | None = None,
     window_budget: int | None = None,
     window_stats: WindowStats | None = None,
+    chars_per_token: float = CHARS_PER_TOKEN_DEFAULT,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding SSE-ready event dicts.
 
@@ -353,6 +446,9 @@ async def stream_turn(
     ``window_budget`` enables the sliding context window (``agent/window.py``)
     on every model request of the turn; the caller's ``window_stats`` collects
     what it did so the router can persist one row per turn.
+    ``chars_per_token`` is the estimator's divisor — the default, or a ratio a
+    previous overflow measured against the provider's own token count. Fixed
+    for the whole turn, so every request reduces the same way.
     """
     config = await resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
@@ -363,7 +459,19 @@ async def stream_turn(
         model = build_model(config, http_client)
     try:
         server = build_tool_server(scope)
-        toolset = MCPToolset(FastMCPClient(server), id="vestigo")
+        stats = window_stats or WindowStats()
+        toolset: Any = MCPToolset(FastMCPClient(server), id="vestigo")
+        # Per-request tool defenses: collapse identical calls and cap one
+        # request's total return bytes. The ceiling is a share of the token
+        # budget converted back to bytes with the same divisor the estimator
+        # uses, so it scales with the model; with no configured budget there is
+        # nothing to derive it from, so the guard only dedupes.
+        byte_ceiling = (
+            int(window_budget * _TOOL_RETURN_BUDGET_FRACTION * chars_per_token)
+            if window_budget is not None
+            else 0
+        )
+        toolset = _RequestGuardToolset(toolset, byte_ceiling=byte_ceiling, stats=stats)
         # retries: a rejected tool call is the agent's version of the Visualize
         # page's dropdown refusing an impossible chart — the error names the
         # legal alternative and is meant to be acted on. pydantic-ai's default
@@ -378,7 +486,7 @@ async def stream_turn(
         capabilities = []
         if window_budget is not None:
             capabilities.append(
-                ProcessHistory(make_window_processor(window_budget, window_stats or WindowStats()))
+                ProcessHistory(make_window_processor(window_budget, stats, chars_per_token))
             )
         agent = Agent(
             model,

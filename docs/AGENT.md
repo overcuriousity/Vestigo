@@ -447,7 +447,26 @@ summarizer ran on the same possibly-small model and was nondeterministic).
   Never elided: the first user request (case/timeline context), the most
   recent request's tool returns (pass 3 may still truncate them), the last
   user turn, and all assistant prose. The budget is `context_window × 0.8 −
-  est(system prompt)`; estimates are chars/4.
+  est(system prompt) − est(tool schemas)` (`budget_for`). **All three things
+  that ship in a request are reserved** — history, the system prompt, *and*
+  the advertised tool schemas. Omitting the tool schemas is what let a 76k-token
+  request through a 49k budget on 2026-07-23: 14 of the 28 tools each carry
+  their own copy of the `FilterSpec` definition (~13k tokens total), invisible
+  to a window processor that only sees `messages`. `schema_chars_for_scope`
+  measures the actual advertised schemas for the conversation's tool set (it
+  varies with `disabled_tools`); the copies cannot be hoisted into one shared
+  `$defs` (the OpenAI function-calling wire gives every tool an independent
+  `parameters` schema — see `agent/schema_slim.py`), so the budget counts the
+  duplication honestly instead.
+- **Calibrated estimate, not a fixed divisor.** The default is
+  `CHARS_PER_TOKEN_DEFAULT = 3.0` — `chars/4` was measured against prose, but
+  real tool payloads (escaped JSON, base64 params, dotted-quad IPs, UUIDs)
+  measured **2.35** on the 2026-07-23 overflow, a 1.7× error `MARGIN` cannot
+  absorb. When a provider overflow body names the request's token count,
+  `calibrate_chars_per_token` derives the true ratio (`request_chars /
+  reported_tokens`, clamped to 1.5–5.0) and it is persisted under
+  `measured_chars_per_token`; the next turn reads it via
+  `get_last_chars_per_token`. Airgapped-safe — no tokenizer, pure Python.
 - **Transparent to the model.** The stubs sit in the replayed history and the
   system prompt explains them, so the model re-runs narrower or fetches via
   `get_event` instead of reasoning over a silent gap.
@@ -456,21 +475,47 @@ summarizer ran on the same possibly-small model and was nondeterministic).
   rewrites the outgoing request, never the record.
 - **Reactive backstop.** With `context_window` unset, a provider 400/413
   matching `_is_context_overflow` (deliberately narrow phrasings) enables the
-  window and re-runs the turn **once**. The budget comes from the error
-  body's window hint when the provider names one, else from the estimated
-  pre-turn size (×0.8); an already-active window tightens (×0.6) instead. A
-  second overflow surfaces `error{code="context_overflow"}`. A learned
-  budget persists per conversation (`get_last_window_budget`) so the next
-  turn doesn't repeat the failed round trip; configured `context_window`
-  always wins.
+  window and re-runs the turn **once**. The provider's ground truth wins:
+  when the error body names a window (`_overflow_window_hint`), the budget is
+  recomputed from it with the reserved shares and the calibrated ratio —
+  **whether or not** a budget already exists. Only with no hint does an
+  already-active window fall back to tightening (×0.6); blindly shrinking a
+  configured budget overshoots into turn-dropping, which made the agent re-run
+  its whole orientation sweep three times over in the 2026-07-23 export. A
+  second overflow surfaces `error{code="context_overflow"}`. Learned budget and
+  ratio persist per conversation (`get_last_window_budget`,
+  `get_last_chars_per_token`) so the next turn doesn't repeat the failed round
+  trip; configured `context_window` always wins.
+- **Per-request tool guard** (`agent/runtime.py` `_RequestGuardToolset`).
+  Wraps the MCP toolset and, scoped to one model request (`RunContext.run_step`),
+  (a) collapses an identical `(tool, canonical-args)` call to a
+  `{"duplicate_of": …}` back-reference — three byte-identical `search_events`
+  calls returned ~100k chars of pure duplicate in one turn on 2026-07-23, which
+  the window protects because they are the *newest* returns — and (b) caps one
+  request's total tool-return bytes at `budget × 0.5 × chars_per_token`,
+  returning later results reduced with a pointer to `get_event`/narrower
+  filters. Deterministic (keyed on canonical args, reset when `run_step`
+  advances); both actions are counted on the turn's `WindowStats`
+  (`duplicate_calls`, `results_capped`) and land on the same `role="window"`
+  row. This is reduction-for-fit, recorded in the export — distinct from
+  `fidelity.py`'s static per-conversation tier (which must never depend on call
+  order); see that module's docstring for the boundary.
+- **Config guard-rail.** `fidelity_config_warning` flags an explicit
+  `tool_fidelity=full` against a `context_window` below `AUTO_FULL_MIN_WINDOW`
+  (100k) — the exact `full` + 65536 shape that overflowed. Advisory only (the
+  operator keeps the override): logged at turn start and surfaced in the admin
+  agent-settings response `warnings` array.
 - **Forensic trail.** A reduced turn persists one append-only `role="window"`
   message row (reason, attempt, budget, counts, before/after estimates — the
   turn's single largest reduction) plus an `agent.window` audit row, written
   on *every* exit including stop and error. The chat renders them (SSE
   `window` event), because the case file must answer "why is there less here
-  than there" from itself. Historical transcripts may still carry
-  `compaction`/`fidelity` marker rows from the retired mechanisms; the panel
-  renders those read-only.
+  than there" from itself. Every appended message bumps the conversation's
+  `updated_at` (`add_agent_message`), so a conversation whose turns all failed
+  — history is rewritten only on the success path — no longer freezes at the
+  last successful turn and sorts wrong in the list. Historical transcripts may
+  still carry `compaction`/`fidelity` marker rows from the retired mechanisms;
+  the panel renders those read-only.
 - **A retry re-runs the tools, and two of them write.** Re-executed
   `run_anomaly_detector` runs are tagged (`params["agent_retry_attempt"]`)
   so the Analysis page's superseded re-runs are distinguishable from an

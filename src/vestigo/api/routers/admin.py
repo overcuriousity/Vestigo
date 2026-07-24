@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from vestigo.agent.availability import list_models, reset_probe_cache
 from vestigo.agent.config import EFFORT_VALUES, resolve_agent_config
-from vestigo.agent.fidelity import FIDELITY_VALUES
+from vestigo.agent.fidelity import FIDELITY_VALUES, fidelity_config_warning
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
 from vestigo.api.deps import get_store, require_admin
 from vestigo.api.uploads import receive_upload_to_tmp
@@ -585,6 +585,14 @@ async def _agent_settings_response() -> dict[str, Any]:
         f: getattr(config, f) for f in _AGENT_SETTINGS_FIELDS if f != "api_key"
     }
     effective["api_key_set"] = bool(config.api_key)
+    # Advisory guard-rails on the resolved config — no behaviour change, the
+    # operator keeps every override; they just find out before an investigation
+    # dies. Currently: full fidelity against an underpowered window.
+    warnings = [
+        w
+        for w in (fidelity_config_warning(config.tool_fidelity, config.context_window),)
+        if w is not None
+    ]
     env_vars = {
         field_name: f"VESTIGO_AGENT_{field_name.upper()}"
         for field_name, source in config.sources.items()
@@ -594,6 +602,7 @@ async def _agent_settings_response() -> dict[str, Any]:
         "effective": effective,
         "sources": dict(config.sources),
         "env_vars": env_vars,
+        "warnings": warnings,
         "secret_mode": get_settings().agent_secret_mode,
         # Full tool catalog so the admin UI renders toggles without
         # hardcoding tool names.

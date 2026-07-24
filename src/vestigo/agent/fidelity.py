@@ -24,7 +24,8 @@ event (a megabyte of JSON in one attribute), which is an input-shape risk
 unrelated to the model's window, and have never been implicated in an overflow.
 
 **Determinism is the design constraint.** The tier is a function of static
-configuration alone — never of what already ran in this turn. A running per-turn budget would be more adaptive and would make identical
+configuration alone — never of what already ran in this turn. A running
+per-turn budget would be more adaptive and would make identical
 calls return different data depending on call order, with nothing in the
 exported conversation to explain the difference. Forensic reproducibility
 (``CLAUDE.md``) means replaying a conversation's tool calls under the same
@@ -33,6 +34,17 @@ configuration must produce byte-identical results, so this module has no state.
 The tier is static per conversation: overflow handling is the sliding
 window's job (``agent/window.py``), which elides old results in place instead
 of re-running the turn at a lower tier (the retired "overflow ladder").
+
+**Boundary with the request guard** (``agent/runtime.py``): that guard *does*
+make one request's later tool returns order-dependent — it dedupes identical
+calls and caps the running byte total. That is deliberately not this module's
+concern and does not violate the rule above. This module chooses a *tier* (the
+shape one call returns), which must never depend on call order. The guard
+reduces for *fit* within a single request and records every reduction on the
+window row, exactly as elision and truncation do — a reduction the export
+explains, not a silent tier change. The two never touch: a call's tier is
+picked here from static config; the guard only decides whether that already-
+shaped result is emitted whole, deduped, or capped.
 
 See ``docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md``
 and ``docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md``.
@@ -102,6 +114,30 @@ AUTO_FULL_MIN_WINDOW = 100_000
 #: fields fit, and the model reaches for ``get_event`` on the few findings it
 #: actually pursues.
 AUTO_MESSAGE_MIN_WINDOW = 32_000
+
+
+def fidelity_config_warning(setting: str | None, context_window: int | None) -> str | None:
+    """A one-line caution when the fidelity/window pair invites an overflow.
+
+    An explicit ``tool_fidelity="full"`` keeps the richest inline tool payloads
+    regardless of window size — the override an operator sets to force full
+    results on a small local model. Against a window below
+    :data:`AUTO_FULL_MIN_WINDOW` that is exactly the shape that died on the
+    2026-07-23 overflow (``full`` + 65536): a single detector sweep's payload
+    can fill the window before history and an answer. ``auto`` would have
+    stepped down instead, so it is not flagged.
+
+    Returns the message for surfacing (admin settings, logs), or ``None`` when
+    the pair is fine. Advisory only — no tier or turn changes on this.
+    """
+    if setting == Fidelity.FULL.value and context_window and context_window < AUTO_FULL_MIN_WINDOW:
+        return (
+            f"tool_fidelity is 'full' but context_window is {context_window} tokens "
+            f"(< {AUTO_FULL_MIN_WINDOW}); a single tool sweep can fill the window before "
+            "history and an answer fit. Use 'auto' to step results down automatically, or "
+            "raise context_window."
+        )
+    return None
 
 
 def resolve_fidelity(setting: str | None, context_window: int | None) -> Fidelity:

@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Literal
 
 from fastapi.concurrency import run_in_threadpool
@@ -268,6 +270,47 @@ class FilterSpec(BaseModel):
         default=False,
         description="Hide events belonging to analyst-marked routine motifs (kind='routine' dispositions).",
     )
+
+    @model_validator(mode="after")
+    def _reject_empty_selections(self) -> FilterSpec:
+        """Refuse a filter key whose value selects nothing.
+
+        ``{"src_ip": []}`` reads like "group by src_ip" and does nothing: an
+        empty value list is an absent filter, so the tool answers with the
+        whole unfiltered timeline. A small model that believes otherwise keeps
+        asking, and each answer is a full-size result — on 2026-07-23 three
+        such calls in one assistant turn returned byte-identical 34 KB payloads
+        and consumed two thirds of the model's context.
+
+        Rejected rather than ignored, and the message names the tool that
+        answers the question actually being asked. This is the same contract as
+        the chart-legality errors: an error the model is meant to act on, with
+        ``retries=3`` (``agent/runtime.py``) giving it room to.
+        """
+        empty_maps = [
+            (name, key)
+            for name, mapping in (("filters", self.filters), ("exclusions", self.exclusions))
+            for key, values in mapping.items()
+            if not values
+        ]
+        if empty_maps:
+            where = ", ".join(f'{name}["{key}"]' for name, key in empty_maps)
+            raise ValueError(
+                f"{where} is an empty list, which filters nothing. Omit the key to "
+                "leave the field unfiltered, list the values you want to match, or "
+                "call field_terms to see a field's value distribution."
+            )
+        empty_lists = [
+            name
+            for name in ("artifacts", "tags_include", "tags_exclude", "annotated", "event_ids")
+            if getattr(self, name) == []
+        ]
+        if empty_lists:
+            raise ValueError(
+                f"{', '.join(empty_lists)} is an empty list, which selects nothing. "
+                "Omit the field entirely to leave it unconstrained."
+            )
+        return self
 
 
 class ChartCompareSpec(BaseModel):
@@ -2322,6 +2365,71 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     _apply_schema_slimming(server)
 
     return server
+
+
+def advertised_schema_chars(server: FastMCP) -> int:
+    """Serialized size of everything the tool list costs, in characters.
+
+    The tools array ships with *every* model request but rides outside the
+    message history, so the sliding window's processor cannot see it — which is
+    why ``budget_for`` has to be told. Measured here, from the schemas actually
+    advertised for this scope, because the size is scope-dependent:
+    ``disabled_tools`` removes tools, and a conversation-less scope never
+    registers ``propose_annotation``.
+
+    Counts name, description and parameters — the three fields a provider puts
+    on the wire per tool — plus a small per-tool allowance for the JSON
+    envelope (``{"type": "function", "function": {...}}`` and its separators).
+    An estimate that ran low here would reintroduce the very gap it exists to
+    close, so it rounds up rather than down.
+    """
+    total = 0
+    for tool in server._tool_manager.list_tools():
+        total += len(tool.name)
+        total += len(tool.description or "")
+        total += len(json.dumps(tool.parameters, default=str))
+        total += _TOOL_ENVELOPE_CHARS
+    return total
+
+
+#: Per-tool JSON envelope the provider wraps each schema in, plus separators.
+#: `{"type":"function","function":{"name":"","description":"","parameters":}}`
+#: is ~70 chars; 96 leaves margin, since under-reserving here is the failure
+#: mode this whole measurement exists to prevent.
+_TOOL_ENVELOPE_CHARS = 96
+
+
+@lru_cache(maxsize=32)
+def _schema_chars_for(disabled: frozenset[str], with_conversation: bool) -> int:
+    """Measure the advertised tool list for one *shape* of scope.
+
+    The tool set depends on exactly two things — which tools are disabled, and
+    whether the scope has a conversation (``propose_annotation`` is only
+    registered when it does) — so the measurement is cached on that pair
+    rather than recomputed per turn. Nothing case-specific enters the key,
+    because nothing case-specific changes the schemas.
+    """
+    probe = AgentScope(
+        case_id="_measure",
+        timeline_id="_measure",
+        user=None,  # type: ignore[arg-type]
+        source_ids=[],
+        field_mappings=None,
+        source_offsets=None,
+        conversation_id="_measure" if with_conversation else None,
+        disabled_tools=disabled,
+    )
+    return advertised_schema_chars(build_tool_server(probe))
+
+
+def schema_chars_for_scope(scope: AgentScope) -> int:
+    """Characters the tool list costs for *scope*, for ``window.budget_for``.
+
+    The number the sliding window was missing: on 2026-07-23 an unmeasured
+    tool list (30 tools, ~12.9k tokens) was the difference between a budget
+    that fit and a provider 400.
+    """
+    return _schema_chars_for(scope.disabled_tools, scope.conversation_id is not None)
 
 
 def _apply_schema_slimming(server: FastMCP) -> None:

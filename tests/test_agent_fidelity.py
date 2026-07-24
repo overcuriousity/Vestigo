@@ -20,6 +20,7 @@ from vestigo.agent.fidelity import (
     FIDELITY_TIERED_TOOLS,
     FIDELITY_VALUES,
     Fidelity,
+    fidelity_config_warning,
     resolve_fidelity,
 )
 from vestigo.agent.tools import (
@@ -114,6 +115,32 @@ def test_unknown_setting_degrades_to_the_default_rather_than_raising():
 def test_every_accepted_setting_resolves():
     for value in FIDELITY_VALUES:
         assert isinstance(resolve_fidelity(value, 128_000), Fidelity)
+
+
+def test_full_fidelity_under_a_small_window_warns():
+    """The exact config that overflowed on 2026-07-23: full + 65536."""
+    warning = fidelity_config_warning("full", 65_536)
+    assert warning is not None
+    assert "65536" in warning
+    assert str(AUTO_FULL_MIN_WINDOW) in warning
+
+
+def test_full_fidelity_with_a_large_window_is_silent():
+    assert fidelity_config_warning("full", AUTO_FULL_MIN_WINDOW) is None
+    assert fidelity_config_warning("full", 200_000) is None
+
+
+def test_full_fidelity_with_no_window_is_silent():
+    # Nothing to compare against — an unset window is the "no constraint
+    # declared" default, not an underpowered one.
+    assert fidelity_config_warning("full", None) is None
+
+
+@pytest.mark.parametrize("setting", ["auto", "message", "minimal", None])
+def test_non_full_settings_never_warn(setting):
+    # auto steps itself down; the reduced tiers already fit — none of these is
+    # the shape the guard-rail is about.
+    assert fidelity_config_warning(setting, 8_000) is None
 
 
 def test_tiered_tools_are_real_tools():

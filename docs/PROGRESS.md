@@ -1,9 +1,65 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-23 (session 91 — converter time-window filtering + forensic footer metadata).
+Last updated: 2026-07-24 (session 92 — agent context-window budget fix, 1.6.1).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 92 — 2026-07-24: agent context-window overflow fixed (1.6.1)
+
+**Why.** An analyst investigation died with no error surfaced in the UI. The LiteLLM body:
+`request (75967 tokens) exceeds the available context size (65536 tokens)`. The sliding
+window (`agent/window.py`) is supposed to make this impossible — it runs before *every*
+model request — yet it let a 76k-token request through a 49k budget without eliding
+anything. Not the mid-conversation model switch (that raised the budget); the window failed
+at a fixed budget. Four root causes, all shipped fixed.
+
+**1 — the budget never counted the tool schemas.** `budget_for` reserved history + system
+prompt but not the advertised tools, which ride *outside* the `messages` the window
+processor sees. 14 of 28 tools each carry their own copy of the `FilterSpec` definition
+(~13k tokens). `budget_for` now takes `tool_schema_chars` (measured per-scope by
+`schema_chars_for_scope`, since `disabled_tools` varies) and reserves it. Verified the
+copies cannot be hoisted into one shared `$defs` — the OpenAI function-calling wire gives
+each tool an independent `parameters` schema; finding recorded in `agent/schema_slim.py`.
+
+**2 — `chars/4` was off 1.7×.** Prose tokenizes near 4 chars/token; real tool payloads
+(escaped JSON, base64 params, dotted-quad IPs, UUIDs) measured **2.35** on this overflow.
+Default is now `CHARS_PER_TOKEN_DEFAULT = 3.0`, and `calibrate_chars_per_token` learns the
+true ratio from an overflow body that names the request's token count (clamped 1.5–5.0),
+persisted as `measured_chars_per_token` and reused next turn via `get_last_chars_per_token`.
+Airgapped-safe — no tokenizer.
+
+**3 — one turn spent the whole window on duplicates.** The failing turn issued three
+`search_events` calls with empty-array (no-op) filters — byte-identical ~34k payloads,
+~100k chars of pure duplicate, and they were the *newest* returns the window protects.
+Fixed two ways: a `FilterSpec` validator now rejects empty-list filter values with an
+actionable message, and a new `_RequestGuardToolset` (`agent/runtime.py`) wraps the toolset
+and, per model request (`RunContext.run_step`), dedupes identical `(tool, canonical-args)`
+calls to a `{"duplicate_of": …}` back-reference and caps one request's total return bytes at
+`budget × 0.5 × chars_per_token`. Both counted on `WindowStats`
+(`duplicate_calls`/`results_capped`) and recorded on the `role="window"` row.
+
+**4 — the overflow retry destroyed the investigation.** It blindly multiplied the budget by
+0.6, overshooting into turn-dropping, so the agent re-ran its whole orientation sweep three
+times over (203 tool calls, ~half repeats). The retry now prefers the provider's reported
+window (`_overflow_window_hint`) whether or not a budget exists, recomputing `budget_for`
+with the reserved shares and calibrated ratio; ×0.6 is only the no-hint fallback.
+
+**Also.** `add_agent_message` bumps the parent conversation's `updated_at` (a failed-only
+conversation no longer freezes and sorts wrong); usage tokens already thread on the success
+path. Config guard-rail `fidelity_config_warning` flags explicit `tool_fidelity=full`
+against a window below `AUTO_FULL_MIN_WINDOW` (the exact `full` + 65536 shape), logged at
+turn start and surfaced in the admin agent-settings `warnings` array. The failed turn's
+partial messages already persist as individual rows (the forensic record); the replay blob
+stays at the last consistent boundary by design (a half-turn would desync the next turn).
+
+**Tests.** New `tests/test_agent_runtime.py` (request guard: dedupe, arg-order canonicality,
+per-request reset, byte ceiling, rejected-call-not-cached); guard-rail cases in
+`test_agent_fidelity.py`; `updated_at` bump in `test_agent_api.py`; realistic escaped-JSON
+payload fixture `tests/data/agent_payload_shape.py` (synthesized, not copied — the real
+capture is a live case). How it slipped through: every window test built payloads from ASCII
+filler where `chars/4` is roughly right, and the tool schemas rode outside the tested
+`messages`.
 
 ## Session 91 — 2026-07-23: `--since`/`--until` for native converters + forensic footer metadata
 

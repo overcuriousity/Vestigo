@@ -3279,6 +3279,16 @@ class PostgresStore:
         )
         async with self.session_factory() as session:
             session.add(message)
+            # Bump the parent's updated_at in the same transaction: a message
+            # landing *is* activity on the conversation. Without this, a
+            # conversation whose turns all failed (history is only rewritten on
+            # the success path) freezes at the last successful turn's time and
+            # sorts wrong in the conversation list, even as rows keep arriving.
+            await session.execute(
+                update(AgentConversation)
+                .where(AgentConversation.id == conversation_id)
+                .values(updated_at=datetime.now(UTC))
+            )
             await session.commit()
             await session.refresh(message)
             return message
@@ -3293,19 +3303,16 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
-    async def get_last_window_budget(self, conversation_id: str) -> int | None:
-        """The budget an earlier turn learned from a provider context overflow.
+    async def _last_overflow_details(self, conversation_id: str) -> list[dict]:
+        """Recent ``reason="overflow"`` window-row details, newest first.
 
-        Only ``reason="overflow"`` window rows carry a learned budget — a
-        ``"fit"`` row just reports what an already-known budget did. Returning
-        the newest one lets a deployment that configured no ``context_window``
-        pay the failed round trip once per conversation instead of once per
-        turn (``api/routers/agent.py``); a budget that overflowed again is
-        itself tightened and re-persisted, so the value converges.
+        Only ``"overflow"`` rows carry values *learned* from a provider — a
+        ``"fit"`` row just reports what an already-known budget did.
 
         The reason lives inside a JSON column, and JSON-path predicates are not
         portable across Postgres and the SQLite the tests run on, so a bounded
-        slice of recent window rows is filtered here instead.
+        slice of recent window rows is filtered here instead. One scan serves
+        every learned field, so adding another costs no extra query.
         """
         async with self.session_factory() as session:
             result = await session.execute(
@@ -3317,13 +3324,43 @@ class PostgresStore:
                 .order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc())
                 .limit(20)
             )
-            for (detail,) in result.all():
-                if not isinstance(detail, dict) or detail.get("reason") != "overflow":
-                    continue
-                budget = detail.get("budget")
-                if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
-                    return budget
-            return None
+            return [
+                detail
+                for (detail,) in result.all()
+                if isinstance(detail, dict) and detail.get("reason") == "overflow"
+            ]
+
+    async def get_last_window_budget(self, conversation_id: str) -> int | None:
+        """The budget an earlier turn learned from a provider context overflow.
+
+        Returning the newest one lets a deployment that configured no
+        ``context_window`` pay the failed round trip once per conversation
+        instead of once per turn (``api/routers/agent.py``); a budget that
+        overflowed again is itself tightened and re-persisted, so the value
+        converges.
+        """
+        for detail in await self._last_overflow_details(conversation_id):
+            budget = detail.get("budget")
+            if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+                return budget
+        return None
+
+    async def get_last_chars_per_token(self, conversation_id: str) -> float | None:
+        """The chars-per-token ratio an earlier overflow measured, if any.
+
+        An overflow body that names the request's token count gives an exact
+        reading of what this model charged for bytes we sent — strictly better
+        than the ``chars/N`` constant, and the only tokenizer signal available
+        to an airgapped deployment (``CLAUDE.md``). Persisted by the router
+        under ``measured_chars_per_token``; the plain ``chars_per_token`` key
+        on a row is the divisor that was *in force*, not one that was learned,
+        so reusing it would relearn the default forever.
+        """
+        for detail in await self._last_overflow_details(conversation_id):
+            ratio = detail.get("measured_chars_per_token")
+            if isinstance(ratio, int | float) and not isinstance(ratio, bool) and ratio > 0:
+                return float(ratio)
+        return None
 
     # ------------------------------------------------------------------
     # Agent proposals (A1)

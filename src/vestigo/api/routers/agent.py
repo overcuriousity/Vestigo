@@ -31,7 +31,7 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior, Usag
 from vestigo import __version__
 from vestigo.agent.availability import agent_available
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
-from vestigo.agent.fidelity import resolve_fidelity
+from vestigo.agent.fidelity import fidelity_config_warning, resolve_fidelity
 from vestigo.agent.runtime import (
     LLM_TIMEOUT,
     SYSTEM_PROMPT,
@@ -39,8 +39,14 @@ from vestigo.agent.runtime import (
     load_history,
     stream_turn,
 )
-from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
-from vestigo.agent.window import WindowStats, budget_for, estimate_tokens
+from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope, schema_chars_for_scope
+from vestigo.agent.window import (
+    CHARS_PER_TOKEN_DEFAULT,
+    WindowStats,
+    budget_for,
+    calibrate_chars_per_token,
+    estimate_tokens,
+)
 from vestigo.api.deps import (
     get_current_user,
     get_store,
@@ -383,6 +389,27 @@ _WINDOW_HINT_RES = (
     re.compile(r"available context size \((\d+) tokens?\)", re.IGNORECASE),
 )
 
+# Overflow bodies that name how many tokens *the request we just sent* cost.
+# Paired with that request's character count this is an exact reading of the
+# model's chars-per-token — the only tokenizer signal an airgapped deployment
+# gets, and the thing that turns the estimator from a guess into a measurement.
+# Ordered — first match wins. Extend alongside _WINDOW_HINT_RES (with a test).
+_REQUEST_TOKENS_RES = (
+    re.compile(r"request \((\d+) tokens?\)", re.IGNORECASE),  # llama.cpp behind LiteLLM
+    re.compile(r"resulted in (\d+) tokens", re.IGNORECASE),  # OpenAI
+    re.compile(r"prompt is too long: (\d+) tokens", re.IGNORECASE),  # Anthropic
+)
+
+
+def _overflow_request_tokens(exc: ModelHTTPError) -> int | None:
+    """How many tokens the provider charged for the request that just failed."""
+    body = str(exc.body or "")
+    for pattern in _REQUEST_TOKENS_RES:
+        if (match := pattern.search(body)) is not None:
+            tokens = int(match.group(1))
+            return tokens if tokens > 0 else None
+    return None
+
 
 def _overflow_window_hint(exc: ModelHTTPError) -> int | None:
     """The model's context window as reported by the overflow error, if any.
@@ -511,6 +538,13 @@ async def _message_stream_inner(
     )
     history = load_history(conversation.history)
 
+    if (
+        warning := fidelity_config_warning(config.tool_fidelity, config.context_window)
+    ) is not None:
+        # Advisory only — the operator keeps the override; the log is so a turn
+        # that later overflows has the reason on record beside it.
+        logger.warning("Agent config (conversation %s): %s", conversation_id, warning)
+
     # Sliding context window (agent/window.py): the one context-management
     # mechanism. Proactive when the operator configured context_window;
     # reactive otherwise — a provider overflow derives a budget from the
@@ -522,8 +556,31 @@ async def _message_stream_inner(
     # already have learned one the hard way — reuse it, or every turn repeats
     # the same failed round trip. Configuration always wins over the learned
     # value: an operator who set context_window has said what the model is.
+    # Everything that ships outside `messages` and therefore outside the
+    # window processor's view: the tool schemas (measured for this exact scope
+    # — disabled_tools changes them) and the system prompt. Omitting the tool
+    # list is what let a 76k-token request through a 49k budget on 2026-07-23.
+    tool_schema_chars = schema_chars_for_scope(scope)
+
+    # chars/N is a heuristic, not a tokenizer, and N is payload-dependent. A
+    # previous overflow on this conversation measured the real ratio against
+    # the provider's own token count; prefer it over the constant.
+    chars_per_token = await store.get_last_chars_per_token(conversation_id)
+    if chars_per_token is None:
+        chars_per_token = CHARS_PER_TOKEN_DEFAULT
+    else:
+        logger.info(
+            "Using the %.2f chars-per-token ratio an earlier overflow on conversation %s "
+            "measured (default %.2f).",
+            chars_per_token,
+            conversation_id,
+            CHARS_PER_TOKEN_DEFAULT,
+        )
+
     window_budget = (
-        budget_for(config.context_window, SYSTEM_PROMPT) if config.context_window else None
+        budget_for(config.context_window, SYSTEM_PROMPT, tool_schema_chars, chars_per_token)
+        if config.context_window
+        else None
     )
     if window_budget is None:
         window_budget = await store.get_last_window_budget(conversation_id)
@@ -575,12 +632,23 @@ async def _message_stream_inner(
             "turns_dropped": window_stats.turns_dropped,
             "estimated_before": window_stats.estimated_before,
             "estimated_after": window_stats.estimated_after,
+            # Without the divisor the estimates above cannot be reproduced,
+            # and reproducing them is what makes this row evidence.
+            "chars_per_token": round(window_stats.chars_per_token, 4),
+            "tool_schema_chars": tool_schema_chars,
+            # Per-request tool-side defenses (agent/runtime.py's request guard),
+            # not message reductions — recorded on the same row so a replay
+            # shows the turn collapsed duplicate calls or capped its output.
+            "duplicate_calls": window_stats.duplicate_calls,
+            "results_capped": window_stats.results_capped,
         }
         await _persist_window(
             detail,
             f"Older tool results ({window_stats.results_elided} elided, "
             f"{window_stats.results_truncated} truncated, "
-            f"{window_stats.turns_dropped} turns dropped) were reduced to fit "
+            f"{window_stats.turns_dropped} turns dropped; "
+            f"{window_stats.duplicate_calls} duplicate calls collapsed, "
+            f"{window_stats.results_capped} returns capped) were reduced to fit "
             "the model's context window — the full record is preserved here.",
         )
         return detail
@@ -603,6 +671,7 @@ async def _message_stream_inner(
                 view_filters=payload.view_filters,
                 window_budget=window_budget,
                 window_stats=window_stats,
+                chars_per_token=chars_per_token,
             ):
                 # A stop lands here, between streamed events — so the partial
                 # turn is persisted the same way the interrupt paths below do
@@ -703,35 +772,74 @@ async def _message_stream_inner(
                 # delimits them from the re-run's.
                 if (stats_detail := await _persist_window_stats(attempt)) is not None:
                     yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
+
+                # Calibrate first: the error body may name what the failed
+                # request actually cost, and every budget below is computed
+                # with the divisor. Pair it with what the window recorded
+                # sending — the router cannot see mid-turn messages itself.
+                measured: float | None = None
+                if (
+                    reported := _overflow_request_tokens(exc)
+                ) is not None and window_stats.max_request_chars:
+                    request_chars = (
+                        window_stats.max_request_chars + len(SYSTEM_PROMPT) + tool_schema_chars
+                    )
+                    measured = calibrate_chars_per_token(request_chars, reported)
+                    if measured is not None:
+                        logger.info(
+                            "Provider charged %d tokens for a ~%d-char request — measured "
+                            "%.2f chars/token (was using %.2f).",
+                            reported,
+                            request_chars,
+                            measured,
+                            chars_per_token,
+                        )
+                        chars_per_token = measured
+
+                previous_budget = window_budget
                 hint: int | None = None
-                if window_budget is not None:
+                if (hint := _overflow_window_hint(exc)) is not None:
+                    # The provider named its own window — ground truth, and
+                    # better than any multiple of a budget we already know to
+                    # be wrong. Used whether or not a budget exists: blindly
+                    # shrinking a configured one overshoots into turn-dropping,
+                    # which makes the agent re-run its whole orientation sweep
+                    # (observed three times over in the 2026-07-23 export).
+                    window_budget = budget_for(
+                        hint, SYSTEM_PROMPT, tool_schema_chars, chars_per_token
+                    )
+                    if previous_budget is not None and window_budget >= previous_budget:
+                        # Recomputing did not tighten anything — the divisor or
+                        # the reserved shares were already right and something
+                        # else overflowed. Fall back to shrinking so the retry
+                        # cannot re-send the same size and fail identically.
+                        window_budget = max(int(previous_budget * _RETRY_SHRINK), 1)
+                    sentence = (
+                        "The request exceeded the model's context window — the provider "
+                        f"reported a window of {hint} tokens, so the sliding window was "
+                        f"resized to a budget of {window_budget} tokens and the turn re-run."
+                    )
+                    if measured is not None:
+                        sentence += (
+                            f" The same error measured this model at {measured:.2f} characters "
+                            "per token, which now sizes the estimate."
+                        )
+                elif window_budget is not None:
                     window_budget = max(int(window_budget * _RETRY_SHRINK), 1)
                     sentence = (
                         "The request still exceeded the model's context window — the sliding "
                         f"window was tightened to a budget of {window_budget} tokens and the "
                         "turn re-run."
                     )
-                elif (hint := _overflow_window_hint(exc)) is not None:
-                    # The provider named its window in the error — the best
-                    # budget source there is: the router never sees the
-                    # mid-turn messages that actually overflowed.
-                    window_budget = budget_for(hint, SYSTEM_PROMPT)
-                    sentence = (
-                        "The request exceeded the model's context window (no context_window "
-                        f"is configured) — the provider reported a window of {hint} tokens, "
-                        f"so a sliding window with a budget of {window_budget} tokens was "
-                        "enabled and the turn re-run. Configure the agent's context_window "
-                        "to avoid the failed round trip."
-                    )
                 else:
-                    # No hint in the error body. The mid-turn tool results
-                    # that overflowed are invisible here (inside agent.run),
-                    # so the pre-turn history is the only size available —
+                    # No hint in the error body, and no budget to shrink. The
+                    # mid-turn tool results that overflowed are invisible here
+                    # (inside agent.run), so the pre-turn history plus what
+                    # rides outside it is the only size available —
                     # deliberately conservative.
-                    estimated = (
-                        estimate_tokens(history)
-                        + len(SYSTEM_PROMPT) // 4
-                        + len(payload.content) // 4
+                    estimated = estimate_tokens(history, chars_per_token) + int(
+                        (len(SYSTEM_PROMPT) + len(payload.content) + tool_schema_chars)
+                        / chars_per_token
                     )
                     window_budget = max(int(estimated * _DERIVED_BUDGET_FACTOR), 1)
                     sentence = (
@@ -740,9 +848,21 @@ async def _message_stream_inner(
                         "tokens was derived from the conversation so far and the turn re-run. "
                         "Configure the agent's context_window to avoid the failed round trip."
                     )
-                detail = {"reason": "overflow", "attempt": attempt, "budget": window_budget}
+                detail = {
+                    "reason": "overflow",
+                    "attempt": attempt,
+                    "budget": window_budget,
+                    "chars_per_token": round(chars_per_token, 4),
+                    "tool_schema_chars": tool_schema_chars,
+                }
                 if hint is not None:
                     detail["window_hint"] = hint
+                if measured is not None:
+                    # Distinct from `chars_per_token` above (the divisor in
+                    # force): only a *measured* value should be relearned by a
+                    # later turn, or the default would relearn itself forever.
+                    detail["measured_chars_per_token"] = round(measured, 4)
+                    detail["reported_request_tokens"] = reported
                 await _persist_window(detail, sentence)
                 yield _sse({"type": "window", "reason": "overflow", "budget": window_budget})
                 continue

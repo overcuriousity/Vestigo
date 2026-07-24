@@ -25,6 +25,18 @@ Both operate on the *advertised* schema only. FastMCP validates incoming
 arguments against ``Tool.fn_metadata.arg_model`` (the real pydantic model),
 which these transforms never touch: we advertise slim and validate full.
 
+Why the ``FilterSpec`` copies cannot be *hoisted* into one shared definition
+(investigated 2026-07-24, do not re-open): ``FilterSpec`` already appears as a
+local ``$defs`` entry referenced by ``$ref`` *within* each of the 14 tools that
+take it — it is not inlined per-property. What repeats is the definition
+itself, once per tool. The OpenAI function-calling wire format gives every tool
+an independent, self-contained ``parameters`` schema inside its own
+``function`` object; there is no document-level ``$defs`` spanning the tools
+array and no ``$ref`` target reachable outside a single tool's ``parameters``.
+So the 14 copies are inherent to the protocol, not an artefact we can remove.
+:func:`vestigo.agent.window.budget_for` now counts this duplication honestly
+against the context budget, which is what actually matters.
+
 Tool descriptions and top-level tool-parameter descriptions are deliberately
 left alone — those are what a small model reads to *pick* a tool.
 """
