@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -30,6 +31,7 @@ from vestigo.api.routers import (
     jobs,
     sigma,
     stream,
+    transfer,
     viz,
 )
 from vestigo.core.config import get_settings
@@ -167,6 +169,16 @@ async def _reconcile_orphaned_ingests() -> None:
             )
 
 
+async def _sweep_stale_transfer_archives() -> None:
+    """Export archives live in temp storage and the job store is in-memory —
+    after a restart every leftover is orphaned by definition."""
+    from vestigo.transfer.archive import temp_root
+
+    root = temp_root()
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+
+
 async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
     """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
 
@@ -239,6 +251,7 @@ async def _startup_recovery(store: PostgresStore) -> None:
     restart if it fails, so running them in the background is safe.
     """
     try:
+        await _sweep_stale_transfer_archives()
         await _reconcile_orphaned_ingests()
         enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
 
@@ -471,6 +484,7 @@ def create_app() -> FastAPI:
     app.include_router(agent.router)
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)
+    app.include_router(transfer.router)
 
     # External streamable-HTTP MCP endpoint (Bearer-token-gated), off by default.
     # Registered outside /api/, so AuthAuditMiddleware's session gate does not
