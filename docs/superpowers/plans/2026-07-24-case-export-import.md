@@ -612,13 +612,20 @@ async def _rich_case(store, owner_id):
     await _add(store, pg.DetectorRun, case_id=case.id, timeline_id=tl.id)
     await _add(store, pg.FindingDisposition, case_id=case.id, timeline_id=tl.id)
     await _add(
-        store, pg.Annotation, case_id=case.id, source_id=src.id,
-        event_id="evt-1", annotation_type="comment", content="note",
+        store,
+        pg.Annotation,
+        case_id=case.id,
+        source_id=src.id,
+        event_id="evt-1",
+        annotation_type="comment",
+        content="note",
     )
     await _add(store, pg.SigmaRule, case_id=case.id)
     await _add(store, pg.SigmaRun, case_id=case.id, timeline_id=tl.id)
     await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=src.id)
-    conv = await _add(store, pg.AgentConversation, case_id=case.id, timeline_id=tl.id, user_id=owner_id)
+    conv = await _add(
+        store, pg.AgentConversation, case_id=case.id, timeline_id=tl.id, user_id=owner_id
+    )
     await _add(store, pg.AgentMessage, conversation_id=conv.id)
     await _add(store, pg.AgentProposal, case_id=case.id, conversation_id=conv.id)
     await _add(store, pg.AuditLog, case_id=case.id)
@@ -631,8 +638,12 @@ async def test_export_roundtrip_all_entities(store, tmp_path, monkeypatch):
     fake_ch = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id)})
 
     result = await export_case(
-        store, lambda: fake_ch, case.id,
-        include_blobs=False, exported_by="alice", dest_dir=tmp_path,
+        store,
+        lambda: fake_ch,
+        case.id,
+        include_blobs=False,
+        exported_by="alice",
+        dest_dir=tmp_path,
     )
 
     assert result.path.exists() and result.bytes > 0
@@ -644,10 +655,23 @@ async def test_export_roundtrip_all_entities(store, tmp_path, monkeypatch):
     assert m["include_blobs"] is False
     reader.verify_members()
     for stem in (
-        "sources", "timelines", "timeline_sources", "timeline_enrichers", "views",
-        "saved_charts", "baseline_definitions", "detector_runs", "finding_dispositions",
-        "annotations", "sigma_rules", "sigma_runs", "source_enrichments",
-        "agent_conversations", "agent_messages", "agent_proposals", "audit_log",
+        "sources",
+        "timelines",
+        "timeline_sources",
+        "timeline_enrichers",
+        "views",
+        "saved_charts",
+        "baseline_definitions",
+        "detector_runs",
+        "finding_dispositions",
+        "annotations",
+        "sigma_rules",
+        "sigma_runs",
+        "source_enrichments",
+        "agent_conversations",
+        "agent_messages",
+        "agent_proposals",
+        "audit_log",
     ):
         rows = reader.read_ndjson(f"postgres/{stem}.ndjson")
         assert len(rows) == 1, f"{stem}: expected 1 row, got {len(rows)}"
@@ -668,8 +692,12 @@ async def test_export_without_sources_never_touches_clickhouse(store, tmp_path):
         raise AssertionError("ClickHouse factory must not be called")
 
     result = await export_case(
-        store, _forbidden, case.id,
-        include_blobs=True, exported_by="bob", dest_dir=tmp_path,
+        store,
+        _forbidden,
+        case.id,
+        include_blobs=True,
+        exported_by="bob",
+        dest_dir=tmp_path,
     )
     assert result.counts["sources"] == 0
     assert result.counts["events"] == 0
@@ -691,8 +719,12 @@ async def test_export_blobs(store, tmp_path, monkeypatch):
         fake_ch = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id, n=1)})
 
         result = await export_case(
-            store, lambda: fake_ch, case.id,
-            include_blobs=True, exported_by="carol", dest_dir=tmp_path / "out",
+            store,
+            lambda: fake_ch,
+            case.id,
+            include_blobs=True,
+            exported_by="carol",
+            dest_dir=tmp_path / "out",
         )
         reader = ArchiveReader(result.path)
         assert f"blobs/{file_hash}" in reader.member_names()
@@ -713,8 +745,12 @@ async def test_export_missing_blob_warns_not_fails(store, tmp_path, monkeypatch)
         case = await _add(store, pg.Case, name="NoBlob", owner_id=owner.id)
         await _add(store, pg.Source, case_id=case.id, name="s", file_hash="ef" * 32)
         result = await export_case(
-            store, lambda: FakeClickHouse(), case.id,
-            include_blobs=True, exported_by="dave", dest_dir=tmp_path / "out",
+            store,
+            lambda: FakeClickHouse(),
+            case.id,
+            include_blobs=True,
+            exported_by="dave",
+            dest_dir=tmp_path / "out",
         )
         assert len(result.warnings) == 1
         assert result.counts["blobs"] == 0
@@ -964,7 +1000,9 @@ async def export_case(
     archive_path = dest_dir / f"export-{case_id}.vestigo"
     writer = ArchiveWriter(archive_path)
     writer.add_bytes("postgres/case.json", json.dumps(snapshot["case"], indent=2).encode())
-    writer.add_bytes("postgres/user_refs.json", json.dumps(snapshot["user_refs"], indent=2).encode())
+    writer.add_bytes(
+        "postgres/user_refs.json", json.dumps(snapshot["user_refs"], indent=2).encode()
+    )
     for stem, rows in stems.items():
         writer.add_bytes(f"postgres/{stem}.ndjson", _ndjson(rows))
 
@@ -990,7 +1028,9 @@ async def export_case(
                     writer.add_file(f"blobs/{source['file_hash']}", blob)
                     counts["blobs"] += 1
                 else:
-                    warnings.append(f"source blob missing on disk: {source['name']} ({source['file_hash'][:12]}…)")
+                    warnings.append(
+                        f"source blob missing on disk: {source['name']} ({source['file_hash'][:12]}…)"
+                    )
 
     _progress("manifest")
     writer.finish(
@@ -1317,9 +1357,15 @@ async def _rich_case(store, owner_id):
     case = await _add(store, pg.Case, name="Roundtrip", owner_id=owner_id)
     src = await _add(store, pg.Source, case_id=case.id, name="src", file_hash="ab" * 32)
     tl = await _add(
-        store, pg.Timeline, case_id=case.id, name="tl", is_default=True,
-        embedding_model="some-model", embedding_config={"dim": 8},
-        embedding_config_hash="h", embedded_source_ids=[src.id],
+        store,
+        pg.Timeline,
+        case_id=case.id,
+        name="tl",
+        is_default=True,
+        embedding_model="some-model",
+        embedding_config={"dim": 8},
+        embedding_config_hash="h",
+        embedded_source_ids=[src.id],
         embedded_at=datetime.now(UTC),
     )
     await _add(store, pg.TimelineSource, timeline_id=tl.id, source_id=src.id)
@@ -1327,14 +1373,22 @@ async def _rich_case(store, owner_id):
     await _add(store, pg.SavedChart, case_id=case.id, timeline_id=tl.id)
     await _add(store, pg.DetectorRun, case_id=case.id, timeline_id=tl.id)
     await _add(
-        store, pg.Annotation, case_id=case.id, source_id=src.id,
-        event_id="evt-1", annotation_type="comment", content="note",
+        store,
+        pg.Annotation,
+        case_id=case.id,
+        source_id=src.id,
+        event_id="evt-1",
+        annotation_type="comment",
+        content="note",
     )
     await _add(store, pg.SigmaRule, case_id=case.id)
     await _add(store, pg.SigmaRun, case_id=case.id, timeline_id=tl.id)
     await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=src.id)
     conv = await _add(
-        store, pg.AgentConversation, case_id=case.id, timeline_id=tl.id,
+        store,
+        pg.AgentConversation,
+        case_id=case.id,
+        timeline_id=tl.id,
         user_id="ghost-user-id",  # not a user on this instance → fallback
     )
     await _add(store, pg.AgentMessage, conversation_id=conv.id)
@@ -1346,8 +1400,12 @@ async def _rich_case(store, owner_id):
 async def _export(store, case, src, tmp_path, rows=2):
     fake = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id, n=rows)})
     result = await export_case(
-        store, lambda: fake, case.id,
-        include_blobs=False, exported_by="alice", dest_dir=tmp_path,
+        store,
+        lambda: fake,
+        case.id,
+        include_blobs=False,
+        exported_by="alice",
+        dest_dir=tmp_path,
     )
     return result.path
 
@@ -1373,41 +1431,51 @@ class TestRoundTrip:
         assert new_case.team_id is None
 
         async with store.session_factory() as s:
-            new_tl = (await s.execute(
-                select(pg.Timeline).where(pg.Timeline.case_id == result.case_id)
-            )).scalar_one()
+            new_tl = (
+                await s.execute(select(pg.Timeline).where(pg.Timeline.case_id == result.case_id))
+            ).scalar_one()
             # Embedding state reset on import.
             assert new_tl.embedding_model is None
             assert new_tl.embedding_config is None
             assert new_tl.embedded_source_ids is None
 
-            new_chart = (await s.execute(
-                select(pg.SavedChart).where(pg.SavedChart.case_id == result.case_id)
-            )).scalar_one()
+            new_chart = (
+                await s.execute(
+                    select(pg.SavedChart).where(pg.SavedChart.case_id == result.case_id)
+                )
+            ).scalar_one()
             assert new_chart.timeline_id == new_tl.id
 
-            new_ann = (await s.execute(
-                select(pg.Annotation).where(pg.Annotation.case_id == result.case_id)
-            )).scalar_one()
-            new_src = (await s.execute(
-                select(pg.Source).where(pg.Source.case_id == result.case_id)
-            )).scalar_one()
+            new_ann = (
+                await s.execute(
+                    select(pg.Annotation).where(pg.Annotation.case_id == result.case_id)
+                )
+            ).scalar_one()
+            new_src = (
+                await s.execute(select(pg.Source).where(pg.Source.case_id == result.case_id))
+            ).scalar_one()
             assert new_ann.source_id == new_src.id
             assert new_src.id != src.id
             assert new_ann.event_id == "evt-1"  # event IDs preserved verbatim
 
-            new_conv = (await s.execute(
-                select(pg.AgentConversation).where(pg.AgentConversation.case_id == result.case_id)
-            )).scalar_one()
+            new_conv = (
+                await s.execute(
+                    select(pg.AgentConversation).where(
+                        pg.AgentConversation.case_id == result.case_id
+                    )
+                )
+            ).scalar_one()
             assert new_conv.user_id == bob.id  # unknown "ghost-user-id" → importer fallback
-            new_msg = (await s.execute(
-                select(pg.AgentMessage).where(pg.AgentMessage.conversation_id == new_conv.id)
-            )).scalar_one()
+            new_msg = (
+                await s.execute(
+                    select(pg.AgentMessage).where(pg.AgentMessage.conversation_id == new_conv.id)
+                )
+            ).scalar_one()
             assert new_msg is not None
 
-            new_audit = (await s.execute(
-                select(pg.AuditLog).where(pg.AuditLog.case_id == result.case_id)
-            )).scalar_one()
+            new_audit = (
+                await s.execute(select(pg.AuditLog).where(pg.AuditLog.case_id == result.case_id))
+            ).scalar_one()
             assert new_audit.user_id is None
             assert new_audit.username_snapshot == "alice"
 
@@ -1451,7 +1519,11 @@ class TestRejection:
 
     async def test_no_secrets_in_archive(self, store, tmp_path):
         alice = await _add(
-            store, pg.User, username="alice", is_admin=False, is_active=True,
+            store,
+            pg.User,
+            username="alice",
+            is_admin=False,
+            is_active=True,
             password_hash="$2b$12$somebcrypthashvalue",
         )
         case, src, _ = await _rich_case(store, alice.id)
@@ -1550,19 +1622,57 @@ _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
     ("sources", Source, {"id": "source", "case_id": "case"}),
     ("timelines", Timeline, {"id": "timeline", "case_id": "case"}),
     ("timeline_sources", TimelineSource, {"timeline_id": "timeline", "source_id": "source"}),
-    ("timeline_enrichers", TimelineEnricher, {"id": "timeline_enricher", "timeline_id": "timeline"}),
+    (
+        "timeline_enrichers",
+        TimelineEnricher,
+        {"id": "timeline_enricher", "timeline_id": "timeline"},
+    ),
     ("views", View, {"id": "view", "case_id": "case"}),
     ("saved_charts", SavedChart, {"id": "chart", "case_id": "case", "timeline_id": "timeline"}),
-    ("baseline_definitions", BaselineDefinition, {"id": "baseline", "case_id": "case", "timeline_id": "timeline"}),
-    ("detector_runs", DetectorRun, {"id": "detector_run", "case_id": "case", "timeline_id": "timeline"}),
-    ("finding_dispositions", FindingDisposition, {"id": "disposition", "case_id": "case", "timeline_id": "timeline", "source_id": "source"}),
+    (
+        "baseline_definitions",
+        BaselineDefinition,
+        {"id": "baseline", "case_id": "case", "timeline_id": "timeline"},
+    ),
+    (
+        "detector_runs",
+        DetectorRun,
+        {"id": "detector_run", "case_id": "case", "timeline_id": "timeline"},
+    ),
+    (
+        "finding_dispositions",
+        FindingDisposition,
+        {"id": "disposition", "case_id": "case", "timeline_id": "timeline", "source_id": "source"},
+    ),
     ("annotations", Annotation, {"id": "annotation", "case_id": "case", "source_id": "source"}),
     ("sigma_rules", SigmaRule, {"id": "sigma_rule", "case_id": "case"}),
     ("sigma_runs", SigmaRun, {"id": "sigma_run", "case_id": "case", "timeline_id": "timeline"}),
-    ("source_enrichments", SourceEnrichment, {"id": "source_enrichment", "case_id": "case", "source_id": "source", "timeline_id": "timeline"}),
-    ("agent_conversations", AgentConversation, {"id": "conversation", "case_id": "case", "timeline_id": "timeline"}),
+    (
+        "source_enrichments",
+        SourceEnrichment,
+        {
+            "id": "source_enrichment",
+            "case_id": "case",
+            "source_id": "source",
+            "timeline_id": "timeline",
+        },
+    ),
+    (
+        "agent_conversations",
+        AgentConversation,
+        {"id": "conversation", "case_id": "case", "timeline_id": "timeline"},
+    ),
     ("agent_messages", AgentMessage, {"id": "message", "conversation_id": "conversation"}),
-    ("agent_proposals", AgentProposal, {"id": "proposal", "case_id": "case", "conversation_id": "conversation", "timeline_id": "timeline"}),
+    (
+        "agent_proposals",
+        AgentProposal,
+        {
+            "id": "proposal",
+            "case_id": "case",
+            "conversation_id": "conversation",
+            "timeline_id": "timeline",
+        },
+    ),
     ("audit_log", AuditLog, {"id": "audit", "case_id": "case"}),
 ]
 
@@ -1608,8 +1718,9 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
     return model(**values)
 
 
-def _insert_source_events(clickhouse: Any, reader: ArchiveReader, arcname: str,
-                          new_case_id: str, new_source_id: str) -> int:
+def _insert_source_events(
+    clickhouse: Any, reader: ArchiveReader, arcname: str, new_case_id: str, new_source_id: str
+) -> int:
     """Sync: rewrite case_id/source_id in every batch and insert. Row count."""
     total = 0
     with reader.open_member(arcname) as f:
@@ -1697,7 +1808,9 @@ async def import_case(
             await session.commit()
 
         source_rows = reader.read_ndjson("postgres/sources.ndjson")
-        event_members = [n for n in member_names if n.startswith("events/") and n.endswith(".arrow")]
+        event_members = [
+            n for n in member_names if n.startswith("events/") and n.endswith(".arrow")
+        ]
         if event_members:
             _progress("events")
             clickhouse = clickhouse_factory()
@@ -1732,7 +1845,9 @@ async def import_case(
         blobbed = {n.removeprefix("blobs/") for n in blob_members}
         for row in source_rows:
             if blob_members and row["file_hash"] not in blobbed:
-                warnings.append(f"no blob in archive for source {row['name']} — events restored, original file absent")
+                warnings.append(
+                    f"no blob in archive for source {row['name']} — events restored, original file absent"
+                )
 
         if clickhouse is not None and inserted_sources:
             _progress("stats")
@@ -1745,7 +1860,9 @@ async def import_case(
         if clickhouse is not None:
             for new_source_id in inserted_sources:
                 try:
-                    await asyncio.to_thread(clickhouse.delete_source_events, new_case_id, new_source_id)
+                    await asyncio.to_thread(
+                        clickhouse.delete_source_events, new_case_id, new_source_id
+                    )
                 except Exception:  # noqa: BLE001,S110 — best-effort cleanup
                     pass
         if created:
@@ -2062,12 +2179,13 @@ def _event(i: int) -> Event:
 
 async def _pg_case(store) -> None:
     async with store.session_factory() as session:
-        session.add(
-            pg.Case(id=CASE_ID, name="Round Trip", owner_id=None, team_id=None)
-        )
+        session.add(pg.Case(id=CASE_ID, name="Round Trip", owner_id=None, team_id=None))
         session.add(
             pg.Source(
-                id=SOURCE_ID, case_id=CASE_ID, name="src", file_hash=FILE_HASH,
+                id=SOURCE_ID,
+                case_id=CASE_ID,
+                name="src",
+                file_hash=FILE_HASH,
                 status="ready",
             )
         )
@@ -2094,13 +2212,21 @@ async def test_roundtrip_events_identical(store, ch_store, tmp_path):
     imported_ch = ClickHouseStore()  # same server; captures nothing — real CH
     try:
         archive = await export_case(
-            store, lambda: ch_store, CASE_ID,
-            include_blobs=False, exported_by="test", dest_dir=tmp_path,
+            store,
+            lambda: ch_store,
+            CASE_ID,
+            include_blobs=False,
+            exported_by="test",
+            dest_dir=tmp_path,
         )
         assert archive.counts["events"] == 3
 
-        bob = pg.User(id=f"rt-user-{uuid.uuid4().hex[:8]}", username=f"rt-{uuid.uuid4().hex[:6]}",
-                      is_admin=False, is_active=True)
+        bob = pg.User(
+            id=f"rt-user-{uuid.uuid4().hex[:8]}",
+            username=f"rt-{uuid.uuid4().hex[:6]}",
+            is_admin=False,
+            is_active=True,
+        )
         async with store.session_factory() as session:
             session.add(bob)
             await session.commit()
@@ -2110,12 +2236,12 @@ async def test_roundtrip_events_identical(store, ch_store, tmp_path):
 
         async with store.session_factory() as session:
             new_src = (
-                await session.execute(
-                    select(pg.Source).where(pg.Source.case_id == result.case_id)
-                )
+                await session.execute(select(pg.Source).where(pg.Source.case_id == result.case_id))
             ).scalar_one()
 
-        original = [r for batch in ch_store.iter_source_events(CASE_ID, SOURCE_ID, 1000) for r in batch]
+        original = [
+            r for batch in ch_store.iter_source_events(CASE_ID, SOURCE_ID, 1000) for r in batch
+        ]
         restored = [
             r
             for batch in imported_ch.iter_source_events(result.case_id, new_src.id, 1000)
@@ -2127,10 +2253,10 @@ async def test_roundtrip_events_identical(store, ch_store, tmp_path):
         try:
             async with store.session_factory() as session:
                 rows = (
-                    await session.execute(
-                        select(pg.Source).where(pg.Source.case_id != CASE_ID)
-                    )
-                ).scalars().all()
+                    (await session.execute(select(pg.Source).where(pg.Source.case_id != CASE_ID)))
+                    .scalars()
+                    .all()
+                )
                 for r in rows:
                     imported_ch.delete_source_events(r.case_id, r.id)
         except Exception:

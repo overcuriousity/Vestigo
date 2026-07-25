@@ -327,8 +327,9 @@ def test_temp_root_and_archive_path(tmp_path):
     root = temp_root()
     assert root.is_dir()
     assert root.stat().st_mode & 0o077 == 0
-    p = new_archive_path("job123")
-    assert p.parent == root and p.name == "job123.vestigo"
+    # A real JobStore id: uuid4().hex[:16], which new_archive_path now requires.
+    p = new_archive_path("0123456789abcdef")
+    assert p.parent == root and p.name == "0123456789abcdef.vestigo"
 
 
 def test_temp_root_repairs_a_loose_mode(tmp_path, monkeypatch):

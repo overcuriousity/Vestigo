@@ -23,7 +23,7 @@ from vestigo.core.config import get_settings
 from vestigo.core.jobs import Job, get_job_store
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.postgres import Case, User
-from vestigo.transfer.archive import new_archive_path, sweep_stale, temp_root
+from vestigo.transfer.archive import is_job_id, new_archive_path, sweep_stale, temp_root
 from vestigo.transfer.exporter import export_case
 from vestigo.transfer.importer import import_case
 
@@ -173,6 +173,12 @@ async def download_export(
     case: Case = Depends(require_case_manage),
     user: User = Depends(get_current_user),
 ):
+    # Shape-check before anything else: job_id is a raw URL path segment and
+    # new_archive_path builds a filesystem path out of it. The lookup below
+    # would reject a traversal string too (job ids are the only keys), but
+    # that is a property of the store, not a check — make the barrier explicit.
+    if not is_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Export not found")
     job = get_job_store().get(job_id)
     # JobStore evicts terminal jobs past its cap, so a long-idle completed
     # export can 404 here while its archive is still on disk. Not a leak —

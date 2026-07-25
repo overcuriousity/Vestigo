@@ -115,7 +115,22 @@ def temp_root() -> Path:
     return root
 
 
+def is_job_id(value: str) -> bool:
+    """Whether a string is shaped like a JobStore id (``uuid4().hex[:16]``)."""
+    return bool(_JOB_ID_RE.fullmatch(value))
+
+
 def new_archive_path(job_id: str) -> Path:
+    """Path of the archive for ``job_id``, which must be a real job id.
+
+    The id reaches here straight from a URL path segment, so the shape check is
+    the barrier that keeps a request from naming a file outside the temp root
+    (``../../etc/passwd``) — the job-store lookup callers do first happens to
+    reject the same thing, but nothing about a dict lookup makes that a
+    guarantee anyone can see from here.
+    """
+    if not is_job_id(job_id):
+        raise ValueError(f"not a job id: {job_id!r}")
     return temp_root() / f"{job_id}.vestigo"
 
 

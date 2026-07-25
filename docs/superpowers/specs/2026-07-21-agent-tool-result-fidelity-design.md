@@ -46,7 +46,7 @@ transcript would explain the difference.
 
 ```python
 class Fidelity(StrEnum):
-    FULL = "full"        # example events inline, attributes at today's caps
+    FULL = "full"  # example events inline, attributes at today's caps
     MESSAGE = "message"  # PR145's shape: event_id + truncated message
     MINIMAL = "minimal"  # ids and aggregates only
 ```

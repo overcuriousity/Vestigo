@@ -84,6 +84,31 @@ class TestExportEndpoint:
         dl2 = client.get(f"/api/cases/{case_id}/export/{job['id']}/download")
         assert dl2.status_code == 404
 
+    def test_download_rejects_non_job_id(self, client, admin_bootstrap):
+        """job_id is a raw path segment that becomes a filesystem path.
+
+        Only ids that actually reach the handler are exercised here — anything
+        with a slash is normalized away by the router before it does. The
+        traversal case belongs to the path builder itself, below.
+        """
+        as_admin(client, admin_bootstrap)
+        case_id = _create_case(client)
+        for job_id in ("not-a-job-id", "0" * 15, "0" * 17, "Z" * 16, "%2e%2e"):
+            resp = client.get(f"/api/cases/{case_id}/export/{job_id}/download")
+            assert resp.status_code == 404, (job_id, resp.status_code)
+
+    def test_new_archive_path_refuses_non_job_id(self, tmp_path, monkeypatch):
+        """The path builder is a barrier in its own right, not only via the router."""
+        from vestigo.transfer.archive import new_archive_path
+
+        monkeypatch.setenv("VESTIGO_TRANSFER_TEMP_PATH", str(tmp_path / "transfer"))
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(ValueError):
+                new_archive_path("../../etc/passwd")
+        finally:
+            get_settings.cache_clear()
+
 
 class TestImportEndpoint:
     def _archive_bytes(self, *, drop: str | None = None) -> bytes:

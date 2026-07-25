@@ -157,20 +157,22 @@ schema below is stricter than CSV/JSONL: every column and type must match exactl
 ### Required per-row schema
 
 ```python
-PARQUET_EVENT_SCHEMA = pa.schema([
-    pa.field("source_file", pa.string()),
-    pa.field("file_hash", pa.string()),
-    pa.field("byte_offset", pa.uint64()),
-    pa.field("content_hash", pa.string()),
-    pa.field("message", pa.string()),
-    pa.field("timestamp", pa.timestamp("ms", tz="UTC")),   # nullable
-    pa.field("timestamp_desc", pa.string()),
-    pa.field("artifact", pa.string()),
-    pa.field("artifact_long", pa.string()),
-    pa.field("display_name", pa.string()),
-    pa.field("tags", pa.list_(pa.string())),
-    pa.field("attributes", pa.map_(pa.string(), pa.string())),
-])
+PARQUET_EVENT_SCHEMA = pa.schema(
+    [
+        pa.field("source_file", pa.string()),
+        pa.field("file_hash", pa.string()),
+        pa.field("byte_offset", pa.uint64()),
+        pa.field("content_hash", pa.string()),
+        pa.field("message", pa.string()),
+        pa.field("timestamp", pa.timestamp("ms", tz="UTC")),  # nullable
+        pa.field("timestamp_desc", pa.string()),
+        pa.field("artifact", pa.string()),
+        pa.field("artifact_long", pa.string()),
+        pa.field("display_name", pa.string()),
+        pa.field("tags", pa.list_(pa.string())),
+        pa.field("attributes", pa.map_(pa.string(), pa.string())),
+    ]
+)
 ```
 
 | Column           | Required? | Notes |
@@ -212,27 +214,31 @@ import pyarrow.parquet as pq
 import json
 import datetime
 
-schema = pa.schema([
-    pa.field("source_file", pa.string()),
-    pa.field("file_hash", pa.string()),
-    pa.field("byte_offset", pa.uint64()),
-    pa.field("content_hash", pa.string()),
-    pa.field("message", pa.string()),
-    pa.field("timestamp", pa.timestamp("ms", tz="UTC")),
-    pa.field("timestamp_desc", pa.string()),
-    pa.field("artifact", pa.string()),
-    pa.field("artifact_long", pa.string()),
-    pa.field("display_name", pa.string()),
-    pa.field("tags", pa.list_(pa.string())),
-    pa.field("attributes", pa.map_(pa.string(), pa.string())),
-]).with_metadata({
-    "vestigo.format_version": "1",
-    "vestigo.converter_name": "example2vestigo",
-    "vestigo.converter_version": "1.0.0",
-    "vestigo.original_files": json.dumps(
-        [{"name": "auth.log", "sha256": "e3b0c4...", "size_bytes": 128}]
-    ),
-})
+schema = pa.schema(
+    [
+        pa.field("source_file", pa.string()),
+        pa.field("file_hash", pa.string()),
+        pa.field("byte_offset", pa.uint64()),
+        pa.field("content_hash", pa.string()),
+        pa.field("message", pa.string()),
+        pa.field("timestamp", pa.timestamp("ms", tz="UTC")),
+        pa.field("timestamp_desc", pa.string()),
+        pa.field("artifact", pa.string()),
+        pa.field("artifact_long", pa.string()),
+        pa.field("display_name", pa.string()),
+        pa.field("tags", pa.list_(pa.string())),
+        pa.field("attributes", pa.map_(pa.string(), pa.string())),
+    ]
+).with_metadata(
+    {
+        "vestigo.format_version": "1",
+        "vestigo.converter_name": "example2vestigo",
+        "vestigo.converter_version": "1.0.0",
+        "vestigo.original_files": json.dumps(
+            [{"name": "auth.log", "sha256": "e3b0c4...", "size_bytes": 128}]
+        ),
+    }
+)
 
 row = {
     "source_file": "auth.log",
