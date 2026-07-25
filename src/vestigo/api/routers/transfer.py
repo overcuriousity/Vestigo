@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import shutil
+from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from vestigo.api.deps import get_current_user, get_store, require_case_manage
+from vestigo.api.uploads import receive_upload_to_tmp
+from vestigo.core.config import get_settings
 from vestigo.core.jobs import get_job_store
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.postgres import Case, User
 from vestigo.transfer.archive import new_archive_path, temp_root
 from vestigo.transfer.exporter import export_case
+from vestigo.transfer.importer import import_case
 
 router = APIRouter(prefix="/api", tags=["transfer"])
 
@@ -106,3 +110,58 @@ async def download_export(
         filename=f"{safe_name}.vestigo",
         background=BackgroundTask(_cleanup),
     )
+
+
+async def _run_import_job(job_id: str, tmp_path: Path, user: User) -> None:
+    job_store = get_job_store()
+    job_store.update(job_id, status="running")
+    store = get_store()
+    try:
+        result = await import_case(
+            store,
+            ClickHouseStore,
+            tmp_path,
+            owner=user,
+            progress=lambda p: job_store.update(job_id, progress=p),
+        )
+        await store.record_audit(
+            action="case.import",
+            actor=user,
+            case_id=result.case_id,
+            target_type="case",
+            target_id=result.case_id,
+            detail={"job_id": job_id, "counts": result.counts, "warnings": result.warnings},
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            result={
+                "case_id": result.case_id,
+                "counts": result.counts,
+                "warnings": result.warnings,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — job error surface
+        job_store.update(job_id, status="failed", error=str(exc))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/cases/import", status_code=202)
+async def import_case_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    # Any authenticated user may import; the importer becomes the case owner.
+    max_bytes = get_settings().max_upload_bytes or None
+    tmp_path, _file_hash, size_bytes = await receive_upload_to_tmp(
+        file, max_bytes=max_bytes, suffix=".vestigo"
+    )
+    job = get_job_store().create(
+        kind="case_import",
+        progress={"phase": "queued", "bytes": size_bytes},
+        created_by=user.id,
+    )
+    background_tasks.add_task(_run_import_job, job.id, tmp_path, user)
+    return {"job_id": job.id}

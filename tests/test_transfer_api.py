@@ -70,3 +70,80 @@ class TestExportEndpoint:
         # Download deletes the server-side temp archive.
         dl2 = client.get(f"/api/cases/{case_id}/export/{job['id']}/download")
         assert dl2.status_code == 404
+
+
+class TestImportEndpoint:
+    def _archive_bytes(self) -> bytes:
+        """Minimal valid archive: manifest + case.json only."""
+        import hashlib
+
+        from vestigo.transfer.archive import FORMAT_VERSION
+
+        buf = BytesIO()
+        case_json = json.dumps({"id": "old-case", "name": "Imported", "description": None}).encode()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("postgres/case.json", case_json)
+            z.writestr(
+                "postgres/user_refs.json",
+                json.dumps({"users": {}, "team": None}).encode(),
+            )
+            manifest = {
+                "format_version": FORMAT_VERSION,
+                "vestigo_version": "test",
+                "exported_at": "2026-07-24T00:00:00+00:00",
+                "exported_by": "alice",
+                "case": {"id": "old-case", "name": "Imported"},
+                "include_blobs": False,
+                "counts": {},
+                "members": [
+                    {
+                        "path": "postgres/case.json",
+                        "sha256": hashlib.sha256(case_json).hexdigest(),
+                        "bytes": len(case_json),
+                    }
+                ],
+            }
+            z.writestr("manifest.json", json.dumps(manifest).encode())
+        return buf.getvalue()
+
+    def test_anonymous_401(self, client):
+        resp = client.post("/api/cases/import")
+        assert resp.status_code == 401
+
+    def test_import_creates_importer_owned_case(self, client, admin_bootstrap):
+        as_admin(client, admin_bootstrap)
+        _register_user(client, "bob", "bob-pass-12345")
+        me = login(client, "bob", "bob-pass-12345")
+        resp = client.post(
+            "/api/cases/import",
+            files={"file": ("backup.vestigo", self._archive_bytes(), "application/zip")},
+        )
+        assert resp.status_code == 202, resp.text
+        job = _job_terminal(client, resp.json()["job_id"])
+        assert job["status"] == "completed", job.get("error")
+        new_case_id = job["result"]["case_id"]
+
+        case = client.get(f"/api/cases/{new_case_id}")
+        assert case.status_code == 200
+        body = case.json()["case"]
+        assert body["name"] == "Imported"
+        assert body["owner_id"] == me["user"]["id"]
+        assert body["team_id"] is None
+
+        # /api/admin/* is admin-gated at the router level; bob can't read it.
+        login(client, "admin", "rotated-pass-456")
+        audit = client.get("/api/admin/audit?action=case.import")
+        assert audit.status_code == 200
+        entries = audit.json()["audit"]
+        assert any(e["action"] == "case.import" for e in entries)
+
+    def test_garbage_upload_fails_job_not_server(self, client, admin_bootstrap):
+        as_admin(client, admin_bootstrap)
+        resp = client.post(
+            "/api/cases/import",
+            files={"file": ("junk.vestigo", b"not a zip at all", "application/zip")},
+        )
+        assert resp.status_code == 202, resp.text
+        job = _job_terminal(client, resp.json()["job_id"])
+        assert job["status"] == "failed"
+        assert "not a zip" in job["error"]
