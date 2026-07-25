@@ -18,6 +18,8 @@ from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
 from vestigo.core.config import get_settings
 from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
+from vestigo.transfer import archive as archive_mod
+from vestigo.transfer import importer
 from vestigo.transfer.archive import ArchiveFormatError
 from vestigo.transfer.exporter import export_case
 from vestigo.transfer.importer import import_case
@@ -572,3 +574,275 @@ class TestCreatedByAttribution:
         new_ann = await self._restored_annotation(store, result.case_id)
         assert new_ann.created_by == "system"
         assert not any("system" in w for w in result.warnings)
+
+
+class TestIdMapScaling:
+    """The substitution alternation is expensive to build and cheap to apply,
+    so it must be built exactly once. Growing the map during the revive loop
+    recompiled it per row and made import quadratic (14s for 1600 audit rows).
+    """
+
+    async def test_alternation_compiles_once_for_a_whole_import(self, store, tmp_path, monkeypatch):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        for i in range(200):
+            await _add(
+                store,
+                pg.AuditLog,
+                case_id=case.id,
+                action="source.upload",
+                username_snapshot="alice",
+                detail={"note": f"row {i}", "target": src.id},
+            )
+        archive = await _export(store, case, src, tmp_path)
+
+        seen = []
+        original = importer._IdMap.freeze
+
+        def _spy(self):
+            seen.append(self)
+            original(self)
+
+        monkeypatch.setattr(importer._IdMap, "freeze", _spy)
+        await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        assert len(seen) == 1
+        assert seen[0].compiles == 1
+
+    async def test_frozen_map_rejects_an_unmapped_ref(self):
+        idmap = importer._IdMap()
+        idmap.bulk_add([("source", "source_old")], {"source_old"})
+        idmap.freeze()
+        assert idmap.remap("source", "source_old")  # known key still resolves
+        with pytest.raises(RuntimeError, match="frozen"):
+            idmap.remap("source", "source_never_seen")
+
+    async def test_generated_ids_avoid_archive_ids(self, monkeypatch):
+        """A generated id colliding with an archived one would be rewritten
+        again by substitute; colliding with another generated id would be a
+        primary-key violation."""
+        minted = iter(["source_collide", "source_dupe", "source_dupe", "source_ok"])
+        monkeypatch.setattr(importer, "generate_id", lambda kind: next(minted))
+        idmap = importer._IdMap()
+        idmap.bulk_add([("source", "a"), ("source", "b")], {"source_collide"})
+        assert idmap.remap("source", "a") == "source_dupe"
+        assert idmap.remap("source", "b") == "source_ok"
+
+
+class TestAuditRestore:
+    async def test_target_id_resolves_to_the_new_entity(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        await _add(
+            store,
+            pg.AuditLog,
+            case_id=case.id,
+            action="source.upload",
+            target_type="source",
+            target_id=src.id,
+        )
+        # A target the archive never carries must survive untouched.
+        await _add(
+            store,
+            pg.AuditLog,
+            case_id=case.id,
+            action="team.member.add",
+            target_type="team",
+            target_id="team_elsewhere",
+        )
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        async with store.session_factory() as s:
+            new_src = (
+                await s.execute(select(pg.Source).where(pg.Source.case_id == result.case_id))
+            ).scalar_one()
+            rows = (
+                (await s.execute(select(pg.AuditLog).where(pg.AuditLog.case_id == result.case_id)))
+                .scalars()
+                .all()
+            )
+        by_action = {r.action: r for r in rows}
+        assert by_action["source.upload"].target_id == new_src.id
+        assert by_action["source.upload"].target_id != src.id
+        assert by_action["team.member.add"].target_id == "team_elsewhere"
+
+    async def test_every_restored_row_is_stamped_as_imported(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        # detail=None in the archive must get a fresh dict, not crash.
+        await _add(store, pg.AuditLog, case_id=case.id, action="case.read", detail=None)
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(
+            store, lambda: FakeClickHouse(), archive, owner=bob, job_id="job-1"
+        )
+
+        async with store.session_factory() as s:
+            rows = (
+                (await s.execute(select(pg.AuditLog).where(pg.AuditLog.case_id == result.case_id)))
+                .scalars()
+                .all()
+            )
+        assert rows
+        for row in rows:
+            marker = row.detail["imported"]
+            assert marker["job_id"] == "job-1"
+            assert marker["by"] == "bob"
+            assert marker["archive_case_id"] == case.id
+            assert marker["at"]
+            # The archive's own attribution is preserved beside the stamp.
+            assert row.user_id is None
+
+
+class TestForwardReferences:
+    async def test_payload_reference_to_a_later_stem_is_rewritten(self, store, tmp_path):
+        """saved_charts revives before annotations, so a chart config embedding
+        an annotation id only resolves because the map is built up front."""
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, tl = await _rich_case(store, alice.id)
+        ann = await _add(
+            store,
+            pg.Annotation,
+            case_id=case.id,
+            source_id=src.id,
+            event_id="evt-9",
+            annotation_type="comment",
+            content="pinned",
+        )
+        async with store.session_factory() as s:
+            chart = (
+                await s.execute(select(pg.SavedChart).where(pg.SavedChart.case_id == case.id))
+            ).scalar_one()
+            chart.config = {"pinned_annotation": ann.id}
+            await s.commit()
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        async with store.session_factory() as s:
+            new_chart = (
+                await s.execute(
+                    select(pg.SavedChart).where(pg.SavedChart.case_id == result.case_id)
+                )
+            ).scalar_one()
+            new_ann = (
+                await s.execute(
+                    select(pg.Annotation).where(
+                        pg.Annotation.case_id == result.case_id, pg.Annotation.event_id == "evt-9"
+                    )
+                )
+            ).scalar_one()
+        assert new_chart.config["pinned_annotation"] == new_ann.id
+        assert new_chart.config["pinned_annotation"] != ann.id
+
+
+class TestMalformedArchives:
+    """case.json and user_refs.json go straight into Postgres, so they are
+    type-checked before anything is created."""
+
+    @pytest.mark.parametrize(
+        ("member", "payload", "message"),
+        [
+            ("postgres/case.json", {"id": "case_a", "name": 42}, "case.name"),
+            ("postgres/case.json", {"id": "case_a", "name": "  "}, "case.name"),
+            ("postgres/case.json", {"name": "ok"}, "case.id"),
+            (
+                "postgres/case.json",
+                {"id": "case_a", "name": "ok", "description": ["nope"]},
+                "case.description",
+            ),
+            ("postgres/user_refs.json", ["not", "a", "dict"], "not a JSON object"),
+            ("postgres/user_refs.json", {"users": {"u1": 5}}, "user_refs.users"),
+            ("postgres/user_refs.json", {"users": {}, "team": 7}, "user_refs.team"),
+        ],
+    )
+    async def test_bad_metadata_aborts_before_the_case_is_created(
+        self, store, tmp_path, member, payload, message
+    ):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        _rewrite_member(archive, {member: json.dumps(payload).encode()})
+        before = await _count(store, pg.Case)
+
+        with pytest.raises(ArchiveFormatError, match=message):
+            await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        assert await _count(store, pg.Case) == before
+
+
+class TestWarningBounds:
+    async def test_warnings_are_capped_with_a_summary_line(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        # Each unknown created_by user yields one warning.
+        for i in range(archive_mod.MAX_WARNINGS + 10):
+            await _add(
+                store,
+                pg.Annotation,
+                case_id=case.id,
+                source_id=src.id,
+                event_id=f"evt-{i}",
+                annotation_type="comment",
+                content="note",
+                created_by=f"ghost-{i}",
+            )
+            await _add(store, pg.User, id=f"ghost-{i}", username=f"ghost-{i}", is_active=True)
+        archive = await _export(store, case, src, tmp_path)
+        async with store.session_factory() as s:
+            await s.execute(delete(pg.User).where(pg.User.username.like("ghost-%")))
+            await s.commit()
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        assert len(result.warnings) == archive_mod.MAX_WARNINGS + 1
+        assert result.warnings[-1].startswith("…and ")
+
+
+class TestBlobFiltering:
+    async def test_blob_no_source_references_is_not_retained(self, store, tmp_path, monkeypatch):
+        """The retention dir is instance-global; an archive must not be able to
+        plant files there that none of its sources claim."""
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retention"))
+        get_settings.cache_clear()
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        # Content-addressed: the retained blob has to hash to the source's
+        # file_hash, or the importer rejects it for a different reason.
+        content = b"real source bytes"
+        real_hash = hashlib.sha256(content).hexdigest()
+        case = await _add(store, pg.Case, name="Blobs", owner_id=alice.id)
+        src = await _add(store, pg.Source, case_id=case.id, name="src", file_hash=real_hash)
+        blob = retention_path(real_hash)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(content)
+
+        fake = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id, n=1)})
+        exported = await export_case(
+            store,
+            lambda: fake,
+            case.id,
+            include_blobs=True,
+            exported_by="alice",
+            dest_dir=tmp_path,
+        )
+        stowaway = b"unreferenced payload"
+        sha = hashlib.sha256(stowaway).hexdigest()
+        _rewrite_member(exported.path, {f"blobs/{sha}": stowaway})
+        # The stowaway has to be manifest-listed to be read at all.
+        with zipfile.ZipFile(exported.path) as zin:
+            items = {i.filename: zin.read(i.filename) for i in zin.infolist()}
+        manifest = json.loads(items["manifest.json"])
+        manifest["members"].append({"path": f"blobs/{sha}", "sha256": sha, "bytes": len(stowaway)})
+        items["manifest.json"] = json.dumps(manifest, indent=2).encode()
+        with zipfile.ZipFile(exported.path, "w") as zout:
+            for name, data in items.items():
+                zout.writestr(name, data)
+
+        result = await import_case(store, lambda: FakeClickHouse(), exported.path, owner=alice)
+
+        assert not retention_path(sha).exists()
+        assert any("no source references" in w for w in result.warnings)
+        assert result.counts["blobs"] == 1  # the legitimate one still landed

@@ -9,10 +9,11 @@ partitions) before the error propagates.
 
 Memory: events stream batch-by-batch, but each Postgres stem is read and
 revived whole before it is flushed, so peak memory scales with the largest
-single entity (usually annotations or audit_log). That is fine for the
-single-process deployment this targets; if a case ever outgrows it, chunk the
-per-stem loop rather than reworking the id remap, which needs the full map
-resolved before dependent stems are revived.
+single entity (usually annotations or audit_log). The id prescan reads the
+same stems one at a time and keeps only id strings, so it does not raise that
+ceiling. All fine for the single-process deployment this targets; if a case
+ever outgrows it, chunk the per-stem revive loop — the prescan already
+resolves the full id map up front, which is what dependent stems need.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -55,9 +57,14 @@ from vestigo.db.postgres import (
     View,
     generate_id,
 )
-from vestigo.transfer.archive import ArchiveFormatError, ArchiveReader
+from vestigo.transfer.archive import ArchiveFormatError, ArchiveReader, cap_warnings
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+# Usernames per `IN (...)` when resolving the archive's user map (see
+# _resolve_users). Keeps one query per batch well inside Postgres' parameter
+# limits regardless of how many users the archive claims.
+_USER_LOOKUP_BATCH = 1000
 
 # Insertion order = dependency order. Refs map column → remap kind.
 _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
@@ -140,39 +147,97 @@ class ImportResult:
 
 
 class _IdMap:
-    """Old archive id → new local id, keyed by (kind, old id)."""
+    """Old archive id → new local id, keyed by (kind, old id).
+
+    Built in full by :func:`_prescan_ids` before any row is revived, then
+    frozen. That is a performance requirement, not a style choice — see
+    ``substitute``.
+    """
 
     def __init__(self) -> None:
         self._map: dict[tuple[str, str], str] = {}
         self._pattern: re.Pattern[str] | None = None
         self._by_old: dict[str, str] = {}
+        self._new_ids: set[str] = set()
+        self._frozen = False
+        # Number of times the substitution alternation has been compiled.
+        # Asserted by the tests: it must stay at 1 for a whole import.
+        self.compiles = 0
 
     def remap(self, kind: str, old: Any) -> Any:
         if old is None:
             return None
         key = (kind, str(old))
         if key not in self._map:
-            self._set(key, generate_id(kind))
+            if self._frozen:
+                raise RuntimeError(
+                    f"id map is frozen but {key} is unmapped — _prescan_ids missed a ref column"
+                )
+            self._set(key, self._fresh_id(kind))
         return self._map[key]
+
+    def lookup(self, old: Any) -> Any:
+        """Existing mapping for an id whose kind is not known statically.
+
+        ``audit_log.target_id`` spans sources, timelines, annotations, teams
+        and users, so the static ``refs`` mechanism cannot express it. Archive
+        ids are globally unique (``generate_id`` appends a random suffix), so
+        the kind is not needed to resolve one. Unmapped values pass through —
+        ``target_id`` also holds ids of entities the archive never carried
+        (teams, users, agent tokens) and non-id targets.
+        """
+        return old if old is None else self._by_old.get(str(old), old)
 
     def pin(self, kind: str, old: Any, new: str) -> None:
         """Force a mapping (the case id is created before the rows are read)."""
         self._set((kind, str(old)), new)
 
+    def bulk_add(self, pairs: list[tuple[str, str]], old_ids: set[str]) -> None:
+        """Add every ``(kind, old id)`` seen in the archive in one go.
+
+        ``old_ids`` is every id string the archive mentions. A generated id
+        colliding with one would be rewritten again by ``substitute``; one
+        colliding with an already-generated id would be a primary-key
+        violation at flush. ``generate_id`` appends only 8 hex characters, so
+        at tens of thousands of rows of one kind neither is negligible —
+        cheap to rule out here rather than to debug later.
+        """
+        for kind, old in pairs:
+            key = (kind, old)
+            if key not in self._map:
+                self._set(key, self._fresh_id(kind, avoid=old_ids))
+
+    def freeze(self) -> None:
+        """No new mappings from here on; ``remap`` raises instead of adding."""
+        self._frozen = True
+
+    def _fresh_id(self, kind: str, avoid: set[str] | None = None) -> str:
+        new = generate_id(kind)
+        while new in self._new_ids or new in self._by_old or (avoid and new in avoid):
+            new = generate_id(kind)
+        return new
+
     def _set(self, key: tuple[str, str], new: str) -> None:
         self._map[key] = new
         self._by_old[key[1]] = new
+        self._new_ids.add(new)
         self._pattern = None  # rebuilt lazily on the next payload rewrite
 
     def substitute(self, text: str) -> str:
         """Rewrite every known old id appearing anywhere in ``text``.
 
         One pass over the text via a single alternation, so a freshly written
-        id can never be rewritten again by a later mapping — ``generate_id``
-        only appends 8 hex characters, which is not enough entropy to dismiss
-        that cascade. Ids also appear inside longer strings (filter
-        expressions, not just whole JSON values), so this stays substring-level
-        rather than matching whole values.
+        id can never be rewritten again by a later mapping. Ids also appear
+        inside longer strings (filter expressions, not just whole JSON
+        values), so this stays substring-level rather than matching whole
+        values.
+
+        The alternation is expensive to build and cheap to apply — measured,
+        200k ids compile in ~2s and substitution is then free. Adding a
+        mapping invalidates it, so the map must be complete *before* the
+        revive loop starts: growing it row by row recompiled once per row and
+        made import quadratic (14s for 1600 audit rows). ``freeze`` is what
+        keeps that from creeping back.
         """
         if not self._by_old:
             return text
@@ -180,14 +245,75 @@ class _IdMap:
             self._pattern = re.compile(
                 "|".join(re.escape(old) for old in sorted(self._by_old, key=len, reverse=True))
             )
+            self.compiles += 1
         return self._pattern.sub(lambda m: self._by_old[m.group(0)], text)
+
+
+def _prescan_ids(reader: ArchiveReader, idmap: _IdMap) -> None:
+    """Populate the id map from every stem before any row is revived.
+
+    Two reasons this is a separate pass. Performance: ``substitute`` compiles
+    one alternation over the whole map, so a map that grows during the revive
+    loop recompiles per row (see ``_IdMap.substitute``). Correctness: rewriting
+    embedded ids used to see only the mappings made so far, so a chart config
+    embedding an annotation id survived unrewritten — charts revive before
+    annotations.
+
+    Memory is unchanged: each stem is read and discarded one at a time, same as
+    the revive loop, and only the id strings are retained. The cost is one
+    extra NDJSON parse per stem.
+    """
+    pairs: list[tuple[str, str]] = []
+    old_ids: set[str] = set()
+    for stem, _model, refs in _IMPORT_SPECS:
+        for row in reader.read_ndjson(f"postgres/{stem}.ndjson"):
+            for column, kind in refs.items():
+                value = row.get(column)
+                if value is not None:
+                    pairs.append((kind, str(value)))
+                    old_ids.add(str(value))
+    idmap.bulk_add(pairs, old_ids)
+    idmap.freeze()
+
+
+def _validated_case(data: Any) -> dict[str, Any]:
+    """Type-check the archive's case record before it reaches ``create_case``.
+
+    An archive is an untrusted upload, and these three fields are the ones
+    that go straight into Postgres. Failing here surfaces as a clean
+    ArchiveFormatError instead of a TypeError from inside the flush.
+    """
+    if not isinstance(data, dict):
+        raise ArchiveFormatError("postgres/case.json is not a JSON object")
+    for key in ("id", "name"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            raise ArchiveFormatError(f"case.{key} must be a non-empty string")
+    if data.get("description") is not None and not isinstance(data["description"], str):
+        raise ArchiveFormatError("case.description must be a string or null")
+    return data
+
+
+def _validated_user_refs(data: Any) -> dict[str, Any]:
+    """Type-check the archived user id → username map and team name."""
+    if not isinstance(data, dict):
+        raise ArchiveFormatError("postgres/user_refs.json is not a JSON object")
+    users = data.get("users")
+    if users is None:
+        users = {}
+    if not isinstance(users, dict) or any(
+        not isinstance(k, str) or not isinstance(v, str) for k, v in users.items()
+    ):
+        raise ArchiveFormatError("user_refs.users must map string ids to string usernames")
+    if data.get("team") is not None and not isinstance(data["team"], str):
+        raise ArchiveFormatError("user_refs.team must be a string or null")
+    return {**data, "users": users}
 
 
 def _remap_json_ids(value: Any, idmap: _IdMap) -> Any:
     """Rewrite archived ids embedded in a JSON payload (proposal events, view
-    filters, chart configs) through the old→new map. Only mappings known so far
-    apply — sources and timelines revive before the views/charts/proposals that
-    embed their ids."""
+    filters, chart configs) through the old→new map. The map is complete before
+    the revive loop starts (``_prescan_ids``), so a payload's references are
+    rewritten regardless of the order its stem revives in."""
     return json.loads(idmap.substitute(json.dumps(value)))
 
 
@@ -247,6 +373,7 @@ async def import_case(
     archive_path: Path,
     *,
     owner: User,
+    job_id: str | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> ImportResult:
     """Restore an archive as a new case owned by `owner`. All-or-nothing."""
@@ -263,15 +390,24 @@ async def import_case(
     # importer — and a member the exporter always writes cannot go missing
     # without failing the import.
     verified = reader.verified_names
-    case_data = reader.read_json("postgres/case.json")
-    user_refs = reader.read_json("postgres/user_refs.json")
+    case_data = _validated_case(reader.read_json("postgres/case.json"))
+    user_refs = _validated_user_refs(reader.read_json("postgres/user_refs.json"))
 
     counts: dict[str, int] = {"events": 0, "blobs": 0}
     warnings: list[str] = []
     idmap = _IdMap()
     new_case_id = generate_id("case")
-    # Pin the case remap to the id we actually create with.
+    # Pin the case remap to the id we actually create with, then resolve every
+    # other id in one pass — the revive loop must not grow the map (see
+    # _prescan_ids).
     idmap.pin("case", case_data["id"], new_case_id)
+    _prescan_ids(reader, idmap)
+    import_marker = {
+        "job_id": job_id,
+        "by": owner.username,
+        "at": datetime.now(UTC).isoformat(),
+        "archive_case_id": case_data["id"],
+    }
 
     created = False
     inserted_sources: list[str] = []
@@ -331,12 +467,24 @@ async def import_case(
                         obj.user_id = _local_user(row.get("user_id"))
                     elif isinstance(obj, AuditLog):
                         obj.user_id = None  # username_snapshot carries attribution
+                        # target_id spans every entity type, so no static ref
+                        # column can cover it; resolve it kind-agnostically.
+                        # Left unremapped, a restored audit trail would point
+                        # at ids that exist nowhere on this instance.
+                        obj.target_id = idmap.lookup(row.get("target_id"))
+                        # Actor, action and timestamp are restored verbatim so
+                        # the chain of custody survives the move — but nothing
+                        # here vouches for them, and any authenticated user can
+                        # upload an archive. Stamp every row so an auditor can
+                        # tell a local action from one an archive asserted.
+                        detail = obj.detail if isinstance(obj.detail, dict) else {}
+                        obj.detail = {**detail, "imported": import_marker}
                     # created_by holds user ids: remap via user_refs (username
                     # → local id, importer fallback + warning). Values absent
                     # from user_refs are not user ids (e.g. system origins) —
                     # keep them verbatim, no warning.
                     created_by = getattr(obj, "created_by", None)
-                    if created_by is not None and str(created_by) in (user_refs.get("users") or {}):
+                    if created_by is not None and str(created_by) in user_refs["users"]:
                         obj.created_by = _local_user(created_by)
                     session.add(obj)
                 await session.flush()
@@ -367,10 +515,18 @@ async def import_case(
         blob_members = [n for n in verified if n.startswith("blobs/")]
         if blob_members:
             _progress("blobs")
+        # The retention dir is instance-global, so only blobs an archived
+        # source actually claims may land in it. Content is verified against
+        # the member name below, which stops an existing blob being poisoned;
+        # this stops an archive planting unrelated files there at all.
+        referenced = {row["file_hash"] for row in source_rows}
         for arcname in blob_members:
             sha = arcname.removeprefix("blobs/")
             if not _SHA256_RE.fullmatch(sha):
                 warnings.append(f"skipping suspicious blob member: {arcname}")
+                continue
+            if sha not in referenced:
+                warnings.append(f"ignoring blob no source references: {sha[:12]}…")
                 continue
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
@@ -389,10 +545,15 @@ async def import_case(
             finally:
                 tmp_path.unlink(missing_ok=True)
         blobbed = {n.removeprefix("blobs/") for n in blob_members}
-        for row in source_rows:
-            if blob_members and row["file_hash"] not in blobbed:
+        if blob_members:
+            # Deduped by hash, not per source row: sources share blobs, and one
+            # warning per row would flood a job result that rides into the
+            # audit detail JSON.
+            missing = sorted({row["file_hash"] for row in source_rows} - blobbed)
+            for file_hash in missing:
                 warnings.append(
-                    f"no blob in archive for source {row['name']} — events restored, original file absent"
+                    f"no blob in archive for {file_hash[:12]}… — events restored, "
+                    "original file absent"
                 )
 
         if clickhouse is not None and inserted_sources:
@@ -417,7 +578,7 @@ async def import_case(
     finally:
         reader.close()
 
-    return ImportResult(case_id=new_case_id, counts=counts, warnings=warnings)
+    return ImportResult(case_id=new_case_id, counts=counts, warnings=cap_warnings(warnings))
 
 
 async def _resolve_users(
@@ -429,16 +590,20 @@ async def _resolve_users(
     """Archived user id → local user id, via username. One query, one warning
     per username that this instance does not know (falls back to the importer).
     """
-    archived: dict[str, str] = user_refs.get("users") or {}
+    archived: dict[str, str] = user_refs["users"]
     if not archived:
         return {}
-    local_ids = dict(
-        (
-            await session.execute(
-                select(User.username, User.id).where(User.username.in_(set(archived.values())))
-            )
-        ).all()
-    )
+    # Batched: an archive can declare an arbitrarily large user map, and one
+    # unbounded IN (...) is a cheap way to make Postgres do too much work.
+    local_ids: dict[str, str] = {}
+    for batch in batched(sorted(set(archived.values())), _USER_LOOKUP_BATCH, strict=False):
+        local_ids.update(
+            (
+                await session.execute(
+                    select(User.username, User.id).where(User.username.in_(batch))
+                )
+            ).all()
+        )
     for username in sorted(set(archived.values()) - set(local_ids)):
         warnings.append(f"user {username} not found on this instance — attributed to importer")
     return {old_id: local_ids.get(username, owner.id) for old_id, username in archived.items()}
