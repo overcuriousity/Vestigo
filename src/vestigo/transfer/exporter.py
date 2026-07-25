@@ -183,6 +183,11 @@ async def _snapshot_postgres(store: PostgresStore, case_id: str) -> dict[str, An
 
         user_ids = {case.owner_id} if case.owner_id else set()
         user_ids |= {r["user_id"] for r in stems["agent_conversations"] if r.get("user_id")}
+        # created_by stores user ids (annotations, dispositions, sigma, …) —
+        # collect them so authors map by username on import. Values that are
+        # not user ids (system origins) simply resolve to no row below.
+        for rows in stems.values():
+            user_ids |= {r["created_by"] for r in rows if r.get("created_by")}
         users: dict[str, str] = {}
         if user_ids:
             pairs = (
@@ -222,10 +227,23 @@ async def export_case(
     _progress("postgres")
     snapshot = await _snapshot_postgres(store, case_id)
     stems = snapshot["stems"]
+    warnings: list[str] = []
+    # Mid-ingest sources (status != "ready") must not ship: their events are
+    # still being written, so both the NDJSON rows and the events/blobs loops
+    # skip them. Analysts re-export after ingest completes.
+    ready_sources = []
+    for source in stems["sources"]:
+        if source.get("status") == "ready":
+            ready_sources.append(source)
+        else:
+            warnings.append(
+                f"source {source['name']} not ready (status={source.get('status')})"
+                " — excluded from export"
+            )
+    stems["sources"] = ready_sources
     counts: dict[str, int] = {stem: len(rows) for stem, rows in stems.items()}
     counts["events"] = 0
     counts["blobs"] = 0
-    warnings: list[str] = []
 
     archive_path = dest_dir / f"export-{case_id}.vestigo"
     writer = ArchiveWriter(archive_path)

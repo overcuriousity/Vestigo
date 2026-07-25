@@ -6,13 +6,17 @@ the shared fakes from tests/transfer_fakes.py.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import zipfile
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
+from vestigo.core.config import get_settings
+from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
 from vestigo.transfer.archive import ArchiveFormatError
 from vestigo.transfer.exporter import export_case
@@ -25,7 +29,7 @@ async def _schema(store):
     await store.init_schema()
 
 
-async def _rich_case(store, owner_id):
+async def _rich_case(store, owner_id, annotation_author=None):
     case = await _add(store, pg.Case, name="Roundtrip", owner_id=owner_id)
     src = await _add(store, pg.Source, case_id=case.id, name="src", file_hash="ab" * 32)
     tl = await _add(
@@ -52,6 +56,7 @@ async def _rich_case(store, owner_id):
         event_id="evt-1",
         annotation_type="comment",
         content="note",
+        created_by=annotation_author,
     )
     await _add(store, pg.SigmaRule, case_id=case.id)
     await _add(store, pg.SigmaRun, case_id=case.id, timeline_id=tl.id)
@@ -65,7 +70,15 @@ async def _rich_case(store, owner_id):
         user_id="ghost-user-id",  # not a user on this instance → fallback
     )
     await _add(store, pg.AgentMessage, conversation_id=conv.id)
-    await _add(store, pg.AgentProposal, case_id=case.id, conversation_id=conv.id, timeline_id=tl.id)
+    # events entries mirror agent/tools.py: {"source_id": ..., "event_id": ...}
+    await _add(
+        store,
+        pg.AgentProposal,
+        case_id=case.id,
+        conversation_id=conv.id,
+        timeline_id=tl.id,
+        events=[{"event_id": "evt-1", "source_id": src.id}],
+    )
     await _add(store, pg.AuditLog, case_id=case.id, user_id=owner_id, username_snapshot="alice")
     return case, src, tl
 
@@ -86,6 +99,25 @@ async def _export(store, case, src, tmp_path, rows=2):
 async def _count(store, model) -> int:
     async with store.session_factory() as session:
         return (await session.execute(select(func.count()).select_from(model))).scalar_one()
+
+
+def _rewrite_member(archive, replacements: dict[str, bytes]):
+    """Rewrite a zip with replaced member contents, fixing the manifest entry
+    for each replacement so verify_members still passes (the attack is a
+    filename/content mismatch, not manifest tampering)."""
+    with zipfile.ZipFile(archive) as zin:
+        items = {i.filename: zin.read(i.filename) for i in zin.infolist()}
+    items.update(replacements)
+    manifest = json.loads(items["manifest.json"])
+    for member in manifest["members"]:
+        if member["path"] in replacements:
+            data = replacements[member["path"]]
+            member["sha256"] = hashlib.sha256(data).hexdigest()
+            member["bytes"] = len(data)
+    items["manifest.json"] = json.dumps(manifest, indent=2).encode()
+    with zipfile.ZipFile(archive, "w") as zout:
+        for name, data in items.items():
+            zout.writestr(name, data)
 
 
 class TestRoundTrip:
@@ -169,6 +201,8 @@ class TestRoundTrip:
                 )
             ).scalar_one()
             assert new_proposal.timeline_id == new_tl.id
+            # Ids embedded in JSON payloads are remapped too.
+            assert new_proposal.events == [{"event_id": "evt-1", "source_id": new_src.id}]
 
             new_audit = (
                 await s.execute(select(pg.AuditLog).where(pg.AuditLog.case_id == result.case_id))
@@ -250,3 +284,120 @@ class TestFailureCleanup:
             await import_case(store, lambda: fake, archive, owner=alice)
         assert await _count(store, pg.Case) == cases_before
         assert fake.deleted, "event partition cleanup must run for inserted sources"
+
+
+class TestArchiveMemberTrust:
+    """Archive members outside the manifest's verified set are never read, and
+    a blob's content must hash to its content-addressed member name before it
+    may reach the instance-global retention dir."""
+
+    async def test_blob_content_must_match_member_name(self, store, tmp_path, monkeypatch):
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            case = await _add(store, pg.Case, name="Blobbed", owner_id=alice.id)
+            file_hash = "ab" * 32
+            src = await _add(store, pg.Source, case_id=case.id, name="s", file_hash=file_hash)
+            blob = retention_path(file_hash)
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(b"original file bytes")
+            fake = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id, n=1)})
+            result = await export_case(
+                store,
+                lambda: fake,
+                case.id,
+                include_blobs=True,
+                exported_by="alice",
+                dest_dir=tmp_path / "out",
+            )
+            archive = result.path
+            # The importer must re-retain from the archive, not short-circuit
+            # on the already-retained original.
+            blob.unlink()
+
+            # Manifest sha256 recomputed for the poisoned bytes — only the
+            # content-addressed name no longer matches the content.
+            _rewrite_member(archive, {f"blobs/{file_hash}": b"poisoned bytes"})
+
+            with pytest.raises(ArchiveFormatError, match="blob"):
+                await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+            assert not retention_path(file_hash).exists()
+        finally:
+            get_settings.cache_clear()
+
+    async def test_unlisted_archive_members_are_ignored(self, store, tmp_path, monkeypatch):
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            case, src, _ = await _rich_case(store, alice.id)
+            archive = await _export(store, case, src, tmp_path)
+            ghost_hash = "ee" * 32
+            # Zip members NOT listed in manifest["members"]: unverified by
+            # definition, so the importer must not read either one. The ghost
+            # blob would otherwise land in the instance-global retention dir.
+            with zipfile.ZipFile(archive, "a") as z:
+                z.writestr("events/ghost.arrow", b"not arrow data at all")
+                z.writestr(f"blobs/{ghost_hash}", b"ghost blob content")
+
+            target = FakeClickHouse()
+            result = await import_case(store, lambda: target, archive, owner=alice)
+
+            assert result.counts["events"] == 2  # only the real source's rows
+            assert len(target.inserted) == 1
+            assert all("ghost" not in source_id for _, source_id in target.inserted)
+            assert result.counts["blobs"] == 0
+            assert not retention_path(ghost_hash).exists()
+        finally:
+            get_settings.cache_clear()
+
+
+class TestCreatedByAttribution:
+    """created_by holds user ids: mapped via user_refs by username with
+    importer fallback; non-user values (system origins) pass through verbatim."""
+
+    async def _restored_annotation(self, store, case_id):
+        async with store.session_factory() as s:
+            return (
+                await s.execute(select(pg.Annotation).where(pg.Annotation.case_id == case_id))
+            ).scalar_one()
+
+    async def test_created_by_maps_through_username(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, bob.id, annotation_author=alice.id)
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=bob)
+
+        new_ann = await self._restored_annotation(store, result.case_id)
+        assert new_ann.created_by == alice.id
+        assert not any("alice" in w for w in result.warnings)
+
+    async def test_created_by_falls_back_to_importer_with_warning(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, bob.id, annotation_author=alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        # alice is gone from this instance before the archive lands.
+        async with store.session_factory() as s:
+            await s.execute(delete(pg.User).where(pg.User.id == alice.id))
+            await s.commit()
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=bob)
+
+        new_ann = await self._restored_annotation(store, result.case_id)
+        assert new_ann.created_by == bob.id
+        assert any("alice" in w for w in result.warnings)
+
+    async def test_non_user_created_by_kept_verbatim(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id, annotation_author="system")
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        new_ann = await self._restored_annotation(store, result.case_id)
+        assert new_ann.created_by == "system"
+        assert not any("system" in w for w in result.warnings)

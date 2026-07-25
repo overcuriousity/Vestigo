@@ -100,6 +100,39 @@ class TestRejection:
             reader.extract_to("../escape", tmp_path / "out")
         reader.close()
 
+    def test_bool_format_version_rejected(self, tmp_path):
+        path = tmp_path / "boolversion.vestigo"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("postgres/case.json", "{}")
+            # JSON true must not satisfy the integer version check.
+            z.writestr("manifest.json", json.dumps({"format_version": True, "members": []}))
+        with pytest.raises(ArchiveFormatError, match="format_version"):
+            ArchiveReader(path)
+
+    def test_members_must_be_list_of_objects(self, tmp_path):
+        path = tmp_path / "badmembers.vestigo"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("postgres/case.json", "{}")
+            z.writestr(
+                "manifest.json",
+                json.dumps({"format_version": FORMAT_VERSION, "members": {}}),
+            )
+        with pytest.raises(ArchiveFormatError, match="members"):
+            ArchiveReader(path)
+
+    def test_member_entries_need_str_path_and_sha256(self, tmp_path):
+        path = tmp_path / "badmemberentries.vestigo"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("postgres/case.json", "{}")
+            z.writestr(
+                "manifest.json",
+                json.dumps(
+                    {"format_version": FORMAT_VERSION, "members": [{"path": "x", "sha256": 7}]}
+                ),
+            )
+        with pytest.raises(ArchiveFormatError, match="members"):
+            ArchiveReader(path)
+
 
 def test_temp_root_and_archive_path(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))

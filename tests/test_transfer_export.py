@@ -182,6 +182,43 @@ async def test_export_missing_blob_warns_not_fails(store, tmp_path, monkeypatch)
         get_settings.cache_clear()
 
 
+async def test_export_skips_sources_not_ready(store, tmp_path):
+    """A mid-ingest source (status != ready) must not ship: neither in the
+    sources NDJSON rows nor in the events loop — with a warning naming it."""
+    owner = await _add(store, pg.User, username="frank", is_admin=False, is_active=True)
+    case = await _add(store, pg.Case, name="Partial", owner_id=owner.id)
+    ready = await _add(store, pg.Source, case_id=case.id, name="ready-src", file_hash="ab" * 32)
+    ingesting = await _add(
+        store, pg.Source, case_id=case.id, name="mid-src", file_hash="cd" * 32, status="ingesting"
+    )
+    fake_ch = FakeClickHouse(
+        {
+            (case.id, ready.id): _event_rows(case.id, ready.id, n=1),
+            (case.id, ingesting.id): _event_rows(case.id, ingesting.id, n=1),
+        }
+    )
+
+    result = await export_case(
+        store,
+        lambda: fake_ch,
+        case.id,
+        include_blobs=False,
+        exported_by="frank",
+        dest_dir=tmp_path,
+    )
+
+    assert result.counts["sources"] == 1
+    assert result.counts["events"] == 1
+    assert any("mid-src" in w for w in result.warnings)
+    reader = ArchiveReader(result.path)
+    rows = reader.read_ndjson("postgres/sources.ndjson")
+    assert [r["name"] for r in rows] == ["ready-src"]
+    names = reader.member_names()
+    assert f"events/{ready.id}.arrow" in names
+    assert not any(ingesting.id in n for n in names)
+    reader.close()
+
+
 async def test_export_event_null_timestamp_and_nul_padded_hash(store, tmp_path):
     """Rows without a parseable timestamp re-encode as NULL_TS_SENTINEL;
     FixedString NUL padding is stripped from hash fields (ClickHouse dtypes)."""

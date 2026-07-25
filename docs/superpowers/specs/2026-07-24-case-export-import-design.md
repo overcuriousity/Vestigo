@@ -106,7 +106,7 @@ Steps inside the job:
    as a case-scoped entity).
 2. Per source: stream `iter_source_events(case_id, source_id)` → Arrow IPC
    file member.
-3. `include_blobs`: add each source's retained blob via `_retention_path`
+3. `include_blobs`: add each source's retained blob via `retention_path`
    (hardlink-or-copy semantics unchanged; missing blob = warning, not failure).
 4. Hash every member as written; write `manifest.json` last.
 5. Archive lands in a per-job temp dir; `job.result = {bytes, counts, warnings}`.

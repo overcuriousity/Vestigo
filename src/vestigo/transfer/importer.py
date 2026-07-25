@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import tempfile
 from collections.abc import Callable
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from sqlalchemy import delete, select
+from sqlalchemy import JSON, delete, select
 
 from vestigo.core.retention import retain_file, retention_path
 from vestigo.db.field_stats import refresh_source_field_stats
@@ -47,7 +48,7 @@ from vestigo.db.postgres import (
     View,
     generate_id,
 )
-from vestigo.transfer.archive import ArchiveReader
+from vestigo.transfer.archive import ArchiveFormatError, ArchiveReader
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -144,6 +145,19 @@ class _IdMap:
         return self._map[key]
 
 
+def _remap_json_ids(value: Any, idmap: _IdMap) -> Any:
+    """Rewrite archived ids embedded in a JSON payload (proposal events, view
+    filters, chart configs) through the old→new map. String-level replace over
+    the serialized form; ids are 64-char random-suffixed strings, so substring
+    collision is a non-issue. Only mappings known so far apply — sources and
+    timelines revive before the views/charts/proposals that embed their ids."""
+    text = json.dumps(value)
+    for (_kind, old), new in idmap._map.items():
+        if old in text:
+            text = text.replace(old, new)
+    return json.loads(text)
+
+
 def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str]) -> Any:
     """Build an ORM object from an archived row with remapped refs."""
     values: dict[str, Any] = {}
@@ -151,6 +165,8 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
         value = row.get(col.name)
         if col.name in refs:
             value = idmap.remap(refs[col.name], value)
+        elif isinstance(col.type, JSON) and value is not None:
+            value = _remap_json_ids(value, idmap)
         if isinstance(value, str):
             # Some column types raise NotImplementedError on python_type —
             # treat those as pass-through (leave the archived value as-is).
@@ -205,7 +221,9 @@ async def import_case(
     reader.verify_members()  # raises before ANY write
     case_data = reader.read_json("postgres/case.json")
     user_refs = reader.read_json("postgres/user_refs.json")
-    member_names = set(reader.member_names())
+    # Only manifest-listed members are hash-verified; anything else in the
+    # zip (unlisted members) is untrusted and must never be read.
+    verified = {m["path"] for m in reader.manifest["members"]}
 
     counts: dict[str, int] = {"events": 0, "blobs": 0}
     warnings: list[str] = []
@@ -248,13 +266,22 @@ async def import_case(
                         )
                     elif isinstance(obj, AuditLog):
                         obj.user_id = None  # username_snapshot carries attribution
+                    # created_by holds user ids: remap via user_refs (username
+                    # → local id, importer fallback + warning). Values absent
+                    # from user_refs are not user ids (e.g. system origins) —
+                    # keep them verbatim, no warning.
+                    created_by = getattr(obj, "created_by", None)
+                    if created_by is not None and str(created_by) in (user_refs.get("users") or {}):
+                        obj.created_by = await _map_user(
+                            session, user_refs, created_by, owner, warnings
+                        )
                     session.add(obj)
                 await session.flush()
             await session.commit()
 
         source_rows = reader.read_ndjson("postgres/sources.ndjson")
         event_members = [
-            n for n in member_names if n.startswith("events/") and n.endswith(".arrow")
+            n for n in verified if n.startswith("events/") and n.endswith(".arrow")
         ]
         if event_members:
             _progress("events")
@@ -262,7 +289,7 @@ async def import_case(
         for row in source_rows:
             new_source_id = idmap.remap("source", row["id"])
             arcname = f"events/{row['id']}.arrow"
-            if arcname in member_names:
+            if arcname in verified:
                 # Track BEFORE inserting: a mid-source failure may leave a
                 # partially written partition, and cleanup must drop it.
                 inserted_sources.append(new_source_id)
@@ -271,7 +298,7 @@ async def import_case(
                 )
                 counts["events"] += n
 
-        blob_members = [n for n in member_names if n.startswith("blobs/")]
+        blob_members = [n for n in verified if n.startswith("blobs/")]
         if blob_members:
             _progress("blobs")
         for arcname in blob_members:
@@ -282,7 +309,15 @@ async def import_case(
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
             try:
-                reader.extract_to(arcname, tmp_path)
+                digest = reader.extract_to(arcname, tmp_path)
+                if digest != sha:
+                    # The blob's content must hash to its content-addressed
+                    # name, or a crafted member would poison the
+                    # instance-global retention dir (retain_file
+                    # short-circuits later uploads of the real hash).
+                    raise ArchiveFormatError(
+                        f"blob content does not hash to its member name: {arcname}"
+                    )
                 await asyncio.to_thread(retain_file, tmp_path, retention_path(sha))
                 counts["blobs"] += 1
             finally:

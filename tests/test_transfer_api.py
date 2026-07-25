@@ -4,6 +4,7 @@ for empty cases — the ClickHouse factory is lazy)."""
 from __future__ import annotations
 
 import json
+import re
 import time
 import zipfile
 from io import BytesIO
@@ -57,6 +58,12 @@ class TestExportEndpoint:
 
         dl = client.get(f"/api/cases/{case_id}/export/{job['id']}/download")
         assert dl.status_code == 200
+        # Filename follows <case>-<date>.vestigo (spec §3); the header is
+        # RFC 5987-encoded (the space becomes %20).
+        assert re.search(
+            r"API%20Case-\d{4}-\d{2}-\d{2}\.vestigo",
+            dl.headers["content-disposition"],
+        ), dl.headers["content-disposition"]
         with zipfile.ZipFile(BytesIO(dl.content)) as z:
             manifest = json.loads(z.read("manifest.json"))
         assert manifest["case"]["id"] == case_id

@@ -8,9 +8,9 @@ reject anything newer than FORMAT_VERSION.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
-import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -33,6 +33,10 @@ def temp_root() -> Path:
     """Directory holding in-flight export archives (swept at app startup)."""
     root = Path(tempfile.gettempdir()) / "vestigo-transfer"
     root.mkdir(parents=True, exist_ok=True)
+    # Archives hold case data — owner-only on a shared tmp. OSError: Windows /
+    # odd filesystems without POSIX modes.
+    with contextlib.suppress(OSError):
+        root.chmod(0o700)
     return root
 
 
@@ -101,13 +105,26 @@ class ArchiveReader:
             self._zip.close()
             raise ArchiveFormatError("manifest is not a JSON object")
         version = self.manifest.get("format_version")
-        if not isinstance(version, int) or version < 1:
+        # type() is int, not isinstance: JSON true is a bool, and bool is an
+        # int subclass — it must not satisfy the version check.
+        if type(version) is not int or version < 1:
             self._zip.close()
             raise ArchiveFormatError("manifest missing integer format_version")
         if version > FORMAT_VERSION:
             self._zip.close()
             raise ArchiveFormatError(
                 f"archive format_version {version} newer than supported {FORMAT_VERSION}"
+            )
+        members = self.manifest.get("members")
+        if not isinstance(members, list) or any(
+            not isinstance(m, dict)
+            or not isinstance(m.get("path"), str)
+            or not isinstance(m.get("sha256"), str)
+            for m in members
+        ):
+            self._zip.close()
+            raise ArchiveFormatError(
+                "manifest members must be a list of objects with str path and sha256"
             )
 
     def verify_members(self) -> None:
@@ -141,10 +158,17 @@ class ArchiveReader:
         _check_member_name(arcname)
         return self._zip.open(arcname)
 
-    def extract_to(self, arcname: str, dest: Path) -> None:
+    def extract_to(self, arcname: str, dest: Path) -> str:
+        """Extract one member to dest; returns the SHA-256 of the extracted
+        bytes (single pass, so callers can verify content-addressed names
+        without re-reading the file)."""
         _check_member_name(arcname)
+        sha = hashlib.sha256()
         with self._zip.open(arcname) as src, dest.open("wb") as dst:
-            shutil.copyfileobj(src, dst, _CHUNK)
+            while chunk := src.read(_CHUNK):
+                sha.update(chunk)
+                dst.write(chunk)
+        return sha.hexdigest()
 
     def member_names(self) -> list[str]:
         return self._zip.namelist()

@@ -232,12 +232,6 @@ compaction + fidelity-ladder approach (PR #152). See `docs/AGENT.md` and
   keeping the op set append-only so old conversations stay replayable. Lowest-friction,
   highest-fit agent-tool addition; can ship independently of (and before) A8.
 
-## Milestone 9 — case portability (export/import)
-
-Any case — evidence, events, and all analyst work — leaves the instance as one file and
-comes back intact, here or elsewhere. Archive/restore and cross-instance transfer are
-equal goals (requested 2026-07-24).
-
 ## Explicitly out of scope & standing decisions (with revisit triggers)
 
 Decisions, not work items — each stays as decided unless its trigger fires.

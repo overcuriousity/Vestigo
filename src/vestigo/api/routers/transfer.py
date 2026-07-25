@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
@@ -18,6 +20,8 @@ from vestigo.db.postgres import Case, User
 from vestigo.transfer.archive import new_archive_path, temp_root
 from vestigo.transfer.exporter import export_case
 from vestigo.transfer.importer import import_case
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["transfer"])
 
@@ -62,6 +66,7 @@ async def _run_export_job(job_id: str, case_id: str, include_blobs: bool, user: 
             },
         )
     except Exception as exc:  # noqa: BLE001 — job error surface
+        logger.exception("case export job %s failed", job_id)
         job_store.update(job_id, status="failed", error=str(exc))
 
 
@@ -104,10 +109,11 @@ async def download_export(
         shutil.rmtree(temp_root() / job_id, ignore_errors=True)
 
     safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in case.name)
+    date = datetime.now(UTC).date().isoformat()
     return FileResponse(
         path,
         media_type="application/vnd.vestigo+zip",
-        filename=f"{safe_name}.vestigo",
+        filename=f"{safe_name}-{date}.vestigo",
         background=BackgroundTask(_cleanup),
     )
 
@@ -142,6 +148,7 @@ async def _run_import_job(job_id: str, tmp_path: Path, user: User) -> None:
             },
         )
     except Exception as exc:  # noqa: BLE001 — job error surface
+        logger.exception("case import job %s failed", job_id)
         job_store.update(job_id, status="failed", error=str(exc))
     finally:
         tmp_path.unlink(missing_ok=True)
