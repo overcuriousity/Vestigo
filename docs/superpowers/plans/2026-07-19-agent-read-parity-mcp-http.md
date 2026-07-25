@@ -89,10 +89,22 @@ async def test_list_baselines_returns_timeline_definitions(store):
         "normal week",
         datetime(2026, 1, 1, tzinfo=UTC),
         datetime(2026, 1, 8, tzinfo=UTC),
-        [{"id": "w1", "label": "incident", "start": "2026-01-09T00:00:00+00:00", "end": "2026-01-10T00:00:00+00:00"}],
+        [
+            {
+                "id": "w1",
+                "label": "incident",
+                "start": "2026-01-09T00:00:00+00:00",
+                "end": "2026-01-10T00:00:00+00:00",
+            }
+        ],
     )
     await store.create_baseline_definition(
-        "c1", "OTHER", "foreign", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), []
+        "c1",
+        "OTHER",
+        "foreign",
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 2, tzinfo=UTC),
+        [],
     )
     server = build_tool_server(_scope("c1", "t1"))
     result = await _call(server, "list_baselines")
@@ -106,9 +118,15 @@ async def test_list_baselines_returns_timeline_definitions(store):
 
 @pytest.mark.asyncio
 async def test_list_dispositions_scoped_and_filtered(store):
-    await store.create_disposition("c1", "normal", detector="value_novelty", timeline_id="t1", field="user", value="svc")
-    await store.create_disposition("c1", "dismissed", detector="frequency", timeline_id="t1", field="host", value="a")
-    await store.create_disposition("c1", "normal", detector="value_novelty", timeline_id="OTHER", field="x", value="y")
+    await store.create_disposition(
+        "c1", "normal", detector="value_novelty", timeline_id="t1", field="user", value="svc"
+    )
+    await store.create_disposition(
+        "c1", "dismissed", detector="frequency", timeline_id="t1", field="host", value="a"
+    )
+    await store.create_disposition(
+        "c1", "normal", detector="value_novelty", timeline_id="OTHER", field="x", value="y"
+    )
     server = build_tool_server(_scope("c1", "t1"))
     result = await _call(server, "list_dispositions", {"kind": "normal"})
     assert result["total"] == 1
@@ -132,7 +150,9 @@ async def test_list_saved_views(store):
 @pytest.mark.asyncio
 async def test_annotations_tools(store):
     await store.create_annotation("c1", "s1", "e1", "a1", "tag", "suspicious", created_by="alice")
-    await store.create_annotation("c1", "s1", "e2", "a2", "comment", "looks like lateral movement", created_by="bob")
+    await store.create_annotation(
+        "c1", "s1", "e2", "a2", "comment", "looks like lateral movement", created_by="bob"
+    )
     await store.create_annotation("c1", "sX", "e3", "a3", "tag", "out-of-scope-source")
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     listed = await _call(server, "list_annotations")
@@ -157,107 +177,111 @@ Expected: FAIL — `Unknown tool: list_baselines` (or fastmcp tool-not-found err
 In `src/vestigo/agent/tools.py`, inside `build_tool_server` (after `similar_events`, before `return server`), add:
 
 ```python
-    @server.tool()
-    async def list_baselines() -> dict[str, Any]:
-        """List saved baseline definitions (baseline range + suspect windows).
+@server.tool()
+async def list_baselines() -> dict[str, Any]:
+    """List saved baseline definitions (baseline range + suspect windows).
 
-        Pass a baseline's id as `baseline_id` to run_anomaly_detector to run
-        temporal detection (proportion_shift, interval_periodicity,
-        sequence_novelty, frequency, value_distribution_drift) against it.
-        """
-        from vestigo.api.deps import get_store
+    Pass a baseline's id as `baseline_id` to run_anomaly_detector to run
+    temporal detection (proportion_shift, interval_periodicity,
+    sequence_novelty, frequency, value_distribution_drift) against it.
+    """
+    from vestigo.api.deps import get_store
 
-        rows = await get_store().list_baseline_definitions(scope.case_id, scope.timeline_id)
-        return {
-            "total": len(rows),
-            "baselines": [
-                {
-                    "id": r.id,
-                    "name": r.name,
-                    **r.windows_payload(),
-                    "created_by": r.created_by,
-                }
-                for r in rows
-            ],
-        }
+    rows = await get_store().list_baseline_definitions(scope.case_id, scope.timeline_id)
+    return {
+        "total": len(rows),
+        "baselines": [
+            {
+                "id": r.id,
+                "name": r.name,
+                **r.windows_payload(),
+                "created_by": r.created_by,
+            }
+            for r in rows
+        ],
+    }
 
-    @server.tool()
-    async def list_dispositions(kind: str | None = None, detector: str | None = None) -> dict[str, Any]:
-        """List analyst verdicts on anomaly findings visible from this timeline.
 
-        Kinds: 'normal' (expected behavior, suppresses detection), 'dismissed'
-        (noise), 'confirmed' (escalated true positive), 'routine' (recurring
-        expected motif). Use these to avoid re-reporting what the analyst has
-        already judged.
-        """
-        from vestigo.api.deps import get_store
+@server.tool()
+async def list_dispositions(kind: str | None = None, detector: str | None = None) -> dict[str, Any]:
+    """List analyst verdicts on anomaly findings visible from this timeline.
 
-        rows = await get_store().list_dispositions(
-            scope.case_id,
-            timeline_id=scope.timeline_id,
-            source_ids=scope.source_ids,
-            kinds=[kind] if kind else None,
-            detector=detector,
-        )
-        return {
-            "total": len(rows),
-            "dispositions": [
-                {
-                    "id": r.id,
-                    "kind": r.kind,
-                    "detector": r.detector,
-                    "field": r.field,
-                    "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
-                    "source_id": r.source_id,
-                    "event_id": r.event_id,
-                    "note": _truncate(r.note, MESSAGE_TRUNCATE),
-                    "created_by": r.created_by,
-                }
-                for r in rows
-            ],
-        }
+    Kinds: 'normal' (expected behavior, suppresses detection), 'dismissed'
+    (noise), 'confirmed' (escalated true positive), 'routine' (recurring
+    expected motif). Use these to avoid re-reporting what the analyst has
+    already judged.
+    """
+    from vestigo.api.deps import get_store
 
-    @server.tool()
-    async def list_saved_views() -> dict[str, Any]:
-        """List the analyst's saved filter views for this case (name, query, filter payload)."""
-        from vestigo.api.deps import get_store
+    rows = await get_store().list_dispositions(
+        scope.case_id,
+        timeline_id=scope.timeline_id,
+        source_ids=scope.source_ids,
+        kinds=[kind] if kind else None,
+        detector=detector,
+    )
+    return {
+        "total": len(rows),
+        "dispositions": [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "detector": r.detector,
+                "field": r.field,
+                "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
+                "source_id": r.source_id,
+                "event_id": r.event_id,
+                "note": _truncate(r.note, MESSAGE_TRUNCATE),
+                "created_by": r.created_by,
+            }
+            for r in rows
+        ],
+    }
 
-        rows = await get_store().list_views(scope.case_id)
-        return {
-            "total": len(rows),
-            "views": [
-                {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
-                for r in rows
-            ],
-        }
 
-    @server.tool()
-    async def list_annotations(annotation_type: str | None = None) -> dict[str, Any]:
-        """List annotations (tags/comments/system anomaly marks) across this timeline's sources.
+@server.tool()
+async def list_saved_views() -> dict[str, Any]:
+    """List the analyst's saved filter views for this case (name, query, filter payload)."""
+    from vestigo.api.deps import get_store
 
-        `annotation_type` filters to 'tag', 'comment', or 'anomaly'. Results
-        are capped at 200 rows, oldest first — use get_event_annotations for
-        one event's full detail.
-        """
-        from vestigo.api.deps import get_store
+    rows = await get_store().list_views(scope.case_id)
+    return {
+        "total": len(rows),
+        "views": [
+            {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
+            for r in rows
+        ],
+    }
 
-        rows = await get_store().list_source_annotations(scope.case_id, scope.source_ids)
-        if annotation_type:
-            rows = [r for r in rows if r.annotation_type == annotation_type]
-        return {
-            "total": len(rows),
-            "annotations": [_slim_annotation(r) for r in rows[:200]],
-        }
 
-    @server.tool()
-    async def get_event_annotations(source_id: str, event_id: str) -> dict[str, Any]:
-        """List all annotations attached to one event (full content, oldest first)."""
-        from vestigo.api.deps import get_store
+@server.tool()
+async def list_annotations(annotation_type: str | None = None) -> dict[str, Any]:
+    """List annotations (tags/comments/system anomaly marks) across this timeline's sources.
 
-        if source_id not in scope.source_ids:
-            return {"error": f"source {source_id} is not part of this timeline"}
-        rows = await get_store().list_annotations(scope.case_id, source_id, event_id)
-        return {"total": len(rows), "annotations": [_slim_annotation(r) for r in rows]}
+    `annotation_type` filters to 'tag', 'comment', or 'anomaly'. Results
+    are capped at 200 rows, oldest first — use get_event_annotations for
+    one event's full detail.
+    """
+    from vestigo.api.deps import get_store
+
+    rows = await get_store().list_source_annotations(scope.case_id, scope.source_ids)
+    if annotation_type:
+        rows = [r for r in rows if r.annotation_type == annotation_type]
+    return {
+        "total": len(rows),
+        "annotations": [_slim_annotation(r) for r in rows[:200]],
+    }
+
+
+@server.tool()
+async def get_event_annotations(source_id: str, event_id: str) -> dict[str, Any]:
+    """List all annotations attached to one event (full content, oldest first)."""
+    from vestigo.api.deps import get_store
+
+    if source_id not in scope.source_ids:
+        return {"error": f"source {source_id} is not part of this timeline"}
+    rows = await get_store().list_annotations(scope.case_id, source_id, event_id)
+    return {"total": len(rows), "annotations": [_slim_annotation(r) for r in rows]}
 ```
 
 And add the module-level helper (near `_slim_event`):
@@ -353,7 +377,15 @@ async def test_sigma_runs_tools(store):
     await store.update_sigma_run(
         run.id,
         status="completed",
-        results=[{"rule_key": "a" * 32, "title": "R", "match_count": 3, "status": "matched", "sql": "SELECT 1"}],
+        results=[
+            {
+                "rule_key": "a" * 32,
+                "title": "R",
+                "match_count": 3,
+                "status": "matched",
+                "sql": "SELECT 1",
+            }
+        ],
         completed=True,
     )
     other_timeline = await store.create_sigma_run("c1", "t2", {}, created_by="alice")
@@ -379,75 +411,78 @@ Expected: FAIL — unknown tool `list_sigma_rules`.
 In `build_tool_server`, after the Task 1 tools:
 
 ```python
-    @server.tool()
-    async def list_sigma_rules() -> dict[str, Any]:
-        """List Sigma detection rules available to this case (metadata only).
+@server.tool()
+async def list_sigma_rules() -> dict[str, Any]:
+    """List Sigma detection rules available to this case (metadata only).
 
-        Covers both the global rule directory and case-uploaded rules. Use
-        get_sigma_rule with a case rule's id to read its YAML body.
-        """
-        from vestigo.api.deps import get_store
-        from vestigo.api.routers.sigma import _global_rule_dict, _load_global
+    Covers both the global rule directory and case-uploaded rules. Use
+    get_sigma_rule with a case rule's id to read its YAML body.
+    """
+    from vestigo.api.deps import get_store
+    from vestigo.api.routers.sigma import _global_rule_dict, _load_global
 
-        global_rules, case_rows = await asyncio.gather(
-            _load_global(), get_store().list_sigma_rules(scope.case_id)
+    global_rules, case_rows = await asyncio.gather(
+        _load_global(), get_store().list_sigma_rules(scope.case_id)
+    )
+    rules = [_global_rule_dict(r) for r in global_rules]
+    for row in case_rows:
+        rules.append(
+            {
+                "origin": "case",
+                "id": row.id,
+                "rule_key": row.rule_key,
+                "title": row.title,
+                "level": row.level,
+                "logsource": row.logsource,
+                "enabled": row.enabled,
+            }
         )
-        rules = [_global_rule_dict(r) for r in global_rules]
-        for row in case_rows:
-            rules.append(
-                {
-                    "origin": "case",
-                    "id": row.id,
-                    "rule_key": row.rule_key,
-                    "title": row.title,
-                    "level": row.level,
-                    "logsource": row.logsource,
-                    "enabled": row.enabled,
-                }
-            )
-        return {"total": len(rules), "rules": rules}
+    return {"total": len(rules), "rules": rules}
 
-    @server.tool()
-    async def get_sigma_rule(rule_id: str) -> dict[str, Any]:
-        """Fetch one case-uploaded Sigma rule including its full YAML content."""
-        from vestigo.api.deps import get_store
 
-        row = await get_store().get_sigma_rule(scope.case_id, rule_id)
-        if row is None:
-            return {"error": f"no case-uploaded sigma rule with id {rule_id}"}
-        return row.to_dict()
+@server.tool()
+async def get_sigma_rule(rule_id: str) -> dict[str, Any]:
+    """Fetch one case-uploaded Sigma rule including its full YAML content."""
+    from vestigo.api.deps import get_store
 
-    @server.tool()
-    async def list_sigma_runs() -> dict[str, Any]:
-        """List past Sigma evaluations over this timeline (newest first, no per-rule detail)."""
-        from vestigo.api.deps import get_store
+    row = await get_store().get_sigma_rule(scope.case_id, rule_id)
+    if row is None:
+        return {"error": f"no case-uploaded sigma rule with id {rule_id}"}
+    return row.to_dict()
 
-        rows = await get_store().list_sigma_runs(scope.case_id)
-        rows = [r for r in rows if r.timeline_id == scope.timeline_id]
-        return {
-            "total": len(rows),
-            "runs": [
-                {
-                    "id": r.id,
-                    "status": r.status,
-                    "created_by": r.created_by,
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-                    "rule_count": len(r.results or []),
-                }
-                for r in rows
-            ],
-        }
 
-    @server.tool()
-    async def get_sigma_run(run_id: str) -> dict[str, Any]:
-        """Fetch one Sigma run's full per-rule results (match counts, statuses, compiled SQL)."""
-        from vestigo.api.deps import get_store
+@server.tool()
+async def list_sigma_runs() -> dict[str, Any]:
+    """List past Sigma evaluations over this timeline (newest first, no per-rule detail)."""
+    from vestigo.api.deps import get_store
 
-        row = await get_store().get_sigma_run(scope.case_id, run_id)
-        if row is None or row.timeline_id != scope.timeline_id:
-            return {"error": f"no sigma run with id {run_id} in this timeline"}
-        return row.to_dict()
+    rows = await get_store().list_sigma_runs(scope.case_id)
+    rows = [r for r in rows if r.timeline_id == scope.timeline_id]
+    return {
+        "total": len(rows),
+        "runs": [
+            {
+                "id": r.id,
+                "status": r.status,
+                "created_by": r.created_by,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "rule_count": len(r.results or []),
+            }
+            for r in rows
+        ],
+    }
+
+
+@server.tool()
+async def get_sigma_run(run_id: str) -> dict[str, Any]:
+    """Fetch one Sigma run's full per-rule results (match counts, statuses, compiled SQL)."""
+    from vestigo.api.deps import get_store
+
+    row = await get_store().get_sigma_run(scope.case_id, run_id)
+    if row is None or row.timeline_id != scope.timeline_id:
+        return {"error": f"no sigma run with id {run_id} in this timeline"}
+    return row.to_dict()
 ```
 
 Add `import asyncio` to the module's imports.
@@ -518,7 +553,12 @@ async def test_filterspec_collapse_routine(store):
     from vestigo.agent.tools import FilterSpec, _build_query
 
     row = await store.create_disposition(
-        "c1", "routine", detector="sequence_motif", timeline_id="t1", field="artifact", value="a → b"
+        "c1",
+        "routine",
+        detector="sequence_motif",
+        timeline_id="t1",
+        field="artifact",
+        value="a → b",
     )
     scope = _scope("c1", "t1", source_ids=["s1"])
     query = await _build_query(scope, FilterSpec(collapse_routine=True))
@@ -539,33 +579,33 @@ Expected: FAIL — `FilterSpec` has no field `annotated` (pydantic ValidationErr
 Add to `FilterSpec` (after `tags_exclude`):
 
 ```python
-    annotated: list[str] | None = Field(
-        default=None,
-        description=(
-            'Restrict to annotated events: any of "tag" (user tags, optionally '
-            'narrowed by annotation_tag_value) and "anomaly" (system anomaly '
-            "marks; unioned with run_id findings when set)."
-        ),
-    )
-    annotation_tag_value: str | None = Field(
-        default=None, description='Narrow annotated=["tag"] to one exact tag value.'
-    )
-    run_id: str | None = Field(
-        default=None,
-        description=(
-            "A persisted detector run id (from run_anomaly_detector) — its "
-            'finding event ids are unioned into the "anomaly" branch of '
-            "`annotated`. Only effective when annotated includes \"anomaly\"."
-        ),
-    )
-    event_ids: list[str] | None = Field(
-        default=None,
-        description="Explicit event_id allowlist, intersected with the other id-based filters.",
-    )
-    collapse_routine: bool = Field(
-        default=False,
-        description="Hide events belonging to analyst-marked routine motifs (kind='routine' dispositions).",
-    )
+annotated: list[str] | None = Field(
+    default=None,
+    description=(
+        'Restrict to annotated events: any of "tag" (user tags, optionally '
+        'narrowed by annotation_tag_value) and "anomaly" (system anomaly '
+        "marks; unioned with run_id findings when set)."
+    ),
+)
+annotation_tag_value: str | None = Field(
+    default=None, description='Narrow annotated=["tag"] to one exact tag value.'
+)
+run_id: str | None = Field(
+    default=None,
+    description=(
+        "A persisted detector run id (from run_anomaly_detector) — its "
+        'finding event ids are unioned into the "anomaly" branch of '
+        '`annotated`. Only effective when annotated includes "anomaly".'
+    ),
+)
+event_ids: list[str] | None = Field(
+    default=None,
+    description="Explicit event_id allowlist, intersected with the other id-based filters.",
+)
+collapse_routine: bool = Field(
+    default=False,
+    description="Hide events belonging to analyst-marked routine motifs (kind='routine' dispositions).",
+)
 ```
 
 In `_build_query`, extend the imports and resolution (replace the existing function body's start):
@@ -613,8 +653,8 @@ async def _build_query(
 and pass the new values into the `EventQuery(...)` constructor:
 
 ```python
-        event_ids=event_ids,
-        exclude_routine_disposition_ids=routine_ids,
+event_ids = (event_ids,)
+exclude_routine_disposition_ids = (routine_ids,)
 ```
 
 Also update `get_event` (`tools.py:238`) — it currently overwrites `query.event_ids` after building; that still works since the spec there is empty, leave it as is.
@@ -701,7 +741,9 @@ async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
 async def test_run_anomaly_detector_rejects_out_of_bounds(store):
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     with pytest.raises(Exception):
-        await _call(server, "run_anomaly_detector", {"detector": "sequence_novelty", "ngram_size": 9})
+        await _call(
+            server, "run_anomaly_detector", {"detector": "sequence_novelty", "ngram_size": 9}
+        )
 ```
 
 Important: `build_tool_server` imports the events-router helpers **into local names at build time** (`tools.py:188-196`), so monkeypatching `events_router._run_stat_detector` after the server is built has no effect. The test above monkeypatches *before* `build_tool_server` is called — keep that order. (If the tool code is changed to late-bind imports, either works.)
@@ -1001,67 +1043,71 @@ class AgentToken(Base):
 Near the agent-conversation store section in `postgres.py`:
 
 ```python
-    # ------------------------------------------------------------------
-    # Agent MCP tokens
-    # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Agent MCP tokens
+# ------------------------------------------------------------------
 
-    async def create_agent_token(
-        self,
-        case_id: str,
-        timeline_id: str,
-        user_id: str,
-        name: str,
-        token_hash: str,
-        expires_at: datetime | None = None,
-    ) -> AgentToken:
-        """Persist a new MCP access token row (hash only, never plaintext)."""
-        row = AgentToken(
-            id=generate_id(f"agent_token_{name}"),
-            token_hash=token_hash,
-            case_id=case_id,
-            timeline_id=timeline_id,
-            user_id=user_id,
-            name=name,
-            expires_at=expires_at,
+
+async def create_agent_token(
+    self,
+    case_id: str,
+    timeline_id: str,
+    user_id: str,
+    name: str,
+    token_hash: str,
+    expires_at: datetime | None = None,
+) -> AgentToken:
+    """Persist a new MCP access token row (hash only, never plaintext)."""
+    row = AgentToken(
+        id=generate_id(f"agent_token_{name}"),
+        token_hash=token_hash,
+        case_id=case_id,
+        timeline_id=timeline_id,
+        user_id=user_id,
+        name=name,
+        expires_at=expires_at,
+    )
+    async with self.session_factory() as session:
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return row
+
+
+async def list_agent_tokens(self, case_id: str, timeline_id: str) -> list[AgentToken]:
+    """Return a timeline's MCP tokens, newest first (revoked ones included)."""
+    async with self.session_factory() as session:
+        result = await session.execute(
+            select(AgentToken)
+            .where(AgentToken.case_id == case_id, AgentToken.timeline_id == timeline_id)
+            .order_by(AgentToken.created_at.desc())
         )
-        async with self.session_factory() as session:
-            session.add(row)
+        return list(result.scalars().all())
+
+
+async def get_agent_token_by_hash(self, token_hash: str) -> AgentToken | None:
+    """Resolve a presented token's SHA-256 to its row (revoked/expired rows included —
+    the caller decides how to respond so auth failures stay distinguishable)."""
+    async with self.session_factory() as session:
+        result = await session.execute(
+            select(AgentToken).where(AgentToken.token_hash == token_hash)
+        )
+        return result.scalar_one_or_none()
+
+
+async def revoke_agent_token(self, case_id: str, token_id: str) -> bool:
+    """Stamp revoked_at on a token row. Returns True when the row existed."""
+    async with self.session_factory() as session:
+        result = await session.execute(
+            select(AgentToken).where(AgentToken.case_id == case_id, AgentToken.id == token_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        if row.revoked_at is None:
+            row.revoked_at = datetime.now(UTC)
             await session.commit()
-            await session.refresh(row)
-            return row
-
-    async def list_agent_tokens(self, case_id: str, timeline_id: str) -> list[AgentToken]:
-        """Return a timeline's MCP tokens, newest first (revoked ones included)."""
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(AgentToken)
-                .where(AgentToken.case_id == case_id, AgentToken.timeline_id == timeline_id)
-                .order_by(AgentToken.created_at.desc())
-            )
-            return list(result.scalars().all())
-
-    async def get_agent_token_by_hash(self, token_hash: str) -> AgentToken | None:
-        """Resolve a presented token's SHA-256 to its row (revoked/expired rows included —
-        the caller decides how to respond so auth failures stay distinguishable)."""
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(AgentToken).where(AgentToken.token_hash == token_hash)
-            )
-            return result.scalar_one_or_none()
-
-    async def revoke_agent_token(self, case_id: str, token_id: str) -> bool:
-        """Stamp revoked_at on a token row. Returns True when the row existed."""
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(AgentToken).where(AgentToken.case_id == case_id, AgentToken.id == token_id)
-            )
-            row = result.scalar_one_or_none()
-            if row is None:
-                return False
-            if row.revoked_at is None:
-                row.revoked_at = datetime.now(UTC)
-                await session.commit()
-            return True
+        return True
 ```
 
 - [ ] **Step 5: Create the migration**
@@ -1143,9 +1189,7 @@ def test_token_api_lifecycle(client, admin_bootstrap):
 def test_token_create_rejects_unknown_timeline(client, admin_bootstrap):
     as_admin(client, admin_bootstrap)
     case_id, _ = _case_and_timeline(client)
-    resp = client.post(
-        f"/api/cases/{case_id}/timelines/nope/agent-tokens", json={"name": "x"}
-    )
+    resp = client.post(f"/api/cases/{case_id}/timelines/nope/agent-tokens", json={"name": "x"})
     assert resp.status_code == 404
 
 
@@ -1402,7 +1446,11 @@ async def test_mcp_rejects_revoked_and_expired_rows(store):
     assert _token_auth_error(revoked) == "token revoked"
 
     expired = await store.create_agent_token(
-        "c1", "t1", "u1", "exp", hash_token("vgo_c"),
+        "c1",
+        "t1",
+        "u1",
+        "exp",
+        hash_token("vgo_c"),
         expires_at=datetime.now(UTC) - timedelta(days=1),
     )
     assert _token_auth_error(expired) == "token expired"
@@ -1546,7 +1594,11 @@ async def _audit_tool_call(body: bytes, token_row: Any, user: Any) -> None:
         case_id=token_row.case_id,
         target_type="agent_token",
         target_id=token_row.id,
-        detail={"tool": params.get("name"), "args": params.get("arguments"), "transport": "mcp_http"},
+        detail={
+            "tool": params.get("name"),
+            "args": params.get("arguments"),
+            "transport": "mcp_http",
+        },
     )
 
 

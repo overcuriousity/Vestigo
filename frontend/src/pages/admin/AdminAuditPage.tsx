@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { adminApi } from "@/api/admin";
+import { Badge } from "@/components/ui/Badge";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import {
@@ -74,7 +75,18 @@ export function AdminAuditPage() {
                 <TableCell className="whitespace-nowrap text-xs text-[var(--color-fg-muted)]">
                   {fmtTimestampFull(r.timestamp)}
                 </TableCell>
-                <TableCell className="text-xs">{r.username ?? "anonymous"}</TableCell>
+                <TableCell className="text-xs">
+                  {r.username ?? "anonymous"}
+                  {/* Rows restored from a .vestigo archive keep the actor,
+                      action and timestamp the archive asserted — nothing on
+                      this instance vouches for them, so they must never read
+                      as locally recorded activity. */}
+                  {(r.detail as { imported?: unknown } | null)?.imported ? (
+                    <Badge variant="anomaly" className="ml-1.5">
+                      imported
+                    </Badge>
+                  ) : null}
+                </TableCell>
                 <TableCell className="font-mono text-xs">{r.action}</TableCell>
                 <TableCell className="font-mono text-xs text-[var(--color-fg-muted)]">
                   {r.method} {r.route}

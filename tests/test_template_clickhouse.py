@@ -22,6 +22,8 @@ from vestigo.db.clickhouse import _EVENTS_TABLE_DDL, ClickHouseStore
 from vestigo.db.queries import EventQuery, EventQueryService
 from vestigo.models.event import Event
 
+pytestmark = pytest.mark.clickhouse
+
 CASE_ID = f"tc-tmpl-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-tmpl"
 

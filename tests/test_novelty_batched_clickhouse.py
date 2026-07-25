@@ -24,6 +24,8 @@ from vestigo.db.anomaly_stats import (
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.models.event import Event
 
+pytestmark = pytest.mark.clickhouse
+
 CASE_ID = f"tc-novbatch-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-novbatch"
 

@@ -1,5 +1,6 @@
 import { CaseList } from "@/components/cases/CaseList";
 import { CreateCaseDialog } from "@/components/cases/CreateCaseDialog";
+import { ImportCaseDialog } from "@/components/cases/ImportCaseDialog";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { guidance } from "@/lib/guidance";
 import { ShieldAlert } from "lucide-react";
@@ -23,7 +24,10 @@ export function CasesPage() {
               Create a case, add timelines, upload log files, and start exploring.
             </p>
           </div>
-          <CreateCaseDialog />
+          <div className="flex items-center gap-2">
+            <ImportCaseDialog />
+            <CreateCaseDialog />
+          </div>
         </div>
 
         <CaseList />

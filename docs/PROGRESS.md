@@ -1,9 +1,217 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-24 (session 95 — 1.6.1 review hardening).
+Last updated: 2026-07-25 (session 99 — X1 third review round).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 99 — 2026-07-25: X1 third review round (untrusted-input bounds, event loop)
+
+**Why.** A third review pass over PR #182. The archive layer's size discipline is
+sound in aggregate but had a gap per member, and the two transfer paths were doing
+all their heavy work on the event loop. Eight findings, all fixed here.
+
+- **One member could still OOM the process.** `transfer_max_expanded_bytes` caps an
+  archive's *total* expansion, which says nothing about any single member: a lone
+  100 GiB `postgres/annotations.ndjson` sits far under a 200 GiB total, and
+  `_read_bounded` pulled it into memory whole. NDJSON deflates ~20x, so it fits
+  inside the 10 GiB upload limit — an out-of-memory kill any authenticated user
+  could trigger. Fixed from both sides: `VESTIGO_TRANSFER_MAX_METADATA_BYTES`
+  (default 2 GiB) rejects an oversized `postgres/*` member in the constructor,
+  before it is ever opened, and `ArchiveReader.iter_ndjson` streams every stem row
+  by row so the importer's peak memory scales with the largest *row*. The prescan
+  and the revive loop both use it; `read_ndjson` survives as `list(iter_ndjson(…))`
+  for the two genuinely small members.
+- **Both transfer directions blocked the event loop.** `import_case` is `async` but
+  called `verify_members` (SHA-256 over the whole archive), the id prescan and
+  `extract_to` synchronously; export hashed and zipped every Arrow member and blob
+  the same way. They run as `BackgroundTasks`, so the entire API — health, SSE,
+  other users' queries — froze for the length of a multi-GiB transfer. All of it
+  now goes through `asyncio.to_thread`, matching what the ClickHouse calls in the
+  same loops already did.
+- **The event Arrow member was never schema-checked.** `_insert_source_events` took
+  the attacker-supplied IPC stream, patched four columns *by name*, and handed the
+  batch to `insert_events_arrow`, which forwards it verbatim to ClickHouse. A
+  renamed column made `get_field_index` return `-1`; a missing one silently took a
+  server-side default instead of what `_normalize_event_row` writes on the way out.
+  Now compared against `EVENT_ARROW_SCHEMA` per batch (a stream may change schema
+  mid-way), raising into the existing all-or-nothing cleanup.
+- **A failed import leaked blobs.** Blobs land in the instance-global retention dir;
+  the cleanup path dropped the Postgres case and the ClickHouse partitions but not
+  them, so a repeatedly-failing import accumulated case file content nothing
+  referenced. The importer now tracks only the blobs *it* created — checked before
+  `retain_file`, which short-circuits on an existing path — so a blob shared with
+  another case is never removed. The test for the second half matters more than the
+  first.
+- **The startup sweep was `rmtree(temp_root)`.** Correct under its stated
+  one-process assumption, but `VESTIGO_TRANSFER_TEMP_PATH=/data` wiped `/data` on
+  every boot. Both sweeps now share `is_transfer_artifact` (a `*.vestigo` file or a
+  job-id-named directory) and `sweep_stale(max_age_seconds=None)` is what startup
+  calls; anything else under the path is left alone and warned about once.
+- **Admission control was racy.** `count_active` then `create` let two simultaneous
+  requests both pass at limit-1, so a cap of 1 admitted 2. `JobStore.create_if_under`
+  does both under one lock. The import endpoint keeps a cheap pre-upload check so a
+  full instance still says no before the body is on disk, and unlinks the temp file
+  if a slot fills while the upload streams.
+- **Docs claimed a check that could not fire.** `temp_root` chmods to `0700` and
+  *then* asserts the mode has no group/world bits, so for a directory we own the
+  mode is silently repaired, never rejected — the old test only passed because it
+  monkeypatched `chmod` away. Kept the repair (it is the behavior an operator
+  wants), corrected `.env.example` and `DEPLOYMENT.md`, and kept the assertion
+  documented as the backstop for filesystems where `chmod` no-ops.
+- **Smaller:** malformed `sources.ndjson` rows raised a bare `KeyError` from inside
+  the events loop — now an `ArchiveFormatError` naming the field, raised while the
+  revive loop is still on that stem; `sources.ndjson` is parsed once instead of
+  three times; blob members are iterated in sorted order so warning order is
+  reproducible; and the import dialog holds itself open to show the importer's
+  warnings ("no blob for X", "user Y attributed to importer") instead of navigating
+  past them — the job store is in-memory, so closing the dialog is the last chance
+  to read them.
+
+## Session 98 — 2026-07-25: X1 second review round (scaling, audit fidelity, limits)
+
+**Why.** A second review pass over PR #182 after the session-97 hardening. The
+archive layer held up; the two blockers were in the importer, and both would only
+have shown up on a case bigger than the test fixtures.
+
+- **Import was quadratic and unusable on a real case.** `_IdMap` rebuilt its
+  substitution alternation every time a mapping was added, and the revive loop
+  added one per row before touching that row's JSON columns — so the regex
+  recompiled once per row. Measured on the branch: 200 rows 0.20s, 400 0.63s,
+  800 2.60s, 1600 13.97s, ~4x per doubling; 25k audit rows extrapolated to about
+  an hour of pure compilation. Compiling the alternation *once* costs ~2s even at
+  200k ids and substitution is then free, so `_prescan_ids` now walks every stem's
+  ref columns up front, `bulk_add` mints the new ids in one go, and `freeze`
+  makes any later map growth raise instead of silently going quadratic again.
+  Same workload after: 1600 rows 0.02s, 25k rows 0.41s, one compile. The prescan
+  also closed an ordering gap — a chart config embedding an annotation id used to
+  survive unrewritten, because charts revive before annotations.
+- **`audit_log.target_id` was never remapped.** Every other reference was, so a
+  restored audit trail pointed at ids that existed nowhere on the instance —
+  it imported but could no longer be joined to the entities it described, which
+  is most of why audit rows are in the archive at all. `target_id` spans every
+  entity type, so no static ref column can cover it; archive ids are globally
+  unique, so `_IdMap.lookup` resolves one without knowing its kind and passes
+  through targets the archive never carried (teams, users, agent tokens).
+- **Imported audit rows are now labelled.** They keep the actor, action, ip and
+  timestamp the archive asserted — deliberately, that is the chain of custody —
+  but any authenticated user can upload an archive, so an unmarked row is a
+  forgery surface: an admin reviewing "what did user X do" would see fabricated
+  entries. Every restored row now carries `detail.imported` (job id, importing
+  user, source case id) and is badged **imported** in the admin audit view.
+  Dropping the rows was the alternative and was rejected — a restored case with
+  no provenance is worse than one with labelled provenance.
+- **Admission control on transfers.** Both directions reserve real disk for the
+  whole job and either can be started by any authenticated user, with nothing
+  bounding concurrency. `VESTIGO_TRANSFER_MAX_CONCURRENT` (default 2, `0`
+  disables) caps in-flight transfers instance-wide; the import check runs
+  *before* `receive_upload_to_tmp`, since rejecting afterwards would mean the
+  whole upload is already on disk.
+- **Blobs no source references are ignored.** Content was already verified
+  against its content-addressed member name, so an existing blob could not be
+  poisoned — but an archive could still plant arbitrary files in the
+  instance-global retention directory. Only hashes an archived source claims are
+  retained now.
+- **Startup sweep can no longer cost the rest of recovery.** It was the first
+  statement in `_startup_recovery`'s single `try`, and `temp_root()` raises on a
+  misowned or group-readable directory — so a misconfigured
+  `transfer_temp_path` silently skipped orphaned-ingest reconciliation,
+  enrichment re-runs and session purge. It now has its own handler.
+- **Smaller.** Warning lists are aggregated per (stem, skipped source) instead of
+  per row and capped at 50 plus a summary, since they ride into the `audit_log`
+  detail JSON; `case.json`/`user_refs.json` are type-checked into
+  `ArchiveFormatError` before reaching the ORM; the archived user map is looked
+  up in batches of 1000 rather than one unbounded `IN (...)`; duplicate manifest
+  member names are rejected; `POST /api/cases/import` uses
+  `require_password_current`, matching `POST /api/cases` (`AuthAuditMiddleware`
+  was already the enforcing boundary — this is consistency and an accurate
+  OpenAPI schema, not a closed hole).
+
+**Not done.** `ClickHouseStore` is still constructed bare and never closed by the
+transfer modules — it has no `close()` and every call site in the repo does the
+same, so this is the codebase convention rather than a transfer bug.
+
+## Session 97 — 2026-07-25: X1 export/import review hardening
+
+**Why.** Code review of the X1 branch (PR #182) before merge. Two findings were
+security-relevant and reachable by the lowest-privileged account — import is open
+to any authenticated user — and the rest were correctness gaps that would have
+surfaced as silent data loss or resource leaks in a long-running instance.
+
+- **Archive expansion is bounded.** The upload cap only limited *compressed*
+  bytes, so a deflate bomb in a small `.vestigo` could OOM the process
+  (`read_ndjson` reads a member whole) or fill the disk (`extract_to`). Sizes are
+  now load-bearing: `ArchiveReader` requires an int `bytes` per member,
+  cross-checks it against the zip directory entry, sums it against
+  `VESTIGO_TRANSFER_MAX_EXPANDED_BYTES` (new setting, 200 GiB default, `0`
+  disables) before reading anything, and every read aborts past the declared size
+  in case a local header lies. Events and blobs are `ZIP_STORED`, so a real
+  archive expands ~1x — a large ratio is an attack, not a big case.
+- **Only manifest-listed members are read.** `postgres/*` members bypassed the
+  verified set, and `read_ndjson` returned `[]` for a missing member, so an
+  archive without `annotations.ndjson` restored a case with no annotations and
+  reported success. Reads now raise for anything unlisted or absent.
+- **Temp root moved and hardened.** In-flight archives lived at a fixed
+  `/tmp/vestigo-transfer` created with a suppressed `chmod` — squattable by
+  another local user on a shared host. New `VESTIGO_TRANSFER_TEMP_PATH` (default
+  `data/transfer`); the directory is created `0700` and refused if it is a
+  symlink, owned by someone else, or group/world accessible.
+- **Archives stop leaking.** A failed export left its working dir and a
+  never-downloaded export sat on disk until restart. The working dir is now
+  cleaned in a `finally`, and each export first sweeps entries older than 24h —
+  opportunistic rather than a timer, since this deployment has no scheduler.
+- **Import correctness.** JSON id rewriting is a single regex pass (the old
+  replace-loop could re-rewrite a fresh id — `generate_id` adds only 8 hex
+  chars); `_IdMap` grew `pin`/`substitute` instead of callers poking `_map`;
+  archived users resolve in one query with one warning per unknown *username*
+  instead of one `SELECT` and one warning per row; and restored events have their
+  embedding markers blanked, with a warning that vectors need re-embedding, since
+  Qdrant data does not travel.
+- **Export honesty.** The Postgres snapshot runs `REPEATABLE READ` on Postgres
+  (skipped on SQLite, which rejects it) so a concurrent ingest can't tear the
+  archive; skipped non-ready sources whose ids are still embedded in chart/run/
+  proposal JSON now produce a warning; failed exports are audited, not just
+  successful ones.
+- **Misc.** Export options moved to a request body, the export dialog's download
+  effect is ref-guarded (StrictMode fired it twice, and the second call 404s
+  because the archive is deleted on download) with a retry affordance, and
+  `ruff format` was applied to the two files that had drifted.
+
+## Session 96 — 2026-07-25: X1 case export/import (`.vestigo` archive)
+
+**Why.** Roadmap Milestone 9: any case — evidence, events, and all analyst work —
+leaves the instance as one file and comes back intact, on the same or a different
+instance. Archive/restore and cross-instance transfer are equal goals. Design:
+`docs/superpowers/specs/2026-07-24-case-export-import-design.md`.
+
+- **Export/import endpoints.** `POST /api/cases/{case_id}/export` (MANAGE gate —
+  export is bulk case-data exfiltration — audit `case.export`) runs a background
+  job building the archive; `GET /api/cases/{case_id}/export/{job_id}/download`
+  streams it. `POST /api/cases/import` (any authenticated user, audit
+  `case.import`) restores the archive as a new case owned by the importer —
+  importer-owned restore, no auto-grants.
+- **Transfer package** (`src/vestigo/transfer/`): `archive.py` (pydantic manifest,
+  zip writer/reader, per-member SHA-256 verified before any write), `exporter.py`
+  (direct-ORM Postgres snapshot with generic column serialization, Arrow event
+  streaming, optional content-addressed blobs behind `include_blobs`),
+  `importer.py` (in-memory old→new ID map rewriting all references, ordered
+  inserts, Arrow `case_id`/`source_id` column rewrite, blob placement, field-stats
+  recompute, all-or-nothing cleanup via the `delete_case` cascade). Event ids are
+  preserved verbatim, so annotation→event cross-references survive. The
+  content-addressed blob helpers moved from `api/routers/cases.py` to
+  `src/vestigo/core/retention.py`.
+- **Format.** Versioned single-file zip (`format_version: 1`): NDJSON per
+  Postgres entity (case-scoped audit rows included), one Arrow IPC member per
+  source, optional `blobs/<sha256>` members. Secrets (tokens, passwords, enricher
+  API keys) never exported; pure caches and Qdrant embeddings recomputed on
+  import. Users map by username, unknown names fall back to the importer with a
+  warning.
+- **Frontend.** Export button + dialog on the case card, import dialog on the
+  case list — both follow the existing job-polling pattern.
+- **ClickHouse pytest marker** (Milestone 2 residue, bundled): `clickhouse`
+  registered in `pyproject.toml` and applied via `pytestmark` to all eleven
+  `tests/*_clickhouse.py` files — `pytest -m clickhouse` selects them, and a run
+  without the dev stack can no longer pass them silently.
 
 ## Session 95 — 2026-07-24: 1.6.1 code-review hardening
 

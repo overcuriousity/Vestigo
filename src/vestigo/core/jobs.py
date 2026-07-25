@@ -77,17 +77,78 @@ class JobStore:
         case_id: str | None = None,
     ) -> Job:
         """Create a new job and return it."""
+        with self._lock:
+            return self._create(
+                kind=kind, progress=progress, created_by=created_by, case_id=case_id
+            )
+
+    def _create(
+        self,
+        kind: str,
+        progress: dict[str, Any] | None,
+        created_by: str | None,
+        case_id: str | None,
+    ) -> Job:
+        """``create`` without the lock. Callers must already hold ``_lock``."""
         job_id = uuid.uuid4().hex[:16]
         job = Job(
             id=job_id, kind=kind, progress=progress or {}, created_by=created_by, case_id=case_id
         )
-        with self._lock:
-            self._jobs[job_id] = job
+        self._jobs[job_id] = job
         return job
 
     def get(self, job_id: str) -> Job | None:
         """Return a job by ID, or None if not found."""
         return self._jobs.get(job_id)
+
+    def create_if_under(
+        self,
+        kinds: tuple[str, ...],
+        limit: int,
+        kind: str,
+        progress: dict[str, Any] | None = None,
+        created_by: str | None = None,
+        case_id: str | None = None,
+    ) -> Job | None:
+        """Create a job only if fewer than ``limit`` of ``kinds`` are active.
+
+        Returns None when the cap is already reached; ``limit`` of 0 disables
+        the cap entirely.
+
+        Counting and creating happen under one lock acquisition, which is the
+        whole point: checking with ``count_active`` and then calling ``create``
+        lets two simultaneous requests both pass at limit-1, so a cap of 1
+        admits 2. The caller is admission control for work that reserves real
+        resources, so the cap has to actually hold.
+        """
+        with self._lock:
+            if limit and self._count_active(kinds) >= limit:
+                return None
+            return self._create(
+                kind=kind, progress=progress, created_by=created_by, case_id=case_id
+            )
+
+    def count_active(self, kinds: tuple[str, ...]) -> int:
+        """Queued or running jobs of the given kinds.
+
+        Admission control for work that reserves real resources before it
+        starts (case transfers hold a multi-GiB upload plus its expansion on
+        disk). Locked like the other readers — jobs are updated from FastAPI's
+        threadpool, so an unlocked scan could see a torn dict.
+
+        Read-only: to *act* on the count, use ``create_if_under``, which does
+        both under one lock.
+        """
+        with self._lock:
+            return self._count_active(kinds)
+
+    def _count_active(self, kinds: tuple[str, ...]) -> int:
+        """``count_active`` without the lock. Callers must already hold ``_lock``."""
+        return sum(
+            1
+            for job in self._jobs.values()
+            if job.kind in kinds and job.status in ("queued", "running")
+        )
 
     def list_by_case(self, case_id: str) -> list[Job]:
         """Return jobs scoped to a case, newest-first."""

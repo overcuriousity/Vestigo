@@ -28,6 +28,8 @@ from vestigo.db.postgres import PostgresStore
 from vestigo.db.queries import EventQueryService
 from vestigo.models.event import Event
 
+pytestmark = pytest.mark.clickhouse
+
 CASE_ID = f"tc-fieldstats-{uuid.uuid4().hex[:8]}"
 SRC_A, SRC_B = "fs-src-a", "fs-src-b"
 

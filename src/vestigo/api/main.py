@@ -30,6 +30,7 @@ from vestigo.api.routers import (
     jobs,
     sigma,
     stream,
+    transfer,
     viz,
 )
 from vestigo.core.config import get_settings
@@ -167,6 +168,32 @@ async def _reconcile_orphaned_ingests() -> None:
             )
 
 
+async def _sweep_stale_transfer_archives() -> None:
+    """Export archives live in temp storage and the job store is in-memory —
+    after a restart every leftover is orphaned by definition.
+
+    Age-independent, unlike the per-export sweep: this assumes one process per
+    configured ``transfer_temp_path``, which the in-memory JobStore already
+    requires. In-flight archives are additionally expired by
+    ``archive.sweep_stale``'s TTL on each export, so a long-running process
+    does not accumulate them.
+
+    It removes only what a transfer job writes (see ``is_transfer_artifact``),
+    never the directory itself: ``transfer_temp_path`` is operator-configurable
+    and pointing it at, say, ``/data`` must not wipe ``/data`` on every boot.
+
+    Failures are swallowed here rather than left to the caller's handler:
+    ``temp_root`` refuses a misowned directory, and a misconfigured
+    ``transfer_temp_path`` must cost no more than this sweep — not the ingest
+    reconciliation and session purge that follow it."""
+    from vestigo.transfer.archive import sweep_stale
+
+    try:
+        sweep_stale(max_age_seconds=None)
+    except Exception:
+        logger.exception("Transfer archive sweep failed; leftover export archives remain.")
+
+
 async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
     """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
 
@@ -239,6 +266,7 @@ async def _startup_recovery(store: PostgresStore) -> None:
     restart if it fails, so running them in the background is safe.
     """
     try:
+        await _sweep_stale_transfer_archives()
         await _reconcile_orphaned_ingests()
         enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
 
@@ -471,6 +499,7 @@ def create_app() -> FastAPI:
     app.include_router(agent.router)
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)
+    app.include_router(transfer.router)
 
     # External streamable-HTTP MCP endpoint (Bearer-token-gated), off by default.
     # Registered outside /api/, so AuthAuditMiddleware's session gate does not

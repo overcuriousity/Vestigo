@@ -1,6 +1,6 @@
 [project]
 name = "vestigo"
-version = "1.6.1"
+version = "1.7.0"
 description = "Local-first, forensic-grade log investigation platform with vector-backed anomaly detection."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -169,3 +169,6 @@ indent-style = "space"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "--cov=vestigo --cov-report=term-missing"
+markers = [
+    "clickhouse: requires a reachable ClickHouse (dev compose stack); skipped otherwise",
+]

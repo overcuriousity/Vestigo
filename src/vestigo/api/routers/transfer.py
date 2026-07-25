@@ -1,0 +1,279 @@
+"""Case export/import (X1) endpoints. Heavy work runs in JobStore jobs."""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from datetime import UTC, datetime
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from starlette.background import BackgroundTask
+
+from vestigo.api.deps import (
+    get_current_user,
+    get_store,
+    require_case_manage,
+    require_password_current,
+)
+from vestigo.api.uploads import receive_upload_to_tmp
+from vestigo.core.config import get_settings
+from vestigo.core.jobs import Job, get_job_store
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.postgres import Case, User
+from vestigo.transfer.archive import is_job_id, new_archive_path, sweep_stale, temp_root
+from vestigo.transfer.exporter import export_case
+from vestigo.transfer.importer import import_case
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api", tags=["transfer"])
+
+_TRANSFER_KINDS = ("case_export", "case_import")
+
+
+def _too_many_transfers(limit: int) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail=(
+            f"{limit} case transfer(s) already in flight — retry when one finishes "
+            "(raise VESTIGO_TRANSFER_MAX_CONCURRENT, 0 disables the cap)"
+        ),
+    )
+
+
+def _admit_transfer_job(**create_kwargs) -> Job:
+    """Create a transfer job, or raise 429 if the instance is already full.
+
+    Both directions reserve real resources for the whole job — an export
+    materializes the archive under ``transfer_temp_path``, an import holds the
+    upload plus everything it expands into. Any authenticated user can start
+    either, so the instance needs a ceiling.
+
+    The count and the create happen under one lock (``create_if_under``), so
+    two simultaneous requests cannot both slip past a cap of 1.
+    """
+    limit = get_settings().transfer_max_concurrent
+    job = get_job_store().create_if_under(_TRANSFER_KINDS, limit, **create_kwargs)
+    if job is None:
+        raise _too_many_transfers(limit)
+    return job
+
+
+def _precheck_transfer_slot() -> None:
+    """Cheap reject before a body is streamed to disk.
+
+    Advisory only — ``_admit_transfer_job`` is what actually enforces the cap.
+    This exists so a full instance says no *before* ``receive_upload_to_tmp``
+    writes multi-GiB of archive we are about to refuse.
+    """
+    limit = get_settings().transfer_max_concurrent
+    if limit and get_job_store().count_active(_TRANSFER_KINDS) >= limit:
+        raise _too_many_transfers(limit)
+
+
+class ExportRequest(BaseModel):
+    """Options for a case export. Blobs are opt-in: they dominate archive size."""
+
+    include_blobs: bool = False
+
+
+async def _run_export_job(job_id: str, case_id: str, include_blobs: bool, user: User) -> None:
+    job_store = get_job_store()
+    job_store.update(job_id, status="running")
+    store = get_store()
+    work_dir = temp_root() / job_id
+    try:
+        # No scheduler in this deployment, so the only path that creates
+        # archives is also the one that expires them: a completed export that
+        # is never downloaded would otherwise sit here until the next restart.
+        sweep_stale()
+        result = await export_case(
+            store,
+            ClickHouseStore,
+            case_id,
+            include_blobs=include_blobs,
+            exported_by=user.username,
+            dest_dir=work_dir,
+            progress=lambda p: job_store.update(job_id, progress=p),
+        )
+        # Move next to a stable per-job path for the download endpoint.
+        final = new_archive_path(job_id)
+        shutil.move(str(result.path), final)
+        await store.record_audit(
+            action="case.export",
+            actor=user,
+            case_id=case_id,
+            target_type="case",
+            target_id=case_id,
+            detail={
+                "job_id": job_id,
+                "include_blobs": include_blobs,
+                "bytes": result.bytes,
+                "counts": result.counts,
+            },
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            result={
+                "bytes": result.bytes,
+                "counts": result.counts,
+                "warnings": result.warnings,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — job error surface
+        logger.exception("case export job %s failed", job_id)
+        job_store.update(job_id, status="failed", error=str(exc))
+        # A failed attempt to extract a case is at least as interesting to an
+        # auditor as a successful one; never let auditing fail the job.
+        try:
+            await store.record_audit(
+                action="case.export",
+                actor=user,
+                case_id=case_id,
+                target_type="case",
+                target_id=case_id,
+                detail={"job_id": job_id, "include_blobs": include_blobs, "error": str(exc)},
+                status_code=500,
+            )
+        except Exception:
+            logger.exception("failed to audit the failed export job %s", job_id)
+    finally:
+        # The archive itself has been moved out by now; anything left in the
+        # working dir is scratch from a failed run.
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@router.post("/cases/{case_id}/export", status_code=202)
+async def export_case_endpoint(
+    case_id: str,
+    background_tasks: BackgroundTasks,
+    body: ExportRequest | None = None,
+    case: Case = Depends(require_case_manage),
+    user: User = Depends(get_current_user),
+):
+    include_blobs = body.include_blobs if body else False
+    job = _admit_transfer_job(
+        kind="case_export",
+        progress={"phase": "queued"},
+        created_by=user.id,
+        case_id=case_id,
+    )
+    background_tasks.add_task(_run_export_job, job.id, case_id, include_blobs, user)
+    return {"job_id": job.id}
+
+
+@router.get("/cases/{case_id}/export/{job_id}/download")
+async def download_export(
+    case_id: str,
+    job_id: str,
+    case: Case = Depends(require_case_manage),
+    user: User = Depends(get_current_user),
+):
+    # Shape-check before anything else: job_id is a raw URL path segment and
+    # new_archive_path builds a filesystem path out of it. The lookup below
+    # would reject a traversal string too (job ids are the only keys), but
+    # that is a property of the store, not a check — make the barrier explicit.
+    if not is_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Export not found")
+    job = get_job_store().get(job_id)
+    # JobStore evicts terminal jobs past its cap, so a long-idle completed
+    # export can 404 here while its archive is still on disk. Not a leak —
+    # sweep_stale expires it on the next export.
+    if job is None or job.kind != "case_export" or job.case_id != case_id:
+        raise HTTPException(status_code=404, detail="Export not found")
+    if job.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Export not ready ({job.status})")
+    # Built from the *stored* id, never the URL segment. The two are equal by
+    # the time we get here, but only one of them was generated by this process
+    # — so the filesystem path is derived from a value no request ever chose.
+    path = new_archive_path(job.id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Archive already downloaded or expired")
+
+    def _cleanup() -> None:
+        # The job's working dir is already gone (see _run_export_job); only the
+        # archive itself outlives the job, and only until it is downloaded.
+        # Two concurrent downloads both stream and both unlink — benign on
+        # POSIX, where the already-open fd survives the unlink.
+        path.unlink(missing_ok=True)
+
+    safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in case.name)
+    date = datetime.now(UTC).date().isoformat()
+    return FileResponse(
+        path,
+        media_type="application/vnd.vestigo+zip",
+        filename=f"{safe_name}-{date}.vestigo",
+        background=BackgroundTask(_cleanup),
+    )
+
+
+async def _run_import_job(job_id: str, tmp_path: Path, user: User) -> None:
+    job_store = get_job_store()
+    job_store.update(job_id, status="running")
+    store = get_store()
+    try:
+        result = await import_case(
+            store,
+            ClickHouseStore,
+            tmp_path,
+            owner=user,
+            job_id=job_id,
+            progress=lambda p: job_store.update(job_id, progress=p),
+        )
+        await store.record_audit(
+            action="case.import",
+            actor=user,
+            case_id=result.case_id,
+            target_type="case",
+            target_id=result.case_id,
+            detail={"job_id": job_id, "counts": result.counts, "warnings": result.warnings},
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            result={
+                "case_id": result.case_id,
+                "counts": result.counts,
+                "warnings": result.warnings,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — job error surface
+        logger.exception("case import job %s failed", job_id)
+        job_store.update(job_id, status="failed", error=str(exc))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/cases/import", status_code=202)
+async def import_case_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user: User = Depends(require_password_current),
+):
+    # Any authenticated user may import; the importer becomes the case owner.
+    # The dependency matches POST /api/cases exactly — import creates a case,
+    # so it must not be the laxer of the two paths.
+    # Admission first: rejecting after receive_upload_to_tmp would mean the
+    # whole upload is already on disk. The authoritative check is the create
+    # below — a slot can free up or fill during the upload either way, so the
+    # temp file has to be cleaned up if this one loses the race.
+    _precheck_transfer_slot()
+    max_bytes = get_settings().max_upload_bytes or None
+    tmp_path, _file_hash, size_bytes = await receive_upload_to_tmp(
+        file, max_bytes=max_bytes, suffix=".vestigo"
+    )
+    try:
+        job = _admit_transfer_job(
+            kind="case_import",
+            progress={"phase": "queued", "bytes": size_bytes},
+            created_by=user.id,
+        )
+    except HTTPException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    background_tasks.add_task(_run_import_job, job.id, tmp_path, user)
+    return {"job_id": job.id}

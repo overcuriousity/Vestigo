@@ -32,6 +32,8 @@ from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.queries import EventQuery, EventQueryService, _field_column_expr
 from vestigo.models.event import Event
 
+pytestmark = pytest.mark.clickhouse
+
 CASE_ID = f"tc-fusedts-{uuid.uuid4().hex[:8]}"
 SRC_A = "src-fused-a"
 SRC_B = "src-fused-b"
