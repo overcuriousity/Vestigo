@@ -25,9 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Import remaps every Postgres id through an in-memory old→new map while event
   ids are preserved verbatim, so annotation→event cross-references survive;
   unknown usernames fall back to the importer with a warning; secrets (tokens,
-  passwords, enricher API keys) are never exported. Frontend: export button in
-  case settings, import dialog on the case list, both on the existing
+  passwords, enricher API keys) are never exported. Frontend: export button on
+  the case card, import dialog on the case list, both on the existing
   job-polling pattern.
+
+  Because an uploaded archive is untrusted input from any authenticated user,
+  the reader treats sizes as load-bearing: every member's declared size is
+  cross-checked against the zip directory, every read is bounded by it, and
+  `VESTIGO_TRANSFER_MAX_EXPANDED_BYTES` (default 200 GiB, `0` disables) caps
+  the total uncompressed size before a single member is read — a decompression
+  bomb can otherwise exhaust memory or disk inside a small upload. Reads are
+  also restricted to manifest-listed members, so an archive missing an entity
+  stream fails instead of silently restoring a case without it. In-flight
+  archives live under `VESTIGO_TRANSFER_TEMP_PATH` (default `data/transfer`),
+  created `0700` and refused if owned by another user or group/world
+  accessible; they are deleted on download, expired after 24h by the next
+  export, and cleared at startup. Restored events have their embedding markers
+  blanked and the import warns that vectors need re-embedding, since Qdrant
+  data is not portable.
 - **`clickhouse` pytest marker** — registered in `pyproject.toml` and applied to
   all eleven `tests/*_clickhouse.py` files, so `pytest -m clickhouse` selects
   the dev-stack tests and a ClickHouse-less run can no longer pass them

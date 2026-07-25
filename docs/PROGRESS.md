@@ -1,9 +1,55 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-25 (session 96 — X1 case export/import).
+Last updated: 2026-07-25 (session 97 — X1 review hardening).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 97 — 2026-07-25: X1 export/import review hardening
+
+**Why.** Code review of the X1 branch (PR #182) before merge. Two findings were
+security-relevant and reachable by the lowest-privileged account — import is open
+to any authenticated user — and the rest were correctness gaps that would have
+surfaced as silent data loss or resource leaks in a long-running instance.
+
+- **Archive expansion is bounded.** The upload cap only limited *compressed*
+  bytes, so a deflate bomb in a small `.vestigo` could OOM the process
+  (`read_ndjson` reads a member whole) or fill the disk (`extract_to`). Sizes are
+  now load-bearing: `ArchiveReader` requires an int `bytes` per member,
+  cross-checks it against the zip directory entry, sums it against
+  `VESTIGO_TRANSFER_MAX_EXPANDED_BYTES` (new setting, 200 GiB default, `0`
+  disables) before reading anything, and every read aborts past the declared size
+  in case a local header lies. Events and blobs are `ZIP_STORED`, so a real
+  archive expands ~1x — a large ratio is an attack, not a big case.
+- **Only manifest-listed members are read.** `postgres/*` members bypassed the
+  verified set, and `read_ndjson` returned `[]` for a missing member, so an
+  archive without `annotations.ndjson` restored a case with no annotations and
+  reported success. Reads now raise for anything unlisted or absent.
+- **Temp root moved and hardened.** In-flight archives lived at a fixed
+  `/tmp/vestigo-transfer` created with a suppressed `chmod` — squattable by
+  another local user on a shared host. New `VESTIGO_TRANSFER_TEMP_PATH` (default
+  `data/transfer`); the directory is created `0700` and refused if it is a
+  symlink, owned by someone else, or group/world accessible.
+- **Archives stop leaking.** A failed export left its working dir and a
+  never-downloaded export sat on disk until restart. The working dir is now
+  cleaned in a `finally`, and each export first sweeps entries older than 24h —
+  opportunistic rather than a timer, since this deployment has no scheduler.
+- **Import correctness.** JSON id rewriting is a single regex pass (the old
+  replace-loop could re-rewrite a fresh id — `generate_id` adds only 8 hex
+  chars); `_IdMap` grew `pin`/`substitute` instead of callers poking `_map`;
+  archived users resolve in one query with one warning per unknown *username*
+  instead of one `SELECT` and one warning per row; and restored events have their
+  embedding markers blanked, with a warning that vectors need re-embedding, since
+  Qdrant data does not travel.
+- **Export honesty.** The Postgres snapshot runs `REPEATABLE READ` on Postgres
+  (skipped on SQLite, which rejects it) so a concurrent ingest can't tear the
+  archive; skipped non-ready sources whose ids are still embedded in chart/run/
+  proposal JSON now produce a warning; failed exports are audited, not just
+  successful ones.
+- **Misc.** Export options moved to a request body, the export dialog's download
+  effect is ref-guarded (StrictMode fired it twice, and the second call 404s
+  because the archive is deleted on download) with a retry affordance, and
+  `ruff format` was applied to the two files that had drifted.
 
 ## Session 96 — 2026-07-25: X1 case export/import (`.vestigo` archive)
 
@@ -34,7 +80,7 @@ instance. Archive/restore and cross-instance transfer are equal goals. Design:
   API keys) never exported; pure caches and Qdrant embeddings recomputed on
   import. Users map by username, unknown names fall back to the importer with a
   warning.
-- **Frontend.** Export button + dialog in case settings, import dialog on the
+- **Frontend.** Export button + dialog on the case card, import dialog on the
   case list — both follow the existing job-polling pattern.
 - **ClickHouse pytest marker** (Milestone 2 residue, bundled): `clickhouse`
   registered in `pyproject.toml` and applied via `pytestmark` to all eleven
