@@ -40,8 +40,10 @@ export function ExportCaseDialog({ case_ }: Props) {
         .downloadExport(case_.id, id, case_.name)
         .then(() => setOpen(false))
         .catch((e) => {
-          // The archive survives a failed transfer, so a retry is worth
-          // offering rather than making the analyst export the case again.
+          // Worth offering a retry rather than making the analyst export the
+          // case again: the archive is only deleted once the response has
+          // fully streamed, so a transfer that died early still has one. If it
+          // died late the retry 404s, which surfaces as an error here anyway.
           downloadedRef.current = false;
           setError((e as Error).message);
         });
