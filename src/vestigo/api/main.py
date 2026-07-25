@@ -176,12 +176,20 @@ async def _sweep_stale_transfer_archives() -> None:
     Wholesale, not TTL-based: this assumes one process per configured
     ``transfer_temp_path``, which the in-memory JobStore already requires.
     In-flight archives are additionally expired by ``archive.sweep_stale`` on
-    each export, so a long-running process does not accumulate them."""
+    each export, so a long-running process does not accumulate them.
+
+    Failures are swallowed here rather than left to the caller's handler:
+    ``temp_root`` refuses a misowned or group-readable directory, and a
+    misconfigured ``transfer_temp_path`` must cost no more than this sweep —
+    not the ingest reconciliation and session purge that follow it."""
     from vestigo.transfer.archive import temp_root
 
-    root = temp_root()
-    if root.exists():
-        shutil.rmtree(root, ignore_errors=True)
+    try:
+        root = temp_root()
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+    except Exception:
+        logger.exception("Transfer archive sweep failed; leftover export archives remain.")
 
 
 async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
