@@ -95,7 +95,12 @@ _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
     (
         "agent_proposals",
         AgentProposal,
-        {"id": "proposal", "case_id": "case", "conversation_id": "conversation"},
+        {
+            "id": "proposal",
+            "case_id": "case",
+            "conversation_id": "conversation",
+            "timeline_id": "timeline",
+        },
     ),
     ("audit_log", AuditLog, {"id": "audit", "case_id": "case"}),
 ]

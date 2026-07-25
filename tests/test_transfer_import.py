@@ -64,7 +64,7 @@ async def _rich_case(store, owner_id):
         user_id="ghost-user-id",  # not a user on this instance → fallback
     )
     await _add(store, pg.AgentMessage, conversation_id=conv.id)
-    await _add(store, pg.AgentProposal, case_id=case.id, conversation_id=conv.id)
+    await _add(store, pg.AgentProposal, case_id=case.id, conversation_id=conv.id, timeline_id=tl.id)
     await _add(store, pg.AuditLog, case_id=case.id, user_id=owner_id, username_snapshot="alice")
     return case, src, tl
 
@@ -144,6 +144,13 @@ class TestRoundTrip:
                 )
             ).scalar_one()
             assert new_msg is not None
+
+            new_proposal = (
+                await s.execute(
+                    select(pg.AgentProposal).where(pg.AgentProposal.case_id == result.case_id)
+                )
+            ).scalar_one()
+            assert new_proposal.timeline_id == new_tl.id
 
             new_audit = (
                 await s.execute(select(pg.AuditLog).where(pg.AuditLog.case_id == result.case_id))
