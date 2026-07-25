@@ -6,6 +6,13 @@ references. Event ids are preserved verbatim — event queries are case-scoped
 and preserved ids keep annotation→event cross-references intact. Any failure
 after case creation deletes the partial case (Postgres cascade + ClickHouse
 partitions) before the error propagates.
+
+Memory: events stream batch-by-batch, but each Postgres stem is read and
+revived whole before it is flushed, so peak memory scales with the largest
+single entity (usually annotations or audit_log). That is fine for the
+single-process deployment this targets; if a case ever outgrows it, chunk the
+per-stem loop rather than reworking the id remap, which needs the full map
+resolved before dependent stems are revived.
 """
 
 from __future__ import annotations
@@ -133,29 +140,55 @@ class ImportResult:
 
 
 class _IdMap:
+    """Old archive id → new local id, keyed by (kind, old id)."""
+
     def __init__(self) -> None:
         self._map: dict[tuple[str, str], str] = {}
+        self._pattern: re.Pattern[str] | None = None
+        self._by_old: dict[str, str] = {}
 
     def remap(self, kind: str, old: Any) -> Any:
         if old is None:
             return None
         key = (kind, str(old))
         if key not in self._map:
-            self._map[key] = generate_id(kind)
+            self._set(key, generate_id(kind))
         return self._map[key]
+
+    def pin(self, kind: str, old: Any, new: str) -> None:
+        """Force a mapping (the case id is created before the rows are read)."""
+        self._set((kind, str(old)), new)
+
+    def _set(self, key: tuple[str, str], new: str) -> None:
+        self._map[key] = new
+        self._by_old[key[1]] = new
+        self._pattern = None  # rebuilt lazily on the next payload rewrite
+
+    def substitute(self, text: str) -> str:
+        """Rewrite every known old id appearing anywhere in ``text``.
+
+        One pass over the text via a single alternation, so a freshly written
+        id can never be rewritten again by a later mapping — ``generate_id``
+        only appends 8 hex characters, which is not enough entropy to dismiss
+        that cascade. Ids also appear inside longer strings (filter
+        expressions, not just whole JSON values), so this stays substring-level
+        rather than matching whole values.
+        """
+        if not self._by_old:
+            return text
+        if self._pattern is None:
+            self._pattern = re.compile(
+                "|".join(re.escape(old) for old in sorted(self._by_old, key=len, reverse=True))
+            )
+        return self._pattern.sub(lambda m: self._by_old[m.group(0)], text)
 
 
 def _remap_json_ids(value: Any, idmap: _IdMap) -> Any:
     """Rewrite archived ids embedded in a JSON payload (proposal events, view
-    filters, chart configs) through the old→new map. String-level replace over
-    the serialized form; ids are 64-char random-suffixed strings, so substring
-    collision is a non-issue. Only mappings known so far apply — sources and
-    timelines revive before the views/charts/proposals that embed their ids."""
-    text = json.dumps(value)
-    for (_kind, old), new in idmap._map.items():
-        if old in text:
-            text = text.replace(old, new)
-    return json.loads(text)
+    filters, chart configs) through the old→new map. Only mappings known so far
+    apply — sources and timelines revive before the views/charts/proposals that
+    embed their ids."""
+    return json.loads(idmap.substitute(json.dumps(value)))
 
 
 def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str]) -> Any:
@@ -183,21 +216,27 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
 def _insert_source_events(
     clickhouse: Any, reader: ArchiveReader, arcname: str, new_case_id: str, new_source_id: str
 ) -> int:
-    """Sync: rewrite case_id/source_id in every batch and insert. Row count."""
+    """Sync: rewrite case_id/source_id in every batch and insert. Row count.
+
+    The embedding markers are blanked in the same pass: Qdrant vectors are not
+    portable, so a restored event claiming an embedding model would describe
+    vectors this instance does not have.
+    """
     total = 0
     with reader.open_member(arcname) as f:
         ipc = pa.ipc.open_stream(f)
         for batch in ipc:
-            batch = batch.set_column(
-                batch.schema.get_field_index("case_id"),
-                "case_id",
-                pa.array([new_case_id] * batch.num_rows, type=pa.string()),
-            )
-            batch = batch.set_column(
-                batch.schema.get_field_index("source_id"),
-                "source_id",
-                pa.array([new_source_id] * batch.num_rows, type=pa.string()),
-            )
+            for column, value in (
+                ("case_id", new_case_id),
+                ("source_id", new_source_id),
+                ("embedding_model", ""),
+                ("embedding_config_hash", ""),
+            ):
+                batch = batch.set_column(
+                    batch.schema.get_field_index(column),
+                    column,
+                    pa.array([value] * batch.num_rows, type=pa.string()),
+                )
             total += clickhouse.insert_events_arrow(batch)
     return total
 
@@ -219,18 +258,20 @@ async def import_case(
     _progress("verify")
     reader = ArchiveReader(archive_path)  # raises ArchiveFormatError on bad manifest
     reader.verify_members()  # raises before ANY write
+    # Reads are restricted to manifest-listed members (ArchiveReader enforces
+    # it), so anything else in the zip is untrusted and never reaches the
+    # importer — and a member the exporter always writes cannot go missing
+    # without failing the import.
+    verified = reader.verified_names
     case_data = reader.read_json("postgres/case.json")
     user_refs = reader.read_json("postgres/user_refs.json")
-    # Only manifest-listed members are hash-verified; anything else in the
-    # zip (unlisted members) is untrusted and must never be read.
-    verified = {m["path"] for m in reader.manifest["members"]}
 
     counts: dict[str, int] = {"events": 0, "blobs": 0}
     warnings: list[str] = []
     idmap = _IdMap()
     new_case_id = generate_id("case")
     # Pin the case remap to the id we actually create with.
-    idmap._map[("case", str(case_data["id"]))] = new_case_id
+    idmap.pin("case", case_data["id"], new_case_id)
 
     created = False
     inserted_sources: list[str] = []
@@ -246,24 +287,48 @@ async def import_case(
         created = True
 
         _progress("postgres")
-        # Username → local user id, for conversation attribution mapping.
         async with store.session_factory() as session:
+            # Archived user ids → local ones, resolved in one query up front:
+            # per-row lookups would be tens of thousands of round-trips inside
+            # the import transaction, and would repeat the same warning once
+            # per row instead of once per missing user.
+            user_map = await _resolve_users(session, user_refs, owner, warnings)
+            unknown_users: set[str] = set()
+
+            def _local_user(old_user_id: Any) -> str:
+                """Archived user id → local id, warning once per unknown id.
+
+                Reaches here for ids the archive carried no username for (the
+                account was already deleted upstream), which ``_resolve_users``
+                cannot see.
+                """
+                key = str(old_user_id)
+                if key in user_map:
+                    return user_map[key]
+                if key not in unknown_users:
+                    unknown_users.add(key)
+                    warnings.append(
+                        f"user {key} not found on this instance — attributed to importer"
+                    )
+                return owner.id
+
             # create_case() seeds a placeholder default timeline; the archive
             # carries the case's real timelines (including its default), so
             # the placeholder must go or the restore would double it.
             await session.execute(delete(Timeline).where(Timeline.case_id == new_case_id))
+            embedded_timelines = 0
             for stem, model, refs in _IMPORT_SPECS:
                 rows = reader.read_ndjson(f"postgres/{stem}.ndjson")
                 counts[stem] = len(rows)
                 for row in rows:
                     obj = _revive(model, row, idmap, refs)
                     if isinstance(obj, Timeline):
+                        if row.get("embedding_config_hash"):
+                            embedded_timelines += 1
                         for colname in _TIMELINE_EMBEDDING_COLUMNS:
                             setattr(obj, colname, None)
                     elif isinstance(obj, AgentConversation):
-                        obj.user_id = await _map_user(
-                            session, user_refs, row.get("user_id"), owner, warnings
-                        )
+                        obj.user_id = _local_user(row.get("user_id"))
                     elif isinstance(obj, AuditLog):
                         obj.user_id = None  # username_snapshot carries attribution
                     # created_by holds user ids: remap via user_refs (username
@@ -272,17 +337,18 @@ async def import_case(
                     # keep them verbatim, no warning.
                     created_by = getattr(obj, "created_by", None)
                     if created_by is not None and str(created_by) in (user_refs.get("users") or {}):
-                        obj.created_by = await _map_user(
-                            session, user_refs, created_by, owner, warnings
-                        )
+                        obj.created_by = _local_user(created_by)
                     session.add(obj)
                 await session.flush()
             await session.commit()
+        if embedded_timelines:
+            warnings.append(
+                f"{embedded_timelines} timeline(s) were embedded on the source instance — "
+                "vectors are not portable; re-run embedding to restore semantic search"
+            )
 
         source_rows = reader.read_ndjson("postgres/sources.ndjson")
-        event_members = [
-            n for n in verified if n.startswith("events/") and n.endswith(".arrow")
-        ]
+        event_members = [n for n in verified if n.startswith("events/") and n.endswith(".arrow")]
         if event_members:
             _progress("events")
             clickhouse = clickhouse_factory()
@@ -354,22 +420,25 @@ async def import_case(
     return ImportResult(case_id=new_case_id, counts=counts, warnings=warnings)
 
 
-async def _map_user(
+async def _resolve_users(
     session: Any,
     user_refs: dict[str, Any],
-    old_user_id: Any,
     owner: User,
     warnings: list[str],
-) -> str:
-    """Old user id → username → local user id; importer fallback + warning."""
-    username = (user_refs.get("users") or {}).get(str(old_user_id)) if old_user_id else None
-    if username:
-        local = (
-            await session.execute(select(User).where(User.username == username))
-        ).scalar_one_or_none()
-        if local is not None:
-            return local.id
-    warnings.append(
-        f"user {username or old_user_id} not found on this instance — attributed to importer"
+) -> dict[str, str]:
+    """Archived user id → local user id, via username. One query, one warning
+    per username that this instance does not know (falls back to the importer).
+    """
+    archived: dict[str, str] = user_refs.get("users") or {}
+    if not archived:
+        return {}
+    local_ids = dict(
+        (
+            await session.execute(
+                select(User.username, User.id).where(User.username.in_(set(archived.values())))
+            )
+        ).all()
     )
-    return owner.id
+    for username in sorted(set(archived.values()) - set(local_ids)):
+        warnings.append(f"user {username} not found on this instance — attributed to importer")
+    return {old_id: local_ids.get(username, owner.id) for old_id, username in archived.items()}

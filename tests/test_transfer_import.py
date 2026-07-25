@@ -211,6 +211,8 @@ class TestRoundTrip:
             assert new_audit.username_snapshot == "alice"
 
         assert any("ghost" in w or "user" in w.lower() for w in result.warnings)
+        # The source timeline was embedded; its vectors are not portable.
+        assert any("re-run embedding" in w for w in result.warnings)
 
     async def test_events_rewritten_to_new_ids(self, store, tmp_path):
         alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
@@ -229,9 +231,80 @@ class TestRoundTrip:
         assert {r["message"] for r in rows} == {"line 0", "line 1"}
         assert result.counts["events"] == 2
 
+    async def test_event_embedding_markers_cleared(self, store, tmp_path):
+        """Vectors don't travel, so restored events must not claim a model."""
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        rows = _event_rows(case.id, src.id, n=1)
+        rows[0]["embedding_model"] = "bge-small"
+        rows[0]["embedding_config_hash"] = "cd" * 32
+        fake = FakeClickHouse({(case.id, src.id): rows})
+        archive = (
+            await export_case(
+                store,
+                lambda: fake,
+                case.id,
+                include_blobs=False,
+                exported_by="alice",
+                dest_dir=tmp_path,
+            )
+        ).path
+
+        target = FakeClickHouse()
+        await import_case(store, lambda: target, archive, owner=alice)
+
+        restored = next(iter(target.inserted.values()))
+        assert restored[0]["embedding_model"] == ""
+        assert restored[0]["embedding_config_hash"] == ""
+
+    async def test_ids_embedded_in_strings_are_remapped(self, store, tmp_path):
+        """Ids appear inside longer strings (filter expressions), not only as
+        whole JSON values — the rewrite is substring-level on purpose."""
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, tl = await _rich_case(store, alice.id)
+        async with store.session_factory() as s:
+            view = (await s.execute(select(pg.View).where(pg.View.case_id == case.id))).scalar_one()
+            view.view_filter = {"query": f"source_id:{src.id} AND timeline:{tl.id}"}
+            await s.commit()
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        async with store.session_factory() as s:
+            new_view = (
+                await s.execute(select(pg.View).where(pg.View.case_id == result.case_id))
+            ).scalar_one()
+            new_src = (
+                await s.execute(select(pg.Source).where(pg.Source.case_id == result.case_id))
+            ).scalar_one()
+            new_tl = (
+                await s.execute(select(pg.Timeline).where(pg.Timeline.case_id == result.case_id))
+            ).scalar_one()
+        assert new_view.view_filter["query"] == f"source_id:{new_src.id} AND timeline:{new_tl.id}"
+
 
 class TestRejection:
     async def test_tampered_archive_aborts_before_writes(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        cases_before = await _count(store, pg.Case)
+
+        with zipfile.ZipFile(archive) as zin:
+            items = {i.filename: zin.read(i.filename) for i in zin.infolist()}
+        # Same length as the original, so this exercises the hash rather than
+        # the manifest's size cross-check.
+        original = items["postgres/sources.ndjson"]
+        items["postgres/sources.ndjson"] = b"X" * (len(original) - 1) + b"\n"
+        with zipfile.ZipFile(archive, "w") as zout:
+            for name, data in items.items():
+                zout.writestr(name, data)
+
+        with pytest.raises(ArchiveFormatError, match="hash mismatch"):
+            await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+        assert await _count(store, pg.Case) == cases_before
+
+    async def test_shrunken_member_rejected_before_writes(self, store, tmp_path):
         alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
         case, src, _ = await _rich_case(store, alice.id)
         archive = await _export(store, case, src, tmp_path)
@@ -244,7 +317,7 @@ class TestRejection:
             for name, data in items.items():
                 zout.writestr(name, data)
 
-        with pytest.raises(ArchiveFormatError, match="hash mismatch"):
+        with pytest.raises(ArchiveFormatError, match="does not match the manifest"):
             await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
         assert await _count(store, pg.Case) == cases_before
 
@@ -395,25 +468,35 @@ class TestSkippedSourceDependents:
 
         async with store.session_factory() as s:
             new_sources = (
-                await s.execute(select(pg.Source).where(pg.Source.case_id == result.case_id))
-            ).scalars().all()
+                (await s.execute(select(pg.Source).where(pg.Source.case_id == result.case_id)))
+                .scalars()
+                .all()
+            )
             assert [src.name for src in new_sources] == ["ready-src"]
             new_tl = (
                 await s.execute(select(pg.Timeline).where(pg.Timeline.case_id == result.case_id))
             ).scalar_one()
             joins = (
-                await s.execute(
-                    select(pg.TimelineSource).where(pg.TimelineSource.timeline_id == new_tl.id)
+                (
+                    await s.execute(
+                        select(pg.TimelineSource).where(pg.TimelineSource.timeline_id == new_tl.id)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             # Exactly the ready source's join row — no phantom id minted by
             # the idmap for the skipped source.
             assert [j.source_id for j in joins] == [new_sources[0].id]
             anns = (
-                await s.execute(
-                    select(pg.Annotation).where(pg.Annotation.case_id == result.case_id)
+                (
+                    await s.execute(
+                        select(pg.Annotation).where(pg.Annotation.case_id == result.case_id)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert anns == []
 
 
@@ -454,6 +537,30 @@ class TestCreatedByAttribution:
         new_ann = await self._restored_annotation(store, result.case_id)
         assert new_ann.created_by == bob.id
         assert any("alice" in w for w in result.warnings)
+
+    async def test_missing_user_warns_once_not_per_row(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, bob.id, annotation_author=alice.id)
+        for i in range(5):
+            await _add(
+                store,
+                pg.Annotation,
+                case_id=case.id,
+                source_id=src.id,
+                event_id=f"evt-{i}",
+                annotation_type="comment",
+                content="note",
+                created_by=alice.id,
+            )
+        archive = await _export(store, case, src, tmp_path)
+        async with store.session_factory() as s:
+            await s.execute(delete(pg.User).where(pg.User.id == alice.id))
+            await s.commit()
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=bob)
+
+        assert len([w for w in result.warnings if "alice" in w]) == 1
 
     async def test_non_user_created_by_kept_verbatim(self, store, tmp_path):
         alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)

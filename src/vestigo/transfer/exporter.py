@@ -4,6 +4,12 @@ The Postgres snapshot is generic: every exported model is read with a plain
 ORM select and serialized by column introspection, so new columns ride along
 without exporter changes. Events stream per source through the existing
 iter_source_events primitive into an Arrow IPC member.
+
+Memory: events stream, but the Postgres snapshot materializes every row of
+every entity as dicts before the archive is written, so peak memory scales
+with the largest single entity (usually annotations or audit_log). Acceptable
+for the single-process deployment this targets; chunk the per-stem loop if a
+case ever outgrows it.
 """
 
 from __future__ import annotations
@@ -152,9 +158,44 @@ def _write_source_events(clickhouse: Any, case_id: str, source_id: str, dest: Pa
     return total
 
 
+def _orphan_reference_warnings(
+    stems: dict[str, list[dict[str, Any]]], skipped_ids: set[str]
+) -> list[str]:
+    """Warn about ids of skipped sources still embedded in JSON payloads.
+
+    FK columns pointing at a skipped source are filtered out, but ids buried in
+    JSON (chart configs, detector params, proposal payloads) are not — nothing
+    enforces them, so they would ride along and resolve to nothing after
+    import. Warn rather than drop: a dangling reference beats silently deleting
+    an analyst's chart. Serialization-level scan, so no per-model knowledge.
+    """
+    if not skipped_ids:
+        return []
+    out: list[str] = []
+    for stem, rows in stems.items():
+        for row in rows:
+            text = json.dumps(row, default=str)
+            for sid in sorted(skipped_ids):
+                if sid in text:
+                    out.append(
+                        f"{stem} {row.get('id')} references excluded source {sid}"
+                        " — payload exported as-is"
+                    )
+    return out
+
+
 async def _snapshot_postgres(store: PostgresStore, case_id: str) -> dict[str, Any]:
-    """One session; returns case dict, per-stem row lists, and user refs."""
+    """One session; returns case dict, per-stem row lists, and user refs.
+
+    Reads run under REPEATABLE READ on Postgres so an ingest or annotation
+    landing mid-export cannot produce a torn snapshot — an archive has to be a
+    point-in-time record to be forensically meaningful. SQLite (tests) rejects
+    that isolation level, and its single-writer model makes it moot, so the
+    setting is applied per-dialect.
+    """
     async with store.session_factory() as session:
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
         case = (await session.execute(select(Case).where(Case.id == case_id))).scalar_one()
         timeline_ids = (
             (await session.execute(select(Timeline.id).where(Timeline.case_id == case_id)))
@@ -232,10 +273,12 @@ async def export_case(
     # still being written, so both the NDJSON rows and the events/blobs loops
     # skip them. Analysts re-export after ingest completes.
     ready_sources = []
+    skipped_ids: set[str] = set()
     for source in stems["sources"]:
         if source.get("status") == "ready":
             ready_sources.append(source)
         else:
+            skipped_ids.add(source["id"])
             warnings.append(
                 f"source {source['name']} not ready (status={source.get('status')})"
                 " — excluded from export"
@@ -251,6 +294,7 @@ async def export_case(
         stems[stem] = [
             r for r in stems[stem] if r.get("source_id") is None or r["source_id"] in ready_ids
         ]
+    warnings.extend(_orphan_reference_warnings(stems, skipped_ids))
     counts: dict[str, int] = {stem: len(rows) for stem, rows in stems.items()}
     counts["events"] = 0
     counts["blobs"] = 0

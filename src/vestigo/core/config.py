@@ -191,6 +191,18 @@ class Settings(BaseSettings):
     # temp file plus a retained content-addressed copy).
     max_upload_bytes: int = Field(default=10 * 1024**3, ge=0)
 
+    # Case export/import (X1). In-flight export archives are written here
+    # before download; they contain the full case, so this directory is as
+    # sensitive as source_retention_path and is created 0700 and owner-checked.
+    # Size it for the largest case exported, not for the average one.
+    transfer_temp_path: str = "data/transfer"
+    # Ceiling on an imported archive's total *uncompressed* size; 0 disables.
+    # Events and blobs travel ZIP_STORED, so a legitimate archive expands by
+    # roughly 1x and only its NDJSON members compress meaningfully — a large
+    # ratio means a decompression bomb, not a big case. Checked against the
+    # manifest before any member is read.
+    transfer_max_expanded_bytes: int = Field(default=200 * 1024**3, ge=0)
+
     # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
     # directory scanned for *.yml/*.yaml at run time — an offline file drop
     # (e.g. a vendored SigmaHQ clone); empty string disables the global set.

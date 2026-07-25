@@ -33,6 +33,21 @@ async def store(tmp_path, monkeypatch):
     await s.engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def transfer_temp(tmp_path, monkeypatch):
+    """Point export archives at the test's tmp dir.
+
+    ``transfer_temp_path`` defaults to ``data/transfer`` relative to the
+    working directory, so without this any test that touches the transfer
+    router would write archives into the repo. Autouse because the app's
+    startup sweep calls ``temp_root()`` before any test body runs.
+    """
+    monkeypatch.setenv("VESTIGO_TRANSFER_TEMP_PATH", str(tmp_path / "transfer"))
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.fixture()
 def admin_bootstrap(monkeypatch):
     """Seed VESTIGO_ADMIN_* env vars and clear the settings cache so the app

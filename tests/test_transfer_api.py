@@ -51,7 +51,7 @@ class TestExportEndpoint:
     def test_export_download_and_audit(self, client, admin_bootstrap):
         as_admin(client, admin_bootstrap)
         case_id = _create_case(client)
-        resp = client.post(f"/api/cases/{case_id}/export?include_blobs=false")
+        resp = client.post(f"/api/cases/{case_id}/export", json={"include_blobs": False})
         assert resp.status_code == 202, resp.text
         job = _job_terminal(client, resp.json()["job_id"])
         assert job["status"] == "completed", job.get("error")
@@ -80,20 +80,36 @@ class TestExportEndpoint:
 
 
 class TestImportEndpoint:
-    def _archive_bytes(self) -> bytes:
-        """Minimal valid archive: manifest + case.json only."""
+    def _archive_bytes(self, *, drop: str | None = None) -> bytes:
+        """Smallest archive the importer accepts: every member the exporter
+        always writes, with empty entity streams. ``drop`` omits one member
+        from the manifest to exercise the completeness check."""
         import hashlib
 
         from vestigo.transfer.archive import FORMAT_VERSION
+        from vestigo.transfer.importer import _IMPORT_SPECS
 
+        members: list[dict] = []
         buf = BytesIO()
-        case_json = json.dumps({"id": "old-case", "name": "Imported", "description": None}).encode()
         with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("postgres/case.json", case_json)
-            z.writestr(
-                "postgres/user_refs.json",
-                json.dumps({"users": {}, "team": None}).encode(),
-            )
+            contents = {
+                "postgres/case.json": json.dumps(
+                    {"id": "old-case", "name": "Imported", "description": None}
+                ).encode(),
+                "postgres/user_refs.json": json.dumps({"users": {}, "team": None}).encode(),
+                **{f"postgres/{stem}.ndjson": b"" for stem, _model, _refs in _IMPORT_SPECS},
+            }
+            for name, data in contents.items():
+                if name == drop:
+                    continue
+                z.writestr(name, data)
+                members.append(
+                    {
+                        "path": name,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "bytes": len(data),
+                    }
+                )
             manifest = {
                 "format_version": FORMAT_VERSION,
                 "vestigo_version": "test",
@@ -102,13 +118,7 @@ class TestImportEndpoint:
                 "case": {"id": "old-case", "name": "Imported"},
                 "include_blobs": False,
                 "counts": {},
-                "members": [
-                    {
-                        "path": "postgres/case.json",
-                        "sha256": hashlib.sha256(case_json).hexdigest(),
-                        "bytes": len(case_json),
-                    }
-                ],
+                "members": members,
             }
             z.writestr("manifest.json", json.dumps(manifest).encode())
         return buf.getvalue()
@@ -143,6 +153,25 @@ class TestImportEndpoint:
         assert audit.status_code == 200
         entries = audit.json()["audit"]
         assert any(e["action"] == "case.import" for e in entries)
+
+    def test_incomplete_archive_fails_the_job(self, client, admin_bootstrap):
+        # A stem the exporter always writes cannot go missing silently — that
+        # would restore a case with, say, no annotations and report success.
+        as_admin(client, admin_bootstrap)
+        resp = client.post(
+            "/api/cases/import",
+            files={
+                "file": (
+                    "backup.vestigo",
+                    self._archive_bytes(drop="postgres/annotations.ndjson"),
+                    "application/zip",
+                )
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        job = _job_terminal(client, resp.json()["job_id"])
+        assert job["status"] == "failed"
+        assert "annotations" in job["error"]
 
     def test_garbage_upload_fails_job_not_server(self, client, admin_bootstrap):
         as_admin(client, admin_bootstrap)

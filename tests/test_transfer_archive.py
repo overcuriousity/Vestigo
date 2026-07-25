@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import zipfile
+from pathlib import Path
 
 import pytest
 
+from vestigo.core.config import get_settings
 from vestigo.transfer.archive import (
     FORMAT_VERSION,
     ArchiveFormatError,
     ArchiveReader,
     ArchiveWriter,
     new_archive_path,
+    sweep_stale,
     temp_root,
 )
 
@@ -37,7 +42,16 @@ class TestRoundTrip:
         reader.verify_members()  # must not raise
         assert reader.read_json("postgres/case.json") == {"name": "Demo"}
         assert reader.read_ndjson("postgres/sources.ndjson") == [{"id": "s1"}, {"id": "s2"}]
-        assert reader.read_ndjson("postgres/absent.ndjson") == []
+        reader.close()
+
+    def test_unlisted_member_cannot_be_read(self, tmp_path):
+        # A member that is not in the manifest is neither hash-verified nor
+        # size-bounded, so reading it at all would defeat both guarantees.
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+        reader = ArchiveReader(path)
+        with pytest.raises(ArchiveFormatError, match="not listed in the manifest"):
+            reader.read_ndjson("postgres/absent.ndjson")
         reader.close()
 
     def test_member_hashes_recorded(self, tmp_path):
@@ -83,7 +97,9 @@ class TestRejection:
         # Rewrite the zip, corrupting one member but keeping the manifest.
         with zipfile.ZipFile(path) as zin:
             items = {i.filename: zin.read(i.filename) for i in zin.infolist()}
-        items["postgres/sources.ndjson"] = b'{"id": "EVIL"}\n'
+        # Same length as the original: a size change is caught earlier, by the
+        # manifest cross-check, so this exercises the hash specifically.
+        items["postgres/sources.ndjson"] = b'{"id": "s1"}\n{"id": "XX"}\n'
         with zipfile.ZipFile(path, "w") as zout:
             for name, data in items.items():
                 zout.writestr(name, data)
@@ -134,12 +150,105 @@ class TestRejection:
             ArchiveReader(path)
 
 
-def test_temp_root_and_archive_path(tmp_path, monkeypatch):
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    import tempfile
+class TestSizeBounds:
+    """Sizes are load-bearing: an import is an untrusted upload."""
 
-    monkeypatch.setattr(tempfile, "tempdir", None)  # force re-evaluation of TMPDIR
+    def _repack(self, path, mutate):
+        with zipfile.ZipFile(path) as zin:
+            items = {i.filename: zin.read(i.filename) for i in zin.infolist()}
+        manifest = json.loads(items["manifest.json"])
+        mutate(manifest, items)
+        items["manifest.json"] = json.dumps(manifest).encode()
+        with zipfile.ZipFile(path, "w") as zout:
+            for name, data in items.items():
+                zout.writestr(name, data)
+
+    def test_declared_size_mismatch_rejected(self, tmp_path):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+
+        def _shrink(manifest, _items):
+            manifest["members"][0]["bytes"] = 1
+
+        self._repack(path, _shrink)
+        with pytest.raises(ArchiveFormatError, match="does not match the manifest"):
+            ArchiveReader(path)
+
+    def test_missing_bytes_rejected(self, tmp_path):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+
+        def _drop(manifest, _items):
+            del manifest["members"][0]["bytes"]
+
+        self._repack(path, _drop)
+        with pytest.raises(ArchiveFormatError, match="members"):
+            ArchiveReader(path)
+
+    def test_total_over_ceiling_rejected(self, tmp_path, monkeypatch):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_EXPANDED_BYTES", "10")
+        get_settings.cache_clear()
+        with pytest.raises(ArchiveFormatError, match="over the 10-byte limit"):
+            ArchiveReader(path)
+
+    def test_zero_ceiling_disables_the_check(self, tmp_path, monkeypatch):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_EXPANDED_BYTES", "0")
+        get_settings.cache_clear()
+        reader = ArchiveReader(path)  # must not raise
+        reader.close()
+
+    def test_manifest_member_absent_from_zip_rejected(self, tmp_path):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+
+        def _drop_member(_manifest, items):
+            del items["postgres/sources.ndjson"]
+
+        self._repack(path, _drop_member)
+        with pytest.raises(ArchiveFormatError, match="member missing"):
+            ArchiveReader(path)
+
+
+def test_temp_root_and_archive_path(tmp_path):
+    # The conftest autouse fixture already points transfer_temp_path at tmp_path.
     root = temp_root()
     assert root.is_dir()
+    assert root.stat().st_mode & 0o077 == 0
     p = new_archive_path("job123")
     assert p.parent == root and p.name == "job123.vestigo"
+
+
+def test_temp_root_rejects_a_world_readable_dir(tmp_path, monkeypatch):
+    root = tmp_path / "loose"
+    root.mkdir(mode=0o755)
+    monkeypatch.setenv("VESTIGO_TRANSFER_TEMP_PATH", str(root))
+    get_settings.cache_clear()
+    # chmod() inside temp_root() would normally fix the mode; simulate a
+    # directory this process does not actually control.
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
+    with pytest.raises(RuntimeError, match="group/world accessible"):
+        temp_root()
+
+
+def test_sweep_stale_removes_expired_entries(tmp_path):
+    root = temp_root()
+    fresh = root / "fresh.vestigo"
+    stale = root / "stale.vestigo"
+    stale_dir = root / "stale-job"
+    fresh.write_bytes(b"x")
+    stale.write_bytes(b"x")
+    stale_dir.mkdir()
+    (stale_dir / "scratch").write_bytes(b"x")
+    old = time.time() - 3600
+    os.utime(stale, (old, old))
+    os.utime(stale_dir, (old, old))
+
+    sweep_stale(max_age_seconds=60)
+
+    assert fresh.exists()
+    assert not stale.exists()
+    assert not stale_dir.exists()

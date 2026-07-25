@@ -67,6 +67,10 @@ def _event(i: int) -> Event:
         display_name="d",
         tags=["rt"],
         attributes={"idx": str(i)},
+        # Embedded upstream: the import must strip these, since the vectors
+        # they point at live in a Qdrant collection that does not travel.
+        embedding_model="bge-small",
+        embedding_config_hash="cd" * 32,
     )
 
 
@@ -137,6 +141,18 @@ async def test_roundtrip_events_identical(store, ch_store, tmp_path):
             for r in batch
         ]
         assert _comparable(restored) == _comparable(original)
+        # Qdrant vectors don't travel, so a restored event must not claim one —
+        # against real ClickHouse column types, not the fake's dicts.
+        assert all(r["embedding_model"] == "bge-small" for r in original)
+        assert all(not r["embedding_model"] for r in restored)
+        assert all(
+            not (
+                r["embedding_config_hash"].decode().rstrip("\x00")
+                if isinstance(r["embedding_config_hash"], bytes)
+                else r["embedding_config_hash"]
+            ).strip("\x00")
+            for r in restored
+        )
     finally:
         # Clean up the imported case's events as well (partition drop).
         try:

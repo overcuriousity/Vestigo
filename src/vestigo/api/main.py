@@ -171,7 +171,12 @@ async def _reconcile_orphaned_ingests() -> None:
 
 async def _sweep_stale_transfer_archives() -> None:
     """Export archives live in temp storage and the job store is in-memory —
-    after a restart every leftover is orphaned by definition."""
+    after a restart every leftover is orphaned by definition.
+
+    Wholesale, not TTL-based: this assumes one process per configured
+    ``transfer_temp_path``, which the in-memory JobStore already requires.
+    In-flight archives are additionally expired by ``archive.sweep_stale`` on
+    each export, so a long-running process does not accumulate them."""
     from vestigo.transfer.archive import temp_root
 
     root = temp_root()

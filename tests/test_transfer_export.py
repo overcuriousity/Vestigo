@@ -209,6 +209,15 @@ async def test_export_skips_sources_not_ready(store, tmp_path):
     await _add(store, pg.FindingDisposition, case_id=case.id, source_id=ingesting.id)
     await _add(store, pg.FindingDisposition, case_id=case.id, source_id=None)  # stays
     await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=ingesting.id)
+    # A chart whose config embeds the skipped source id: no FK enforces this,
+    # so it ships and must at least be reported.
+    chart = await _add(
+        store,
+        pg.SavedChart,
+        case_id=case.id,
+        timeline_id=tl.id,
+        config={"source_ids": [ingesting.id]},
+    )
     fake_ch = FakeClickHouse(
         {
             (case.id, ready.id): _event_rows(case.id, ready.id, n=1),
@@ -228,6 +237,10 @@ async def test_export_skips_sources_not_ready(store, tmp_path):
     assert result.counts["sources"] == 1
     assert result.counts["events"] == 1
     assert any("mid-src" in w for w in result.warnings)
+    assert any(
+        f"saved_charts {chart.id} references excluded source {ingesting.id}" in w
+        for w in result.warnings
+    )
     reader = ArchiveReader(result.path)
     rows = reader.read_ndjson("postgres/sources.ndjson")
     assert [r["name"] for r in rows] == ["ready-src"]
