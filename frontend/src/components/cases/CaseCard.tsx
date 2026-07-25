@@ -3,6 +3,7 @@ import { FolderOpen, ChevronRight, Users, User as UserIcon } from "lucide-react"
 import { fmtRelative } from "@/lib/time";
 import { DeleteCaseDialog } from "./DeleteCaseDialog";
 import { ChangeCaseScopeDialog } from "./ChangeCaseScopeDialog";
+import { ExportCaseDialog } from "./ExportCaseDialog";
 import { Badge } from "@/components/ui/Badge";
 import { canManageCase } from "@/lib/caseAccess";
 import { useAuthStore } from "@/stores/auth";
@@ -51,6 +52,7 @@ export function CaseCard({ case_ }: Props) {
         </p>
       </Link>
       <div className="flex items-center gap-1">
+        {canManage && <ExportCaseDialog case_={case_} />}
         {canManage && <ChangeCaseScopeDialog case_={case_} />}
         {canManage && <DeleteCaseDialog case_={case_} />}
         <Link to={`/cases/${case_.id}`} tabIndex={-1}>
