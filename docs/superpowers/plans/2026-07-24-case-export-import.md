@@ -1515,7 +1515,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from vestigo.core.retention import retain_file, retention_path
 from vestigo.db.field_stats import refresh_source_field_stats
@@ -1562,7 +1562,7 @@ _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
     ("source_enrichments", SourceEnrichment, {"id": "source_enrichment", "case_id": "case", "source_id": "source"}),
     ("agent_conversations", AgentConversation, {"id": "conversation", "case_id": "case", "timeline_id": "timeline"}),
     ("agent_messages", AgentMessage, {"id": "message", "conversation_id": "conversation"}),
-    ("agent_proposals", AgentProposal, {"id": "proposal", "case_id": "case", "conversation_id": "conversation"}),
+    ("agent_proposals", AgentProposal, {"id": "proposal", "case_id": "case", "conversation_id": "conversation", "timeline_id": "timeline"}),
     ("audit_log", AuditLog, {"id": "audit", "case_id": "case"}),
 ]
 
@@ -1673,6 +1673,11 @@ async def import_case(
         _progress("postgres")
         # Username → local user id, for conversation attribution mapping.
         async with store.session_factory() as session:
+            # create_case() seeds a placeholder default timeline — remove it
+            # before restoring the archived ones (round-trip fidelity + the
+            # one-default-timeline invariant). A case exported with zero
+            # timelines legitimately imports with zero.
+            await session.execute(delete(Timeline).where(Timeline.case_id == new_case_id))
             for stem, model, refs in _IMPORT_SPECS:
                 rows = reader.read_ndjson(f"postgres/{stem}.ndjson")
                 counts[stem] = len(rows)
