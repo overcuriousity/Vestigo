@@ -4,7 +4,7 @@ import type { Job } from "./types";
 
 export const transferApi = {
   startExport: (caseId: string, includeBlobs: boolean) =>
-    post<{ job_id: string }>(`/cases/${caseId}/export?include_blobs=${includeBlobs}`),
+    post<{ job_id: string }>(`/cases/${caseId}/export`, { include_blobs: includeBlobs }),
 
   downloadExport: async (caseId: string, jobId: string, caseName: string): Promise<void> => {
     const blob = await fetchBlobGet(`/cases/${caseId}/export/${jobId}/download`);
