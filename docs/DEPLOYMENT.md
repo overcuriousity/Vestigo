@@ -170,24 +170,35 @@ Two directories hold case data on the app host itself, both `VESTIGO_*`-configur
 - `VESTIGO_TRANSFER_TEMP_PATH` (default `data/transfer`) — in-flight case export
   archives. An archive is a **complete** case (optionally including the original
   source blobs), so treat this directory as exactly as sensitive as the retention
-  path. Vestigo creates it `0700` and refuses to export if it turns out to be owned
-  by another user or to be group/world accessible — do not point it at a shared
-  `/tmp`. Size it for the largest single case you expect to export, times
-  `VESTIGO_TRANSFER_MAX_CONCURRENT` (below).
+  path. Vestigo creates it `0700`, forces that mode on an existing directory, and
+  refuses to export if the path turns out to be owned by another user or not to be
+  a real directory — do not point it at a shared `/tmp`. Size it for the largest
+  single case you expect to export, times `VESTIGO_TRANSFER_MAX_CONCURRENT` (below).
 
   Archives are removed as soon as they are downloaded; anything left by an
-  interrupted download is expired 24 hours later by the next export, and the whole
-  directory is cleared at startup (the job store is in-memory, so nothing there
+  interrupted download is expired 24 hours later by the next export, and everything
+  left over is cleared at startup (the job store is in-memory, so nothing there
   survives a restart anyway). That startup sweep assumes **one app process per
-  configured path**.
+  configured path**. It removes only what a transfer job writes — `*.vestigo`
+  archives and job-id working directories — and logs a warning about anything else
+  it finds, so pointing the setting at a populated directory costs that directory
+  nothing. Give it a directory of its own regardless.
 
 Import is open to any authenticated user and restores as a new case owned by them.
-Because an uploaded archive is untrusted input, `VESTIGO_TRANSFER_MAX_EXPANDED_BYTES`
-(default 200 GiB, `0` disables) caps an archive's total *uncompressed* size, checked
-against the manifest before a single member is read. Events and blobs travel
-uncompressed, so a real export expands by roughly 1x; a ratio far above that is a
-decompression bomb rather than a big case. Raise it only if a genuine export trips
-the check.
+Because an uploaded archive is untrusted input, two size caps apply, both checked
+against the manifest before a single member is read:
+
+- `VESTIGO_TRANSFER_MAX_EXPANDED_BYTES` (default 200 GiB, `0` disables) caps the
+  archive's **total** uncompressed size. Events and blobs travel uncompressed, so a
+  real export expands by roughly 1x; a ratio far above that is a decompression bomb
+  rather than a big case.
+- `VESTIGO_TRANSFER_MAX_METADATA_BYTES` (default 2 GiB, `0` disables) caps any
+  **single** `postgres/*` member. A total says nothing about one member — a lone
+  100 GiB metadata member fits comfortably under a 200 GiB total. These members
+  hold case metadata (rows, not events), so a genuine export stays far below the
+  default.
+
+Raise either only if a genuine export trips the check.
 
 `VESTIGO_TRANSFER_MAX_CONCURRENT` (default 2, `0` disables) caps how many export and
 import jobs may be in flight at once, across the instance. Both directions reserve
@@ -195,6 +206,11 @@ real disk for the whole job and any authenticated user can start either, so this
 admission control rather than a throughput knob; an import over the cap is rejected
 with 429 *before* its upload is accepted. Raise it only alongside the temp path's
 capacity.
+
+Transfers do their hashing, zipping and verification in worker threads, so a
+multi-GiB export or import does not stall the rest of the API while it runs. They
+are still CPU- and disk-bound, so the concurrency cap remains the thing that keeps
+them from crowding out ordinary queries.
 
 Restored `audit_log` rows keep the actor, action and timestamp the archive asserted —
 that is the point of exporting them — but nothing on the importing instance vouches

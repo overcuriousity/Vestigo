@@ -11,6 +11,7 @@ import json
 import zipfile
 from datetime import UTC, datetime
 
+import pyarrow as pa
 import pytest
 from sqlalchemy import delete, func, select
 
@@ -18,6 +19,7 @@ from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
 from vestigo.core.config import get_settings
 from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
+from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.transfer import archive as archive_mod
 from vestigo.transfer import importer
 from vestigo.transfer.archive import ArchiveFormatError
@@ -359,6 +361,150 @@ class TestFailureCleanup:
             await import_case(store, lambda: fake, archive, owner=alice)
         assert await _count(store, pg.Case) == cases_before
         assert fake.deleted, "event partition cleanup must run for inserted sources"
+
+    async def _two_blob_archive(self, store, alice, tmp_path, blobs):
+        """Archive of a case with one source (and one blob) per entry in `blobs`."""
+        case = await _add(store, pg.Case, name="Blobbed", owner_id=alice.id)
+        rows = {}
+        for i, (file_hash, content) in enumerate(blobs):
+            src = await _add(store, pg.Source, case_id=case.id, name=f"s{i}", file_hash=file_hash)
+            rows[(case.id, src.id)] = _event_rows(case.id, src.id, n=1)
+            blob = retention_path(file_hash)
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(content)
+        fake = FakeClickHouse(rows)
+        result = await export_case(
+            store,
+            lambda: fake,
+            case.id,
+            include_blobs=True,
+            exported_by="alice",
+            dest_dir=tmp_path / "out",
+        )
+        return result.path
+
+    @staticmethod
+    def _blob(seed: bytes) -> tuple[str, bytes]:
+        content = hashlib.sha256(seed).hexdigest().encode()
+        return hashlib.sha256(content).hexdigest(), content
+
+    @staticmethod
+    def _fail_on_second_retain(monkeypatch):
+        """Retain one blob, then blow up — the only way to reach the cleanup
+        path with a blob already in the instance-global retention dir."""
+        real = importer.retain_file
+        calls = []
+
+        def _retain(tmp, dest):
+            calls.append(dest)
+            if len(calls) > 1:
+                raise RuntimeError("disk went away")
+            real(tmp, dest)
+
+        monkeypatch.setattr(importer, "retain_file", _retain)
+
+    async def test_a_blob_this_run_retained_is_removed_on_failure(
+        self, store, tmp_path, monkeypatch
+    ):
+        """The retention dir is instance-global and nothing else tracks these:
+        a repeatedly-failing import would otherwise accumulate case file content
+        on disk that no Source row references."""
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            blobs = [self._blob(b"one"), self._blob(b"two")]
+            archive = await self._two_blob_archive(store, alice, tmp_path, blobs)
+            # Neither blob is on this instance any more, so the import retains
+            # both — the first succeeds, the second fails.
+            for file_hash, _ in blobs:
+                retention_path(file_hash).unlink()
+            self._fail_on_second_retain(monkeypatch)
+
+            with pytest.raises(RuntimeError, match="disk went away"):
+                await import_case(store, FakeClickHouse, archive, owner=alice)
+            assert not any(retention_path(h).exists() for h, _ in blobs)
+        finally:
+            get_settings.cache_clear()
+
+    async def test_a_pre_existing_blob_survives_a_failure(self, store, tmp_path, monkeypatch):
+        """The important half: blobs are content-addressed and shared, so a
+        failed import must never delete one another case still references."""
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            shared, doomed = self._blob(b"shared"), self._blob(b"doomed")
+            archive = await self._two_blob_archive(store, alice, tmp_path, [shared, doomed])
+            # `shared` stays put — it is the blob the exporting case still uses,
+            # so retain_file short-circuits on it and the import never owns it.
+            retention_path(doomed[0]).unlink()
+            self._fail_on_second_retain(monkeypatch)
+
+            with pytest.raises(RuntimeError, match="disk went away"):
+                await import_case(store, FakeClickHouse, archive, owner=alice)
+            assert retention_path(shared[0]).read_bytes() == shared[1]
+        finally:
+            get_settings.cache_clear()
+
+
+class TestEventSchemaTrust:
+    """The Arrow member is attacker-supplied and insert_events_arrow hands
+    whatever it gets straight to ClickHouse."""
+
+    def _reschema(self, archive, arcname, schema, rows):
+        sink = pa.BufferOutputStream()
+        writer = pa.ipc.new_stream(sink, schema)
+        writer.write_batch(pa.RecordBatch.from_pylist(rows, schema=schema))
+        writer.close()
+        _rewrite_member(archive, {arcname: sink.getvalue().to_pybytes()})
+
+    async def test_mismatched_event_schema_aborts_the_import(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        cases_before = await _count(store, pg.Case)
+
+        # A renamed column: get_field_index would return -1, and the missing
+        # real column would silently take a ClickHouse server-side default.
+        fields = [
+            pa.field("case_id_typo" if f.name == "case_id" else f.name, f.type)
+            for f in EVENT_ARROW_SCHEMA
+        ]
+        bogus = pa.schema(fields)
+        self._reschema(archive, f"events/{src.id}.arrow", bogus, [])
+
+        fake = FakeClickHouse()
+        with pytest.raises(ArchiveFormatError, match="event schema"):
+            await import_case(store, lambda: fake, archive, owner=alice)
+        assert await _count(store, pg.Case) == cases_before
+        assert not fake.inserted
+
+
+class TestMalformedSources:
+    """sources.ndjson drives the events and blobs phases; a row missing the two
+    fields they key off must fail as a format error, not a KeyError from deep
+    inside the import."""
+
+    @pytest.mark.parametrize("column", ["id", "file_hash"])
+    async def test_source_row_without_a_required_field(self, store, tmp_path, column):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, _ = await _rich_case(store, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        cases_before = await _count(store, pg.Case)
+
+        with zipfile.ZipFile(archive) as z:
+            rows = [json.loads(line) for line in z.read("postgres/sources.ndjson").splitlines()]
+        for row in rows:
+            row.pop(column, None)
+        _rewrite_member(
+            archive,
+            {"postgres/sources.ndjson": b"".join(json.dumps(r).encode() + b"\n" for r in rows)},
+        )
+
+        with pytest.raises(ArchiveFormatError, match=f"no usable {column}"):
+            await import_case(store, FakeClickHouse, archive, owner=alice)
+        assert await _count(store, pg.Case) == cases_before
 
 
 class TestArchiveMemberTrust:

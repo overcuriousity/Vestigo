@@ -34,15 +34,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-checked against the zip directory, every read is bounded by it, and
   `VESTIGO_TRANSFER_MAX_EXPANDED_BYTES` (default 200 GiB, `0` disables) caps
   the total uncompressed size before a single member is read — a decompression
-  bomb can otherwise exhaust memory or disk inside a small upload. Reads are
-  also restricted to manifest-listed members, so an archive missing an entity
-  stream fails instead of silently restoring a case without it. In-flight
-  archives live under `VESTIGO_TRANSFER_TEMP_PATH` (default `data/transfer`),
-  created `0700` and refused if owned by another user or group/world
-  accessible; they are deleted on download, expired after 24h by the next
-  export, and cleared at startup. Restored events have their embedding markers
-  blanked and the import warns that vectors need re-embedding, since Qdrant
-  data is not portable.
+  bomb can otherwise exhaust memory or disk inside a small upload. Because a
+  total says nothing about any *one* member, `VESTIGO_TRANSFER_MAX_METADATA_BYTES`
+  (default 2 GiB, `0` disables) additionally caps each `postgres/*` member, and
+  the importer streams every one of them row by row rather than materializing
+  it — peak memory scales with the largest single row, not the largest entity.
+  Event Arrow members are checked against the current event schema before
+  reaching ClickHouse. Reads are also restricted to manifest-listed members, so
+  an archive missing an entity stream fails instead of silently restoring a
+  case without it. In-flight archives live under `VESTIGO_TRANSFER_TEMP_PATH`
+  (default `data/transfer`), created `0700` (and repaired to it) and refused if
+  owned by another user or not a real directory; they are deleted on download,
+  expired after 24h by the next export, and cleared at startup — a sweep that
+  removes only Vestigo's own archives and job directories, never anything else
+  it finds under the configured path. Restored events have their embedding
+  markers blanked and the import warns that vectors need re-embedding, since
+  Qdrant data is not portable.
+
+  Export and import do their hashing, zipping and archive verification off the
+  event loop, so a multi-GiB transfer no longer stalls the rest of the API for
+  its duration. A failed import removes the blobs it had already written to the
+  instance-global retention directory, leaving nothing untracked behind, and
+  the frontend holds the import dialog open to show the importer's warnings
+  instead of navigating past them.
 
   Restored `audit_log` rows keep the actor, action and timestamp the archive
   asserted — that is what makes an exported chain of custody worth having —
@@ -52,10 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archive can never read as locally recorded activity. Their `target_id` is
   remapped along with everything else, so a restored audit trail still points
   at the entities it describes. `VESTIGO_TRANSFER_MAX_CONCURRENT` (default 2,
-  `0` disables) caps in-flight transfers instance-wide; an import over the cap
-  is rejected with 429 before its upload is accepted. Blob members no source
-  in the archive references are ignored rather than written to the
-  instance-global retention directory.
+  `0` disables) caps in-flight transfers instance-wide; the count and the job
+  creation happen under one lock, so simultaneous requests cannot both slip
+  past a cap of 1, and an import over the cap is rejected with 429 before its
+  upload is accepted (and its temp file removed if a slot fills while the body
+  streams). Blob members no source in the archive references are ignored rather
+  than written to the instance-global retention directory.
 - **`clickhouse` pytest marker** — registered in `pyproject.toml` and applied to
   all eleven `tests/*_clickhouse.py` files, so `pytest -m clickhouse` selects
   the dev-stack tests and a ClickHouse-less run can no longer pass them

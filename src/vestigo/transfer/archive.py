@@ -10,18 +10,30 @@ from any authenticated user, so every read is bounded by the member's declared
 size, the declared size is cross-checked against the zip's own directory entry,
 and the total is capped by VESTIGO_TRANSFER_MAX_EXPANDED_BYTES. Without that a
 deflate bomb inside a small upload could exhaust memory or disk.
+
+The total cap alone is not enough, because it says nothing about any *single*
+member: a lone 100 GiB NDJSON member sits well under a 200 GiB total, and
+reading it whole would exhaust memory long before the disk. So the metadata
+members (``postgres/*``) carry their own much smaller ceiling
+(VESTIGO_TRANSFER_MAX_METADATA_BYTES) and are additionally read as streams
+rather than materialized. Events and blobs are exempt from that ceiling —
+they are the legitimately large part of an archive and are only ever streamed.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
+import logging
 import os
+import re
 import shutil
 import stat
 import time
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +41,17 @@ from vestigo.core.config import get_settings
 
 FORMAT_VERSION = 1
 _CHUNK = 1 << 20
+
+# Members under this prefix are archive *metadata* (the Postgres snapshot):
+# small relative to the events they describe, and the only ones a reader ever
+# parses rather than streams. They carry the per-member size ceiling.
+METADATA_PREFIX = "postgres/"
+
+# JobStore ids: uuid4().hex[:16]. Export working directories are named after
+# one, which is how a sweep tells its own scratch from an operator's files.
+_JOB_ID_RE = re.compile(r"[0-9a-f]{16}")
+
+logger = logging.getLogger(__name__)
 
 # How long an export archive survives in the temp root before an opportunistic
 # sweep removes it. Sizing detail, not an operator tunable: the download link
@@ -63,8 +86,13 @@ def temp_root() -> Path:
 
     Archives hold complete case data, so the directory must be ours alone.
     A world-writable parent (the old default was the system temp dir) lets
-    another local user pre-create the path and read every export, so an
-    unexpected owner or mode is a hard failure rather than a warning.
+    another local user pre-create the path and read every export.
+
+    The directory is created 0700, and that mode is *forced* on an existing
+    one — a loose mode is repaired rather than rejected, because repairing it
+    is both safe and what an operator wants. The hard failures are the two
+    conditions we cannot fix from here: a path that is not a real directory
+    (a symlink someone else controls) and one owned by another user.
     """
     root = Path(get_settings().transfer_temp_path)
     root.mkdir(parents=True, exist_ok=True)
@@ -80,6 +108,9 @@ def temp_root() -> Path:
     if st.st_uid != os.getuid():
         raise RuntimeError(f"transfer temp path is not owned by this process: {root}")
     if st.st_mode & 0o077:
+        # Normally unreachable — the chmod above just cleared these bits. It
+        # stays as the backstop for filesystems where chmod silently no-ops
+        # (some network mounts), which is the one case we must not run in.
         raise RuntimeError(f"transfer temp path is group/world accessible: {root}")
     return root
 
@@ -88,24 +119,55 @@ def new_archive_path(job_id: str) -> Path:
     return temp_root() / f"{job_id}.vestigo"
 
 
-def sweep_stale(max_age_seconds: int = _ARCHIVE_TTL_SECONDS) -> None:
-    """Delete export archives and job working dirs older than the TTL.
+def is_transfer_artifact(entry: Path) -> bool:
+    """Whether a temp-root entry is something a transfer job created.
+
+    The only two shapes a transfer ever writes here: ``<job_id>.vestigo`` for a
+    finished archive, and a ``<job_id>/`` working directory. Nothing else in
+    the directory is ours, and a sweep must not touch it — ``transfer_temp_path``
+    is operator-configurable, and pointing it at a populated directory must
+    cost that directory nothing.
+    """
+    if entry.is_dir():
+        return bool(_JOB_ID_RE.fullmatch(entry.name))
+    return entry.suffix == ".vestigo"
+
+
+def sweep_stale(max_age_seconds: float | None = _ARCHIVE_TTL_SECONDS) -> None:
+    """Delete export archives and job working dirs older than ``max_age_seconds``.
+
+    ``None`` sweeps them all regardless of age — what startup wants, where every
+    leftover is orphaned by definition (the job store is in-memory).
 
     Called opportunistically when an export starts rather than from a timer:
     this deployment has no scheduler (see ``core/jobs.py``), and an export is
     the only thing that creates these files. Without it, a completed export
     that is never downloaded would sit on disk until the process restarts.
     """
-    cutoff = time.time() - max_age_seconds
+    cutoff = None if max_age_seconds is None else time.time() - max_age_seconds
     root = temp_root()
+    foreign = 0
     for entry in root.iterdir():
+        if not is_transfer_artifact(entry):
+            foreign += 1
+            continue
         with contextlib.suppress(OSError):
-            if entry.stat().st_mtime >= cutoff:
+            if cutoff is not None and entry.stat().st_mtime >= cutoff:
                 continue
             if entry.is_dir():
                 shutil.rmtree(entry, ignore_errors=True)
             else:
                 entry.unlink(missing_ok=True)
+    if foreign:
+        # Once per sweep, not once per entry: a misconfigured transfer_temp_path
+        # pointing at a shared directory would otherwise flood the log.
+        logger.warning(
+            "%s entr(ies) under the transfer temp path %s were not written by a "
+            "transfer job and were left alone — is VESTIGO_TRANSFER_TEMP_PATH "
+            "pointing at a shared directory?",
+            foreign,
+            root,
+        )
 
 
 class ArchiveWriter:
@@ -204,7 +266,9 @@ class ArchiveReader:
         self._sizes: dict[str, int] = {m["path"]: m["bytes"] for m in members}
 
     def _validate_sizes(self, members: list[dict[str, Any]]) -> None:
-        """Cross-check declared sizes against the zip directory and the cap."""
+        """Cross-check declared sizes against the zip directory and the caps."""
+        settings = get_settings()
+        meta_limit = settings.transfer_max_metadata_bytes
         total = 0
         seen: set[str] = set()
         for member in members:
@@ -224,8 +288,17 @@ class ArchiveReader:
                     f"member size {info.file_size} does not match the manifest's "
                     f"{member['bytes']}: {name}"
                 )
+            if meta_limit and name.startswith(METADATA_PREFIX) and info.file_size > meta_limit:
+                # The total cap says nothing about one member: a single huge
+                # NDJSON fits comfortably under it and would still be too big
+                # to hold a row of at a time, let alone whole.
+                raise ArchiveFormatError(
+                    f"metadata member is {info.file_size} bytes, over the "
+                    f"{meta_limit}-byte per-member limit: {name} "
+                    "(raise VESTIGO_TRANSFER_MAX_METADATA_BYTES, 0 disables)"
+                )
             total += info.file_size
-        limit = get_settings().transfer_max_expanded_bytes
+        limit = settings.transfer_max_expanded_bytes
         if limit and total > limit:
             raise ArchiveFormatError(
                 f"archive expands to {total} bytes, over the {limit}-byte limit "
@@ -275,9 +348,30 @@ class ArchiveReader:
     def read_json(self, arcname: str) -> Any:
         return json.loads(self._read_bounded(arcname))
 
+    def iter_ndjson(self, arcname: str) -> Iterator[dict[str, Any]]:
+        """Stream a listed member one row at a time, bounded by its declared size.
+
+        The bounded alternative to ``read_ndjson``: peak memory is one row
+        rather than the whole member, so a caller's footprint no longer scales
+        with how big the archive's largest entity happens to be. Every import
+        path that walks a stem uses this; ``read_ndjson`` remains for the two
+        members that are genuinely small and read as a whole.
+        """
+        limit = self._declared_size(arcname)
+        read = 0
+        with self._zip.open(arcname) as f:
+            for raw in io.TextIOWrapper(f, encoding="utf-8"):
+                read += len(raw.encode())
+                if read > limit:
+                    # A local header that lies about its size — i.e. a bomb.
+                    # Same check verify_members makes, repeated because a
+                    # caller may stream a member without re-verifying it.
+                    raise ArchiveFormatError(f"member exceeds its declared size: {arcname}")
+                if raw.strip():
+                    yield json.loads(raw)
+
     def read_ndjson(self, arcname: str) -> list[dict[str, Any]]:
-        raw = self._read_bounded(arcname)
-        return [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+        return list(self.iter_ndjson(arcname))
 
     def open_member(self, arcname: str):
         """Raw stream for a listed member. Only safe after ``verify_members``,

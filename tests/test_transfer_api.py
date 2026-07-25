@@ -8,9 +8,13 @@ import re
 import time
 import zipfile
 from io import BytesIO
+from pathlib import Path
+
+import pytest
 
 from tests.conftest import as_admin, login
 from vestigo.api.routers import transfer as transfer_router
+from vestigo.core import jobs
 from vestigo.core.config import get_settings
 
 
@@ -213,11 +217,15 @@ class TestTransferAdmission:
     """Both directions reserve real resources for the whole job and any
     authenticated user can start one, so the instance needs a ceiling."""
 
-    def _fill_transfer_slots(self, n: int) -> None:
-        from vestigo.core.jobs import get_job_store
+    @pytest.fixture(autouse=True)
+    def _clean_job_store(self, monkeypatch):
+        """The job store is a process-global singleton, so jobs one test parks
+        in it would count against the next test's cap."""
+        monkeypatch.setattr(jobs, "_default_store", jobs.JobStore())
 
+    def _fill_transfer_slots(self, n: int) -> None:
         for _ in range(n):
-            get_job_store().create(kind="case_export", progress={"phase": "queued"})
+            jobs.get_job_store().create(kind="case_export", progress={"phase": "queued"})
 
     def test_export_rejected_when_slots_are_full(self, client, admin_bootstrap, monkeypatch):
         monkeypatch.setenv("VESTIGO_TRANSFER_MAX_CONCURRENT", "1")
@@ -267,3 +275,57 @@ class TestTransferAdmission:
         resp = client.post(f"/api/cases/{case_id}/export")
 
         assert resp.status_code == 202
+
+    def test_the_cap_holds_under_concurrent_creates(self):
+        """Counting and creating happen under one lock. Checking with
+        count_active and then calling create lets two simultaneous requests
+        both pass at limit-1, so a cap of 1 would admit 2."""
+        import threading
+
+        from vestigo.core.jobs import JobStore
+
+        store = JobStore()
+        admitted: list[object] = []
+        start = threading.Barrier(8)
+
+        def _try() -> None:
+            start.wait()
+            job = store.create_if_under(("case_export",), 1, kind="case_export")
+            if job is not None:
+                admitted.append(job)
+
+        threads = [threading.Thread(target=_try) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(admitted) == 1
+        assert store.count_active(("case_export",)) == 1
+
+    def test_a_rejected_import_leaves_no_temp_file(self, client, admin_bootstrap, monkeypatch):
+        """A slot can fill while the upload streams, so the authoritative check
+        lands after receive_upload_to_tmp — and must clean up after itself."""
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_CONCURRENT", "1")
+        get_settings.cache_clear()
+        as_admin(client, admin_bootstrap)
+        received: list[Path] = []
+        real_receive = transfer_router.receive_upload_to_tmp
+
+        async def _receive_then_fill(*args, **kwargs):
+            result = await real_receive(*args, **kwargs)
+            received.append(result[0])
+            # The race this guards: the slot is taken while the body streams.
+            self._fill_transfer_slots(1)
+            return result
+
+        monkeypatch.setattr(transfer_router, "receive_upload_to_tmp", _receive_then_fill)
+
+        # Content is irrelevant — the rejection happens before a job exists.
+        resp = client.post(
+            "/api/cases/import",
+            files={"file": ("backup.vestigo", b"anything", "application/zip")},
+        )
+
+        assert resp.status_code == 429
+        assert received and not received[0].exists()

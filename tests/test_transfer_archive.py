@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -215,6 +216,112 @@ class TestSizeBounds:
             ArchiveReader(path)
 
 
+class TestMetadataCeiling:
+    """The total cap says nothing about one member: a lone huge NDJSON fits
+    under it and would still be an out-of-memory kill for any authenticated
+    user who uploads one."""
+
+    def _archive(self, path, metadata_bytes, events_bytes=0):
+        writer = ArchiveWriter(path)
+        writer.add_bytes("postgres/case.json", json.dumps({"name": "Demo"}).encode())
+        writer.add_bytes("postgres/annotations.ndjson", b"x" * metadata_bytes)
+        if events_bytes:
+            writer.add_bytes("events/s1.arrow", b"x" * events_bytes, compress=False)
+        writer.finish({"format_version": FORMAT_VERSION, "case": {"name": "Demo"}})
+
+    def test_oversized_metadata_member_rejected(self, tmp_path, monkeypatch):
+        path = tmp_path / "demo.vestigo"
+        self._archive(path, metadata_bytes=5000)
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_METADATA_BYTES", "1000")
+        get_settings.cache_clear()
+        with pytest.raises(ArchiveFormatError, match="per-member limit"):
+            ArchiveReader(path)
+
+    def test_events_and_blobs_are_exempt(self, tmp_path, monkeypatch):
+        """They stream, and they are the legitimately large part of an archive."""
+        path = tmp_path / "demo.vestigo"
+        self._archive(path, metadata_bytes=100, events_bytes=5000)
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_METADATA_BYTES", "1000")
+        get_settings.cache_clear()
+        ArchiveReader(path).close()  # must not raise
+
+    def test_zero_disables_the_check(self, tmp_path, monkeypatch):
+        path = tmp_path / "demo.vestigo"
+        self._archive(path, metadata_bytes=5000)
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_METADATA_BYTES", "0")
+        get_settings.cache_clear()
+        ArchiveReader(path).close()  # must not raise
+
+    def test_the_check_precedes_any_read(self, tmp_path, monkeypatch):
+        """It runs in the constructor, so the oversized member is never opened
+        — the point is to reject it without ever holding its bytes."""
+        path = tmp_path / "demo.vestigo"
+        self._archive(path, metadata_bytes=5000)
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_METADATA_BYTES", "1000")
+        get_settings.cache_clear()
+        real_open = zipfile.ZipFile.open
+
+        def _guard(self, name, *args, **kwargs):
+            filename = name.filename if hasattr(name, "filename") else name
+            if filename == "postgres/annotations.ndjson":
+                pytest.fail("the oversized member was opened")
+            return real_open(self, name, *args, **kwargs)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", _guard)
+        with pytest.raises(ArchiveFormatError, match="per-member limit"):
+            ArchiveReader(path)
+
+
+class TestStreamingNdjson:
+    def test_iter_matches_read(self, tmp_path):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+        reader = ArchiveReader(path)
+        try:
+            rows = list(reader.iter_ndjson("postgres/sources.ndjson"))
+            assert rows == [{"id": "s1"}, {"id": "s2"}]
+            assert reader.read_ndjson("postgres/sources.ndjson") == rows
+        finally:
+            reader.close()
+
+    def test_blank_lines_skipped(self, tmp_path):
+        path = tmp_path / "demo.vestigo"
+        writer = ArchiveWriter(path)
+        writer.add_bytes("postgres/sources.ndjson", b'{"id": "s1"}\n\n\n{"id": "s2"}\n')
+        writer.finish({"format_version": FORMAT_VERSION})
+        reader = ArchiveReader(path)
+        try:
+            assert list(reader.iter_ndjson("postgres/sources.ndjson")) == [
+                {"id": "s1"},
+                {"id": "s2"},
+            ]
+        finally:
+            reader.close()
+
+    def test_stream_longer_than_declared_is_rejected(self, tmp_path):
+        """A local header that lies about its size, i.e. a bomb — iter_ndjson
+        stops rather than yielding past the manifest's declared bound."""
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+        reader = ArchiveReader(path)
+        try:
+            reader._sizes["postgres/sources.ndjson"] = 5  # shorter than the member
+            with pytest.raises(ArchiveFormatError, match="exceeds its declared size"):
+                list(reader.iter_ndjson("postgres/sources.ndjson"))
+        finally:
+            reader.close()
+
+    def test_unlisted_member_cannot_be_streamed(self, tmp_path):
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+        reader = ArchiveReader(path)
+        try:
+            with pytest.raises(ArchiveFormatError, match="not listed in the manifest"):
+                list(reader.iter_ndjson("postgres/nope.ndjson"))
+        finally:
+            reader.close()
+
+
 def test_temp_root_and_archive_path(tmp_path):
     # The conftest autouse fixture already points transfer_temp_path at tmp_path.
     root = temp_root()
@@ -224,23 +331,48 @@ def test_temp_root_and_archive_path(tmp_path):
     assert p.parent == root and p.name == "job123.vestigo"
 
 
-def test_temp_root_rejects_a_world_readable_dir(tmp_path, monkeypatch):
+def test_temp_root_repairs_a_loose_mode(tmp_path, monkeypatch):
+    """A group/world-readable directory we own is fixed, not rejected."""
     root = tmp_path / "loose"
     root.mkdir(mode=0o755)
     monkeypatch.setenv("VESTIGO_TRANSFER_TEMP_PATH", str(root))
     get_settings.cache_clear()
-    # chmod() inside temp_root() would normally fix the mode; simulate a
-    # directory this process does not actually control.
+    assert temp_root().stat().st_mode & 0o077 == 0
+
+
+def test_temp_root_rejects_a_world_readable_dir_it_cannot_repair(tmp_path, monkeypatch):
+    """The mode check is the backstop for filesystems where chmod no-ops."""
+    root = tmp_path / "loose"
+    root.mkdir(mode=0o755)
+    monkeypatch.setenv("VESTIGO_TRANSFER_TEMP_PATH", str(root))
+    get_settings.cache_clear()
     monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
     with pytest.raises(RuntimeError, match="group/world accessible"):
         temp_root()
+
+
+def test_temp_root_rejects_a_symlinked_path(tmp_path, monkeypatch):
+    """A symlink is a path someone else may control — never adopt it."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("VESTIGO_TRANSFER_TEMP_PATH", str(link))
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="not a real directory"):
+        temp_root()
+
+
+def _job_id() -> str:
+    """A JobStore-shaped id — what an export working directory is named."""
+    return uuid.uuid4().hex[:16]
 
 
 def test_sweep_stale_removes_expired_entries(tmp_path):
     root = temp_root()
     fresh = root / "fresh.vestigo"
     stale = root / "stale.vestigo"
-    stale_dir = root / "stale-job"
+    stale_dir = root / _job_id()
     fresh.write_bytes(b"x")
     stale.write_bytes(b"x")
     stale_dir.mkdir()
@@ -254,6 +386,40 @@ def test_sweep_stale_removes_expired_entries(tmp_path):
     assert fresh.exists()
     assert not stale.exists()
     assert not stale_dir.exists()
+
+
+def test_sweep_stale_without_a_ttl_removes_everything_of_ours(tmp_path):
+    """What startup does: after a restart every leftover is orphaned."""
+    root = temp_root()
+    fresh = root / "fresh.vestigo"
+    fresh_dir = root / _job_id()
+    fresh.write_bytes(b"x")
+    fresh_dir.mkdir()
+
+    sweep_stale(max_age_seconds=None)
+
+    assert not fresh.exists()
+    assert not fresh_dir.exists()
+
+
+def test_sweep_stale_leaves_foreign_entries_alone(tmp_path):
+    """transfer_temp_path is operator-configurable — pointing it at a populated
+    directory must not cost that directory anything."""
+    root = temp_root()
+    bystander_file = root / "important.db"
+    bystander_dir = root / "someone-elses-data"
+    bystander_file.write_bytes(b"x")
+    bystander_dir.mkdir()
+    (bystander_dir / "payload").write_bytes(b"x")
+    old = time.time() - 3600
+    os.utime(bystander_file, (old, old))
+    os.utime(bystander_dir, (old, old))
+
+    sweep_stale(max_age_seconds=None)
+
+    assert bystander_file.exists()
+    assert (bystander_dir / "payload").exists()
+    assert root.exists()
 
     def test_duplicate_member_names_rejected(self, tmp_path):
         """A duplicate would be summed twice against the expansion cap but

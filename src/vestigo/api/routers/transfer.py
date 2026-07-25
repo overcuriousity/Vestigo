@@ -20,7 +20,7 @@ from vestigo.api.deps import (
 )
 from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.core.config import get_settings
-from vestigo.core.jobs import get_job_store
+from vestigo.core.jobs import Job, get_job_store
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.postgres import Case, User
 from vestigo.transfer.archive import new_archive_path, sweep_stale, temp_root
@@ -34,24 +34,44 @@ router = APIRouter(prefix="/api", tags=["transfer"])
 _TRANSFER_KINDS = ("case_export", "case_import")
 
 
-def _admit_transfer() -> None:
-    """Reject a new transfer when too many are already in flight.
+def _too_many_transfers(limit: int) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail=(
+            f"{limit} case transfer(s) already in flight — retry when one finishes "
+            "(raise VESTIGO_TRANSFER_MAX_CONCURRENT, 0 disables the cap)"
+        ),
+    )
+
+
+def _admit_transfer_job(**create_kwargs) -> Job:
+    """Create a transfer job, or raise 429 if the instance is already full.
 
     Both directions reserve real resources for the whole job — an export
     materializes the archive under ``transfer_temp_path``, an import holds the
     upload plus everything it expands into. Any authenticated user can start
-    either, so the instance needs a ceiling. Call this *before* accepting an
-    upload, or the bytes are already on disk by the time we say no.
+    either, so the instance needs a ceiling.
+
+    The count and the create happen under one lock (``create_if_under``), so
+    two simultaneous requests cannot both slip past a cap of 1.
+    """
+    limit = get_settings().transfer_max_concurrent
+    job = get_job_store().create_if_under(_TRANSFER_KINDS, limit, **create_kwargs)
+    if job is None:
+        raise _too_many_transfers(limit)
+    return job
+
+
+def _precheck_transfer_slot() -> None:
+    """Cheap reject before a body is streamed to disk.
+
+    Advisory only — ``_admit_transfer_job`` is what actually enforces the cap.
+    This exists so a full instance says no *before* ``receive_upload_to_tmp``
+    writes multi-GiB of archive we are about to refuse.
     """
     limit = get_settings().transfer_max_concurrent
     if limit and get_job_store().count_active(_TRANSFER_KINDS) >= limit:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"{limit} case transfer(s) already in flight — retry when one finishes "
-                "(raise VESTIGO_TRANSFER_MAX_CONCURRENT, 0 disables the cap)"
-            ),
-        )
+        raise _too_many_transfers(limit)
 
 
 class ExportRequest(BaseModel):
@@ -135,9 +155,8 @@ async def export_case_endpoint(
     case: Case = Depends(require_case_manage),
     user: User = Depends(get_current_user),
 ):
-    _admit_transfer()
     include_blobs = body.include_blobs if body else False
-    job = get_job_store().create(
+    job = _admit_transfer_job(
         kind="case_export",
         progress={"phase": "queued"},
         created_by=user.id,
@@ -230,16 +249,22 @@ async def import_case_endpoint(
     # The dependency matches POST /api/cases exactly — import creates a case,
     # so it must not be the laxer of the two paths.
     # Admission first: rejecting after receive_upload_to_tmp would mean the
-    # whole upload is already on disk.
-    _admit_transfer()
+    # whole upload is already on disk. The authoritative check is the create
+    # below — a slot can free up or fill during the upload either way, so the
+    # temp file has to be cleaned up if this one loses the race.
+    _precheck_transfer_slot()
     max_bytes = get_settings().max_upload_bytes or None
     tmp_path, _file_hash, size_bytes = await receive_upload_to_tmp(
         file, max_bytes=max_bytes, suffix=".vestigo"
     )
-    job = get_job_store().create(
-        kind="case_import",
-        progress={"phase": "queued", "bytes": size_bytes},
-        created_by=user.id,
-    )
+    try:
+        job = _admit_transfer_job(
+            kind="case_import",
+            progress={"phase": "queued", "bytes": size_bytes},
+            created_by=user.id,
+        )
+    except HTTPException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     background_tasks.add_task(_run_import_job, job.id, tmp_path, user)
     return {"job_id": job.id}

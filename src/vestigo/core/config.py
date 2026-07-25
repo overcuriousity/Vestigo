@@ -193,8 +193,10 @@ class Settings(BaseSettings):
 
     # Case export/import (X1). In-flight export archives are written here
     # before download; they contain the full case, so this directory is as
-    # sensitive as source_retention_path and is created 0700 and owner-checked.
-    # Size it for the largest case exported, not for the average one.
+    # sensitive as source_retention_path. It is created 0700 and that mode is
+    # forced on an existing directory; startup fails only if the path is owned
+    # by another user or is not a real directory. Size it for the largest case
+    # exported, not for the average one.
     transfer_temp_path: str = "data/transfer"
     # Ceiling on an imported archive's total *uncompressed* size; 0 disables.
     # Events and blobs travel ZIP_STORED, so a legitimate archive expands by
@@ -202,6 +204,12 @@ class Settings(BaseSettings):
     # ratio means a decompression bomb, not a big case. Checked against the
     # manifest before any member is read.
     transfer_max_expanded_bytes: int = Field(default=200 * 1024**3, ge=0)
+    # Ceiling on any *single* postgres/* member of an imported archive; 0
+    # disables. Separate from the total because the total says nothing about
+    # one member: a lone 100 GiB NDJSON sits far under a 200 GiB total and
+    # would still exhaust memory. These members hold the case's metadata (rows,
+    # not events), so even a huge case stays orders of magnitude below this.
+    transfer_max_metadata_bytes: int = Field(default=2 * 1024**3, ge=0)
     # Concurrent case export/import jobs across the instance; 0 disables the
     # cap. Each one can hold a multi-GiB upload plus its expansion on disk and
     # any authenticated user may start one, so the default is deliberately

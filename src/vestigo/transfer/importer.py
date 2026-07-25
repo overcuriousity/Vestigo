@@ -7,13 +7,20 @@ and preserved ids keep annotation→event cross-references intact. Any failure
 after case creation deletes the partial case (Postgres cascade + ClickHouse
 partitions) before the error propagates.
 
-Memory: events stream batch-by-batch, but each Postgres stem is read and
-revived whole before it is flushed, so peak memory scales with the largest
-single entity (usually annotations or audit_log). The id prescan reads the
-same stems one at a time and keeps only id strings, so it does not raise that
-ceiling. All fine for the single-process deployment this targets; if a case
-ever outgrows it, chunk the per-stem revive loop — the prescan already
-resolves the full id map up front, which is what dependent stems need.
+Memory: nothing here is materialized whole. Events stream batch-by-batch and
+every Postgres stem streams row-by-row (``ArchiveReader.iter_ndjson``), so peak
+memory scales with the largest single *row*, not the largest entity. The id
+prescan streams the same stems and keeps only id strings. An archive is an
+untrusted upload, so this is a bound, not a tuning detail: reading one member
+whole was an out-of-memory kill any authenticated user could trigger with a
+crafted NDJSON member — see ``archive.METADATA_PREFIX``, which caps the same
+members from the other side.
+
+The one thing that scales with the case is the SQLAlchemy session's identity
+map, which holds a flush's worth of ORM objects; the per-stem flush bounds it
+to one entity's rows. Chunk the flush if a case ever outgrows that — the
+prescan already resolves the full id map up front, which is what dependent
+stems need.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import pyarrow as pa
 from sqlalchemy import JSON, delete, select
 
 from vestigo.core.retention import retain_file, retention_path
+from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db.field_stats import refresh_source_field_stats
 from vestigo.db.postgres import (
     AgentConversation,
@@ -259,14 +267,18 @@ def _prescan_ids(reader: ArchiveReader, idmap: _IdMap) -> None:
     embedding an annotation id survived unrewritten — charts revive before
     annotations.
 
-    Memory is unchanged: each stem is read and discarded one at a time, same as
-    the revive loop, and only the id strings are retained. The cost is one
-    extra NDJSON parse per stem.
+    Memory is unchanged: each stem streams row by row, same as the revive loop,
+    and only the id strings are retained. The cost is one extra NDJSON parse
+    per stem.
+
+    Synchronous and CPU-bound (it parses every metadata member), so callers run
+    it in a worker thread. Safe to do: it is a full await, so the revive loop
+    never reads the map while this is still writing it.
     """
     pairs: list[tuple[str, str]] = []
     old_ids: set[str] = set()
     for stem, _model, refs in _IMPORT_SPECS:
-        for row in reader.read_ndjson(f"postgres/{stem}.ndjson"):
+        for row in reader.iter_ndjson(f"postgres/{stem}.ndjson"):
             for column, kind in refs.items():
                 value = row.get(column)
                 if value is not None:
@@ -339,6 +351,26 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
     return model(**values)
 
 
+def _source_ref(row: dict[str, Any]) -> tuple[str, str]:
+    """``(id, file_hash)`` from an archived source row, type-checked.
+
+    The events and blobs phases key off exactly these two fields. Both are
+    NOT NULL on the model, so a row without them is a malformed archive — but
+    reaching that conclusion via a ``KeyError`` raised from the middle of the
+    events loop tells an operator nothing. Fail with the format error instead,
+    while the revive loop is still walking the stem.
+    """
+    values: list[str] = []
+    for column in ("id", "file_hash"):
+        value = row.get(column)
+        if not isinstance(value, str) or not value:
+            raise ArchiveFormatError(
+                f"postgres/sources.ndjson row has no usable {column} (string, non-empty)"
+            )
+        values.append(value)
+    return values[0], values[1]
+
+
 def _insert_source_events(
     clickhouse: Any, reader: ArchiveReader, arcname: str, new_case_id: str, new_source_id: str
 ) -> int:
@@ -352,6 +384,16 @@ def _insert_source_events(
     with reader.open_member(arcname) as f:
         ipc = pa.ipc.open_stream(f)
         for batch in ipc:
+            # The IPC stream is attacker-supplied and insert_events_arrow hands
+            # whatever it gets straight to ClickHouse. Without this, a renamed
+            # column makes get_field_index return -1 (set_column then fails
+            # obscurely) and a missing one silently takes a server-side default
+            # instead of the value _normalize_event_row would have written.
+            # Per batch, not once: an IPC stream may change schema mid-stream.
+            if not batch.schema.equals(EVENT_ARROW_SCHEMA):
+                raise ArchiveFormatError(
+                    f"{arcname}: event schema does not match this version's event schema"
+                )
             for column, value in (
                 ("case_id", new_case_id),
                 ("source_id", new_source_id),
@@ -384,7 +426,9 @@ async def import_case(
 
     _progress("verify")
     reader = ArchiveReader(archive_path)  # raises ArchiveFormatError on bad manifest
-    reader.verify_members()  # raises before ANY write
+    # SHA-256 over every member of a multi-GiB archive: off the event loop, or
+    # the whole API stalls for the length of the import. Raises before ANY write.
+    await asyncio.to_thread(reader.verify_members)
     # Reads are restricted to manifest-listed members (ArchiveReader enforces
     # it), so anything else in the zip is untrusted and never reaches the
     # importer — and a member the exporter always writes cannot go missing
@@ -401,7 +445,7 @@ async def import_case(
     # other id in one pass — the revive loop must not grow the map (see
     # _prescan_ids).
     idmap.pin("case", case_data["id"], new_case_id)
-    _prescan_ids(reader, idmap)
+    await asyncio.to_thread(_prescan_ids, reader, idmap)  # parses every stem — CPU-bound
     import_marker = {
         "job_id": job_id,
         "by": owner.username,
@@ -411,6 +455,10 @@ async def import_case(
 
     created = False
     inserted_sources: list[str] = []
+    # Blobs this run put into the instance-global retention dir. Only ones that
+    # were not already there — a pre-existing blob is content-addressed and
+    # shared with whatever else references it, so cleanup must never touch it.
+    retained_blobs: list[Path] = []
     clickhouse = None
     try:
         await store.create_case(
@@ -453,10 +501,16 @@ async def import_case(
             # the placeholder must go or the restore would double it.
             await session.execute(delete(Timeline).where(Timeline.case_id == new_case_id))
             embedded_timelines = 0
+            # (old source id, file_hash) for the events and blobs phases,
+            # collected while this loop already has the stem open rather than
+            # by re-parsing sources.ndjson a third time.
+            source_refs: list[tuple[str, str]] = []
             for stem, model, refs in _IMPORT_SPECS:
-                rows = reader.read_ndjson(f"postgres/{stem}.ndjson")
-                counts[stem] = len(rows)
-                for row in rows:
+                rows_seen = 0
+                for row in reader.iter_ndjson(f"postgres/{stem}.ndjson"):
+                    rows_seen += 1
+                    if stem == "sources":
+                        source_refs.append(_source_ref(row))
                     obj = _revive(model, row, idmap, refs)
                     if isinstance(obj, Timeline):
                         if row.get("embedding_config_hash"):
@@ -487,6 +541,7 @@ async def import_case(
                     if created_by is not None and str(created_by) in user_refs["users"]:
                         obj.created_by = _local_user(created_by)
                     session.add(obj)
+                counts[stem] = rows_seen
                 await session.flush()
             await session.commit()
         if embedded_timelines:
@@ -495,14 +550,13 @@ async def import_case(
                 "vectors are not portable; re-run embedding to restore semantic search"
             )
 
-        source_rows = reader.read_ndjson("postgres/sources.ndjson")
         event_members = [n for n in verified if n.startswith("events/") and n.endswith(".arrow")]
         if event_members:
             _progress("events")
             clickhouse = clickhouse_factory()
-        for row in source_rows:
-            new_source_id = idmap.remap("source", row["id"])
-            arcname = f"events/{row['id']}.arrow"
+        for old_source_id, _file_hash in source_refs:
+            new_source_id = idmap.remap("source", old_source_id)
+            arcname = f"events/{old_source_id}.arrow"
             if arcname in verified:
                 # Track BEFORE inserting: a mid-source failure may leave a
                 # partially written partition, and cleanup must drop it.
@@ -512,14 +566,16 @@ async def import_case(
                 )
                 counts["events"] += n
 
-        blob_members = [n for n in verified if n.startswith("blobs/")]
+        # Sorted, because `verified` is a set: warning order in the job result
+        # (and from there the audit detail) must not vary run to run.
+        blob_members = sorted(n for n in verified if n.startswith("blobs/"))
         if blob_members:
             _progress("blobs")
         # The retention dir is instance-global, so only blobs an archived
         # source actually claims may land in it. Content is verified against
         # the member name below, which stops an existing blob being poisoned;
         # this stops an archive planting unrelated files there at all.
-        referenced = {row["file_hash"] for row in source_rows}
+        referenced = {file_hash for _sid, file_hash in source_refs}
         for arcname in blob_members:
             sha = arcname.removeprefix("blobs/")
             if not _SHA256_RE.fullmatch(sha):
@@ -531,7 +587,8 @@ async def import_case(
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
             try:
-                digest = reader.extract_to(arcname, tmp_path)
+                # Off the event loop: this hashes and writes the whole blob.
+                digest = await asyncio.to_thread(reader.extract_to, arcname, tmp_path)
                 if digest != sha:
                     # The blob's content must hash to its content-addressed
                     # name, or a crafted member would poison the
@@ -540,7 +597,14 @@ async def import_case(
                     raise ArchiveFormatError(
                         f"blob content does not hash to its member name: {arcname}"
                     )
-                await asyncio.to_thread(retain_file, tmp_path, retention_path(sha))
+                dest = retention_path(sha)
+                # Checked before the call, because retain_file short-circuits
+                # on an existing path: only a blob this run actually created is
+                # ours to remove if the import later fails.
+                fresh = not dest.exists()
+                await asyncio.to_thread(retain_file, tmp_path, dest)
+                if fresh:
+                    retained_blobs.append(dest)
                 counts["blobs"] += 1
             finally:
                 tmp_path.unlink(missing_ok=True)
@@ -549,7 +613,7 @@ async def import_case(
             # Deduped by hash, not per source row: sources share blobs, and one
             # warning per row would flood a job result that rides into the
             # audit detail JSON.
-            missing = sorted({row["file_hash"] for row in source_rows} - blobbed)
+            missing = sorted(referenced - blobbed)
             for file_hash in missing:
                 warnings.append(
                     f"no blob in archive for {file_hash[:12]}… — events restored, "
@@ -572,6 +636,14 @@ async def import_case(
                     await asyncio.to_thread(
                         clickhouse.delete_source_events, new_case_id, new_source_id
                     )
+        # The retention dir is instance-global and nothing else tracks these:
+        # without this a repeatedly-failing import accumulates case file content
+        # on disk that no Source row references. Only blobs this run created
+        # are listed (see `fresh` above), so a blob shared with an existing case
+        # is never removed.
+        for blob_path in retained_blobs:
+            with contextlib.suppress(OSError):
+                blob_path.unlink(missing_ok=True)
         if created:
             await store.delete_case(new_case_id)
         raise

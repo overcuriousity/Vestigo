@@ -323,7 +323,9 @@ async def export_case(
                 n = await asyncio.to_thread(
                     _write_source_events, clickhouse, case_id, source["id"], dest
                 )
-                writer.add_file(f"events/{source['id']}.arrow", dest)
+                # Hashes and zips a whole source's events — off the event loop
+                # for the same reason the query above is.
+                await asyncio.to_thread(writer.add_file, f"events/{source['id']}.arrow", dest)
                 counts["events"] += n
             finally:
                 dest.unlink(missing_ok=True)
@@ -338,7 +340,9 @@ async def export_case(
                 seen.add(file_hash)
                 blob = retention_path(file_hash)
                 if blob.exists():
-                    writer.add_file(f"blobs/{file_hash}", blob)
+                    # Original source files, routinely the largest members in
+                    # the archive — never hash one on the event loop.
+                    await asyncio.to_thread(writer.add_file, f"blobs/{file_hash}", blob)
                     counts["blobs"] += 1
                 else:
                     warnings.append(

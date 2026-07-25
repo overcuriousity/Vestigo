@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -173,21 +172,24 @@ async def _sweep_stale_transfer_archives() -> None:
     """Export archives live in temp storage and the job store is in-memory —
     after a restart every leftover is orphaned by definition.
 
-    Wholesale, not TTL-based: this assumes one process per configured
-    ``transfer_temp_path``, which the in-memory JobStore already requires.
-    In-flight archives are additionally expired by ``archive.sweep_stale`` on
-    each export, so a long-running process does not accumulate them.
+    Age-independent, unlike the per-export sweep: this assumes one process per
+    configured ``transfer_temp_path``, which the in-memory JobStore already
+    requires. In-flight archives are additionally expired by
+    ``archive.sweep_stale``'s TTL on each export, so a long-running process
+    does not accumulate them.
+
+    It removes only what a transfer job writes (see ``is_transfer_artifact``),
+    never the directory itself: ``transfer_temp_path`` is operator-configurable
+    and pointing it at, say, ``/data`` must not wipe ``/data`` on every boot.
 
     Failures are swallowed here rather than left to the caller's handler:
-    ``temp_root`` refuses a misowned or group-readable directory, and a
-    misconfigured ``transfer_temp_path`` must cost no more than this sweep —
-    not the ingest reconciliation and session purge that follow it."""
-    from vestigo.transfer.archive import temp_root
+    ``temp_root`` refuses a misowned directory, and a misconfigured
+    ``transfer_temp_path`` must cost no more than this sweep — not the ingest
+    reconciliation and session purge that follow it."""
+    from vestigo.transfer.archive import sweep_stale
 
     try:
-        root = temp_root()
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
+        sweep_stale(max_age_seconds=None)
     except Exception:
         logger.exception("Transfer archive sweep failed; leftover export archives remain.")
 

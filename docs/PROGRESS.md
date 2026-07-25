@@ -1,9 +1,72 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-25 (session 98 — X1 second review round).
+Last updated: 2026-07-25 (session 99 — X1 third review round).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 99 — 2026-07-25: X1 third review round (untrusted-input bounds, event loop)
+
+**Why.** A third review pass over PR #182. The archive layer's size discipline is
+sound in aggregate but had a gap per member, and the two transfer paths were doing
+all their heavy work on the event loop. Eight findings, all fixed here.
+
+- **One member could still OOM the process.** `transfer_max_expanded_bytes` caps an
+  archive's *total* expansion, which says nothing about any single member: a lone
+  100 GiB `postgres/annotations.ndjson` sits far under a 200 GiB total, and
+  `_read_bounded` pulled it into memory whole. NDJSON deflates ~20x, so it fits
+  inside the 10 GiB upload limit — an out-of-memory kill any authenticated user
+  could trigger. Fixed from both sides: `VESTIGO_TRANSFER_MAX_METADATA_BYTES`
+  (default 2 GiB) rejects an oversized `postgres/*` member in the constructor,
+  before it is ever opened, and `ArchiveReader.iter_ndjson` streams every stem row
+  by row so the importer's peak memory scales with the largest *row*. The prescan
+  and the revive loop both use it; `read_ndjson` survives as `list(iter_ndjson(…))`
+  for the two genuinely small members.
+- **Both transfer directions blocked the event loop.** `import_case` is `async` but
+  called `verify_members` (SHA-256 over the whole archive), the id prescan and
+  `extract_to` synchronously; export hashed and zipped every Arrow member and blob
+  the same way. They run as `BackgroundTasks`, so the entire API — health, SSE,
+  other users' queries — froze for the length of a multi-GiB transfer. All of it
+  now goes through `asyncio.to_thread`, matching what the ClickHouse calls in the
+  same loops already did.
+- **The event Arrow member was never schema-checked.** `_insert_source_events` took
+  the attacker-supplied IPC stream, patched four columns *by name*, and handed the
+  batch to `insert_events_arrow`, which forwards it verbatim to ClickHouse. A
+  renamed column made `get_field_index` return `-1`; a missing one silently took a
+  server-side default instead of what `_normalize_event_row` writes on the way out.
+  Now compared against `EVENT_ARROW_SCHEMA` per batch (a stream may change schema
+  mid-way), raising into the existing all-or-nothing cleanup.
+- **A failed import leaked blobs.** Blobs land in the instance-global retention dir;
+  the cleanup path dropped the Postgres case and the ClickHouse partitions but not
+  them, so a repeatedly-failing import accumulated case file content nothing
+  referenced. The importer now tracks only the blobs *it* created — checked before
+  `retain_file`, which short-circuits on an existing path — so a blob shared with
+  another case is never removed. The test for the second half matters more than the
+  first.
+- **The startup sweep was `rmtree(temp_root)`.** Correct under its stated
+  one-process assumption, but `VESTIGO_TRANSFER_TEMP_PATH=/data` wiped `/data` on
+  every boot. Both sweeps now share `is_transfer_artifact` (a `*.vestigo` file or a
+  job-id-named directory) and `sweep_stale(max_age_seconds=None)` is what startup
+  calls; anything else under the path is left alone and warned about once.
+- **Admission control was racy.** `count_active` then `create` let two simultaneous
+  requests both pass at limit-1, so a cap of 1 admitted 2. `JobStore.create_if_under`
+  does both under one lock. The import endpoint keeps a cheap pre-upload check so a
+  full instance still says no before the body is on disk, and unlinks the temp file
+  if a slot fills while the upload streams.
+- **Docs claimed a check that could not fire.** `temp_root` chmods to `0700` and
+  *then* asserts the mode has no group/world bits, so for a directory we own the
+  mode is silently repaired, never rejected — the old test only passed because it
+  monkeypatched `chmod` away. Kept the repair (it is the behavior an operator
+  wants), corrected `.env.example` and `DEPLOYMENT.md`, and kept the assertion
+  documented as the backstop for filesystems where `chmod` no-ops.
+- **Smaller:** malformed `sources.ndjson` rows raised a bare `KeyError` from inside
+  the events loop — now an `ArchiveFormatError` naming the field, raised while the
+  revive loop is still on that stem; `sources.ndjson` is parsed once instead of
+  three times; blob members are iterated in sorted order so warning order is
+  reproducible; and the import dialog holds itself open to show the importer's
+  warnings ("no blob for X", "user Y attributed to importer") instead of navigating
+  past them — the job store is in-memory, so closing the dialog is the last chance
+  to read them.
 
 ## Session 98 — 2026-07-25: X1 second review round (scaling, audit fidelity, limits)
 
