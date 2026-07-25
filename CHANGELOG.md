@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   export, and cleared at startup. Restored events have their embedding markers
   blanked and the import warns that vectors need re-embedding, since Qdrant
   data is not portable.
+
+  Restored `audit_log` rows keep the actor, action and timestamp the archive
+  asserted — that is what makes an exported chain of custody worth having —
+  but nothing on the importing instance vouches for them. Every imported row
+  therefore carries `detail.imported` (import job id, importing user, source
+  case id) and is badged **imported** in the admin audit view, so a forged
+  archive can never read as locally recorded activity. Their `target_id` is
+  remapped along with everything else, so a restored audit trail still points
+  at the entities it describes. `VESTIGO_TRANSFER_MAX_CONCURRENT` (default 2,
+  `0` disables) caps in-flight transfers instance-wide; an import over the cap
+  is rejected with 429 before its upload is accepted. Blob members no source
+  in the archive references are ignored rather than written to the
+  instance-global retention directory.
 - **`clickhouse` pytest marker** — registered in `pyproject.toml` and applied to
   all eleven `tests/*_clickhouse.py` files, so `pytest -m clickhouse` selects
   the dev-stack tests and a ClickHouse-less run can no longer pass them

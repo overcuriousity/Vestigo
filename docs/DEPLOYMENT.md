@@ -172,7 +172,8 @@ Two directories hold case data on the app host itself, both `VESTIGO_*`-configur
   source blobs), so treat this directory as exactly as sensitive as the retention
   path. Vestigo creates it `0700` and refuses to export if it turns out to be owned
   by another user or to be group/world accessible — do not point it at a shared
-  `/tmp`. Size it for the largest single case you expect to export.
+  `/tmp`. Size it for the largest single case you expect to export, times
+  `VESTIGO_TRANSFER_MAX_CONCURRENT` (below).
 
   Archives are removed as soon as they are downloaded; anything left by an
   interrupted download is expired 24 hours later by the next export, and the whole
@@ -187,6 +188,20 @@ against the manifest before a single member is read. Events and blobs travel
 uncompressed, so a real export expands by roughly 1x; a ratio far above that is a
 decompression bomb rather than a big case. Raise it only if a genuine export trips
 the check.
+
+`VESTIGO_TRANSFER_MAX_CONCURRENT` (default 2, `0` disables) caps how many export and
+import jobs may be in flight at once, across the instance. Both directions reserve
+real disk for the whole job and any authenticated user can start either, so this is
+admission control rather than a throughput knob; an import over the cap is rejected
+with 429 *before* its upload is accepted. Raise it only alongside the temp path's
+capacity.
+
+Restored `audit_log` rows keep the actor, action and timestamp the archive asserted —
+that is the point of exporting them — but nothing on the importing instance vouches
+for any of it. Every imported row therefore carries `detail.imported` (import job id,
+importing user, source case id) and is badged **imported** in the admin audit view.
+When reviewing a user's activity, treat badged rows as claims made by whoever
+uploaded the archive, not as locally recorded events.
 
 ## Stability & upgrades
 

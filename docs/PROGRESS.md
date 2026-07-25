@@ -1,9 +1,72 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-25 (session 97 — X1 review hardening).
+Last updated: 2026-07-25 (session 98 — X1 second review round).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 98 — 2026-07-25: X1 second review round (scaling, audit fidelity, limits)
+
+**Why.** A second review pass over PR #182 after the session-97 hardening. The
+archive layer held up; the two blockers were in the importer, and both would only
+have shown up on a case bigger than the test fixtures.
+
+- **Import was quadratic and unusable on a real case.** `_IdMap` rebuilt its
+  substitution alternation every time a mapping was added, and the revive loop
+  added one per row before touching that row's JSON columns — so the regex
+  recompiled once per row. Measured on the branch: 200 rows 0.20s, 400 0.63s,
+  800 2.60s, 1600 13.97s, ~4x per doubling; 25k audit rows extrapolated to about
+  an hour of pure compilation. Compiling the alternation *once* costs ~2s even at
+  200k ids and substitution is then free, so `_prescan_ids` now walks every stem's
+  ref columns up front, `bulk_add` mints the new ids in one go, and `freeze`
+  makes any later map growth raise instead of silently going quadratic again.
+  Same workload after: 1600 rows 0.02s, 25k rows 0.41s, one compile. The prescan
+  also closed an ordering gap — a chart config embedding an annotation id used to
+  survive unrewritten, because charts revive before annotations.
+- **`audit_log.target_id` was never remapped.** Every other reference was, so a
+  restored audit trail pointed at ids that existed nowhere on the instance —
+  it imported but could no longer be joined to the entities it described, which
+  is most of why audit rows are in the archive at all. `target_id` spans every
+  entity type, so no static ref column can cover it; archive ids are globally
+  unique, so `_IdMap.lookup` resolves one without knowing its kind and passes
+  through targets the archive never carried (teams, users, agent tokens).
+- **Imported audit rows are now labelled.** They keep the actor, action, ip and
+  timestamp the archive asserted — deliberately, that is the chain of custody —
+  but any authenticated user can upload an archive, so an unmarked row is a
+  forgery surface: an admin reviewing "what did user X do" would see fabricated
+  entries. Every restored row now carries `detail.imported` (job id, importing
+  user, source case id) and is badged **imported** in the admin audit view.
+  Dropping the rows was the alternative and was rejected — a restored case with
+  no provenance is worse than one with labelled provenance.
+- **Admission control on transfers.** Both directions reserve real disk for the
+  whole job and either can be started by any authenticated user, with nothing
+  bounding concurrency. `VESTIGO_TRANSFER_MAX_CONCURRENT` (default 2, `0`
+  disables) caps in-flight transfers instance-wide; the import check runs
+  *before* `receive_upload_to_tmp`, since rejecting afterwards would mean the
+  whole upload is already on disk.
+- **Blobs no source references are ignored.** Content was already verified
+  against its content-addressed member name, so an existing blob could not be
+  poisoned — but an archive could still plant arbitrary files in the
+  instance-global retention directory. Only hashes an archived source claims are
+  retained now.
+- **Startup sweep can no longer cost the rest of recovery.** It was the first
+  statement in `_startup_recovery`'s single `try`, and `temp_root()` raises on a
+  misowned or group-readable directory — so a misconfigured
+  `transfer_temp_path` silently skipped orphaned-ingest reconciliation,
+  enrichment re-runs and session purge. It now has its own handler.
+- **Smaller.** Warning lists are aggregated per (stem, skipped source) instead of
+  per row and capped at 50 plus a summary, since they ride into the `audit_log`
+  detail JSON; `case.json`/`user_refs.json` are type-checked into
+  `ArchiveFormatError` before reaching the ORM; the archived user map is looked
+  up in batches of 1000 rather than one unbounded `IN (...)`; duplicate manifest
+  member names are rejected; `POST /api/cases/import` uses
+  `require_password_current`, matching `POST /api/cases` (`AuthAuditMiddleware`
+  was already the enforcing boundary — this is consistency and an accurate
+  OpenAPI schema, not a closed hole).
+
+**Not done.** `ClickHouseStore` is still constructed bare and never closed by the
+transfer modules — it has no `close()` and every call site in the repo does the
+same, so this is the codebase convention rather than a transfer bug.
 
 ## Session 97 — 2026-07-25: X1 export/import review hardening
 
