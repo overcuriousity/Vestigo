@@ -237,8 +237,11 @@ async def test_export_skips_sources_not_ready(store, tmp_path):
     assert result.counts["sources"] == 1
     assert result.counts["events"] == 1
     assert any("mid-src" in w for w in result.warnings)
+    # Aggregated per (stem, skipped source), not per row — see
+    # _orphan_reference_warnings.
+    assert chart.id  # the chart is what carries the buried reference
     assert any(
-        f"saved_charts {chart.id} references excluded source {ingesting.id}" in w
+        f"1 saved_charts row(s) reference excluded source {ingesting.id}" in w
         for w in result.warnings
     )
     reader = ArchiveReader(result.path)

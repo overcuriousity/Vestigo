@@ -13,9 +13,11 @@ import pytest
 from vestigo.core.config import get_settings
 from vestigo.transfer.archive import (
     FORMAT_VERSION,
+    MAX_WARNINGS,
     ArchiveFormatError,
     ArchiveReader,
     ArchiveWriter,
+    cap_warnings,
     new_archive_path,
     sweep_stale,
     temp_root,
@@ -252,3 +254,26 @@ def test_sweep_stale_removes_expired_entries(tmp_path):
     assert fresh.exists()
     assert not stale.exists()
     assert not stale_dir.exists()
+
+    def test_duplicate_member_names_rejected(self, tmp_path):
+        """A duplicate would be summed twice against the expansion cap but
+        deduped everywhere else — reject rather than pick one."""
+        path = tmp_path / "demo.vestigo"
+        _write_sample(path)
+
+        def _duplicate(manifest, _items):
+            manifest["members"].append(dict(manifest["members"][0]))
+
+        self._repack(path, _duplicate)
+        with pytest.raises(ArchiveFormatError, match="listed twice"):
+            ArchiveReader(path)
+
+
+class TestWarningBounds:
+    def test_short_lists_pass_through(self):
+        assert cap_warnings(["a", "b"]) == ["a", "b"]
+
+    def test_long_lists_truncate_with_a_summary(self):
+        capped = cap_warnings([f"w{i}" for i in range(MAX_WARNINGS + 5)])
+        assert len(capped) == MAX_WARNINGS + 1
+        assert capped[-1] == "…and 5 more"

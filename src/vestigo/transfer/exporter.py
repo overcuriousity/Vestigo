@@ -52,7 +52,7 @@ from vestigo.db.postgres import (
     User,
     View,
 )
-from vestigo.transfer.archive import FORMAT_VERSION, ArchiveWriter
+from vestigo.transfer.archive import FORMAT_VERSION, ArchiveWriter, cap_warnings
 
 # (file stem, model, scope): "case" = WHERE case_id == ..., "timeline" =
 # WHERE timeline_id IN (case's timelines), "conversation" = WHERE
@@ -168,20 +168,25 @@ def _orphan_reference_warnings(
     enforces them, so they would ride along and resolve to nothing after
     import. Warn rather than drop: a dangling reference beats silently deleting
     an analyst's chart. Serialization-level scan, so no per-model knowledge.
+
+    Aggregated to one warning per (stem, skipped source) with a count: warnings
+    ride into the audit detail JSON, and one per matching row could be tens of
+    thousands of lines. Costs an O(rows) json.dumps, but only runs at all when
+    a source was actually skipped.
     """
     if not skipped_ids:
         return []
-    out: list[str] = []
+    hits: dict[tuple[str, str], int] = {}
     for stem, rows in stems.items():
         for row in rows:
             text = json.dumps(row, default=str)
             for sid in sorted(skipped_ids):
                 if sid in text:
-                    out.append(
-                        f"{stem} {row.get('id')} references excluded source {sid}"
-                        " — payload exported as-is"
-                    )
-    return out
+                    hits[(stem, sid)] = hits.get((stem, sid), 0) + 1
+    return [
+        f"{count} {stem} row(s) reference excluded source {sid} — payloads exported as-is"
+        for (stem, sid), count in sorted(hits.items())
+    ]
 
 
 async def _snapshot_postgres(store: PostgresStore, case_id: str) -> dict[str, Any]:
@@ -356,5 +361,5 @@ async def export_case(
         path=archive_path,
         bytes=archive_path.stat().st_size,
         counts=counts,
-        warnings=warnings,
+        warnings=cap_warnings(warnings),
     )

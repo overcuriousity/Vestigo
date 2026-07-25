@@ -36,8 +36,21 @@ _CHUNK = 1 << 20
 _ARCHIVE_TTL_SECONDS = 24 * 3600
 
 
+# Export and import warnings ride into the job result and from there into the
+# audit_log detail JSON column, so the list has to stay bounded — a single
+# skipped source can otherwise produce one warning per affected row.
+MAX_WARNINGS = 50
+
+
 class ArchiveFormatError(Exception):
     """Raised when an archive is malformed, unsupported, or tampered with."""
+
+
+def cap_warnings(warnings: list[str]) -> list[str]:
+    """Truncate a warning list to ``MAX_WARNINGS`` plus a summary line."""
+    if len(warnings) <= MAX_WARNINGS:
+        return warnings
+    return [*warnings[:MAX_WARNINGS], f"…and {len(warnings) - MAX_WARNINGS} more"]
 
 
 def _check_member_name(name: str) -> None:
@@ -193,9 +206,15 @@ class ArchiveReader:
     def _validate_sizes(self, members: list[dict[str, Any]]) -> None:
         """Cross-check declared sizes against the zip directory and the cap."""
         total = 0
+        seen: set[str] = set()
         for member in members:
             name = member["path"]
             _check_member_name(name)
+            if name in seen:
+                # Duplicates would be counted twice against the expansion cap
+                # but deduped everywhere else — reject rather than pick one.
+                raise ArchiveFormatError(f"member listed twice in the manifest: {name}")
+            seen.add(name)
             try:
                 info = self._zip.getinfo(name)
             except KeyError as exc:
