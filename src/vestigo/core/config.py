@@ -202,6 +202,11 @@ class Settings(BaseSettings):
     # ratio means a decompression bomb, not a big case. Checked against the
     # manifest before any member is read.
     transfer_max_expanded_bytes: int = Field(default=200 * 1024**3, ge=0)
+    # Concurrent case export/import jobs across the instance; 0 disables the
+    # cap. Each one can hold a multi-GiB upload plus its expansion on disk and
+    # any authenticated user may start one, so the default is deliberately
+    # small — this is admission control, not a throughput knob.
+    transfer_max_concurrent: int = Field(default=2, ge=0)
 
     # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
     # directory scanned for *.yml/*.yaml at run time — an offline file drop

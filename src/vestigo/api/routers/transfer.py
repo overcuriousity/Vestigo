@@ -12,7 +12,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from vestigo.api.deps import get_current_user, get_store, require_case_manage
+from vestigo.api.deps import (
+    get_current_user,
+    get_store,
+    require_case_manage,
+    require_password_current,
+)
 from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.core.config import get_settings
 from vestigo.core.jobs import get_job_store
@@ -25,6 +30,28 @@ from vestigo.transfer.importer import import_case
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["transfer"])
+
+_TRANSFER_KINDS = ("case_export", "case_import")
+
+
+def _admit_transfer() -> None:
+    """Reject a new transfer when too many are already in flight.
+
+    Both directions reserve real resources for the whole job — an export
+    materializes the archive under ``transfer_temp_path``, an import holds the
+    upload plus everything it expands into. Any authenticated user can start
+    either, so the instance needs a ceiling. Call this *before* accepting an
+    upload, or the bytes are already on disk by the time we say no.
+    """
+    limit = get_settings().transfer_max_concurrent
+    if limit and get_job_store().count_active(_TRANSFER_KINDS) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"{limit} case transfer(s) already in flight — retry when one finishes "
+                "(raise VESTIGO_TRANSFER_MAX_CONCURRENT, 0 disables the cap)"
+            ),
+        )
 
 
 class ExportRequest(BaseModel):
@@ -108,6 +135,7 @@ async def export_case_endpoint(
     case: Case = Depends(require_case_manage),
     user: User = Depends(get_current_user),
 ):
+    _admit_transfer()
     include_blobs = body.include_blobs if body else False
     job = get_job_store().create(
         kind="case_export",
@@ -127,6 +155,9 @@ async def download_export(
     user: User = Depends(get_current_user),
 ):
     job = get_job_store().get(job_id)
+    # JobStore evicts terminal jobs past its cap, so a long-idle completed
+    # export can 404 here while its archive is still on disk. Not a leak —
+    # sweep_stale expires it on the next export.
     if job is None or job.kind != "case_export" or job.case_id != case_id:
         raise HTTPException(status_code=404, detail="Export not found")
     if job.status != "completed":
@@ -138,6 +169,8 @@ async def download_export(
     def _cleanup() -> None:
         # The job's working dir is already gone (see _run_export_job); only the
         # archive itself outlives the job, and only until it is downloaded.
+        # Two concurrent downloads both stream and both unlink — benign on
+        # POSIX, where the already-open fd survives the unlink.
         path.unlink(missing_ok=True)
 
     safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in case.name)
@@ -160,6 +193,7 @@ async def _run_import_job(job_id: str, tmp_path: Path, user: User) -> None:
             ClickHouseStore,
             tmp_path,
             owner=user,
+            job_id=job_id,
             progress=lambda p: job_store.update(job_id, progress=p),
         )
         await store.record_audit(
@@ -190,9 +224,14 @@ async def _run_import_job(job_id: str, tmp_path: Path, user: User) -> None:
 async def import_case_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ):
     # Any authenticated user may import; the importer becomes the case owner.
+    # The dependency matches POST /api/cases exactly — import creates a case,
+    # so it must not be the laxer of the two paths.
+    # Admission first: rejecting after receive_upload_to_tmp would mean the
+    # whole upload is already on disk.
+    _admit_transfer()
     max_bytes = get_settings().max_upload_bytes or None
     tmp_path, _file_hash, size_bytes = await receive_upload_to_tmp(
         file, max_bytes=max_bytes, suffix=".vestigo"

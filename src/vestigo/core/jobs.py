@@ -89,6 +89,21 @@ class JobStore:
         """Return a job by ID, or None if not found."""
         return self._jobs.get(job_id)
 
+    def count_active(self, kinds: tuple[str, ...]) -> int:
+        """Queued or running jobs of the given kinds.
+
+        Admission control for work that reserves real resources before it
+        starts (case transfers hold a multi-GiB upload plus its expansion on
+        disk). Locked like the other readers — jobs are updated from FastAPI's
+        threadpool, so an unlocked scan could see a torn dict.
+        """
+        with self._lock:
+            return sum(
+                1
+                for job in self._jobs.values()
+                if job.kind in kinds and job.status in ("queued", "running")
+            )
+
     def list_by_case(self, case_id: str) -> list[Job]:
         """Return jobs scoped to a case, newest-first."""
         with self._lock:

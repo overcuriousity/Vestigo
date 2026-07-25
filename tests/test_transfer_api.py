@@ -10,6 +10,8 @@ import zipfile
 from io import BytesIO
 
 from tests.conftest import as_admin, login
+from vestigo.api.routers import transfer as transfer_router
+from vestigo.core.config import get_settings
 
 
 def _create_case(client, name="API Case") -> str:
@@ -183,3 +185,85 @@ class TestImportEndpoint:
         job = _job_terminal(client, resp.json()["job_id"])
         assert job["status"] == "failed"
         assert "not a zip" in job["error"]
+
+    def test_forced_password_rotation_blocks_import(self, client, admin_bootstrap):
+        """Import creates a case, so it must be gated exactly like POST
+        /api/cases. AuthAuditMiddleware is the real boundary; the in-route
+        dependency keeps the two endpoints consistent and documents the 403."""
+        as_admin(client, admin_bootstrap)
+        created = client.post(
+            "/api/admin/users",
+            json={"username": "dave", "password": "dave-pass-12345"},
+        )
+        assert created.status_code == 200, created.text
+        rotated = client.post(
+            f"/api/admin/users/{created.json()['user']['id']}/password",
+            json={"new_password": "dave-pass-67890", "force_change": True},
+        )
+        assert rotated.status_code == 200, rotated.text
+        login(client, "dave", "dave-pass-67890")
+        resp = client.post(
+            "/api/cases/import",
+            files={"file": ("backup.vestigo", self._archive_bytes(), "application/zip")},
+        )
+        assert resp.status_code == 403
+
+
+class TestTransferAdmission:
+    """Both directions reserve real resources for the whole job and any
+    authenticated user can start one, so the instance needs a ceiling."""
+
+    def _fill_transfer_slots(self, n: int) -> None:
+        from vestigo.core.jobs import get_job_store
+
+        for _ in range(n):
+            get_job_store().create(kind="case_export", progress={"phase": "queued"})
+
+    def test_export_rejected_when_slots_are_full(self, client, admin_bootstrap, monkeypatch):
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_CONCURRENT", "1")
+        get_settings.cache_clear()
+        as_admin(client, admin_bootstrap)
+        case_id = _create_case(client)
+        self._fill_transfer_slots(1)
+
+        resp = client.post(f"/api/cases/{case_id}/export")
+
+        assert resp.status_code == 429
+        assert "in flight" in resp.json()["detail"]
+
+    def test_import_rejected_before_the_upload_is_written(
+        self, client, admin_bootstrap, monkeypatch
+    ):
+        # Rejecting after receive_upload_to_tmp would mean the whole upload is
+        # already on disk, which defeats the point of the cap.
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_CONCURRENT", "1")
+        get_settings.cache_clear()
+        called = False
+
+        async def _boom(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("upload must not be received when the cap is hit")
+
+        monkeypatch.setattr(transfer_router, "receive_upload_to_tmp", _boom)
+        as_admin(client, admin_bootstrap)
+        self._fill_transfer_slots(1)
+
+        resp = client.post(
+            "/api/cases/import",
+            files={"file": ("backup.vestigo", b"anything", "application/zip")},
+        )
+
+        assert resp.status_code == 429
+        assert not called
+
+    def test_zero_disables_the_cap(self, client, admin_bootstrap, monkeypatch):
+        monkeypatch.setenv("VESTIGO_TRANSFER_MAX_CONCURRENT", "0")
+        get_settings.cache_clear()
+        as_admin(client, admin_bootstrap)
+        case_id = _create_case(client)
+        self._fill_transfer_slots(5)
+
+        resp = client.post(f"/api/cases/{case_id}/export")
+
+        assert resp.status_code == 202
