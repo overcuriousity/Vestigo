@@ -76,7 +76,12 @@ _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
     (
         "finding_dispositions",
         FindingDisposition,
-        {"id": "disposition", "case_id": "case", "timeline_id": "timeline"},
+        {
+            "id": "disposition",
+            "case_id": "case",
+            "timeline_id": "timeline",
+            "source_id": "source",
+        },
     ),
     ("annotations", Annotation, {"id": "annotation", "case_id": "case", "source_id": "source"}),
     ("sigma_rules", SigmaRule, {"id": "sigma_rule", "case_id": "case"}),
@@ -84,7 +89,12 @@ _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
     (
         "source_enrichments",
         SourceEnrichment,
-        {"id": "source_enrichment", "case_id": "case", "source_id": "source"},
+        {
+            "id": "source_enrichment",
+            "case_id": "case",
+            "source_id": "source",
+            "timeline_id": "timeline",
+        },
     ),
     (
         "agent_conversations",
@@ -290,7 +300,9 @@ async def import_case(
                 try:
                     await refresh_source_field_stats(store, clickhouse, new_case_id, new_source_id)
                 except Exception as exc:  # noqa: BLE001 — stats never fail an import
-                    warnings.append(f"field stats recompute failed for a source: {exc}")
+                    warnings.append(
+                        f"field stats recompute failed for source {new_source_id}: {exc}"
+                    )
     except Exception:
         if clickhouse is not None:
             for new_source_id in inserted_sources:

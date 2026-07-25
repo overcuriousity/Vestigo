@@ -55,7 +55,8 @@ async def _rich_case(store, owner_id):
     )
     await _add(store, pg.SigmaRule, case_id=case.id)
     await _add(store, pg.SigmaRun, case_id=case.id, timeline_id=tl.id)
-    await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=src.id)
+    await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=src.id, timeline_id=tl.id)
+    await _add(store, pg.FindingDisposition, case_id=case.id, timeline_id=tl.id, source_id=src.id)
     conv = await _add(
         store,
         pg.AgentConversation,
@@ -129,6 +130,23 @@ class TestRoundTrip:
             assert new_ann.source_id == new_src.id
             assert new_src.id != src.id
             assert new_ann.event_id == "evt-1"  # event IDs preserved verbatim
+
+            new_enrichment = (
+                await s.execute(
+                    select(pg.SourceEnrichment).where(pg.SourceEnrichment.case_id == result.case_id)
+                )
+            ).scalar_one()
+            assert new_enrichment.timeline_id == new_tl.id
+
+            new_disposition = (
+                await s.execute(
+                    select(pg.FindingDisposition).where(
+                        pg.FindingDisposition.case_id == result.case_id
+                    )
+                )
+            ).scalar_one()
+            assert new_disposition.source_id == new_src.id
+            assert new_disposition.timeline_id == new_tl.id
 
             new_conv = (
                 await s.execute(
