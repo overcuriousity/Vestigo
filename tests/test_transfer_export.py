@@ -184,13 +184,31 @@ async def test_export_missing_blob_warns_not_fails(store, tmp_path, monkeypatch)
 
 async def test_export_skips_sources_not_ready(store, tmp_path):
     """A mid-ingest source (status != ready) must not ship: neither in the
-    sources NDJSON rows nor in the events loop — with a warning naming it."""
+    sources NDJSON rows nor in the events loop — with a warning naming it.
+    Its dependents (timeline_sources is a real FK on sources.id) must be
+    filtered too, or the archive aborts at import flush on Postgres."""
     owner = await _add(store, pg.User, username="frank", is_admin=False, is_active=True)
     case = await _add(store, pg.Case, name="Partial", owner_id=owner.id)
     ready = await _add(store, pg.Source, case_id=case.id, name="ready-src", file_hash="ab" * 32)
     ingesting = await _add(
         store, pg.Source, case_id=case.id, name="mid-src", file_hash="cd" * 32, status="ingesting"
     )
+    tl = await _add(store, pg.Timeline, case_id=case.id, name="tl", is_default=True)
+    # Every uploaded source gets a default-timeline join row at upload start.
+    await _add(store, pg.TimelineSource, timeline_id=tl.id, source_id=ready.id)
+    await _add(store, pg.TimelineSource, timeline_id=tl.id, source_id=ingesting.id)
+    await _add(
+        store,
+        pg.Annotation,
+        case_id=case.id,
+        source_id=ingesting.id,
+        event_id="evt-x",
+        annotation_type="comment",
+        content="x",
+    )
+    await _add(store, pg.FindingDisposition, case_id=case.id, source_id=ingesting.id)
+    await _add(store, pg.FindingDisposition, case_id=case.id, source_id=None)  # stays
+    await _add(store, pg.SourceEnrichment, case_id=case.id, source_id=ingesting.id)
     fake_ch = FakeClickHouse(
         {
             (case.id, ready.id): _event_rows(case.id, ready.id, n=1),
@@ -216,6 +234,14 @@ async def test_export_skips_sources_not_ready(store, tmp_path):
     names = reader.member_names()
     assert f"events/{ready.id}.arrow" in names
     assert not any(ingesting.id in n for n in names)
+    # Dependents of the skipped source are filtered; the None-source
+    # (value-scoped) disposition stays.
+    tl_rows = reader.read_ndjson("postgres/timeline_sources.ndjson")
+    assert [r["source_id"] for r in tl_rows] == [ready.id]
+    assert reader.read_ndjson("postgres/annotations.ndjson") == []
+    disp_rows = reader.read_ndjson("postgres/finding_dispositions.ndjson")
+    assert [r["source_id"] for r in disp_rows] == [None]
+    assert reader.read_ndjson("postgres/source_enrichments.ndjson") == []
     reader.close()
 
 

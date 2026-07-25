@@ -353,6 +353,70 @@ class TestArchiveMemberTrust:
             get_settings.cache_clear()
 
 
+class TestSkippedSourceDependents:
+    async def test_skipped_source_dependents_roundtrip(self, store, tmp_path):
+        """An export taken mid-ingest must import clean: the skipped source's
+        dependents (timeline_sources is a real FK on sources.id — Postgres
+        would abort at flush on the phantom row) are filtered at export time."""
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case = await _add(store, pg.Case, name="Partial", owner_id=alice.id)
+        ready = await _add(store, pg.Source, case_id=case.id, name="ready-src", file_hash="ab" * 32)
+        ingesting = await _add(
+            store,
+            pg.Source,
+            case_id=case.id,
+            name="mid-src",
+            file_hash="cd" * 32,
+            status="ingesting",
+        )
+        tl = await _add(store, pg.Timeline, case_id=case.id, name="tl", is_default=True)
+        await _add(store, pg.TimelineSource, timeline_id=tl.id, source_id=ready.id)
+        await _add(store, pg.TimelineSource, timeline_id=tl.id, source_id=ingesting.id)
+        await _add(
+            store,
+            pg.Annotation,
+            case_id=case.id,
+            source_id=ingesting.id,
+            event_id="evt-x",
+            annotation_type="comment",
+            content="x",
+        )
+        fake = FakeClickHouse({(case.id, ready.id): _event_rows(case.id, ready.id, n=1)})
+        exported = await export_case(
+            store,
+            lambda: fake,
+            case.id,
+            include_blobs=False,
+            exported_by="alice",
+            dest_dir=tmp_path,
+        )
+
+        result = await import_case(store, lambda: FakeClickHouse(), exported.path, owner=alice)
+
+        async with store.session_factory() as s:
+            new_sources = (
+                await s.execute(select(pg.Source).where(pg.Source.case_id == result.case_id))
+            ).scalars().all()
+            assert [src.name for src in new_sources] == ["ready-src"]
+            new_tl = (
+                await s.execute(select(pg.Timeline).where(pg.Timeline.case_id == result.case_id))
+            ).scalar_one()
+            joins = (
+                await s.execute(
+                    select(pg.TimelineSource).where(pg.TimelineSource.timeline_id == new_tl.id)
+                )
+            ).scalars().all()
+            # Exactly the ready source's join row — no phantom id minted by
+            # the idmap for the skipped source.
+            assert [j.source_id for j in joins] == [new_sources[0].id]
+            anns = (
+                await s.execute(
+                    select(pg.Annotation).where(pg.Annotation.case_id == result.case_id)
+                )
+            ).scalars().all()
+            assert anns == []
+
+
 class TestCreatedByAttribution:
     """created_by holds user ids: mapped via user_refs by username with
     importer fallback; non-user values (system origins) pass through verbatim."""

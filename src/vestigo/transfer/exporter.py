@@ -241,6 +241,16 @@ async def export_case(
                 " — excluded from export"
             )
     stems["sources"] = ready_sources
+    # Dependents of a skipped source must not ship either: TimelineSource.
+    # source_id is a real ForeignKey (ondelete CASCADE), so a join row
+    # referencing a skipped source would abort the import at flush on
+    # Postgres (SQLite lets it dangle silently). Rows whose source_id is
+    # None (value-scoped dispositions) stay.
+    ready_ids = {s["id"] for s in ready_sources}
+    for stem in ("timeline_sources", "annotations", "finding_dispositions", "source_enrichments"):
+        stems[stem] = [
+            r for r in stems[stem] if r.get("source_id") is None or r["source_id"] in ready_ids
+        ]
     counts: dict[str, int] = {stem: len(rows) for stem, rows in stems.items()}
     counts["events"] = 0
     counts["blobs"] = 0
