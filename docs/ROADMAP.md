@@ -52,6 +52,18 @@ round — the data model migrates once, not twice.
   record-boundary chunking, CSV intra-file record-boundary chunking (a logical CSV
   record can span physical lines via quoted embedded newlines, unsafe to newline-chunk).
 
+- [ ] **X1 residue — case export/import follow-ups.** Export/import shipped (PR #182, see
+  `docs/DEPLOYMENT.md` and `docs/superpowers/specs/2026-07-24-case-export-import-design.md`).
+  Open from the review, full text in
+  [`docs/archive/PR182_REVIEW_FINDINGS.md`](./archive/PR182_REVIEW_FINDINGS.md): a failed
+  import records no audit row while a failed export does; `_insert_source_events` lets an
+  untrusted Arrow stream size its own record batches (bounded only by the 200 GiB total
+  expansion cap, not per batch); the frontend buffers a whole archive in memory to download it
+  instead of navigating to the URL; orphan `events/*.arrow` members are skipped silently while
+  orphan blobs warn; `ImportCaseDialog` doesn't reset state on reopen; and adding an
+  `_IMPORT_SPECS` entity breaks reading current-format archives without a `FORMAT_VERSION`
+  bump — decide missing-stem-as-empty vs. mandatory bump and write it on the list.
+
 - [ ] **Choropleth / geographic charts** — the one chart family from the
   "Datenanalyse und -visualisierung" lecture set left unimplemented in the 2026-07-22 viz
   round (everything else — correlation matrix, grouped box/violin, waffle,
