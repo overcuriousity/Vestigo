@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-07-25
+
+### Added
+
+- **Case export/import (`.vestigo` archive)** — any case leaves the instance as
+  a single versioned zip and comes back intact, on the same or a different
+  instance (roadmap Milestone 9 / X1; design in
+  `docs/superpowers/specs/2026-07-24-case-export-import-design.md`). The archive
+  carries every case-scoped Postgres entity (including audit rows), all
+  ClickHouse events as per-source Arrow IPC, and — behind an explicit
+  `include_blobs` flag — the original source-file blobs, with a SHA-256 per
+  member verified before import writes anything. `POST
+  /api/cases/{case_id}/export` is MANAGE-gated and audited (`case.export`);
+  `POST /api/cases/import` is open to any authenticated user and restores as a
+  new case owned by the importer with no other grants (audited `case.import`).
+  Import remaps every Postgres id through an in-memory old→new map while event
+  ids are preserved verbatim, so annotation→event cross-references survive;
+  unknown usernames fall back to the importer with a warning; secrets (tokens,
+  passwords, enricher API keys) are never exported. Frontend: export button in
+  case settings, import dialog on the case list, both on the existing
+  job-polling pattern.
+- **`clickhouse` pytest marker** — registered in `pyproject.toml` and applied to
+  all eleven `tests/*_clickhouse.py` files, so `pytest -m clickhouse` selects
+  the dev-stack tests and a ClickHouse-less run can no longer pass them
+  silently (roadmap Milestone 2 residue).
+
 ## [1.6.1] — 2026-07-24
 
 ### Fixed

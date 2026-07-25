@@ -1,9 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-24 (session 95 — 1.6.1 review hardening).
+Last updated: 2026-07-25 (session 96 — X1 case export/import).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 96 — 2026-07-25: X1 case export/import (`.vestigo` archive)
+
+**Why.** Roadmap Milestone 9: any case — evidence, events, and all analyst work —
+leaves the instance as one file and comes back intact, on the same or a different
+instance. Archive/restore and cross-instance transfer are equal goals. Design:
+`docs/superpowers/specs/2026-07-24-case-export-import-design.md`.
+
+- **Export/import endpoints.** `POST /api/cases/{case_id}/export` (MANAGE gate —
+  export is bulk case-data exfiltration — audit `case.export`) runs a background
+  job building the archive; `GET /api/cases/{case_id}/export/{job_id}/download`
+  streams it. `POST /api/cases/import` (any authenticated user, audit
+  `case.import`) restores the archive as a new case owned by the importer —
+  importer-owned restore, no auto-grants.
+- **Transfer package** (`src/vestigo/transfer/`): `archive.py` (pydantic manifest,
+  zip writer/reader, per-member SHA-256 verified before any write), `exporter.py`
+  (direct-ORM Postgres snapshot with generic column serialization, Arrow event
+  streaming, optional content-addressed blobs behind `include_blobs`),
+  `importer.py` (in-memory old→new ID map rewriting all references, ordered
+  inserts, Arrow `case_id`/`source_id` column rewrite, blob placement, field-stats
+  recompute, all-or-nothing cleanup via the `delete_case` cascade). Event ids are
+  preserved verbatim, so annotation→event cross-references survive. The
+  content-addressed blob helpers moved from `api/routers/cases.py` to
+  `src/vestigo/core/retention.py`.
+- **Format.** Versioned single-file zip (`format_version: 1`): NDJSON per
+  Postgres entity (case-scoped audit rows included), one Arrow IPC member per
+  source, optional `blobs/<sha256>` members. Secrets (tokens, passwords, enricher
+  API keys) never exported; pure caches and Qdrant embeddings recomputed on
+  import. Users map by username, unknown names fall back to the importer with a
+  warning.
+- **Frontend.** Export button + dialog in case settings, import dialog on the
+  case list — both follow the existing job-polling pattern.
+- **ClickHouse pytest marker** (Milestone 2 residue, bundled): `clickhouse`
+  registered in `pyproject.toml` and applied via `pytestmark` to all eleven
+  `tests/*_clickhouse.py` files — `pytest -m clickhouse` selects them, and a run
+  without the dev stack can no longer pass them silently.
 
 ## Session 95 — 2026-07-24: 1.6.1 code-review hardening
 

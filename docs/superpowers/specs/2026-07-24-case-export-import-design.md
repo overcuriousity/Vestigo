@@ -101,9 +101,9 @@ exports).
 
 Steps inside the job:
 
-1. Snapshot Postgres entities via the existing `PostgresStore` list methods
-   (one new method needed: `list_detector_runs_for_case(case_id)`; audit via
-   existing `query_audit(case_id=...)`).
+1. Snapshot Postgres entities via direct ORM selects in the exporter (generic
+   column serialization — no new `PostgresStore` methods; audit rows included
+   as a case-scoped entity).
 2. Per source: stream `iter_source_events(case_id, source_id)` → Arrow IPC
    file member.
 3. `include_blobs`: add each source's retained blob via `_retention_path`
@@ -132,8 +132,8 @@ Steps:
    operator-configurable).
 2. Read `manifest.json`; reject `format_version > 1` with a clear error.
 3. Verify every member's SHA-256; any mismatch aborts before any write.
-4. Create the new case (fresh id; name reused, suffixed ` (imported)` when the
-   importer already owns a case with that name).
+4. Create the new case (fresh id; archived name kept verbatim — case names are
+   not unique-constrained).
 5. Insert Postgres rows in dependency order (case → sources → timelines →
    timeline_sources/timeline_enrichers → views/charts/baselines/detector_runs/
    dispositions/annotations → sigma → agent tables → source_enrichments →
@@ -214,10 +214,11 @@ New package `src/vestigo/transfer/`:
 - `importer.py` — verification, ID remap, ordered inserts, Arrow column
   rewrite, blob placement, stats recompute, cleanup.
 
-Touched existing files: `src/vestigo/db/postgres.py` (add
-`list_detector_runs_for_case`; reuse everything else), `src/vestigo/api/main.py`
-(router include, temp-sweep at startup), `pyproject.toml` (pytest marker),
-`docs/ROADMAP.md` + `CHANGELOG.md` (on completion).
+Touched existing files: `src/vestigo/core/retention.py` (new home for the
+content-addressed blob helpers, moved from `api/routers/cases.py` — no
+`postgres.py` changes), `src/vestigo/api/main.py` (router include, temp-sweep at
+startup), `pyproject.toml` (pytest marker), `docs/ROADMAP.md` + `CHANGELOG.md`
+(on completion).
 
 Frontend (minimal): Export button in case settings (start job → poll →
 auto-download when ready); Import upload on the case list (start job → poll →

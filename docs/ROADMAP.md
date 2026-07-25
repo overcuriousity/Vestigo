@@ -18,9 +18,7 @@ payoff-per-effort: A12 local transform tools (low friction, no design round need
 A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
 D10 correlation rules (heaviest lift, last of the detector line). Milestones 6 (streaming
 ingest) and 7 (forensic examination) are future phases gated on a joint data-model design
-round (S1+E1). Milestone 9 (X1 case export/import) trails that same gate: its archive
-format must absorb the data-model migration, so its design round lands after S1+E1's.
-Everything in Milestones 2–3 is residue/polish, picked up opportunistically.
+round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up opportunistically.
 
 ## Phase 3 — investigation depth (active, decided 2026-07-19)
 
@@ -80,14 +78,6 @@ round — the data model migrates once, not twice.
   Reusing `field_numeric_grouped` is the cheaper alternative — it already bins every group
   over a global range in one scan — at the cost of capping panels at 8 and selecting
   groups by numeric-value count rather than event count.
-
-- [ ] **Make the ClickHouse-dependent tests visibly skipped.** All ten `tests/*_clickhouse.py`
-  files `pytest.skip` inside a module fixture when the dev compose stack is absent, so a run
-  without ClickHouse reports them as ordinary passes-worth-of-dots and a CI that never had a
-  server looks green. Register a `clickhouse` marker in `pyproject.toml` and apply
-  `pytestmark` to all ten, so `-m clickhouse` selects them and their absence is assertable.
-  Pre-existing convention, surfaced by the PR #162 review — the statistics work leans on
-  `test_viz_stats_clickhouse.py` to pin ClickHouse's NULL-handling semantics.
 
 ## Milestone 3 — polish
 
@@ -247,23 +237,6 @@ compaction + fidelity-ladder approach (PR #152). See `docs/AGENT.md` and
 Any case — evidence, events, and all analyst work — leaves the instance as one file and
 comes back intact, here or elsewhere. Archive/restore and cross-instance transfer are
 equal goals (requested 2026-07-24).
-
-- [ ] **X1 — Case export/import (`.vestigo` archive).** Full-fidelity export of a case
-  into a single versioned, Vestigo-proprietary archive, restorable on the same or a
-  different instance. Carries **everything case-related**: Postgres state (case, sources,
-  timelines + field mappings, enricher configs and results, views, saved charts,
-  baselines, detector runs, finding dispositions, annotations/tags, sigma runs, agent
-  conversations/messages/proposals, case-scoped audit entries), all ClickHouse events,
-  and — optional flag at export time — the original source-file blobs (content-addressed,
-  hashes re-verified on import). Excluded by design: pure caches (field stats, viz cache)
-  and Qdrant embeddings — recomputed on import; and secrets (enricher API keys, agent
-  tokens, session/password material) — never exported. Import is the hard half: ID
-  remapping with UUIDv5 determinism (`derive_event_id`) as the dedup anchor, user/team
-  mapping by username with unassigned fallback, `(case_id, file_hash)` collision
-  handling, restore-as-new-case vs. conflict-abort. Export and import are both
-  permission-gated and audited — export is bulk case-data exfiltration. Needs its own
-  design round; format versioning must absorb the S1+E1 data-model migration, so sequence
-  it after (or pin a v1 that migrates like the interchange).
 
 ## Explicitly out of scope & standing decisions (with revisit triggers)
 
