@@ -2843,6 +2843,20 @@ class PostgresStore:
             await session.refresh(chart)
             return chart
 
+    async def get_saved_chart(
+        self, case_id: str, timeline_id: str, chart_id: str
+    ) -> SavedChart | None:
+        """Return a saved chart by case, timeline and chart IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SavedChart).where(
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
     async def rename_saved_chart(
         self, case_id: str, timeline_id: str, chart_id: str, name: str
     ) -> SavedChart | None:
@@ -3119,6 +3133,85 @@ class PostgresStore:
             if block is None:
                 return False
             await session.delete(block)
+            await session.commit()
+            return True
+
+    async def create_story_export(
+        self,
+        export_id: str,
+        story_id: str,
+        case_id: str,
+        snapshot: dict,
+        snapshot_hash: str,
+        user: str,
+    ) -> StoryExport:
+        """Persist a resolved export snapshot (immutable; artifact sealed later)."""
+        export = StoryExport(
+            id=export_id,
+            story_id=story_id,
+            case_id=case_id,
+            snapshot=snapshot,
+            snapshot_hash=snapshot_hash,
+            created_by=user,
+        )
+        async with self.session_factory() as session:
+            session.add(export)
+            await session.commit()
+            await session.refresh(export)
+            return export
+
+    async def get_story_export(self, case_id: str, export_id: str) -> StoryExport | None:
+        """Return an export by case and export IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport).where(
+                    StoryExport.case_id == case_id, StoryExport.id == export_id
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_story_exports(self, story_id: str) -> list[StoryExport]:
+        """Return a story's exports, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport)
+                .where(StoryExport.story_id == story_id)
+                .order_by(StoryExport.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def seal_story_export_artifact(
+        self, export_id: str, html: str, html_hash: str
+    ) -> StoryExport | None:
+        """Attach the rendered artifact to an export, exactly once.
+
+        Returns None when the export doesn't exist **or** already carries an
+        artifact — exports are immutable, so a second upload is refused rather
+        than overwriting the sealed record.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport).where(StoryExport.id == export_id)
+            )
+            export = result.scalar_one_or_none()
+            if export is None or export.html is not None:
+                return None
+            export.html = html
+            export.html_hash = html_hash
+            await session.commit()
+            await session.refresh(export)
+            return export
+
+    async def delete_story_export(self, export_id: str) -> bool:
+        """Delete an export row (admin-only path). Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport).where(StoryExport.id == export_id)
+            )
+            export = result.scalar_one_or_none()
+            if export is None:
+                return False
+            await session.delete(export)
             await session.commit()
             return True
 
