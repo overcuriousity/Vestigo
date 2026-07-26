@@ -16,8 +16,8 @@ Reported defects live as GitHub issues, condensed into the "Open defects" sectio
 with their issue numbers — triage notes and root-cause detail stay in the issue threads,
 not here.
 
-**Priority order** (verified against the codebase 2026-07-26): the open defects come first
-(B2 causes duplicate imports). Phase 3 is complete, so
+**Priority order** (verified against the codebase 2026-07-26): the remaining open defects
+(B5, B6) are low-priority polish. Phase 3 is complete, so
 the feature queue is led, roughly by payoff-per-effort, by
 A12 local transform tools (low friction, no design round needed),
 A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
@@ -29,19 +29,8 @@ round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up oppor
 
 All ten open issues re-verified against `main` @ 9034609; every one still reproduced.
 Grouped into batches that share a file/subsystem — work a batch as one change.
-B1, B3 and B4 shipped in session 103 (see `PROGRESS.md`).
+B1, B3 and B4 shipped in session 103, B2 in session 107 (see `PROGRESS.md`).
 
-- [ ] **B2 — Transfer progress + file-input batch** ([#184], [#183]). Import: `start()` in
-  `ImportCaseDialog.tsx` sets `jobId` only in the `.then()`, so the button stays enabled
-  for the whole multi-GB upload — this is the reported duplicate-import cause. Needs a
-  synchronous `submitting` state plus real byte progress (`fetch` can't report upload
-  progress — `XMLHttpRequest` + `upload.onprogress`). Export: the dialog polls the job but
-  renders nothing from it, and `downloadExport` has no feedback at all — the backend
-  already emits `{"phase": ...}` (`transfer/exporter.py:268-352`,
-  `transfer/importer.py:423`), nothing on the frontend reads `job.progress`. Also: four
-  bare `<input type="file">` sites (`ImportCaseDialog`, `timelines/UploadDialog`,
-  `analysis/SigmaPanel`, `admin/AdminEnrichersPage`) — fix once as a `ui/` file-input
-  primitive.
 - [ ] **B5 — Docs/API hygiene** ([#160], [#159]). `.env.example` covers 23 of ~96
   `Settings` fields: keep it curated, add a header pointing at `core/config.py`, document
   the operationally-relevant gaps (`oidc_*`, `max_upload_bytes`, `login_backoff_*`,
@@ -55,8 +44,6 @@ B1, B3 and B4 shipped in session 103 (see `PROGRESS.md`).
   `setdefault` still inserts past the cap. Evict the earliest `locked_until` instead.
   Low priority: expensive to trigger and self-limiting.
 
-[#184]: https://github.com/overcuriousity/Vestigo/issues/184
-[#183]: https://github.com/overcuriousity/Vestigo/issues/183
 [#160]: https://github.com/overcuriousity/Vestigo/issues/160
 [#159]: https://github.com/overcuriousity/Vestigo/issues/159
 [#158]: https://github.com/overcuriousity/Vestigo/issues/158
@@ -121,6 +108,10 @@ round — the data model migrates once, not twice.
   to replace the hand-mirrored finding/response types in `frontend/src/api/types.ts`
   (~1240 lines, ~90 types) — eliminates the per-detector backend↔frontend type duplication
   wholesale instead of special-casing single detectors (PR109 review follow-up).
+- [ ] Extract a `ui/Callout` primitive. `analysis/EmbeddingStatusBanner`, `timelines/
+  UploadDialog`'s duplicate warning and a handful of other sites hand-roll the same
+  border/dim-background/icon banner shape with per-site colour tokens (deferred out of the
+  B2 batch, which touched three of them).
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 
