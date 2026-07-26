@@ -13,8 +13,17 @@ that instant. Two shapes in that snapshot cannot be replayed as-is:
    pydantic-ai appends the *partial* ``ModelResponse`` to the history so
    nothing is lost. Its last ``ToolCallPart`` can carry half-written JSON
    arguments, and it never reached the tool executor.
+3. **A trailing request.** A completed turn's history always ends in a
+   ``ModelResponse``; a repaired snapshot would end in the synthesized
+   ``ModelRequest`` of tool returns. pydantic-ai appends the next turn's prompt
+   as its own ``ModelRequest``, and the Anthropic mapping emits one
+   ``role: "user"`` message per request with no merging — two consecutive user
+   messages, which Anthropic-protocol endpoints (the Kimi ``/coding`` endpoint
+   included, see ``agent/runtime.py``) reject with a role-alternation error.
+   :data:`RESUME_MARKER` closes the pair, exactly as ``agent/window.py``'s turn
+   drop does for the same reason.
 
-:func:`repair_partial` fixes both, and is deliberately pure: same snapshot in,
+:func:`repair_partial` fixes all three, and is deliberately pure: same snapshot in,
 same blob out, which is the determinism constraint the sliding window and the
 fidelity tiers already hold to.
 
@@ -32,6 +41,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
 )
@@ -44,10 +54,22 @@ INTERRUPTED_RESULT: dict[str, Any] = {
     "note": "The previous turn ended before this tool returned. Re-run the call if you still need its result.",
 }
 
-#: Prefixed to the next turn's context when the stored history is a mid-turn
-#: checkpoint. Neutral about the cause — a provider error and an analyst
-#: pressing Stop both land here — and it directs continuity of *context*, not
-#: of the model's old plan, because a Stop usually means "redirect".
+#: Closes a repaired snapshot that would otherwise end in a ``ModelRequest``
+#: (see the module docstring, point 3). Same request/response *pair* shape the
+#: window's turn drop uses, and visible to the analyst in raw_history exports.
+RESUME_MARKER = "Understood. Continuing from where the previous turn was interrupted."
+
+#: Sent as the next turn's ``instructions`` when the stored history is a
+#: mid-turn checkpoint. Neutral about the cause — a provider error and an
+#: analyst pressing Stop both land here — and it directs continuity of
+#: *context*, not of the model's old plan, because a Stop usually means
+#: "redirect". Deliberately *not* folded into the user prompt: that text is
+#: persisted verbatim as a ``UserPromptPart``, so the history would claim the
+#: analyst wrote it, and a repeatedly interrupted conversation would stack one
+#: stale note per interruption. Instructions belong to the request being made,
+#: not to the replayed history (verified against pydantic-ai 2.17.0: the model
+#: takes them from the current run's ``instruction_parts``, never from a
+#: historical ``ModelRequest.instructions``).
 RESUME_NOTE = (
     "Note: the previous turn ended early (an error, or the analyst stopped it). "
     "Everything it established is already in the conversation history above — "
@@ -133,4 +155,12 @@ def repair_partial(
                 ]
             )
         )
+
+    # Pass 3: end on a ModelResponse. The next turn's prompt arrives as its own
+    # ModelRequest, and the Anthropic protocol rejects two consecutive user
+    # messages — so a snapshot ending in a request (the synthesized returns
+    # above, or a retry prompt) needs the pair closed. Idempotent: the marker
+    # is itself a ModelResponse, so a second repair adds nothing.
+    if repaired and isinstance(repaired[-1], ModelRequest):
+        repaired.append(ModelResponse(parts=[TextPart(content=RESUME_MARKER)]))
     return repaired

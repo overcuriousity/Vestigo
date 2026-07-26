@@ -109,7 +109,10 @@ def test_a_retry_prompt_counts_as_answering_a_call():
         ),
     ]
     repaired = repair_partial(messages, called_ids={"a"}, results={})
-    assert repaired == messages
+    # No second answer synthesized; only the trailing marker response closing
+    # the request/response pair (see test_a_repaired_snapshot_ends_in_a_response).
+    assert repaired[:3] == messages
+    assert _returns(repaired) == {}
 
 
 def test_tool_call_that_never_executed_is_dropped():
@@ -131,8 +134,8 @@ def test_response_left_with_no_parts_is_dropped_entirely():
         ModelResponse(parts=[_call("ghost")]),
     ]
     repaired = repair_partial(messages, called_ids=set(), results={})
-    assert len(repaired) == 1
     assert isinstance(repaired[0], ModelRequest)
+    assert not any(isinstance(p, ToolCallPart) for m in repaired[1:] for p in m.parts)
 
 
 def test_only_the_trailing_response_is_pruned():
@@ -164,6 +167,38 @@ def test_repair_is_idempotent():
     once = repair_partial(messages, called_ids={"a"}, results={"a": {"hits": 3}})
     twice = repair_partial(once, called_ids={"a"}, results={"a": {"hits": 3}})
     assert once == twice
+
+
+@pytest.mark.parametrize(
+    "trailing",
+    [
+        pytest.param(None, id="synthesized-tool-returns"),
+        pytest.param(
+            ModelRequest(
+                parts=[RetryPromptPart(content="bad", tool_name="search_events", tool_call_id="a")]
+            ),
+            id="retry-prompt",
+        ),
+    ],
+)
+def test_a_repaired_snapshot_ends_in_a_response(trailing):
+    """A completed turn's history ends in a `ModelResponse`, and the next turn's
+    prompt arrives as its own `ModelRequest`. Ending on a request would put two
+    `role: "user"` messages back to back on the Anthropic protocol — a
+    role-alternation 400 on exactly the endpoints (Kimi /coding) this feature
+    exists to rescue."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="find it")]),
+        ModelResponse(parts=[_call("a")]),
+    ]
+    if trailing is not None:
+        messages.append(trailing)
+    repaired = repair_partial(messages, called_ids={"a"}, results={"a": {"hits": 3}})
+    assert isinstance(repaired[-1], ModelResponse)
+    assert isinstance(repaired[-1].parts[0], TextPart)
+    # Idempotent: a second repair must not stack a second marker.
+    twice = repair_partial(repaired, called_ids={"a"}, results={"a": {"hits": 3}})
+    assert twice == repaired
 
 
 def test_input_is_not_mutated():
@@ -269,6 +304,49 @@ async def test_stream_turn_checkpoints_after_each_tool_result(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_no_second_checkpoint_at_a_node_that_ended_on_a_tool_result(monkeypatch):
+    """Write amplification: the node-boundary checkpoint after a tool batch
+    captures the state the per-result checkpoint already did. A real turn's ~125
+    tool calls would otherwise pay 250 full history serializations and 250
+    whole-column JSON UPDATEs on the event loop."""
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: _ping_stub())
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        last = messages[-1]
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in last.parts):
+            yield "done"
+        else:
+            yield {
+                0: DeltaToolCall(name="ping", json_args='{"word": "a"}'),
+                1: DeltaToolCall(name="ping", json_args='{"word": "b"}'),
+            }
+
+    types: list[str] = []
+    async for event in runtime.stream_turn(
+        _scope(),
+        user_text="ping please",
+        history=[],
+        recorder=runtime.TurnRecorder(),
+        model=FunctionModel(stream_function=model_stream),
+    ):
+        types.append(event["type"])
+
+    # Two tool results -> two checkpoints, plus one for the node that streamed
+    # the final text. No checkpoint immediately follows the last tool_result's.
+    assert types.count("checkpoint") == 3
+    assert types.count("tool_result") == 2
+    for i, kind in enumerate(types):
+        if kind == "tool_result":
+            assert types[i + 1] == "checkpoint"
+            assert types[i + 2] != "checkpoint"
+
+
+@pytest.mark.asyncio
 async def test_stream_turn_still_maps_events_and_returns_a_result(monkeypatch):
     """The rewrite onto agent.iter must not change the event contract the
     router and the frontend consume."""
@@ -341,6 +419,50 @@ async def test_recorder_survives_a_turn_that_dies_mid_stream(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_synthesized_return_keeps_the_raw_tool_content(monkeypatch):
+    """The SSE payload coerces a non-dict/list result with `str(...)` for the
+    wire. Writing that coerced form into the replayed history would make the
+    resumed conversation disagree with the run about what the tool returned —
+    the forensic-reproducibility rule forbids it."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    stub = FastMCP("stub")
+
+    @stub.tool()
+    async def count(word: str) -> int:
+        """Count."""
+        return 7
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: stub)
+
+    async def dying(messages: list[ModelMessage], info: AgentInfo):
+        last = messages[-1]
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in last.parts):
+            raise RuntimeError("endpoint died")
+        yield {0: DeltaToolCall(name="count", json_args='{"word": "hi"}')}
+
+    recorder = runtime.TurnRecorder()
+    mapped: list[object] = []
+    with pytest.raises(RuntimeError):
+        async for event in runtime.stream_turn(
+            _scope(),
+            user_text="count please",
+            history=[],
+            recorder=recorder,
+            model=FunctionModel(stream_function=dying),
+        ):
+            if event["type"] == "tool_result":
+                mapped.append(event["result"])
+
+    assert mapped == ["7"], "the SSE payload keeps its coerced shape"
+    assert list(_returns(recorder.messages).values()) == [7]
+
+
+@pytest.mark.asyncio
 async def test_a_checkpointed_snapshot_replays_as_history(monkeypatch):
     """End to end: dump the interrupted snapshot the way the router does, load
     it back, and run a second turn on top of it."""
@@ -390,6 +512,53 @@ async def test_a_checkpointed_snapshot_replays_as_history(monkeypatch):
     assert events[-1]["type"] == "result"
     # The second turn saw the first turn's work, not an empty slate.
     assert seen_history[0] > 1
+
+
+@pytest.mark.asyncio
+async def test_the_resume_note_reaches_the_model_but_not_the_stored_prompt(monkeypatch):
+    """The note has to be *sent* (that is the whole feature) without becoming
+    part of the analyst's persisted message — instructions ride with the
+    request, the prompt is kept in the history forever."""
+    from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from vestigo.agent import runtime
+    from vestigo.agent.resume import RESUME_NOTE
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: _ping_stub())
+
+    sent: list[str | None] = []
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        sent.extend(
+            m.instructions for m in messages if isinstance(m, ModelRequest) and m.instructions
+        )
+        yield "carrying on"
+
+    seen = []
+    async for event in runtime.stream_turn(
+        _scope(),
+        user_text="carry on",
+        history=[],
+        model=FunctionModel(stream_function=model_stream),
+        resume_note=RESUME_NOTE,
+    ):
+        seen.append(event)
+
+    assert sent and RESUME_NOTE in sent[0], "the model must actually receive the note"
+
+    turn = seen[-1]["turn"]
+    prompts = [
+        part.content
+        for message in turn.new_messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    ]
+    assert prompts and all(RESUME_NOTE not in str(p) for p in prompts)
+    # And it is not smuggled in anywhere else the analyst's prompt is stored.
+    blob = ModelMessagesTypeAdapter.dump_json(turn.new_messages).decode()
+    assert blob.count(RESUME_NOTE[:40]) <= 1, "at most the request's own instructions"
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +625,21 @@ def _fake_turn_messages():
     ]
 
 
+def _assert_is_the_turn_blob(history) -> None:
+    """The persisted blob is exactly the turn's messages on the (empty) base.
+
+    Asserting only that it is truthy would miss the regression that matters:
+    persisting the wrong base — the history duplicated, or the failed attempt
+    concatenated ahead of the re-run — still yields a non-empty blob.
+    """
+    from vestigo.agent.runtime import load_history
+
+    assert len(history) == 2, history
+    loaded = load_history(history)
+    assert [type(m) for m in loaded] == [ModelRequest, ModelResponse]
+    assert loaded[-1].parts[-1].content == "partial answer"
+
+
 @pytest.mark.asyncio
 async def test_a_stopped_turn_keeps_its_history_and_is_marked_partial(store, monkeypatch):
     """The reported bug: an interrupted turn used to persist message rows and
@@ -491,8 +675,8 @@ async def test_a_stopped_turn_keeps_its_history_and_is_marked_partial(store, mon
     assert all(e["type"] != "checkpoint" for e in events)
 
     fresh = await store.get_agent_conversation(case.id, conversation.id)
-    assert fresh.history, "the stopped turn's history must survive"
     assert fresh.history_partial_at is not None
+    _assert_is_the_turn_blob(fresh.history)
 
 
 @pytest.mark.asyncio
@@ -514,8 +698,46 @@ async def test_a_failed_turn_keeps_its_history_and_is_marked_partial(store, monk
         pass
 
     fresh = await store.get_agent_conversation(case.id, conversation.id)
-    assert fresh.history
     assert fresh.history_partial_at is not None
+    _assert_is_the_turn_blob(fresh.history)
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_that_did_not_advance_is_not_rewritten(store, monkeypatch):
+    """Each write is a full `dump_history` plus a whole-column JSON UPDATE of a
+    blob that grows into hundreds of KB, on the event loop. Repeating it for a
+    recorder that has not moved (the error exit right after a checkpoint) buys
+    nothing."""
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    writes: list[object] = []
+    original = store.update_agent_conversation
+
+    async def counting(conversation_id, **kwargs):
+        if "history" in kwargs:
+            writes.append(kwargs["history"])
+        return await original(conversation_id, **kwargs)
+
+    monkeypatch.setattr(store, "update_agent_conversation", counting)
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        recorder.messages = _fake_turn_messages()
+        recorder.revision += 1
+        yield {"type": "checkpoint"}
+        # Same state, checkpointed again, then an error exit that persists once
+        # more — one write in total is the honest cost.
+        yield {"type": "checkpoint"}
+        raise RuntimeError("endpoint died")
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    assert len(writes) == 1, "only advanced snapshots are written"
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    _assert_is_the_turn_blob(fresh.history)
 
 
 @pytest.mark.asyncio

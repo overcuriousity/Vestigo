@@ -665,15 +665,27 @@ async def _message_stream_inner(
         )
         return detail
 
+    # Revision of the last snapshot actually written, so the redundant writes
+    # are skipped rather than re-serialized (see `_persist_partial`).
+    persisted_revision = 0
+
     async def _persist_partial() -> None:
         """Store what the turn has produced so far, marked as mid-turn.
 
         Called from every exit that is not a completed turn — a stop, a
         provider error, the checkpoints in between. A hard kill runs none of
         them, which is exactly why the checkpoints exist.
+
+        A write is a full `dump_history` plus a whole-column JSON UPDATE of a
+        blob that grows into hundreds of KB, on the event loop of a
+        single-process deployment. It is skipped when the recorder has not
+        advanced since the last one, so the exit paths that follow a checkpoint
+        (a stop, a provider error) cost nothing extra.
         """
-        if not recorder.messages:
+        nonlocal persisted_revision
+        if not recorder.messages or recorder.revision == persisted_revision:
             return
+        persisted_revision = recorder.revision
         await store.update_agent_conversation(
             conversation_id,
             history=dump_history(history + recorder.messages),
@@ -689,6 +701,7 @@ async def _message_stream_inner(
         # faithful record of what ran.
         recorder.messages = []
         recorder.revision = 0
+        persisted_revision = 0
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return

@@ -550,9 +550,11 @@ async def stream_turn(
     history instead of losing the whole turn.
 
     ``resume_note`` is set by the router when ``history`` is a mid-turn
-    checkpoint rather than a completed turn; it is prefixed to the turn's
-    context so the model builds on the interrupted turn's findings instead of
-    re-running the orientation sweep it already paid for.
+    checkpoint rather than a completed turn, and rides as the run's
+    ``instructions`` so the model builds on the interrupted turn's findings
+    instead of re-running the orientation sweep it already paid for. Not folded
+    into the prompt: that text is persisted as the analyst's own
+    ``UserPromptPart`` and would stack one stale note per interruption.
     """
     config = await resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
@@ -606,12 +608,13 @@ async def stream_turn(
             f"Case: {scope.case_id}. Timeline: {scope.timeline_id} "
             f"({len(scope.source_ids)} sources). {_view_context(view_filters)}\n\n{user_text}"
         )
-        if resume_note:
-            # Ahead of everything else, so the analyst's own message stays last.
-            context = f"{resume_note}\n\n{context}"
-
         track = recorder if recorder is not None else TurnRecorder()
         called_ids: set[str] = set()
+        # Raw tool-return contents, not the SSE-mapped ones: `_map_event`
+        # coerces a non-dict/list result with `str(...)` for the wire, and a
+        # synthesized ToolReturnPart built from that would differ in type from
+        # what the tool actually returned — the forensic-reproducibility rule
+        # (CLAUDE.md) makes the replayed history match the run.
         results: dict[str, Any] = {}
 
         def checkpoint() -> dict[str, Any]:
@@ -621,7 +624,15 @@ async def stream_turn(
             track.revision += 1
             return {"type": "checkpoint"}
 
-        async with agent.iter(context, message_history=history or None, usage_limits=limits) as run:
+        async with agent.iter(
+            context,
+            message_history=history or None,
+            usage_limits=limits,
+            # Instructions belong to this request, not to the stored history:
+            # pydantic-ai takes them from the current run, so a note left on an
+            # older ModelRequest is never resent (verified on 2.17.0).
+            instructions=resume_note or None,
+        ) as run:
             async for node in run:
                 # UserPromptNode and End carry no stream; everything the router
                 # forwards comes from the other two.
@@ -633,13 +644,13 @@ async def stream_turn(
                 # to checkpoint. Gate the node-boundary checkpoint on the node
                 # having actually produced a mapped event, or a premature
                 # checkpoint lands before the tool_call/tool_result it precedes.
-                made_progress = False
+                last_type: str | None = None
                 async with node.stream(run.ctx) as stream:
                     async for event in stream:
                         mapped = _map_event(event)
                         if mapped is None:
                             continue
-                        made_progress = True
+                        last_type = mapped["type"]
                         if mapped["type"] == "tool_call":
                             called_ids.add(mapped["tool_call_id"])
                         yield mapped
@@ -647,10 +658,16 @@ async def stream_turn(
                             # Checkpoint per tool result, not just per node: a
                             # batch of four ClickHouse queries is seconds of
                             # work a kill -9 must not erase.
-                            results[mapped["tool_call_id"]] = mapped["result"]
+                            results[mapped["tool_call_id"]] = event.part.content
                             yield checkpoint()
-                if made_progress:
-                    # Node boundary — the natural place the snapshot is whole.
+                # Node boundary — the natural place the snapshot is whole. Not
+                # taken when the node produced nothing mapped (a response that
+                # only decided to call a tool: the checkpoint would land before
+                # the tool_call it precedes), nor when its last mapped event was
+                # a tool_result — that checkpoint already captured this exact
+                # state, and a real turn's ~125 tool calls would otherwise pay
+                # 250 full history serializations and whole-column UPDATEs.
+                if last_type is not None and last_type != "tool_result":
                     yield checkpoint()
             result = run.result
             if result is not None:

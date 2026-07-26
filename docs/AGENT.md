@@ -572,16 +572,37 @@ shows 125 persisted tool rows against an empty history blob, and the next turn
 re-ran the entire orientation sweep.
 
 `stream_turn` now drives `agent.iter` and updates a caller-owned `TurnRecorder`
-after every tool result and every node, yielding a router-internal `checkpoint`
-event. Each snapshot passes through `agent/resume.py::repair_partial`, which
-answers tool calls left unpaired (with the result the turn actually streamed,
-or an explicit `interrupted` marker) and drops trailing calls that never
-reached the executor — so any checkpoint is replayable on its own.
+after every tool result and at every node boundary, yielding a router-internal
+`checkpoint` event. Each snapshot passes through
+`agent/resume.py::repair_partial`, which answers tool calls left unpaired (with
+the result the turn actually streamed, or an explicit `interrupted` marker),
+drops trailing calls that never reached the executor, and closes the history
+with a `RESUME_MARKER` response when it would otherwise end on a `ModelRequest`
+— a completed turn's history always ends in a `ModelResponse`, and ending on a
+request puts two `role: "user"` messages back to back on the Anthropic protocol
+(a role-alternation 400 on Kimi `/coding` and friends). Same request/response
+pair shape the window's turn drop uses. The synthesized return carries the tool's
+*raw* content, not the `str()`-coerced form the SSE payload sends, so the
+replayed history agrees with the run about what the tool returned. Any
+checkpoint is replayable on its own.
+
+Checkpointing is deliberately cheap: the node-boundary checkpoint is skipped
+when the node produced nothing mapped, and when its last mapped event was a
+`tool_result` (that checkpoint already captured the same state), and the
+router's `_persist_partial` skips a write whose `recorder.revision` has not
+advanced. A 125-tool-call turn therefore pays ~125 history serializations and
+UPDATEs, not ~250. The per-tool-result checkpoint stays — losing a tool batch
+to a `kill -9` is the thing this exists to prevent.
 
 The router writes each checkpoint and stamps `history_partial_at`. Only a
 completed turn clears it; a stop is treated as an interruption like any other.
-While it is set, the next turn carries `RESUME_NOTE`, which tells the model the
-previous turn ended early and to build on the history rather than re-orient.
+While it is set, the next turn is run with `RESUME_NOTE` as pydantic-ai
+`instructions` — it tells the model the previous turn ended early and to build
+on the history rather than re-orient, without being folded into the prompt: the
+prompt is persisted verbatim as the analyst's `UserPromptPart`, so a note there
+would claim words the analyst never wrote and stack one stale copy per
+interruption. Instructions come from the current run only (verified against
+pydantic-ai 2.17.0), so a note left on an older `ModelRequest` is never resent.
 The recorder is reset per attempt, so the reactive overflow re-run replays from
 the same pre-turn base rather than concatenating the failed attempt's messages.
 
