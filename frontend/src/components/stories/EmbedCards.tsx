@@ -18,6 +18,7 @@ import { ChartCanvas } from "@/components/viz/ChartCanvas";
 import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
 import { Spinner } from "@/components/ui/Spinner";
 import { filtersToParams, viewPayloadToFilters } from "@/lib/queryParams";
+import { fmtNum } from "@/lib/format";
 import { fmtTimestamp } from "@/lib/time";
 
 function Unresolved({ what }: { what: string }) {
@@ -125,7 +126,7 @@ export function ViewBlockCard({ block, caseId }: { block: StoryBlock; caseId: st
           </div>
           <p className="text-[10px] text-[var(--color-fg-muted)]">
             {total != null && total > rows.length
-              ? `${rows.length} of ${total.toLocaleString()} rows shown`
+              ? `${rows.length} of ${fmtNum(total)} rows shown`
               : `${rows.length} row${rows.length === 1 ? "" : "s"}`}
           </p>
         </>

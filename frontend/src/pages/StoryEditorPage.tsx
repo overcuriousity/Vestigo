@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BookOpenText, ChevronLeft } from "lucide-react";
 import { storiesApi } from "@/api/stories";
+import { ExportsTab } from "@/components/stories/ExportsTab";
 import { StoryEditor } from "@/components/stories/StoryEditor";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -12,6 +13,7 @@ export function StoryEditorPage() {
   const { caseId, storyId } = useParams<{ caseId: string; storyId: string }>();
   const qc = useQueryClient();
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
+  const [tab, setTab] = useState<"editor" | "exports">("editor");
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["story", caseId, storyId],
@@ -76,7 +78,28 @@ export function StoryEditorPage() {
           </div>
         </div>
 
-        <StoryEditor caseId={caseId!} storyId={storyId!} />
+        <div className="mb-4 flex gap-1 border-b border-[var(--color-border)]">
+          {(["editor", "exports"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setTab(t)}
+              className={`-mb-px border-b-2 px-3 py-1.5 text-xs capitalize transition-base ${
+                tab === t
+                  ? "border-[var(--color-accent)] text-[var(--color-fg-primary)]"
+                  : "border-transparent text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]"
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {tab === "editor" ? (
+          <StoryEditor caseId={caseId!} storyId={storyId!} />
+        ) : (
+          <ExportsTab caseId={caseId!} storyId={storyId!} />
+        )}
       </div>
     </div>
   );

@@ -1,0 +1,103 @@
+{
+  "v": 1,
+  "story": {
+    "id": "s1",
+    "title": "Intrusion report",
+    "case_id": "c1",
+    "exported_at": "2026-07-26T12:00:00+00:00",
+    "exported_by": "alice"
+  },
+  "blocks": [
+    {
+      "id": "b1",
+      "kind": "markdown",
+      "origin": "user",
+      "ref": { "text": "## Initial access" },
+      "data": { "text": "## Initial access\n\nBrute force against the VPN gateway." },
+      "resolution": { "executed_at": "2026-07-26T12:00:00+00:00", "error": null }
+    },
+    {
+      "id": "b2",
+      "kind": "view_ref",
+      "origin": "user",
+      "ref": { "view_id": "v1", "timeline_id": "t1", "name": "Failed logins" },
+      "data": {
+        "rows": [
+          {
+            "event_id": "e1",
+            "timestamp": "2026-07-20T04:11:00+00:00",
+            "message": "Failed password for invalid user admin",
+            "attributes": { "src_ip": "203.0.113.9" }
+          },
+          {
+            "event_id": "e2",
+            "timestamp": "2026-07-20T04:11:02+00:00",
+            "message": "Failed password for invalid user root",
+            "attributes": { "src_ip": "203.0.113.9" }
+          }
+        ],
+        "row_count_total": 14203,
+        "rows_included": 2,
+        "truncated": true,
+        "columns": null
+      },
+      "resolution": {
+        "executed_at": "2026-07-26T12:00:00+00:00",
+        "timeline_id": "t1",
+        "error": null
+      }
+    },
+    {
+      "id": "b3",
+      "kind": "chart_ref",
+      "origin": "agent",
+      "ref": { "chart_id": "ch1", "timeline_id": "t1", "name": "Top source IPs" },
+      "data": {
+        "name": "Top source IPs",
+        "config": { "v": 1, "chartType": "bar", "scale": "nominal", "field": "src_ip" },
+        "resolved": { "data_kind": "terms", "compare_mode": "off", "chart_type": "bar" },
+        "warnings": [],
+        "chart": {
+          "total": 240,
+          "distinct": 2,
+          "values": [
+            { "value": "203.0.113.9", "count": 200 },
+            { "value": "198.51.100.4", "count": 40 }
+          ]
+        }
+      },
+      "resolution": {
+        "executed_at": "2026-07-26T12:00:00+00:00",
+        "timeline_id": "t1",
+        "error": null
+      }
+    },
+    {
+      "id": "b4",
+      "kind": "event_ref",
+      "origin": "user",
+      "ref": { "event_id": "e9", "source_id": "s9", "caption": "first successful login" },
+      "data": {
+        "event": {
+          "event_id": "e9",
+          "timestamp": "2026-07-20T04:19:41+00:00",
+          "source_file": "auth.log",
+          "message": "Accepted password for svc_backup from 203.0.113.9"
+        },
+        "caption": "first successful login"
+      },
+      "resolution": { "executed_at": "2026-07-26T12:00:00+00:00", "error": null }
+    },
+    {
+      "id": "b5",
+      "kind": "view_ref",
+      "origin": "user",
+      "ref": { "view_id": "gone", "timeline_id": "t1" },
+      "data": null,
+      "resolution": {
+        "executed_at": "2026-07-26T12:00:00+00:00",
+        "error": "view 'gone' not found (deleted before export)"
+      }
+    }
+  ]
+}
