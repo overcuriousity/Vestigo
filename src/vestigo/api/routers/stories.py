@@ -6,20 +6,26 @@ a stale write returns 409 with the current block so the editor can present
 the conflict instead of clobbering a collaborator's edit.
 """
 
+import hashlib
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from vestigo.api.deps import (
     get_current_user,
     get_store,
+    require_admin,
     require_case_contribute,
     require_case_read,
 )
 from vestigo.db.postgres import Case, StaleBlockError, StoryBlock, User
-from vestigo.stories.schemas import validate_block_content
+from vestigo.stories.export import resolve_story_snapshot
+from vestigo.stories.schemas import canonical_hash, validate_block_content
+
+#: Upper bound on an uploaded export artifact (standalone HTML), bytes.
+MAX_ARTIFACT_BYTES = 20_000_000
 
 router = APIRouter(prefix="/api/cases", tags=["stories"])
 
@@ -43,6 +49,10 @@ class BlockUpdateBody(BaseModel):
 class BlockMoveBody(BaseModel):
     after_block_id: str | None = None
     version: int
+
+
+class ArtifactBody(BaseModel):
+    html: str
 
 
 async def _get_story_or_404(case_id: str, story_id: str):
@@ -226,4 +236,123 @@ async def delete_block(
     await _get_story_or_404(case.id, story_id)
     await _get_block_or_404(story_id, block_id)
     await get_store().delete_story_block(block_id)
+    return {"deleted": True}
+
+
+async def _get_export_or_404(case_id: str, story_id: str, export_id: str):
+    export = await get_store().get_story_export(case_id, export_id)
+    if export is None or export.story_id != story_id:
+        raise HTTPException(status_code=404, detail="Export not found")
+    return export
+
+
+@router.post("/{case_id}/stories/{story_id}/exports")
+async def create_export(
+    story_id: str,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Freeze the story into an immutable, hashed point-in-time snapshot.
+
+    The server resolves every block itself (view queries, chart execution,
+    event fetches) — the snapshot is authoritative; the client-rendered HTML
+    artifact uploaded afterwards is presentation only.
+    """
+    story = await _get_story_or_404(case.id, story_id)
+    store = get_store()
+    blocks = await store.list_story_blocks(story.id)
+    snapshot = await resolve_story_snapshot(story, blocks, user=user)
+    export = await store.create_story_export(
+        uuid.uuid4().hex,
+        story.id,
+        case.id,
+        snapshot,
+        canonical_hash(snapshot),
+        user=user.username,
+    )
+    await store.record_audit(
+        action="story.export",
+        actor=user,
+        case_id=case.id,
+        target_type="story_export",
+        target_id=export.id,
+    )
+    return {"export": export.to_dict(include_snapshot=True)}
+
+
+@router.post("/{case_id}/stories/{story_id}/exports/{export_id}/artifact")
+async def seal_export_artifact(
+    story_id: str,
+    export_id: str,
+    body: ArtifactBody,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Attach the client-rendered standalone HTML to an export, exactly once."""
+    await _get_export_or_404(case.id, story_id, export_id)
+    if len(body.html.encode("utf-8")) > MAX_ARTIFACT_BYTES:
+        raise HTTPException(status_code=413, detail="artifact exceeds the size cap")
+    html_hash = hashlib.sha256(body.html.encode("utf-8")).hexdigest()
+    export = await get_store().seal_story_export_artifact(export_id, body.html, html_hash)
+    if export is None:
+        raise HTTPException(status_code=409, detail="export already carries an artifact")
+    return {"export": export.to_dict()}
+
+
+@router.get("/{case_id}/stories/{story_id}/exports")
+async def list_exports(
+    story_id: str, case: Case = Depends(require_case_read)
+) -> dict[str, Any]:
+    """List a story's exports, newest first (snapshots omitted)."""
+    await _get_story_or_404(case.id, story_id)
+    exports = await get_store().list_story_exports(story_id)
+    return {"exports": [e.to_dict() for e in exports]}
+
+
+@router.get("/{case_id}/stories/{story_id}/exports/{export_id}/snapshot")
+async def download_export_snapshot(
+    story_id: str, export_id: str, case: Case = Depends(require_case_read)
+) -> dict[str, Any]:
+    """Download the frozen snapshot JSON."""
+    export = await _get_export_or_404(case.id, story_id, export_id)
+    return export.snapshot
+
+
+@router.get("/{case_id}/stories/{story_id}/exports/{export_id}/artifact")
+async def download_export_artifact(
+    story_id: str, export_id: str, case: Case = Depends(require_case_read)
+) -> Response:
+    """Download the sealed standalone HTML artifact."""
+    export = await _get_export_or_404(case.id, story_id, export_id)
+    if export.html is None:
+        raise HTTPException(status_code=404, detail="export has no artifact yet")
+    return Response(
+        content=export.html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="story-{story_id}-{export_id}.html"'
+            )
+        },
+    )
+
+
+@router.delete("/{case_id}/stories/{story_id}/exports/{export_id}")
+async def delete_export(
+    story_id: str,
+    export_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Delete an export — admin only; exports are otherwise immutable."""
+    await _get_export_or_404(case.id, story_id, export_id)
+    store = get_store()
+    await store.delete_story_export(export_id)
+    await store.record_audit(
+        action="story.export_delete",
+        actor=user,
+        case_id=case.id,
+        target_type="story_export",
+        target_id=export_id,
+    )
     return {"deleted": True}

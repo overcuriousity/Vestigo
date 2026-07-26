@@ -150,6 +150,82 @@ def test_rbac_non_member_denied(client, admin_bootstrap, store):
     )
 
 
+def test_export_flow(client, admin_bootstrap, store):
+    from vestigo.stories.schemas import canonical_hash
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    client.post(f"{base}/blocks", json={"kind": "markdown", "content": {"text": "# frozen"}})
+    # A dangling view ref must not fail the export — it freezes as an error.
+    client.post(
+        f"{base}/blocks",
+        json={"kind": "view_ref", "content": {"view_id": "ghost", "timeline_id": "t1"}},
+    )
+
+    resp = client.post(f"{base}/exports")
+    assert resp.status_code == 200, resp.text
+    export = resp.json()["export"]
+    snapshot = export["snapshot"]
+    assert snapshot["v"] == 1
+    md, view = snapshot["blocks"]
+    assert md["data"] == {"text": "# frozen"}
+    assert view["resolution"]["error"] is not None
+    assert export["snapshot_hash"] == canonical_hash(snapshot)
+    assert export["has_artifact"] is False
+
+    # Seal the artifact exactly once.
+    ok = client.post(f"{base}/exports/{export['id']}/artifact", json={"html": "<p>r</p>"})
+    assert ok.status_code == 200
+    assert ok.json()["export"]["has_artifact"] is True
+    again = client.post(f"{base}/exports/{export['id']}/artifact", json={"html": "<p>x</p>"})
+    assert again.status_code == 409
+
+    # Downloads round-trip.
+    snap = client.get(f"{base}/exports/{export['id']}/snapshot")
+    assert snap.status_code == 200
+    assert snap.json()["v"] == 1
+    art = client.get(f"{base}/exports/{export['id']}/artifact")
+    assert art.status_code == 200
+    assert art.text == "<p>r</p>"
+
+    listed = client.get(f"{base}/exports").json()["exports"]
+    assert [e["id"] for e in listed] == [export["id"]]
+    assert "snapshot" not in listed[0]
+
+    rows = client.get("/api/admin/audit", params={"case_id": case_id}).json()["audit"]
+    assert "story.export" in [r["action"] for r in rows]
+
+
+def test_export_artifact_missing_404(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    export = client.post(f"{base}/exports").json()["export"]
+    assert client.get(f"{base}/exports/{export['id']}/artifact").status_code == 404
+    assert client.get(f"{base}/exports/ghost/snapshot").status_code == 404
+
+
+def test_export_delete_admin_only(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    export = client.post(f"{base}/exports").json()["export"]
+
+    client.post("/api/admin/users", json={"username": "worker", "password": "abcdefgh12"})
+    login(client, "worker", "abcdefgh12")
+    assert client.delete(f"{base}/exports/{export['id']}").status_code == 403
+
+    # as_admin already rotated the bootstrap password; log back in directly.
+    login(client, admin_bootstrap["username"], "rotated-pass-456")
+    assert client.delete(f"{base}/exports/{export['id']}").status_code == 200
+    rows = client.get("/api/admin/audit", params={"case_id": case_id}).json()["audit"]
+    assert "story.export_delete" in [r["action"] for r in rows]
+
+
 def test_story_lifecycle_audited(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     case_id = _setup_case(client)
