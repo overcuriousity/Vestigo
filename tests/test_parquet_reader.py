@@ -131,6 +131,21 @@ class TestArrowBatches:
         assert [str(e.event_id) for e in events] == batch_ids
         assert all(e.timestamp is not None for e in events)
 
+    def test_event_id_disagreement_raises_descriptive_error(self, converter_output, monkeypatch):
+        """The batch path and Event must derive the same identity.
+
+        A bare ``assert`` here is stripped under ``python -O``, which would
+        turn a broken identity invariant into silent evidence corruption — so
+        the guard has to be a real raise with an actionable message.
+        """
+        monkeypatch.setattr(
+            "vestigo.ingestion.parquet_reader.derive_event_id",
+            lambda *a, **k: "00000000-0000-0000-0000-000000000000",
+        )
+        parser = _parser()
+        with pytest.raises(ValueError, match="event_id mismatch"):
+            list(parser.parse(converter_output))
+
 
 class TestValidation:
     def _write(self, path: Path, schema: pa.Schema, metadata: dict[str, str]) -> Path:

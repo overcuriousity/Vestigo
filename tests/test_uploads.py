@@ -3,6 +3,7 @@ ingestion job (upload returns a job id; events land when the job runs)."""
 
 from __future__ import annotations
 
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -438,6 +439,66 @@ async def test_source_delete_succeeds_and_audits(
     assert response == {"deleted": True, "source_id": "s_ok"}
     assert await store.get_source(case, "s_ok") is None
     assert await store.query_audit(case_id=case, action="source.delete") != []
+
+
+class _ThreadRecordingQdrant:
+    """Records which thread each blocking Qdrant call ran on."""
+
+    threads: list[str] = []
+
+    def delete_source_points(self, case_id: str, source_id: str) -> None:
+        type(self).threads.append(threading.current_thread().name)
+
+    def delete_case_collections(self, case_id: str) -> None:
+        type(self).threads.append(threading.current_thread().name)
+
+
+@pytest.mark.asyncio
+async def test_case_delete_runs_qdrant_calls_off_the_event_loop(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Qdrant client is synchronous HTTP — calling it inline blocks the
+    event loop for the whole cascade, exactly like the ClickHouse deletes it
+    sits next to (which are already offloaded)."""
+    _ThreadRecordingQdrant.threads = []
+    monkeypatch.setattr(cases, "QdrantStore", _ThreadRecordingQdrant)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    await store.create_source(case, "s_thr", "victim", file_hash="ht", size_bytes=1)
+    case_obj = await store.get_case(case)
+
+    await cases.delete_case(case=case_obj, user=_fake_user())
+
+    loop_thread = threading.current_thread().name
+    assert _ThreadRecordingQdrant.threads  # both point + collection deletes ran
+    assert loop_thread not in _ThreadRecordingQdrant.threads
+
+
+@pytest.mark.asyncio
+async def test_source_delete_runs_qdrant_call_off_the_event_loop(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ThreadRecordingQdrant.threads = []
+    monkeypatch.setattr(cases, "QdrantStore", _ThreadRecordingQdrant)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    await store.create_source(case, "s_thr2", "victim", file_hash="ht2", size_bytes=1)
+    case_obj = await store.get_case(case)
+
+    await cases.delete_source(source_id="s_thr2", case=case_obj, user=_fake_user())
+
+    assert _ThreadRecordingQdrant.threads
+    assert threading.current_thread().name not in _ThreadRecordingQdrant.threads
 
 
 @pytest.mark.asyncio

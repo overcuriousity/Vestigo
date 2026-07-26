@@ -211,6 +211,61 @@ def test_jsonl_parser_skips_non_object_json_lines(tmp_path: Path) -> None:
     assert events[1].line_number == 6
 
 
+def test_jsonl_byte_offsets_survive_invalid_utf8(tmp_path: Path) -> None:
+    """A non-UTF-8 byte must not shift every later byte_offset.
+
+    Text decoded with ``errors="replace"`` turns each bad byte into U+FFFD,
+    which re-encodes to three bytes — measuring the decoded line therefore
+    over-counts and breaks the event-to-source-byte invariant for the whole
+    rest of the file.
+    """
+    path = tmp_path / "latin1.jsonl"
+    line1 = b'{"message":"caf\xe9 broken"}\n'
+    line2 = b'{"message":"second"}\n'
+    path.write_bytes(line1 + line2)
+
+    config = ParserConfig(name="jsonl", version="0.1.0")
+    parser = JsonlParser("case1", "source1", config, file_hash="hash1", source_name="s.jsonl")
+    events = list(parser.parse(path))
+
+    assert [e.byte_offset for e in events] == [0, len(line1)]
+    raw = path.read_bytes()
+    for event, expected in zip(events, (line1, line2), strict=True):
+        assert raw[event.byte_offset : event.byte_offset + len(expected)] == expected
+
+
+def test_csv_byte_offsets_survive_invalid_utf8(tmp_path: Path) -> None:
+    """Same invariant for the CSV record tracker, including the header."""
+    path = tmp_path / "latin1.csv"
+    header = b"datetime,message\n"
+    row1 = b"2024-01-01T00:00:00+00:00,caf\xe9 broken\n"
+    row2 = b"2024-01-01T00:01:00+00:00,second\n"
+    path.write_bytes(header + row1 + row2)
+
+    config = ParserConfig(name="timesketch_csv", version="0.1.0")
+    parser = TimesketchCsvParser("case1", "source1", config, file_hash="hash1", source_name="s.csv")
+    events = list(parser.parse(path))
+
+    assert [e.byte_offset for e in events] == [len(header), len(header) + len(row1)]
+    raw = path.read_bytes()
+    for event, expected in zip(events, (row1, row2), strict=True):
+        assert raw[event.byte_offset : event.byte_offset + len(expected)] == expected
+
+
+def test_invalid_utf8_still_yields_clean_text(tmp_path: Path) -> None:
+    """Undecodable bytes stay replaced by U+FFFD in the event payload — the
+    stored message must never carry lone surrogates into JSON/ClickHouse."""
+    path = tmp_path / "latin1.jsonl"
+    path.write_bytes(b'{"message":"caf\xe9"}\n')
+
+    config = ParserConfig(name="jsonl", version="0.1.0")
+    parser = JsonlParser("case1", "source1", config, file_hash="hash1", source_name="s.jsonl")
+    (event,) = list(parser.parse(path))
+
+    assert event.message == "caf�"
+    event.message.encode("utf-8")  # would raise on a surrogate
+
+
 def test_missing_file_hash_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "x.csv"
     path.write_text("datetime,message\n2024-01-01T00:00:00+00:00,Hello\n")

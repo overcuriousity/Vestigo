@@ -51,6 +51,55 @@ def test_to_dict_is_serializable() -> None:
     assert data["result"] == {"vectors_inserted": 42}
 
 
+def test_to_dict_snapshots_progress_and_result() -> None:
+    """to_dict must copy the mutable payloads, not alias them.
+
+    Job progress is mutated from worker threads while a request thread is
+    serializing the response; handing out the live dict lets the payload
+    change (or raise "dictionary changed size during iteration") mid-encode.
+    """
+    store = JobStore()
+    job = store.create("embed", progress={"processed": 1})
+    store.update(job.id, result={"vectors_inserted": 1})
+
+    data = job.to_dict()
+    store.update(job.id, progress={"processed": 2}, result={"vectors_inserted": 2})
+
+    assert data["progress"] == {"processed": 1}
+    assert data["result"] == {"vectors_inserted": 1}
+
+
+def test_concurrent_progress_updates_do_not_tear_to_dict() -> None:
+    """Serializing a job while a worker updates it must not observe a torn dict."""
+    import json
+    import threading
+
+    store = JobStore()
+    job = store.create("embed")
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            for i in range(2000):
+                store.update(job.id, progress={f"k{i}": i})
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+        finally:
+            stop.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        while not stop.is_set():
+            json.dumps(job.to_dict())
+    except BaseException as exc:  # pragma: no cover - failure path
+        errors.append(exc)
+    thread.join()
+
+    assert not errors
+
+
 def test_terminal_jobs_evicted_beyond_cap_oldest_first() -> None:
     store = JobStore(max_terminal=5)
     jobs = [store.create("embed") for _ in range(10)]

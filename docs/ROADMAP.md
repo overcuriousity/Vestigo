@@ -17,7 +17,7 @@ with their issue numbers — triage notes and root-cause detail stay in the issu
 not here.
 
 **Priority order** (verified against the codebase 2026-07-26): the open defects come first
-(B1 is the only hard 500 in the tree, B2 causes duplicate imports). Phase 3 is complete, so
+(B2 causes duplicate imports). Phase 3 is complete, so
 the feature queue is led, roughly by payoff-per-effort, by
 A12 local transform tools (low friction, no design round needed),
 A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
@@ -27,17 +27,10 @@ round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up oppor
 
 ## Open defects (GitHub issues, triaged 2026-07-26)
 
-All ten open issues re-verified against `main` @ 9034609; every one still reproduces.
+All ten open issues re-verified against `main` @ 9034609; every one still reproduced.
 Grouped into batches that share a file/subsystem — work a batch as one change.
+B1, B3 and B4 shipped in session 103 (see `PROGRESS.md`).
 
-- [ ] **B1 — Large id filters 500 with ClickHouse `Field value too long`** ([#181]).
-  `annotated=`, `ids=` and tag include/exclude bind an unbounded event-id list as one
-  `Array(String)` parameter (`db/queries.py:547`, `:578`, `:613-618`, `:983`, `:986`);
-  past ~3,300 ids clickhouse-connect switches to a form body and Poco's
-  `http_max_field_value_size` rejects it. A case becomes progressively un-filterable as
-  tagging grows — agent bulk-tagging hits the cliff fast. Fix: clickhouse-connect
-  **external data** (temp table) for every large-list binder, not just `annotated`; plus
-  translate ClickHouse `code: 1000` into an actionable 4xx instead of a raw 500.
 - [ ] **B2 — Transfer progress + file-input batch** ([#184], [#183]). Import: `start()` in
   `ImportCaseDialog.tsx` sets `jobId` only in the `.then()`, so the button stays enabled
   for the whole multi-GB upload — this is the reported duplicate-import cause. Needs a
@@ -49,19 +42,6 @@ Grouped into batches that share a file/subsystem — work a batch as one change.
   bare `<input type="file">` sites (`ImportCaseDialog`, `timelines/UploadDialog`,
   `analysis/SigmaPanel`, `admin/AdminEnrichersPage`) — fix once as a `ui/` file-input
   primitive.
-- [ ] **B3 — Ingestion integrity batch** ([#156], [#161]). Byte offsets are computed as
-  `len(line.encode("utf-8"))` over text decoded with `errors="replace"`
-  (`ingestion/parser.py:54`, `:232`, `:332`), so after the first non-UTF-8 byte every
-  `byte_offset` is wrong and `content_hash` covers mangled text — the event-to-source-byte
-  invariant silently breaks on real-world logs. Track offsets over raw bytes. Same change:
-  replace the bare `assert` guarding the Parquet event-id identity invariant
-  (`ingestion/parquet_reader.py:194`, stripped under `-O`) with a descriptive raise, and
-  add `S101` to the ruff select list (per-file-ignore for `tests/`).
-- [ ] **B4 — Async/concurrency one-liners** ([#155], [#157]). Wrap the three sync Qdrant
-  calls in `asyncio.to_thread` like their ClickHouse neighbours
-  (`api/routers/cases.py:309`, `:311`, `:878`); snapshot `progress`/`result` under the lock
-  in `Job.to_dict()` (`core/jobs.py`) so worker-thread mutation can't race response
-  serialization.
 - [ ] **B5 — Docs/API hygiene** ([#160], [#159]). `.env.example` covers 23 of ~96
   `Settings` fields: keep it curated, add a header pointing at `core/config.py`, document
   the operationally-relevant gaps (`oidc_*`, `max_upload_bytes`, `login_backoff_*`,
@@ -75,13 +55,8 @@ Grouped into batches that share a file/subsystem — work a batch as one change.
   `setdefault` still inserts past the cap. Evict the earliest `locked_until` instead.
   Low priority: expensive to trigger and self-limiting.
 
-[#181]: https://github.com/overcuriousity/Vestigo/issues/181
 [#184]: https://github.com/overcuriousity/Vestigo/issues/184
 [#183]: https://github.com/overcuriousity/Vestigo/issues/183
-[#156]: https://github.com/overcuriousity/Vestigo/issues/156
-[#161]: https://github.com/overcuriousity/Vestigo/issues/161
-[#155]: https://github.com/overcuriousity/Vestigo/issues/155
-[#157]: https://github.com/overcuriousity/Vestigo/issues/157
 [#160]: https://github.com/overcuriousity/Vestigo/issues/160
 [#159]: https://github.com/overcuriousity/Vestigo/issues/159
 [#158]: https://github.com/overcuriousity/Vestigo/issues/158

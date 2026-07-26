@@ -138,8 +138,13 @@ src = ["src", "tests"]
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "S101"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# `assert` is the point of a test; S101 only guards production code, where a
+# stripped assertion (`python -O`) would silently drop an invariant check.
+"tests/**" = ["S101"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

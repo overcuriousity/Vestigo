@@ -35,15 +35,29 @@ class Job:
     # rest of the access model.
     case_id: str | None = None
     created_at: float = field(default_factory=time.time)
+    # Guards the two mutable payloads (`progress`, `result`) against the
+    # worker-thread-writes / request-thread-serializes race. Held by
+    # ``JobStore.update`` around the mutation and by ``to_dict`` around the
+    # snapshot; always taken *inside* the store lock, never the other way.
+    _payload_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a serializable representation."""
+        """Return a serializable representation.
+
+        ``progress`` and ``result`` are snapshotted under the payload lock:
+        jobs are updated from FastAPI's threadpool while the polling request
+        serializes them, so handing out the live dicts lets a response change
+        mid-encode (or raise "dictionary changed size during iteration").
+        """
+        with self._payload_lock:
+            progress = dict(self.progress)
+            result = dict(self.result) if self.result is not None else None
         return {
             "id": self.id,
             "kind": self.kind,
             "status": self.status,
-            "progress": self.progress,
-            "result": self.result,
+            "progress": progress,
+            "result": result,
             "error": self.error,
             "case_id": self.case_id,
             "created_at": self.created_at,
@@ -176,10 +190,12 @@ class JobStore:
                 if status in _TERMINAL_STATUSES and not was_terminal:
                     self._terminal_order.append(job_id)
                     self._evict_locked()
-            if progress is not None:
-                job.progress.update(progress)
-            if result is not None:
-                job.result = result
+            if progress is not None or result is not None:
+                with job._payload_lock:  # noqa: SLF001 - same-module dataclass
+                    if progress is not None:
+                        job.progress.update(progress)
+                    if result is not None:
+                        job.result = result
             if error is not None:
                 job.error = error
             return job

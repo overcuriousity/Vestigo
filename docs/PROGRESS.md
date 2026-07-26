@@ -1,9 +1,62 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 102 — W7 second-pass review remediation).
+Last updated: 2026-07-26 (session 103 — backend defect batch B1/B3/B4).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 103 — 2026-07-26: backend defect batch (B1, B3, B4)
+
+**Why.** The three backend items from the triaged defect backlog, worked as one
+change: they share no files but do share a release. B1 was the only hard 500 in
+the tree.
+
+- **B1 — large id filters no longer 500 ([#181]).** Any filter resolving to a big
+  Postgres-side event_id list (`annotated=`, `ids=`, tag include/exclude) bound the
+  whole list as one `Array(String)` parameter. clickhouse-connect form-encodes bind
+  params past 4 KiB, and ClickHouse's Poco form parser caps a single field value at
+  128 KiB, so the query died at ~3,300 ids with `code: 1000 … Field value too long` —
+  a case became progressively un-filterable as tagging grew. Membership lists past
+  `EXTERNAL_LIST_THRESHOLD` (512) now ship as **external data** (a multipart file part,
+  1 GiB ceiling) and filter with `IN (SELECT * FROM …)`, which also builds a hash set
+  instead of scanning a constant array per row. Applied to every large-list binder —
+  `add_in_list`, `add_not_in_list`, the unified tag predicate's id half, exact
+  field filters/exclusions, and the template-hash `NOT IN` — not just the reported one.
+  External tables travel *with* their parameters (`QueryParameters` carries them,
+  `_with_params` copies them, `_select` forwards them), because a WHERE clause that
+  names a table is unexecutable without it. Whatever still overflows now raises
+  `QueryRequestTooLargeError` and the app answers **413** with an actionable message
+  instead of a raw ClickHouse 500.
+- **B3 — byte offsets survive non-UTF-8 input ([#156], [#161]).** Offsets were measured
+  as `len(line.encode("utf-8"))` over text decoded with `errors="replace"`; U+FFFD
+  re-encodes to three bytes, so every `byte_offset` after the first bad byte was wrong
+  and the event-to-source-byte invariant silently broke on real-world logs. Files are
+  now decoded with `errors="surrogateescape"` and measured by re-encoding (exact
+  original bytes), with the text handed on re-decoded via `replace` so payloads keep
+  the same U+FFFD substitution and never carry lone surrogates into JSON/ClickHouse.
+  Note: `content_hash` still covers the decoded text, so event ids for files with
+  invalid UTF-8 change — they were derived from a wrong offset before. Also replaced
+  the bare `assert` guarding the Parquet event-id identity invariant with a descriptive
+  `ValueError` (`python -O` strips asserts, which would turn a broken identity into
+  silent corruption) and added `S101` to the ruff select list, ignored under `tests/`.
+- **B4 — async/concurrency one-liners ([#155], [#157]).** The three synchronous Qdrant
+  deletes in the case/source cascade now run in `asyncio.to_thread` like the ClickHouse
+  deletes beside them. `Job.to_dict()` snapshots `progress`/`result` under a new
+  per-job payload lock (taken inside the store lock), so a worker thread updating
+  progress can't change — or tear — a response mid-encode.
+
+Verified: `uv run pytest` 1822 passed (3 pre-existing failures from the `embeddings`
+extra not being installed in this environment, unchanged from `main`), `ruff check`
+clean. B1 verified end-to-end against live ClickHouse per `/verify` on a 20 000-event
+case with all events tagged: pre-fix `GET …/events?annotated=tag` → HTTP 500 with the
+exact `code: 1000 / HTML Form Exception: Field value too long` from the issue; post-fix
+→ 200 with `total: 20000`, and `histogram`/`events/count` likewise 200.
+
+[#181]: https://github.com/overcuriousity/Vestigo/issues/181
+[#156]: https://github.com/overcuriousity/Vestigo/issues/156
+[#161]: https://github.com/overcuriousity/Vestigo/issues/161
+[#155]: https://github.com/overcuriousity/Vestigo/issues/155
+[#157]: https://github.com/overcuriousity/Vestigo/issues/157
 
 ## Session 102 — 2026-07-26: W7 second-pass review remediation
 
