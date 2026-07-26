@@ -32,6 +32,7 @@ function renderCard(onApply = vi.fn()) {
       <TooltipProvider>
         <FindingCard
           caseId={CASE}
+          timelineId="t1"
           title="Suspicious PowerShell"
           description="looks odd"
           spec={SPEC}

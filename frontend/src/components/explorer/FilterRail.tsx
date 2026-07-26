@@ -4,6 +4,9 @@ import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, 
 import { Input } from "@/components/ui/Input";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
+import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
+import { viewsApi } from "@/api/views";
+import { filtersToViewPayload } from "@/lib/queryParams";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
@@ -650,11 +653,33 @@ export function FilterRail({
       </div>
       </div>
 
-      {/* Save current view */}
-      <div className="border-t border-[var(--color-border)] p-2.5 shrink-0">
+      {/* Save current view / push it into a story */}
+      <div className="space-y-2 border-t border-[var(--color-border)] p-2.5 shrink-0">
         <Button variant="outline" size="sm" className="w-full" onClick={onSaveView}>
           <BookmarkCheck size={13} /> Save Current View
         </Button>
+        {/* Embeds must reference a persisted View, so pushing live filter
+            state saves one named after the story it lands in. */}
+        <AddToStoryButton
+          caseId={caseId}
+          className="w-full"
+          resolveContent={async (story) => {
+            const view = await viewsApi.create(
+              caseId,
+              `${story.title} — view`,
+              filters.q ?? "",
+              filtersToViewPayload(filters),
+            );
+            return {
+              kind: "view_ref",
+              content: {
+                view_id: view.id,
+                timeline_id: timelineId,
+                display: { limit: 200 },
+              },
+            };
+          }}
+        />
       </div>
     </aside>
   );

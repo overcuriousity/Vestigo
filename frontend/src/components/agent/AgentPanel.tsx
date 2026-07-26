@@ -912,6 +912,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
               <FindingCard
                 key={i}
                 caseId={caseId}
+                timelineId={timelineId}
                 title={item.title}
                 description={item.description}
                 spec={item.spec}

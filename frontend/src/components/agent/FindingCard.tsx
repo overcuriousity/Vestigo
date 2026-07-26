@@ -10,12 +10,16 @@ import { ArrowRight, Bookmark, Lightbulb } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
+import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
+import { viewsApi } from "@/api/views";
+import { filtersToViewPayload } from "@/lib/queryParams";
 import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
 import type { EventFilters } from "@/api/types";
 import { Markdown } from "./Markdown";
 
 interface Props {
   caseId: string;
+  timelineId: string;
   title: string;
   description: string;
   spec: AgentFilterSpec;
@@ -47,7 +51,15 @@ function specChips(spec: AgentFilterSpec): string[] {
   return chips;
 }
 
-export function FindingCard({ caseId, title, description, spec, total, onApply }: Props) {
+export function FindingCard({
+  caseId,
+  timelineId,
+  title,
+  description,
+  spec,
+  total,
+  onApply,
+}: Props) {
   const [saveOpen, setSaveOpen] = useState(false);
   const filters = useMemo(() => specToEventFilters(spec), [spec]);
   return (
@@ -91,6 +103,30 @@ export function FindingCard({ caseId, title, description, spec, total, onApply }
               <Bookmark size={12} />
             </Button>
           </Tooltip>
+          {/* A finding is a filter set, so pushing it into a story saves a
+              View first — embeds always reference persisted objects. */}
+          <AddToStoryButton
+            caseId={caseId}
+            iconOnly
+            className="h-6 px-1.5"
+            label="Add this finding to a story"
+            resolveContent={async (story) => {
+              const view = await viewsApi.create(
+                caseId,
+                `${story.title} — ${title}`,
+                filters.q ?? "",
+                filtersToViewPayload(filters),
+              );
+              return {
+                kind: "view_ref",
+                content: {
+                  view_id: view.id,
+                  timeline_id: timelineId,
+                  display: { limit: 200 },
+                },
+              };
+            }}
+          />
           <Button variant="accent" size="sm" onClick={() => onApply(filters)}>
             Apply to Explorer
             <ArrowRight size={12} />
