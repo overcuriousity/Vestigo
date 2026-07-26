@@ -83,8 +83,13 @@ async def test_chart_block_freezes_execution_result(store):
     case, story, blocks = await _case_with_story(
         store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]
     )
+    # The real stored shape: the frontend's camelCase ChartConfig, verbatim.
     await store.create_saved_chart(
-        case.id, "t1", "ch1", "Top ports", {"v": 1, "chart_type": "bar", "field": "port"}
+        case.id,
+        "t1",
+        "ch1",
+        "Top ports",
+        {"v": 1, "chartType": "bar", "scale": "nominal", "field": "port", "options": {}},
     )
 
     async def fake_chart(scope, spec):
@@ -202,3 +207,95 @@ async def test_export_store_seal_once(store):
     assert got.html == "<html>"
     assert await store.delete_story_export("e1") is True
     assert await store.delete_story_export("e1") is False
+
+
+async def test_snapshot_coerces_non_json_query_values(store):
+    """ClickHouse hands back FixedString columns as raw bytes (content_hash,
+    file_hash, embedding_config_hash) and can carry datetimes — a snapshot is
+    stored *and hashed* as JSON, so those have to round-trip."""
+    import json
+
+    case, story, blocks = await _case_with_story(
+        store, [("event_ref", {"event_id": "e1", "source_id": "s1", "caption": None})]
+    )
+
+    def fake_event_query(query):
+        return EventPage(
+            total=1,
+            offset=0,
+            limit=1,
+            events=[
+                {
+                    "event_id": "e1",
+                    "message": "boom",
+                    "content_hash": b"70e7de49",
+                    "file_hash": b"\xff\xfe not utf-8",
+                    "ingest_time": datetime(2026, 7, 26, 12, 0, tzinfo=UTC),
+                }
+            ],
+        )
+
+    snapshot = await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        run_event_query=fake_event_query,
+        now=lambda: FROZEN_NOW,
+    )
+    event = snapshot["blocks"][0]["data"]["event"]
+    assert event["content_hash"] == "70e7de49"
+    assert event["file_hash"] == b"\xff\xfe not utf-8".hex()
+    assert event["ingest_time"] == "2026-07-26T12:00:00+00:00"
+    # The whole bundle must survive the exact serialization the hash uses.
+    assert canonical_hash(snapshot)
+    assert json.loads(json.dumps(snapshot)) == snapshot
+
+
+def test_stored_chart_config_translates_to_spec():
+    """`SavedChart.config` is the frontend's camelCase ChartConfig round-tripped
+    verbatim; the agent's ChartSpec is snake_case. Executing a saved chart
+    server-side crosses that boundary exactly once, here."""
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    spec = _stored_chart_to_spec(
+        {
+            "v": 1,
+            "chartType": "histogram",
+            "scale": "ratio",
+            "field": "duration",
+            "fieldY": None,
+            "fields": None,
+            "metric": "count",
+            "compare": {"mode": "custom", "filters": {"q": "ssh", "filters": {}}},
+            "options": {"bins": 20, "logScale": True, "showPoints": False},
+        }
+    )
+    assert spec.chart_type == "histogram"
+    assert spec.scale == "ratio"
+    assert spec.field == "duration"
+    assert spec.options.bins == 20
+    assert spec.options.log_scale is True
+    assert spec.compare.mode == "custom"
+    assert spec.compare.filters.q == "ssh"
+
+
+def test_stored_chart_config_minimal_and_compare_off():
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    spec = _stored_chart_to_spec(
+        {
+            "v": 1,
+            "chartType": "time",
+            "scale": "nominal",
+            "metric": "count",
+            "field": None,
+            "fieldY": None,
+            "fields": None,
+            "compare": {"mode": "off"},
+            "options": {},
+        }
+    )
+    assert spec.chart_type == "time"
+    assert spec.field is None
+    assert spec.compare.mode == "off"

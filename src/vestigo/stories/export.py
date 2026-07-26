@@ -17,8 +17,10 @@ tests; production callers pass none of them.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from fastapi.concurrency import run_in_threadpool
@@ -27,17 +29,54 @@ if TYPE_CHECKING:
     from vestigo.db.postgres import Story, StoryBlock, User, View
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce a resolved payload into JSON-round-trippable types.
+
+    Query results are not JSON to begin with: ClickHouse hands back
+    ``FixedString`` columns (``content_hash``, ``file_hash``,
+    ``embedding_config_hash``) as raw ``bytes``, and aggregations can carry
+    ``datetime``/``Decimal``. A snapshot is stored *and hashed* as JSON, so
+    anything that cannot round-trip has to be coerced here rather than
+    blowing up the export — or, worse, hashing a payload that later reads
+    back differently.
+    """
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return str(value)
+
+
 def _view_filter_to_spec(view: View):
-    """Map a stored ``View.view_filter`` payload onto the agent's FilterSpec.
+    """Map a stored ``View.view_filter`` payload onto the agent's FilterSpec."""
+    return _filter_payload_to_spec(view.view_filter or {})
+
+
+def _filter_payload_to_spec(payload: dict[str, Any]):
+    """Map a stored Explorer filter payload onto the agent's FilterSpec.
 
     The payload is ``filtersToViewPayload``'s shape
-    (``frontend/src/lib/queryParams.ts``); FilterSpec is the same Explorer
+    (``frontend/src/lib/queryParams.ts``) — used both by a saved View and by a
+    saved chart's custom comparison layer. FilterSpec is the same Explorer
     filter vocabulary, so this is a key rename plus dropping the empties
     (FilterSpec rejects explicit empty selections as select-nothing traps).
     """
     from vestigo.agent.tools import FilterSpec
 
-    p = view.view_filter or {}
+    p = payload or {}
 
     def _list(key: str) -> list[str] | None:
         values = p.get(key) or None
@@ -82,6 +121,71 @@ def _view_filter_to_spec(view: View):
     )
 
 
+#: Stored ``ChartConfig`` key → ``ChartSpec`` field. The two describe the same
+#: chart field for field; only the casing differs (the frontend serializes its
+#: own camelCase config, the agent tool takes snake_case). Explicit rather than
+#: a generic camel→snake pass so an added key has to be considered here.
+_CHART_CONFIG_KEYS = {
+    "chartType": "chart_type",
+    "scale": "scale",
+    "field": "field",
+    "fieldY": "field_y",
+    "fields": "fields",
+    "metric": "metric",
+}
+
+_CHART_OPTION_KEYS = {
+    "orientation": "orientation",
+    "sort": "sort",
+    "logScale": "log_scale",
+    "seriesMode": "series_mode",
+    "legend": "legend",
+    "topN": "top_n",
+    "bins": "bins",
+    "showDensity": "show_density",
+    "buckets": "buckets",
+    "limitX": "limit_x",
+    "limitY": "limit_y",
+    "sampleLimit": "sample_limit",
+    "groups": "groups",
+    "showPoints": "show_points",
+}
+
+
+def _stored_chart_to_spec(config: dict[str, Any]):
+    """Translate a saved chart's stored config into an executable ChartSpec.
+
+    ``SavedChart.config`` is the frontend's own ``ChartConfig`` round-tripped
+    verbatim (the backend never interprets it), so executing one server-side
+    means crossing the casing boundary exactly once — here.
+    """
+    from vestigo.agent.tools import ChartSpec
+
+    spec: dict[str, Any] = {}
+    for stored_key, spec_key in _CHART_CONFIG_KEYS.items():
+        value = config.get(stored_key)
+        if value is not None:
+            spec[spec_key] = value
+
+    options = config.get("options") or {}
+    spec_options = {
+        spec_key: options[stored_key]
+        for stored_key, spec_key in _CHART_OPTION_KEYS.items()
+        if options.get(stored_key) is not None
+    }
+    if spec_options:
+        spec["options"] = spec_options
+
+    compare = config.get("compare") or {}
+    mode = compare.get("mode", "off")
+    if mode != "off":
+        spec["compare"] = {"mode": mode}
+        if mode == "custom":
+            spec["compare"]["filters"] = _filter_payload_to_spec(compare.get("filters") or {})
+
+    return ChartSpec.model_validate(spec)
+
+
 async def resolve_story_snapshot(
     story: Story,
     blocks: list[StoryBlock],
@@ -97,7 +201,7 @@ async def resolve_story_snapshot(
 
     Never raises for a bad block — failures freeze as ``resolution.error``.
     """
-    from vestigo.agent.tools import AgentScope, ChartSpec, _build_query
+    from vestigo.agent.tools import AgentScope, _build_query
 
     if store is None:
         from vestigo.api.deps import get_store
@@ -196,7 +300,7 @@ async def resolve_story_snapshot(
                 f"saved chart {content['chart_id']!r} not found (deleted before export)"
             )
         try:
-            spec = ChartSpec.model_validate(chart.config or {})
+            spec = _stored_chart_to_spec(chart.config or {})
         except Exception as exc:
             raise ValueError(
                 f"saved chart config (v={((chart.config or {}).get('v'))}) "
@@ -263,14 +367,18 @@ async def resolve_story_snapshot(
             }
         )
 
-    return {
-        "v": 1,
-        "story": {
-            "id": story.id,
-            "title": story.title,
-            "case_id": story.case_id,
-            "exported_at": now().isoformat(),
-            "exported_by": user.username,
-        },
-        "blocks": frozen_blocks,
-    }
+    # Hash and storage both happen over JSON, so normalize once, at the end,
+    # rather than trusting every query path to hand back JSON-native types.
+    return _json_safe(
+        {
+            "v": 1,
+            "story": {
+                "id": story.id,
+                "title": story.title,
+                "case_id": story.case_id,
+                "exported_at": now().isoformat(),
+                "exported_by": user.username,
+            },
+            "blocks": frozen_blocks,
+        }
+    )
