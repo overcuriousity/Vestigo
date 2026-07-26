@@ -17,8 +17,9 @@ tests; production callers pass none of them.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from fastapi.concurrency import run_in_threadpool
 
