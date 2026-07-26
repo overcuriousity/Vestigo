@@ -2077,3 +2077,56 @@ def test_populated_and_absent_filters_still_validate():
 
     assert FilterSpec().filters == {}
     assert FilterSpec(filters={"src_ip": ["203.0.113.1"]}).filters == {"src_ip": ["203.0.113.1"]}
+
+
+# ---------------------------------------------------------------------------
+# Stories read tools (W7)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_stories_scoped_to_case(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_case("c2", "Case Two")
+    s1 = await store.create_story("c1", "s1", "Ours", "notes", user="alice")
+    await store.create_story_block(s1.id, "b1", "markdown", {"text": "x"}, user="alice")
+    await store.create_story("c2", "s2", "Foreign", None, user="bob")
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "list_stories")
+    rows = _rows(payload["stories"])
+    assert payload["total"] == 1
+    assert rows[0]["id"] == "s1"
+    assert rows[0]["title"] == "Ours"
+    assert rows[0]["block_count"] == 1
+
+
+async def test_read_story_returns_ordered_blocks(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "first"}, user="alice")
+    await store.create_story_block(
+        story.id,
+        "b2",
+        "view_ref",
+        {"view_id": "v1", "timeline_id": "t1", "display": {"limit": 200, "columns": None}},
+        user="alice",
+    )
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    assert payload["story"]["title"] == "Report"
+    kinds = [b["kind"] for b in payload["blocks"]]
+    assert kinds == ["markdown", "view_ref"]
+    assert payload["blocks"][0]["content"]["text"] == "first"
+    # Embed blocks carry their reference, not inline data.
+    assert payload["blocks"][1]["content"]["view_id"] == "v1"
+
+
+async def test_read_story_unknown_id(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "ghost"})
+    assert "not found" in payload["error"]

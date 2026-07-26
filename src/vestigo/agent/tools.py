@@ -181,6 +181,8 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         embeddings_gated=True,
     ),
     ToolInfo("list_baselines", "List saved baseline definitions (range + suspect windows)."),
+    ToolInfo("list_stories", "List this case's stories (the analyst's report documents)."),
+    ToolInfo("read_story", "Read a story's ordered blocks — markdown text and embed references."),
     ToolInfo("list_dispositions", "List analyst verdicts on anomaly findings."),
     ToolInfo("list_saved_views", "List the analyst's saved filter views for this case."),
     ToolInfo("list_annotations", "List annotations across this timeline's sources."),
@@ -1767,6 +1769,69 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             ],
             len(rows),
         )
+
+    @server.tool()
+    async def list_stories() -> dict[str, Any]:
+        """List this case's stories — the analyst's report documents.
+
+        Read one with read_story. Stories collect markdown narrative plus
+        embedded views/charts/events; they are where the investigation's
+        conclusions live.
+        """
+        from vestigo.api.deps import get_store
+
+        store = get_store()
+        rows = await store.list_stories(scope.case_id)
+        listing = []
+        for s in rows:
+            blocks = await store.list_story_blocks(s.id)
+            listing.append(
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "description": _truncate(s.description, SLIM_MESSAGE_TRUNCATE),
+                    "block_count": len(blocks),
+                    "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+                    "updated_by": s.updated_by,
+                }
+            )
+        return _listing("stories", listing, len(rows))
+
+    @server.tool()
+    async def read_story(story_id: str) -> dict[str, Any]:
+        """Read a story's blocks in document order.
+
+        Markdown blocks carry their text (truncated at the usual cap); embed
+        blocks carry their reference — resolve a view/chart/event through the
+        matching read tools rather than expecting inline data here.
+        """
+        from vestigo.api.deps import get_store
+
+        store = get_store()
+        story = await store.get_story(scope.case_id, story_id)
+        if story is None:
+            return {"error": f"story {story_id!r} not found in this case"}
+        blocks = await store.list_story_blocks(story_id)
+        return {
+            "story": {
+                "id": story.id,
+                "title": story.title,
+                "description": story.description,
+            },
+            "blocks": [
+                {
+                    "id": b.id,
+                    "kind": b.kind,
+                    "origin": b.origin,
+                    "content": (
+                        {"text": _truncate(b.content.get("text", ""), ATTR_VALUE_TRUNCATE * 8)}
+                        if b.kind == "markdown"
+                        else b.content
+                    ),
+                }
+                for b in blocks
+            ],
+        }
 
     @server.tool()
     async def list_dispositions(
