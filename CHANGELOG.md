@@ -19,34 +19,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slip through before the button re-renders as disabled. The export dialog got
   the same guard.
 
-### Added
-
-- **Real progress for case export and import** ([#183]). Both transfer dialogs
-  now show what the server is doing — "Verifying archive integrity", "Packing
+- **Case export and import report progress** ([#183]). Both transfer dialogs
+  polled the job and rendered nothing from it, and the download had no feedback
+  at all, so a multi-GB transfer was indistinguishable from a hang. They now
+  show what the server is doing — "Verifying archive integrity", "Packing
   events", "Restoring original source files" — with a percentage for the phases
   that process many items, plus byte progress with throughput and a time
-  estimate for the upload and the download themselves. Previously a multi-GB
-  transfer was indistinguishable from a hang. An import upload can be cancelled
-  while it is in flight; because the server creates the job only after the whole
-  archive has landed, cancelling leaves no job and no partially restored case.
-  An import that is still running is now also tracked in the job tray, so
-  closing the dialog no longer hides it.
+  estimate for the upload and the download themselves. An import upload can be
+  cancelled while it is in flight; because the server creates the job only after
+  the whole archive has landed, cancelling leaves no job and no partially
+  restored case. A running import is also tracked in the job tray, so closing
+  the dialog no longer hides it.
 
-- **Visualize states the filters it inherits.** The page charts exactly what the
-  Explorer grid is showing, but said so only in the caption underneath the
+- **Re-selecting the same file after a failed case import works.** The import
+  dialog never cleared its file input, so picking the same archive again fired
+  no change event and the button looked dead. Fixed for every file picker in the
+  app (case import, source upload, Sigma rule upload, admin enricher assets),
+  which now share one implementation — that also means files dropped onto the
+  source-upload zone are checked against the accepted extensions, as they always
+  were when picked through the file dialog.
+
+- **The Visualize page states the filters it inherits.** It charts exactly what
+  the Explorer grid is showing, but said so only in the caption underneath the
   chart, so a chart of one narrow slice looked identical to a chart of the whole
   timeline — a real risk for a figure exported into a report. The active filters
   now appear above the chart as removable chips, with an explicit "No filters —
   charting the whole timeline" when there are none, a one-click way to clear
-  them, and a link back to the Explorer.
-
-### Changed
-
-- File pickers across the app (case import, source upload, Sigma rule upload,
-  admin enricher assets) share one implementation. Re-selecting the same file
-  after a failed case import now works — it previously did nothing — and files
-  dropped onto the source-upload zone are checked against the accepted
-  extensions, as they always were when picked through the file dialog.
+  them, and a link back to the Explorer. Removing an exclusion, tag or
+  time-range chip in the comparison-layer editor also works now; those chips
+  were inert.
 
 ## [1.8.1] — 2026-07-26
 
