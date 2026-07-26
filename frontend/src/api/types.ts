@@ -247,8 +247,23 @@ export interface Job {
   status: "queued" | "running" | "completed" | "failed";
   progress:
     | {
-        total: number;
-        processed: number;
+        /** Unit-count progress. Optional: a job may publish only a `phase`
+         * before it knows how many items the phase covers. */
+        total?: number;
+        processed?: number;
+        /** Coarse stage within a multi-stage job. Vocabulary is per `kind`:
+         * `case_export` → queued|postgres|events|blobs|manifest
+         * (transfer/exporter.py), `case_import` → queued|verify|postgres|
+         * events|blobs|stats (transfer/importer.py). The same token means
+         * opposite directions in the two, so always resolve copy through
+         * `lib/jobPhases.ts` keyed on `kind`. */
+        phase?: string;
+        /** Size of the received archive (`case_import` only, set at job
+         * creation). Note `JobStore.update` *merges* progress dicts
+         * (core/jobs.py), so this survives every later phase write. */
+        bytes?: number;
+        /** Total archive bytes (`case_export`, emitted on completion). */
+        bytes_total?: number;
         /** Kalman-filtered throughput/ETA (bytes ingest jobs only; see
          * core/eta.py). Absent for embed jobs and before the second batch. */
         rate_bps?: number | null;

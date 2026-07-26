@@ -7,6 +7,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { jobsApi } from "@/api/jobs";
 import { useJobsStore, type TrackedJob } from "@/stores/jobs";
 import { JobStatusRow } from "@/components/ui/JobStatusRow";
+import { jobPhaseLabel } from "@/lib/jobPhases";
 
 function JobRow({ job }: { job: TrackedJob }) {
   const { updateJob, dismiss } = useJobsStore();
@@ -44,6 +45,7 @@ function JobRow({ job }: { job: TrackedJob }) {
       status={job.status}
       progress={job.progress}
       error={job.error}
+      detail={jobPhaseLabel(job.kind, job.progress)}
       className="w-72"
       onDismiss={isTerminal ? () => dismiss(job.id) : undefined}
     />

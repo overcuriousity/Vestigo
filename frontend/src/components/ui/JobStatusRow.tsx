@@ -14,15 +14,28 @@ interface Props {
   status: Job["status"];
   progress: Job["progress"];
   error: string | null;
+  /** Resolved human phase copy (see `lib/jobPhases.ts`), shown after the
+   * status word. This row stays presentational — callers resolve the text. */
+  detail?: string | null;
   onDismiss?: () => void;
   className?: string;
 }
 
-export function JobStatusRow({ label, status, progress, error, onDismiss, className }: Props) {
+export function JobStatusRow({
+  label,
+  status,
+  progress,
+  error,
+  detail,
+  onDismiss,
+  className,
+}: Props) {
   const isTerminal = status === "completed" || status === "failed";
 
   const pct =
-    progress && progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : null;
+    progress?.total != null && progress.total > 0 && progress.processed != null
+      ? Math.round((progress.processed / progress.total) * 100)
+      : null;
 
   const rate = progress?.rate_bps;
   const etaS = progress?.eta_s;
@@ -53,8 +66,11 @@ export function JobStatusRow({ label, status, progress, error, onDismiss, classN
       <div className="mt-0.5">{icon}</div>
       <div className="flex-1 min-w-0">
         <div className="truncate font-medium text-[var(--color-fg-primary)]">{label}</div>
-        <div className="text-[var(--color-fg-muted)] capitalize">
-          {status}
+        <div className="text-[var(--color-fg-muted)]">
+          {/* `capitalize` stays scoped to the status word — it would title-case
+              every word of the phase copy otherwise. */}
+          <span className="capitalize">{status}</span>
+          {detail && ` · ${detail}`}
           {pct != null && ` · ${pct}%`}
         </div>
         {pct != null && status !== "failed" && <Progress value={pct} className="mt-1.5" />}
