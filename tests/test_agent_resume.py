@@ -10,6 +10,7 @@ pairing invariant `agent/window.py` relies on.
 
 from __future__ import annotations
 
+import pytest
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -193,3 +194,197 @@ def test_a_repaired_snapshot_survives_the_sliding_window():
     )
     windowed, _stats = apply_window(repaired, budget=200)
     assert _unpaired(windowed) == set()
+
+
+# ---------------------------------------------------------------------------
+# stream_turn checkpointing
+# ---------------------------------------------------------------------------
+
+from vestigo.agent.tools import AgentScope  # noqa: E402
+
+
+def _scope() -> AgentScope:
+    return AgentScope(
+        case_id="c1",
+        timeline_id="t1",
+        user=None,  # unused by the stubbed tool server
+        source_ids=["s1"],
+        field_mappings=None,
+        source_offsets=None,
+    )
+
+
+def _ping_stub():
+    """A minimal FastMCP server with one echo tool, shared by the tests below."""
+    from mcp.server.fastmcp import FastMCP
+
+    stub = FastMCP("stub")
+
+    @stub.tool()
+    async def ping(word: str) -> dict:
+        """Echo."""
+        return {"echo": word}
+
+    return stub
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_checkpoints_after_each_tool_result(monkeypatch):
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: _ping_stub())
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        last = messages[-1]
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in last.parts):
+            yield "done"
+        else:
+            yield {0: DeltaToolCall(name="ping", json_args='{"word": "hi"}')}
+
+    recorder = runtime.TurnRecorder()
+    seen: list[dict] = []
+    async for event in runtime.stream_turn(
+        _scope(),
+        user_text="ping please",
+        history=[],
+        recorder=recorder,
+        model=FunctionModel(stream_function=model_stream),
+    ):
+        seen.append(event)
+        # The snapshot is replay-safe at every single checkpoint, not just the
+        # last one — a hard kill lands on an arbitrary checkpoint.
+        if event["type"] == "checkpoint":
+            assert _unpaired(recorder.messages) == set()
+
+    types = [e["type"] for e in seen]
+    assert "checkpoint" in types
+    assert types.index("checkpoint") > types.index("tool_result")
+    assert recorder.revision >= 2
+    assert recorder.messages, "the recorder must hold the turn's messages"
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_still_maps_events_and_returns_a_result(monkeypatch):
+    """The rewrite onto agent.iter must not change the event contract the
+    router and the frontend consume."""
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: _ping_stub())
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        last = messages[-1]
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in last.parts):
+            yield "the echo "
+            yield "came back"
+        else:
+            yield {0: DeltaToolCall(name="ping", json_args='{"word": "hi"}')}
+
+    seen = []
+    async for event in runtime.stream_turn(
+        _scope(),
+        user_text="ping please",
+        history=[],
+        view_filters={"q": "ssh"},
+        model=FunctionModel(stream_function=model_stream),
+    ):
+        seen.append(event)
+
+    types = [e["type"] for e in seen]
+    assert types[-1] == "result"
+    assert "tool_call" in types and "tool_result" in types
+    streamed = "".join(e["text"] for e in seen if e["type"] == "text_delta")
+    assert streamed == "the echo came back"
+    turn = seen[-1]["turn"]
+    assert turn.output_text == "the echo came back"
+    assert turn.new_messages
+
+
+@pytest.mark.asyncio
+async def test_recorder_survives_a_turn_that_dies_mid_stream(monkeypatch):
+    """The reported failure: the model endpoint dies partway through. The
+    recorder must still hold a replayable snapshot of what ran."""
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: _ping_stub())
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        last = messages[-1]
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in last.parts):
+            raise RuntimeError("endpoint died")
+        yield {0: DeltaToolCall(name="ping", json_args='{"word": "hi"}')}
+
+    recorder = runtime.TurnRecorder()
+    with pytest.raises(RuntimeError):
+        async for _event in runtime.stream_turn(
+            _scope(),
+            user_text="ping please",
+            history=[],
+            recorder=recorder,
+            model=FunctionModel(stream_function=model_stream),
+        ):
+            pass
+
+    assert recorder.messages, "the tool call and its result must survive"
+    assert _unpaired(recorder.messages) == set()
+    assert _returns(recorder.messages)  # the echo result is on the record
+
+
+@pytest.mark.asyncio
+async def test_a_checkpointed_snapshot_replays_as_history(monkeypatch):
+    """End to end: dump the interrupted snapshot the way the router does, load
+    it back, and run a second turn on top of it."""
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: _ping_stub())
+
+    async def dying(messages: list[ModelMessage], info: AgentInfo):
+        last = messages[-1]
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in last.parts):
+            raise RuntimeError("endpoint died")
+        yield {0: DeltaToolCall(name="ping", json_args='{"word": "hi"}')}
+
+    recorder = runtime.TurnRecorder()
+    with pytest.raises(RuntimeError):
+        async for _event in runtime.stream_turn(
+            _scope(),
+            user_text="ping please",
+            history=[],
+            recorder=recorder,
+            model=FunctionModel(stream_function=dying),
+        ):
+            pass
+
+    stored = runtime.dump_history(recorder.messages)
+    resumed = runtime.load_history(stored)
+    assert resumed, "the blob round-trips"
+
+    seen_history: list[int] = []
+
+    async def second(messages: list[ModelMessage], info: AgentInfo):
+        seen_history.append(len(messages))
+        yield "continuing"
+
+    events = []
+    async for event in runtime.stream_turn(
+        _scope(),
+        user_text="carry on",
+        history=resumed,
+        model=FunctionModel(stream_function=second),
+    ):
+        events.append(event)
+
+    assert events[-1]["type"] == "result"
+    # The second turn saw the first turn's work, not an empty slate.
+    assert seen_history[0] > 1

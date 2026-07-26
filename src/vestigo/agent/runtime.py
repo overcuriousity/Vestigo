@@ -25,12 +25,12 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 from fastmcp.client import Client as FastMCPClient
-from pydantic_ai import Agent, AgentRunResultEvent
+from pydantic_ai import Agent
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import (
@@ -57,6 +57,7 @@ from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
 from vestigo.agent.config import AgentConfig, is_kimi_coding_endpoint, resolve_agent_config
+from vestigo.agent.resume import repair_partial
 from vestigo.agent.tools import (
     RESULT_FORMAT_NOTE,
     SPEC_REFERENCE,
@@ -326,6 +327,20 @@ class TurnResult:
     completion_tokens: int | None = None
 
 
+@dataclass
+class TurnRecorder:
+    """Live, replay-safe snapshot of what one turn has produced so far.
+
+    Caller-owned, like ``WindowStats``: ``stream_turn`` fills it in as the turn
+    runs and the router persists it on every exit path, so an interrupted turn
+    keeps its work. ``revision`` counts checkpoints — useful in logs and tests,
+    and a cheap way for a caller to skip a redundant write.
+    """
+
+    messages: list[ModelMessage] = field(default_factory=list)
+    revision: int = 0
+
+
 def dump_history(messages: list[ModelMessage]) -> list[Any]:
     """Serialize pydantic-ai message history to JSON-safe data."""
     return json.loads(ModelMessagesTypeAdapter.dump_json(messages))
@@ -456,6 +471,52 @@ class _RequestGuardToolset(WrapperToolset):
         return result
 
 
+def _map_event(event: Any) -> dict[str, Any] | None:
+    """Map one pydantic-ai stream event to an SSE-ready dict, or None to skip."""
+    if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+        # A text part's first chunk arrives in the start event, not as a
+        # delta — dropping it clips the opening of every segment.
+        return {"type": "text_delta", "text": event.part.content} if event.part.content else None
+    if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+        return (
+            {"type": "text_delta", "text": event.delta.content_delta}
+            if event.delta.content_delta
+            else None
+        )
+    if isinstance(event, PartStartEvent) and isinstance(event.part, ThinkingPart):
+        return (
+            {"type": "thinking_delta", "text": event.part.content} if event.part.content else None
+        )
+    if isinstance(event, PartDeltaEvent) and isinstance(event.delta, ThinkingPartDelta):
+        return (
+            {"type": "thinking_delta", "text": event.delta.content_delta}
+            if event.delta.content_delta
+            else None
+        )
+    if isinstance(event, PartEndEvent) and isinstance(event.part, ThinkingPart):
+        # The end event carries the fully-assembled part, so each completed
+        # thinking segment (there can be several per turn, interleaved with
+        # tool calls) flushes without manual buffering. Signatures stay in the
+        # history blob only.
+        return {"type": "thinking", "text": event.part.content} if event.part.content else None
+    if isinstance(event, FunctionToolCallEvent):
+        return {
+            "type": "tool_call",
+            "tool_call_id": event.part.tool_call_id,
+            "tool": event.part.tool_name,
+            "args": event.part.args_as_dict(),
+        }
+    if isinstance(event, FunctionToolResultEvent):
+        content = event.part.content
+        return {
+            "type": "tool_result",
+            "tool_call_id": event.part.tool_call_id,
+            "tool": event.part.tool_name,
+            "result": content if isinstance(content, (dict, list)) else str(content),
+        }
+    return None
+
+
 async def stream_turn(
     scope: AgentScope,
     *,
@@ -466,6 +527,7 @@ async def stream_turn(
     window_budget: int | None = None,
     window_stats: WindowStats | None = None,
     chars_per_token: float = CHARS_PER_TOKEN_DEFAULT,
+    recorder: TurnRecorder | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding SSE-ready event dicts.
 
@@ -479,6 +541,12 @@ async def stream_turn(
     ``chars_per_token`` is the estimator's divisor — the default, or a ratio a
     previous overflow measured against the provider's own token count. Fixed
     for the whole turn, so every request reduces the same way.
+
+    ``recorder``, if given, is updated after every tool result and every
+    completed node with a replay-safe snapshot of the turn so far, and a
+    ``{"type": "checkpoint"}`` event is yielded alongside. The router persists
+    it, so a turn that is stopped, errors, or dies with the process keeps its
+    history instead of losing the whole turn.
     """
     config = await resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
@@ -533,65 +601,64 @@ async def stream_turn(
             f"({len(scope.source_ids)} sources). {_view_context(view_filters)}\n\n{user_text}"
         )
 
-        async with agent.run_stream_events(
-            context, message_history=history or None, usage_limits=limits
-        ) as stream:
-            async for event in stream:
-                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-                    # A text part's first chunk arrives in the start event, not as
-                    # a delta — dropping it clips the opening of every segment.
-                    if event.part.content:
-                        yield {"type": "text_delta", "text": event.part.content}
-                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                    if event.delta.content_delta:
-                        yield {"type": "text_delta", "text": event.delta.content_delta}
-                elif isinstance(event, PartStartEvent) and isinstance(event.part, ThinkingPart):
-                    if event.part.content:
-                        yield {"type": "thinking_delta", "text": event.part.content}
-                elif isinstance(event, PartDeltaEvent) and isinstance(
-                    event.delta, ThinkingPartDelta
-                ):
-                    if event.delta.content_delta:
-                        yield {"type": "thinking_delta", "text": event.delta.content_delta}
-                elif isinstance(event, PartEndEvent) and isinstance(event.part, ThinkingPart):
-                    # The end event carries the fully-assembled part, so each
-                    # completed thinking segment (there can be several per turn,
-                    # interleaved with tool calls) flushes without manual
-                    # buffering. Signatures stay in the history blob only.
-                    if event.part.content:
-                        yield {"type": "thinking", "text": event.part.content}
-                elif isinstance(event, FunctionToolCallEvent):
-                    yield {
-                        "type": "tool_call",
-                        "tool_call_id": event.part.tool_call_id,
-                        "tool": event.part.tool_name,
-                        "args": event.part.args_as_dict(),
-                    }
-                elif isinstance(event, FunctionToolResultEvent):
-                    content = event.part.content
-                    summary = content if isinstance(content, (dict, list)) else str(content)
-                    yield {
-                        "type": "tool_result",
-                        "tool_call_id": event.part.tool_call_id,
-                        "tool": event.part.tool_name,
-                        "result": summary,
-                    }
-                elif isinstance(event, AgentRunResultEvent):
-                    result = event.result
-                    # `AgentRunResult.usage` is a property in pydantic-ai 2.13.0
-                    # (not the callable `.usage()` some older docs/snippets show).
-                    usage = result.usage
-                    yield {
-                        "type": "result",
-                        "turn": TurnResult(
-                            output_text=str(result.output),
-                            new_messages=result.new_messages(),
-                            # 0 means the endpoint reported nothing — store NULL,
-                            # never a fake count.
-                            prompt_tokens=usage.input_tokens or None,
-                            completion_tokens=usage.output_tokens or None,
-                        ),
-                    }
+        track = recorder if recorder is not None else TurnRecorder()
+        called_ids: set[str] = set()
+        results: dict[str, Any] = {}
+
+        def checkpoint() -> dict[str, Any]:
+            track.messages = repair_partial(
+                run.new_messages(), called_ids=called_ids, results=results
+            )
+            track.revision += 1
+            return {"type": "checkpoint"}
+
+        async with agent.iter(context, message_history=history or None, usage_limits=limits) as run:
+            async for node in run:
+                # UserPromptNode and End carry no stream; everything the router
+                # forwards comes from the other two.
+                if not (Agent.is_model_request_node(node) or Agent.is_call_tools_node(node)):
+                    continue
+                # A ModelRequestNode that only decided *to* call a tool streams
+                # PartStartEvent/PartEndEvent for the ToolCallPart, both unmapped
+                # by _map_event — nothing forwarded yet, so there is nothing new
+                # to checkpoint. Gate the node-boundary checkpoint on the node
+                # having actually produced a mapped event, or a premature
+                # checkpoint lands before the tool_call/tool_result it precedes.
+                made_progress = False
+                async with node.stream(run.ctx) as stream:
+                    async for event in stream:
+                        mapped = _map_event(event)
+                        if mapped is None:
+                            continue
+                        made_progress = True
+                        if mapped["type"] == "tool_call":
+                            called_ids.add(mapped["tool_call_id"])
+                        yield mapped
+                        if mapped["type"] == "tool_result":
+                            # Checkpoint per tool result, not just per node: a
+                            # batch of four ClickHouse queries is seconds of
+                            # work a kill -9 must not erase.
+                            results[mapped["tool_call_id"]] = mapped["result"]
+                            yield checkpoint()
+                if made_progress:
+                    # Node boundary — the natural place the snapshot is whole.
+                    yield checkpoint()
+            result = run.result
+            if result is not None:
+                # `AgentRunResult.usage` is a property in pydantic-ai 2.13.0+
+                # (not the callable `.usage()` some older docs/snippets show).
+                usage = result.usage
+                yield {
+                    "type": "result",
+                    "turn": TurnResult(
+                        output_text=str(result.output),
+                        new_messages=result.new_messages(),
+                        # 0 means the endpoint reported nothing — store NULL,
+                        # never a fake count.
+                        prompt_tokens=usage.input_tokens or None,
+                        completion_tokens=usage.output_tokens or None,
+                    ),
+                }
     finally:
         if http_client is not None:
             await http_client.aclose()
