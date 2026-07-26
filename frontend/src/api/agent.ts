@@ -271,6 +271,11 @@ export interface AgentConversation {
    * process state, not a column. Lets a reopened panel show a working Stop
    * instead of an input that silently 409s. */
   active?: boolean;
+  /** Set while the replayable history blob is a mid-turn checkpoint rather than
+   * a completed turn — a stopped, errored or process-killed turn. Cleared when
+   * the next turn completes. The next turn resumes from that snapshot, so this
+   * says "the model is continuing an interrupted turn", not "data was lost". */
+  history_partial_at: string | null;
   created_at: string | null;
   updated_at: string | null;
 }

@@ -3,8 +3,8 @@
 `AgentRun.new_messages()` mid-run can end with tool calls that have no
 returns (pydantic-ai assembles the returns `ModelRequest` only after a whole
 batch finishes) and, when a model stream dies, with a partial `ModelResponse`
-whose trailing `ToolCallPart` carries half-written JSON arguments. Replaying
-either shape breaks providers on the Anthropic protocol and violates the
+whose trailing `ToolCallPart` carries half-written JSON arguments. Replaying an
+unpaired call breaks providers on the Anthropic protocol and violates the
 pairing invariant `agent/window.py` relies on.
 """
 
@@ -23,11 +23,16 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from vestigo.agent.resume import INTERRUPTED_RESULT, repair_partial
+from vestigo.agent.resume import INTERRUPTED_RESULT, RESUME_MARKER, repair_partial
 
 
 def _call(tool_call_id: str, name: str = "search_events") -> ToolCallPart:
     return ToolCallPart(tool_name=name, args={"q": "x"}, tool_call_id=tool_call_id)
+
+
+def _result(tool_call_id: str, content: object, name: str = "search_events") -> ToolReturnPart:
+    """A tool answer as `stream_turn` records it — the part, not its content."""
+    return ToolReturnPart(tool_name=name, content=content, tool_call_id=tool_call_id)
 
 
 def _returns(messages) -> dict[str, object]:
@@ -59,19 +64,17 @@ def _unpaired(messages) -> set[str]:
 
 
 def test_empty_snapshot_is_returned_unchanged():
-    assert repair_partial([], called_ids=set(), results={}) == []
+    assert repair_partial([], results={}) == []
 
 
 def test_complete_snapshot_is_returned_unchanged():
     messages = [
         ModelRequest(parts=[UserPromptPart(content="find it")]),
         ModelResponse(parts=[_call("a")]),
-        ModelRequest(
-            parts=[ToolReturnPart(tool_name="search_events", content={"n": 1}, tool_call_id="a")]
-        ),
+        ModelRequest(parts=[_result("a", {"n": 1})]),
         ModelResponse(parts=[TextPart(content="done")]),
     ]
-    repaired = repair_partial(messages, called_ids={"a"}, results={"a": {"n": 1}})
+    repaired = repair_partial(messages, results={"a": _result("a", {"n": 1})})
     assert repaired == messages
 
 
@@ -83,7 +86,7 @@ def test_unpaired_call_gets_its_streamed_result_back():
         ModelResponse(parts=[_call("a"), _call("b")]),
     ]
     repaired = repair_partial(
-        messages, called_ids={"a", "b"}, results={"a": {"hits": 3}, "b": {"hits": 4}}
+        messages, results={"a": _result("a", {"hits": 3}), "b": _result("b", {"hits": 4})}
     )
     assert _unpaired(repaired) == set()
     assert _returns(repaired) == {"a": {"hits": 3}, "b": {"hits": 4}}
@@ -94,8 +97,32 @@ def test_call_that_never_returned_gets_the_interrupted_marker():
         ModelRequest(parts=[UserPromptPart(content="find it")]),
         ModelResponse(parts=[_call("a"), _call("b")]),
     ]
-    repaired = repair_partial(messages, called_ids={"a", "b"}, results={"a": {"hits": 3}})
+    repaired = repair_partial(messages, results={"a": _result("a", {"hits": 3})})
     assert _returns(repaired) == {"a": {"hits": 3}, "b": INTERRUPTED_RESULT}
+    # The prose note is for the model; `outcome` is for a machine reading an
+    # export, which must be able to tell a synthesized answer from a real one.
+    synthesized = {
+        part.tool_call_id: part.outcome
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    }
+    assert synthesized == {"a": "success", "b": "interrupted"}
+
+
+def test_a_synthesized_request_is_marked_interrupted():
+    """pydantic-ai reads `state` on a trailing request to decide that the
+    preceding response's open calls will never be executed."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="find it")]),
+        ModelResponse(parts=[_call("a")]),
+    ]
+    repaired = repair_partial(messages, results={})
+    assert [m.state for m in repaired if isinstance(m, ModelRequest)] == [
+        "complete",
+        "interrupted",
+    ]
 
 
 def test_a_retry_prompt_counts_as_answering_a_call():
@@ -108,55 +135,98 @@ def test_a_retry_prompt_counts_as_answering_a_call():
             parts=[RetryPromptPart(content="bad args", tool_name="search_events", tool_call_id="a")]
         ),
     ]
-    repaired = repair_partial(messages, called_ids={"a"}, results={})
+    repaired = repair_partial(messages, results={})
     # No second answer synthesized; only the trailing marker response closing
     # the request/response pair (see test_a_repaired_snapshot_ends_in_a_response).
     assert repaired[:3] == messages
     assert _returns(repaired) == {}
 
 
-def test_tool_call_that_never_executed_is_dropped():
-    """A model stream that dies mid-response leaves a ToolCallPart whose JSON
-    arguments may be truncated. It never reached the tool executor, so no
-    FunctionToolCallEvent was seen for it — drop it rather than replay it."""
+def test_a_rejected_call_is_replayed_as_a_retry_not_a_return():
+    """`FunctionToolResultEvent.part` is a RetryPromptPart when the call was
+    rejected. Rebuilding it as a ToolReturnPart would replay a rejection as a
+    successful result and put the retry's error text where a tool's output
+    belongs."""
+    retry = RetryPromptPart(content="bad args", tool_name="search_events", tool_call_id="a")
     messages = [
         ModelRequest(parts=[UserPromptPart(content="find it")]),
-        ModelResponse(parts=[TextPart(content="let me look"), _call("ghost")]),
+        ModelResponse(parts=[_call("a")]),
     ]
-    repaired = repair_partial(messages, called_ids=set(), results={})
+    repaired = repair_partial(messages, results={"a": retry})
     assert _unpaired(repaired) == set()
-    assert repaired[-1].parts == [TextPart(content="let me look")]
-
-
-def test_response_left_with_no_parts_is_dropped_entirely():
-    messages = [
-        ModelRequest(parts=[UserPromptPart(content="find it")]),
-        ModelResponse(parts=[_call("ghost")]),
-    ]
-    repaired = repair_partial(messages, called_ids=set(), results={})
-    assert isinstance(repaired[0], ModelRequest)
-    assert not any(isinstance(p, ToolCallPart) for m in repaired[1:] for p in m.parts)
-
-
-def test_only_the_trailing_response_is_pruned():
-    """An earlier response's calls did execute — a missing call id there means
-    our bookkeeping lost it, not that the call is a phantom. Pruning it would
-    silently delete real investigation steps."""
-    messages = [
-        ModelRequest(parts=[UserPromptPart(content="find it")]),
-        ModelResponse(parts=[_call("old")]),
-        ModelRequest(
-            parts=[ToolReturnPart(tool_name="search_events", content={"n": 1}, tool_call_id="old")]
-        ),
-        ModelResponse(parts=[_call("ghost")]),
-    ]
-    repaired = repair_partial(messages, called_ids=set(), results={})
+    assert _returns(repaired) == {}, "a rejection is not a return"
     assert any(
-        isinstance(p, ToolCallPart) and p.tool_call_id == "old"
-        for m in repaired
-        if isinstance(m, ModelResponse)
-        for p in m.parts
+        part is retry
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
     )
+
+
+def test_a_truncated_tool_call_is_kept_and_answered():
+    """A model stream that dies mid-response leaves a ToolCallPart whose JSON
+    arguments may be truncated. Dropping it rewrites the shape of a response
+    whose thinking signature was computed over the turn that included the call —
+    and this blob is the only place those signatures live. Keep it and answer
+    it, as pydantic-ai does for the same reason."""
+    ghost = ToolCallPart(tool_name="search_events", args='{"q": "unf', tool_call_id="ghost")
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="find it")]),
+        ModelResponse(parts=[TextPart(content="let me look"), ghost]),
+    ]
+    repaired = repair_partial(messages, results={})
+    assert _unpaired(repaired) == set()
+    assert repaired[1].parts == [TextPart(content="let me look"), ghost]
+    assert _returns(repaired) == {"ghost": INTERRUPTED_RESULT}
+
+
+def test_an_answer_sits_in_the_request_after_its_own_call():
+    """Anthropic wants a tool_result in the request immediately following its
+    tool_use, and no later normalization reorders across a response. Batching
+    every synthesized answer onto the end of the snapshot would separate the
+    first response's answers from its calls."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="find it")]),
+        ModelResponse(parts=[_call("early")]),
+        ModelResponse(parts=[_call("late")]),
+    ]
+    repaired = repair_partial(messages, results={})
+    shape = [
+        (type(m).__name__, [getattr(p, "tool_call_id", None) for p in m.parts]) for m in repaired
+    ]
+    assert shape == [
+        ("ModelRequest", [None]),
+        ("ModelResponse", ["early"]),
+        ("ModelRequest", ["early"]),
+        ("ModelResponse", ["late"]),
+        ("ModelRequest", ["late"]),
+        ("ModelResponse", [None]),
+    ]
+
+
+def test_an_answer_joins_the_existing_returns_of_the_following_request():
+    """Half a batch has already been assembled into a request. The missing
+    answer belongs in that same request, ahead of its user-facing parts, not in
+    a second one."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="find it")]),
+        ModelResponse(parts=[_call("a"), _call("b")]),
+        ModelRequest(parts=[_result("a", {"n": 1}), UserPromptPart(content="also this")]),
+    ]
+    repaired = repair_partial(messages, results={"b": _result("b", {"n": 2})})
+    # Only the trailing marker response is added — no second request.
+    assert [type(m).__name__ for m in repaired] == [
+        "ModelRequest",
+        "ModelResponse",
+        "ModelRequest",
+        "ModelResponse",
+    ]
+    assert [type(p).__name__ for p in repaired[2].parts] == [
+        "ToolReturnPart",
+        "ToolReturnPart",
+        "UserPromptPart",
+    ]
+    assert _returns(repaired) == {"a": {"n": 1}, "b": {"n": 2}}
 
 
 def test_repair_is_idempotent():
@@ -164,8 +234,9 @@ def test_repair_is_idempotent():
         ModelRequest(parts=[UserPromptPart(content="find it")]),
         ModelResponse(parts=[_call("a")]),
     ]
-    once = repair_partial(messages, called_ids={"a"}, results={"a": {"hits": 3}})
-    twice = repair_partial(once, called_ids={"a"}, results={"a": {"hits": 3}})
+    results = {"a": _result("a", {"hits": 3})}
+    once = repair_partial(messages, results=results)
+    twice = repair_partial(once, results=results)
     assert once == twice
 
 
@@ -183,30 +254,62 @@ def test_repair_is_idempotent():
 )
 def test_a_repaired_snapshot_ends_in_a_response(trailing):
     """A completed turn's history ends in a `ModelResponse`, and the next turn's
-    prompt arrives as its own `ModelRequest`. Ending on a request would put two
-    `role: "user"` messages back to back on the Anthropic protocol — a
-    role-alternation 400 on exactly the endpoints (Kimi /coding) this feature
-    exists to rescue."""
+    prompt arrives as its own `ModelRequest`. pydantic-ai merges the two, so
+    ending on a request is not itself a protocol error — but that merge is
+    private API under a `>=` pin, and a checkpoint blob shaped exactly like a
+    completed turn's is one less thing downstream has to special-case."""
     messages = [
         ModelRequest(parts=[UserPromptPart(content="find it")]),
         ModelResponse(parts=[_call("a")]),
     ]
     if trailing is not None:
         messages.append(trailing)
-    repaired = repair_partial(messages, called_ids={"a"}, results={"a": {"hits": 3}})
+    results = {"a": _result("a", {"hits": 3})}
+    repaired = repair_partial(messages, results=results)
     assert isinstance(repaired[-1], ModelResponse)
     assert isinstance(repaired[-1].parts[0], TextPart)
     # Idempotent: a second repair must not stack a second marker.
-    twice = repair_partial(repaired, called_ids={"a"}, results={"a": {"hits": 3}})
+    twice = repair_partial(repaired, results=results)
     assert twice == repaired
+
+
+def test_the_library_still_merges_adjacent_requests():
+    """Guards the assumption behind RESUME_MARKER being belt-and-braces rather
+    than load-bearing (see `agent/resume.py`). If a pydantic-ai bump stops
+    merging a trailing tool-return request into the next turn's prompt request,
+    this fails here instead of as a role-alternation 400 against a live
+    endpoint."""
+    from pydantic_ai._agent_graph import _clean_message_history  # noqa: PLC2701
+
+    cleaned = _clean_message_history(
+        [
+            ModelResponse(parts=[_call("a")]),
+            ModelRequest(parts=[_result("a", {"n": 1})]),
+            ModelRequest(parts=[UserPromptPart(content="next turn")]),
+        ]
+    )
+    assert [type(m).__name__ for m in cleaned] == ["ModelResponse", "ModelRequest"]
+    # And the tool result still leads the merged request, where providers want it.
+    assert [type(p).__name__ for p in cleaned[-1].parts] == ["ToolReturnPart", "UserPromptPart"]
+
+
+def test_repairing_a_prompt_only_snapshot_would_fabricate_a_reply():
+    """Why `stream_turn` refuses to checkpoint before the model has committed a
+    response: closing the pair on a snapshot that is only the analyst's prompt
+    puts an answer to it in the model's mouth. The repair can't detect this —
+    a trailing request is a trailing request — so the caller must not ask."""
+    repaired = repair_partial([ModelRequest(parts=[UserPromptPart(content="find it")])], results={})
+    assert repaired[-1].parts[0].content == RESUME_MARKER
 
 
 def test_input_is_not_mutated():
     response = ModelResponse(parts=[_call("ghost")])
-    messages = [ModelRequest(parts=[UserPromptPart(content="find it")]), response]
-    repair_partial(messages, called_ids=set(), results={})
-    assert len(messages) == 2
+    request = ModelRequest(parts=[UserPromptPart(content="find it")])
+    messages = [request, response]
+    repair_partial(messages, results={})
+    assert messages == [request, response]
     assert len(response.parts) == 1
+    assert request.state == "complete"
 
 
 def test_a_repaired_snapshot_survives_the_sliding_window():
@@ -217,18 +320,10 @@ def test_a_repaired_snapshot_survives_the_sliding_window():
     messages = [
         ModelRequest(parts=[UserPromptPart(content="find it")]),
         ModelResponse(parts=[_call("a")]),
-        ModelRequest(
-            parts=[
-                ToolReturnPart(
-                    tool_name="search_events", content={"n": "x" * 5000}, tool_call_id="a"
-                )
-            ]
-        ),
+        ModelRequest(parts=[_result("a", {"n": "x" * 5000})]),
         ModelResponse(parts=[_call("b"), _call("c")]),
     ]
-    repaired = repair_partial(
-        messages, called_ids={"a", "b", "c"}, results={"b": {"hits": "y" * 5000}}
-    )
+    repaired = repair_partial(messages, results={"b": _result("b", {"hits": "y" * 5000})})
     windowed, _stats = apply_window(repaired, budget=200)
     assert _unpaired(windowed) == set()
 
@@ -295,6 +390,15 @@ async def test_stream_turn_checkpoints_after_each_tool_result(monkeypatch):
         # last one — a hard kill lands on an arbitrary checkpoint.
         if event["type"] == "checkpoint":
             assert _unpaired(recorder.messages) == set()
+            # And it always holds something the model actually produced, never
+            # just the prompt closed off with a fabricated reply.
+            assert any(
+                isinstance(m, ModelResponse)
+                and not (
+                    len(m.parts) == 1 and getattr(m.parts[0], "content", None) == RESUME_MARKER
+                )
+                for m in recorder.messages
+            )
 
     types = [e["type"] for e in seen]
     assert "checkpoint" in types
@@ -738,6 +842,93 @@ async def test_a_checkpoint_that_did_not_advance_is_not_rewritten(store, monkeyp
     assert len(writes) == 1, "only advanced snapshots are written"
     fresh = await store.get_agent_conversation(case.id, conversation.id)
     _assert_is_the_turn_blob(fresh.history)
+
+
+def _count_partial_writes(store, monkeypatch) -> list[object]:
+    """Record the blobs written by `_persist_partial`, ignoring completed-turn
+    writes (which clear the stamp instead of setting it)."""
+    writes: list[object] = []
+    original = store.update_agent_conversation
+
+    async def counting(conversation_id, **kwargs):
+        if kwargs.get("history_partial_at") is not None:
+            writes.append(kwargs["history"])
+        return await original(conversation_id, **kwargs)
+
+    monkeypatch.setattr(store, "update_agent_conversation", counting)
+    return writes
+
+
+@pytest.mark.asyncio
+async def test_checkpoints_in_quick_succession_are_written_once(store, monkeypatch):
+    """Each write is a full `dump_history` plus a whole-column JSON UPDATE of a
+    monotonically growing blob, on the event loop. A 125-tool-call turn writing
+    every time costs bytes quadratic in the turn's length, to buy durability at
+    a granularity nobody asked for."""
+    from vestigo.agent.runtime import TurnResult
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    writes = _count_partial_writes(store, monkeypatch)
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        for revision in range(1, 4):
+            # Each snapshot differs, so the revision guard would let all three
+            # through — only the interval floor stops them.
+            recorder.messages = _fake_turn_messages() * revision
+            recorder.revision = revision
+            yield {"type": "checkpoint"}
+        yield {
+            "type": "result",
+            "turn": TurnResult(output_text="done", new_messages=_fake_turn_messages()),
+        }
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    assert len(writes) == 1, "the interval floor collapses a burst into one write"
+
+
+@pytest.mark.asyncio
+async def test_a_stop_right_after_a_throttled_checkpoint_still_persists(store, monkeypatch):
+    """The floor must never cost an analyst their turn. A stop is the one moment
+    the write is worth paying for unconditionally — otherwise throttling would
+    reintroduce exactly the loss this feature exists to prevent."""
+    import asyncio
+    from time import monotonic
+
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    turn = agent_router._ActiveTurn(cancel=asyncio.Event(), started=monotonic())
+    agent_router._active_turns[conversation.id] = turn
+    writes = _count_partial_writes(store, monkeypatch)
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        recorder.messages = _fake_turn_messages()
+        recorder.revision = 1
+        yield {"type": "checkpoint"}
+        # Throttled: too soon after the first, and the turn is about to end.
+        recorder.messages = [
+            *_fake_turn_messages(),
+            ModelResponse(parts=[TextPart(content="more")]),
+        ]
+        recorder.revision = 2
+        yield {"type": "checkpoint"}
+        turn.cancel.set()
+        yield {"type": "text_delta", "text": "never streamed"}
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    assert len(writes) == 2, "the throttled snapshot is written by the stop, not lost"
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is not None
+    assert len(fresh.history) == 3, "the newest snapshot won, not the one that got in first"
 
 
 @pytest.mark.asyncio

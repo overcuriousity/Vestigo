@@ -574,25 +574,58 @@ re-ran the entire orientation sweep.
 `stream_turn` now drives `agent.iter` and updates a caller-owned `TurnRecorder`
 after every tool result and at every node boundary, yielding a router-internal
 `checkpoint` event. Each snapshot passes through
-`agent/resume.py::repair_partial`, which answers tool calls left unpaired (with
-the result the turn actually streamed, or an explicit `interrupted` marker),
-drops trailing calls that never reached the executor, and closes the history
-with a `RESUME_MARKER` response when it would otherwise end on a `ModelRequest`
-— a completed turn's history always ends in a `ModelResponse`, and ending on a
-request puts two `role: "user"` messages back to back on the Anthropic protocol
-(a role-alternation 400 on Kimi `/coding` and friends). Same request/response
-pair shape the window's turn drop uses. The synthesized return carries the tool's
-*raw* content, not the `str()`-coerced form the SSE payload sends, so the
-replayed history agrees with the run about what the tool returned. Any
-checkpoint is replayable on its own.
+`agent/resume.py::repair_partial`, and any checkpoint is replayable on its own.
 
-Checkpointing is deliberately cheap: the node-boundary checkpoint is skipped
+pydantic-ai already normalizes a history before every request
+(`_clean_message_history`: drop orphaned results, answer dangling calls, merge
+adjacent same-role messages), so `repair_partial` is not there to make the blob
+sendable — it is there to make it *faithful*, and to keep it that way if a
+future version normalizes differently:
+
+- **Unpaired calls are answered with the part the tool actually produced.** The
+  library's own repair substitutes a generic stub; replaying the real
+  `ToolReturnPart` — or `RetryPromptPart`, so a rejection is never replayed as a
+  success — keeps the resumed history in agreement with the run about what each
+  tool returned, including the content's type and its `outcome`. Only a call that
+  genuinely never returned gets `INTERRUPTED_RESULT`, stamped
+  `outcome="interrupted"` so a reader of an export can tell synthesized answers
+  from real ones without parsing prose. Answers are inserted in the request
+  immediately following the response that made the call, because the Anthropic
+  protocol requires that adjacency and nothing downstream reorders across a
+  response.
+- **A truncated trailing call is kept, not dropped.** A dead model stream can
+  leave a `ToolCallPart` with half-written JSON arguments. Removing it would
+  rewrite the shape of a `ModelResponse` whose thinking signature was computed
+  over the turn that included the call, and this blob is the only place those
+  signatures live. Malformed arguments are already sendable (`args_as_dict`
+  degrades them), so the call is replayed and answered like any other — the same
+  reasoning pydantic-ai gives for its own pass.
+- **The trailing request/response pair is closed** with a `RESUME_MARKER`
+  response. On 2.17.0 this is belt-and-braces: `_merge_consecutive_messages`
+  already folds a trailing tool-return request into the next turn's prompt
+  request, so the unmerged shape is not a protocol error. But that merge is
+  private API under a `>=` pin, and a checkpoint blob shaped exactly like a
+  completed turn's is one less case for the window and the exporter to reason
+  about. `tests/test_agent_resume.py::test_the_library_still_merges_adjacent_requests`
+  fails loudly if a bump changes it.
+
+No checkpoint is taken before the model commits a response: there would be
+nothing to save, and closing the pair on a lone prompt would put a reply to the
+analyst in the model's mouth.
+
+Checkpointing is deliberately cheap. The node-boundary checkpoint is skipped
 when the node produced nothing mapped, and when its last mapped event was a
-`tool_result` (that checkpoint already captured the same state), and the
-router's `_persist_partial` skips a write whose `recorder.revision` has not
-advanced. A 125-tool-call turn therefore pays ~125 history serializations and
-UPDATEs, not ~250. The per-tool-result checkpoint stays — losing a tool batch
-to a `kill -9` is the thing this exists to prevent.
+`tool_result` (that checkpoint already captured the same state), so a
+125-tool-call turn takes ~125 snapshots rather than 250. Reaching the database is
+throttled separately, because each write is a full `dump_history` plus a
+whole-column JSON UPDATE of a monotonically growing blob on the event loop —
+writing every snapshot costs bytes quadratic in the turn's length.
+`_persist_partial` skips a write whose `recorder.revision` has not advanced, and
+skips a periodic one taken less than `_CHECKPOINT_MIN_INTERVAL` (3s) after the
+last. Every terminal exit forces the write regardless, so the floor bounds
+worst-case loss at a few seconds of tool work and never at an analyst's turn. The
+per-tool-result checkpoint stays — losing a tool batch to a `kill -9` is the
+thing this exists to prevent.
 
 The router writes each checkpoint and stamps `history_partial_at`. Only a
 completed turn clears it; a stop is treated as an interruption like any other.
@@ -605,6 +638,15 @@ interruption. Instructions come from the current run only (verified against
 pydantic-ai 2.17.0), so a note left on an older `ModelRequest` is never resent.
 The recorder is reset per attempt, so the reactive overflow re-run replays from
 the same pre-turn base rather than concatenating the failed attempt's messages.
+If that re-run dies before its own first checkpoint, attempt 0's stamped
+snapshot stays on the record: it is a faithful account of work that really ran,
+and the window sizes it like any other history on the next turn.
+
+`history_partial_at` is on the conversation payload (`to_dict`), so it reaches
+the list and detail responses and the JSON export alongside `raw_history` — a
+reader can tell a replayable turn boundary from a mid-turn checkpoint without
+inspecting the blob. A partial write also bumps `updated_at`, which floats an
+actively streaming conversation to the top of the list; that is the intent.
 
 No extra truncation logic: a resumed history is ordinary `message_history` and
 the sliding window (`agent/window.py`) still sizes every request. Because the

@@ -378,6 +378,17 @@ def _is_context_overflow(exc: ModelHTTPError) -> bool:
 _RETRY_SHRINK = 0.6
 _DERIVED_BUDGET_FACTOR = 0.8
 
+#: Minimum seconds between two mid-turn checkpoint writes (see
+#: `_persist_partial`). Each write is a full `dump_history` plus a whole-column
+#: JSON UPDATE of a blob that grows monotonically, on the event loop of a
+#: single-process deployment: a 125-tool-call turn writes a growing blob 125
+#: times, so the bytes are quadratic in turn length. The floor trades a few
+#: seconds of worst-case tool work for roughly an order of magnitude fewer
+#: writes on a busy turn. It never applies to a real interruption — every
+#: terminal exit forces the write. A module constant, not a `VESTIGO_` setting:
+#: it is an implementation trade, not something an operator should be tuning.
+_CHECKPOINT_MIN_INTERVAL = 3.0
+
 # Overflow bodies that name the model's actual window, per provider phrasing.
 # OpenAI / vLLM / LiteLLM passthrough: "This model's maximum context length is
 # 65536 tokens"; Anthropic: "prompt is too long: 123456 tokens > 64000 maximum";
@@ -666,26 +677,33 @@ async def _message_stream_inner(
         return detail
 
     # Revision of the last snapshot actually written, so the redundant writes
-    # are skipped rather than re-serialized (see `_persist_partial`).
+    # are skipped rather than re-serialized, and when that write happened, so
+    # the periodic ones stay rate-limited (see `_persist_partial`).
     persisted_revision = 0
+    persisted_at = 0.0
 
-    async def _persist_partial() -> None:
+    async def _persist_partial(*, force: bool = False) -> None:
         """Store what the turn has produced so far, marked as mid-turn.
 
         Called from every exit that is not a completed turn — a stop, a
         provider error, the checkpoints in between. A hard kill runs none of
         them, which is exactly why the checkpoints exist.
 
-        A write is a full `dump_history` plus a whole-column JSON UPDATE of a
-        blob that grows into hundreds of KB, on the event loop of a
-        single-process deployment. It is skipped when the recorder has not
-        advanced since the last one, so the exit paths that follow a checkpoint
-        (a stop, a provider error) cost nothing extra.
+        Two guards, for two different kinds of waste. The recorder's revision
+        skips a write whose snapshot is byte-identical to the last one, and
+        applies always. `_CHECKPOINT_MIN_INTERVAL` skips a write that is merely
+        *soon*, and applies only to the periodic checkpoints: `force` is set on
+        every terminal exit, because an interruption is the one moment the cost
+        of a write is worth paying unconditionally.
         """
-        nonlocal persisted_revision
+        nonlocal persisted_revision, persisted_at
         if not recorder.messages or recorder.revision == persisted_revision:
             return
+        now = monotonic()
+        if not force and now - persisted_at < _CHECKPOINT_MIN_INTERVAL:
+            return
         persisted_revision = recorder.revision
+        persisted_at = now
         await store.update_agent_conversation(
             conversation_id,
             history=dump_history(history + recorder.messages),
@@ -702,6 +720,9 @@ async def _message_stream_inner(
         recorder.messages = []
         recorder.revision = 0
         persisted_revision = 0
+        # 0.0 rather than `monotonic()`: the re-run's first checkpoint must not
+        # be throttled by how recently attempt 0 wrote.
+        persisted_at = 0.0
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return
@@ -738,13 +759,14 @@ async def _message_stream_inner(
                         )
                     # A stop is an interruption like any other: the analyst's
                     # next message must be answered against this turn's work.
-                    await _persist_partial()
+                    await _persist_partial(force=True)
                     if (stats_detail := await _persist_window_stats(attempt)) is not None:
                         yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
                     yield _sse({"type": "cancelled"})
                     return
                 if event["type"] == "checkpoint":
                     # Router-internal: persist the snapshot, never forward it.
+                    # Rate-limited — the terminal exits below are not.
                     await _persist_partial()
                     continue
                 if event["type"] == "result":
@@ -934,7 +956,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
-            await _persist_partial()
+            await _persist_partial(force=True)
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if overflow:
@@ -964,7 +986,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
-            await _persist_partial()
+            await _persist_partial(force=True)
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if isinstance(exc, UsageLimitExceeded):
@@ -986,7 +1008,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
-            await _persist_partial()
+            await _persist_partial(force=True)
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             yield _sse({"type": "error", "detail": "Agent turn failed — see server logs."})

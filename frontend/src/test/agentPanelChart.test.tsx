@@ -62,6 +62,7 @@ function conversation(): AgentConversation {
     title: "Investigating",
     model_id: "m",
     disabled_tools: null,
+    history_partial_at: null,
     created_at: null,
     updated_at: null,
   };

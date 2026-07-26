@@ -1,9 +1,78 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 105 — agent turn checkpointing).
+Last updated: 2026-07-26 (session 106 — PR #187 review remediation).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 106 — 2026-07-26: PR #187 review remediation
+
+**Why.** Review of the turn-checkpointing branch. The mechanism was sound, but
+`agent/resume.py` had been written against a wrong model of pydantic-ai 2.17.0 — as if
+the library did no history repair of its own, when it runs a three-pass
+`_clean_message_history` pipeline (drop orphaned results → answer dangling calls → merge
+adjacent same-role messages) before every single request. Three of the findings follow
+from that one mistake. Verified as *correct* and left alone: `agent.iter(instructions=)`
+is additive rather than a replacement (`SYSTEM_PROMPT` survives the resume note), a
+historical `ModelRequest.instructions` is never resent, and the `new_messages()` boundary
+survives the library cleaning the incoming history in place.
+
+- **Stopped dropping truncated tool calls.** Pass 1 pruned trailing `ToolCallPart`s that
+  never reached the executor. pydantic-ai deliberately does the opposite, and its reason
+  applies here with force: removing a part rewrites the shape of a `ModelResponse` whose
+  thinking signature was computed over the turn that included the call, and this blob is
+  the only place those signatures live. Truncated arguments are already sendable, so the
+  call is now kept and answered like any other. The `called_ids` bookkeeping it needed —
+  a parameter, an accumulator and a branch in `stream_turn` — is gone with it.
+- **Synthesized answers sit next to their own call.** Pass 2 batched every answer onto
+  the end of the snapshot, which on a history with two unanswered responses separates the
+  first one's answers from its calls by an intervening response — an adjacency the
+  Anthropic protocol requires and no later normalization restores. Answers now go into
+  the request immediately following the response that made the call, behind that
+  request's existing tool results, mirroring the library's own placement.
+- **A rejection is no longer replayed as a success.** `FunctionToolResultEvent.part` is a
+  `RetryPromptPart` when a call was rejected, and the recorder was storing its `.content`
+  and rebuilding it as a `ToolReturnPart`. It now stores the streamed *part*, which the
+  repair reuses verbatim — so `outcome`, `metadata` and the content's type all match what
+  the run saw. A genuinely unanswered call gets `INTERRUPTED_RESULT` stamped
+  `outcome="interrupted"`, and a synthesized request is stamped `state="interrupted"`;
+  both are public fields, and both make the interruption machine-readable in an export
+  instead of legible only as prose.
+- **`RESUME_MARKER` kept, its justification corrected.** The claim that ending on a
+  `ModelRequest` puts two `role: "user"` messages back to back is false on 2.17.0:
+  `_merge_consecutive_messages` folds that request into the next turn's prompt request.
+  The marker stays as defence in depth — that merge is private API and the pin is `>=` —
+  and a test now asserts the library still merges, so a bump that changes it fails in CI
+  rather than as a 400 against a live endpoint. The "same as `agent/window.py`'s turn
+  drop" analogy was dropped: that marker needs its response because it *is* a
+  `UserPromptPart`, and it is only ever sent, never persisted.
+- **No checkpoint before the model commits a response.** A text part's first delta can
+  arrive before its `ModelResponse` lands in `new_messages()`, and repairing a snapshot
+  of just the analyst's prompt closed the pair with `RESUME_MARKER` — fabricating a reply
+  to the analyst. `stream_turn` now takes no checkpoint in that state.
+- **Checkpoint writes are rate-limited.** Each is a full `dump_history` plus a
+  whole-column JSON UPDATE of a monotonically growing blob, on the event loop of a
+  single-process deployment: a 125-tool-call turn wrote a growing blob 125 times, so the
+  bytes were quadratic in the turn's length. `_CHECKPOINT_MIN_INTERVAL` (3s) collapses a
+  burst into one write, while `force=True` on every terminal exit — the stop path and all
+  three `except` branches — keeps an actual interruption unthrottled. Worst-case loss is
+  a few seconds of tool work, never an analyst's turn.
+- **`history_partial_at` is visible.** It was on the row but absent from
+  `AgentConversation.to_dict()`, so no API response and no export carried it. Added there
+  and to the frontend's `AgentConversation` interface: a reader can now tell a replayable
+  turn boundary from a mid-turn checkpoint without inspecting `raw_history`.
+- **Migration renamed** `8030282d015f_…` → `0019_agent_history_partial_at.py`
+  (`revision = "0019"`), matching the sequential convention every other revision follows,
+  with the autogenerated comment scaffolding removed. A dev database that already applied
+  the old id needs `UPDATE alembic_version SET version_num = '0019';` once.
+
+Documented rather than coded around: if the overflow re-run dies before its own first
+checkpoint, attempt 0's stamped snapshot stays on the record — it is a faithful account
+of work that really ran. And a partial write bumps `updated_at`, floating an actively
+streaming conversation to the top of the conversation list, which is the intent.
+
+`uv run pytest` → 1863 passed, 3 failed (the same environmental embeddings failures as at
+merge-base). Frontend typecheck, lint and 510 tests clean.
 
 ## Session 105 — 2026-07-26: an interrupted agent turn keeps its history
 
@@ -17,10 +86,9 @@ blob, and the follow-up turn re-ran the entire orientation sweep.
 
 - **`agent/resume.py` (new).** `repair_partial` turns a mid-turn snapshot into
   something replayable: it answers tool calls left unpaired — with the result the turn
-  actually streamed, or an explicit `interrupted` marker, never anything invented — and
-  drops trailing `ToolCallPart`s that never reached the executor (a dead model stream
-  leaves half-written JSON arguments behind). Pure and idempotent, which is the same
-  determinism constraint the sliding window holds to. `RESUME_NOTE` lives here too.
+  actually streamed, or an explicit `interrupted` marker, never anything invented. Pure
+  and idempotent, which is the same determinism constraint the sliding window holds to.
+  `RESUME_NOTE` lives here too. (Session 106 reworked the details; see there.)
 - **`stream_turn` now drives `agent.iter`** instead of `agent.run_stream`, so the run's
   live message list is reachable mid-turn. It fills a caller-owned `TurnRecorder` after
   every tool result and every completed node and yields a router-internal

@@ -1268,6 +1268,13 @@ class AgentConversation(Base):
             "title": self.title,
             "model_id": self.model_id,
             "disabled_tools": self.disabled_tools,
+            # Exposed so a reader of an export — or of the API — can tell a
+            # replayable turn boundary from a mid-turn checkpoint. Without it the
+            # blob looks the same either way and an analyst has no way to know
+            # the conversation is resuming from a turn that never finished.
+            "history_partial_at": (
+                self.history_partial_at.isoformat() if self.history_partial_at else None
+            ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

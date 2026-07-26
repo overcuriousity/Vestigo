@@ -38,13 +38,16 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
     ModelMessage,
     ModelMessagesTypeAdapter,
+    ModelResponse,
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
+    RetryPromptPart,
     TextPart,
     TextPartDelta,
     ThinkingPart,
     ThinkingPartDelta,
+    ToolReturnPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
@@ -546,8 +549,10 @@ async def stream_turn(
     ``recorder``, if given, is updated after every tool result and every
     completed node with a replay-safe snapshot of the turn so far, and a
     ``{"type": "checkpoint"}`` event is yielded alongside. The router persists
-    it, so a turn that is stopped, errors, or dies with the process keeps its
-    history instead of losing the whole turn.
+    it — at its own throttled cadence — so a turn that is stopped, errors, or
+    dies with the process keeps its history instead of losing the whole turn.
+    No checkpoint is taken before the model has committed a response: there is
+    nothing to save, and repairing a lone prompt would fabricate a reply to it.
 
     ``resume_note`` is set by the router when ``history`` is a mid-turn
     checkpoint rather than a completed turn, and rides as the run's
@@ -609,18 +614,23 @@ async def stream_turn(
             f"({len(scope.source_ids)} sources). {_view_context(view_filters)}\n\n{user_text}"
         )
         track = recorder if recorder is not None else TurnRecorder()
-        called_ids: set[str] = set()
-        # Raw tool-return contents, not the SSE-mapped ones: `_map_event`
-        # coerces a non-dict/list result with `str(...)` for the wire, and a
-        # synthesized ToolReturnPart built from that would differ in type from
-        # what the tool actually returned — the forensic-reproducibility rule
-        # (CLAUDE.md) makes the replayed history match the run.
-        results: dict[str, Any] = {}
+        # The tool-answer parts themselves, not the SSE-mapped payloads:
+        # `_map_event` coerces a non-dict/list result with `str(...)` for the
+        # wire and flattens a rejection into the same shape as a return, so a
+        # part rebuilt from that would misreport both the content's type and
+        # whether the call succeeded. Replaying the real part is what the
+        # forensic-reproducibility rule (CLAUDE.md) asks for.
+        results: dict[str, ToolReturnPart | RetryPromptPart] = {}
 
-        def checkpoint() -> dict[str, Any]:
-            track.messages = repair_partial(
-                run.new_messages(), called_ids=called_ids, results=results
-            )
+        def checkpoint() -> dict[str, Any] | None:
+            snapshot = run.new_messages()
+            # Nothing the model produced has landed yet — a text part's first
+            # delta can arrive before its ModelResponse is committed. Repairing
+            # a lone user-prompt request would close it with the RESUME_MARKER
+            # response, i.e. put a reply to the analyst in the model's mouth.
+            if not any(isinstance(m, ModelResponse) and m.parts for m in snapshot):
+                return None
+            track.messages = repair_partial(snapshot, results=results)
             track.revision += 1
             return {"type": "checkpoint"}
 
@@ -651,24 +661,34 @@ async def stream_turn(
                         if mapped is None:
                             continue
                         last_type = mapped["type"]
-                        if mapped["type"] == "tool_call":
-                            called_ids.add(mapped["tool_call_id"])
                         yield mapped
                         if mapped["type"] == "tool_result":
                             # Checkpoint per tool result, not just per node: a
                             # batch of four ClickHouse queries is seconds of
-                            # work a kill -9 must not erase.
-                            results[mapped["tool_call_id"]] = event.part.content
-                            yield checkpoint()
+                            # work a kill -9 must not erase. The router throttles
+                            # how often a checkpoint reaches the database.
+                            results[mapped["tool_call_id"]] = event.part
+                            if (mark := checkpoint()) is not None:
+                                yield mark
                 # Node boundary — the natural place the snapshot is whole. Not
                 # taken when the node produced nothing mapped (a response that
                 # only decided to call a tool: the checkpoint would land before
                 # the tool_call it precedes), nor when its last mapped event was
                 # a tool_result — that checkpoint already captured this exact
-                # state, and a real turn's ~125 tool calls would otherwise pay
-                # 250 full history serializations and whole-column UPDATEs.
-                if last_type is not None and last_type != "tool_result":
-                    yield checkpoint()
+                # state, so a real turn's ~125 tool calls pay ~125 snapshots
+                # rather than 250.
+                #
+                # The final response's boundary checkpoint is always redundant:
+                # the `result` event a moment later rewrites the same column with
+                # the completed history. It can't be told apart from a mid-turn
+                # text node, whose text is worth keeping, and the router's write
+                # throttle makes it nearly free — so it stays.
+                if (
+                    last_type is not None
+                    and last_type != "tool_result"
+                    and (mark := checkpoint()) is not None
+                ):
+                    yield mark
             result = run.result
             if result is not None:
                 # `AgentRunResult.usage` is a property in pydantic-ai 2.13.0+
