@@ -1354,3 +1354,66 @@ export interface ExportRequest {
     run_id?: string;
   };
 }
+
+// ---------------------------------------------------------------------------
+// Stories (W7)
+// ---------------------------------------------------------------------------
+
+export type StoryBlockKind = "markdown" | "view_ref" | "chart_ref" | "event_ref";
+
+export interface Story {
+  id: string;
+  case_id: string;
+  title: string;
+  description: string | null;
+  created_by: string;
+  updated_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoryBlock {
+  id: string;
+  story_id: string;
+  position: number;
+  kind: StoryBlockKind;
+  content: Record<string, unknown>;
+  origin: "user" | "agent";
+  version: number;
+  created_by: string;
+  updated_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoryExportMeta {
+  id: string;
+  story_id: string;
+  case_id: string;
+  snapshot_hash: string;
+  html_hash: string | null;
+  has_artifact: boolean;
+  created_by: string;
+  created_at: string;
+}
+
+export interface SnapshotBlock {
+  id: string;
+  kind: StoryBlockKind;
+  origin: string;
+  ref: Record<string, unknown>;
+  data: Record<string, unknown> | null;
+  resolution: { executed_at: string; timeline_id?: string; error: string | null };
+}
+
+export interface StorySnapshot {
+  v: 1;
+  story: {
+    id: string;
+    title: string;
+    case_id: string;
+    exported_at: string;
+    exported_by: string;
+  };
+  blocks: SnapshotBlock[];
+}
