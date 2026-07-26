@@ -4,6 +4,11 @@ Date: 2026-07-26. Status: approved (brainstorm session, user-confirmed).
 Phase 3 Step 3 (`2026-07-19-phase3-investigation-depth-design.md`); canonical roadmap
 entry: Phase 3 Step 3 in `ROADMAP.md`.
 
+**Phase-spec override (user decision, 2026-07-26):** the phase spec deferred agent
+authorship of stories; that deferral is rescinded. The agent-parity principle — the
+agent can do (via propose→confirm) whatever an analyst can do — applies to Stories from
+day one. W7 ships as a complete package, agent surface included, no follow-up round.
+
 ## Decision summary
 
 A Story is a per-case block document — the investigation report that assembles itself
@@ -16,8 +21,8 @@ Decisions made in the brainstorm, with the alternatives they beat:
 
 - **Block editor (Notion-style)** over plain-markdown-with-directives or a hybrid:
   matches the agreed Postgres block model 1:1, gives the drag-chart-into-report feel,
-  and is the cleanest surface for later agent authorship (a `propose_block` tool fits
-  the existing sandbox+apply invariant).
+  and is the cleanest surface for agent authorship (the `propose_story_block` tool fits
+  the existing sandbox+apply invariant — see "Agent parity" below).
 - **Live editor + stored export snapshots** over freeze-at-export-only (report not
   reproducible from within Vestigo) and pin-at-embed (kills the live-report feel).
   Export = attested point-in-time record, like Source hashing.
@@ -58,8 +63,8 @@ Three new tables.
     block, not the View, so one View can be embedded twice with different presentation
   - `chart_ref`: `{chart_id}`
   - `event_ref`: `{event_id, source_id, caption?}`
-- `origin`: `user` now; `agent` reserved (phase-spec insurance — agent-drafted blocks
-  slot in later without migration pain)
+- `origin`: `user | agent` — agent-origin blocks are created by confirming a
+  `propose_story_block` proposal (see "Agent parity")
 - `version` Integer — optimistic concurrency counter
 - `created_by`, `updated_by`, timestamps
 
@@ -118,6 +123,52 @@ Export, two-phase, snapshot server-authoritative:
 
 RBAC: existing case roles — case read = view stories and exports, case write = edit and
 export. Audit entries: story create/delete, export create (with hashes).
+
+## Agent parity
+
+The agent-parity principle (see `docs/AGENT.md`): read parity directly, write parity
+through propose→confirm — the agent itself never writes. Stories get both at launch.
+
+### Read tools
+
+- `list_stories(case)` — id, title, description, block count, updated_at.
+- `read_story(story_id)` — story with blocks; markdown as text, embed blocks as their
+  ref + name (the agent resolves referenced views/charts/events through its existing
+  read tools rather than a duplicate data path). Output bounded by the existing
+  `_truncate`/cap conventions.
+
+Both enter `TOOL_REGISTRY` as core read tools; the three deny layers (admin hard-deny,
+per-user defaults, per-chat opt-in) and the tool-selector popover apply as everywhere.
+Exposed on the external `/mcp` endpoint like the other read tools.
+
+### Authorship: `propose_story_block`
+
+`propose_story_block(story_id, kind, content, after_block_id?)` — conversation-bound,
+records an `AgentProposal` (does not touch `story_blocks`), analyst confirms or rejects
+via the existing decide endpoints; confirm re-resolves and creates the block with
+`origin: agent`, audit-logged. All four kinds:
+
+- `markdown` — the agent drafts narrative.
+- `view_ref` / `event_ref` — must reference persisted objects, same rule as human push.
+- `chart_ref` — may carry an inline `ChartConfig` (the `propose_chart` spec shape,
+  validated by executing the query) instead of a `chart_id`; confirm then creates the
+  SavedChart and the block in one step, so the agent can author a chart block without
+  a pre-existing saved chart.
+
+Like `propose_annotation`, `propose_story_block` is absent from the external `/mcp`
+tool list — external MCP clients get read-only story access.
+
+The chat panel renders a story-block proposal card (markdown preview or embed card,
+reusing the editor's block renderers) with confirm/reject — same pattern as
+`ChartProposalCard`.
+
+### Deliberate parity boundary
+
+Block **edit/move/delete and export** stay analyst-only. Parity covers analytical
+contribution (authoring content), not document arrangement or the attestation act:
+an export is a human sign-off by design, and diff-style proposals for editing other
+authors' blocks add proposal-UX weight with no analytical payoff. Not a follow-up —
+a decided boundary; revisit trigger: a user asks the agent to restructure a story.
 
 ## Frontend (`components/stories/`)
 
@@ -182,6 +233,10 @@ Versioned (`"v": 1`):
 - Backend: model/store unit tests (SQLite, as elsewhere); router tests for block CRUD,
   gap reordering + renumber-on-exhaustion, the 409 conflict path, the RBAC matrix,
   export resolution with dangling refs, snapshot hash stability (canonical JSON).
+- Agent: tool tests for `list_stories`/`read_story` (truncation caps included) and the
+  `propose_story_block` lifecycle — proposal row, confirm creates block with
+  `origin: agent` (incl. the inline-ChartConfig chart_ref path creating the
+  SavedChart), reject path, absence from the external `/mcp` tool list.
 - Frontend (vitest): block ordering logic, conflict UI state, `SnapshotRenderer`
   rendering a fixture snapshot with zero network calls (assert no fetch).
 - End-to-end via the `/verify` skill against the live stack: create story, push blocks
@@ -190,8 +245,9 @@ Versioned (`"v": 1`):
 ## Documentation plan
 
 New `docs/STORIES.md` reference (model, snapshot format contract, export semantics);
-remove the Phase 3 Step 3 entry from `ROADMAP.md` on landing; `PROGRESS.md` entry as
-usual.
+`docs/AGENT.md` updated in the same commit as the agent tools (tool table, proposal
+lifecycle, `/mcp` exposure note); remove the Phase 3 Step 3 entry from `ROADMAP.md` on
+landing; `PROGRESS.md` entry as usual.
 
 ## Alternatives considered
 
