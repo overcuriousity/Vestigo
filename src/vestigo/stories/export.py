@@ -44,9 +44,8 @@ def _view_filter_to_spec(view: View):
         return list(values) if values else None
 
     artifacts = _list("artifacts") or []
-    if p.get("artifact"):
-        if p["artifact"] not in artifacts:
-            artifacts.append(p["artifact"])
+    if p.get("artifact") and p["artifact"] not in artifacts:
+        artifacts.append(p["artifact"])
     tags_include = _list("tagsInclude") or []
     if p.get("tag") and p["tag"] not in tags_include:
         tags_include.append(p["tag"])

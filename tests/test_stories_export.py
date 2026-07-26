@@ -179,7 +179,7 @@ def test_view_filter_to_spec_maps_payload():
 
 async def test_snapshot_hash_stable(store):
     case, story, blocks = await _case_with_story(store, [("markdown", {"text": "same"})])
-    kwargs = dict(user=_user(), store=store, now=lambda: FROZEN_NOW)
+    kwargs = {"user": _user(), "store": store, "now": lambda: FROZEN_NOW}
     a = await resolve_story_snapshot(story, blocks, **kwargs)
     b = await resolve_story_snapshot(story, blocks, **kwargs)
     assert canonical_hash(a) == canonical_hash(b)
