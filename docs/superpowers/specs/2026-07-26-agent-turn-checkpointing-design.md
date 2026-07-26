@@ -121,7 +121,7 @@ batch, each taking seconds against ClickHouse.
 |---|---|---|
 | `checkpoint` | write | set to now |
 | `result` | write (unchanged) | cleared |
-| cancel — `[stopped]` | write | cleared |
+| cancel — `[stopped]` | write | set |
 | `ModelHTTPError` / `UnexpectedModelBehavior` / `UsageLimitExceeded` — `[interrupted]` | write | set |
 | hard kill, OOM, container restart | last checkpoint stands | stays set |
 
@@ -130,9 +130,10 @@ Every write is `dump_history(history + recorder.messages)` computed from the
 re-run (attempt 1) supersedes attempt 0's checkpoints instead of concatenating
 with them.
 
-A user-initiated stop clears the flag: the analyst stopped on purpose and must
-not be nudged to continue on their next message. The work is still preserved —
-only the resume marker differs.
+Only a completed turn clears the flag. A user-initiated stop is an interruption
+like any other — the turn ended mid-investigation with work on the record, and
+the analyst's next message must be answered against that work, not against a
+model that re-orients from scratch.
 
 ### 4. Schema
 
@@ -151,10 +152,15 @@ that method, and clearing the flag is a real update. Same trap the existing
 ### 5. Resume marker
 
 When `conversation.history_partial_at` is set, the router prefixes `RESUME_NOTE`
-to the context string `stream_turn` builds: the previous turn was interrupted
-mid-investigation, the findings so far are in the history, continue from them
-rather than re-orienting. It rides in the last user turn, which the window never
-elides.
+to the context string `stream_turn` builds: the previous turn ended early, the
+findings so far are in the history, build on them rather than re-orienting, and
+follow the analyst's new message. It rides in the last user turn, which the
+window never elides.
+
+The wording stays neutral about *why* the turn ended, because both causes land
+here — a provider error and an analyst pressing stop. Neither implies the model
+should resume its old plan verbatim: a stop usually means redirect, so the note
+directs continuity of *context*, not of intent.
 
 ### 6. Context constraints on reconstruction
 
@@ -198,9 +204,8 @@ turn, so pass 2 can only drop it wholesale. Passes 1 and 3 carry that case.
   unchanged.
 - Fake-model turn killed mid-tool-batch: the stored blob replays as
   `message_history` without a provider protocol error.
-- Router: an errored turn sets `history_partial_at` and persists a non-empty
-  blob; a cancelled turn persists the blob and clears the flag; a completed turn
-  clears it.
+- Router: an errored turn and a cancelled turn each persist a non-empty blob and
+  set `history_partial_at`; only a completed turn clears it.
 - Window: a repaired partial blob survives `apply_window` with pairing intact.
 
 ## Docs
