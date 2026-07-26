@@ -1372,12 +1372,41 @@ export interface Story {
   updated_at: string;
 }
 
-export interface StoryBlock {
+/**
+ * Per-kind block content, mirroring the backend's pydantic models
+ * (`vestigo/stories/schemas.py`) field for field.
+ *
+ * Typed as a discriminated union rather than `Record<string, unknown>` on
+ * purpose: the untyped version forced every renderer to re-assert the shape
+ * locally, and a mismatch between what the server freezes and what a mark
+ * reads then surfaces as a blank chart in a signed report instead of a build
+ * failure. Narrow on `kind`, don't cast.
+ */
+export interface MarkdownBlockContent {
+  text: string;
+}
+
+export interface ViewRefBlockContent {
+  view_id: string;
+  timeline_id: string;
+  display?: { limit?: number; columns?: string[] | null };
+}
+
+export interface ChartRefBlockContent {
+  chart_id: string;
+  timeline_id: string;
+}
+
+export interface EventRefBlockContent {
+  event_id: string;
+  source_id: string;
+  caption?: string | null;
+}
+
+interface StoryBlockBase {
   id: string;
   story_id: string;
   position: number;
-  kind: StoryBlockKind;
-  content: Record<string, unknown>;
   origin: "user" | "agent";
   version: number;
   created_by: string;
@@ -1385,6 +1414,15 @@ export interface StoryBlock {
   created_at: string;
   updated_at: string;
 }
+
+export type StoryBlock =
+  | (StoryBlockBase & { kind: "markdown"; content: MarkdownBlockContent })
+  | (StoryBlockBase & { kind: "view_ref"; content: ViewRefBlockContent })
+  | (StoryBlockBase & { kind: "chart_ref"; content: ChartRefBlockContent })
+  | (StoryBlockBase & { kind: "event_ref"; content: EventRefBlockContent });
+
+/** One variant of `StoryBlock`, selected by kind. */
+export type StoryBlockOf<K extends StoryBlockKind> = Extract<StoryBlock, { kind: K }>;
 
 export interface StoryExportMeta {
   id: string;
@@ -1397,14 +1435,69 @@ export interface StoryExportMeta {
   created_at: string;
 }
 
-export interface SnapshotBlock {
-  id: string;
-  kind: StoryBlockKind;
-  origin: string;
-  ref: Record<string, unknown>;
-  data: Record<string, unknown> | null;
-  resolution: { executed_at: string; timeline_id?: string; error: string | null };
+export interface SnapshotResolution {
+  executed_at: string;
+  timeline_id?: string;
+  error: string | null;
 }
+
+export interface SnapshotViewData {
+  rows: Record<string, unknown>[];
+  row_count_total: number;
+  rows_included: number;
+  truncated: boolean;
+  columns: string[] | null;
+}
+
+export interface SnapshotChartData {
+  name: string;
+  config: Record<string, unknown>;
+  /** The aggregation the server actually ran, which selects the mark. */
+  resolved: { data_kind: string; compare_mode: string } | null;
+  warnings: string[];
+  /** Raw aggregation payload — reshape via `snapshotToChartResult`, never cast. */
+  chart: unknown;
+}
+
+export interface SnapshotEventData {
+  event: Record<string, unknown>;
+  caption: string | null;
+}
+
+interface SnapshotBlockBase {
+  id: string;
+  origin: string;
+  resolution: SnapshotResolution;
+}
+
+/**
+ * One frozen block of an export snapshot, discriminated on `kind`.
+ *
+ * `data` is null exactly when the server could not resolve the block (see
+ * `resolution.error`) — that pairing is the "honest gap" contract, so both
+ * have to be checked together before rendering.
+ */
+export type SnapshotBlock =
+  | (SnapshotBlockBase & {
+      kind: "markdown";
+      ref: MarkdownBlockContent;
+      data: MarkdownBlockContent | null;
+    })
+  | (SnapshotBlockBase & {
+      kind: "view_ref";
+      ref: ViewRefBlockContent & { name?: string; query?: string; filter?: Record<string, unknown> };
+      data: SnapshotViewData | null;
+    })
+  | (SnapshotBlockBase & {
+      kind: "chart_ref";
+      ref: ChartRefBlockContent & { name?: string };
+      data: SnapshotChartData | null;
+    })
+  | (SnapshotBlockBase & {
+      kind: "event_ref";
+      ref: EventRefBlockContent;
+      data: SnapshotEventData | null;
+    });
 
 export interface StorySnapshot {
   v: 1;

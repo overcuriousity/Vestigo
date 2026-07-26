@@ -5,6 +5,7 @@ import { BASE } from "@/api/client";
 import { storiesApi } from "@/api/stories";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
+import { triggerDownload } from "@/lib/download";
 import { fmtTimestamp } from "@/lib/time";
 import { toast } from "@/stores/toasts";
 import { renderExportHtml } from "./exportHtml";
@@ -14,14 +15,12 @@ interface Props {
   storyId: string;
 }
 
-function download(name: string, content: string, type: string) {
-  const url = URL.createObjectURL(new Blob([content], { type }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(url);
-}
+/**
+ * Size at which the rendered artifact is worth warning about, well under the
+ * server's `VESTIGO_STORY_MAX_ARTIFACT_BYTES` (20 MB by default) so the
+ * warning arrives before the rejection does.
+ */
+const ARTIFACT_WARN_BYTES = 15 * 1024 * 1024;
 
 /**
  * Export controls and the log of past exports.
@@ -44,7 +43,17 @@ export function ExportsTab({ caseId, storyId }: Props) {
     mutationFn: async () => {
       setBusy(true);
       const created = await storiesApi.createExport(caseId, storyId);
-      const html = renderExportHtml(created.snapshot);
+      const html = renderExportHtml(created.snapshot, created.snapshot_hash);
+      // The artifact inlines the whole compiled stylesheet plus every frozen
+      // row, so a large story can exceed the server cap. Say so up front
+      // rather than letting the analyst discover a 413 in a toast — the
+      // snapshot itself is already stored and usable either way.
+      if (html.length > ARTIFACT_WARN_BYTES) {
+        toast.info(
+          "Large HTML artifact",
+          `${(html.length / 1024 / 1024).toFixed(1)} MB — the upload may be rejected; the snapshot JSON is unaffected.`,
+        );
+      }
       try {
         await storiesApi.uploadArtifact(caseId, storyId, created.id, html);
       } catch (err) {
@@ -56,7 +65,10 @@ export function ExportsTab({ caseId, storyId }: Props) {
     },
     onSuccess: ({ created, html }) => {
       qc.invalidateQueries({ queryKey: ["story-exports", caseId, storyId] });
-      download(`story-${storyId}-${created.id}.html`, html, "text/html");
+      triggerDownload(
+        new Blob([html], { type: "text/html" }),
+        `story-${storyId}-${created.id}.html`,
+      );
       toast.success("Export created", `snapshot ${created.snapshot_hash.slice(0, 12)}…`);
     },
     onError: (err) => toast.error("Export failed", (err as Error).message),
@@ -121,6 +133,7 @@ export function ExportsTab({ caseId, storyId }: Props) {
                     <div className="flex items-center gap-3">
                       <a
                         href={`${base}/${exp.id}/snapshot`}
+                        download={`story-${storyId}-${exp.id}.json`}
                         className="flex items-center gap-1 text-[var(--color-accent)] hover:underline"
                       >
                         <Download size={10} /> JSON
@@ -128,6 +141,7 @@ export function ExportsTab({ caseId, storyId }: Props) {
                       {exp.has_artifact ? (
                         <a
                           href={`${base}/${exp.id}/artifact`}
+                          download={`story-${storyId}-${exp.id}.html`}
                           className="flex items-center gap-1 text-[var(--color-accent)] hover:underline"
                         >
                           <Download size={10} /> HTML

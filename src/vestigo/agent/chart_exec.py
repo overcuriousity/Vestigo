@@ -16,6 +16,7 @@ field-vocabulary cache), the export resolver uses the defaults.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from fastapi.concurrency import run_in_threadpool
@@ -34,6 +35,71 @@ if TYPE_CHECKING:
     from vestigo.agent.tools import AgentScope, ChartSpec
 
 
+@dataclass(frozen=True)
+class ChartLimits:
+    """Per-option ``(default, cap)`` bounds for a chart execution.
+
+    Two callers execute the same spec for different audiences. The agent runs
+    a *validation* query whose result has to fit a context window, so it caps
+    hard. An export runs the *analyst's* chart and freezes the answer into an
+    attested report, so it must not silently show less than the interactive
+    card did. Same code path, different bounds — see ``AGENT_CHART_LIMITS``
+    and ``ANALYST_CHART_LIMITS``.
+
+    ``reason`` is the phrase appended to a clamp warning; it ends up in the
+    snapshot, so it has to describe the caller the reader is looking at.
+    """
+
+    reason: str
+    terms_top_n: tuple[int, int]
+    groups: tuple[int, int]
+    bins: tuple[int, int]
+    series_buckets: tuple[int, int]
+    series_top_n: tuple[int, int]
+    time_buckets: tuple[int, int]
+    pivot_limit: tuple[int, int]
+    scatter_sample: tuple[int, int]
+    corr_max_fields: int
+    points_overlay_max: int
+    group_cardinality_caution: int
+
+
+#: The agent's bounds: small, because every number here lands in the model's
+#: context. Values match what ``propose_chart`` always used.
+AGENT_CHART_LIMITS = ChartLimits(
+    reason="for this validation query (agent context budget); the analyst's card is not capped",
+    terms_top_n=(30, 30),
+    groups=(8, 8),
+    bins=(30, 30),
+    series_buckets=(30, 60),
+    series_top_n=(6, 8),
+    time_buckets=(30, 60),
+    pivot_limit=(8, 12),
+    scatter_sample=(300, 1000),
+    corr_max_fields=8,
+    points_overlay_max=1000,
+    group_cardinality_caution=50,
+)
+
+#: The analyst's bounds: the same defaults and ceilings the ``/api/viz/*``
+#: endpoints apply to the interactive card, so a frozen export shows what the
+#: analyst saw rather than an agent-sized subset of it.
+ANALYST_CHART_LIMITS = ChartLimits(
+    reason="to the analyst chart ceiling",
+    terms_top_n=(50, 500),
+    groups=(8, 8),
+    bins=(30, 200),
+    series_buckets=(60, 200),
+    series_top_n=(12, 50),
+    time_buckets=(60, 200),
+    pivot_limit=(10, 50),
+    scatter_sample=(5000, 20000),
+    corr_max_fields=8,
+    points_overlay_max=1000,
+    group_cardinality_caution=50,
+)
+
+
 async def execute_chart_spec(
     scope: AgentScope,
     spec: ChartSpec,
@@ -41,6 +107,7 @@ async def execute_chart_spec(
     service: Any = None,
     validated: Any = None,
     check_field: Any = None,
+    limits: ChartLimits | None = None,
 ) -> dict[str, Any]:
     """Validate and execute a chart spec against the scope's timeline.
 
@@ -49,23 +116,13 @@ async def execute_chart_spec(
     was compressed from, which the export resolver freezes into snapshots
     (``propose_chart`` drops it to protect the agent's context budget).
     Raises ValueError with an analyst-correctable message on an illegal spec.
+
+    ``limits`` defaults to ``AGENT_CHART_LIMITS``; the export resolver passes
+    ``ANALYST_CHART_LIMITS`` so a frozen chart matches the card it came from.
     """
-    from vestigo.agent.tools import (
-        VIZ_CORR_MAX_FIELDS,
-        VIZ_GROUP_CARDINALITY_CAUTION,
-        VIZ_GROUPS_MAX,
-        VIZ_MAX_BINS,
-        VIZ_MAX_BUCKETS,
-        VIZ_MAX_TERMS,
-        VIZ_PIVOT_MAX_LIMIT,
-        VIZ_POINTS_OVERLAY_MAX,
-        VIZ_SCATTER_MAX_POINTS,
-        VIZ_TIMESERIES_MAX_BUCKETS,
-        VIZ_TIMESERIES_MAX_SERIES,
-        FilterSpec,
-        _build_query,
-        _pie_readability_warning,
-    )
+    if limits is None:
+        limits = AGENT_CHART_LIMITS
+    from vestigo.agent.tools import FilterSpec, _build_query, _pie_readability_warning
 
     if service is None:
         from vestigo.api.routers.events import _get_query_service
@@ -153,7 +210,7 @@ async def execute_chart_spec(
         if not spec.fields or len(spec.fields) < 2:
             raise ValueError(
                 f'chart_type="{chart_type}" needs `fields`: 2-'
-                f"{VIZ_CORR_MAX_FIELDS} numeric field tokens to correlate. "
+                f"{limits.corr_max_fields} numeric field tokens to correlate. "
                 "`field`/`field_y` are not used by this chart."
             )
         if len(set(spec.fields)) != len(spec.fields):
@@ -162,17 +219,16 @@ async def execute_chart_spec(
         # answer a question the model never asked and label it the answer
         # to the one it did — the same rule (and wording) as the
         # field_correlation tool and the HTTP endpoint's 422.
-        if len(spec.fields) > VIZ_CORR_MAX_FIELDS:
+        if len(spec.fields) > limits.corr_max_fields:
             raise ValueError(
-                f"a correlation matrix needs between 2 and {VIZ_CORR_MAX_FIELDS} fields, "
+                f"a correlation matrix needs between 2 and {limits.corr_max_fields} fields, "
                 f"got {len(spec.fields)}. Correlate the most promising ones, or run "
                 "several matrices."
             )
     elif spec.fields:
         multi = [c for c in CHART_META if CHART_META[c].multi_field]
         raise ValueError(
-            f'chart_type="{chart_type}" takes no `fields` list. '
-            f"Charts that do: {', '.join(multi)}."
+            f'chart_type="{chart_type}" takes no `fields` list. Charts that do: {", ".join(multi)}.'
         )
 
     compare_on = spec.compare.mode != "off"
@@ -218,13 +274,11 @@ async def execute_chart_spec(
     for token in spec.fields or []:
         await check_field(token, "fields")
 
-    def _capped(value: int | None, default: int, cap: int, name: str, floor: int = 1) -> int:
+    def _capped(value: int | None, bounds: tuple[int, int], name: str, floor: int = 1) -> int:
+        default, cap = bounds
         resolved = max(floor, min(value or default, cap))
         if value is not None and resolved != value:
-            warnings.append(
-                f"options.{name}={value} clamped to {resolved} for this validation "
-                "query (agent context budget); the analyst's card is not capped."
-            )
+            warnings.append(f"options.{name}={value} clamped to {resolved} {limits.reason}.")
         return resolved
 
     primary_filters = validated(spec.filters)
@@ -246,7 +300,7 @@ async def execute_chart_spec(
 
     # ── execute, dispatching on the aggregation the mark needs ───────────
     if data_kind == "terms":
-        applied["top_n"] = _capped(opts.top_n, 30, VIZ_MAX_TERMS, "top_n")
+        applied["top_n"] = _capped(opts.top_n, limits.terms_top_n, "top_n")
         if comparison_query is not None:
             result = await run_in_threadpool(
                 service.compare_field_terms,
@@ -275,8 +329,8 @@ async def execute_chart_spec(
                     warnings.append(readability)
     elif data_kind == "numeric" and spec.field_y and meta.accepts_second_field:
         # Grouped box/violin: numeric response × categorical grouping field.
-        applied["groups"] = _capped(opts.groups, 8, VIZ_GROUPS_MAX, "groups", floor=2)
-        applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
+        applied["groups"] = _capped(opts.groups, limits.groups, "groups", floor=2)
+        applied["bins"] = _capped(opts.bins, limits.bins, "bins")
         result = await run_in_threadpool(
             service.field_numeric_grouped,
             primary_query,
@@ -285,7 +339,7 @@ async def execute_chart_spec(
             applied["groups"],
             applied["bins"],
             bool(opts.show_points),
-            VIZ_POINTS_OVERLAY_MAX,
+            limits.points_overlay_max,
         )
         if not result["total"]:
             raise ValueError(
@@ -314,7 +368,7 @@ async def execute_chart_spec(
         # Advisory, like the pie rule: a grouping variable with hundreds of
         # values is usually an identifier, and a box per identifier is not
         # a comparison. Never a refusal — the analyst may know better.
-        if result["distinct_groups"] > VIZ_GROUP_CARDINALITY_CAUTION:
+        if result["distinct_groups"] > limits.group_cardinality_caution:
             warnings.append(
                 f'"{spec.field_y}" has {result["distinct_groups"]} distinct values — '
                 "that looks like an identifier rather than a grouping variable, and "
@@ -326,7 +380,7 @@ async def execute_chart_spec(
             # The comparison aggregation has no auto-bin path (shared bin
             # edges are negotiated between the two layers), so an omitted
             # bins falls back to the manual default.
-            applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
+            applied["bins"] = _capped(opts.bins, limits.bins, "bins")
             result = await run_in_threadpool(
                 service.compare_field_numeric,
                 primary_query,
@@ -341,9 +395,7 @@ async def execute_chart_spec(
         else:
             # bins omitted → the service picks Freedman–Diaconis; echo the
             # resolved count so the model knows what will be drawn.
-            bins_arg = (
-                _capped(opts.bins, 30, VIZ_MAX_BINS, "bins") if opts.bins is not None else None
-            )
+            bins_arg = _capped(opts.bins, limits.bins, "bins") if opts.bins is not None else None
             result = await run_in_threadpool(
                 service.field_numeric_stats, primary_query, spec.field, bins_arg
             )
@@ -363,10 +415,8 @@ async def execute_chart_spec(
                 "skewness": result.get("skewness"),
             }
     elif data_kind == "timeseries":
-        applied["buckets"] = _capped(
-            opts.buckets, 30, VIZ_TIMESERIES_MAX_BUCKETS, "buckets", floor=4
-        )
-        applied["top_n"] = _capped(opts.top_n, 6, VIZ_TIMESERIES_MAX_SERIES, "top_n")
+        applied["buckets"] = _capped(opts.buckets, limits.series_buckets, "buckets", floor=4)
+        applied["top_n"] = _capped(opts.top_n, limits.series_top_n, "top_n")
         result = await run_in_threadpool(
             service.field_value_timeseries,
             primary_query,
@@ -379,7 +429,7 @@ async def execute_chart_spec(
             "interval_seconds": result["interval_seconds"],
         }
     elif data_kind == "time":
-        applied["buckets"] = _capped(opts.buckets, 30, VIZ_MAX_BUCKETS, "buckets", floor=4)
+        applied["buckets"] = _capped(opts.buckets, limits.time_buckets, "buckets", floor=4)
         if comparison_query is not None:
             result = await run_in_threadpool(
                 service.compare_time_histogram,
@@ -401,8 +451,8 @@ async def execute_chart_spec(
         result = await run_in_threadpool(service.time_punchcard, primary_query)
         summary = {"total": result["total"], "max_count": result["max_count"]}
     elif data_kind == "pivot":
-        applied["limit_x"] = _capped(opts.limit_x, 8, VIZ_PIVOT_MAX_LIMIT, "limit_x")
-        applied["limit_y"] = _capped(opts.limit_y, 8, VIZ_PIVOT_MAX_LIMIT, "limit_y")
+        applied["limit_x"] = _capped(opts.limit_x, limits.pivot_limit, "limit_x")
+        applied["limit_y"] = _capped(opts.limit_y, limits.pivot_limit, "limit_y")
         result = await run_in_threadpool(
             service.field_pivot,
             primary_query,
@@ -443,7 +493,7 @@ async def execute_chart_spec(
             "matrix_size": len(result["x_values"]) * len(result["y_values"]),
         }
     elif data_kind == "corr":
-        # `fields` is already validated (2–VIZ_CORR_MAX_FIELDS, distinct)
+        # `fields` is already validated (2–limits.corr_max_fields, distinct)
         # by the multi_field guard above, so no capping happens here.
         fields = spec.fields or []
         result = await run_in_threadpool(service.field_correlation, primary_query, fields)
@@ -468,9 +518,7 @@ async def execute_chart_spec(
             "dropped_fields": dropped,
         }
     else:  # scatter
-        applied["sample_limit"] = _capped(
-            opts.sample_limit, 300, VIZ_SCATTER_MAX_POINTS, "sample_limit"
-        )
+        applied["sample_limit"] = _capped(opts.sample_limit, limits.scatter_sample, "sample_limit")
         result = await run_in_threadpool(
             service.field_scatter,
             primary_query,

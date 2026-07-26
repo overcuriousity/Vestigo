@@ -2470,7 +2470,16 @@ def test_confirm_story_block_inline_chart_creates_saved_chart(
     chart = asyncio.run(store.get_saved_chart(case_id, timeline_id, chart_id))
     assert chart is not None
     assert chart.name == "Top ports"
-    assert chart.config["chart_type"] == "bar"
+    # SavedChart.config is the frontend's versioned camelCase ChartConfig, not
+    # the agent's snake_case ChartSpec. Storing the spec dump produced a chart
+    # that every consumer refused to draw, with no error at write time.
+    assert chart.config["v"] == 1
+    assert chart.config["chartType"] == "bar"
+    assert chart.config["field"] == "port"
+    # And it must survive the trip back into an executable spec.
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    assert _stored_chart_to_spec(chart.config).chart_type == "bar"
 
 
 def test_confirm_story_block_story_deleted(client, admin_bootstrap, agent_on, store):

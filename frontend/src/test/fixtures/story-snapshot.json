@@ -12,28 +12,43 @@
       "id": "b1",
       "kind": "markdown",
       "origin": "user",
-      "ref": { "text": "## Initial access" },
-      "data": { "text": "## Initial access\n\nBrute force against the VPN gateway." },
-      "resolution": { "executed_at": "2026-07-26T12:00:00+00:00", "error": null }
+      "ref": {
+        "text": "## Initial access"
+      },
+      "data": {
+        "text": "## Initial access\n\nBrute force against the VPN gateway."
+      },
+      "resolution": {
+        "executed_at": "2026-07-26T12:00:00+00:00",
+        "error": null
+      }
     },
     {
       "id": "b2",
       "kind": "view_ref",
       "origin": "user",
-      "ref": { "view_id": "v1", "timeline_id": "t1", "name": "Failed logins" },
+      "ref": {
+        "view_id": "v1",
+        "timeline_id": "t1",
+        "name": "Failed logins"
+      },
       "data": {
         "rows": [
           {
             "event_id": "e1",
             "timestamp": "2026-07-20T04:11:00+00:00",
             "message": "Failed password for invalid user admin",
-            "attributes": { "src_ip": "203.0.113.9" }
+            "attributes": {
+              "src_ip": "203.0.113.9"
+            }
           },
           {
             "event_id": "e2",
             "timestamp": "2026-07-20T04:11:02+00:00",
             "message": "Failed password for invalid user root",
-            "attributes": { "src_ip": "203.0.113.9" }
+            "attributes": {
+              "src_ip": "203.0.113.9"
+            }
           }
         ],
         "row_count_total": 14203,
@@ -51,18 +66,37 @@
       "id": "b3",
       "kind": "chart_ref",
       "origin": "agent",
-      "ref": { "chart_id": "ch1", "timeline_id": "t1", "name": "Top source IPs" },
+      "ref": {
+        "chart_id": "ch1",
+        "timeline_id": "t1",
+        "name": "Top source IPs"
+      },
       "data": {
         "name": "Top source IPs",
-        "config": { "v": 1, "chartType": "bar", "scale": "nominal", "field": "src_ip" },
-        "resolved": { "data_kind": "terms", "compare_mode": "off", "chart_type": "bar" },
+        "config": {
+          "v": 1,
+          "chartType": "bar",
+          "scale": "nominal",
+          "field": "src_ip"
+        },
+        "resolved": {
+          "data_kind": "terms",
+          "compare_mode": "off",
+          "chart_type": "bar"
+        },
         "warnings": [],
         "chart": {
           "total": 240,
           "distinct": 2,
           "values": [
-            { "value": "203.0.113.9", "count": 200 },
-            { "value": "198.51.100.4", "count": 40 }
+            {
+              "value": "203.0.113.9",
+              "count": 200
+            },
+            {
+              "value": "198.51.100.4",
+              "count": 40
+            }
           ]
         }
       },
@@ -76,7 +110,11 @@
       "id": "b4",
       "kind": "event_ref",
       "origin": "user",
-      "ref": { "event_id": "e9", "source_id": "s9", "caption": "first successful login" },
+      "ref": {
+        "event_id": "e9",
+        "source_id": "s9",
+        "caption": "first successful login"
+      },
       "data": {
         "event": {
           "event_id": "e9",
@@ -86,13 +124,77 @@
         },
         "caption": "first successful login"
       },
-      "resolution": { "executed_at": "2026-07-26T12:00:00+00:00", "error": null }
+      "resolution": {
+        "executed_at": "2026-07-26T12:00:00+00:00",
+        "error": null
+      }
+    },
+    {
+      "id": "b6",
+      "kind": "chart_ref",
+      "origin": "user",
+      "ref": {
+        "chart_id": "ch2",
+        "timeline_id": "t1",
+        "name": "Events over time"
+      },
+      "data": {
+        "name": "Events over time",
+        "config": {
+          "v": 1,
+          "chartType": "time",
+          "scale": "nominal",
+          "field": null,
+          "fieldY": null,
+          "fields": null,
+          "metric": "count",
+          "compare": {
+            "mode": "off"
+          },
+          "options": {
+            "buckets": 3
+          }
+        },
+        "resolved": {
+          "data_kind": "time",
+          "compare_mode": "off",
+          "chart_type": "time"
+        },
+        "warnings": [],
+        "chart": {
+          "interval_seconds": 3600,
+          "min": "2026-07-20T00:00:00+00:00",
+          "max": "2026-07-20T03:00:00+00:00",
+          "buckets": [
+            {
+              "start": "2026-07-20T00:00:00+00:00",
+              "count": 41
+            },
+            {
+              "start": "2026-07-20T01:00:00+00:00",
+              "count": 7
+            },
+            {
+              "start": "2026-07-20T02:00:00+00:00",
+              "count": 512
+            }
+          ]
+        }
+      },
+      "resolution": {
+        "executed_at": "2026-07-26T12:00:00+00:00",
+        "error": null,
+        "timeline_id": "t1"
+      }
     },
     {
       "id": "b5",
       "kind": "view_ref",
       "origin": "user",
-      "ref": { "view_id": "gone", "timeline_id": "t1" },
+      "ref": {
+        "view_id": "gone",
+        "timeline_id": "t1"
+      },
       "data": null,
       "resolution": {
         "executed_at": "2026-07-26T12:00:00+00:00",

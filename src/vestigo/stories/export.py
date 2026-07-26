@@ -17,6 +17,7 @@ tests; production callers pass none of them.
 
 from __future__ import annotations
 
+import math
 import uuid
 from collections.abc import Callable
 from datetime import UTC, date, datetime
@@ -39,6 +40,16 @@ def _json_safe(value: Any) -> Any:
     anything that cannot round-trip has to be coerced here rather than
     blowing up the export — or, worse, hashing a payload that later reads
     back differently.
+
+    Two coercions are less obvious than they look:
+
+    * ``NaN``/``Infinity`` are not JSON. Python emits them as bare literals
+      that no conforming parser accepts, Postgres rejects them on insert, and
+      the hash would cover bytes nobody can re-parse. They become ``None`` —
+      "this aggregate had no defined value", which is what they mean.
+    * A ``set`` iterates in an order that varies between processes, so
+      freezing one as a list would make the snapshot (and its hash)
+      irreproducible. Sorted by string form to pin it down.
     """
     if isinstance(value, bytes):
         try:
@@ -48,16 +59,36 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime | date):
         return value.isoformat()
     if isinstance(value, Decimal):
-        return float(value)
+        value = float(value)
     if isinstance(value, uuid.UUID):
         return str(value)
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list | tuple | set):
+    if isinstance(value, set | frozenset):
+        return sorted((_json_safe(v) for v in value), key=repr)
+    if isinstance(value, list | tuple):
         return [_json_safe(v) for v in value]
-    if isinstance(value, str | int | float | bool) or value is None:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, str | int | float):
         return value
     return str(value)
+
+
+def _validate_filters(fspec):
+    """Run the Explorer's regex checks over a FilterSpec, returning it.
+
+    Mirrors the ``validated`` helper ``execute_chart_spec`` builds; kept here
+    so the view-block path can't drift away from the chart path.
+    """
+    from vestigo.api.routers.events import _validate_field_regexes, _validate_regex
+
+    _validate_regex(fspec.q, fspec.q_regex)
+    _validate_field_regexes(fspec.filters, fspec.filter_modes)
+    _validate_field_regexes(fspec.exclusions, fspec.exclusion_modes)
+    return fspec
 
 
 def _view_filter_to_spec(view: View):
@@ -152,12 +183,21 @@ _CHART_OPTION_KEYS = {
 }
 
 
+#: Version stamp on a stored ``ChartConfig``. The frontend refuses to draw a
+#: config carrying any other value (``parseStoredChartConfig``), so anything
+#: writing a SavedChart has to set it.
+CHART_CONFIG_VERSION = 1
+
+
 def _stored_chart_to_spec(config: dict[str, Any]):
     """Translate a saved chart's stored config into an executable ChartSpec.
 
     ``SavedChart.config`` is the frontend's own ``ChartConfig`` round-tripped
     verbatim (the backend never interprets it), so executing one server-side
     means crossing the casing boundary exactly once — here.
+    ``spec_to_stored_chart_config`` is the inverse; the two are tested as a
+    round trip, because a config written in the wrong shape produces a chart
+    that is silently undrawable in every consumer rather than an error.
     """
     from vestigo.agent.tools import ChartSpec
 
@@ -184,6 +224,73 @@ def _stored_chart_to_spec(config: dict[str, Any]):
             spec["compare"]["filters"] = _filter_payload_to_spec(compare.get("filters") or {})
 
     return ChartSpec.model_validate(spec)
+
+
+def _spec_filters_to_payload(fspec: Any) -> dict[str, Any]:
+    """Inverse of ``_filter_payload_to_spec``: FilterSpec → stored filter payload."""
+    payload: dict[str, Any] = {}
+    if fspec is None:
+        return payload
+    simple = {
+        "q": fspec.q,
+        "qRegex": fspec.q_regex or None,
+        "artifacts": list(fspec.artifacts) if fspec.artifacts else None,
+        "sourceId": fspec.source_id,
+        "start": fspec.start.isoformat() if fspec.start else None,
+        "end": fspec.end.isoformat() if fspec.end else None,
+        "filters": dict(fspec.filters) if fspec.filters else None,
+        "exclusions": dict(fspec.exclusions) if fspec.exclusions else None,
+        "filterModes": dict(fspec.filter_modes) if fspec.filter_modes else None,
+        "exclusionModes": dict(fspec.exclusion_modes) if fspec.exclusion_modes else None,
+        "tagsInclude": list(fspec.tags_include) if fspec.tags_include else None,
+        "tagsExclude": list(fspec.tags_exclude) if fspec.tags_exclude else None,
+        "annotated": list(fspec.annotated) if fspec.annotated else None,
+        "annotationTagValue": fspec.annotation_tag_value,
+    }
+    return {**payload, **{k: v for k, v in simple.items() if v is not None}}
+
+
+def spec_to_stored_chart_config(spec: Any, *, base_filters_allowed: bool = False) -> dict[str, Any]:
+    """Translate an agent ``ChartSpec`` into a stored ``ChartConfig``.
+
+    The exact inverse of ``_stored_chart_to_spec``. Needed because the agent
+    speaks ``ChartSpec`` (snake_case, unversioned) while a persisted
+    ``SavedChart.config`` is the frontend's ``ChartConfig`` (camelCase,
+    ``v: 1``) — storing the spec's dump directly produces a row that the
+    export resolver, the story editor card and the Visualize rail all refuse
+    to draw, with no error at write time.
+
+    ``spec.filters`` (a chart-local base filter set) has no representation in
+    ``ChartConfig`` — a saved chart takes its filters from the Explorer state
+    it was saved from. Rather than drop them silently, this raises unless the
+    caller opts in with ``base_filters_allowed``.
+    """
+    if spec.filters is not None and not base_filters_allowed:
+        raise ValueError(
+            "a saved chart cannot carry chart-local base filters; "
+            "save the chart from the filtered Explorer view instead"
+        )
+    config: dict[str, Any] = {"v": CHART_CONFIG_VERSION}
+    for stored_key, spec_key in _CHART_CONFIG_KEYS.items():
+        value = getattr(spec, spec_key, None)
+        if value is not None:
+            config[stored_key] = value
+
+    dumped_options = spec.options.model_dump() if spec.options is not None else {}
+    options = {
+        stored_key: dumped_options[spec_key]
+        for stored_key, spec_key in _CHART_OPTION_KEYS.items()
+        if dumped_options.get(spec_key) is not None
+    }
+    config["options"] = options
+
+    mode = getattr(spec.compare, "mode", "off") if spec.compare is not None else "off"
+    if mode != "off":
+        compare: dict[str, Any] = {"mode": mode}
+        if mode == "custom":
+            compare["filters"] = _spec_filters_to_payload(spec.compare.filters)
+        config["compare"] = compare
+    return config
 
 
 async def resolve_story_snapshot(
@@ -238,9 +345,16 @@ async def resolve_story_snapshot(
             return _sync_query(query)
 
     if run_chart is None:
-        from vestigo.agent.chart_exec import execute_chart_spec
+        from functools import partial
 
-        run_chart = execute_chart_spec
+        from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS, execute_chart_spec
+
+        # An export freezes the *analyst's* chart, so it runs under the same
+        # defaults and ceilings as the interactive card. Executing it under
+        # the agent's context-budget caps would quietly show less than the
+        # analyst saw — a top-50 bar chart frozen as top-30 — and leak the
+        # agent-facing clamp wording into the report.
+        run_chart = partial(execute_chart_spec, limits=ANALYST_CHART_LIMITS)
 
     scope_cache: dict[str, AgentScope] = {}
 
@@ -270,7 +384,11 @@ async def resolve_story_snapshot(
         scope = await _scope_for(timeline_id)
         display = content.get("display") or {}
         limit = int(display.get("limit") or 200)
-        query = await _build_query(scope, _view_filter_to_spec(view))
+        # Same regex validation every interactive path applies before building
+        # a query — a stored View can carry a pattern that was never checked
+        # by this code path, and the asymmetry becomes a hole the moment the
+        # validator grows a rule that matters.
+        query = await _build_query(scope, _validate_filters(_view_filter_to_spec(view)))
         # _build_query clamps limit to the agent's per-search context cap;
         # export blocks carry their own (validated ≤ VIEW_BLOCK_ROW_CAP).
         query.limit = limit

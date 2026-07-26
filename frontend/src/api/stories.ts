@@ -7,6 +7,12 @@ import type {
   StorySnapshot,
 } from "./types";
 
+/** A story plus its blocks in document order — the story-editor query's shape. */
+export interface StoryWithBlocks {
+  story: Story;
+  blocks: StoryBlock[];
+}
+
 export const storiesApi = {
   list: (caseId: string) =>
     get<{ stories: Story[] }>(`/cases/${caseId}/stories`).then((r) => r.stories),
@@ -17,7 +23,7 @@ export const storiesApi = {
     ),
 
   getWithBlocks: (caseId: string, storyId: string) =>
-    get<{ story: Story; blocks: StoryBlock[] }>(`/cases/${caseId}/stories/${storyId}`),
+    get<StoryWithBlocks>(`/cases/${caseId}/stories/${storyId}`),
 
   update: (caseId: string, storyId: string, body: { title?: string; description?: string }) =>
     patch<{ story: Story }>(`/cases/${caseId}/stories/${storyId}`, body).then((r) => r.story),

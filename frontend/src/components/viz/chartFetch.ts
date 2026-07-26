@@ -15,6 +15,15 @@ import type {
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
+  FieldCorrelationResponse,
+  FieldNumericGroupedResponse,
+  FieldNumericResponse,
+  FieldPivotResponse,
+  FieldScatterResponse,
+  FieldTermsResponse,
+  FieldTimeseriesResponse,
+  HistogramResponse,
+  PunchcardResponse,
 } from "@/api/types";
 
 /**
@@ -182,3 +191,69 @@ export async function fetchChartData(
 
 /** Discriminated aggregation payload a chart is drawn from. */
 export type ChartResult = Awaited<ReturnType<typeof fetchChartData>>;
+
+/** The aggregation the server recorded having run, as frozen in a snapshot. */
+export type FrozenChartKind =
+  | "terms"
+  | "numeric"
+  | "timeseries"
+  | "time"
+  | "punchcard"
+  | "pivot"
+  | "corr"
+  | "scatter";
+
+/**
+ * Rebuild a `ChartResult` from a snapshot's frozen aggregation.
+ *
+ * The live path does more than name the payload — for an uncompared time
+ * chart it runs the raw histogram (`{buckets: [{start, count}]}`) through
+ * `histogramToCompare` before any mark sees it. Handing the frozen histogram
+ * straight to the mark produces a chart of `undefined` bars, silently, in
+ * every export. This is the one place that reshaping happens for snapshots,
+ * and the return type is the real union rather than a cast, so a future
+ * divergence between the two paths is a build failure.
+ *
+ * Returns null when the frozen payload doesn't match any known aggregation.
+ */
+export function snapshotToChartResult(
+  dataKind: string,
+  compareMode: string,
+  config: ChartConfig,
+  frozen: unknown,
+): ChartResult | null {
+  const compare = compareMode !== "off";
+  const grouped = !!CHART_META[config.chartType].acceptsSecondField && !!config.fieldY;
+  switch (dataKind as FrozenChartKind) {
+    case "terms":
+      return compare
+        ? { kind: "terms", compare: true, data: frozen as CompareTermsResponse }
+        : { kind: "terms", compare: false, data: frozen as FieldTermsResponse };
+    case "numeric":
+      if (grouped) {
+        return { kind: "numeric_grouped", data: frozen as FieldNumericGroupedResponse };
+      }
+      return compare
+        ? { kind: "numeric", compare: true, data: frozen as CompareNumericResponse }
+        : { kind: "numeric", compare: false, data: frozen as FieldNumericResponse };
+    case "timeseries":
+      return { kind: "timeseries", data: frozen as FieldTimeseriesResponse };
+    case "time":
+      return {
+        kind: "time",
+        data: compare
+          ? (frozen as CompareTimeResponse)
+          : histogramToCompare(frozen as HistogramResponse),
+      };
+    case "punchcard":
+      return { kind: "punchcard", data: frozen as PunchcardResponse };
+    case "pivot":
+      return { kind: "pivot", data: frozen as FieldPivotResponse };
+    case "corr":
+      return { kind: "corr", data: frozen as FieldCorrelationResponse };
+    case "scatter":
+      return { kind: "scatter", data: frozen as FieldScatterResponse };
+    default:
+      return null;
+  }
+}

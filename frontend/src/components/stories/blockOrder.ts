@@ -1,8 +1,35 @@
 import type { StoryBlock } from "@/api/types";
 
-/** Blocks in document order (server positions ascending). */
+/**
+ * Blocks in document order (server positions ascending).
+ *
+ * `id` breaks ties, matching the server's ordering, so the document never
+ * reshuffles between polls on a database written before positions were
+ * unique per story.
+ */
 export function sortBlocks(blocks: StoryBlock[]): StoryBlock[] {
-  return [...blocks].sort((a, b) => a.position - b.position);
+  return [...blocks].sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
+}
+
+/**
+ * Apply a move to a local block list, for the optimistic reorder.
+ *
+ * Mirrors the server's `after_block_id` semantics (null = top of document)
+ * so the optimistic order matches what the server will return — otherwise
+ * the block visibly jumps twice.
+ */
+export function reorderLocally(
+  sorted: StoryBlock[],
+  movingId: string,
+  afterBlockId: string | null,
+): StoryBlock[] {
+  const moving = sorted.find((b) => b.id === movingId);
+  if (!moving) return sorted;
+  const others = sorted.filter((b) => b.id !== movingId);
+  if (afterBlockId === null) return [moving, ...others];
+  const anchor = others.findIndex((b) => b.id === afterBlockId);
+  if (anchor < 0) return sorted;
+  return [...others.slice(0, anchor + 1), moving, ...others.slice(anchor + 1)];
 }
 
 /**

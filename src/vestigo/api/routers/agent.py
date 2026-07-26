@@ -1025,12 +1025,25 @@ async def _apply_story_block_proposal(
         block_kind = payload.get("block_kind")
         content = dict(payload.get("content") or {})
         if block_kind == "chart_ref" and "chart_spec" in content:
+            from vestigo.agent.tools import ChartSpec
+            from vestigo.stories.export import spec_to_stored_chart_config
+
+            # ``SavedChart.config`` is the frontend's versioned camelCase
+            # ChartConfig, not the agent's ChartSpec — storing the spec's dump
+            # produces a chart no consumer can draw (and no error until the
+            # analyst opens it). Proposals made before ``chart_config`` was
+            # carried in the payload are converted here instead.
+            chart_config = content.get("chart_config")
+            if not chart_config:
+                chart_config = spec_to_stored_chart_config(
+                    ChartSpec.model_validate(content["chart_spec"])
+                )
             chart = await store.create_saved_chart(
                 case_id,
                 decided.timeline_id,
                 _uuid.uuid4().hex,
                 content.get("name") or "Agent chart",
-                content["chart_spec"],
+                chart_config,
             )
             content = {"chart_id": chart.id, "timeline_id": decided.timeline_id}
         try:
@@ -1109,9 +1122,7 @@ async def confirm_proposal(
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
 
     if decided.kind == "story_block":
-        return await _apply_story_block_proposal(
-            store, decided, case_id, conversation_id, user
-        )
+        return await _apply_story_block_proposal(store, decided, case_id, conversation_id, user)
 
     scope = await build_scope(case_id, conversation.timeline_id, user)
     found, unknown = await _proposal_resolver()(scope, [e["event_id"] for e in decided.events])

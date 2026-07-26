@@ -12,10 +12,15 @@ import { Link } from "react-router-dom";
 import { BookOpenText, CircleCheck, CircleX } from "lucide-react";
 import { agentApi, type AgentProposal } from "@/api/agent";
 import { ApiError } from "@/api/client";
+import { eventsApi } from "@/api/events";
 import { storiesApi } from "@/api/stories";
+import { viewsApi } from "@/api/views";
+import { savedChartsApi } from "@/api/viz";
+import { useTimelineForSource } from "@/hooks/useTimelineForSource";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useUserNames } from "@/hooks/useUserNames";
+import { fmtTimestamp } from "@/lib/time";
 import { toast } from "@/stores/toasts";
 import { Markdown } from "./Markdown";
 
@@ -31,6 +36,90 @@ const KIND_LABEL: Record<string, string> = {
   chart_ref: "chart",
   event_ref: "event",
 };
+
+/**
+ * What the analyst is actually signing off on, for an embed proposal.
+ *
+ * This is the human confirm gate for an agent write, and it used to print
+ * `JSON.stringify(content)` — `{"view_id":"a3f9…","timeline_id":"7c2…"}` tells
+ * nobody anything. The referenced object is resolved by name (and, for an
+ * event, by its message) so the decision can be made on what the block will
+ * show rather than on opaque ids. Deliberately not the full editor card: a
+ * 200-row table inside a chat message is not a preview.
+ */
+function ProposedEmbed({
+  caseId,
+  blockKind,
+  content,
+}: {
+  caseId: string;
+  blockKind: string;
+  content: Record<string, unknown>;
+}) {
+  const timelineId = content.timeline_id as string | undefined;
+  const sourceId = content.source_id as string | undefined;
+
+  const viewsQuery = useQuery({
+    queryKey: ["views", caseId],
+    queryFn: () => viewsApi.list(caseId),
+    enabled: blockKind === "view_ref",
+  });
+  const chartsQuery = useQuery({
+    queryKey: ["viz-saved-charts", caseId, timelineId],
+    queryFn: () => savedChartsApi.list(caseId, timelineId!),
+    enabled: blockKind === "chart_ref" && !!timelineId,
+  });
+  const { timelineId: eventTimelineId } = useTimelineForSource(caseId, sourceId ?? "");
+  const eventQuery = useQuery({
+    queryKey: ["story-event", caseId, eventTimelineId, content.event_id],
+    queryFn: () => eventsApi.getById(caseId, eventTimelineId!, content.event_id as string),
+    enabled: blockKind === "event_ref" && !!eventTimelineId,
+  });
+
+  const active =
+    blockKind === "view_ref" ? viewsQuery : blockKind === "chart_ref" ? chartsQuery : eventQuery;
+  if (active.isLoading) return <Spinner size={12} />;
+
+  if (blockKind === "view_ref") {
+    const view = viewsQuery.data?.find((v) => v.id === content.view_id);
+    if (!view) return <Missing what="saved view" />;
+    return (
+      <p className="text-[var(--color-fg-secondary)]">
+        Saved view <span className="font-medium">{view.name}</span>
+        {view.query ? <> · query “{view.query}”</> : null}
+      </p>
+    );
+  }
+  if (blockKind === "chart_ref") {
+    const chart = chartsQuery.data?.charts.find((c) => c.id === content.chart_id);
+    if (!chart) return <Missing what="chart" />;
+    return (
+      <p className="text-[var(--color-fg-secondary)]">
+        Chart <span className="font-medium">{chart.name}</span>
+      </p>
+    );
+  }
+  const ev = eventQuery.data;
+  if (!ev) return <Missing what="event" />;
+  return (
+    <div className="space-y-0.5">
+      <p className="font-mono text-[10px] text-[var(--color-fg-muted)]">
+        {ev.timestamp ? fmtTimestamp(ev.timestamp) : "no timestamp"}
+      </p>
+      <p className="break-words font-mono text-[10px] text-[var(--color-fg-secondary)]">
+        {ev.message}
+      </p>
+    </div>
+  );
+}
+
+function Missing({ what }: { what: string }) {
+  return (
+    <p className="text-[var(--color-warning)]">
+      The proposed {what} no longer exists — confirming will not add anything.
+    </p>
+  );
+}
 
 export function StoryBlockProposalCard({ caseId, conversationId, proposal }: Props) {
   const queryClient = useQueryClient();
@@ -123,9 +212,7 @@ export function StoryBlockProposalCard({ caseId, conversationId, proposal }: Pro
             you confirm.
           </p>
         ) : (
-          <p className="font-mono text-[10px] text-[var(--color-fg-secondary)]">
-            {JSON.stringify(content)}
-          </p>
+          <ProposedEmbed caseId={caseId} blockKind={blockKind} content={content} />
         )}
       </div>
 

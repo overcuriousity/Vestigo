@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import type { StoryBlock } from "@/api/types";
+import type { StoryBlockOf } from "@/api/types";
 import { Markdown } from "@/components/agent/Markdown";
 import { Button } from "@/components/ui/Button";
 
 interface Props {
-  block: StoryBlock;
+  block: StoryBlockOf<"markdown">;
   /** Save the draft against the given base version. */
   onSave: (text: string, version: number) => void;
   /**
@@ -12,7 +12,7 @@ interface Props {
    * there is no open conflict. While set, the draft is kept and the user
    * chooses.
    */
-  conflict: StoryBlock | null;
+  conflict: StoryBlockOf<"markdown"> | null;
   onResolveConflict: (choice: "theirs" | "mine") => void;
   /** Report enter/leave of edit mode so polling never clobbers a draft. */
   onEditingChange: (editing: boolean) => void;
@@ -25,21 +25,38 @@ interface Props {
 export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEditingChange }: Props) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  /**
+   * The block as it stood when this edit began. `block` is a live prop from
+   * the story poll, so reading `block.version` at save time would send
+   * whatever version the last poll happened to fetch — including a
+   * collaborator's. The server's check would then pass and their edit would
+   * be destroyed with no 409 and no conflict UI. Since a paragraph routinely
+   * takes longer to write than the poll interval, that is the common case,
+   * not the rare one.
+   */
+  const [base, setBase] = useState<{ version: number; text: string } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const text = (block.content.text as string) ?? "";
+  const text = block.content.text ?? "";
 
   useEffect(() => {
     onEditingChange(editing);
   }, [editing, onEditingChange]);
 
   const startEdit = () => {
+    setBase({ version: block.version, text });
     setDraft(text);
     setEditing(true);
   };
 
   const save = () => {
     setEditing(false);
-    if (draft !== text) onSave(draft, block.version);
+    if (base && draft !== base.text) onSave(draft, base.version);
+    setBase(null);
+  };
+
+  const cancel = () => {
+    setEditing(false);
+    setBase(null);
   };
 
   if (conflict) {
@@ -52,7 +69,7 @@ export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEd
           <p className="mb-1 text-[10px] uppercase tracking-wider text-[var(--color-fg-muted)]">
             Their version
           </p>
-          <Markdown content={(conflict.content.text as string) ?? ""} />
+          <Markdown content={conflict.content.text ?? ""} />
         </div>
         <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2">
           <p className="mb-1 text-[10px] uppercase tracking-wider text-[var(--color-fg-muted)]">
@@ -95,7 +112,12 @@ export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEd
             save();
           }
           if (e.key === "Escape") {
-            setEditing(false);
+            // Escape throws the draft away, so only do it silently when
+            // there is nothing to throw away.
+            if (base && draft !== base.text) {
+              if (!window.confirm("Discard your unsaved changes to this block?")) return;
+            }
+            cancel();
           }
         }}
       />
@@ -103,21 +125,27 @@ export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEd
   }
 
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      title="Click to edit"
-      className="cursor-text text-sm"
-      onClick={startEdit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") startEdit();
-      }}
-    >
+    // Not role="button": the rendered markdown can contain its own links, and
+    // nesting interactives inside a button is both invalid and unusable with
+    // a screen reader. The click target is a convenience; the explicit Edit
+    // button below is the accessible path.
+    <div className="group/md relative cursor-text text-sm" onClick={startEdit}>
       {text.trim() ? (
         <Markdown content={text} />
       ) : (
         <span className="text-xs italic text-[var(--color-fg-muted)]">Empty — click to write</span>
       )}
+      <button
+        type="button"
+        aria-label="Edit this text block"
+        className="absolute right-0 top-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--color-fg-muted)] opacity-0 transition-opacity group-hover/md:opacity-100 focus-visible:opacity-100"
+        onClick={(e) => {
+          e.stopPropagation();
+          startEdit();
+        }}
+      >
+        Edit
+      </button>
     </div>
   );
 }

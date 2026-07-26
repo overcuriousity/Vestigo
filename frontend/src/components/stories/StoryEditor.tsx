@@ -17,14 +17,15 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { ApiError } from "@/api/client";
-import { storiesApi } from "@/api/stories";
-import type { StoryBlock, StoryBlockKind } from "@/api/types";
+import { storiesApi, type StoryWithBlocks } from "@/api/stories";
+import type { StoryBlock, StoryBlockKind, StoryBlockOf } from "@/api/types";
 import { Spinner } from "@/components/ui/Spinner";
+import { toast } from "@/stores/toasts";
 import { BlockFrame } from "./BlockFrame";
 import { BlockPicker } from "./BlockPicker";
 import { ChartBlockCard, EventBlockCard, ViewBlockCard } from "./EmbedCards";
 import { MarkdownBlock } from "./MarkdownBlock";
-import { afterIdForIndex, sortBlocks } from "./blockOrder";
+import { afterIdForIndex, reorderLocally, sortBlocks } from "./blockOrder";
 
 interface Props {
   caseId: string;
@@ -38,7 +39,7 @@ export function StoryEditor({ caseId, storyId }: Props) {
   const qc = useQueryClient();
   // Blocks under active edit: their local draft state must survive polling.
   const [editingIds, setEditingIds] = useState<Set<string>>(new Set());
-  const [conflicts, setConflicts] = useState<Record<string, StoryBlock>>({});
+  const [conflicts, setConflicts] = useState<Record<string, StoryBlockOf<"markdown">>>({});
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["story", caseId, storyId],
@@ -67,7 +68,11 @@ export function StoryEditor({ caseId, storyId }: Props) {
         // refetch and present the winning block from fresh data instead.
         const fresh = await storiesApi.getWithBlocks(caseId, storyId);
         const winner = fresh.blocks.find((b) => b.id === vars.blockId);
-        if (winner) setConflicts((prev) => ({ ...prev, [vars.blockId]: winner }));
+        // Only markdown blocks have an inline conflict UI; an embed block's
+        // content is a reference, not text a collaborator can diverge on.
+        if (winner?.kind === "markdown") {
+          setConflicts((prev) => ({ ...prev, [vars.blockId]: winner }));
+        }
         qc.setQueryData(["story", caseId, storyId], fresh);
       }
     },
@@ -85,18 +90,42 @@ export function StoryEditor({ caseId, storyId }: Props) {
         after_block_id: vars.afterBlockId,
       }),
     onSuccess: invalidate,
+    // Without this a rejected insert is completely silent: the picker closes
+    // and no block appears.
+    onError: (err) => toast.error("Could not add the block", (err as Error).message),
   });
 
   const deleteBlock = useMutation({
     mutationFn: (blockId: string) => storiesApi.deleteBlock(caseId, storyId, blockId),
     onSuccess: invalidate,
+    onError: (err) => toast.error("Could not delete the block", (err as Error).message),
   });
 
   const moveBlock = useMutation({
     mutationFn: (vars: { blockId: string; afterBlockId: string | null; version: number }) =>
       storiesApi.moveBlock(caseId, storyId, vars.blockId, vars.afterBlockId, vars.version),
-    // Both outcomes reconcile against the server: a 409 means a collaborator
-    // moved it first, and their order is the one that stands.
+    // Optimistic: the dragged block stays where it was dropped instead of
+    // snapping back for the round-trip. `onSettled` reconciles against the
+    // server either way.
+    onMutate: async (vars) => {
+      await qc.cancelQueries({ queryKey: ["story", caseId, storyId] });
+      const previous = qc.getQueryData<StoryWithBlocks>(["story", caseId, storyId]);
+      if (previous) {
+        qc.setQueryData<StoryWithBlocks>(["story", caseId, storyId], {
+          ...previous,
+          blocks: reorderLocally(sortBlocks(previous.blocks), vars.blockId, vars.afterBlockId),
+        });
+      }
+      return { previous };
+    },
+    onError: (err, _vars, context) => {
+      if (context?.previous) qc.setQueryData(["story", caseId, storyId], context.previous);
+      if (err instanceof ApiError && err.status === 409) {
+        toast.info("A collaborator moved that block first", "Their order stands.");
+      } else {
+        toast.error("Could not move the block", (err as Error).message);
+      }
+    },
     onSettled: invalidate,
   });
 

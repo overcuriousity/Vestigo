@@ -299,3 +299,190 @@ def test_stored_chart_config_minimal_and_compare_off():
     assert spec.chart_type == "time"
     assert spec.field is None
     assert spec.compare.mode == "off"
+
+
+def test_chart_spec_and_stored_config_round_trip():
+    """The two translators must be exact inverses.
+
+    They live on opposite sides of the same boundary — the agent writes a
+    SavedChart from a ChartSpec, the export resolver reads one back into a
+    ChartSpec. A mismatch produces a chart that is silently undrawable in the
+    export, the story editor and the Visualize rail, with no error at write
+    time. This is the assertion that would have caught that.
+    """
+    from vestigo.agent.tools import ChartSpec
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    for payload in (
+        {"chart_type": "bar", "field": "port", "metric": "count"},
+        {
+            "chart_type": "histogram",
+            "scale": "ratio",
+            "field": "duration",
+            "metric": "count",
+            "options": {"bins": 20, "log_scale": True},
+        },
+        {
+            "chart_type": "time",
+            "metric": "count",
+            "options": {"buckets": 40},
+            "compare": {"mode": "baseline"},
+        },
+        {
+            "chart_type": "bar",
+            "field": "user",
+            "metric": "count",
+            "compare": {"mode": "custom", "filters": {"q": "ssh", "tags_include": ["susp"]}},
+        },
+        {
+            "chart_type": "scatter",
+            "scale": "ratio",
+            "field": "bytes_in",
+            "field_y": "bytes_out",
+            "metric": "count",
+            "options": {"sample_limit": 900},
+        },
+    ):
+        spec = ChartSpec.model_validate(payload)
+        config = spec_to_stored_chart_config(spec)
+        assert config["v"] == 1, config
+        assert _stored_chart_to_spec(config) == spec, config
+
+
+def test_spec_with_base_filters_is_refused_not_dropped():
+    """`ChartSpec.filters` has no home in a stored ChartConfig.
+
+    Dropping them silently would persist a chart that answers a different
+    question than the one the agent proposed.
+    """
+    import pytest as _pytest
+
+    from vestigo.agent.tools import ChartSpec
+    from vestigo.stories.export import spec_to_stored_chart_config
+
+    spec = ChartSpec.model_validate(
+        {"chart_type": "bar", "field": "port", "metric": "count", "filters": {"q": "ssh"}}
+    )
+    with _pytest.raises(ValueError, match="base filters"):
+        spec_to_stored_chart_config(spec)
+
+
+def test_json_safe_coerces_non_finite_floats_and_sets():
+    """NaN/Infinity are not JSON, and set order is not stable across processes."""
+    import json
+    import math
+
+    from vestigo.stories.export import _json_safe
+
+    coerced = _json_safe(
+        {"nan": float("nan"), "inf": float("inf"), "ninf": -math.inf, "tags": {"b", "a"}}
+    )
+    assert coerced["nan"] is None
+    assert coerced["inf"] is None
+    assert coerced["ninf"] is None
+    assert coerced["tags"] == ["a", "b"]
+    # ``allow_nan=False`` is what the hash uses; bare NaN would slip past a
+    # default json.dumps and produce bytes no conforming parser accepts.
+    assert json.dumps(coerced, allow_nan=False)
+    assert canonical_hash(coerced)
+
+
+async def test_export_runs_charts_under_analyst_limits(store, monkeypatch):
+    """A frozen chart must show what the analyst's card showed.
+
+    The agent's context-budget caps would clamp a top-50 bar chart to top-30
+    and stamp agent-facing wording ("agent context budget") into the report.
+    ``execute_chart_spec`` itself is patched rather than passing ``run_chart``,
+    because the default wiring is exactly what's under test.
+    """
+    from vestigo.agent import chart_exec
+
+    case, story, blocks = await _case_with_story(
+        store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]
+    )
+    await store.create_saved_chart(
+        case.id,
+        "t1",
+        "ch1",
+        "Top ports",
+        {"v": 1, "chartType": "bar", "field": "port", "metric": "count", "options": {"topN": 50}},
+    )
+
+    seen: dict[str, object] = {}
+
+    async def fake_execute(scope, spec, **kwargs):
+        seen["limits"] = kwargs.get("limits")
+        return {"resolved": {}, "warnings": [], "result": {"values": []}}
+
+    monkeypatch.setattr(chart_exec, "execute_chart_spec", fake_execute)
+
+    snapshot = await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        resolve_scope=lambda case_id, timeline_id: ([], {}, {}),
+        now=lambda: FROZEN_NOW,
+    )
+    assert snapshot["blocks"][0]["resolution"]["error"] is None
+    assert seen["limits"] is chart_exec.ANALYST_CHART_LIMITS
+    # 50 is inside the analyst ceiling and outside the agent's.
+    assert chart_exec.ANALYST_CHART_LIMITS.terms_top_n[1] >= 50
+    assert chart_exec.AGENT_CHART_LIMITS.terms_top_n[1] < 50
+
+
+async def test_analyst_limits_do_not_clamp_a_normal_saved_chart():
+    """Through the real executor: a top-50 saved chart stays top-50.
+
+    Under the agent's caps the same spec resolves to 30 and picks up a clamp
+    warning worded for the model — both of which would end up in the report.
+    """
+    from vestigo.agent.chart_exec import (
+        AGENT_CHART_LIMITS,
+        ANALYST_CHART_LIMITS,
+        execute_chart_spec,
+    )
+    from vestigo.db.postgres import User as _User
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    from vestigo.agent.tools import AgentScope  # isort: skip
+
+    spec = _stored_chart_to_spec(
+        {"v": 1, "chartType": "bar", "field": "port", "metric": "count", "options": {"topN": 50}}
+    )
+    scope = AgentScope(
+        case_id="c1",
+        timeline_id="t1",
+        user=_User(id="u1", username="alice", is_admin=True, is_active=True),
+        source_ids=["s1"],
+        field_mappings=None,
+        source_offsets=None,
+    )
+
+    captured: dict[str, int] = {}
+
+    class _Service:
+        def field_terms(self, query, field, top_n):
+            captured["top_n"] = top_n
+            return {"total": 0, "distinct": 0, "values": []}
+
+    async def _no_check(token, label):
+        return None
+
+    async def _run(limits):
+        return await execute_chart_spec(
+            scope,
+            spec,
+            service=_Service(),
+            validated=lambda f: f,
+            check_field=_no_check,
+            limits=limits,
+        )
+
+    analyst = await _run(ANALYST_CHART_LIMITS)
+    assert captured["top_n"] == 50
+    assert analyst["warnings"] == []
+
+    agent = await _run(AGENT_CHART_LIMITS)
+    assert captured["top_n"] == 30
+    assert any("agent context budget" in w for w in agent["warnings"])

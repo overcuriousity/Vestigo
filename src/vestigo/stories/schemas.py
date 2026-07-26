@@ -10,16 +10,36 @@ no whitespace) so a snapshot hash is reproducible from the stored JSON.
 import hashlib
 import json
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from vestigo.core.config import get_settings
 
 BLOCK_KINDS = ("markdown", "view_ref", "chart_ref", "event_ref")
 
 #: Hard cap on rows a view block may freeze into a snapshot.
 VIEW_BLOCK_ROW_CAP = 1000
 
+#: Ceiling on an ``event_ref`` caption. A caption is a one-line label under a
+#: frozen event, not a second narrative block — that's what markdown is for.
+MAX_CAPTION_CHARS = 1000
+
 
 class MarkdownContent(BaseModel):
     text: str
+
+    @field_validator("text")
+    @classmethod
+    def _bounded(cls, value: str) -> str:
+        """Bound a block's prose.
+
+        A markdown block is copied verbatim into every subsequent export
+        snapshot, so an unbounded one multiplies across the case's exports
+        rather than costing its size once.
+        """
+        limit = get_settings().story_max_markdown_bytes
+        if len(value.encode("utf-8")) > limit:
+            raise ValueError(f"markdown text exceeds the {limit}-byte cap")
+        return value
 
 
 class ViewDisplay(BaseModel):
@@ -41,7 +61,7 @@ class ChartRefContent(BaseModel):
 class EventRefContent(BaseModel):
     event_id: str
     source_id: str
-    caption: str | None = None
+    caption: str | None = Field(default=None, max_length=MAX_CAPTION_CHARS)
 
 
 _CONTENT_MODELS: dict[str, type[BaseModel]] = {
@@ -67,7 +87,26 @@ def validate_block_content(kind: str, content: dict) -> dict:
         raise ValueError(f"invalid {kind} content: {exc}") from exc
 
 
+def canonical_json(payload: dict) -> str:
+    """Serialize a snapshot the way its hash is computed.
+
+    ``allow_nan=False`` on purpose: Python happily emits bare ``NaN`` and
+    ``Infinity``, which are not JSON. Hashing bytes that no conforming parser
+    accepts would leave an export whose hash cannot be independently verified,
+    so a non-finite float has to fail loudly here rather than be frozen. The
+    resolver coerces them upstream (``vestigo.stories.export._json_safe``).
+    """
+    return json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+
+
 def canonical_hash(payload: dict) -> str:
-    """SHA-256 over canonical JSON — same convention as config hashes."""
-    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    """SHA-256 over canonical JSON — same convention as config hashes.
+
+    Verifying a downloaded snapshot means re-serializing it with
+    ``canonical_json`` first; the bytes a JSON encoder happens to produce are
+    not the hashed bytes. ``GET .../exports/{id}/snapshot`` serves exactly
+    these bytes so a third party can hash the response body directly.
+    """
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()

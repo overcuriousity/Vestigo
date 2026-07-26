@@ -5,8 +5,7 @@ import { Input } from "@/components/ui/Input";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
 import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
-import { viewsApi } from "@/api/views";
-import { filtersToViewPayload } from "@/lib/queryParams";
+import { findOrCreateView } from "@/lib/storyViews";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
@@ -659,17 +658,14 @@ export function FilterRail({
           <BookmarkCheck size={13} /> Save Current View
         </Button>
         {/* Embeds must reference a persisted View, so pushing live filter
-            state saves one named after the story it lands in. */}
+            state persists one — reusing an existing View that already
+            encodes exactly these filters rather than minting a duplicate on
+            every push. */}
         <AddToStoryButton
           caseId={caseId}
           className="w-full"
           resolveContent={async (story) => {
-            const view = await viewsApi.create(
-              caseId,
-              `${story.title} — view`,
-              filters.q ?? "",
-              filtersToViewPayload(filters),
-            );
+            const view = await findOrCreateView(caseId, `${story.title} — view`, filters);
             return {
               kind: "view_ref",
               content: {

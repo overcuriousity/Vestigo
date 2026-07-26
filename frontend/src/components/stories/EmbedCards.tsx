@@ -13,18 +13,38 @@ import { AlertTriangle, ExternalLink } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { savedChartsApi } from "@/api/viz";
 import { viewsApi } from "@/api/views";
-import type { StoryBlock } from "@/api/types";
+import type { StoryBlockOf } from "@/api/types";
 import { ChartCanvas } from "@/components/viz/ChartCanvas";
 import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
 import { Spinner } from "@/components/ui/Spinner";
 import { filtersToParams, viewPayloadToFilters } from "@/lib/queryParams";
 import { fmtNum } from "@/lib/format";
 import { fmtTimestamp } from "@/lib/time";
+import { useTimelineForSource } from "@/hooks/useTimelineForSource";
 
+/**
+ * A block whose target is genuinely gone.
+ *
+ * Only for a *successful* lookup that found nothing. A failed request is a
+ * different statement — see `LookupFailed`. Telling an analyst that a live
+ * object was deleted because a request 500'd is worse than saying nothing.
+ */
 function Unresolved({ what }: { what: string }) {
   return (
     <p className="flex items-center gap-1.5 text-xs text-[var(--color-warning)]">
       <AlertTriangle size={12} /> {what} was deleted — this block no longer resolves.
+    </p>
+  );
+}
+
+/** A block whose target could not be looked up (network, 5xx, permissions). */
+function LookupFailed({ what, error }: { what: string; error: unknown }) {
+  return (
+    <p className="flex items-start gap-1.5 text-xs text-[var(--color-danger)]">
+      <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+      <span>
+        {what} could not be loaded: {(error as Error)?.message ?? "unknown error"}
+      </span>
     </p>
   );
 }
@@ -40,10 +60,15 @@ function OpenLink({ to, label }: { to: string; label: string }) {
   );
 }
 
-export function ViewBlockCard({ block, caseId }: { block: StoryBlock; caseId: string }) {
-  const viewId = block.content.view_id as string;
-  const timelineId = block.content.timeline_id as string;
-  const display = (block.content.display ?? {}) as { limit?: number; columns?: string[] | null };
+export function ViewBlockCard({
+  block,
+  caseId,
+}: {
+  block: StoryBlockOf<"view_ref">;
+  caseId: string;
+}) {
+  const { view_id: viewId, timeline_id: timelineId } = block.content;
+  const display = block.content.display ?? {};
   const limit = display.limit ?? 200;
 
   const viewQuery = useQuery({
@@ -54,12 +79,18 @@ export function ViewBlockCard({ block, caseId }: { block: StoryBlock; caseId: st
   const filters = view ? viewPayloadToFilters(view.filter) : null;
 
   const rowsQuery = useQuery({
-    queryKey: ["story-view-rows", caseId, timelineId, viewId, limit],
+    // The view's filter payload is part of the key: editing a View's filters
+    // elsewhere has to invalidate this card, and the ids alone never change
+    // when it does.
+    queryKey: ["story-view-rows", caseId, timelineId, viewId, limit, view?.filter ?? null],
     queryFn: () => eventsApi.list(caseId, timelineId, { ...filters!, limit }),
     enabled: !!filters,
   });
 
   if (viewQuery.isLoading) return <Spinner size={14} />;
+  if (viewQuery.isError) {
+    return <LookupFailed what="The referenced view" error={viewQuery.error} />;
+  }
   if (!view) return <Unresolved what="The referenced view" />;
 
   const rows = rowsQuery.data?.events ?? [];
@@ -135,9 +166,14 @@ export function ViewBlockCard({ block, caseId }: { block: StoryBlock; caseId: st
   );
 }
 
-export function ChartBlockCard({ block, caseId }: { block: StoryBlock; caseId: string }) {
-  const chartId = block.content.chart_id as string;
-  const timelineId = block.content.timeline_id as string;
+export function ChartBlockCard({
+  block,
+  caseId,
+}: {
+  block: StoryBlockOf<"chart_ref">;
+  caseId: string;
+}) {
+  const { chart_id: chartId, timeline_id: timelineId } = block.content;
 
   const chartsQuery = useQuery({
     queryKey: ["viz-saved-charts", caseId, timelineId],
@@ -147,6 +183,9 @@ export function ChartBlockCard({ block, caseId }: { block: StoryBlock; caseId: s
   const config = chart ? parseStoredChartConfig(chart.config) : null;
 
   if (chartsQuery.isLoading) return <Spinner size={14} />;
+  if (chartsQuery.isError) {
+    return <LookupFailed what="The referenced chart" error={chartsQuery.error} />;
+  }
   if (!chart) return <Unresolved what="The referenced chart" />;
   if (!config) {
     return (
@@ -172,17 +211,18 @@ export function ChartBlockCard({ block, caseId }: { block: StoryBlock; caseId: s
   );
 }
 
-export function EventBlockCard({ block, caseId }: { block: StoryBlock; caseId: string }) {
-  const eventId = block.content.event_id as string;
-  const caption = block.content.caption as string | null;
+export function EventBlockCard({
+  block,
+  caseId,
+}: {
+  block: StoryBlockOf<"event_ref">;
+  caseId: string;
+}) {
+  const { event_id: eventId, source_id: sourceId } = block.content;
+  const caption = block.content.caption ?? null;
 
-  const { data: timelines } = useQuery({
-    queryKey: ["timelines", caseId],
-    queryFn: () => import("@/api/timelines").then((m) => m.timelinesApi.list(caseId)),
-  });
-  // An event is addressed by (source, id); any timeline covering its source
-  // resolves it, so use the case's default timeline.
-  const timelineId = timelines?.find((t) => t.is_default)?.id ?? timelines?.[0]?.id;
+  const timelinesQuery = useTimelineForSource(caseId, sourceId);
+  const timelineId = timelinesQuery.timelineId;
 
   const eventQuery = useQuery({
     queryKey: ["story-event", caseId, timelineId, eventId],
@@ -190,7 +230,17 @@ export function EventBlockCard({ block, caseId }: { block: StoryBlock; caseId: s
     enabled: !!timelineId,
   });
 
-  if (eventQuery.isLoading || !timelineId) return <Spinner size={14} />;
+  if (timelinesQuery.isLoading) return <Spinner size={14} />;
+  if (timelinesQuery.isError) {
+    return <LookupFailed what="The referenced event" error={timelinesQuery.error} />;
+  }
+  if (!timelineId) {
+    return <Unresolved what="The event's source" />;
+  }
+  if (eventQuery.isLoading) return <Spinner size={14} />;
+  if (eventQuery.isError) {
+    return <LookupFailed what="The referenced event" error={eventQuery.error} />;
+  }
   if (!eventQuery.data) return <Unresolved what="The referenced event" />;
 
   const ev = eventQuery.data;

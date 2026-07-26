@@ -14,9 +14,9 @@ import { AlertTriangle } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { SnapshotBlock, StorySnapshot } from "@/api/types";
-import { ChartMarks, type ChartResult } from "@/components/viz/ChartCanvas";
+import { ChartMarks } from "@/components/viz/ChartCanvas";
+import { snapshotToChartResult } from "@/components/viz/chartFetch";
 import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
-import { CHART_META } from "@/components/viz/lib/chartMeta";
 import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
 import { fmtNum } from "@/lib/format";
 import { fmtTimestamp } from "@/lib/time";
@@ -30,8 +30,15 @@ function Unresolved({ error }: { error: string }) {
   );
 }
 
-function MarkdownSnapshot({ block }: { block: SnapshotBlock }) {
-  const text = (block.data?.text as string) ?? "";
+type SnapshotOf<K extends SnapshotBlock["kind"]> = Extract<SnapshotBlock, { kind: K }>;
+
+/** A resolved block: `data` is non-null exactly when `resolution.error` is. */
+type Resolved<K extends SnapshotBlock["kind"]> = SnapshotOf<K> & {
+  data: NonNullable<SnapshotOf<K>["data"]>;
+};
+
+function MarkdownSnapshot({ block }: { block: Resolved<"markdown"> }) {
+  const text = block.data.text ?? "";
   return (
     <div className="story-md text-sm [&>*+*]:mt-2 [&_code]:font-mono [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_ol]:list-decimal [&_ol]:pl-5 [&_table]:w-full [&_td]:border [&_td]:px-1.5 [&_td]:py-0.5 [&_th]:border [&_th]:px-1.5 [&_th]:py-0.5 [&_ul]:list-disc [&_ul]:pl-5">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
@@ -39,16 +46,10 @@ function MarkdownSnapshot({ block }: { block: SnapshotBlock }) {
   );
 }
 
-function ViewSnapshot({ block }: { block: SnapshotBlock }) {
-  const data = block.data as {
-    rows: Record<string, unknown>[];
-    row_count_total: number;
-    rows_included: number;
-    truncated: boolean;
-    columns: string[] | null;
-  };
+function ViewSnapshot({ block }: { block: Resolved<"view_ref"> }) {
+  const data = block.data;
   const columns = data.columns?.length ? data.columns : null;
-  const name = (block.ref.name as string) ?? "View";
+  const name = block.ref.name ?? "View";
 
   return (
     <div className="space-y-1.5">
@@ -106,30 +107,28 @@ function ViewSnapshot({ block }: { block: SnapshotBlock }) {
   );
 }
 
-function ChartSnapshot({ block }: { block: SnapshotBlock }) {
-  const data = block.data as {
-    name: string;
-    config: Record<string, unknown>;
-    resolved: { data_kind: string; compare_mode: string } | null;
-    warnings: string[];
-    chart: unknown;
-  };
+function ChartSnapshot({ block }: { block: Resolved<"chart_ref"> }) {
+  const data = block.data;
   const config = parseStoredChartConfig(data.config);
   if (!config || !data.resolved || data.chart == null) {
     return <Unresolved error={`chart “${data.name}” could not be redrawn from the snapshot`} />;
   }
-  const meta = CHART_META[config.chartType];
-  // The server records the aggregation it ran; rebuild the discriminated
-  // payload the mark dispatch expects around the frozen result.
-  const kind =
-    data.resolved.data_kind === "numeric" && meta.acceptsSecondField && config.fieldY
-      ? "numeric_grouped"
-      : data.resolved.data_kind;
-  const result = {
-    kind,
-    compare: data.resolved.compare_mode !== "off",
-    data: data.chart,
-  } as unknown as ChartResult;
+  // The server records the aggregation it ran; `snapshotToChartResult` rebuilds
+  // the discriminated payload the mark dispatch expects — including the
+  // histogram reshaping the live path applies before any mark sees it.
+  const result = snapshotToChartResult(
+    data.resolved.data_kind,
+    data.resolved.compare_mode,
+    config,
+    data.chart,
+  );
+  if (!result) {
+    return (
+      <Unresolved
+        error={`chart “${data.name}” froze an aggregation this build does not know how to draw (${data.resolved.data_kind})`}
+      />
+    );
+  }
 
   return (
     <div className="space-y-1.5">
@@ -151,8 +150,8 @@ function ChartSnapshot({ block }: { block: SnapshotBlock }) {
   );
 }
 
-function EventSnapshot({ block }: { block: SnapshotBlock }) {
-  const data = block.data as { event: Record<string, unknown>; caption: string | null };
+function EventSnapshot({ block }: { block: Resolved<"event_ref"> }) {
+  const data = block.data;
   const ev = data.event;
   return (
     <div className="space-y-1 rounded border border-[var(--color-border)] p-2">
@@ -170,20 +169,46 @@ function EventSnapshot({ block }: { block: SnapshotBlock }) {
   );
 }
 
-function Block({ block }: { block: SnapshotBlock }) {
+/**
+ * Provenance marker on an agent-authored block.
+ *
+ * The exported HTML is the artifact that leaves the tool and gets attached to
+ * a report, so "which paragraphs the AI wrote" has to be legible in it — the
+ * editor shows the badge, and a reader of the export is exactly who needs it.
+ * Analyst-authored blocks are unmarked: the default is a human wrote it.
+ */
+function OriginBadge({ block }: { block: SnapshotBlock }) {
+  if (block.origin !== "agent") return null;
+  return (
+    <p className="mb-1 inline-block rounded border border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-accent)]">
+      agent-authored
+    </p>
+  );
+}
+
+function BlockBody({ block }: { block: SnapshotBlock }) {
   if (block.resolution.error || block.data == null) {
     return <Unresolved error={block.resolution.error ?? "no data was captured"} />;
   }
   switch (block.kind) {
     case "markdown":
-      return <MarkdownSnapshot block={block} />;
+      return <MarkdownSnapshot block={block as Resolved<"markdown">} />;
     case "view_ref":
-      return <ViewSnapshot block={block} />;
+      return <ViewSnapshot block={block as Resolved<"view_ref">} />;
     case "chart_ref":
-      return <ChartSnapshot block={block} />;
+      return <ChartSnapshot block={block as Resolved<"chart_ref">} />;
     case "event_ref":
-      return <EventSnapshot block={block} />;
+      return <EventSnapshot block={block as Resolved<"event_ref">} />;
   }
+}
+
+function Block({ block }: { block: SnapshotBlock }) {
+  return (
+    <>
+      <OriginBadge block={block} />
+      <BlockBody block={block} />
+    </>
+  );
 }
 
 export function SnapshotRenderer({ snapshot }: { snapshot: StorySnapshot }) {

@@ -1,9 +1,70 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 100 — W7 Stories).
+Last updated: 2026-07-26 (session 101 — W7 Stories review remediation).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 101 — 2026-07-26: W7 Stories review remediation
+
+**Why.** A three-way code review of the W7 branch (`009e50c..3bf2bb0`, ~8.5k lines)
+found three silent-failure bugs in the features the design round was actually built
+around, plus a set of smaller issues. Everything found was fixed; the two structural
+root causes are worth recording because they explain most of the individual findings.
+
+- **No compare-and-swap anywhere.** `update_story_block`, `move_story_block`,
+  `seal_story_export_artifact` and the gap-position computation were all read-then-write.
+  Under `READ COMMITTED` two collaborators could both read `version=1`, both pass a
+  Python-side check, and both write `version=2` — the exact lost update the `version`
+  column exists to prevent, and the invariant the router docstring and `STORIES.md`
+  both promised. Same shape let two uploads double-seal an immutable export and two
+  inserts tie for a position. All four are now conditional `UPDATE … WHERE <guard>` +
+  `rowcount`, position mutations run under a `FOR UPDATE` lock on the parent story row,
+  and `(story_id, position)` is unique (migration `0018`) with a bounded retry behind it
+  — a lock orders transactions but doesn't make a pre-lock read current, and SQLite
+  ignores `FOR UPDATE`, so the index is the real invariant. A sequential test cannot
+  distinguish the old code from the new one, which is why none of this was caught;
+  `tests/test_stories_store.py` now has genuinely concurrent `asyncio.gather` cases.
+- **Untyped payload boundaries.** Two of the three criticals trace to the same habit.
+  `SnapshotBlock.ref`/`data` were `Record<string, unknown>`, so eight renderers
+  re-asserted the shape locally — and an `as unknown as ChartResult` cast hid that an
+  uncompared time chart freezes a raw histogram (`{start, count}`) while the mark reads
+  `{primary, comparison}`. Every time-histogram block therefore rendered blank bars in
+  every export, silently. Symmetrically, the agent wrote its snake_case `ChartSpec` dump
+  into `SavedChart.config`, which is contractually the frontend's camelCase `v: 1`
+  `ChartConfig`, so an agent-authored chart block was undrawable in the export, the story
+  card *and* the Visualize rail — with a test asserting the wrong shape, protecting the
+  bug. Both are now discriminated unions with one typed mapper each
+  (`snapshotToChartResult`, `spec_to_stored_chart_config`) and a round-trip assertion, so
+  a future divergence is a build failure rather than a blank chart in a signed report.
+- **The editor defeated its own concurrency check.** `MarkdownBlock` read `block.version`
+  from a live prop refreshed by the 10s story poll, so a collaborator saving mid-edit
+  became the base version: the server's check passed and their edit was destroyed with no
+  409 and no conflict UI. A paragraph takes longer to write than the poll interval, so the
+  conflict path was close to unreachable. The version is now captured at edit start.
+- **Attestation gaps.** `delete_case` didn't delete stories, blocks or exports — leaving
+  orphaned snapshots holding frozen event data from a case the operator believes is gone.
+  A contributor could erase every sealed export by deleting the story, bypassing the
+  admin-only export deletion; that path is now admin-only when exports exist, and the
+  hashes go into the audit record. Exported charts ran under the *agent's* context-budget
+  caps, so a report showed less than the analyst signed off on (top-50 frozen as top-30)
+  and carried agent-facing clamp prose; `execute_chart_spec` now takes a `ChartLimits`
+  and exports use `ANALYST_CHART_LIMITS`. `GET .../snapshot` serves the canonical hashed
+  bytes so a third party can verify the hash directly, and a sealed artifact must embed
+  the `snapshot_hash` it claims to render.
+- **Bounds and honesty.** Block content, snapshot bytes, block count per export and the
+  artifact stream are all capped via `VESTIGO_STORY_*` settings (the artifact cap now
+  applies to the arriving stream, not to the already-buffered body). `_json_safe` coerces
+  non-finite floats — `NaN`/`Infinity` are not JSON, and hashing them would leave an
+  unverifiable attestation — and sorts sets. Embed cards distinguish "deleted" from
+  "lookup failed", an event block resolves through a timeline that actually contains its
+  source (the editor and the server-side resolver previously disagreed), pushes reuse a
+  matching saved View instead of minting a duplicate per push, and the exported HTML marks
+  agent-authored blocks. The RBAC test the plan specified now actually exercises the
+  read-vs-contribute boundary rather than a non-member who is 403 on everything.
+
+Verified: `uv run pytest` 1791 passed, `uv run ruff check .` clean, frontend
+`typecheck`/`lint` clean, `npm run test` 503 passed.
 
 ## Session 100 — 2026-07-26: W7 Stories (Phase 3 Step 3)
 

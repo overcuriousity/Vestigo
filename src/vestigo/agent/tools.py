@@ -1711,6 +1711,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             confirming then saves the chart and embeds it in one step.
             """
             from vestigo.api.deps import get_store
+            from vestigo.stories.export import spec_to_stored_chart_config
             from vestigo.stories.schemas import validate_block_content
 
             store = get_store()
@@ -1734,8 +1735,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                         validated=_validated,
                         check_field=_check_chart_field,
                     )
+                    # Derive the stored ChartConfig now, not at confirm time:
+                    # a spec that can't be represented as one (chart-local
+                    # base filters) has to be an error the model can correct,
+                    # not a saved chart nothing can draw.
                     content = {
                         "chart_spec": spec.model_dump(mode="json", exclude_none=True),
+                        "chart_config": spec_to_stored_chart_config(spec),
                         "name": content["name"].strip(),
                         "resolved": executed["resolved"],
                     }
@@ -1853,19 +1859,21 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
 
         store = get_store()
         rows = await store.list_stories(scope.case_id)
-        listing = []
-        for s in rows:
-            blocks = await store.list_story_blocks(s.id)
-            listing.append(
-                {
-                    "id": s.id,
-                    "title": s.title,
-                    "description": _truncate(s.description, SLIM_MESSAGE_TRUNCATE),
-                    "block_count": len(blocks),
-                    "updated_at": s.updated_at.isoformat() if s.updated_at else None,
-                    "updated_by": s.updated_by,
-                }
-            )
+        # Count in one grouped query and only for the rows that survive the
+        # listing cap — the discarded tail's blocks are never looked at.
+        shown = rows[:MAX_LIST_ROWS]
+        counts = await store.count_story_blocks([s.id for s in shown])
+        listing = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "description": _truncate(s.description, SLIM_MESSAGE_TRUNCATE),
+                "block_count": counts.get(s.id, 0),
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+                "updated_by": s.updated_by,
+            }
+            for s in shown
+        ]
         return _listing("stories", listing, len(rows))
 
     @server.tool()
@@ -1874,7 +1882,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
 
         Markdown blocks carry their text (truncated at the usual cap); embed
         blocks carry their reference — resolve a view/chart/event through the
-        matching read tools rather than expecting inline data here.
+        matching read tools rather than expecting inline data here. Long
+        stories are capped at the usual listing limit and say so.
         """
         from vestigo.api.deps import get_store
 
@@ -1883,12 +1892,17 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         if story is None:
             return {"error": f"story {story_id!r} not found in this case"}
         blocks = await store.list_story_blocks(story_id)
+        # Individual markdown text was capped but the block *list* was not, so
+        # a long report could return hundreds of entries into the context.
+        shown = blocks[:MAX_LIST_ROWS]
         return {
             "story": {
                 "id": story.id,
                 "title": story.title,
                 "description": story.description,
             },
+            "block_count": len(blocks),
+            "returned": len(shown),
             "blocks": [
                 {
                     "id": b.id,
@@ -1900,7 +1914,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                         else b.content
                     ),
                 }
-                for b in blocks
+                for b in shown
             ],
         }
 

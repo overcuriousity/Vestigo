@@ -29,7 +29,17 @@ function collectStyles(): string {
   return chunks.join("\n");
 }
 
-export function renderExportHtml(snapshot: StorySnapshot): string {
+/**
+ * Render a snapshot to standalone HTML.
+ *
+ * `snapshotHash` is required and appears in both a `<meta>` tag and the
+ * visible footer: it is the only thing binding this document to the record it
+ * claims to render. Without it the server would hash and store whatever
+ * markup it was handed, and `html_hash` would be presented with the same
+ * authority as `snapshot_hash` while attesting to nothing — so the seal
+ * endpoint refuses an artifact that does not carry it.
+ */
+export function renderExportHtml(snapshot: StorySnapshot, snapshotHash: string): string {
   const body = renderToStaticMarkup(createElement(SnapshotRenderer, { snapshot }));
   const css = collectStyles();
   const title = `${snapshot.story.title} — Vestigo story export`;
@@ -38,6 +48,7 @@ export function renderExportHtml(snapshot: StorySnapshot): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="vestigo:snapshot-hash" content="${escapeHtml(snapshotHash)}">
 <title>${escapeHtml(title)}</title>
 <style>${css}</style>
 </head>
@@ -45,7 +56,8 @@ export function renderExportHtml(snapshot: StorySnapshot): string {
 ${body}
 <footer style="max-width:56rem;margin:0 auto;padding:1.5rem;font-size:11px;opacity:.7">
 ${escapeHtml(snapshot.story.title)} · exported ${escapeHtml(snapshot.story.exported_at)} by
-${escapeHtml(snapshot.story.exported_by)} · snapshot is the authoritative record
+${escapeHtml(snapshot.story.exported_by)} · snapshot is the authoritative record<br>
+snapshot SHA-256 <code>${escapeHtml(snapshotHash)}</code> — verify against the exported JSON
 </footer>
 </body>
 </html>`;

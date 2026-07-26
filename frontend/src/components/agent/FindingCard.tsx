@@ -11,8 +11,7 @@ import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
-import { viewsApi } from "@/api/views";
-import { filtersToViewPayload } from "@/lib/queryParams";
+import { findOrCreateView } from "@/lib/storyViews";
 import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
 import type { EventFilters } from "@/api/types";
 import { Markdown } from "./Markdown";
@@ -111,11 +110,12 @@ export function FindingCard({
             className="h-6 px-1.5"
             label="Add this finding to a story"
             resolveContent={async (story) => {
-              const view = await viewsApi.create(
+              // Reuses a View that already encodes these filters — the same
+              // finding pushed twice must not leave two saved Views behind.
+              const view = await findOrCreateView(
                 caseId,
                 `${story.title} — ${title}`,
-                filters.q ?? "",
-                filtersToViewPayload(filters),
+                filters,
               );
               return {
                 kind: "view_ref",

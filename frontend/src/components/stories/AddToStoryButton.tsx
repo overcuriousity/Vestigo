@@ -9,6 +9,7 @@
  * `resolveContent` and saves a View first.
  */
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BookOpenText, Plus } from "lucide-react";
 import { storiesApi } from "@/api/stories";
@@ -24,20 +25,35 @@ export interface StoryBlockDraft {
   content: Record<string, unknown>;
 }
 
-interface Props {
+interface CommonProps {
   caseId: string;
-  /** Ready-made block content (chart/event pushes). */
-  content?: StoryBlockDraft;
-  /**
-   * Content that can only be built once the target story is known — e.g. an
-   * Explorer filter set, which is saved as a View named after the story.
-   */
-  resolveContent?: (story: Story) => Promise<StoryBlockDraft>;
   label?: string;
   className?: string;
   /** Compact icon-only trigger for dense toolbars. */
   iconOnly?: boolean;
 }
+
+/**
+ * Exactly one of `content` / `resolveContent` is required, as a union rather
+ * than two optionals: passing neither used to be a runtime crash on the
+ * non-null assertion instead of a compile error.
+ */
+type Props = CommonProps &
+  (
+    | {
+        /** Ready-made block content (chart/event pushes). */
+        content: StoryBlockDraft;
+        resolveContent?: never;
+      }
+    | {
+        content?: never;
+        /**
+         * Content that can only be built once the target story is known —
+         * e.g. an Explorer filter set, which needs a persisted View.
+         */
+        resolveContent: (story: Story) => Promise<StoryBlockDraft>;
+      }
+  );
 
 export function AddToStoryButton({
   caseId,
@@ -50,6 +66,7 @@ export function AddToStoryButton({
   const [open, setOpen] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const qc = useQueryClient();
+  const navigate = useNavigate();
 
   const { data: stories, isLoading } = useQuery({
     queryKey: ["stories", caseId],
@@ -59,7 +76,7 @@ export function AddToStoryButton({
 
   const push = useMutation({
     mutationFn: async (story: Story) => {
-      const draft = content ?? (await resolveContent!(story));
+      const draft = content ?? (await resolveContent(story));
       await storiesApi.createBlock(caseId, story.id, {
         kind: draft.kind,
         content: draft.content,
@@ -72,9 +89,9 @@ export function AddToStoryButton({
       setOpen(false);
       toast.success(`Added to “${story.title}”`, undefined, {
         label: "Open story",
-        onClick: () => {
-          window.location.href = `/cases/${caseId}/stories/${story.id}`;
-        },
+        // Client-side navigation: a full reload would drop the query cache
+        // and the Explorer's in-memory state the analyst just built up.
+        onClick: () => navigate(`/cases/${caseId}/stories/${story.id}`),
       });
     },
     onError: (err) => toast.error("Couldn't add to story", (err as Error).message),

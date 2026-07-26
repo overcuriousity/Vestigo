@@ -1,31 +1,31 @@
 """Stories (W7): per-case block documents. See docs/STORIES.md.
 
 Case-scoped routes so the shared ``require_case_read``/``require_case_contribute``
-dependencies apply unchanged. Block writes carry an optimistic ``version``;
-a stale write returns 409 with the current block so the editor can present
-the conflict instead of clobbering a collaborator's edit.
+dependencies apply unchanged. Block writes carry an optimistic ``version``; a
+stale write returns 409 so the caller presents the conflict instead of
+clobbering a collaborator's edit. The winning block travels in the 409 body for
+API consumers; the browser client collapses an error body to its message, so the
+editor refetches and reads the winner from fresh data instead.
 """
 
 import hashlib
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from vestigo.api.deps import (
-    get_current_user,
     get_store,
     require_admin,
     require_case_contribute,
     require_case_read,
+    require_password_current,
 )
-from vestigo.db.postgres import Case, StaleBlockError, StoryBlock, User
+from vestigo.core.config import get_settings
+from vestigo.db.postgres import UNSET, Case, StaleBlockError, StoryBlock, User
 from vestigo.stories.export import resolve_story_snapshot
-from vestigo.stories.schemas import canonical_hash, validate_block_content
-
-#: Upper bound on an uploaded export artifact (standalone HTML), bytes.
-MAX_ARTIFACT_BYTES = 20_000_000
+from vestigo.stories.schemas import canonical_hash, canonical_json, validate_block_content
 
 router = APIRouter(prefix="/api/cases", tags=["stories"])
 
@@ -69,6 +69,27 @@ async def _get_block_or_404(story_id: str, block_id: str) -> StoryBlock:
     return block
 
 
+async def _validate_block_scope(case_id: str, kind: str, content: dict[str, Any]) -> None:
+    """Check that an embed block's referents exist inside this case.
+
+    ``validate_block_content`` only checks shape. Catching a foreign or
+    mistyped id here turns what would otherwise surface much later as a
+    "cannot be drawn" card or a frozen ``resolution.error`` in an export into
+    a 422 at the point the analyst made the mistake. Raises ValueError so the
+    caller maps it the same way as a schema failure.
+    """
+    store = get_store()
+    timeline_id = content.get("timeline_id")
+    if timeline_id and await store.get_timeline(case_id, timeline_id) is None:
+        raise ValueError(f"timeline {timeline_id!r} is not in this case")
+    if kind == "view_ref" and await store.get_view(case_id, content["view_id"]) is None:
+        raise ValueError(f"view {content['view_id']!r} is not in this case")
+    if kind == "chart_ref":
+        chart = await store.get_saved_chart(case_id, timeline_id, content["chart_id"])
+        if chart is None:
+            raise ValueError(f"chart {content['chart_id']!r} is not in this case/timeline")
+
+
 @router.get("/{case_id}/stories")
 async def list_stories(case: Case = Depends(require_case_read)) -> dict[str, Any]:
     """List the case's stories, newest first."""
@@ -80,7 +101,7 @@ async def list_stories(case: Case = Depends(require_case_read)) -> dict[str, Any
 async def create_story(
     body: StoryBody,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Create a story."""
     if not (body.title or "").strip():
@@ -100,9 +121,7 @@ async def create_story(
 
 
 @router.get("/{case_id}/stories/{story_id}")
-async def get_story(
-    story_id: str, case: Case = Depends(require_case_read)
-) -> dict[str, Any]:
+async def get_story(story_id: str, case: Case = Depends(require_case_read)) -> dict[str, Any]:
     """Return a story with its blocks in document order."""
     story = await _get_story_or_404(case.id, story_id)
     blocks = await get_store().list_story_blocks(story.id)
@@ -114,13 +133,31 @@ async def update_story(
     story_id: str,
     body: StoryBody,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Update a story's title/description."""
+    """Update a story's title/description.
+
+    Only fields present in the request body are touched, so
+    ``{"description": null}`` clears the description while ``{"title": "x"}``
+    leaves it alone. A supplied title must be non-blank — the same rule
+    ``POST`` applies, rather than letting PATCH blank it out.
+    """
     await _get_story_or_404(case.id, story_id)
+    sent = body.model_fields_set
+    title: Any = UNSET
+    if "title" in sent:
+        if not (body.title or "").strip():
+            raise HTTPException(status_code=422, detail="title cannot be blank")
+        title = body.title.strip()
     story = await get_store().update_story(
-        case.id, story_id, title=body.title, description=body.description, user=user.username
+        case.id,
+        story_id,
+        title=title,
+        description=body.description if "description" in sent else UNSET,
+        user=user.username,
     )
+    if story is None:
+        raise HTTPException(status_code=404, detail="Story not found")
     return {"story": story.to_dict()}
 
 
@@ -128,12 +165,28 @@ async def update_story(
 async def delete_story(
     story_id: str,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a story with its blocks and exports (audited)."""
+    """Delete a story with its blocks and exports (audited).
+
+    Deleting a single export is admin-only because an export is an immutable
+    attestation; the story cascade takes exports too, so a story that carries
+    any is admin-only to delete as well — otherwise the cascade would be a way
+    around that gate. The deleted exports' hashes go into the audit record so
+    the attestation trail outlives the rows.
+    """
     store = get_store()
-    deleted = await store.delete_story(case.id, story_id)
-    if not deleted:
+    await _get_story_or_404(case.id, story_id)
+    exports = await store.list_story_exports(story_id)
+    if exports and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"story has {len(exports)} sealed export(s); deleting it requires an administrator"
+            ),
+        )
+    summary = await store.delete_story(case.id, story_id)
+    if summary is None:
         raise HTTPException(status_code=404, detail="Story not found")
     await store.record_audit(
         action="story.delete",
@@ -141,6 +194,7 @@ async def delete_story(
         case_id=case.id,
         target_type="story",
         target_id=story_id,
+        detail=summary,
     )
     return {"deleted": True}
 
@@ -150,12 +204,13 @@ async def create_block(
     story_id: str,
     body: BlockCreateBody,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Append or insert a block (also the push target for "Add to story")."""
     story = await _get_story_or_404(case.id, story_id)
     try:
         content = validate_block_content(body.kind, body.content)
+        await _validate_block_scope(case.id, body.kind, content)
         block = await get_store().create_story_block(
             story.id,
             uuid.uuid4().hex,
@@ -166,6 +221,8 @@ async def create_block(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if block is None:
+        raise HTTPException(status_code=404, detail="Story not found")
     return {"block": block.to_dict()}
 
 
@@ -175,13 +232,14 @@ async def update_block(
     block_id: str,
     body: BlockUpdateBody,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Update a block's content under optimistic concurrency (409 when stale)."""
     await _get_story_or_404(case.id, story_id)
     existing = await _get_block_or_404(story_id, block_id)
     try:
         content = validate_block_content(existing.kind, body.content)
+        await _validate_block_scope(case.id, existing.kind, content)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
@@ -204,7 +262,7 @@ async def move_block(
     block_id: str,
     body: BlockMoveBody,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Reposition a block; ``after_block_id: null`` moves it to the top."""
     await _get_story_or_404(case.id, story_id)
@@ -230,13 +288,36 @@ async def delete_block(
     story_id: str,
     block_id: str,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Delete a block."""
     await _get_story_or_404(case.id, story_id)
     await _get_block_or_404(story_id, block_id)
     await get_store().delete_story_block(block_id)
     return {"deleted": True}
+
+
+async def _read_capped_body(request: Request, cap: int) -> bytes:
+    """Read the request body, abandoning it the moment it exceeds ``cap``.
+
+    A declared ``Content-Length`` is rejected up front; a chunked upload
+    declares none, so the stream is also counted as it arrives. ``cap <= 0``
+    disables the limit, matching the other ``VESTIGO_MAX_*_BYTES`` settings.
+    """
+    if cap <= 0:
+        return await request.body()
+    too_large = HTTPException(status_code=413, detail="artifact exceeds the size cap")
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > cap:
+        raise too_large
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > cap:
+            raise too_large
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def _get_export_or_404(case_id: str, story_id: str, export_id: str):
@@ -250,18 +331,41 @@ async def _get_export_or_404(case_id: str, story_id: str, export_id: str):
 async def create_export(
     story_id: str,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Freeze the story into an immutable, hashed point-in-time snapshot.
 
     The server resolves every block itself (view queries, chart execution,
     event fetches) — the snapshot is authoritative; the client-rendered HTML
     artifact uploaded afterwards is presentation only.
+
+    Resolution runs synchronously inside the request and issues one or more
+    ClickHouse queries per embed block, so both the block count and the
+    resulting snapshot are capped (``VESTIGO_STORY_EXPORT_MAX_BLOCKS`` /
+    ``VESTIGO_STORY_EXPORT_MAX_SNAPSHOT_BYTES``). The size check happens
+    before anything is persisted.
     """
     story = await _get_story_or_404(case.id, story_id)
+    settings = get_settings()
     store = get_store()
     blocks = await store.list_story_blocks(story.id)
+    if len(blocks) > settings.story_export_max_blocks:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"story has {len(blocks)} blocks; the export cap is "
+                f"{settings.story_export_max_blocks}"
+            ),
+        )
     snapshot = await resolve_story_snapshot(story, blocks, user=user)
+    serialized = canonical_json(snapshot)
+    snapshot_bytes = len(serialized.encode("utf-8"))
+    cap = settings.story_export_max_snapshot_bytes
+    if cap and snapshot_bytes > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=f"resolved snapshot is {snapshot_bytes} bytes; the cap is {cap}",
+        )
     export = await store.create_story_export(
         uuid.uuid4().hex,
         story.id,
@@ -284,14 +388,34 @@ async def create_export(
 async def seal_export_artifact(
     story_id: str,
     export_id: str,
-    body: ArtifactBody,
+    request: Request,
     case: Case = Depends(require_case_contribute),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Attach the client-rendered standalone HTML to an export, exactly once."""
-    await _get_export_or_404(case.id, story_id, export_id)
-    if len(body.html.encode("utf-8")) > MAX_ARTIFACT_BYTES:
-        raise HTTPException(status_code=413, detail="artifact exceeds the size cap")
+    """Attach the client-rendered standalone HTML to an export, exactly once.
+
+    Takes the raw request rather than a parsed body model so the size cap is
+    applied to the arriving stream: validating the decoded string would bound
+    what gets *stored* while still buffering an unbounded body first.
+
+    The HTML must carry the export's ``snapshot_hash``. Nothing else ties the
+    artifact's content to the snapshot it claims to render — without this the
+    server would hash and store whatever it was handed, and ``html_hash``
+    would be presented with the same authority as ``snapshot_hash`` while
+    attesting to nothing. Verification is still always against the snapshot;
+    this only stops an artifact being sealed onto the wrong export.
+    """
+    export = await _get_export_or_404(case.id, story_id, export_id)
+    raw = await _read_capped_body(request, get_settings().story_max_artifact_bytes)
+    try:
+        body = ArtifactBody.model_validate_json(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"invalid artifact body: {exc}") from exc
+    if export.snapshot_hash not in body.html:
+        raise HTTPException(
+            status_code=422,
+            detail="artifact must embed the export's snapshot_hash",
+        )
     html_hash = hashlib.sha256(body.html.encode("utf-8")).hexdigest()
     export = await get_store().seal_story_export_artifact(export_id, body.html, html_hash)
     if export is None:
@@ -300,9 +424,7 @@ async def seal_export_artifact(
 
 
 @router.get("/{case_id}/stories/{story_id}/exports")
-async def list_exports(
-    story_id: str, case: Case = Depends(require_case_read)
-) -> dict[str, Any]:
+async def list_exports(story_id: str, case: Case = Depends(require_case_read)) -> dict[str, Any]:
     """List a story's exports, newest first (snapshots omitted)."""
     await _get_story_or_404(case.id, story_id)
     exports = await get_store().list_story_exports(story_id)
@@ -312,10 +434,24 @@ async def list_exports(
 @router.get("/{case_id}/stories/{story_id}/exports/{export_id}/snapshot")
 async def download_export_snapshot(
     story_id: str, export_id: str, case: Case = Depends(require_case_read)
-) -> dict[str, Any]:
-    """Download the frozen snapshot JSON."""
+) -> Response:
+    """Download the frozen snapshot JSON.
+
+    Serves the *canonical* bytes — the exact serialization ``snapshot_hash``
+    was computed over — rather than letting the framework re-encode the dict
+    with its own key order and spacing. A third party can then verify the
+    attestation by hashing the response body directly, with no knowledge of
+    our canonicalization rules.
+    """
     export = await _get_export_or_404(case.id, story_id, export_id)
-    return export.snapshot
+    return Response(
+        content=canonical_json(export.snapshot),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (f'attachment; filename="story-{story_id}-{export_id}.json"'),
+            "X-Vestigo-Snapshot-Hash": export.snapshot_hash,
+        },
+    )
 
 
 @router.get("/{case_id}/stories/{story_id}/exports/{export_id}/artifact")
@@ -330,9 +466,7 @@ async def download_export_artifact(
         content=export.html,
         media_type="text/html; charset=utf-8",
         headers={
-            "Content-Disposition": (
-                f'attachment; filename="story-{story_id}-{export_id}.html"'
-            )
+            "Content-Disposition": (f'attachment; filename="story-{story_id}-{export_id}.html"')
         },
     )
 
@@ -345,8 +479,11 @@ async def delete_export(
     user: User = Depends(require_admin),
 ) -> dict[str, Any]:
     """Delete an export — admin only; exports are otherwise immutable."""
-    await _get_export_or_404(case.id, story_id, export_id)
+    export = await _get_export_or_404(case.id, story_id, export_id)
     store = get_store()
+    # Captured before the row goes: the hashes are the attestation, and the
+    # audit log is the only place they survive the delete.
+    detail = {"snapshot_hash": export.snapshot_hash, "html_hash": export.html_hash}
     await store.delete_story_export(export_id)
     await store.record_audit(
         action="story.export_delete",
@@ -354,5 +491,6 @@ async def delete_export(
         case_id=case.id,
         target_type="story_export",
         target_id=export_id,
+        detail=detail,
     )
     return {"deleted": True}
