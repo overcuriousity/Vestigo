@@ -10,7 +10,12 @@
  * (same wire format as useCaseStream's EventSource, parsed by hand).
  */
 import { BASE, get, post, put, patch, del, fetchBlobGet, ApiError } from "./client";
-import type { EventFilters, FieldMatchMode } from "./types";
+import type {
+  EventFilters,
+  FieldMatchMode,
+  StoryBlock,
+  StoryBlockKind,
+} from "./types";
 import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { Metric } from "@/components/viz/lib/transforms";
@@ -225,12 +230,23 @@ function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
 /** An agent-proposed annotation, propose→confirm (A1): the agent never
  * writes annotations directly — `propose_annotation` creates one of these,
  * and an analyst confirms or rejects it via the endpoints below. */
+export interface StoryBlockProposalPayload {
+  story_id: string;
+  block_kind: StoryBlockKind;
+  content: Record<string, unknown>;
+  after_block_id: string | null;
+}
+
 export interface AgentProposal {
   id: string;
   conversation_id: string;
   case_id: string;
   timeline_id: string;
   status: "proposed" | "confirmed" | "rejected";
+  /** What the proposal proposes; "annotation" for every pre-W7 row. */
+  kind: "annotation" | "story_block";
+  /** Kind-specific body — the story-block target and content, else null. */
+  payload: StoryBlockProposalPayload | null;
   tag: string | null;
   comment: string | null;
   rationale: string;
@@ -438,7 +454,16 @@ export const agentApi = {
     ),
 
   confirmProposal: (caseId: string, conversationId: string, proposalId: string) =>
-    post<{ proposal: AgentProposal; written: number; skipped_event_ids: string[] }>(
+    post<{
+      proposal: AgentProposal;
+      // Annotation proposals report what they wrote…
+      written?: number;
+      skipped_event_ids?: string[];
+      // …story-block proposals report whether the block landed.
+      applied?: boolean;
+      block?: StoryBlock | null;
+      reason?: string | null;
+    }>(
       `/cases/${caseId}/agent/conversations/${conversationId}/proposals/${proposalId}/confirm`,
     ),
 
