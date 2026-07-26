@@ -31,6 +31,8 @@ auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/
   frequency, semantic similarity). Update alongside any detector change in the same commit.
 - `AGENT.md` — the optional AI investigation agent (design invariants, MCP tools, provider
   config incl. Kimi coding plan). Update alongside any `src/vestigo/agent/` change.
+- `STORIES.md` — the Stories subsystem (block model, collaboration and export semantics,
+  snapshot format, agent parity). Update alongside any `src/vestigo/stories/` change.
 - `DEPLOYMENT.md` — operator guide: reference compose stack, containerized app, airgapped
   install, TLS reverse proxy (`nginx-tls.conf`), stability/upgrade guarantees.
 - `INPUT_FORMATS.md` — CSV/JSONL/Parquet field-level normalization spec for ingestion.

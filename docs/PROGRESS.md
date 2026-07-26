@@ -1,9 +1,58 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-25 (session 99 — X1 third review round).
+Last updated: 2026-07-26 (session 100 — W7 Stories).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 100 — 2026-07-26: W7 Stories (Phase 3 Step 3)
+
+**Why.** The last open item of Phase 3, and the feature Timesketch users reach for
+most: a per-case document where the narrative and the evidence live together, so the
+report assembles itself during the investigation instead of being written afterwards.
+Design round: `docs/superpowers/specs/2026-07-26-w7-stories-design.md`; reference doc:
+`docs/STORIES.md`.
+
+- **Live editor, frozen exports.** The central tension the design round settled: embeds
+  stay live while an analyst writes (the document tracks ingestion and detection as they
+  progress), and `POST .../exports` freezes a server-resolved, SHA-256-hashed, immutable
+  snapshot. Freeze-at-embed would have killed the live-report feel; freeze-only-at-export
+  with no stored bundle would have left "what did this chart show?" unanswerable once the
+  file was lost. The stored snapshot is the attested record, like a Source's `file_hash`.
+- **Server resolves, browser renders.** Export is two-phase and deliberately asymmetric.
+  The server executes every block itself — view queries through the same `_build_query`
+  path the Explorer uses, charts through `execute_chart_spec` — and stores the hashed
+  bundle. The client then renders that bundle to standalone HTML and uploads it once. The
+  JSON is authoritative; the HTML is presentation, and an export is complete without it.
+  This also kept a server-side chart-rendering stack (and a headless browser in an
+  airgapped install) out of the deployment.
+- **Nothing vanishes silently.** Per-block resolution is individually wrapped: a view
+  deleted before the export freezes as `resolution.error`, visible in the artifact, and
+  one bad block never fails an export. Truncation is always stated — a report showing 200
+  of 14203 rows says which it is, in the editor and in the export.
+- **Collaboration without new infrastructure.** Block-level optimistic concurrency
+  (`version` per block, 409 with the winning row) plus 10s polling. Block granularity does
+  the work: two analysts on different blocks never collide, and a conflict keeps the local
+  draft with a load-theirs/overwrite choice. No CRDT, no WebSockets — the same call the
+  streaming milestone already made for the live Explorer.
+- **Integer gap ordering.** Positions stride by 1024; an insert between two blocks takes
+  the midpoint, and an exhausted gap renumbers the story inside the same transaction.
+  Boring on purpose: float positions accumulate precision failures exactly where a
+  document is edited most.
+- **Agent parity, phase-spec deferral rescinded.** The Phase 3 spec had deferred
+  agent-authored stories; the user rescinded that during the design round, on the standing
+  principle that the agent can do what an analyst can do. Stories shipped with
+  `list_stories`/`read_story` (also on external `/mcp`) and `propose_story_block`
+  (in-app only, like `propose_annotation`). `AgentProposal` gained `kind`/`payload` so
+  both proposal shapes share one decide path and its 409 idempotency backbone. A
+  `chart_ref` may be proposed with an inline spec — confirming saves the chart and embeds
+  it in one step. Block edit/move/delete and export stay analyst-only: parity covers
+  analytical contribution, not document arrangement or the attestation act.
+- **Two extractions, no duplication.** `execute_chart_spec` came out of `propose_chart`
+  so the export resolver runs the identical validated path, and `ChartCanvas`/`ChartMarks`
+  came out of `ChartProposalCard` so a chart is drawn by one component in the Visualize
+  page, an agent card, a story block *and* an exported snapshot. The snapshot renderer
+  performs no network access at all — asserted by a test that fails if a render fetches.
 
 ## Session 99 — 2026-07-25: X1 third review round (untrusted-input bounds, event loop)
 

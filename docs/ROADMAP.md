@@ -12,28 +12,23 @@ Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_F
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
 resolved.
 
-**Priority order** (verified against the codebase 2026-07-22): the active phase comes
-first — Phase 3 Step 3 (W7 Stories) is the next major feature. Behind it, roughly by
-payoff-per-effort: A12 local transform tools (low friction, no design round needed),
+**Priority order** (verified against the codebase 2026-07-26): Phase 3 is complete, so
+the queue is led, roughly by payoff-per-effort, by
+A12 local transform tools (low friction, no design round needed),
 A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
 D10 correlation rules (heaviest lift, last of the detector line). Milestones 6 (streaming
 ingest) and 7 (forensic examination) are future phases gated on a joint data-model design
 round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up opportunistically.
 
-## Phase 3 — investigation depth (active, decided 2026-07-19)
+## Phase 3 — investigation depth (complete, 2026-07-26)
 
-Analyst-depth phase; full rationale in
-`docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md`. Agent stays an
-analysis companion — agent-authored stories deferred. Steps 1 (W6 template clustering,
-see `docs/ANOMALY_DETECTION.md` §14) and 2 (A9 viz parity, see `docs/AGENT.md`) shipped.
-
-- [ ] **Step 3 — W7 Stories, human-first** (canonical entry; Milestone 5 pointed here).
-  Markdown document per case embedding live references to saved Views, charts, and tagged
-  events — the report writes itself during the investigation. Building blocks (Views,
-  annotations, saved charts, RBAC) all exist; mostly a new Postgres model + frontend
-  editor. Timesketch's most-loved feature. Own design round; key tension: live embeds in
-  editor vs. point-in-time snapshot on export. Block model leaves room for a later
-  `origin` field (agent authorship later, no migration pain).
+All three steps shipped: W6 template clustering (`docs/ANOMALY_DETECTION.md` §14),
+A9 viz parity (`docs/AGENT.md`) and W7 Stories (`docs/STORIES.md`). Rationale in
+`docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md`; the W7 design
+round in `docs/superpowers/specs/2026-07-26-w7-stories-design.md`. The phase spec's
+deferral of agent-authored stories was rescinded during that round — Stories shipped
+with full agent parity (read tools plus propose→confirm authorship), so nothing from
+Phase 3 carries forward.
 
 Parked: D10 (next phase; W6 feeds it), M6 streaming, M7 examination. Standing rule:
 when M6 or M7 resumes, S1 and E1 are designed **jointly** in one `MODEL_REFINEMENT.md`
@@ -120,7 +115,7 @@ covers most of it and stays explainable).
   parsing per [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md)
   — was superseded by the client-side Parquet converter architecture shipped with M20.)
 
-W7 (Stories) lives in Phase 3 Step 3 above — single canonical entry.
+W7 (Stories) shipped with Phase 3 — see `docs/STORIES.md`.
 
 ## Milestone 6 — streaming ingest ("live forensic" mode, agentless)
 

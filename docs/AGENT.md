@@ -18,13 +18,21 @@ management) and `api/routers/agent.py` (HTTP/SSE layer). Design records:
   analyst click applies filters (through the normal URL-driven filter path,
   `frontend/src/lib/queryParams.ts`).
 - **Propose→confirm writes.** The agent itself never writes an annotation.
-  `propose_annotation` (available only once a conversation is bound) records an
-  `AgentProposal` row — it does not touch `annotations`. An analyst confirms or
-  rejects via `POST .../proposals/{id}/confirm|reject`; confirm re-resolves the
-  events against the *current* scope, writes one annotation per still-resolving
-  event with `origin="agentic-analysis"` and `created_by` set to the confirming
-  analyst, and reports `skipped_event_ids`. The decide is an atomic
-  `UPDATE … WHERE status='proposed'`, so a second confirm/reject 409s.
+  `propose_annotation` and `propose_story_block` (available only once a
+  conversation is bound) record an
+  `AgentProposal` row — it does not touch `annotations` or `story_blocks`. An
+  analyst confirms or rejects via `POST .../proposals/{id}/confirm|reject`; the
+  decide is an atomic `UPDATE … WHERE status='proposed'`, so a second
+  confirm/reject 409s. `AgentProposal.kind` discriminates what gets applied:
+  - `annotation` — confirm re-resolves the events against the *current* scope,
+    writes one annotation per still-resolving event with
+    `origin="agentic-analysis"` and `created_by` set to the confirming analyst,
+    and reports `skipped_event_ids`.
+  - `story_block` (W7) — confirm creates the block with `origin: agent` in the
+    story named by `payload`; an inline `chart_spec` is saved as a SavedChart
+    first, so the block references a persisted object like every other embed. A
+    story deleted since propose time still decides the proposal and reports
+    `applied: false` with a reason. See `docs/STORIES.md`.
   `run_anomaly_detector` is the only other write-shaped tool (it persists a
   `DetectorRun`, same as an analyst-triggered scan).
   - **Origin is provenance, not a visibility class.** A confirmed
@@ -33,10 +41,12 @@ management) and `api/routers/agent.py` (HTTP/SSE layer). Design records:
     (`USER_VISIBLE_ANNOTATION_ORIGINS = ("user", "agentic-analysis")`); only
     `origin="system"` stays outside that set.
   - Every decision is audited (`agent.annotation_confirm` /
-    `agent.annotation_reject`, keyed to `target_type="agent_proposal"`).
-  - `propose_annotation` and the decide endpoints are **absent from the
-    external `/mcp` transport** — only an in-app conversation binds the
-    `conversation_id` that gates the tool's registration.
+    `agent.annotation_reject`, `agent.story_block_confirm` /
+    `agent.story_block_reject`, keyed to `target_type="agent_proposal"`).
+  - `propose_annotation`, `propose_story_block` and the decide endpoints are
+    **absent from the external `/mcp` transport** — only an in-app conversation
+    binds the `conversation_id` that gates the tools' registration. Story
+    *read* tools are exposed there like every other read tool.
 - **Invisible unless configured.** `/api/health` reports `agent_available` only
   when `VESTIGO_AGENT_*` is set **and** the endpoint answered a cached probe
   (`agent/availability.py`, TTL `VESTIGO_AGENT_PROBE_TTL_SECONDS`). Otherwise
@@ -157,11 +167,14 @@ small-context local models.
 | `propose_finding` | core | Finding card with applicable Explorer filters. |
 | `propose_chart` | | Chart card, validated by executing the underlying query. |
 | `propose_annotation` | core | Propose tagging/commenting events; conversation-bound only, analyst must confirm. |
+| `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
 | `semantic_search` | | Events similar to free text (embeddings-gated). |
 | `similar_events` | | Events similar to an existing event (embeddings-gated). |
 | `list_baselines` | | Saved baseline definitions — unlocks the temporal-only detectors. |
 | `list_dispositions` | | Analyst verdicts on anomaly findings. |
 | `list_saved_views` | | The analyst's saved filter views. |
+| `list_stories` | | The case's stories (the analyst's report documents). |
+| `read_story` | | One story's ordered blocks — markdown text and embed references. |
 | `list_annotations` | | Annotations across the timeline's sources. |
 | `get_event_annotations` | | All annotations on one event. |
 | `list_sigma_rules` | | Sigma rules available to the case. |
@@ -607,7 +620,8 @@ route).
 - `tests/test_agent_tokens.py` / `tests/test_mcp_http.py` — token model +
   management API (create/list/revoke, RBAC), token lifecycle over HTTP,
   scope binding, an end-to-end tool call, off-by-default 404, admin deny
-  list on the external `tools/list`, `propose_annotation` absent from `/mcp`.
+  list on the external `tools/list`, `propose_annotation` and
+  `propose_story_block` absent from `/mcp`.
 - `tests/test_chart_meta.py` — chart-meta legality table + generated
   frontend copy is regeneration-stable.
 - Frontend: `frontend/src/test/agent.test.ts` — FilterSpec → EventFilters
