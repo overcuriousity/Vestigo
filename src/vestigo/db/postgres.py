@@ -1300,6 +1300,14 @@ class AgentProposal(Base):
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    # What the proposal proposes: "annotation" (the original shape, columns
+    # below) or "story_block" (payload carries {story_id, block_kind, content,
+    # after_block_id} — see W7). One table so the decide/409 idempotency
+    # backbone and the audit surface stay single-path.
+    kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="annotation", server_default="annotation"
+    )
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -1320,6 +1328,8 @@ class AgentProposal(Base):
             "case_id": self.case_id,
             "timeline_id": self.timeline_id,
             "status": self.status,
+            "kind": self.kind,
+            "payload": self.payload,
             "tag": self.tag,
             "comment": self.comment,
             "rationale": self.rationale,
@@ -3851,22 +3861,26 @@ class PostgresStore:
         case_id: str,
         timeline_id: str,
         conversation_id: str,
-        tag: str | None,
-        comment: str | None,
-        rationale: str,
-        events: list,
+        tag: str | None = None,
+        comment: str | None = None,
+        rationale: str = "",
+        events: list | None = None,
+        kind: str = "annotation",
+        payload: dict | None = None,
     ) -> AgentProposal:
-        """Create a new proposed annotation awaiting analyst decision."""
+        """Create a new agent proposal awaiting analyst decision."""
         proposal = AgentProposal(
             id=generate_id("agentprop"),
             conversation_id=conversation_id,
             case_id=case_id,
             timeline_id=timeline_id,
             status="proposed",
+            kind=kind,
+            payload=payload,
             tag=tag,
             comment=comment,
             rationale=rationale,
-            events=events,
+            events=events or [],
         )
         async with self.session_factory() as session:
             session.add(proposal)

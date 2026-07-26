@@ -176,7 +176,11 @@ def test_mcp_end_to_end_tool_call(mcp_client, admin_bootstrap):
     )
     assert listed.status_code == 200, listed.text
     assert "list_baselines" in listed.text
+    # Read parity reaches external clients; propose tools stay in-app only.
+    assert "list_stories" in listed.text
+    assert "read_story" in listed.text
     assert "propose_annotation" not in listed.text
+    assert "propose_story_block" not in listed.text
 
     called = mcp_client.post(
         "/mcp",

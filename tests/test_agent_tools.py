@@ -2130,3 +2130,69 @@ async def test_read_story_unknown_id(store):
     server = build_tool_server(_scope("c1", "t1"))
     payload = await _call(server, "read_story", {"story_id": "ghost"})
     assert "not found" in payload["error"]
+
+
+async def test_propose_story_block_records_proposal(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+    result = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "markdown",
+            "content": {"text": "## agent finding"},
+            "rationale": "summarizes the brute-force window",
+        },
+    )
+    assert result["status"] == "proposed"
+    assert isinstance(result["proposal_id"], str) and result["proposal_id"]
+    (p,) = await store.list_agent_proposals(conv.id)
+    assert p.kind == "story_block"
+    assert p.payload["story_id"] == "s1"
+    assert p.payload["content"] == {"text": "## agent finding"}
+
+
+async def test_propose_story_block_validates(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    unknown_story = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "ghost", "block_kind": "markdown", "content": {"text": "x"}},
+    )
+    assert "not found" in unknown_story["error"]
+
+    bad_kind = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "gif", "content": {}},
+    )
+    assert "unknown block kind" in bad_kind["error"]
+
+    bad_anchor = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "markdown",
+            "content": {"text": "x"},
+            "after_block_id": "ghost",
+        },
+    )
+    assert "after_block_id" in bad_anchor["error"]
+
+
+async def test_propose_story_block_absent_without_conversation(store):
+    await store.init_schema()
+    server = build_tool_server(_scope("c1", "t1"))  # no conversation_id
+    async with FastMCPClient(server) as client:
+        names = [t.name for t in await client.list_tools()]
+    assert "propose_story_block" not in names

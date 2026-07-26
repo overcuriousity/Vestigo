@@ -171,6 +171,12 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         tier="core",
     ),
     ToolInfo(
+        "propose_story_block",
+        "Propose adding a block to a story — the analyst must confirm.",
+        requires_conversation=True,
+        tier="core",
+    ),
+    ToolInfo(
         "semantic_search",
         "Find events semantically similar to free text (needs embeddings).",
         embeddings_gated=True,
@@ -1686,6 +1692,71 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "status": "proposed",
                 "event_count": len(found),
             }
+
+        @server.tool()
+        async def propose_story_block(
+            story_id: str,
+            block_kind: str,
+            content: dict[str, Any],
+            after_block_id: str | None = None,
+            rationale: str = "",
+        ) -> dict[str, Any]:
+            """Propose adding one block to a story — the analyst must confirm.
+
+            Nothing is written until the analyst confirms the proposal card.
+            block_kind is one of markdown | view_ref | chart_ref | event_ref.
+            view_ref/event_ref must reference existing persisted objects.
+            chart_ref may instead carry {"chart_spec": {...}, "name": "..."} —
+            a spec exactly as propose_chart takes, validated by executing it;
+            confirming then saves the chart and embeds it in one step.
+            """
+            from vestigo.api.deps import get_store
+            from vestigo.stories.schemas import validate_block_content
+
+            store = get_store()
+            story = await store.get_story(scope.case_id, story_id)
+            if story is None:
+                return {"error": f"story {story_id!r} not found in this case — list_stories"}
+            if after_block_id is not None:
+                blocks = await store.list_story_blocks(story_id)
+                if after_block_id not in {b.id for b in blocks}:
+                    return {"error": f"after_block_id {after_block_id!r} not in this story"}
+            inline_chart = block_kind == "chart_ref" and "chart_spec" in (content or {})
+            try:
+                if inline_chart:
+                    if not (content.get("name") or "").strip():
+                        return {"error": 'inline chart_ref needs a "name" for the saved chart'}
+                    spec = ChartSpec.model_validate(content["chart_spec"])
+                    executed = await execute_chart_spec(
+                        scope,
+                        spec,
+                        service=service,
+                        validated=_validated,
+                        check_field=_check_chart_field,
+                    )
+                    content = {
+                        "chart_spec": spec.model_dump(mode="json", exclude_none=True),
+                        "name": content["name"].strip(),
+                        "resolved": executed["resolved"],
+                    }
+                else:
+                    content = validate_block_content(block_kind, content)
+            except ValueError as exc:
+                return {"error": str(exc)}
+            proposal = await store.create_agent_proposal(
+                case_id=scope.case_id,
+                timeline_id=scope.timeline_id,
+                conversation_id=scope.conversation_id,
+                rationale=rationale,
+                kind="story_block",
+                payload={
+                    "story_id": story_id,
+                    "block_kind": block_kind,
+                    "content": content,
+                    "after_block_id": after_block_id,
+                },
+            )
+            return {"proposal_id": proposal.id, "status": "proposed"}
 
     @server.tool()
     async def semantic_search(q: str, limit: int = 10) -> dict[str, Any]:
