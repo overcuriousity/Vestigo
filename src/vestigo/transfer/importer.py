@@ -420,9 +420,20 @@ async def import_case(
 ) -> ImportResult:
     """Restore an archive as a new case owned by `owner`. All-or-nothing."""
 
-    def _progress(phase: str) -> None:
+    def _progress(phase: str, total: int = 0) -> None:
+        """Enter a phase, resetting the unit counters in the same write.
+
+        ``JobStore.update`` *merges* progress dicts, so a phase that only sets
+        ``phase`` inherits the previous phase's ``processed``/``total`` and the
+        UI shows a percentage from the wrong denominator. Always reset both
+        here, and let ``_advance`` move ``processed`` within the phase.
+        """
         if progress:
-            progress({"phase": phase})
+            progress({"phase": phase, "processed": 0, "total": total})
+
+    def _advance(processed: int) -> None:
+        if progress:
+            progress({"processed": processed})
 
     _progress("verify")
     reader = ArchiveReader(archive_path)  # raises ArchiveFormatError on bad manifest
@@ -552,7 +563,7 @@ async def import_case(
 
         event_members = [n for n in verified if n.startswith("events/") and n.endswith(".arrow")]
         if event_members:
-            _progress("events")
+            _progress("events", total=len(event_members))
             clickhouse = clickhouse_factory()
         for old_source_id, _file_hash in source_refs:
             new_source_id = idmap.remap("source", old_source_id)
@@ -565,24 +576,29 @@ async def import_case(
                     _insert_source_events, clickhouse, reader, arcname, new_case_id, new_source_id
                 )
                 counts["events"] += n
+                # Counts restored members, so it tracks the `event_members`
+                # denominator rather than the wider `source_refs` loop.
+                _advance(len(inserted_sources))
 
         # Sorted, because `verified` is a set: warning order in the job result
         # (and from there the audit detail) must not vary run to run.
         blob_members = sorted(n for n in verified if n.startswith("blobs/"))
         if blob_members:
-            _progress("blobs")
+            _progress("blobs", total=len(blob_members))
         # The retention dir is instance-global, so only blobs an archived
         # source actually claims may land in it. Content is verified against
         # the member name below, which stops an existing blob being poisoned;
         # this stops an archive planting unrelated files there at all.
         referenced = {file_hash for _sid, file_hash in source_refs}
-        for arcname in blob_members:
+        for done, arcname in enumerate(blob_members, start=1):
             sha = arcname.removeprefix("blobs/")
             if not _SHA256_RE.fullmatch(sha):
                 warnings.append(f"skipping suspicious blob member: {arcname}")
+                _advance(done)
                 continue
             if sha not in referenced:
                 warnings.append(f"ignoring blob no source references: {sha[:12]}…")
+                _advance(done)
                 continue
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
@@ -608,6 +624,7 @@ async def import_case(
                 counts["blobs"] += 1
             finally:
                 tmp_path.unlink(missing_ok=True)
+            _advance(done)
         blobbed = {n.removeprefix("blobs/") for n in blob_members}
         if blob_members:
             # Deduped by hash, not per source row: sources share blobs, and one
@@ -621,14 +638,15 @@ async def import_case(
                 )
 
         if clickhouse is not None and inserted_sources:
-            _progress("stats")
-            for new_source_id in inserted_sources:
+            _progress("stats", total=len(inserted_sources))
+            for done, new_source_id in enumerate(inserted_sources, start=1):
                 try:
                     await refresh_source_field_stats(store, clickhouse, new_case_id, new_source_id)
                 except Exception as exc:  # noqa: BLE001 — stats never fail an import
                     warnings.append(
                         f"field stats recompute failed for source {new_source_id}: {exc}"
                     )
+                _advance(done)
     except Exception:
         if clickhouse is not None:
             for new_source_id in inserted_sources:

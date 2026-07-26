@@ -265,9 +265,20 @@ async def export_case(
     """Build the archive for one case. ClickHouse is only constructed when
     the case has sources (keeps empty-case export — and unit tests — CH-free)."""
 
-    def _progress(phase: str) -> None:
+    def _progress(phase: str, total: int = 0) -> None:
+        """Enter a phase, resetting the unit counters in the same write.
+
+        ``JobStore.update`` *merges* progress dicts, so a phase that only sets
+        ``phase`` inherits the previous phase's ``processed``/``total`` and the
+        UI shows a percentage from the wrong denominator. Always reset both
+        here, and let ``_advance`` move ``processed`` within the phase.
+        """
         if progress:
-            progress({"phase": phase})
+            progress({"phase": phase, "processed": 0, "total": total})
+
+    def _advance(processed: int) -> None:
+        if progress:
+            progress({"processed": processed})
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     _progress("postgres")
@@ -315,9 +326,9 @@ async def export_case(
 
     sources = stems["sources"]
     if sources:
-        _progress("events")
+        _progress("events", total=len(sources))
         clickhouse = clickhouse_factory()
-        for source in sources:
+        for done, source in enumerate(sources, start=1):
             dest = dest_dir / f"events-{source['id']}.arrow"
             try:
                 n = await asyncio.to_thread(
@@ -329,15 +340,14 @@ async def export_case(
                 counts["events"] += n
             finally:
                 dest.unlink(missing_ok=True)
+            _advance(done)
         if include_blobs:
-            _progress("blobs")
-            seen: set[str] = set()
-            for source in sources:
-                file_hash = source["file_hash"]
-                if file_hash in seen:
-                    # Content-addressed: two sources can share a blob; emit once.
-                    continue
-                seen.add(file_hash)
+            # Content-addressed: two sources can share a blob, so the unique
+            # hashes — not the sources — are the denominator.
+            blob_hashes = list(dict.fromkeys(s["file_hash"] for s in sources))
+            _progress("blobs", total=len(blob_hashes))
+            for done, file_hash in enumerate(blob_hashes, start=1):
+                source = next(s for s in sources if s["file_hash"] == file_hash)
                 blob = retention_path(file_hash)
                 if blob.exists():
                     # Original source files, routinely the largest members in
@@ -348,6 +358,7 @@ async def export_case(
                     warnings.append(
                         f"source blob missing on disk: {source['name']} ({file_hash[:12]}…)"
                     )
+                _advance(done)
 
     _progress("manifest")
     writer.finish(
@@ -361,9 +372,13 @@ async def export_case(
             "counts": counts,
         }
     )
+    size_bytes = archive_path.stat().st_size
+    # Lets the download bar size itself before the response headers arrive.
+    if progress:
+        progress({"bytes_total": size_bytes})
     return ExportResult(
         path=archive_path,
-        bytes=archive_path.stat().st_size,
+        bytes=size_bytes,
         counts=counts,
         warnings=cap_warnings(warnings),
     )

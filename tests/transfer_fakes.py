@@ -1,13 +1,40 @@
 """Shared test doubles for the transfer (X1) test suite.
 
 `_add` fills unknown non-nullable columns so tests survive model churn;
-`FakeClickHouse` stands in for ClickHouseStore keyed by (case_id, source_id).
+`FakeClickHouse` stands in for ClickHouseStore keyed by (case_id, source_id);
+`ProgressRecorder` stands in for the job store's progress callback.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
+
+
+class ProgressRecorder:
+    """Records progress writes the way ``JobStore.update`` applies them.
+
+    ``JobStore.update`` *merges* each dict into the job's existing progress,
+    so what the UI reads is the accumulated state, not the individual write.
+    `snapshots` replays that merge, which is what makes a stale
+    ``total`` from a previous phase visible to a test.
+    """
+
+    def __init__(self) -> None:
+        self.writes: list[dict[str, Any]] = []
+        self.snapshots: list[dict[str, Any]] = []
+        self._state: dict[str, Any] = {}
+
+    def __call__(self, payload: dict[str, Any]) -> None:
+        self.writes.append(dict(payload))
+        self._state.update(payload)
+        self.snapshots.append(dict(self._state))
+
+    @property
+    def phases(self) -> list[str]:
+        """Phase tokens in the order they were entered."""
+        return [w["phase"] for w in self.writes if "phase" in w]
 
 
 def _fill(col):
