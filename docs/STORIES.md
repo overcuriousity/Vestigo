@@ -119,12 +119,20 @@ for both the HTTP router and the agent's `propose_story_block`).
 | `chart_ref` | `{chart_id, timeline_id}` |
 | `event_ref` | `{event_id, source_id, caption?}` (caption ≤ 1000 chars) |
 
-A block's `timeline_id`, `view_id` and `chart_id` are additionally checked
-against the case at create/update time. Shape validation alone let a foreign or
-mistyped id through, to surface much later as an undrawable card or a frozen
-`resolution.error`; a 422 at the point of the mistake is the better failure.
-(A ref that goes dangling *afterwards* is a different thing, and still degrades
-visibly.)
+A block's `timeline_id`, `view_id`, `chart_id` and `source_id` are additionally
+checked against the case by `vestigo.stories.refs.validate_block_scope`. Shape
+validation alone let a foreign or mistyped id through, to surface much later as
+an undrawable card or a frozen `resolution.error`; an error at the point of the
+mistake is the better failure. (A ref that goes dangling *afterwards* is a
+different thing, and still degrades visibly.)
+
+Every write path runs both gates: the HTTP router (422), the agent's
+`propose_story_block` (a tool error the model can correct) **and** its confirm
+handler — the last because a referent can be deleted between propose and
+confirm, in which case the proposal still decides but reports
+`applied: false` with the reason. An `event_ref`'s `source_id` is checked;
+the `event_id` itself is only resolvable against ClickHouse, so a wrong one
+surfaces at export as a `resolution.error`.
 
 `display` lives on the block, not on the View, so one View can be embedded
 twice with different presentation. `limit` is validated `1..VIEW_BLOCK_ROW_CAP`
@@ -194,7 +202,11 @@ Two phases, deliberately asymmetric:
    `SnapshotRenderer` (which performs no network access at all — asserted by a
    test that fails if a render fetches), inlines the app's compiled CSS, and
    uploads the standalone HTML once. The artifact is presentation; an export
-   is complete and usable if the upload never happens.
+   is complete and usable if the upload never happens. Such an export stays
+   unsealed (`html IS NULL`), and the Exports tab offers **Render HTML** on it
+   — a retry that re-renders from the *stored* snapshot, never a fresh
+   resolution, so the artifact still attests to the same frozen record and the
+   same hash.
 
 Charts are executed at export time under **`ANALYST_CHART_LIMITS`**, not the
 agent's. `execute_chart_spec` is shared with `propose_chart`, whose caps exist

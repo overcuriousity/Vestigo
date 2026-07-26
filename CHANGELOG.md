@@ -33,7 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is individually wrapped, so a view deleted before the export freezes as a
   visible `resolution.error` rather than vanishing, and one bad block never
   fails an export. Truncation is always stated — a report showing 200 of 14203
-  rows says which it is.
+  rows says which it is. An export whose HTML upload fails stays usable as JSON
+  and can be re-rendered from its stored snapshot ("Render HTML"), so a
+  transport failure never costs the attestation.
 
   **Collaborative at block granularity.** Every block carries an optimistic
   `version`; a stale write returns 409 with the winning row and the editor keeps

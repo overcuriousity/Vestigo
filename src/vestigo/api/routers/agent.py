@@ -1012,6 +1012,7 @@ async def _apply_story_block_proposal(
     """
     import uuid as _uuid
 
+    from vestigo.stories.refs import validate_block_scope
     from vestigo.stories.schemas import validate_block_content
 
     payload = decided.payload or {}
@@ -1024,30 +1025,43 @@ async def _apply_story_block_proposal(
     else:
         block_kind = payload.get("block_kind")
         content = dict(payload.get("content") or {})
-        if block_kind == "chart_ref" and "chart_spec" in content:
-            from vestigo.agent.tools import ChartSpec
-            from vestigo.stories.export import spec_to_stored_chart_config
-
-            # ``SavedChart.config`` is the frontend's versioned camelCase
-            # ChartConfig, not the agent's ChartSpec — storing the spec's dump
-            # produces a chart no consumer can draw (and no error until the
-            # analyst opens it). Proposals made before ``chart_config`` was
-            # carried in the payload are converted here instead.
-            chart_config = content.get("chart_config")
-            if not chart_config:
-                chart_config = spec_to_stored_chart_config(
-                    ChartSpec.model_validate(content["chart_spec"])
-                )
-            chart = await store.create_saved_chart(
-                case_id,
-                decided.timeline_id,
-                _uuid.uuid4().hex,
-                content.get("name") or "Agent chart",
-                chart_config,
-            )
-            content = {"chart_id": chart.id, "timeline_id": decided.timeline_id}
+        # Everything that can fail on a *stored* payload is inside one try:
+        # a decided proposal must report an honest ``applied: false`` with a
+        # reason, never a 500. That includes the legacy chart conversion —
+        # a spec carrying chart-local base filters has no ChartConfig
+        # representation and raises.
         try:
+            if block_kind == "chart_ref" and "chart_spec" in content:
+                from pydantic import ValidationError
+
+                from vestigo.agent.tools import ChartSpec
+                from vestigo.stories.export import spec_to_stored_chart_config
+
+                # ``SavedChart.config`` is the frontend's versioned camelCase
+                # ChartConfig, not the agent's ChartSpec — storing the spec's
+                # dump produces a chart no consumer can draw (and no error
+                # until the analyst opens it). Proposals made before
+                # ``chart_config`` was carried in the payload are converted
+                # here instead.
+                chart_config = content.get("chart_config")
+                if not chart_config:
+                    try:
+                        spec = ChartSpec.model_validate(content["chart_spec"])
+                    except ValidationError as exc:
+                        raise ValueError(f"stored chart spec no longer validates: {exc}") from exc
+                    chart_config = spec_to_stored_chart_config(spec)
+                chart = await store.create_saved_chart(
+                    case_id,
+                    decided.timeline_id,
+                    _uuid.uuid4().hex,
+                    content.get("name") or "Agent chart",
+                    chart_config,
+                )
+                content = {"chart_id": chart.id, "timeline_id": decided.timeline_id}
             content = validate_block_content(block_kind, content)
+            # Re-checked at confirm time, not only at propose time: the view,
+            # chart or source the block points at can be deleted in between.
+            await validate_block_scope(case_id, block_kind, content, store=store)
             after_block_id = payload.get("after_block_id")
             try:
                 block = await store.create_story_block(
@@ -1070,8 +1084,13 @@ async def _apply_story_block_proposal(
                     user=user.username,
                     origin="agent",
                 )
-            applied = True
-            block_dict = block.to_dict()
+            if block is None:
+                # The story was deleted between the lookup above and the
+                # insert; same honest report as the propose-time case.
+                reason = "story deleted since the proposal was made"
+            else:
+                applied = True
+                block_dict = block.to_dict()
         except ValueError as exc:
             reason = str(exc)
     await store.record_audit(

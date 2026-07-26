@@ -41,6 +41,20 @@ async def test_unknown_after_block_rejected(store):
         )
 
 
+async def test_duplicate_block_id_surfaces_immediately(store):
+    """Only a position race is retried — a duplicate id must not be swallowed.
+
+    Retrying anything else burns ``STORY_POSITION_ATTEMPTS`` round-trips and
+    then reports a misleading "could not place a block".
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    story = await _story(store)
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "a"}, user="alice")
+    with pytest.raises(IntegrityError):
+        await store.create_story_block(story.id, "b1", "markdown", {"text": "dup"}, user="alice")
+
+
 async def test_exhausted_gap_triggers_renumber(store):
     story = await _story(store)
     await store.create_story_block(story.id, "b1", "markdown", {"text": "a"}, user="alice")

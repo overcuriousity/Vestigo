@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Download, FileDown } from "lucide-react";
 import { BASE } from "@/api/client";
 import { storiesApi } from "@/api/stories";
+import type { StoryExportMeta, StorySnapshot } from "@/api/types";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { triggerDownload } from "@/lib/download";
@@ -23,6 +24,17 @@ interface Props {
 const ARTIFACT_WARN_BYTES = 15 * 1024 * 1024;
 
 /**
+ * Byte length of the rendered document, not `String.length`.
+ *
+ * The server caps the *encoded* body; `length` counts UTF-16 code units, so
+ * non-ASCII report prose would be under-counted and the warning would arrive
+ * after the 413 it exists to pre-empt.
+ */
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+/**
  * Export controls and the log of past exports.
  *
  * Two phases, matching the API: the server resolves and hashes the snapshot
@@ -33,34 +45,47 @@ const ARTIFACT_WARN_BYTES = 15 * 1024 * 1024;
 export function ExportsTab({ caseId, storyId }: Props) {
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
+  const [sealing, setSealing] = useState<string | null>(null);
 
   const { data: exports, isLoading } = useQuery({
     queryKey: ["story-exports", caseId, storyId],
     queryFn: () => storiesApi.listExports(caseId, storyId),
   });
 
+  /** Render a snapshot and seal it onto its export; returns the HTML either way. */
+  const sealArtifact = async (
+    exportId: string,
+    snapshot: StorySnapshot,
+    snapshotHash: string,
+  ): Promise<string> => {
+    const html = renderExportHtml(snapshot, snapshotHash);
+    // The artifact inlines the whole compiled stylesheet plus every frozen
+    // row, so a large story can exceed the server cap. Say so up front
+    // rather than letting the analyst discover a 413 in a toast — the
+    // snapshot itself is already stored and usable either way.
+    const bytes = utf8Bytes(html);
+    if (bytes > ARTIFACT_WARN_BYTES) {
+      toast.info(
+        "Large HTML artifact",
+        `${(bytes / 1024 / 1024).toFixed(1)} MB — the upload may be rejected; the snapshot JSON is unaffected.`,
+      );
+    }
+    try {
+      await storiesApi.uploadArtifact(caseId, storyId, exportId, html);
+    } catch (err) {
+      // The snapshot is already stored and hashed; a failed artifact upload
+      // degrades the export to JSON-only rather than losing it. The export
+      // row stays unsealed, so "Render HTML" can retry it later.
+      toast.error("Snapshot stored, but the HTML artifact upload failed", (err as Error).message);
+    }
+    return html;
+  };
+
   const runExport = useMutation({
     mutationFn: async () => {
       setBusy(true);
       const created = await storiesApi.createExport(caseId, storyId);
-      const html = renderExportHtml(created.snapshot, created.snapshot_hash);
-      // The artifact inlines the whole compiled stylesheet plus every frozen
-      // row, so a large story can exceed the server cap. Say so up front
-      // rather than letting the analyst discover a 413 in a toast — the
-      // snapshot itself is already stored and usable either way.
-      if (html.length > ARTIFACT_WARN_BYTES) {
-        toast.info(
-          "Large HTML artifact",
-          `${(html.length / 1024 / 1024).toFixed(1)} MB — the upload may be rejected; the snapshot JSON is unaffected.`,
-        );
-      }
-      try {
-        await storiesApi.uploadArtifact(caseId, storyId, created.id, html);
-      } catch (err) {
-        // The snapshot is already stored and hashed; a failed artifact upload
-        // degrades the export to JSON-only rather than losing it.
-        toast.error("Snapshot stored, but the HTML artifact upload failed", (err as Error).message);
-      }
+      const html = await sealArtifact(created.id, created.snapshot, created.snapshot_hash);
       return { created, html };
     },
     onSuccess: ({ created, html }) => {
@@ -73,6 +98,29 @@ export function ExportsTab({ caseId, storyId }: Props) {
     },
     onError: (err) => toast.error("Export failed", (err as Error).message),
     onSettled: () => setBusy(false),
+  });
+
+  /**
+   * Retry the presentation half of an export whose artifact never landed.
+   *
+   * Sealing is once-only, so this only ever applies to an export still
+   * carrying no HTML — it re-renders from the *stored* snapshot, never a
+   * fresh resolution, so the artifact still attests to the same frozen
+   * record and the same hash.
+   */
+  const retrySeal = useMutation({
+    mutationFn: async (exp: StoryExportMeta) => {
+      setSealing(exp.id);
+      const snapshot = await storiesApi.getSnapshot(caseId, storyId, exp.id);
+      const html = await sealArtifact(exp.id, snapshot, exp.snapshot_hash);
+      return { exp, html };
+    },
+    onSuccess: ({ exp, html }) => {
+      qc.invalidateQueries({ queryKey: ["story-exports", caseId, storyId] });
+      triggerDownload(new Blob([html], { type: "text/html" }), `story-${storyId}-${exp.id}.html`);
+    },
+    onError: (err) => toast.error("Artifact render failed", (err as Error).message),
+    onSettled: () => setSealing(null),
   });
 
   const base = `${BASE}/cases/${caseId}/stories/${storyId}/exports`;
@@ -147,7 +195,16 @@ export function ExportsTab({ caseId, storyId }: Props) {
                           <Download size={10} /> HTML
                         </a>
                       ) : (
-                        <span className="text-[var(--color-fg-muted)]">no artifact</span>
+                        <button
+                          type="button"
+                          disabled={sealing === exp.id}
+                          onClick={() => retrySeal.mutate(exp)}
+                          className="flex items-center gap-1 text-[var(--color-accent)] hover:underline disabled:opacity-50"
+                          title="Re-render the standalone HTML from this stored snapshot and attach it"
+                        >
+                          {sealing === exp.id ? <Spinner size={10} /> : <FileDown size={10} />}{" "}
+                          Render HTML
+                        </button>
                       )}
                     </div>
                   </td>

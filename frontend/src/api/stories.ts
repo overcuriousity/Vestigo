@@ -82,6 +82,15 @@ export const storiesApi = {
       { html },
     ).then((r) => r.export),
 
+  /**
+   * Fetch a stored export's frozen snapshot.
+   *
+   * The listing omits snapshots (they are large), so re-rendering the HTML
+   * artifact for an export whose upload failed has to read it back.
+   */
+  getSnapshot: (caseId: string, storyId: string, exportId: string) =>
+    get<StorySnapshot>(`/cases/${caseId}/stories/${storyId}/exports/${exportId}/snapshot`),
+
   listExports: (caseId: string, storyId: string) =>
     get<{ exports: StoryExportMeta[] }>(`/cases/${caseId}/stories/${storyId}/exports`).then(
       (r) => r.exports,

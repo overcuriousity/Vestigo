@@ -25,6 +25,7 @@ from vestigo.api.deps import (
 from vestigo.core.config import get_settings
 from vestigo.db.postgres import UNSET, Case, StaleBlockError, StoryBlock, User
 from vestigo.stories.export import resolve_story_snapshot
+from vestigo.stories.refs import validate_block_scope
 from vestigo.stories.schemas import canonical_hash, canonical_json, validate_block_content
 
 router = APIRouter(prefix="/api/cases", tags=["stories"])
@@ -67,27 +68,6 @@ async def _get_block_or_404(story_id: str, block_id: str) -> StoryBlock:
     if block is None or block.story_id != story_id:
         raise HTTPException(status_code=404, detail="Block not found")
     return block
-
-
-async def _validate_block_scope(case_id: str, kind: str, content: dict[str, Any]) -> None:
-    """Check that an embed block's referents exist inside this case.
-
-    ``validate_block_content`` only checks shape. Catching a foreign or
-    mistyped id here turns what would otherwise surface much later as a
-    "cannot be drawn" card or a frozen ``resolution.error`` in an export into
-    a 422 at the point the analyst made the mistake. Raises ValueError so the
-    caller maps it the same way as a schema failure.
-    """
-    store = get_store()
-    timeline_id = content.get("timeline_id")
-    if timeline_id and await store.get_timeline(case_id, timeline_id) is None:
-        raise ValueError(f"timeline {timeline_id!r} is not in this case")
-    if kind == "view_ref" and await store.get_view(case_id, content["view_id"]) is None:
-        raise ValueError(f"view {content['view_id']!r} is not in this case")
-    if kind == "chart_ref":
-        chart = await store.get_saved_chart(case_id, timeline_id, content["chart_id"])
-        if chart is None:
-            raise ValueError(f"chart {content['chart_id']!r} is not in this case/timeline")
 
 
 @router.get("/{case_id}/stories")
@@ -210,7 +190,7 @@ async def create_block(
     story = await _get_story_or_404(case.id, story_id)
     try:
         content = validate_block_content(body.kind, body.content)
-        await _validate_block_scope(case.id, body.kind, content)
+        await validate_block_scope(case.id, body.kind, content)
         block = await get_store().create_story_block(
             story.id,
             uuid.uuid4().hex,
@@ -239,7 +219,7 @@ async def update_block(
     existing = await _get_block_or_404(story_id, block_id)
     try:
         content = validate_block_content(existing.kind, body.content)
-        await _validate_block_scope(case.id, existing.kind, content)
+        await validate_block_scope(case.id, existing.kind, content)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:

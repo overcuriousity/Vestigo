@@ -2190,6 +2190,35 @@ async def test_propose_story_block_validates(store):
     assert "after_block_id" in bad_anchor["error"]
 
 
+async def test_propose_story_block_checks_referent_scope(store):
+    """A referent outside the case is an error the model can correct.
+
+    Without this the analyst gets a proposal card that confirms into a block
+    which only reveals itself as broken at export time, as a frozen
+    ``resolution.error``.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_case("c2", "Case Two")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    await store.create_timeline("c1", "t1", "Timeline One")
+    foreign = await store.create_view("c2", "v-foreign", "Theirs", "ssh", {})
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    result = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "view_ref",
+            "content": {"view_id": foreign.id, "timeline_id": "t1"},
+        },
+    )
+    assert result["error"] == "view 'v-foreign' is not in this case"
+    assert await store.list_agent_proposals(conv.id) == []
+
+
 async def test_propose_story_block_absent_without_conversation(store):
     await store.init_schema()
     server = build_tool_server(_scope("c1", "t1"))  # no conversation_id

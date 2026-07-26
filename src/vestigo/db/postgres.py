@@ -761,6 +761,20 @@ UNSET = _Unset()
 #: the caller asked for "after block X", not for a specific integer.
 STORY_POSITION_ATTEMPTS = 25
 
+#: Substrings identifying a ``(story_id, position)`` uniqueness violation.
+#: Postgres names the index in its message; SQLite names the columns.
+_POSITION_CONFLICT_MARKERS = ("ix_story_blocks_story_position", "story_blocks.position")
+
+
+def _is_position_conflict(exc: IntegrityError) -> bool:
+    """True when *exc* is the position race the insert/move loops retry.
+
+    Retrying anything else is wrong: a duplicate block id or a NOT NULL
+    violation is not going to resolve itself, and swallowing it costs 25
+    round-trips before surfacing as a misleading "could not place a block".
+    """
+    return any(marker in str(exc.orig) for marker in _POSITION_CONFLICT_MARKERS)
+
 
 class StoryExport(Base):
     """An immutable point-in-time export of a Story.
@@ -3206,7 +3220,9 @@ class PostgresStore:
                 return await self._create_story_block_once(
                     story_id, block_id, kind, content, user, origin, after_block_id
                 )
-            except IntegrityError:
+            except IntegrityError as exc:
+                if not _is_position_conflict(exc):
+                    raise
                 continue
         raise RuntimeError(
             f"could not place a block in story {story_id!r} after "
@@ -3233,6 +3249,8 @@ class PostgresStore:
                 # Gap exhausted: renumber onto the stride, then recompute.
                 order = await self._renumber_story_blocks(session, story_id, order)
                 position = self._story_position_for(order, after_block_id)
+            if position is None:  # pragma: no cover - unreachable after a renumber
+                raise RuntimeError(f"no free position in story {story_id!r} even after renumbering")
             block = StoryBlock(
                 id=block_id,
                 story_id=story_id,
@@ -3312,7 +3330,9 @@ class PostgresStore:
                 return await self._move_story_block_once(
                     block_id, after_block_id, expected_version, user
                 )
-            except IntegrityError:
+            except IntegrityError as exc:
+                if not _is_position_conflict(exc):
+                    raise
                 continue
         raise RuntimeError(
             f"could not reposition block {block_id!r} after {STORY_POSITION_ATTEMPTS} attempts"
@@ -3354,6 +3374,10 @@ class PostgresStore:
                 if position is None:
                     order = await self._renumber_story_blocks(session, story_id, order)
                     position = self._story_position_for(order, after_block_id)
+                if position is None:  # pragma: no cover - unreachable after a renumber
+                    raise RuntimeError(
+                        f"no free position in story {story_id!r} even after renumbering"
+                    )
             result = await session.execute(
                 update(StoryBlock)
                 .where(StoryBlock.id == block_id, StoryBlock.version == expected_version)

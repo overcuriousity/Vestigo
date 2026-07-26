@@ -2512,6 +2512,81 @@ def test_confirm_story_block_story_deleted(client, admin_bootstrap, agent_on, st
     assert body["proposal"]["status"] == "confirmed"
 
 
+def test_confirm_story_block_unrepresentable_legacy_spec_is_reported(
+    client, admin_bootstrap, agent_on, store
+):
+    """A stored payload that no longer converts is `applied: false`, not a 500.
+
+    Proposals now carry ``chart_config`` from propose time, but ones written
+    before that fall back to converting the spec at confirm — and a spec with
+    chart-local base filters has no ``ChartConfig`` representation.
+    """
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "chart_ref",
+                "content": {
+                    "chart_spec": {
+                        "v": 1,
+                        "chart_type": "bar",
+                        "field": "port",
+                        "filters": {"q": "ssh"},
+                    },
+                    "name": "Top ports",
+                },
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "base filters" in body["reason"]
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+
+def test_confirm_story_block_rechecks_referent_scope(client, admin_bootstrap, agent_on, store):
+    """A referent deleted between propose and confirm is reported, not embedded."""
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "view_ref",
+                "content": {"view_id": "gone", "timeline_id": timeline_id},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "not in this case" in body["reason"]
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+
 def test_reject_story_block_writes_nothing(client, admin_bootstrap, agent_on, store):
     owner = as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)

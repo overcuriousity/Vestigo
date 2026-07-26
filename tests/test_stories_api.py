@@ -268,6 +268,36 @@ def test_block_scope_validated_against_case(client, admin_bootstrap, store):
     assert ok.status_code == 200, ok.text
 
 
+def test_event_block_source_validated_against_case(client, admin_bootstrap, store):
+    """An event block's source has to be one of this case's sources."""
+    import asyncio
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}/blocks"
+
+    foreign = client.post("/api/cases/", json={"name": "other-case"}).json()["case"]
+
+    async def _make_sources():
+        await store.create_source(case_id, "src-mine", "mine.csv", "h1", 10)
+        await store.create_source(foreign["id"], "src-theirs", "theirs.csv", "h2", 10)
+
+    asyncio.run(_make_sources())
+
+    assert (
+        client.post(
+            base,
+            json={"kind": "event_ref", "content": {"event_id": "e1", "source_id": "src-theirs"}},
+        ).status_code
+        == 422
+    )
+    ok = client.post(
+        base, json={"kind": "event_ref", "content": {"event_id": "e1", "source_id": "src-mine"}}
+    )
+    assert ok.status_code == 200, ok.text
+
+
 def test_story_delete_with_exports_is_admin_only(client, admin_bootstrap, store, monkeypatch):
     """The cascade must not be a way around the admin-only export deletion.
 

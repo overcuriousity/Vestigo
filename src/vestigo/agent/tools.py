@@ -1712,6 +1712,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             """
             from vestigo.api.deps import get_store
             from vestigo.stories.export import spec_to_stored_chart_config
+            from vestigo.stories.refs import validate_block_scope
             from vestigo.stories.schemas import validate_block_content
 
             store = get_store()
@@ -1747,6 +1748,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     }
                 else:
                     content = validate_block_content(block_kind, content)
+                    # Checked here so a wrong id is an error the model can
+                    # correct, rather than a proposal card the analyst
+                    # confirms into a block that resolves to an error.
+                    # Re-checked at confirm time — referents can be deleted
+                    # in between.
+                    await validate_block_scope(scope.case_id, block_kind, content, store=store)
             except ValueError as exc:
                 return {"error": str(exc)}
             proposal = await store.create_agent_proposal(

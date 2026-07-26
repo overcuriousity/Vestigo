@@ -1,9 +1,46 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 101 — W7 Stories review remediation).
+Last updated: 2026-07-26 (session 102 — W7 second-pass review remediation).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 102 — 2026-07-26: W7 second-pass review remediation
+
+**Why.** A second review pass over the finished W7 branch before integration. No
+criticals left, but five issues where a failure was reported in the wrong shape —
+a 500 instead of a refusal, or a late symptom instead of an early error.
+
+- **The agent's write path skipped the referent-scope gate.** The HTTP router checked
+  that a block's `view_id`/`chart_id`/`timeline_id` belong to the case; the agent's
+  propose and confirm paths ran shape validation only. A wrong id therefore survived
+  all the way to export, as a frozen `resolution.error`, instead of being an error the
+  model could correct. The check moved out of the router into
+  `vestigo.stories.refs.validate_block_scope` and now runs on all three paths — and at
+  confirm as well as propose, because a referent can be deleted in between. It also
+  covers an `event_ref`'s `source_id`, which nothing had been checking.
+- **A decided proposal could 500.** The legacy chart-config conversion in
+  `_apply_story_block_proposal` sat outside the handler's `try`, so a stored spec that
+  no longer converts (chart-local base filters have no `ChartConfig` representation)
+  raised out of a *decided* proposal instead of reporting `applied: false` with a
+  reason. Same for the `block is None` race when the story is deleted between the
+  lookup and the insert. Everything that can fail on a stored payload is now inside
+  one `try`, and the proposal always reports honestly.
+- **The position retry was too broad.** `create_story_block`/`move_story_block` retried
+  *any* `IntegrityError` 25 times, so a duplicate block id or a NOT NULL violation cost
+  25 round-trips and then surfaced as a misleading "could not place a block". Narrowed
+  to the `(story_id, position)` uniqueness violation the loop exists for; anything else
+  propagates immediately.
+- **A failed artifact upload was terminal.** Sealing is once-only and correctly so, but
+  an export whose upload failed had no way back — the analyst's only route was a whole
+  new export under a different hash. The Exports tab now offers **Render HTML** on an
+  unsealed export, re-rendering from the *stored* snapshot (never a fresh resolution),
+  so the artifact still attests to the same frozen record. The pre-upload size warning
+  also measures UTF-8 bytes rather than `String.length`, which under-counted non-ASCII
+  prose and let the warning arrive after the 413 it exists to pre-empt.
+
+Verified: `uv run pytest` 1796 passed, `uv run ruff check .` clean, frontend
+`typecheck`/`lint` clean, `npm run test` 510 passed.
 
 ## Session 101 — 2026-07-26: W7 Stories review remediation
 
