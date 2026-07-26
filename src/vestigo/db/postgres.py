@@ -29,6 +29,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 
@@ -627,6 +628,200 @@ class SavedChart(Base):
         }
 
 
+class Story(Base):
+    """A per-case block document — the investigation report (W7).
+
+    Content lives in ``StoryBlock`` rows; this row is title/metadata only.
+    See docs/STORIES.md.
+    """
+
+    __tablename__ = "stories"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the Story API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "title": self.title,
+            "description": self.description,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class StoryBlock(Base):
+    """One ordered block of a Story.
+
+    ``position`` uses an integer gap strategy (1024, 2048, ...); insert-between
+    takes the midpoint and the story is renumbered when a gap is exhausted.
+    ``(story_id, position)`` is unique so a racing insert fails loudly instead
+    of producing two blocks that tie for the same slot — document order in a
+    forensic report must not be ambiguous.
+    ``version`` is the optimistic-concurrency counter: every update/move
+    increments it via a compare-and-swap, and a stale caller gets a 409
+    instead of clobbering. ``content`` is validated per ``kind`` at the API
+    boundary (``vestigo.stories.schemas``); the DB stores it opaquely.
+    """
+
+    __tablename__ = "story_blocks"
+    __table_args__ = (Index("ix_story_blocks_story_position", "story_id", "position", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    story_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the StoryBlock API response."""
+        return {
+            "id": self.id,
+            "story_id": self.story_id,
+            "position": self.position,
+            "kind": self.kind,
+            "content": self.content or {},
+            "origin": self.origin,
+            "version": self.version,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+#: Gap between consecutive story-block positions. Insert-between takes the
+#: midpoint; when a gap closes to <2 the story is renumbered back onto this
+#: stride inside the same transaction.
+STORY_POSITION_GAP = 1024
+
+
+class StaleBlockError(Exception):
+    """A block update/move carried a stale version; ``current`` is the winner."""
+
+    def __init__(self, current: StoryBlock) -> None:
+        super().__init__(f"stale version for block {current.id}")
+        self.current = current
+
+
+class _Unset:
+    """Sentinel for "caller did not supply this field" (distinct from ``None``)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNSET"
+
+
+#: Distinguishes "leave unchanged" from an explicit ``None`` ("clear it") on
+#: partial updates. ``PATCH {"description": null}`` has to be able to blank a
+#: field that ``PATCH {"title": "x"}`` must leave alone.
+UNSET = _Unset()
+
+#: How many times a block insert/move retries after losing a race for its
+#: computed position. The story row lock serializes these on Postgres, but a
+#: lock only orders transactions — it doesn't make a value read before it was
+#: taken current, and SQLite ignores ``FOR UPDATE`` entirely. The unique index
+#: on ``(story_id, position)`` is the real invariant; a collision means
+#: somebody else took the slot, and recomputing is the correct response since
+#: the caller asked for "after block X", not for a specific integer.
+STORY_POSITION_ATTEMPTS = 25
+
+#: Substrings identifying a ``(story_id, position)`` uniqueness violation.
+#: Postgres names the index in its message; SQLite names the columns.
+_POSITION_CONFLICT_MARKERS = ("ix_story_blocks_story_position", "story_blocks.position")
+
+
+def _is_position_conflict(exc: IntegrityError) -> bool:
+    """True when *exc* is the position race the insert/move loops retry.
+
+    Retrying anything else is wrong: a duplicate block id or a NOT NULL
+    violation is not going to resolve itself, and swallowing it costs 25
+    round-trips before surfacing as a misleading "could not place a block".
+    """
+    return any(marker in str(exc.orig) for marker in _POSITION_CONFLICT_MARKERS)
+
+
+class StoryExport(Base):
+    """An immutable point-in-time export of a Story.
+
+    ``snapshot`` is the server-resolved frozen bundle (see docs/STORIES.md for
+    the ``"v": 1`` format); ``snapshot_hash`` is SHA-256 over its canonical
+    JSON. ``html``/``html_hash`` hold the client-rendered standalone artifact,
+    uploaded exactly once after creation (sealed thereafter). No update path;
+    deletion is admin-only and audit-logged.
+    """
+
+    __tablename__ = "story_exports"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    story_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    html_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, include_snapshot: bool = False) -> dict[str, Any]:
+        """Return a serializable dictionary for the StoryExport API response.
+
+        The snapshot can be large; listings omit it unless asked.
+        """
+        d: dict[str, Any] = {
+            "id": self.id,
+            "story_id": self.story_id,
+            "case_id": self.case_id,
+            "snapshot_hash": self.snapshot_hash,
+            "html_hash": self.html_hash,
+            "has_artifact": self.html is not None,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_snapshot:
+            d["snapshot"] = self.snapshot
+        return d
+
+
 def _windows_config_hash(payload: dict[str, Any]) -> str:
     """SHA-256 over the canonical JSON of a window payload.
 
@@ -1148,6 +1343,14 @@ class AgentProposal(Base):
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    # What the proposal proposes: "annotation" (the original shape, columns
+    # below) or "story_block" (payload carries {story_id, block_kind, content,
+    # after_block_id} — see W7). One table so the decide/409 idempotency
+    # backbone and the audit surface stay single-path.
+    kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="annotation", server_default="annotation"
+    )
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -1168,6 +1371,8 @@ class AgentProposal(Base):
             "case_id": self.case_id,
             "timeline_id": self.timeline_id,
             "status": self.status,
+            "kind": self.kind,
+            "payload": self.payload,
             "tag": self.tag,
             "comment": self.comment,
             "rationale": self.rationale,
@@ -2547,8 +2752,10 @@ class PostgresStore:
         Returns True if the case existed and was removed, False otherwise.
 
         ``View``, ``Annotation``, ``DetectorRun``, the Sigma tables
-        (``SigmaRule``, ``SigmaRun``), and the enrichment tables
-        (``SourceEnrichment``, ``EnrichmentResultStaging``,
+        (``SigmaRule``, ``SigmaRun``), the story tables (``Story``,
+        ``StoryBlock``, ``StoryExport`` — the last of which holds frozen event
+        data the operator believes went with the case), and the enrichment
+        tables (``SourceEnrichment``, ``EnrichmentResultStaging``,
         ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
         ``cases.id``), so they must be deleted explicitly here alongside
@@ -2585,6 +2792,14 @@ class PostgresStore:
             )
             await session.execute(delete(SigmaRule).where(SigmaRule.case_id == case_id))
             await session.execute(delete(SigmaRun).where(SigmaRun.case_id == case_id))
+            # StoryBlock has no case_id of its own — reach it through its story.
+            await session.execute(
+                delete(StoryBlock).where(
+                    StoryBlock.story_id.in_(select(Story.id).where(Story.case_id == case_id))
+                )
+            )
+            await session.execute(delete(StoryExport).where(StoryExport.case_id == case_id))
+            await session.execute(delete(Story).where(Story.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True
@@ -2691,6 +2906,20 @@ class PostgresStore:
             await session.refresh(chart)
             return chart
 
+    async def get_saved_chart(
+        self, case_id: str, timeline_id: str, chart_id: str
+    ) -> SavedChart | None:
+        """Return a saved chart by case, timeline and chart IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SavedChart).where(
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
     async def rename_saved_chart(
         self, case_id: str, timeline_id: str, chart_id: str, name: str
     ) -> SavedChart | None:
@@ -2733,6 +2962,582 @@ class PostgresStore:
             if chart is None:
                 return False
             await session.delete(chart)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Stories (W7)
+    # ------------------------------------------------------------------
+
+    async def create_story(
+        self, case_id: str, story_id: str, title: str, description: str | None, user: str
+    ) -> Story:
+        """Create a story within a case."""
+        story = Story(
+            id=story_id,
+            case_id=case_id,
+            title=title,
+            description=description,
+            created_by=user,
+            updated_by=user,
+        )
+        async with self.session_factory() as session:
+            session.add(story)
+            await session.commit()
+            await session.refresh(story)
+            return story
+
+    async def get_story(self, case_id: str, story_id: str) -> Story | None:
+        """Return a story by case and story IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def list_stories(self, case_id: str) -> list[Story]:
+        """Return a case's stories, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id).order_by(Story.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def update_story(
+        self,
+        case_id: str,
+        story_id: str,
+        *,
+        title: str | None | _Unset = UNSET,
+        description: str | None | _Unset = UNSET,
+        user: str,
+    ) -> Story | None:
+        """Update story title/description; returns the row or None if missing.
+
+        Fields left at ``UNSET`` are untouched; passing ``description=None``
+        explicitly clears it. ``title`` is required on the row, so ``None`` is
+        rejected by the API boundary rather than here.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            story = result.scalar_one_or_none()
+            if story is None:
+                return None
+            if not isinstance(title, _Unset) and title is not None:
+                story.title = title
+            if not isinstance(description, _Unset):
+                story.description = description
+            story.updated_by = user
+            await session.commit()
+            await session.refresh(story)
+            return story
+
+    async def delete_story(self, case_id: str, story_id: str) -> dict[str, Any] | None:
+        """Delete a story with its blocks and exports.
+
+        Returns a summary of what went with it — ``block_count`` and every
+        deleted export's ``id``/``snapshot_hash`` — or None when the story
+        doesn't exist. Exports are immutable attestations, so their hashes
+        have to survive into the caller's audit record even though the rows
+        themselves don't.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            story = result.scalar_one_or_none()
+            if story is None:
+                return None
+            exports = (
+                await session.execute(
+                    select(StoryExport.id, StoryExport.snapshot_hash, StoryExport.html_hash)
+                    .where(StoryExport.story_id == story_id)
+                    .order_by(StoryExport.created_at.asc())
+                )
+            ).all()
+            block_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(StoryBlock)
+                    .where(StoryBlock.story_id == story_id)
+                )
+            ).scalar_one()
+            await session.execute(delete(StoryBlock).where(StoryBlock.story_id == story_id))
+            await session.execute(delete(StoryExport).where(StoryExport.story_id == story_id))
+            await session.delete(story)
+            await session.commit()
+            return {
+                "block_count": int(block_count or 0),
+                "exports": [
+                    {"id": e[0], "snapshot_hash": e[1], "html_hash": e[2]} for e in exports
+                ],
+            }
+
+    async def list_story_blocks(self, story_id: str) -> list[StoryBlock]:
+        """Return a story's blocks in document order.
+
+        ``id`` breaks position ties so document order is stable across polls
+        even on a database written before the unique index existed.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryBlock)
+                .where(StoryBlock.story_id == story_id)
+                .order_by(StoryBlock.position.asc(), StoryBlock.id.asc())
+            )
+            return list(result.scalars().all())
+
+    async def count_story_blocks(self, story_ids: list[str]) -> dict[str, int]:
+        """Return ``{story_id: block_count}`` for the given stories in one query.
+
+        Listings need only the count; fetching every block of every story to
+        call ``len()`` on it is one query per story and pulls whole documents
+        into memory to discard them.
+        """
+        if not story_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryBlock.story_id, func.count())
+                .where(StoryBlock.story_id.in_(story_ids))
+                .group_by(StoryBlock.story_id)
+            )
+            counts = {row[0]: int(row[1]) for row in result.all()}
+        return {story_id: counts.get(story_id, 0) for story_id in story_ids}
+
+    async def get_story_block(self, block_id: str) -> StoryBlock | None:
+        """Return a block by ID."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+            return result.scalar_one_or_none()
+
+    @staticmethod
+    async def _lock_story(session: AsyncSession, story_id: str) -> bool:
+        """Take a row lock on the story, serializing its position mutations.
+
+        Gap positions are derived from a read of the sibling set, so two
+        concurrent inserts would otherwise compute the same position (and now
+        collide on the unique index). Locking the parent row makes insert and
+        move mutually exclusive per story — stories are documents, not a hot
+        path, so a per-document mutex is cheap. SQLite ignores ``FOR UPDATE``
+        and is single-writer anyway. Returns False if the story is gone.
+        """
+        result = await session.execute(
+            select(Story.id).where(Story.id == story_id).with_for_update()
+        )
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    async def _story_block_order(session: AsyncSession, story_id: str) -> list[tuple[str, int]]:
+        """Return ``(block_id, position)`` in document order, ties broken by id."""
+        result = await session.execute(
+            select(StoryBlock.id, StoryBlock.position)
+            .where(StoryBlock.story_id == story_id)
+            .order_by(StoryBlock.position.asc(), StoryBlock.id.asc())
+        )
+        return [(row[0], row[1]) for row in result.all()]
+
+    @staticmethod
+    async def _renumber_story_blocks(
+        session: AsyncSession,
+        story_id: str,
+        order: list[tuple[str, int]],
+        *,
+        start_index: int = 1,
+    ) -> list[tuple[str, int]]:
+        """Rewrite ``order`` onto the canonical stride, collision-free.
+
+        ``(story_id, position)`` is unique, so assigning final positions in
+        place can transiently collide with a row that still holds the target
+        value. Every row in the story is first parked at a distinct negative
+        rank — disjoint from the positive finals by construction — and the
+        finals are then written. Rows of the story absent from ``order`` (the
+        block being moved) stay parked; the caller gives them their position.
+
+        ``updated_at`` is self-assigned so renumbering doesn't make untouched
+        blocks look edited to a polling client, and ``version`` is deliberately
+        left alone so it never manufactures a 409 for a collaborator.
+        """
+        parked = (
+            await session.execute(select(StoryBlock.id).where(StoryBlock.story_id == story_id))
+        ).scalars()
+        for rank, parked_id in enumerate(parked.all(), start=1):
+            await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == parked_id)
+                .values(position=-rank, updated_at=StoryBlock.updated_at)
+            )
+        renumbered = [
+            (block_id, (i + start_index) * STORY_POSITION_GAP)
+            for i, (block_id, _position) in enumerate(order)
+        ]
+        for block_id, position in renumbered:
+            await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == block_id)
+                .values(position=position, updated_at=StoryBlock.updated_at)
+            )
+        return renumbered
+
+    @staticmethod
+    def _story_position_for(order: list[tuple[str, int]], after_block_id: str | None) -> int | None:
+        """Compute the gap position for an insert, or None if the gap is exhausted.
+
+        ``order`` is ``(block_id, position)`` in document order.
+        ``after_block_id=None`` appends at the end. Raises ValueError when
+        ``after_block_id`` names a block that isn't in ``order``.
+        """
+        if after_block_id is None:
+            return order[-1][1] + STORY_POSITION_GAP if order else STORY_POSITION_GAP
+        idx = next((i for i, (bid, _) in enumerate(order) if bid == after_block_id), None)
+        if idx is None:
+            raise ValueError(f"after_block_id {after_block_id!r} not in story")
+        lo = order[idx][1]
+        hi = order[idx + 1][1] if idx + 1 < len(order) else lo + 2 * STORY_POSITION_GAP
+        mid = (lo + hi) // 2
+        return mid if lo < mid < hi else None
+
+    async def create_story_block(
+        self,
+        story_id: str,
+        block_id: str,
+        kind: str,
+        content: dict,
+        user: str,
+        origin: str = "user",
+        after_block_id: str | None = None,
+    ) -> StoryBlock | None:
+        """Insert a block; appends at the end unless ``after_block_id`` is given.
+
+        Returns None when the story doesn't exist. Positions are computed under
+        the story row lock and guarded by the unique index; losing the race for
+        a slot is retried (see ``STORY_POSITION_ATTEMPTS``), not surfaced.
+        """
+        for _attempt in range(STORY_POSITION_ATTEMPTS):
+            try:
+                return await self._create_story_block_once(
+                    story_id, block_id, kind, content, user, origin, after_block_id
+                )
+            except IntegrityError as exc:
+                if not _is_position_conflict(exc):
+                    raise
+                continue
+        raise RuntimeError(
+            f"could not place a block in story {story_id!r} after "
+            f"{STORY_POSITION_ATTEMPTS} attempts"
+        )
+
+    async def _create_story_block_once(
+        self,
+        story_id: str,
+        block_id: str,
+        kind: str,
+        content: dict,
+        user: str,
+        origin: str,
+        after_block_id: str | None,
+    ) -> StoryBlock | None:
+        """One insert attempt; raises IntegrityError if the position was taken."""
+        async with self.session_factory() as session:
+            if not await self._lock_story(session, story_id):
+                return None
+            order = await self._story_block_order(session, story_id)
+            position = self._story_position_for(order, after_block_id)
+            if position is None:
+                # Gap exhausted: renumber onto the stride, then recompute.
+                order = await self._renumber_story_blocks(session, story_id, order)
+                position = self._story_position_for(order, after_block_id)
+            if position is None:  # pragma: no cover - unreachable after a renumber
+                raise RuntimeError(f"no free position in story {story_id!r} even after renumbering")
+            block = StoryBlock(
+                id=block_id,
+                story_id=story_id,
+                position=position,
+                kind=kind,
+                content=content,
+                origin=origin,
+                created_by=user,
+                updated_by=user,
+            )
+            session.add(block)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise
+            await session.refresh(block)
+            return block
+
+    @staticmethod
+    async def _reload_block(session: AsyncSession, block_id: str) -> StoryBlock | None:
+        """Read a block inside ``session`` (used after a Core-level write)."""
+        result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+        return result.scalar_one_or_none()
+
+    async def update_story_block(
+        self, block_id: str, content: dict, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """Update a block's content under optimistic concurrency.
+
+        The version guard is a compare-and-swap in the UPDATE's WHERE clause,
+        not a read-then-write: under READ COMMITTED two collaborators could
+        both read ``version=1``, both pass a Python-side check, and both write
+        ``version=2``, silently losing one edit. ``rowcount == 0`` means the
+        row moved under us.
+
+        Raises StaleBlockError (carrying the current row) when
+        ``expected_version`` no longer matches; returns None when the block
+        doesn't exist.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == block_id, StoryBlock.version == expected_version)
+                .values(
+                    content=content,
+                    version=StoryBlock.version + 1,
+                    updated_by=user,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if result.rowcount == 0:
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return None
+                session.expunge(current)
+                raise StaleBlockError(current)
+            block = await self._reload_block(session, block_id)
+            await session.commit()
+            if block is not None:
+                await session.refresh(block)
+            return block
+
+    async def move_story_block(
+        self, block_id: str, after_block_id: str | None, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """Reposition a block; ``after_block_id=None`` moves it to the top.
+
+        Same compare-and-swap version semantics as ``update_story_block``, run
+        under the story row lock so the sibling renumber and the move commit
+        atomically. Losing the race for the computed slot is retried; losing
+        the version race is a StaleBlockError and propagates immediately.
+        """
+        for _attempt in range(STORY_POSITION_ATTEMPTS):
+            try:
+                return await self._move_story_block_once(
+                    block_id, after_block_id, expected_version, user
+                )
+            except IntegrityError as exc:
+                if not _is_position_conflict(exc):
+                    raise
+                continue
+        raise RuntimeError(
+            f"could not reposition block {block_id!r} after {STORY_POSITION_ATTEMPTS} attempts"
+        )
+
+    async def _move_story_block_once(
+        self, block_id: str, after_block_id: str | None, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """One move attempt; raises IntegrityError if the position was taken."""
+        async with self.session_factory() as session:
+            story_id = (
+                await session.execute(select(StoryBlock.story_id).where(StoryBlock.id == block_id))
+            ).scalar_one_or_none()
+            if story_id is None:
+                return None
+            await self._lock_story(session, story_id)
+            order = [
+                row
+                for row in await self._story_block_order(session, story_id)
+                if row[0] != block_id
+            ]
+            if after_block_id is None:
+                # Top of document: halve below the first block, renumbering
+                # first when there's no room left above it.
+                if not order:
+                    position = STORY_POSITION_GAP
+                else:
+                    if order[0][1] < 2:
+                        order = await self._renumber_story_blocks(
+                            session, story_id, order, start_index=2
+                        )
+                    position = order[0][1] // 2
+            else:
+                try:
+                    position = self._story_position_for(order, after_block_id)
+                except ValueError:
+                    await session.rollback()
+                    raise
+                if position is None:
+                    order = await self._renumber_story_blocks(session, story_id, order)
+                    position = self._story_position_for(order, after_block_id)
+                if position is None:  # pragma: no cover - unreachable after a renumber
+                    raise RuntimeError(
+                        f"no free position in story {story_id!r} even after renumbering"
+                    )
+            result = await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == block_id, StoryBlock.version == expected_version)
+                .values(
+                    position=position,
+                    version=StoryBlock.version + 1,
+                    updated_by=user,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if result.rowcount == 0:
+                # Rolls the renumber back too — the move never happened.
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return None
+                session.expunge(current)
+                raise StaleBlockError(current)
+            block = await self._reload_block(session, block_id)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise
+            if block is not None:
+                await session.refresh(block)
+            return block
+
+    async def delete_story_block(self, block_id: str, expected_version: int | None = None) -> bool:
+        """Delete a block row. Returns True if it existed.
+
+        With ``expected_version``, the delete is guarded the same way an
+        update or a move is: a compare-and-swap in the DELETE's WHERE clause,
+        raising StaleBlockError when the row moved under the caller. Deleting
+        a block a collaborator has meanwhile rewritten destroys their edit
+        with no conflict to resolve, which is the one outcome the optimistic
+        ``version`` exists to prevent — so it must not be the one mutation
+        that skips the check.
+        """
+        async with self.session_factory() as session:
+            stmt = delete(StoryBlock).where(StoryBlock.id == block_id)
+            if expected_version is not None:
+                stmt = stmt.where(StoryBlock.version == expected_version)
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return False
+                session.expunge(current)
+                raise StaleBlockError(current)
+            await session.commit()
+            return True
+
+    async def create_story_export(
+        self,
+        export_id: str,
+        story_id: str,
+        case_id: str,
+        snapshot: dict,
+        snapshot_hash: str,
+        user: str,
+    ) -> StoryExport:
+        """Persist a resolved export snapshot (immutable; artifact sealed later)."""
+        export = StoryExport(
+            id=export_id,
+            story_id=story_id,
+            case_id=case_id,
+            snapshot=snapshot,
+            snapshot_hash=snapshot_hash,
+            created_by=user,
+        )
+        async with self.session_factory() as session:
+            session.add(export)
+            await session.commit()
+            await session.refresh(export)
+            return export
+
+    async def get_story_export(self, case_id: str, export_id: str) -> StoryExport | None:
+        """Return an export by case and export IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport).where(
+                    StoryExport.case_id == case_id, StoryExport.id == export_id
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_story_exports(self, story_id: str) -> list[StoryExport]:
+        """Return a story's exports, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport)
+                .where(StoryExport.story_id == story_id)
+                .order_by(StoryExport.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def list_case_export_attestations(self, case_id: str) -> list[dict[str, Any]]:
+        """Return every sealed export in a case as ``id``/``story_id``/hashes.
+
+        Deleting a case cascades its exports away. The hashes *are* the
+        attestation, so the caller has to be able to put them in an audit
+        record that outlives the rows — and to decide whether a cascade that
+        destroys them needs a stronger gate than an ordinary case delete.
+        Deliberately not returning ORM rows: the snapshot column is large and
+        nothing on this path reads it.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    StoryExport.id,
+                    StoryExport.story_id,
+                    StoryExport.snapshot_hash,
+                    StoryExport.html_hash,
+                )
+                .where(StoryExport.case_id == case_id)
+                .order_by(StoryExport.created_at.asc())
+            )
+            return [
+                {"id": r[0], "story_id": r[1], "snapshot_hash": r[2], "html_hash": r[3]}
+                for r in result.all()
+            ]
+
+    async def seal_story_export_artifact(
+        self, export_id: str, html: str, html_hash: str
+    ) -> StoryExport | None:
+        """Attach the rendered artifact to an export, exactly once.
+
+        Returns None when the export doesn't exist **or** already carries an
+        artifact — exports are immutable, so a second upload is refused rather
+        than overwriting the sealed record. The ``html IS NULL`` guard lives in
+        the UPDATE's WHERE clause, not in a preceding read: two concurrent
+        uploads would both observe an unsealed row and the second would
+        overwrite a sealed forensic record.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(StoryExport)
+                .where(StoryExport.id == export_id, StoryExport.html.is_(None))
+                .values(html=html, html_hash=html_hash)
+            )
+            if result.rowcount == 0:
+                await session.rollback()
+                return None
+            export = (
+                await session.execute(select(StoryExport).where(StoryExport.id == export_id))
+            ).scalar_one()
+            await session.commit()
+            await session.refresh(export)
+            return export
+
+    async def delete_story_export(self, export_id: str) -> bool:
+        """Delete an export row (admin-only path). Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryExport).where(StoryExport.id == export_id))
+            export = result.scalar_one_or_none()
+            if export is None:
+                return False
+            await session.delete(export)
             await session.commit()
             return True
 
@@ -3372,22 +4177,26 @@ class PostgresStore:
         case_id: str,
         timeline_id: str,
         conversation_id: str,
-        tag: str | None,
-        comment: str | None,
-        rationale: str,
-        events: list,
+        tag: str | None = None,
+        comment: str | None = None,
+        rationale: str = "",
+        events: list | None = None,
+        kind: str = "annotation",
+        payload: dict | None = None,
     ) -> AgentProposal:
-        """Create a new proposed annotation awaiting analyst decision."""
+        """Create a new agent proposal awaiting analyst decision."""
         proposal = AgentProposal(
             id=generate_id("agentprop"),
             conversation_id=conversation_id,
             case_id=case_id,
             timeline_id=timeline_id,
             status="proposed",
+            kind=kind,
+            payload=payload,
             tag=tag,
             comment=comment,
             rationale=rationale,
-            events=events,
+            events=events or [],
         )
         async with self.session_factory() as session:
             session.add(proposal)

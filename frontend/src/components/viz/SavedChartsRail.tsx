@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Save, Trash2 } from "lucide-react";
 import { savedChartsApi } from "@/api/viz";
 import { Button } from "@/components/ui/Button";
+import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
 import { Input } from "@/components/ui/Input";
 import {
   chartConfigToStored,
@@ -104,6 +105,16 @@ export function SavedChartsRail({ caseId, timelineId, currentConfig, onLoad }: P
               >
                 {c.name}
               </button>
+              <AddToStoryButton
+                caseId={caseId}
+                iconOnly
+                className="h-6 w-6 px-0 opacity-0 group-hover:opacity-100"
+                label={`Add "${c.name}" to a story`}
+                content={{
+                  kind: "chart_ref",
+                  content: { chart_id: c.id, timeline_id: timelineId },
+                }}
+              />
               <button
                 onClick={() => deleteMutation.mutate(c.id)}
                 className="rounded p-1 text-[var(--color-fg-muted)] opacity-0 hover:text-[var(--color-danger)] group-hover:opacity-100"

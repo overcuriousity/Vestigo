@@ -201,6 +201,8 @@ describe("proposal events → Explorer filter mapping", () => {
       case_id: "case-1",
       timeline_id: "tl-1",
       status: "confirmed",
+    kind: "annotation" as const,
+    payload: null,
       tag: "suspicious",
       comment: null,
       rationale: "clustered auth failures",

@@ -2077,3 +2077,151 @@ def test_populated_and_absent_filters_still_validate():
 
     assert FilterSpec().filters == {}
     assert FilterSpec(filters={"src_ip": ["203.0.113.1"]}).filters == {"src_ip": ["203.0.113.1"]}
+
+
+# ---------------------------------------------------------------------------
+# Stories read tools (W7)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_stories_scoped_to_case(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_case("c2", "Case Two")
+    s1 = await store.create_story("c1", "s1", "Ours", "notes", user="alice")
+    await store.create_story_block(s1.id, "b1", "markdown", {"text": "x"}, user="alice")
+    await store.create_story("c2", "s2", "Foreign", None, user="bob")
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "list_stories")
+    rows = _rows(payload["stories"])
+    assert payload["total"] == 1
+    assert rows[0]["id"] == "s1"
+    assert rows[0]["title"] == "Ours"
+    assert rows[0]["block_count"] == 1
+
+
+async def test_read_story_returns_ordered_blocks(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "first"}, user="alice")
+    await store.create_story_block(
+        story.id,
+        "b2",
+        "view_ref",
+        {"view_id": "v1", "timeline_id": "t1", "display": {"limit": 200, "columns": None}},
+        user="alice",
+    )
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    assert payload["story"]["title"] == "Report"
+    kinds = [b["kind"] for b in payload["blocks"]]
+    assert kinds == ["markdown", "view_ref"]
+    assert payload["blocks"][0]["content"]["text"] == "first"
+    # Embed blocks carry their reference, not inline data.
+    assert payload["blocks"][1]["content"]["view_id"] == "v1"
+
+
+async def test_read_story_unknown_id(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "ghost"})
+    assert "not found" in payload["error"]
+
+
+async def test_propose_story_block_records_proposal(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+    result = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "markdown",
+            "content": {"text": "## agent finding"},
+            "rationale": "summarizes the brute-force window",
+        },
+    )
+    assert result["status"] == "proposed"
+    assert isinstance(result["proposal_id"], str) and result["proposal_id"]
+    (p,) = await store.list_agent_proposals(conv.id)
+    assert p.kind == "story_block"
+    assert p.payload["story_id"] == "s1"
+    assert p.payload["content"] == {"text": "## agent finding"}
+
+
+async def test_propose_story_block_validates(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    unknown_story = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "ghost", "block_kind": "markdown", "content": {"text": "x"}},
+    )
+    assert "not found" in unknown_story["error"]
+
+    bad_kind = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "gif", "content": {}},
+    )
+    assert "unknown block kind" in bad_kind["error"]
+
+    bad_anchor = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "markdown",
+            "content": {"text": "x"},
+            "after_block_id": "ghost",
+        },
+    )
+    assert "after_block_id" in bad_anchor["error"]
+
+
+async def test_propose_story_block_checks_referent_scope(store):
+    """A referent outside the case is an error the model can correct.
+
+    Without this the analyst gets a proposal card that confirms into a block
+    which only reveals itself as broken at export time, as a frozen
+    ``resolution.error``.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_case("c2", "Case Two")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    await store.create_timeline("c1", "t1", "Timeline One")
+    foreign = await store.create_view("c2", "v-foreign", "Theirs", "ssh", {})
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    result = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "view_ref",
+            "content": {"view_id": foreign.id, "timeline_id": "t1"},
+        },
+    )
+    assert result["error"] == "view 'v-foreign' is not in this case"
+    assert await store.list_agent_proposals(conv.id) == []
+
+
+async def test_propose_story_block_absent_without_conversation(store):
+    await store.init_schema()
+    server = build_tool_server(_scope("c1", "t1"))  # no conversation_id
+    async with FastMCPClient(server) as client:
+        names = [t.name for t in await client.list_tools()]
+    assert "propose_story_block" not in names

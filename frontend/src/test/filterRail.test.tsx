@@ -6,6 +6,9 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+// AddToStoryButton navigates client-side on its success toast, so this
+// subtree needs a router the same way the real app always provides one.
+import { MemoryRouter } from "react-router-dom";
 import { FilterRail } from "@/components/explorer/FilterRail";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import type { EventFilters } from "@/api/types";
@@ -17,8 +20,9 @@ function renderRail(
   const onChange = vi.fn();
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <QueryClientProvider client={qc}>
-      <TooltipProvider><FilterRail
+    <MemoryRouter>
+      <QueryClientProvider client={qc}>
+        <TooltipProvider><FilterRail
         filters={filters}
         onChange={onChange}
         views={[]}
@@ -29,7 +33,8 @@ function renderRail(
         timelineId="t1"
         {...props}
       /></TooltipProvider>
-    </QueryClientProvider>,
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
   return { onChange };
 }

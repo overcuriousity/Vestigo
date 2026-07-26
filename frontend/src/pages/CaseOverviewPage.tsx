@@ -4,6 +4,7 @@ import { casesApi } from "@/api/cases";
 import { sourcesApi } from "@/api/sources";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
+import { StoriesPanel } from "@/components/stories/StoriesPanel";
 import { ParserDownloadsPanel } from "@/components/sources/ParserDownloadsPanel";
 import { CaseJobsPanel } from "@/components/jobs/CaseJobsPanel";
 import { Spinner } from "@/components/ui/Spinner";
@@ -100,6 +101,7 @@ export function CaseOverviewPage() {
           <div className="order-1 space-y-8 lg:order-2">
             <TimelineList caseId={caseId!} />
             <SourceList caseId={caseId!} />
+            <StoriesPanel caseId={caseId!} />
 
             <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
               <ol className="space-y-2">

@@ -274,9 +274,27 @@ async def delete_case(
     case: Case = Depends(require_case_manage),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a case and cascade-remove all its sources, timelines, events, and vectors."""
+    """Delete a case and cascade-remove all its sources, timelines, events, and vectors.
+
+    A case carrying sealed story exports is admin-only to delete, and the
+    deleted exports' hashes go into the audit record. Deleting a single export
+    is admin-only because an export is an immutable attestation
+    (``routers/stories.py``), and a story carrying any is admin-only for the
+    same reason — the case cascade takes them too, so without the same gate it
+    would be the way around both.
+    """
     store = get_store()
     case_id = case.id
+
+    attestations = await store.list_case_export_attestations(case_id)
+    if attestations and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"case has {len(attestations)} sealed story export(s); "
+                "deleting it requires an administrator"
+            ),
+        )
 
     qdrant = QdrantStore()
     ch = ClickHouseStore()
@@ -313,6 +331,10 @@ async def delete_case(
         case_id=case_id,
         target_type="case",
         target_id=case_id,
+        # The rows are gone; the audit log is the only place the attestations
+        # survive. Omitted entirely when there were none, rather than logging
+        # an empty list on every ordinary case delete.
+        detail={"story_exports": attestations} if attestations else None,
     )
     return {"deleted": True, "case_id": case_id}
 

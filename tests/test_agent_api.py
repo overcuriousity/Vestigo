@@ -2373,3 +2373,244 @@ def test_interrupted_turn_still_persists_window_row(
     assert len(rows) == 1
     assert rows[0].tool_result["reason"] == "fit"
     assert rows[0].tool_result["results_elided"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Proposals: story_block kind (W7 agent parity)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_story_block_proposal(store, case_id, timeline_id, user_id, payload):
+    await store.create_story(case_id, "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation(case_id, timeline_id, user_id, model_id="m")
+    proposal = await store.create_agent_proposal(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        conversation_id=conv.id,
+        rationale="drafted summary",
+        kind="story_block",
+        payload=payload,
+    )
+    return conv, proposal
+
+
+def test_confirm_story_block_creates_agent_block(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "## drafted by agent"},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True
+    assert body["block"]["origin"] == "agent"
+    assert body["block"]["content"] == {"text": "## drafted by agent"}
+
+    # Idempotency backbone holds for the new kind.
+    again = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert again.status_code == 409
+
+    blocks = asyncio.run(store.list_story_blocks("s1"))
+    assert len(blocks) == 1 and blocks[0].origin == "agent"
+
+    audit_rows = asyncio.run(store.query_audit(case_id=case_id))
+    assert any(a.action == "agent.story_block_confirm" for a in audit_rows)
+
+
+def test_confirm_story_block_inline_chart_creates_saved_chart(
+    client, admin_bootstrap, agent_on, store
+):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "chart_ref",
+                "content": {
+                    "chart_spec": {"v": 1, "chart_type": "bar", "field": "port"},
+                    "name": "Top ports",
+                },
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True
+    chart_id = body["block"]["content"]["chart_id"]
+
+    chart = asyncio.run(store.get_saved_chart(case_id, timeline_id, chart_id))
+    assert chart is not None
+    assert chart.name == "Top ports"
+    # SavedChart.config is the frontend's versioned camelCase ChartConfig, not
+    # the agent's snake_case ChartSpec. Storing the spec dump produced a chart
+    # that every consumer refused to draw, with no error at write time.
+    assert chart.config["v"] == 1
+    assert chart.config["chartType"] == "bar"
+    assert chart.config["field"] == "port"
+    # And it must survive the trip back into an executable spec.
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    assert _stored_chart_to_spec(chart.config).chart_type == "bar"
+
+
+def test_confirm_story_block_story_deleted(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "x"},
+                "after_block_id": None,
+            },
+        )
+    )
+    asyncio.run(store.delete_story(case_id, "s1"))
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "deleted" in body["reason"]
+    assert body["proposal"]["status"] == "confirmed"
+
+
+def test_confirm_story_block_unrepresentable_legacy_spec_is_reported(
+    client, admin_bootstrap, agent_on, store
+):
+    """A stored payload that no longer converts is `applied: false`, not a 500.
+
+    Proposals now carry ``chart_config`` from propose time, but ones written
+    before that fall back to converting the spec at confirm — and a spec with
+    chart-local base filters has no ``ChartConfig`` representation.
+    """
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "chart_ref",
+                "content": {
+                    "chart_spec": {
+                        "v": 1,
+                        "chart_type": "bar",
+                        "field": "port",
+                        "filters": {"q": "ssh"},
+                    },
+                    "name": "Top ports",
+                },
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "base filters" in body["reason"]
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+
+def test_confirm_story_block_rechecks_referent_scope(client, admin_bootstrap, agent_on, store):
+    """A referent deleted between propose and confirm is reported, not embedded."""
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "view_ref",
+                "content": {"view_id": "gone", "timeline_id": timeline_id},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "not in this case" in body["reason"]
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+
+def test_reject_story_block_writes_nothing(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "x"},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/reject"
+    )
+    assert resp.status_code == 200, resp.text
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+    audit_rows = asyncio.run(store.query_audit(case_id=case_id))
+    assert any(a.action == "agent.story_block_reject" for a in audit_rows)

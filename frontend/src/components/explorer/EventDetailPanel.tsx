@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight, EyeOff } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampFull, fmtRelative } from "@/lib/time";
@@ -440,6 +441,16 @@ export function EventDetailPanel({
             </span>
           </Tooltip>
         )}
+        <AddToStoryButton
+          caseId={caseId}
+          iconOnly
+          className="h-8 w-8 px-0"
+          label="Add this event to a story"
+          content={{
+            kind: "event_ref",
+            content: { event_id: event.event_id, source_id: event.source_id },
+          }}
+        />
         {onJumpToTime && event.timestamp && (
           <Tooltip content="Locate this event in the timeline — keeps active filters; if it's normally hidden it's shown here, marked distinct">
             <Button

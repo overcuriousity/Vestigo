@@ -226,6 +226,20 @@ class Settings(BaseSettings):
     # both write-transaction size and peak memory for match-everything rules.
     sigma_annotation_batch_size: int = Field(default=5_000, ge=100, le=50_000)
 
+    # Stories (docs/STORIES.md). An export freezes every block server-side and
+    # then stores the client-rendered standalone HTML artifact, so both the
+    # work and the stored bytes need a ceiling. The block cap bounds how much
+    # querying one export request can trigger (resolution is synchronous); the
+    # snapshot cap bounds the JSON column; the artifact cap bounds the uploaded
+    # HTML, which inlines the stylesheet and every frozen row.
+    story_export_max_blocks: int = Field(default=500, ge=1)
+    story_export_max_snapshot_bytes: int = Field(default=64 * 1024**2, ge=0)
+    story_max_artifact_bytes: int = Field(default=20 * 1024**2, ge=0)
+    # Ceiling on one markdown block's text. Generous for report prose; the
+    # point is that a block is embedded verbatim into every later snapshot,
+    # so an unbounded one multiplies across exports.
+    story_max_markdown_bytes: int = Field(default=256 * 1024, ge=1024)
+
     # Enrichers: where admin-uploaded enricher assets (e.g. the MaxMind
     # GeoLite2 database) are stored.
     enricher_data_path: str = "data/enrichers"

@@ -93,6 +93,11 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
         content_hash="cd" * 32,
     )
     sigma_run = await store.create_sigma_run("c1", "t1", params={})
+    story = await store.create_story("c1", "st1", "Report", None, user="alice")
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "x"}, user="alice")
+    # An export snapshot holds frozen event data — the most important of these
+    # to take with the case, and the easiest to leave behind.
+    await store.create_story_export("ex1", story.id, "c1", {"v": 1}, "hash", user="alice")
 
     assert await store.delete_case("c1") is True
 
@@ -101,6 +106,9 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
     assert await store.get_detector_run("c1", run.id) is None
     assert await store.get_sigma_rule("c1", sigma_rule.id) is None
     assert await store.get_sigma_run("c1", sigma_run.id) is None
+    assert await store.get_story("c1", "st1") is None
+    assert await store.list_story_blocks("st1") == []
+    assert await store.list_story_exports("st1") == []
 
 
 @pytest.mark.asyncio
@@ -233,6 +241,10 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("DROP TABLE agent_proposals"))
         # 0011 adds the instance-wide agent settings table.
         await conn.execute(text("DROP TABLE agent_settings"))
+        # 0016 adds the Stories tables.
+        await conn.execute(text("DROP TABLE stories"))
+        await conn.execute(text("DROP TABLE story_blocks"))
+        await conn.execute(text("DROP TABLE story_exports"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))

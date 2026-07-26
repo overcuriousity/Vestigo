@@ -7,6 +7,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+// AddToStoryButton navigates client-side on its success toast, so this
+// subtree needs a router the same way the real app always provides one.
+import { MemoryRouter } from "react-router-dom";
 import { FindingCard } from "@/components/agent/FindingCard";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import type { AgentFilterSpec } from "@/api/agent";
@@ -28,10 +31,12 @@ const SPEC: AgentFilterSpec = {
 function renderCard(onApply = vi.fn()) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
+    <MemoryRouter>
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
         <FindingCard
           caseId={CASE}
+          timelineId="t1"
           title="Suspicious PowerShell"
           description="looks odd"
           spec={SPEC}
@@ -39,7 +44,8 @@ function renderCard(onApply = vi.fn()) {
           onApply={onApply}
         />
       </TooltipProvider>
-    </QueryClientProvider>,
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
   return onApply;
 }

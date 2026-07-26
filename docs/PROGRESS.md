@@ -1,9 +1,156 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-25 (session 99 — X1 third review round).
+Last updated: 2026-07-26 (session 102 — W7 second-pass review remediation).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 102 — 2026-07-26: W7 second-pass review remediation
+
+**Why.** A second review pass over the finished W7 branch before integration. No
+criticals left, but five issues where a failure was reported in the wrong shape —
+a 500 instead of a refusal, or a late symptom instead of an early error.
+
+- **The agent's write path skipped the referent-scope gate.** The HTTP router checked
+  that a block's `view_id`/`chart_id`/`timeline_id` belong to the case; the agent's
+  propose and confirm paths ran shape validation only. A wrong id therefore survived
+  all the way to export, as a frozen `resolution.error`, instead of being an error the
+  model could correct. The check moved out of the router into
+  `vestigo.stories.refs.validate_block_scope` and now runs on all three paths — and at
+  confirm as well as propose, because a referent can be deleted in between. It also
+  covers an `event_ref`'s `source_id`, which nothing had been checking.
+- **A decided proposal could 500.** The legacy chart-config conversion in
+  `_apply_story_block_proposal` sat outside the handler's `try`, so a stored spec that
+  no longer converts (chart-local base filters have no `ChartConfig` representation)
+  raised out of a *decided* proposal instead of reporting `applied: false` with a
+  reason. Same for the `block is None` race when the story is deleted between the
+  lookup and the insert. Everything that can fail on a stored payload is now inside
+  one `try`, and the proposal always reports honestly.
+- **The position retry was too broad.** `create_story_block`/`move_story_block` retried
+  *any* `IntegrityError` 25 times, so a duplicate block id or a NOT NULL violation cost
+  25 round-trips and then surfaced as a misleading "could not place a block". Narrowed
+  to the `(story_id, position)` uniqueness violation the loop exists for; anything else
+  propagates immediately.
+- **A failed artifact upload was terminal.** Sealing is once-only and correctly so, but
+  an export whose upload failed had no way back — the analyst's only route was a whole
+  new export under a different hash. The Exports tab now offers **Render HTML** on an
+  unsealed export, re-rendering from the *stored* snapshot (never a fresh resolution),
+  so the artifact still attests to the same frozen record. The pre-upload size warning
+  also measures UTF-8 bytes rather than `String.length`, which under-counted non-ASCII
+  prose and let the warning arrive after the 413 it exists to pre-empt.
+
+Verified: `uv run pytest` 1796 passed, `uv run ruff check .` clean, frontend
+`typecheck`/`lint` clean, `npm run test` 510 passed.
+
+## Session 101 — 2026-07-26: W7 Stories review remediation
+
+**Why.** A three-way code review of the W7 branch (`009e50c..3bf2bb0`, ~8.5k lines)
+found three silent-failure bugs in the features the design round was actually built
+around, plus a set of smaller issues. Everything found was fixed; the two structural
+root causes are worth recording because they explain most of the individual findings.
+
+- **No compare-and-swap anywhere.** `update_story_block`, `move_story_block`,
+  `seal_story_export_artifact` and the gap-position computation were all read-then-write.
+  Under `READ COMMITTED` two collaborators could both read `version=1`, both pass a
+  Python-side check, and both write `version=2` — the exact lost update the `version`
+  column exists to prevent, and the invariant the router docstring and `STORIES.md`
+  both promised. Same shape let two uploads double-seal an immutable export and two
+  inserts tie for a position. All four are now conditional `UPDATE … WHERE <guard>` +
+  `rowcount`, position mutations run under a `FOR UPDATE` lock on the parent story row,
+  and `(story_id, position)` is unique (migration `0018`) with a bounded retry behind it
+  — a lock orders transactions but doesn't make a pre-lock read current, and SQLite
+  ignores `FOR UPDATE`, so the index is the real invariant. A sequential test cannot
+  distinguish the old code from the new one, which is why none of this was caught;
+  `tests/test_stories_store.py` now has genuinely concurrent `asyncio.gather` cases.
+- **Untyped payload boundaries.** Two of the three criticals trace to the same habit.
+  `SnapshotBlock.ref`/`data` were `Record<string, unknown>`, so eight renderers
+  re-asserted the shape locally — and an `as unknown as ChartResult` cast hid that an
+  uncompared time chart freezes a raw histogram (`{start, count}`) while the mark reads
+  `{primary, comparison}`. Every time-histogram block therefore rendered blank bars in
+  every export, silently. Symmetrically, the agent wrote its snake_case `ChartSpec` dump
+  into `SavedChart.config`, which is contractually the frontend's camelCase `v: 1`
+  `ChartConfig`, so an agent-authored chart block was undrawable in the export, the story
+  card *and* the Visualize rail — with a test asserting the wrong shape, protecting the
+  bug. Both are now discriminated unions with one typed mapper each
+  (`snapshotToChartResult`, `spec_to_stored_chart_config`) and a round-trip assertion, so
+  a future divergence is a build failure rather than a blank chart in a signed report.
+- **The editor defeated its own concurrency check.** `MarkdownBlock` read `block.version`
+  from a live prop refreshed by the 10s story poll, so a collaborator saving mid-edit
+  became the base version: the server's check passed and their edit was destroyed with no
+  409 and no conflict UI. A paragraph takes longer to write than the poll interval, so the
+  conflict path was close to unreachable. The version is now captured at edit start.
+- **Attestation gaps.** `delete_case` didn't delete stories, blocks or exports — leaving
+  orphaned snapshots holding frozen event data from a case the operator believes is gone.
+  A contributor could erase every sealed export by deleting the story, bypassing the
+  admin-only export deletion; that path is now admin-only when exports exist, and the
+  hashes go into the audit record. Exported charts ran under the *agent's* context-budget
+  caps, so a report showed less than the analyst signed off on (top-50 frozen as top-30)
+  and carried agent-facing clamp prose; `execute_chart_spec` now takes a `ChartLimits`
+  and exports use `ANALYST_CHART_LIMITS`. `GET .../snapshot` serves the canonical hashed
+  bytes so a third party can verify the hash directly, and a sealed artifact must embed
+  the `snapshot_hash` it claims to render.
+- **Bounds and honesty.** Block content, snapshot bytes, block count per export and the
+  artifact stream are all capped via `VESTIGO_STORY_*` settings (the artifact cap now
+  applies to the arriving stream, not to the already-buffered body). `_json_safe` coerces
+  non-finite floats — `NaN`/`Infinity` are not JSON, and hashing them would leave an
+  unverifiable attestation — and sorts sets. Embed cards distinguish "deleted" from
+  "lookup failed", an event block resolves through a timeline that actually contains its
+  source (the editor and the server-side resolver previously disagreed), pushes reuse a
+  matching saved View instead of minting a duplicate per push, and the exported HTML marks
+  agent-authored blocks. The RBAC test the plan specified now actually exercises the
+  read-vs-contribute boundary rather than a non-member who is 403 on everything.
+
+Verified: `uv run pytest` 1791 passed, `uv run ruff check .` clean, frontend
+`typecheck`/`lint` clean, `npm run test` 503 passed.
+
+## Session 100 — 2026-07-26: W7 Stories (Phase 3 Step 3)
+
+**Why.** The last open item of Phase 3, and the feature Timesketch users reach for
+most: a per-case document where the narrative and the evidence live together, so the
+report assembles itself during the investigation instead of being written afterwards.
+Design round: `docs/superpowers/specs/2026-07-26-w7-stories-design.md`; reference doc:
+`docs/STORIES.md`.
+
+- **Live editor, frozen exports.** The central tension the design round settled: embeds
+  stay live while an analyst writes (the document tracks ingestion and detection as they
+  progress), and `POST .../exports` freezes a server-resolved, SHA-256-hashed, immutable
+  snapshot. Freeze-at-embed would have killed the live-report feel; freeze-only-at-export
+  with no stored bundle would have left "what did this chart show?" unanswerable once the
+  file was lost. The stored snapshot is the attested record, like a Source's `file_hash`.
+- **Server resolves, browser renders.** Export is two-phase and deliberately asymmetric.
+  The server executes every block itself — view queries through the same `_build_query`
+  path the Explorer uses, charts through `execute_chart_spec` — and stores the hashed
+  bundle. The client then renders that bundle to standalone HTML and uploads it once. The
+  JSON is authoritative; the HTML is presentation, and an export is complete without it.
+  This also kept a server-side chart-rendering stack (and a headless browser in an
+  airgapped install) out of the deployment.
+- **Nothing vanishes silently.** Per-block resolution is individually wrapped: a view
+  deleted before the export freezes as `resolution.error`, visible in the artifact, and
+  one bad block never fails an export. Truncation is always stated — a report showing 200
+  of 14203 rows says which it is, in the editor and in the export.
+- **Collaboration without new infrastructure.** Block-level optimistic concurrency
+  (`version` per block, 409 with the winning row) plus 10s polling. Block granularity does
+  the work: two analysts on different blocks never collide, and a conflict keeps the local
+  draft with a load-theirs/overwrite choice. No CRDT, no WebSockets — the same call the
+  streaming milestone already made for the live Explorer.
+- **Integer gap ordering.** Positions stride by 1024; an insert between two blocks takes
+  the midpoint, and an exhausted gap renumbers the story inside the same transaction.
+  Boring on purpose: float positions accumulate precision failures exactly where a
+  document is edited most.
+- **Agent parity, phase-spec deferral rescinded.** The Phase 3 spec had deferred
+  agent-authored stories; the user rescinded that during the design round, on the standing
+  principle that the agent can do what an analyst can do. Stories shipped with
+  `list_stories`/`read_story` (also on external `/mcp`) and `propose_story_block`
+  (in-app only, like `propose_annotation`). `AgentProposal` gained `kind`/`payload` so
+  both proposal shapes share one decide path and its 409 idempotency backbone. A
+  `chart_ref` may be proposed with an inline spec — confirming saves the chart and embeds
+  it in one step. Block edit/move/delete and export stay analyst-only: parity covers
+  analytical contribution, not document arrangement or the attestation act.
+- **Two extractions, no duplication.** `execute_chart_spec` came out of `propose_chart`
+  so the export resolver runs the identical validated path, and `ChartCanvas`/`ChartMarks`
+  came out of `ChartProposalCard` so a chart is drawn by one component in the Visualize
+  page, an agent card, a story block *and* an exported snapshot. The snapshot renderer
+  performs no network access at all — asserted by a test that fails if a render fetches.
 
 ## Session 99 — 2026-07-25: X1 third review round (untrusted-input bounds, event loop)
 

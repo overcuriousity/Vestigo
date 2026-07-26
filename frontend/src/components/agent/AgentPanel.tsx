@@ -42,6 +42,7 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
 import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
+import { StoryBlockProposalCard } from "./StoryBlockProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
 import { Markdown } from "./Markdown";
 import { capPersistedForStream, type TurnBaseline } from "./transcript";
@@ -92,6 +93,7 @@ type ChatItem =
     }
   | { kind: "chart"; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
+  | { kind: "storyProposal"; proposalId: string }
   | { kind: "error"; detail: string }
   /** Something happened that isn't a failure — a turn the analyst stopped. */
   | { kind: "notice"; detail: string };
@@ -159,6 +161,13 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
           promptTokens: m.prompt_tokens,
           completionTokens: m.completion_tokens,
         });
+      }
+    } else if (m.role === "tool" && m.tool_name === "propose_story_block") {
+      // Same rule as propose_annotation: rendered from the result row, which
+      // carries the proposal_id the proposals query is keyed by.
+      const result = m.tool_result as { proposal_id?: string } | null;
+      if (result?.proposal_id) {
+        items.push({ kind: "storyProposal", proposalId: result.proposal_id });
       }
     } else if (m.role === "tool" && m.tool_name === "propose_annotation") {
       // propose_annotation is rendered from its *result* row (which carries
@@ -912,6 +921,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
               <FindingCard
                 key={i}
                 caseId={caseId}
+                timelineId={timelineId}
                 title={item.title}
                 description={item.description}
                 spec={item.spec}
@@ -944,6 +954,20 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 conversationId={activeId}
                 proposal={proposal}
                 onApply={onApplyFilters}
+              />
+            );
+          }
+          if (item.kind === "storyProposal") {
+            const proposal = proposalsById[item.proposalId];
+            if (!proposal || !activeId) {
+              return <ToolRow key={i} tool="propose_story_block" />;
+            }
+            return (
+              <StoryBlockProposalCard
+                key={i}
+                caseId={caseId}
+                conversationId={activeId}
+                proposal={proposal}
               />
             );
           }

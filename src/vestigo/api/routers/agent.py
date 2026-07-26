@@ -999,6 +999,121 @@ async def list_proposals(
     return {"proposals": [p.to_dict() for p in rows]}
 
 
+async def _apply_story_block_proposal(
+    store, decided, case_id: str, conversation_id: str, user
+) -> dict[str, Any]:
+    """Apply a confirmed ``story_block`` proposal (W7 agent parity).
+
+    Confirm is the write: the block lands with ``origin: agent``. An inline
+    chart spec first becomes a SavedChart so the block references a persisted
+    object like every other embed. A story deleted since propose time still
+    decides the proposal (idempotency backbone untouched) but applies nothing,
+    reported honestly.
+    """
+    import uuid as _uuid
+
+    from vestigo.stories.refs import validate_block_scope
+    from vestigo.stories.schemas import validate_block_content
+
+    payload = decided.payload or {}
+    story = await store.get_story(case_id, payload.get("story_id"))
+    applied = False
+    block_dict = None
+    reason = None
+    if story is None:
+        reason = "story deleted since the proposal was made"
+    else:
+        block_kind = payload.get("block_kind")
+        content = dict(payload.get("content") or {})
+        # Everything that can fail on a *stored* payload is inside one try:
+        # a decided proposal must report an honest ``applied: false`` with a
+        # reason, never a 500. That includes the legacy chart conversion —
+        # a spec carrying chart-local base filters has no ChartConfig
+        # representation and raises.
+        try:
+            if block_kind == "chart_ref" and "chart_spec" in content:
+                from pydantic import ValidationError
+
+                from vestigo.agent.tools import ChartSpec
+                from vestigo.stories.export import spec_to_stored_chart_config
+
+                # ``SavedChart.config`` is the frontend's versioned camelCase
+                # ChartConfig, not the agent's ChartSpec — storing the spec's
+                # dump produces a chart no consumer can draw (and no error
+                # until the analyst opens it). Proposals made before
+                # ``chart_config`` was carried in the payload are converted
+                # here instead.
+                chart_config = content.get("chart_config")
+                if not chart_config:
+                    try:
+                        spec = ChartSpec.model_validate(content["chart_spec"])
+                    except ValidationError as exc:
+                        raise ValueError(f"stored chart spec no longer validates: {exc}") from exc
+                    chart_config = spec_to_stored_chart_config(spec)
+                chart = await store.create_saved_chart(
+                    case_id,
+                    decided.timeline_id,
+                    _uuid.uuid4().hex,
+                    content.get("name") or "Agent chart",
+                    chart_config,
+                )
+                content = {"chart_id": chart.id, "timeline_id": decided.timeline_id}
+            content = validate_block_content(block_kind, content)
+            # Re-checked at confirm time, not only at propose time: the view,
+            # chart or source the block points at can be deleted in between.
+            await validate_block_scope(case_id, block_kind, content, store=store)
+            after_block_id = payload.get("after_block_id")
+            try:
+                block = await store.create_story_block(
+                    story.id,
+                    _uuid.uuid4().hex,
+                    block_kind,
+                    content,
+                    user=user.username,
+                    origin="agent",
+                    after_block_id=after_block_id,
+                )
+            except ValueError:
+                # The anchor block vanished since propose time — append instead
+                # of failing a decided proposal.
+                block = await store.create_story_block(
+                    story.id,
+                    _uuid.uuid4().hex,
+                    block_kind,
+                    content,
+                    user=user.username,
+                    origin="agent",
+                )
+            if block is None:
+                # The story was deleted between the lookup above and the
+                # insert; same honest report as the propose-time case.
+                reason = "story deleted since the proposal was made"
+            else:
+                applied = True
+                block_dict = block.to_dict()
+        except ValueError as exc:
+            reason = str(exc)
+    await store.record_audit(
+        action="agent.story_block_confirm",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_proposal",
+        target_id=decided.id,
+        detail={
+            "conversation_id": conversation_id,
+            "applied": applied,
+            "story_id": payload.get("story_id"),
+            "reason": reason,
+        },
+    )
+    return {
+        "proposal": decided.to_dict(),
+        "applied": applied,
+        "block": block_dict,
+        "reason": reason,
+    }
+
+
 @router.post("/{case_id}/agent/conversations/{conversation_id}/proposals/{proposal_id}/confirm")
 async def confirm_proposal(
     case_id: str,
@@ -1024,6 +1139,9 @@ async def confirm_proposal(
     )
     if decided is None:
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
+
+    if decided.kind == "story_block":
+        return await _apply_story_block_proposal(store, decided, case_id, conversation_id, user)
 
     scope = await build_scope(case_id, conversation.timeline_id, user)
     found, unknown = await _proposal_resolver()(scope, [e["event_id"] for e in decided.events])
@@ -1083,7 +1201,11 @@ async def reject_proposal(
     if decided is None:
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
     await store.record_audit(
-        action="agent.annotation_reject",
+        action=(
+            "agent.story_block_reject"
+            if decided.kind == "story_block"
+            else "agent.annotation_reject"
+        ),
         actor=user,
         case_id=case_id,
         target_type="agent_proposal",
