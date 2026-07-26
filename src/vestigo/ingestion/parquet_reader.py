@@ -190,6 +190,14 @@ class ParquetEventsParser(Parser):
                     attributes=dict(row["attributes"] or {}),
                 )
                 # The batch path derives event_id without Event's
-                # content-hash recomputation; identities must agree.
-                assert str(event.event_id) == row["event_id"]
+                # content-hash recomputation; identities must agree. Not an
+                # ``assert``: `python -O` strips those, and a stripped guard
+                # would let the two paths disagree silently — the identity
+                # invariant every provenance lookup depends on.
+                if str(event.event_id) != row["event_id"]:
+                    raise ValueError(
+                        "event_id mismatch between the Arrow batch and Event derivation for "
+                        f"{row['content_hash']!r} at byte {row['byte_offset']}: "
+                        f"batch={row['event_id']} event={event.event_id}"
+                    )
                 yield event

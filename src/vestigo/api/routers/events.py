@@ -1526,6 +1526,14 @@ async def export_events(
     # Pre-flight the expected row count over the *same* EventQuery, so the stream
     # can prove it emitted every matching row (and hard-fail if it didn't). Same
     # WHERE as the stream's keyset scan → identical scope.
+    #
+    # Second job, load-bearing: this is the last point at which a query-layer
+    # failure can still become a status code. Once StreamingResponse flushes
+    # headers, an exception from `iter_events` truncates a 200 — no exception
+    # handler runs. Because the count executes the identical WHERE, anything
+    # structurally wrong with the filter (an over-large membership list →
+    # QueryRequestTooLargeError → 413) surfaces here instead. Don't move this
+    # below the StreamingResponse construction.
     expected = await _run_regex_guarded(
         _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes),
         _get_query_service().count,

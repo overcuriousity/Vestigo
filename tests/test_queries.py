@@ -7,11 +7,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from clickhouse_connect.driver.exceptions import DatabaseError
 
 from vestigo.db._dt import NULL_TS_SENTINEL, VESTIGO_NOT_SENTINEL_SQL
 from vestigo.db.queries import (
+    EXTERNAL_LIST_THRESHOLD,
     EventQuery,
     EventQueryService,
+    QueryRequestTooLargeError,
     TagFilter,
     _normalize_event_row,
 )
@@ -30,6 +33,8 @@ class FakeClickHouseClient:
 
     def __init__(self, event_rows: list[list[Any]] | None = None) -> None:
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
+        # Parallel to `queries`: the external_data kwarg each call carried.
+        self.external: list[Any] = []
         self.event_rows = event_rows or []
         self.event_columns = [
             "event_id",
@@ -62,6 +67,7 @@ class FakeClickHouseClient:
         **_kwargs: Any,
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
+        self.external.append(_kwargs.get("external_data"))
         stripped = query.strip()
         if stripped.startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
@@ -156,6 +162,184 @@ def test_template_hash_exclusion_is_parameterized_uint64(service: EventQueryServ
     service.query(EventQuery(case_id="case-1"))
     query, _ = _last_query(service)
     assert "template_hash NOT IN" not in query
+
+
+def _many_ids(n: int) -> list[str]:
+    return [f"00000000-0000-4000-8000-{i:012d}" for i in range(n)]
+
+
+def _external_names(external: Any) -> list[str]:
+    return [] if external is None else [f.name for f in external.files]
+
+
+def test_large_event_id_filter_uses_external_table(service: EventQueryService) -> None:
+    """Past a few thousand ids, binding the list as one Array(String) parameter
+    makes clickhouse-connect form-encode it and ClickHouse's Poco form parser
+    rejects the field ("Field value too long", code 1000) — a hard 500 that
+    grows in with tagging. Large lists ship as external data instead."""
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(EventQuery(case_id="case-1", event_ids=ids))
+
+    query, params = _last_query(service)
+    assert "toString(event_id) IN (SELECT * FROM vestigo_ext_" in query
+    assert params is not None
+    assert not any(
+        isinstance(v, list) and len(v) > EXTERNAL_LIST_THRESHOLD for v in params.values()
+    )
+    # Every statement the page fetch issues carries the table it references.
+    for (sql, _), external in zip(
+        service.store.client.queries, service.store.client.external, strict=True
+    ):
+        for name in _external_names(external):
+            assert name in sql or "vestigo_ext_" not in sql
+        if "vestigo_ext_" in sql:
+            assert external is not None
+
+
+def test_large_event_id_exclusion_uses_external_table(service: EventQueryService) -> None:
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(EventQuery(case_id="case-1", exclude_event_ids=ids))
+    query, _ = _last_query(service)
+    assert "toString(event_id) NOT IN (SELECT * FROM vestigo_ext_" in query
+
+
+def test_large_tag_filter_ids_use_external_table(service: EventQueryService) -> None:
+    """The unified tag predicate's postgres_event_ids half is the one the
+    `annotated=` filters resolve to, and the one that actually overflows."""
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(
+        EventQuery(
+            case_id="case-1", tags_include=TagFilter(tag_values=["x"], postgres_event_ids=ids)
+        )
+    )
+    query, _ = _last_query(service)
+    assert "hasAny(tags, {" in query
+    assert "toString(event_id) IN (SELECT * FROM vestigo_ext_" in query
+
+
+def test_large_field_filter_values_use_external_table(service: EventQueryService) -> None:
+    values = [f"value-{i}" for i in range(EXTERNAL_LIST_THRESHOLD + 1)]
+    service.query(EventQuery(case_id="case-1", field_filters={"artifact": values}))
+    query, _ = _last_query(service)
+    assert "IN (SELECT * FROM vestigo_ext_" in query
+
+    service.query(EventQuery(case_id="case-1", field_exclusions={"artifact": values}))
+    query, _ = _last_query(service)
+    assert "NOT IN (SELECT * FROM vestigo_ext_" in query
+
+
+def test_large_template_hash_exclusion_uses_external_table(service: EventQueryService) -> None:
+    hashes = list(range(EXTERNAL_LIST_THRESHOLD + 1))
+    service.query(EventQuery(case_id="case-1", exclude_template_hashes=hashes))
+    query, _ = _last_query(service)
+    assert "template_hash NOT IN (SELECT * FROM vestigo_ext_" in query
+
+
+def test_external_table_payload_is_tsv_escaped(service: EventQueryService) -> None:
+    """Values are not UUIDs in the general case — a tab or newline inside a
+    value would otherwise shift the whole external table by a column/row."""
+    values = [f"value-{i}" for i in range(EXTERNAL_LIST_THRESHOLD)] + ["a\tb\nc\\d"]
+    service.query(EventQuery(case_id="case-1", field_filters={"artifact": values}))
+    external = service.store.client.external[-1]
+    assert external is not None
+    payload = external.files[0].data.decode()
+    assert payload.splitlines()[-1] == "a\\tb\\nc\\\\d"
+
+
+def test_external_table_payload_escapes_remaining_control_chars(
+    service: EventQueryService,
+) -> None:
+    """NUL/backspace/form-feed are legal inside a log field value and have
+    their own ClickHouse TSV escapes — emit them rather than trusting the
+    reader to pass the raw byte through."""
+    values = [f"value-{i}" for i in range(EXTERNAL_LIST_THRESHOLD)] + ["a\0b\bc\fd\re"]
+    service.query(EventQuery(case_id="case-1", field_filters={"artifact": values}))
+    payload = service.store.client.external[-1].files[0].data.decode()
+    assert payload.split("\n")[-2] == "a\\0b\\bc\\fd\\re"
+
+
+def test_external_table_payload_keeps_empty_values(service: EventQueryService) -> None:
+    """The empty string is a real filter value (Vestigo's "field is missing"
+    predicate), and TSV reads an empty line as one empty String column — so
+    the row must survive, not be silently dropped."""
+    values = [""] + [f"value-{i}" for i in range(EXTERNAL_LIST_THRESHOLD)]
+    service.query(EventQuery(case_id="case-1", field_filters={"artifact": values}))
+    payload = service.store.client.external[-1].files[0].data.decode()
+    assert payload.split("\n")[0] == ""
+    assert payload.count("\n") == len(values)
+
+
+def test_external_table_payload_dedupes_values(service: EventQueryService) -> None:
+    """An IN test cannot care about a repeated value, but the upload does —
+    annotation lookups resolve to the same event id once per tag."""
+    unique = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(EventQuery(case_id="case-1", event_ids=unique + unique))
+    payload = service.store.client.external[-1].files[0].data.decode()
+    assert payload.splitlines() == unique
+
+
+def test_identical_lists_share_one_external_table(service: EventQueryService) -> None:
+    """Two predicates over the same list upload the payload once."""
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            event_ids=ids,
+            tags_include=TagFilter(tag_values=["x"], postgres_event_ids=ids),
+        )
+    )
+    external = service.store.client.external[-1]
+    assert len(external.files) == 1
+    query, _ = _last_query(service)
+    assert query.count(external.files[0].name) == 2
+
+
+def test_histogram_carries_external_table(service: EventQueryService) -> None:
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.histogram(EventQuery(case_id="case-1", event_ids=ids))
+    query, _ = _last_query(service)
+    assert "vestigo_ext_" in query
+    assert service.store.client.external[-1] is not None
+
+
+def test_small_id_list_keeps_inline_array(service: EventQueryService) -> None:
+    """Below the threshold the SQL and parameters are unchanged — the inline
+    array is cheaper and keeps a single request body."""
+    service.query(EventQuery(case_id="case-1", event_ids=["a", "b"]))
+    query, params = _last_query(service)
+    assert "has({p1:Array(String)}, toString(event_id))" in query
+    assert params is not None
+    assert ["a", "b"] in list(params.values())
+    assert service.store.client.external[-1] is None
+
+
+def test_form_overflow_is_translated_to_a_domain_error(service: EventQueryService) -> None:
+    """A list that still overflows must not surface as an opaque 500.
+
+    ClickHouse rejects an over-long form field with Poco code 1000, whose
+    message says nothing an analyst can act on; the query layer translates it
+    into an error the API can turn into an actionable 4xx.
+    """
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise DatabaseError(
+            "Received ClickHouse exception, code: 1000, server response: "
+            "Poco::Exception. Code: 1000, e.code() = 0, HTML Form Exception: "
+            "Field value too long"
+        )
+
+    service.store.client.query = boom  # type: ignore[method-assign]
+    with pytest.raises(QueryRequestTooLargeError):
+        service.query(EventQuery(case_id="case-1"))
+
+
+def test_other_database_errors_are_not_swallowed(service: EventQueryService) -> None:
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise DatabaseError("code: 241, memory limit exceeded")
+
+    service.store.client.query = boom  # type: ignore[method-assign]
+    with pytest.raises(DatabaseError):
+        service.query(EventQuery(case_id="case-1"))
 
 
 def test_source_ids_filter_is_parameterized(service: EventQueryService) -> None:
@@ -1084,6 +1268,8 @@ class _BatchedFakeClient:
         self.remainder = remainder
         self._select_call = 0
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
+        # Parallel to `queries`: the external_data kwarg each call carried.
+        self.external: list[Any] = []
 
     def _make_rows(self, n: int) -> list[list[Any]]:
         # `_cursor_ts` (last column) must be a real datetime — iter_events
@@ -1102,6 +1288,7 @@ class _BatchedFakeClient:
         **_kwargs: Any,
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
+        self.external.append(_kwargs.get("external_data"))
         if query.strip().startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
         call = self._select_call
@@ -1181,6 +1368,38 @@ def test_iter_events_yields_dicts_with_expected_keys() -> None:
     assert "event_id" in rows[0]
     assert "message" in rows[0]
     assert "source_id" in rows[0]
+
+
+def test_iter_events_reuses_one_external_table_across_batches() -> None:
+    """`iter_events` rebuilds the WHERE clause per batch — the keyset cursor
+    lives inside it — but the membership payloads it references do not change.
+
+    Without a registry shared across those rebuilds, a large export
+    re-serializes and re-uploads the whole id list once per batch: a 50k-id
+    JSONL export would ship ~2 MB fifty times over. The table *name* has to
+    stay stable too, since parameter numbering shifts between rebuilds once
+    the cursor predicate starts binding values.
+    """
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    svc = _batched_service(batch_size=2, full_batches=3, remainder=1)
+
+    list(svc.iter_events(EventQuery(case_id="c1", event_ids=ids), batch_size=2))
+
+    externals = [e for e in svc.store.client.external if e is not None]  # type: ignore[union-attr]
+    assert len(externals) > 2, "expected several batches"
+    # One registry, one ExternalData object, one file — reused, not rebuilt.
+    assert len({id(e) for e in externals}) == 1
+    assert len(externals[0].files) == 1
+    names = {e.files[0].name for e in externals}
+    assert len(names) == 1
+    for (sql, _), external in zip(
+        svc.store.client.queries,  # type: ignore[union-attr]
+        svc.store.client.external,  # type: ignore[union-attr]
+        strict=True,
+    ):
+        if "vestigo_ext_" in sql:
+            assert external is not None
+            assert external.files[0].name in sql
 
 
 def test_iter_events_where_clause_is_parameterized() -> None:

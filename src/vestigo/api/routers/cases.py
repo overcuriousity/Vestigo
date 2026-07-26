@@ -306,9 +306,9 @@ async def delete_case(
     # retryable instead of leaving orphan events behind a "successful" delete.
     try:
         for source in sources:
-            qdrant.delete_source_points(case_id, source.id)
+            await asyncio.to_thread(qdrant.delete_source_points, case_id, source.id)
             await asyncio.to_thread(ch.delete_source_events, case_id, source.id)
-        qdrant.delete_case_collections(case_id)
+        await asyncio.to_thread(qdrant.delete_case_collections, case_id)
     except Exception as exc:
         await store.record_audit(
             action="case.delete_failed",
@@ -875,7 +875,7 @@ async def delete_source(
     # A failed cascade aborts with 502 so the delete stays visible and
     # retryable instead of leaving orphan events behind a "successful" delete.
     try:
-        qdrant.delete_source_points(case_id, source_id)
+        await asyncio.to_thread(qdrant.delete_source_points, case_id, source_id)
         await asyncio.to_thread(ch.delete_source_events, case_id, source_id)
     except Exception as exc:
         await store.record_audit(

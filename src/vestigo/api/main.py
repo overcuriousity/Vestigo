@@ -37,6 +37,7 @@ from vestigo.api.routers import (
 from vestigo.core.config import get_settings
 from vestigo.core.security import hash_password
 from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, generate_id
+from vestigo.db.queries import QueryRequestTooLargeError
 from vestigo.models.embeddings import embeddings_available
 
 logger = logging.getLogger(__name__)
@@ -465,6 +466,39 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(QueryRequestTooLargeError)
+    async def _query_too_large(_request: Request, exc: QueryRequestTooLargeError) -> JSONResponse:
+        """Answer 413 instead of leaking a Poco form-parser 500.
+
+        Reached when a filter resolves to a value list ClickHouse refuses to
+        accept in one request (issue #181). Large membership lists now travel
+        as external data, so this is the backstop for whatever still overflows
+        — and it tells the analyst to narrow the filter rather than showing a
+        ClickHouse-internal message.
+
+        413 rather than 400: the analyst's own request is well-formed and
+        small, but the request *Vestigo* must make of the event store to
+        answer it exceeds a payload limit. 413 is the only status that names
+        size as the problem, which is the one thing the analyst can act on;
+        400 would suggest the filter itself is malformed.
+
+        Streaming exports reach this handler because the route pre-flights a
+        ``count()`` over the same ``EventQuery`` before constructing the
+        ``StreamingResponse`` (``routers/events.py``) — once the response
+        headers are flushed no handler can run, so that pre-flight is what
+        keeps an over-large export filter a clean 413 instead of a truncated
+        200. Covered by ``tests/test_query_too_large_handler.py``.
+        """
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": (
+                    f"This filter is too large for the event store to process ({exc}). "
+                    "Narrow it — a shorter time range or fewer selected events — and retry."
+                )
+            },
+        )
 
     @app.get("/api/health", response_class=JSONResponse)
     async def health() -> dict:

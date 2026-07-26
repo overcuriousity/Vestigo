@@ -47,6 +47,12 @@ Forensic provenance fields (`file_hash`, `byte_offset`, `content_hash`, `parser_
 being read; Parquet converters compute them from the original raw evidence file. See
 `docs/MODEL_REFINEMENT.md` for the full Case/Source/Timeline/Event model.
 
+CSV/JSONL inputs are decoded as UTF-8 with `errors="surrogateescape"`, so `byte_offset`
+always counts the file's *real* bytes even when a line is not valid UTF-8 (a Latin-1
+logfile, a truncated multi-byte sequence). Undecodable bytes are replaced with U+FFFD in
+the event payload itself — the offset points at the original bytes, the stored text is
+always valid UTF-8.
+
 ---
 
 ## CSV

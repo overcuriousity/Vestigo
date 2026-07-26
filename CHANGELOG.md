@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-07-26
+
+### Fixed
+
+- **Large id filters no longer fail with a ClickHouse 500** ([#181]). Any filter
+  resolving to a large Postgres-side event-id list — `annotated=`, `ids=`, tag
+  include/exclude — bound the whole list as a single `Array(String)` query
+  parameter. Past roughly 3,300 ids the driver form-encodes that parameter and
+  ClickHouse's form parser rejects the oversized field (`code: 1000, HTML Form
+  Exception: Field value too long`), so a case became progressively
+  un-filterable as tagging grew and agent bulk-tagging hit the wall quickly.
+  Membership lists past a threshold now travel as ClickHouse **external data** —
+  a multipart file part with a 1 GiB ceiling instead of a 128 KiB field cap —
+  and filter with `IN (SELECT * FROM …)`, which builds a hash set rather than
+  scanning a constant array per row. Applied to every large-list filter, not
+  only the reported one. A filter that still overflows now answers **413** with
+  an actionable message instead of a raw ClickHouse error, on the Explorer and
+  on streaming exports alike.
+
+- **Byte offsets are correct for sources containing invalid UTF-8** ([#156],
+  [#161]). Offsets were measured over text decoded with `errors="replace"`;
+  because the replacement character re-encodes to three bytes, every
+  `byte_offset` after the first undecodable byte was wrong and the
+  event-to-source-byte provenance invariant silently broke on real-world logs
+  (a Latin-1 logfile, a truncated multi-byte sequence). Offsets are now measured
+  over the file's real bytes, while the stored event text keeps the same U+FFFD
+  substitution as before — the offset points at the original bytes, the stored
+  text is always valid UTF-8. See `docs/INPUT_FORMATS.md`.
+
+  **Upgrade note:** `byte_offset` contributes to an event's derived id, so
+  re-ingesting a file that contains invalid UTF-8 produces different event ids
+  than a previous ingest of that same file. Already-ingested data is unaffected —
+  ids are derived once at ingest and nothing recomputes them. See
+  `docs/DEPLOYMENT.md` § Stability & upgrades.
+
+- **The Parquet event-id identity invariant is enforced under `python -O`**. It
+  was guarded by a bare `assert`, which the optimizer strips — turning a broken
+  identity into silent evidence corruption rather than a loud failure. It is now
+  a descriptive error, and the linter rejects new bare asserts in production
+  code.
+
+- **Case and source deletion no longer block the event loop** ([#155]). The
+  synchronous Qdrant calls in the delete cascade now run on a worker thread,
+  matching the ClickHouse deletes beside them.
+
+- **Job status responses can no longer tear mid-serialization** ([#157]). A
+  worker thread updating a job's progress while a polling request serialized it
+  could change the payload mid-encode. `progress` and `result` are now
+  snapshotted under a per-job lock.
+
+### Changed
+
+- Streaming exports and paginated reads that carry a large filter upload the
+  filter's value list once per read rather than once per batch, and identical
+  lists referenced by two predicates share a single upload.
+
+[#181]: https://github.com/overcuriousity/Vestigo/issues/181
+[#156]: https://github.com/overcuriousity/Vestigo/issues/156
+[#161]: https://github.com/overcuriousity/Vestigo/issues/161
+[#155]: https://github.com/overcuriousity/Vestigo/issues/155
+[#157]: https://github.com/overcuriousity/Vestigo/issues/157
+
 ## [1.8.0] — 2026-07-26
 
 ### Added

@@ -238,6 +238,17 @@ What the 1.x line guarantees, and what it doesn't:
 - The REST API is versioned by the app itself (`/api/health` reports the version);
   breaking API changes are reserved for 2.0.
 
+**Event ids for sources containing invalid UTF-8 changed.** `byte_offset` used to be
+measured over `errors="replace"`-decoded text, which over-counts by two bytes per
+undecodable byte, so every offset after the first bad byte was wrong — and
+`byte_offset` feeds `derive_event_id`. Offsets are now measured over the file's real
+bytes (`docs/INPUT_FORMATS.md`). **Already-ingested data is unaffected**: ids are
+derived once at ingest and nothing recomputes them. The change is only visible if you
+*re-ingest* a file that contains invalid UTF-8 — the new ids won't match the old ones,
+so annotations recorded against the previous ingest of that same file will not carry
+over. Sources are immutable, so the safe procedure is to treat a re-ingest as a new
+source, which is what the model already does.
+
 **Upgrading from a pre-1.0 (TraceSignal) deployment:** the project was renamed for
 1.0 — CLI `tsig` → `vestigo`, env vars `TS_*` → `VESTIGO_*`, and default
 backing-store names are now `vestigo`. Existing data stays where it is: rename your
