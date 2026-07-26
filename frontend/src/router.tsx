@@ -8,6 +8,8 @@ import { RequireAdmin } from "@/components/auth/RequireAdmin";
 import { RequireAuth } from "@/components/auth/RequireAuth";
 import { CasesPage } from "@/pages/CasesPage";
 import { CaseOverviewPage } from "@/pages/CaseOverviewPage";
+import { StoriesPage } from "@/pages/StoriesPage";
+import { StoryEditorPage } from "@/pages/StoryEditorPage";
 import { ExplorerPage } from "@/pages/ExplorerPage";
 import { VisualizePage } from "@/pages/VisualizePage";
 import { LoginPage } from "@/pages/LoginPage";
@@ -29,6 +31,8 @@ export const router = createBrowserRouter(
         <Route element={<AppShell />}>
           <Route index element={<CasesPage />} />
           <Route path="cases/:caseId" element={<CaseOverviewPage />} />
+          <Route path="cases/:caseId/stories" element={<StoriesPage />} />
+          <Route path="cases/:caseId/stories/:storyId" element={<StoryEditorPage />} />
           <Route
             path="cases/:caseId/timelines/:timelineId"
             element={<ExplorerPage />}
