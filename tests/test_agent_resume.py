@@ -388,3 +388,44 @@ async def test_a_checkpointed_snapshot_replays_as_history(monkeypatch):
     assert events[-1]["type"] == "result"
     # The second turn saw the first turn's work, not an empty slate.
     assert seen_history[0] > 1
+
+
+# ---------------------------------------------------------------------------
+# Persistence of the partial-history stamp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_history_partial_at_is_set_and_cleared_independently(store):
+    """`None` already means "no change" for every other field on this method,
+    so clearing the stamp needs its own sentinel — otherwise a turn could
+    never mark itself complete."""
+    from datetime import UTC, datetime
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is None
+
+    stamp = datetime.now(UTC)
+    await store.update_agent_conversation(
+        conversation.id, history=[{"x": 1}], history_partial_at=stamp
+    )
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is not None
+    assert fresh.history == [{"x": 1}]
+
+    # A title-only update must not disturb the stamp.
+    await store.update_agent_conversation(conversation.id, title="renamed")
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is not None
+
+    await store.update_agent_conversation(conversation.id, history_partial_at=None)
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is None

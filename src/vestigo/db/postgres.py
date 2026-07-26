@@ -1238,6 +1238,14 @@ class AgentConversation(Base):
     # creation — later preference edits never mutate an existing chat.
     disabled_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
     history: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Set while `history` holds a mid-turn checkpoint rather than a completed
+    # turn — an errored, stopped or process-killed turn. Cleared only when a
+    # turn completes. Drives the resume note on the next turn; a column rather
+    # than sniffing the blob because a completed turn and an interrupted one
+    # both end in a ModelResponse.
+    history_partial_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -4017,12 +4025,16 @@ class PostgresStore:
         title: str | None = None,
         history: list | None = None,
         disabled_tools: list[str] | None = None,
+        history_partial_at: datetime | None | _Unset = UNSET,
     ) -> None:
         """Update a conversation's title, replayable history, and/or tool set.
 
         ``disabled_tools`` accepts ``[]`` meaningfully (re-enable everything),
         so it is checked against None rather than falsiness — the caller
         clearing the restriction must not be read as "no change".
+        ``history_partial_at`` goes further: ``None`` *is* the clearing value
+        (this turn completed), so it needs the ``UNSET`` sentinel to express
+        "leave it alone".
         """
         values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
         if title is not None:
@@ -4031,6 +4043,8 @@ class PostgresStore:
             values["history"] = history
         if disabled_tools is not None:
             values["disabled_tools"] = disabled_tools
+        if not isinstance(history_partial_at, _Unset):
+            values["history_partial_at"] = history_partial_at
         async with self.session_factory() as session:
             await session.execute(
                 update(AgentConversation)
