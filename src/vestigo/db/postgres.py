@@ -627,6 +627,144 @@ class SavedChart(Base):
         }
 
 
+class Story(Base):
+    """A per-case block document — the investigation report (W7).
+
+    Content lives in ``StoryBlock`` rows; this row is title/metadata only.
+    See docs/STORIES.md.
+    """
+
+    __tablename__ = "stories"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the Story API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "title": self.title,
+            "description": self.description,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class StoryBlock(Base):
+    """One ordered block of a Story.
+
+    ``position`` uses an integer gap strategy (1024, 2048, ...); insert-between
+    takes the midpoint and the story is renumbered when a gap is exhausted.
+    ``version`` is the optimistic-concurrency counter: every update/move
+    increments it, and a stale caller gets a 409 instead of clobbering.
+    ``content`` is validated per ``kind`` at the API boundary
+    (``vestigo.stories.schemas``); the DB stores it opaquely.
+    """
+
+    __tablename__ = "story_blocks"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    story_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the StoryBlock API response."""
+        return {
+            "id": self.id,
+            "story_id": self.story_id,
+            "position": self.position,
+            "kind": self.kind,
+            "content": self.content or {},
+            "origin": self.origin,
+            "version": self.version,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class StoryExport(Base):
+    """An immutable point-in-time export of a Story.
+
+    ``snapshot`` is the server-resolved frozen bundle (see docs/STORIES.md for
+    the ``"v": 1`` format); ``snapshot_hash`` is SHA-256 over its canonical
+    JSON. ``html``/``html_hash`` hold the client-rendered standalone artifact,
+    uploaded exactly once after creation (sealed thereafter). No update path;
+    deletion is admin-only and audit-logged.
+    """
+
+    __tablename__ = "story_exports"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    story_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    html_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, include_snapshot: bool = False) -> dict[str, Any]:
+        """Return a serializable dictionary for the StoryExport API response.
+
+        The snapshot can be large; listings omit it unless asked.
+        """
+        d: dict[str, Any] = {
+            "id": self.id,
+            "story_id": self.story_id,
+            "case_id": self.case_id,
+            "snapshot_hash": self.snapshot_hash,
+            "html_hash": self.html_hash,
+            "has_artifact": self.html is not None,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_snapshot:
+            d["snapshot"] = self.snapshot
+        return d
+
+
 def _windows_config_hash(payload: dict[str, Any]) -> str:
     """SHA-256 over the canonical JSON of a window payload.
 
@@ -2733,6 +2871,85 @@ class PostgresStore:
             if chart is None:
                 return False
             await session.delete(chart)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Stories (W7)
+    # ------------------------------------------------------------------
+
+    async def create_story(
+        self, case_id: str, story_id: str, title: str, description: str | None, user: str
+    ) -> Story:
+        """Create a story within a case."""
+        story = Story(
+            id=story_id,
+            case_id=case_id,
+            title=title,
+            description=description,
+            created_by=user,
+            updated_by=user,
+        )
+        async with self.session_factory() as session:
+            session.add(story)
+            await session.commit()
+            await session.refresh(story)
+            return story
+
+    async def get_story(self, case_id: str, story_id: str) -> Story | None:
+        """Return a story by case and story IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def list_stories(self, case_id: str) -> list[Story]:
+        """Return a case's stories, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id).order_by(Story.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def update_story(
+        self,
+        case_id: str,
+        story_id: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        user: str,
+    ) -> Story | None:
+        """Update story title/description; returns the row or None if missing."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            story = result.scalar_one_or_none()
+            if story is None:
+                return None
+            if title is not None:
+                story.title = title
+            if description is not None:
+                story.description = description
+            story.updated_by = user
+            await session.commit()
+            await session.refresh(story)
+            return story
+
+    async def delete_story(self, case_id: str, story_id: str) -> bool:
+        """Delete a story with its blocks and exports. True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            story = result.scalar_one_or_none()
+            if story is None:
+                return False
+            await session.execute(delete(StoryBlock).where(StoryBlock.story_id == story_id))
+            await session.execute(delete(StoryExport).where(StoryExport.story_id == story_id))
+            await session.delete(story)
             await session.commit()
             return True
 
