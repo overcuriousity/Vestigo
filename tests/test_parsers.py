@@ -252,6 +252,27 @@ def test_csv_byte_offsets_survive_invalid_utf8(tmp_path: Path) -> None:
         assert raw[event.byte_offset : event.byte_offset + len(expected)] == expected
 
 
+def test_jsonl_byte_offsets_are_bytes_not_characters(tmp_path: Path) -> None:
+    """Valid multi-byte UTF-8 must count bytes, not characters.
+
+    The ASCII fast path in ``_raw_bytes_and_text`` returns ``len(line)``, which
+    is only equal to the byte length while the line is ASCII — a line that is
+    valid UTF-8 but not ASCII has to fall through to the encode.
+    """
+    path = tmp_path / "utf8.jsonl"
+    line1 = '{"message":"café ☕"}\n'.encode()
+    line2 = b'{"message":"ascii"}\n'
+    path.write_bytes(line1 + line2)
+    assert len(line1) > len(line1.decode())  # multi-byte, so the counts differ
+
+    config = ParserConfig(name="jsonl", version="0.1.0")
+    parser = JsonlParser("case1", "source1", config, file_hash="hash1", source_name="s.jsonl")
+    events = list(parser.parse(path))
+
+    assert [e.byte_offset for e in events] == [0, len(line1)]
+    assert events[0].message == "café ☕"
+
+
 def test_invalid_utf8_still_yields_clean_text(tmp_path: Path) -> None:
     """Undecodable bytes stay replaced by U+FFFD in the event payload — the
     stored message must never carry lone surrogates into JSON/ClickHouse."""

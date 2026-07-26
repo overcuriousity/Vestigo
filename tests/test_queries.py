@@ -246,6 +246,54 @@ def test_external_table_payload_is_tsv_escaped(service: EventQueryService) -> No
     assert payload.splitlines()[-1] == "a\\tb\\nc\\\\d"
 
 
+def test_external_table_payload_escapes_remaining_control_chars(
+    service: EventQueryService,
+) -> None:
+    """NUL/backspace/form-feed are legal inside a log field value and have
+    their own ClickHouse TSV escapes — emit them rather than trusting the
+    reader to pass the raw byte through."""
+    values = [f"value-{i}" for i in range(EXTERNAL_LIST_THRESHOLD)] + ["a\0b\bc\fd\re"]
+    service.query(EventQuery(case_id="case-1", field_filters={"artifact": values}))
+    payload = service.store.client.external[-1].files[0].data.decode()
+    assert payload.split("\n")[-2] == "a\\0b\\bc\\fd\\re"
+
+
+def test_external_table_payload_keeps_empty_values(service: EventQueryService) -> None:
+    """The empty string is a real filter value (Vestigo's "field is missing"
+    predicate), and TSV reads an empty line as one empty String column — so
+    the row must survive, not be silently dropped."""
+    values = [""] + [f"value-{i}" for i in range(EXTERNAL_LIST_THRESHOLD)]
+    service.query(EventQuery(case_id="case-1", field_filters={"artifact": values}))
+    payload = service.store.client.external[-1].files[0].data.decode()
+    assert payload.split("\n")[0] == ""
+    assert payload.count("\n") == len(values)
+
+
+def test_external_table_payload_dedupes_values(service: EventQueryService) -> None:
+    """An IN test cannot care about a repeated value, but the upload does —
+    annotation lookups resolve to the same event id once per tag."""
+    unique = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(EventQuery(case_id="case-1", event_ids=unique + unique))
+    payload = service.store.client.external[-1].files[0].data.decode()
+    assert payload.splitlines() == unique
+
+
+def test_identical_lists_share_one_external_table(service: EventQueryService) -> None:
+    """Two predicates over the same list upload the payload once."""
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            event_ids=ids,
+            tags_include=TagFilter(tag_values=["x"], postgres_event_ids=ids),
+        )
+    )
+    external = service.store.client.external[-1]
+    assert len(external.files) == 1
+    query, _ = _last_query(service)
+    assert query.count(external.files[0].name) == 2
+
+
 def test_histogram_carries_external_table(service: EventQueryService) -> None:
     ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
     service.histogram(EventQuery(case_id="case-1", event_ids=ids))
@@ -1220,6 +1268,8 @@ class _BatchedFakeClient:
         self.remainder = remainder
         self._select_call = 0
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
+        # Parallel to `queries`: the external_data kwarg each call carried.
+        self.external: list[Any] = []
 
     def _make_rows(self, n: int) -> list[list[Any]]:
         # `_cursor_ts` (last column) must be a real datetime — iter_events
@@ -1238,6 +1288,7 @@ class _BatchedFakeClient:
         **_kwargs: Any,
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
+        self.external.append(_kwargs.get("external_data"))
         if query.strip().startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
         call = self._select_call
@@ -1317,6 +1368,38 @@ def test_iter_events_yields_dicts_with_expected_keys() -> None:
     assert "event_id" in rows[0]
     assert "message" in rows[0]
     assert "source_id" in rows[0]
+
+
+def test_iter_events_reuses_one_external_table_across_batches() -> None:
+    """`iter_events` rebuilds the WHERE clause per batch — the keyset cursor
+    lives inside it — but the membership payloads it references do not change.
+
+    Without a registry shared across those rebuilds, a large export
+    re-serializes and re-uploads the whole id list once per batch: a 50k-id
+    JSONL export would ship ~2 MB fifty times over. The table *name* has to
+    stay stable too, since parameter numbering shifts between rebuilds once
+    the cursor predicate starts binding values.
+    """
+    ids = _many_ids(EXTERNAL_LIST_THRESHOLD + 1)
+    svc = _batched_service(batch_size=2, full_batches=3, remainder=1)
+
+    list(svc.iter_events(EventQuery(case_id="c1", event_ids=ids), batch_size=2))
+
+    externals = [e for e in svc.store.client.external if e is not None]  # type: ignore[union-attr]
+    assert len(externals) > 2, "expected several batches"
+    # One registry, one ExternalData object, one file — reused, not rebuilt.
+    assert len({id(e) for e in externals}) == 1
+    assert len(externals[0].files) == 1
+    names = {e.files[0].name for e in externals}
+    assert len(names) == 1
+    for (sql, _), external in zip(
+        svc.store.client.queries,  # type: ignore[union-attr]
+        svc.store.client.external,  # type: ignore[union-attr]
+        strict=True,
+    ):
+        if "vestigo_ext_" in sql:
+            assert external is not None
+            assert external.files[0].name in sql
 
 
 def test_iter_events_where_clause_is_parameterized() -> None:

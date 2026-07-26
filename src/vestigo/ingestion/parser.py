@@ -34,6 +34,13 @@ def _raw_bytes_and_text(line: str) -> tuple[int, str]:
     payload sees the same U+FFFD substitution as before — lone surrogates
     would blow up JSON encoding and the ClickHouse insert.
     """
+    # This runs once per line of every ingested file, so the common case has
+    # to stay free. `str.isascii()` reads CPython's cached ASCII flag on the
+    # string object — O(1), no scan — and an ASCII line's byte length is its
+    # character count, so the encode/decode round-trip below is skipped
+    # entirely for the overwhelming majority of log lines.
+    if line.isascii():
+        return len(line), line
     raw = line.encode("utf-8", "surrogateescape")
     try:
         raw.decode("utf-8")

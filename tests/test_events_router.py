@@ -19,6 +19,7 @@ from tests.conftest import _fake_user
 from vestigo.api import deps
 from vestigo.api.routers import events
 from vestigo.db.postgres import Case, PostgresStore
+from vestigo.db.queries import QueryRequestTooLargeError
 
 
 @pytest_asyncio.fixture()
@@ -575,6 +576,39 @@ async def test_export_complete_marks_trailer_and_does_not_raise(patched_store, m
     joined = "".join(chunks)
     assert ("complete=true" in joined) or ('"complete": true' in joined)
     assert ("rows=3" in joined) or ('"written": 3' in joined)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["jsonl", "csv"])
+async def test_export_surfaces_too_large_filter_before_streaming(patched_store, monkeypatch, fmt):
+    """A too-large filter must reach the 413 handler, not truncate a 200.
+
+    Once ``StreamingResponse`` flushes headers no exception handler can run, so
+    a ``QueryRequestTooLargeError`` from ``iter_events`` would leave the analyst
+    with a silently short file. The route's pre-flight ``count()`` executes the
+    identical WHERE clause, so the failure surfaces while a status code can
+    still be chosen. This test pins that ordering — moving the count below the
+    response construction would break it.
+    """
+    await _seed_export_timeline(patched_store)
+
+    class _TooLargeService:
+        def count(self, query):
+            raise QueryRequestTooLargeError("the filter is too large")
+
+        def iter_events(self, query, batch_size: int = 1000):
+            raise AssertionError("streaming must not start")
+
+        def query(self, query):
+            raise AssertionError("query() should not be called")
+
+    fake = _TooLargeService()
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format=fmt, filter=events.ExportFilter())
+    with pytest.raises(QueryRequestTooLargeError):
+        await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
 
 
 # ---------------------------------------------------------------------------

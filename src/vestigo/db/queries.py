@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -88,6 +89,16 @@ _logger = logging.getLogger(__name__)
 # The threshold sits far below the failure point on purpose: it only needs to
 # keep the inline path (cheaper for the common handful-of-values filter) away
 # from the cliff.
+#
+# Cost note: external data is per-*request*, not per-session — ClickHouse's
+# HTTP interface has no place to keep a temp table between requests, and the
+# pooled stateless client is a deliberate design choice (`docs/TECH_STACK.md`).
+# So one Explorer page under a large `annotated=` filter uploads the table
+# once per statement it issues (count + key scan + hydrate = 3). That is
+# bounded and acceptable; what is *not* acceptable is an unbounded multiplier,
+# which is why :class:`_ExternalTables` is threaded through the per-batch
+# `_build_where` rebuilds in :py:meth:`EventQueryService.iter_events` instead
+# of re-serializing the payload for every export batch.
 EXTERNAL_LIST_THRESHOLD = 512
 
 
@@ -100,7 +111,24 @@ class QueryRequestTooLargeError(Exception):
     """
 
 
-_TSV_ESCAPES = str.maketrans({"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r"})
+# Mirrors ClickHouse's TSV escape table exactly, so every sequence we emit
+# decodes back to the byte we meant. Tab/newline/backslash are the ones that
+# would actually corrupt the table (column shift, row shift, escape hijack);
+# the rest are escaped for round-trip symmetry — a NUL or form-feed inside a
+# log field value is rare but perfectly legal, and silently relying on the
+# reader to pass it through is the kind of assumption that breaks on a
+# ClickHouse upgrade.
+_TSV_ESCAPES = str.maketrans(
+    {
+        "\\": "\\\\",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\r": "\\r",
+        "\0": "\\0",
+        "\b": "\\b",
+        "\f": "\\f",
+    }
+)
 
 
 def _tsv_payload(values: Sequence[Any]) -> bytes:
@@ -109,9 +137,64 @@ def _tsv_payload(values: Sequence[Any]) -> bytes:
     Membership lists are not always UUIDs — a field-value filter can carry an
     arbitrary log string, and an unescaped tab or newline in one would shift
     the rest of the table by a column or a row.
+
+    Duplicates are dropped (first occurrence wins): the payload feeds an
+    ``IN`` test, where a repeated value is pure upload weight. Annotation
+    lookups routinely resolve to the same event id more than once (one row per
+    tag), so this is not a theoretical saving.
+
+    Lone surrogates cannot reach here — ingestion re-decodes undecodable bytes
+    to U+FFFD (see ``ingestion/parser.py``) — but ``errors="surrogatepass"``
+    is *not* used deliberately: an encode failure here should be loud, not a
+    silently truncated filter.
     """
-    lines = [str(value).translate(_TSV_ESCAPES) for value in values]
+    lines = dict.fromkeys(str(value).translate(_TSV_ESCAPES) for value in values)
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+class _ExternalTables:
+    """Content-addressed registry of the external-data tables one query needs.
+
+    Two jobs, both about not paying for the same bytes twice:
+
+    * **Within a statement** — the same value list can be reachable from more
+      than one predicate (an id set used by both a tag filter and an explicit
+      ``ids=``). Identical payloads collapse onto one table.
+    * **Across statement rebuilds** — :py:meth:`EventQueryService.iter_events`
+      calls ``_build_where`` once per export batch, because the keyset cursor
+      lives in the WHERE clause. Passing one registry through every rebuild
+      keeps the table name *and* the serialized payload stable, so a 50k-id
+      export uploads the TSV once instead of once per 1000-row batch.
+
+    Table names are numbered from this registry's own counter rather than the
+    builder's parameter counter: parameter numbering shifts between rebuilds
+    (the cursor predicate binds extra parameters), which would rename the
+    table mid-export and defeat the cache.
+    """
+
+    def __init__(self) -> None:
+        # Keyed on a digest, not the payload itself — an id list is megabytes
+        # and the bytes are already held by the ExternalFile.
+        self._names_by_key: dict[tuple[str, bytes], str] = {}
+        self._counter = 0
+        self.data: ExternalData | None = None
+
+    def register(self, values: Sequence[Any], ch_type: str) -> str:
+        """Return the SQL table name holding *values*, creating it if new."""
+        payload = _tsv_payload(values)
+        key = (ch_type, hashlib.blake2b(payload, digest_size=16).digest())
+        cached = self._names_by_key.get(key)
+        if cached is not None:
+            return cached
+        name = f"vestigo_ext_{self._counter}"
+        self._counter += 1
+        structure = [f"v {ch_type}"]
+        if self.data is None:
+            self.data = ExternalData(file_name=name, data=payload, fmt="TSV", structure=structure)
+        else:
+            self.data.add_file(file_name=name, data=payload, fmt="TSV", structure=structure)
+        self._names_by_key[key] = name
+        return name
 
 
 class QueryParameters(dict[str, Any]):
@@ -581,9 +664,14 @@ class _ParameterizedQueryBuilder:
         *,
         source_offsets: dict[str, int] | None = None,
         search_blob_ready: bool = False,
+        external_tables: _ExternalTables | None = None,
     ) -> None:
         self.conditions: list[str] = []
         self.parameters: QueryParameters = QueryParameters()
+        # Shared by callers that rebuild the WHERE clause repeatedly for one
+        # logical read (the export keyset loop) so the payload is serialized
+        # and uploaded once. A fresh registry per builder is the default.
+        self._external = external_tables if external_tables is not None else _ExternalTables()
         self._counter = 0
         self._field_mappings = field_mappings
         # Only `time:` tokens read this — they bucket the offset-corrected
@@ -610,18 +698,11 @@ class _ParameterizedQueryBuilder:
 
         The caller embeds the name as ``<expr> IN (SELECT * FROM <name>)``.
         See :data:`EXTERNAL_LIST_THRESHOLD` for why large lists cannot stay
-        inline query parameters.
+        inline query parameters, and :class:`_ExternalTables` for why the
+        registry — not this builder — owns the names and the payloads.
         """
-        name = f"vestigo_ext_{self._param_name()}"
-        payload = _tsv_payload(values)
-        if self.parameters.external is None:
-            self.parameters.external = ExternalData(
-                file_name=name, data=payload, fmt="TSV", structure=[f"v {ch_type}"]
-            )
-        else:
-            self.parameters.external.add_file(
-                file_name=name, data=payload, fmt="TSV", structure=[f"v {ch_type}"]
-            )
+        name = self._external.register(values, ch_type)
+        self.parameters.external = self._external.data
         return name
 
     def _use_external(self, values: Sequence[Any]) -> bool:
@@ -1028,7 +1109,9 @@ class EventQueryService:
                 ) from exc
             raise
 
-    def _build_where(self, query: EventQuery) -> tuple[str, QueryParameters]:
+    def _build_where(
+        self, query: EventQuery, *, external_tables: _ExternalTables | None = None
+    ) -> tuple[str, QueryParameters]:
         """Build the parameterized WHERE clause for *query*.
 
         Returns the clause string and the bound parameters. The parameters
@@ -1037,11 +1120,16 @@ class EventQueryService:
         never to ``store.client.query`` directly. Both are consumed by
         :py:meth:`query` (paginated) and :py:meth:`iter_events` (streaming
         export).
+
+        *external_tables* lets a caller that rebuilds the clause many times
+        for one logical read reuse the already-serialized payloads — see
+        :class:`_ExternalTables`. Leave it unset for a one-shot read.
         """
         builder = _ParameterizedQueryBuilder(
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
             search_blob_ready=self.store.search_blob_ready() if query.q else False,
+            external_tables=external_tables,
         )
         builder.add_param("case_id = :name", query.case_id)
 
@@ -1379,9 +1467,15 @@ class EventQueryService:
         sort_dir = query.order.upper()
         eff = effective_ts_sql(query.source_offsets)
         q = replace(query, after=None, before=None, offset=0)
+        # One registry for the whole export: the clause is rebuilt per batch
+        # (the keyset cursor lives inside it), but the membership payloads it
+        # references do not change, and re-serializing + re-uploading a
+        # multi-megabyte id list once per 1000-row batch is the difference
+        # between one upload and one per batch.
+        external_tables = _ExternalTables()
 
         while True:
-            where, parameters = self._build_where(q)
+            where, parameters = self._build_where(q, external_tables=external_tables)
             result = self._select(
                 f"""
                 SELECT {_EVENT_SELECT_COLUMNS}, {eff} AS _cursor_ts

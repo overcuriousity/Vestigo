@@ -1,9 +1,54 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 103 — backend defect batch B1/B3/B4).
+Last updated: 2026-07-26 (session 104 — PR #186 review remediation).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 104 — 2026-07-26: PR #186 review remediation
+
+**Why.** Review of the B1/B3/B4 batch. No correctness defects, but the external-data
+path had one unbounded cost and several sharp edges worth filing down before the
+mechanism becomes load-bearing across the query layer.
+
+- **Export re-uploaded the whole membership payload once per batch.** `iter_events`
+  rebuilds the WHERE clause per batch (the keyset cursor lives inside it), and each
+  rebuild built a fresh `ExternalData`. A 50k-id JSONL export shipped ~2 MB fifty
+  times. Introduced `_ExternalTables`, a content-addressed per-read registry, and
+  threaded it through `_build_where(…, external_tables=…)` so the export serializes
+  and uploads once. It also collapses identical lists reachable from two predicates
+  (`ids=` + a tag filter over the same set) onto one table, and names tables from its
+  own counter rather than the parameter counter — parameter numbering shifts between
+  rebuilds, which would otherwise rename the table mid-export.
+- **Payloads are deduped.** An `IN` test cannot care about a repeated value; the upload
+  does, and annotation lookups routinely resolve to the same event id once per tag.
+- **TSV escaping completed** to match ClickHouse's table exactly (`\0`, `\b`, `\f`
+  alongside `\\`, `\t`, `\n`, `\r`), so every emitted sequence round-trips rather than
+  relying on the reader to pass a raw control byte through.
+- **Per-request upload cost documented, not hidden.** External data is per-request —
+  ClickHouse's HTTP interface has nowhere to keep a temp table between requests, and
+  the stateless pooled client is deliberate. One Explorer page under a large filter
+  therefore uploads the table once per statement it issues (count + key scan +
+  hydrate). Bounded and accepted; recorded at `EXTERNAL_LIST_THRESHOLD`.
+- **Why the export 413 works is now pinned by a test.** Once `StreamingResponse`
+  flushes headers no exception handler can run, so the route's pre-flight `count()` —
+  which runs the identical WHERE — is what keeps an over-large export filter a clean
+  413 instead of a truncated 200. `test_export_surfaces_too_large_filter_before_streaming`
+  fails if that count is ever moved below the response construction.
+- **Ingestion fast path.** `_raw_bytes_and_text` runs per line of every ingested file
+  and had doubled its Unicode work (encode + validating decode, previously one encode).
+  An `str.isascii()` guard — CPython's cached ASCII flag, O(1) — skips the round-trip
+  for the overwhelming majority of log lines.
+- **`Job._payload_lock` is `init=False`**, so a caller can't supply or share one, and
+  the dead `# noqa: SLF001` (SLF isn't in the ruff select list) is gone.
+- **B3's id change is in the operator docs**, not only here: `DEPLOYMENT.md`
+  §Stability & upgrades now states that already-ingested data is unaffected and that
+  only a *re-ingest* of an invalid-UTF-8 file produces different ids.
+
+New coverage: external-table reuse across export batches, dedup, control-char
+escaping, empty-string values surviving as rows, identical lists sharing one table,
+multi-byte-but-valid UTF-8 offsets (the ASCII fast path's boundary), and the export
+413 ordering.
 
 ## Session 103 — 2026-07-26: backend defect batch (B1, B3, B4)
 

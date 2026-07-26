@@ -39,7 +39,16 @@ class Job:
     # worker-thread-writes / request-thread-serializes race. Held by
     # ``JobStore.update`` around the mutation and by ``to_dict`` around the
     # snapshot; always taken *inside* the store lock, never the other way.
-    _payload_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    #
+    # `init=False`: the lock is an implementation detail of this instance, not
+    # something a caller may supply or share — two Jobs sharing one lock would
+    # serialize unrelated updates, and a caller passing `None` would break
+    # `to_dict` at read time rather than at construction. It also means
+    # `dataclasses.asdict`/`copy.deepcopy` are the only remaining ways to trip
+    # over a non-copyable field, and neither is used on Job.
+    _payload_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serializable representation.
@@ -191,7 +200,7 @@ class JobStore:
                     self._terminal_order.append(job_id)
                     self._evict_locked()
             if progress is not None or result is not None:
-                with job._payload_lock:  # noqa: SLF001 - same-module dataclass
+                with job._payload_lock:
                     if progress is not None:
                         job.progress.update(progress)
                     if result is not None:
