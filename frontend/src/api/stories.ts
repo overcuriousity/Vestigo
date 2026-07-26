@@ -68,8 +68,11 @@ export const storiesApi = {
       { after_block_id: afterBlockId, version },
     ).then((r) => r.block),
 
-  deleteBlock: (caseId: string, storyId: string, blockId: string) =>
-    del<{ deleted: boolean }>(`/cases/${caseId}/stories/${storyId}/blocks/${blockId}`),
+  /** `version` is required: the server refuses a stale delete with 409. */
+  deleteBlock: (caseId: string, storyId: string, blockId: string, version: number) =>
+    del<{ deleted: boolean }>(
+      `/cases/${caseId}/stories/${storyId}/blocks/${blockId}?version=${version}`,
+    ),
 
   createExport: (caseId: string, storyId: string) =>
     post<{ export: StoryExportMeta & { snapshot: StorySnapshot } }>(

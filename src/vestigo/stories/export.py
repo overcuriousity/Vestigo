@@ -26,8 +26,32 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi.concurrency import run_in_threadpool
 
+from vestigo.stories.schemas import canonical_json
+
 if TYPE_CHECKING:
     from vestigo.db.postgres import Story, StoryBlock, User, View
+
+
+class SnapshotTooLargeError(Exception):
+    """The resolved snapshot crossed its byte ceiling mid-resolution.
+
+    Raised by ``resolve_story_snapshot`` as soon as the running total passes
+    the cap, rather than after the whole bundle exists. Checking only at the
+    end bounds what gets *stored* while still materializing an arbitrarily
+    large bundle first — 500 blocks of 1000 frozen rows (or 20000 scatter
+    points) live in memory, plus a second copy as the serialized string,
+    before anything rejects them. The block that crossed the line is named so
+    the analyst knows which embed to shrink.
+    """
+
+    def __init__(self, resolved_bytes: int, cap: int, block_id: str) -> None:
+        super().__init__(
+            f"resolved snapshot exceeds {cap} bytes at block {block_id!r} "
+            f"({resolved_bytes} bytes so far)"
+        )
+        self.resolved_bytes = resolved_bytes
+        self.cap = cap
+        self.block_id = block_id
 
 
 def _json_safe(value: Any) -> Any:
@@ -303,10 +327,17 @@ async def resolve_story_snapshot(
     run_chart: Any = None,
     resolve_scope: Any = None,
     now: Callable[[], datetime] | None = None,
+    max_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Resolve every block of *story* into the frozen ``"v": 1`` snapshot.
 
     Never raises for a bad block — failures freeze as ``resolution.error``.
+
+    ``max_bytes`` caps the resolved bundle. It is enforced *during*
+    resolution, block by block, so a story that would blow past it stops
+    costing memory and ClickHouse queries at the point it crosses the line
+    rather than after the whole thing is built (``SnapshotTooLargeError``).
+    ``None`` or ``0`` disables the ceiling.
     """
     from vestigo.agent.tools import AgentScope, _build_query
 
@@ -459,6 +490,10 @@ async def resolve_story_snapshot(
     }
 
     frozen_blocks: list[dict[str, Any]] = []
+    # Running size of the blocks resolved so far. Each block is coerced and
+    # measured as it lands, because the point of the ceiling is to stop the
+    # work, not just to refuse the result.
+    resolved_bytes = 0
     for block in blocks:
         resolution: dict[str, Any] = {"executed_at": now().isoformat(), "error": None}
         ref = dict(block.content or {})
@@ -474,7 +509,10 @@ async def resolve_story_snapshot(
         except Exception as exc:  # noqa: BLE001 — every failure freezes as an error block
             data = None
             resolution["error"] = str(exc)
-        frozen_blocks.append(
+        # Coerce per block rather than once over the finished bundle: hash and
+        # storage both happen over JSON, and measuring a block means
+        # serializing it, which only works on JSON-native types.
+        frozen = _json_safe(
             {
                 "id": block.id,
                 "kind": block.kind,
@@ -484,19 +522,22 @@ async def resolve_story_snapshot(
                 "resolution": resolution,
             }
         )
+        if max_bytes:
+            resolved_bytes += len(canonical_json(frozen).encode("utf-8"))
+            if resolved_bytes > max_bytes:
+                raise SnapshotTooLargeError(resolved_bytes, max_bytes, block.id)
+        frozen_blocks.append(frozen)
 
-    # Hash and storage both happen over JSON, so normalize once, at the end,
-    # rather than trusting every query path to hand back JSON-native types.
-    return _json_safe(
-        {
-            "v": 1,
-            "story": {
+    return {
+        "v": 1,
+        "story": _json_safe(
+            {
                 "id": story.id,
                 "title": story.title,
                 "case_id": story.case_id,
                 "exported_at": now().isoformat(),
                 "exported_by": user.username,
-            },
-            "blocks": frozen_blocks,
-        }
-    )
+            }
+        ),
+        "blocks": frozen_blocks,
+    }

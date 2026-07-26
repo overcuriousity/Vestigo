@@ -154,7 +154,7 @@ DELETE /api/cases/{case}/stories/{story}
 POST   .../stories/{story}/blocks                      {kind, content, after_block_id?}
 PATCH  .../stories/{story}/blocks/{block}              {content, version}   409 on stale
 POST   .../stories/{story}/blocks/{block}/move         {after_block_id, version}
-DELETE .../stories/{story}/blocks/{block}
+DELETE .../stories/{story}/blocks/{block}?version=N                  409 on stale
 
 POST   .../stories/{story}/exports                     → resolves + hashes (server)
 POST   .../stories/{story}/exports/{export}/artifact   {html}   409 once sealed
@@ -166,6 +166,13 @@ DELETE .../stories/{story}/exports/{export}            admin only
 
 `after_block_id: null` appends on create and moves to the top on move.
 
+Every block mutation carries the optimistic `version`, **delete included** — it
+rides as a query parameter there because DELETE bodies are not reliably carried
+end to end. Deleting a block a collaborator has meanwhile rewritten is the one
+loss the version guard cannot undo afterwards, so it is not the mutation that
+skips the check; the editor refetches on the 409 and lets the analyst decide
+again.
+
 `PATCH` touches only the fields present in the body, so `{"description": null}`
 clears the description while `{"title": "x"}` leaves it alone; a supplied title
 must be non-blank, the same rule `POST` applies. Mutating routes additionally
@@ -174,10 +181,23 @@ depend on `require_password_current`, like the `cases`/`events`/`viz` writes.
 **Limits** (all `VESTIGO_`-prefixed settings, `core/config.py`):
 `STORY_EXPORT_MAX_BLOCKS` (500) bounds how much querying one export request can
 trigger — resolution is synchronous; `STORY_EXPORT_MAX_SNAPSHOT_BYTES` (64 MiB)
-is checked before anything is persisted; `STORY_MAX_ARTIFACT_BYTES` (20 MiB) is
-applied to the *arriving stream* (the seal route reads the raw request rather
-than a parsed body model, so an oversized upload is abandoned instead of
-buffered and then rejected).
+is enforced *during* resolution, block by block, so a story that would blow past
+it stops costing memory and ClickHouse queries at the block that crosses the
+line (the 413 names that block, which is what tells the analyst which embed to
+shrink) — measuring only the finished bundle would bound what gets stored while
+still materializing an arbitrarily large one first; `STORY_MAX_ARTIFACT_BYTES`
+(20 MiB) is applied to the *arriving stream* (the seal route reads the raw
+request rather than a parsed body model, so an oversized upload is abandoned
+instead of buffered and then rejected). `0` disables the two byte ceilings,
+matching the other `VESTIGO_MAX_*_BYTES` settings.
+
+**The artifact download is hardened against its own origin.** The HTML is
+authored entirely by the client — the seal route only checks that it embeds the
+export's `snapshot_hash` — and is served back from the app's origin, where the
+session cookie lives. `Content-Disposition: attachment` is what stops a browser
+rendering analyst-supplied markup there; `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox` ride along so that defense is not one header
+deep. Every UI path treats the response as a download, so nothing is lost.
 
 **The editor needs no story-specific data endpoints.** Embed blocks hold refs;
 the frontend resolves them through the existing events/viz APIs, so an embedded
@@ -186,7 +206,16 @@ view is the same query the Explorer runs and cannot drift from it.
 **Audit actions:** `story.create`, `story.delete` (with the cascaded exports'
 hashes in `detail`), `story.export`, `story.export_delete` (with the deleted
 export's hashes), plus the agent's `agent.story_block_confirm` /
-`agent.story_block_reject`.
+`agent.story_block_reject`. `case.delete` also carries the hashes of every story
+export the case cascade destroyed.
+
+**Deleting sealed exports is admin-only at every level.** A single export is
+admin-only because it is an immutable attestation; a story carrying any is
+admin-only for the same reason, since the story cascade takes them too; and so
+is a *case* carrying any (`DELETE /api/cases/{case}`, otherwise
+`require_case_manage`). Each level is a way around the one below it, so the gate
+has to sit on all three. The hashes go into the audit record in every case —
+that log is the only place an attestation survives its row.
 
 ## Export semantics
 

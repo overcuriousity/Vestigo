@@ -24,7 +24,7 @@ from vestigo.api.deps import (
 )
 from vestigo.core.config import get_settings
 from vestigo.db.postgres import UNSET, Case, StaleBlockError, StoryBlock, User
-from vestigo.stories.export import resolve_story_snapshot
+from vestigo.stories.export import SnapshotTooLargeError, resolve_story_snapshot
 from vestigo.stories.refs import validate_block_scope
 from vestigo.stories.schemas import canonical_hash, canonical_json, validate_block_content
 
@@ -267,13 +267,27 @@ async def move_block(
 async def delete_block(
     story_id: str,
     block_id: str,
+    version: int,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a block."""
+    """Delete a block under the same optimistic concurrency as an edit (409 when stale).
+
+    ``version`` rides as a query parameter because DELETE bodies are not
+    reliably carried end to end. It is required, not optional: deleting a
+    block a collaborator has meanwhile rewritten would destroy their edit
+    silently, which is exactly what the version guard on update and move
+    exists to prevent.
+    """
     await _get_story_or_404(case.id, story_id)
     await _get_block_or_404(story_id, block_id)
-    await get_store().delete_story_block(block_id)
+    try:
+        await get_store().delete_story_block(block_id, expected_version=version)
+    except StaleBlockError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "block changed", "block": exc.current.to_dict()},
+        ) from exc
     return {"deleted": True}
 
 
@@ -322,8 +336,11 @@ async def create_export(
     Resolution runs synchronously inside the request and issues one or more
     ClickHouse queries per embed block, so both the block count and the
     resulting snapshot are capped (``VESTIGO_STORY_EXPORT_MAX_BLOCKS`` /
-    ``VESTIGO_STORY_EXPORT_MAX_SNAPSHOT_BYTES``). The size check happens
-    before anything is persisted.
+    ``VESTIGO_STORY_EXPORT_MAX_SNAPSHOT_BYTES``). The size ceiling is enforced
+    *during* resolution, so a story that would blow past it stops costing
+    memory and queries at the block that crosses the line — checking only the
+    finished bundle would bound what gets stored while still materializing an
+    arbitrarily large one first.
     """
     story = await _get_story_or_404(case.id, story_id)
     settings = get_settings()
@@ -337,15 +354,17 @@ async def create_export(
                 f"{settings.story_export_max_blocks}"
             ),
         )
-    snapshot = await resolve_story_snapshot(story, blocks, user=user)
-    serialized = canonical_json(snapshot)
-    snapshot_bytes = len(serialized.encode("utf-8"))
     cap = settings.story_export_max_snapshot_bytes
-    if cap and snapshot_bytes > cap:
+    try:
+        snapshot = await resolve_story_snapshot(story, blocks, user=user, max_bytes=cap)
+    except SnapshotTooLargeError as exc:
         raise HTTPException(
             status_code=413,
-            detail=f"resolved snapshot is {snapshot_bytes} bytes; the cap is {cap}",
-        )
+            detail=(
+                f"resolved snapshot exceeds the {exc.cap}-byte cap at block "
+                f"{exc.block_id}; shrink or split the story"
+            ),
+        ) from exc
     export = await store.create_story_export(
         uuid.uuid4().hex,
         story.id,
@@ -438,7 +457,17 @@ async def download_export_snapshot(
 async def download_export_artifact(
     story_id: str, export_id: str, case: Case = Depends(require_case_read)
 ) -> Response:
-    """Download the sealed standalone HTML artifact."""
+    """Download the sealed standalone HTML artifact.
+
+    The artifact is authored entirely by the client — the seal endpoint only
+    checks that it embeds the export's ``snapshot_hash`` — and it is served
+    back from the app's own origin, where the session cookie lives. Every UI
+    path treats this as a download, so ``Content-Disposition: attachment`` is
+    what stops a browser rendering analyst-supplied markup in that origin.
+    ``nosniff`` and a ``sandbox`` CSP are the belt to that suspenders: the
+    defense should not be one header deep, and nothing here needs a document
+    that can run script or reach the network.
+    """
     export = await _get_export_or_404(case.id, story_id, export_id)
     if export.html is None:
         raise HTTPException(status_code=404, detail="export has no artifact yet")
@@ -446,7 +475,9 @@ async def download_export_artifact(
         content=export.html,
         media_type="text/html; charset=utf-8",
         headers={
-            "Content-Disposition": (f'attachment; filename="story-{story_id}-{export_id}.html"')
+            "Content-Disposition": (f'attachment; filename="story-{story_id}-{export_id}.html"'),
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox",
         },
     )
 

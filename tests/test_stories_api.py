@@ -121,7 +121,9 @@ def test_block_move_and_order(client, admin_bootstrap, store):
 
     # Block ids are validated against the story in the path.
     other = _create_story(client, case_id, "Other")
-    cross = client.delete(f"/api/cases/{case_id}/stories/{other['id']}/blocks/{ids[0]}")
+    cross = client.delete(
+        f"/api/cases/{case_id}/stories/{other['id']}/blocks/{ids[0]}", params={"version": 1}
+    )
     assert cross.status_code == 404
 
 
@@ -131,8 +133,41 @@ def test_block_delete(client, admin_bootstrap, store):
     story = _create_story(client, case_id)
     base = f"/api/cases/{case_id}/stories/{story['id']}/blocks"
     block = client.post(base, json={"kind": "markdown", "content": {"text": "x"}}).json()["block"]
-    assert client.delete(f"{base}/{block['id']}").status_code == 200
-    assert client.delete(f"{base}/{block['id']}").status_code == 404
+    url = f"{base}/{block['id']}"
+    assert client.delete(url, params={"version": block["version"]}).status_code == 200
+    assert client.delete(url, params={"version": block["version"]}).status_code == 404
+
+
+def test_block_delete_rejects_a_stale_version(client, admin_bootstrap, store):
+    """Deleting a block a collaborator has since edited is a 409, not a silent loss.
+
+    Delete is the one block mutation that cannot be undone by reading the
+    winner back, so it gets the same optimistic guard as update and move.
+    """
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}/blocks"
+    block = client.post(base, json={"kind": "markdown", "content": {"text": "x"}}).json()["block"]
+
+    # A collaborator rewrites it; our version is now behind by one.
+    edited = client.patch(
+        f"{base}/{block['id']}",
+        json={"content": {"text": "their careful paragraph"}, "version": block["version"]},
+    )
+    assert edited.status_code == 200, edited.text
+
+    stale = client.delete(f"{base}/{block['id']}", params={"version": block["version"]})
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["block"]["content"]["text"] == "their careful paragraph"
+    # The block survived the stale delete.
+    blocks = client.get(f"/api/cases/{case_id}/stories/{story['id']}").json()["blocks"]
+    assert [b["id"] for b in blocks] == [block["id"]]
+
+    fresh = client.delete(
+        f"{base}/{block['id']}", params={"version": edited.json()["block"]["version"]}
+    )
+    assert fresh.status_code == 200
 
 
 def test_rbac_non_member_denied(client, admin_bootstrap, store):
@@ -338,6 +373,68 @@ def test_story_delete_with_exports_is_admin_only(client, admin_bootstrap, store,
     assert hashes == [export["snapshot_hash"]]
 
 
+def test_case_delete_with_exports_is_admin_only(client, admin_bootstrap, store, monkeypatch):
+    """The case cascade is the other way around the admin-only export gate.
+
+    Deleting a story that carries sealed exports needs an administrator; the
+    case cascade takes those same rows, so without the same gate a case
+    manager could destroy the attestations by deleting one level up. The
+    hashes go into the audit record, which is the only place they survive.
+    """
+    from vestigo.api import deps
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    export = client.post(f"{base}/exports").json()["export"]
+
+    client.post("/api/admin/users", json={"username": "manager", "password": "abcdefgh12"})
+
+    async def _manage(user, case):
+        return deps.AccessLevel.MANAGE
+
+    real_resolve = deps.resolve_case_access
+    monkeypatch.setattr(deps, "resolve_case_access", _manage)
+    login(client, "manager", "abcdefgh12")
+    resp = client.delete(f"/api/cases/{case_id}")
+    assert resp.status_code == 403, resp.text
+    assert "administrator" in resp.json()["detail"]
+
+    monkeypatch.setattr(deps, "resolve_case_access", real_resolve)
+    login(client, admin_bootstrap["username"], "rotated-pass-456")
+    # The case survived the refusal intact.
+    assert client.get(f"{base}/exports").json()["exports"][0]["id"] == export["id"]
+    assert client.delete(f"/api/cases/{case_id}").status_code == 200
+
+    rows = client.get("/api/admin/audit", params={"case_id": case_id}).json()["audit"]
+    deletes = [r for r in rows if r["action"] == "case.delete"]
+    assert deletes, rows
+    assert [e["snapshot_hash"] for e in deletes[0]["detail"]["story_exports"]] == [
+        export["snapshot_hash"]
+    ]
+
+
+def test_case_delete_without_exports_needs_no_admin(client, admin_bootstrap, store, monkeypatch):
+    """The gate is about attestations, not about cases — an ordinary case still deletes."""
+    from vestigo.api import deps
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    _create_story(client, case_id)
+
+    client.post("/api/admin/users", json={"username": "manager2", "password": "abcdefgh12"})
+
+    async def _manage(user, case):
+        return deps.AccessLevel.MANAGE
+
+    real_resolve = deps.resolve_case_access
+    monkeypatch.setattr(deps, "resolve_case_access", _manage)
+    login(client, "manager2", "abcdefgh12")
+    assert client.delete(f"/api/cases/{case_id}").status_code == 200
+    monkeypatch.setattr(deps, "resolve_case_access", real_resolve)
+
+
 def test_markdown_block_size_is_bounded(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     case_id = _setup_case(client)
@@ -418,6 +515,162 @@ def test_export_flow(client, admin_bootstrap, store):
 
     rows = client.get("/api/admin/audit", params={"case_id": case_id}).json()["audit"]
     assert "story.export" in [r["action"] for r in rows]
+
+
+def _export_with_one_block(client, case_id: str) -> tuple[str, dict]:
+    """Create a one-block story and freeze it; returns (base_url, export)."""
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    client.post(f"{base}/blocks", json={"kind": "markdown", "content": {"text": "# frozen"}})
+    resp = client.post(f"{base}/exports")
+    assert resp.status_code == 200, resp.text
+    return base, resp.json()["export"]
+
+
+def test_artifact_upload_rejects_a_declared_oversize_body(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """A Content-Length over the cap is refused before the body is read."""
+    from vestigo.core.config import get_settings
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    base, export = _export_with_one_block(client, case_id)
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "story_max_artifact_bytes", 256)
+    body = {"html": f"<p>{export['snapshot_hash']}{'x' * 512}</p>"}
+    resp = client.post(f"{base}/exports/{export['id']}/artifact", json=body)
+    assert resp.status_code == 413, resp.text
+    # Nothing was sealed, so the presentation half can still be retried.
+    assert client.get(f"{base}/exports").json()["exports"][0]["has_artifact"] is False
+
+
+def test_artifact_upload_counts_a_chunked_stream(client, admin_bootstrap, store, monkeypatch):
+    """A chunked upload declares no length, so the arriving stream is counted.
+
+    This is the path that actually protects the process: without it an
+    unbounded body is buffered in full and only the decoded string is
+    checked. Sent as a generator so httpx uses Transfer-Encoding: chunked
+    and omits Content-Length.
+    """
+    from vestigo.core.config import get_settings
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    base, export = _export_with_one_block(client, case_id)
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "story_max_artifact_bytes", 256)
+
+    payload = b'{"html": "' + b"x" * 4096 + b'"}'
+
+    def _chunks():
+        for i in range(0, len(payload), 64):
+            yield payload[i : i + 64]
+
+    resp = client.post(
+        f"{base}/exports/{export['id']}/artifact",
+        content=_chunks(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert "content-length" not in {k.lower() for k in resp.request.headers}
+    assert resp.status_code == 413, resp.text
+
+
+def test_artifact_upload_cap_of_zero_disables_the_limit(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """``0`` disables the ceiling, matching the other VESTIGO_MAX_*_BYTES settings."""
+    from vestigo.core.config import get_settings
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    base, export = _export_with_one_block(client, case_id)
+
+    monkeypatch.setattr(get_settings(), "story_max_artifact_bytes", 0)
+    html = f"<p>{export['snapshot_hash']}{'x' * 4096}</p>"
+    resp = client.post(f"{base}/exports/{export['id']}/artifact", json={"html": html})
+    assert resp.status_code == 200, resp.text
+
+
+def test_export_refused_over_the_block_cap(client, admin_bootstrap, store, monkeypatch):
+    """The block cap bounds how much querying one export request can trigger."""
+    from vestigo.core.config import get_settings
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    for i in range(3):
+        client.post(f"{base}/blocks", json={"kind": "markdown", "content": {"text": f"p{i}"}})
+
+    monkeypatch.setattr(get_settings(), "story_export_max_blocks", 2)
+    resp = client.post(f"{base}/exports")
+    assert resp.status_code == 413, resp.text
+    assert "3 blocks" in resp.json()["detail"]
+    assert client.get(f"{base}/exports").json()["exports"] == []
+
+
+def test_export_refused_over_the_snapshot_byte_cap(client, admin_bootstrap, store, monkeypatch):
+    """The byte ceiling stops resolution at the block that crosses it.
+
+    The 413 names that block, which is what tells the analyst which embed to
+    shrink — and is only possible because the check runs during resolution
+    rather than over the finished bundle.
+    """
+    from vestigo.core.config import get_settings
+    from vestigo.stories.schemas import canonical_json
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    first = client.post(
+        f"{base}/blocks", json={"kind": "markdown", "content": {"text": "a" * 400}}
+    ).json()["block"]
+
+    # Calibrate against a real one-block snapshot rather than a guessed
+    # number: the per-block cost is an implementation detail (a markdown
+    # block's text is carried in both `ref` and `data`) and hardcoding it
+    # would make this test fail on unrelated changes to the bundle shape.
+    sized = client.post(f"{base}/exports").json()["export"]
+    one_block = len(canonical_json(sized["snapshot"]).encode("utf-8"))
+
+    second = client.post(
+        f"{base}/blocks", json={"kind": "markdown", "content": {"text": "b" * 400}}
+    ).json()["block"]
+
+    # Wide enough for the first block, not for both.
+    monkeypatch.setattr(get_settings(), "story_export_max_snapshot_bytes", one_block + 50)
+    resp = client.post(f"{base}/exports")
+    assert resp.status_code == 413, resp.text
+    detail = resp.json()["detail"]
+    assert second["id"] in detail and first["id"] not in detail
+    # Only the calibration export exists; the refused one persisted nothing.
+    assert [e["id"] for e in client.get(f"{base}/exports").json()["exports"]] == [sized["id"]]
+
+
+def test_artifact_download_is_not_renderable_in_the_app_origin(client, admin_bootstrap, store):
+    """The artifact is client-authored HTML served from the app's own origin.
+
+    Content-Disposition keeps a browser from rendering it there; nosniff and
+    a sandbox CSP mean that defense is not one header deep.
+    """
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    base, export = _export_with_one_block(client, case_id)
+    html = f"<p>{export['snapshot_hash']}</p>"
+    assert (
+        client.post(f"{base}/exports/{export['id']}/artifact", json={"html": html}).status_code
+        == 200
+    )
+
+    art = client.get(f"{base}/exports/{export['id']}/artifact")
+    assert art.status_code == 200
+    assert art.headers["Content-Disposition"].startswith("attachment;")
+    assert art.headers["X-Content-Type-Options"] == "nosniff"
+    assert art.headers["Content-Security-Policy"] == "sandbox"
 
 
 def test_export_artifact_missing_404(client, admin_bootstrap, store):

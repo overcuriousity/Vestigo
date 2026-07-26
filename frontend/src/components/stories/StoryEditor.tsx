@@ -96,9 +96,23 @@ export function StoryEditor({ caseId, storyId }: Props) {
   });
 
   const deleteBlock = useMutation({
-    mutationFn: (blockId: string) => storiesApi.deleteBlock(caseId, storyId, blockId),
+    mutationFn: (vars: { blockId: string; version: number }) =>
+      storiesApi.deleteBlock(caseId, storyId, vars.blockId, vars.version),
     onSuccess: invalidate,
-    onError: (err) => toast.error("Could not delete the block", (err as Error).message),
+    onError: (err) => {
+      // A 409 means the block was edited between this render and the click.
+      // Refetching is the resolution: the user sees what changed and can
+      // decide again, rather than being told the delete "failed".
+      if (err instanceof ApiError && err.status === 409) {
+        invalidate();
+        toast.info(
+          "A collaborator edited that block first",
+          "Reloaded — delete it again if you still want it gone.",
+        );
+        return;
+      }
+      toast.error("Could not delete the block", (err as Error).message);
+    },
   });
 
   const moveBlock = useMutation({
@@ -193,7 +207,7 @@ export function StoryEditor({ caseId, storyId }: Props) {
         <SortableContext items={blocks.map((b) => b.id)} strategy={verticalListSortingStrategy}>
           {blocks.map((block) => (
             <div key={block.id} className="space-y-2">
-              <SortableBlock block={block} draggable={!editingIds.has(block.id)} onDelete={() => deleteBlock.mutate(block.id)}>
+              <SortableBlock block={block} draggable={!editingIds.has(block.id)} onDelete={() => deleteBlock.mutate({ blockId: block.id, version: block.version })}>
                 {block.kind === "markdown" ? (
                   <MarkdownBlock
                     block={block}

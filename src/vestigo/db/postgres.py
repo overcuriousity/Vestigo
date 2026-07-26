@@ -3406,14 +3406,29 @@ class PostgresStore:
                 await session.refresh(block)
             return block
 
-    async def delete_story_block(self, block_id: str) -> bool:
-        """Delete a block row. Returns True if it existed."""
+    async def delete_story_block(self, block_id: str, expected_version: int | None = None) -> bool:
+        """Delete a block row. Returns True if it existed.
+
+        With ``expected_version``, the delete is guarded the same way an
+        update or a move is: a compare-and-swap in the DELETE's WHERE clause,
+        raising StaleBlockError when the row moved under the caller. Deleting
+        a block a collaborator has meanwhile rewritten destroys their edit
+        with no conflict to resolve, which is the one outcome the optimistic
+        ``version`` exists to prevent — so it must not be the one mutation
+        that skips the check.
+        """
         async with self.session_factory() as session:
-            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
-            block = result.scalar_one_or_none()
-            if block is None:
-                return False
-            await session.delete(block)
+            stmt = delete(StoryBlock).where(StoryBlock.id == block_id)
+            if expected_version is not None:
+                stmt = stmt.where(StoryBlock.version == expected_version)
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return False
+                session.expunge(current)
+                raise StaleBlockError(current)
             await session.commit()
             return True
 
@@ -3460,6 +3475,32 @@ class PostgresStore:
                 .order_by(StoryExport.created_at.desc())
             )
             return list(result.scalars().all())
+
+    async def list_case_export_attestations(self, case_id: str) -> list[dict[str, Any]]:
+        """Return every sealed export in a case as ``id``/``story_id``/hashes.
+
+        Deleting a case cascades its exports away. The hashes *are* the
+        attestation, so the caller has to be able to put them in an audit
+        record that outlives the rows — and to decide whether a cascade that
+        destroys them needs a stronger gate than an ordinary case delete.
+        Deliberately not returning ORM rows: the snapshot column is large and
+        nothing on this path reads it.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    StoryExport.id,
+                    StoryExport.story_id,
+                    StoryExport.snapshot_hash,
+                    StoryExport.html_hash,
+                )
+                .where(StoryExport.case_id == case_id)
+                .order_by(StoryExport.created_at.asc())
+            )
+            return [
+                {"id": r[0], "story_id": r[1], "snapshot_hash": r[2], "html_hash": r[3]}
+                for r in result.all()
+            ]
 
     async def seal_story_export_artifact(
         self, export_id: str, html: str, html_hash: str

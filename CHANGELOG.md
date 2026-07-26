@@ -41,7 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `version`; a stale write returns 409 with the winning row and the editor keeps
   the local draft, offering load-theirs or overwrite. Other analysts' changes
   arrive by polling. No CRDT and no WebSockets — the same call the streaming
-  milestone already made for the live Explorer.
+  milestone already made for the live Explorer. Block **delete** carries the
+  same guard (`?version=N`, 409 when stale): deleting a block a collaborator
+  has meanwhile rewritten is the one loss the version cannot undo afterwards,
+  so it is not the mutation that skips the check.
 
   **Agent parity from day one.** The phase spec had deferred agent-authored
   stories; that deferral was rescinded during the design round, on the standing
@@ -64,6 +67,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ChartMarks` client-side — so a chart is validated and drawn identically in
   the Visualize page, an agent proposal card, a story block and an exported
   report. No behavior change to `propose_chart`.
+- Deleting a **case** that carries sealed story exports now requires an
+  administrator, and the destroyed exports' hashes go into the `case.delete`
+  audit record. Deleting a single export, or a story carrying any, was already
+  admin-only because an export is an immutable attestation; the case cascade
+  takes the same rows, so without the same gate it was the way around both.
+
+### Security
+
+- The story-export HTML artifact is authored entirely by the client and served
+  back from the app's own origin. `Content-Disposition: attachment` already kept
+  a browser from rendering it there; the download now also sends
+  `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so
+  that defense is not one header deep. Every UI path treats the response as a
+  download, so nothing changes for users.
+- `VESTIGO_STORY_EXPORT_MAX_SNAPSHOT_BYTES` is now enforced *during* export
+  resolution rather than over the finished bundle. Measuring only at the end
+  bounded what got stored while still materializing an arbitrarily large bundle
+  first — the worst legal case under the default caps held hundreds of thousands
+  of frozen rows in memory, plus a second copy as the serialized string, before
+  anything rejected them. Resolution now stops at the block that crosses the
+  ceiling, and the 413 names it.
 
 ## [1.7.0] — 2026-07-25
 

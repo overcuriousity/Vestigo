@@ -195,6 +195,23 @@ async def test_delete_block(store):
     assert await store.delete_story_block("b1") is False
 
 
+async def test_delete_block_honors_the_expected_version(store):
+    """A guarded delete is a compare-and-swap, like update and move."""
+    story = await _story(store)
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "a"}, user="alice")
+    await store.update_story_block("b1", {"text": "b"}, expected_version=1, user="bob")
+
+    with pytest.raises(StaleBlockError) as excinfo:
+        await store.delete_story_block("b1", expected_version=1)
+    assert excinfo.value.current.content == {"text": "b"}
+    # The stale delete left the row alone.
+    assert [b.id for b in await store.list_story_blocks(story.id)] == ["b1"]
+
+    assert await store.delete_story_block("b1", expected_version=2) is True
+    # A missing row is reported as False, not as a stale version.
+    assert await store.delete_story_block("b1", expected_version=2) is False
+
+
 async def test_story_crud_roundtrip(store):
     await store.init_schema()
     case = await store.create_case("c1", "Case One")
