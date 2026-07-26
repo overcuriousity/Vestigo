@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-07-26
+
+### Added
+
+- **Stories** — a per-case block document where the investigation's narrative
+  and its evidence live together, so the report assembles itself while the work
+  happens instead of being written afterwards (roadmap Phase 3 Step 3 / W7;
+  design in `docs/superpowers/specs/2026-07-26-w7-stories-design.md`, reference
+  in `docs/STORIES.md`). A story is an ordered list of blocks —
+  `markdown | view_ref | chart_ref | event_ref` — and embeds stay **live** while
+  an analyst writes, so the document tracks the data as ingestion and detection
+  progress. "Add to story" buttons on the Explorer filter rail, the saved-chart
+  rail, event detail and agent finding cards push evidence in without leaving
+  the analysis surface; a push carrying live filter state saves a View first, so
+  an embed always references a persisted object.
+
+  **Export freezes a point-in-time snapshot.** `POST .../exports` resolves every
+  block server-side — view queries through the same path the Explorer uses,
+  charts through the shared `execute_chart_spec` — and stores the bundle with a
+  SHA-256 over its canonical JSON. That snapshot is the authoritative record;
+  the browser then renders it to a standalone HTML document (styles inlined, no
+  network access at all) and uploads it once. Exports are immutable: the
+  artifact seals exactly once and deletion is admin-only. Per-block resolution
+  is individually wrapped, so a view deleted before the export freezes as a
+  visible `resolution.error` rather than vanishing, and one bad block never
+  fails an export. Truncation is always stated — a report showing 200 of 14203
+  rows says which it is.
+
+  **Collaborative at block granularity.** Every block carries an optimistic
+  `version`; a stale write returns 409 with the winning row and the editor keeps
+  the local draft, offering load-theirs or overwrite. Other analysts' changes
+  arrive by polling. No CRDT and no WebSockets — the same call the streaming
+  milestone already made for the live Explorer.
+
+  **Agent parity from day one.** The phase spec had deferred agent-authored
+  stories; that deferral was rescinded during the design round, on the standing
+  principle that the agent can do what an analyst can do. `list_stories` and
+  `read_story` are read tools (also on the external `/mcp` endpoint), and
+  `propose_story_block` drafts a block through the existing propose→confirm
+  machinery — the analyst's confirm is the write, and the block lands with
+  `origin: agent`. A chart may be proposed with an inline spec, which is saved
+  as a chart and embedded in one step. Block edit/move/delete and export stay
+  analyst-only: parity covers analytical contribution, not document arrangement
+  or the attestation act.
+
+### Changed
+
+- `AgentProposal` gained `kind`/`payload` (migration `0017`) so annotation and
+  story-block proposals share one decide path and its 409 idempotency backbone;
+  pre-existing rows read as `kind="annotation"`.
+- Chart execution and chart rendering each moved behind one shared seam —
+  `agent/chart_exec.py::execute_chart_spec` server-side, `viz/ChartCanvas`'s
+  `ChartMarks` client-side — so a chart is validated and drawn identically in
+  the Visualize page, an agent proposal card, a story block and an exported
+  report. No behavior change to `propose_chart`.
+
 ## [1.7.0] — 2026-07-25
 
 ### Added
