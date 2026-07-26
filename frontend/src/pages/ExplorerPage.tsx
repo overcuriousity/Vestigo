@@ -69,8 +69,8 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import type { AnomalyMarker, Disposition, Event, EventFilters, EventPage, Annotation } from "@/api/types";
 import {
   applyFieldFilter,
-  dropMode,
   mapFieldTokenToFilterKey,
+  removeFilterEntry,
 } from "@/lib/fieldFilters";
 
 const PAGE_SIZE = 100;
@@ -245,69 +245,7 @@ export function ExplorerPage() {
 
   const removeFilter = useCallback(
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
-      const f = { ...filters };
-      if (key === "filters" && fieldKey) {
-        if (value !== undefined) {
-          const remaining = (f.filters?.[fieldKey] ?? []).filter((v) => v !== value);
-          if (remaining.length === 0) {
-            const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
-            f.filters = rest;
-            f.filterModes = dropMode(f.filterModes, fieldKey);
-          } else {
-            f.filters = { ...(f.filters ?? {}), [fieldKey]: remaining };
-          }
-        } else {
-          const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
-          f.filters = rest;
-          f.filterModes = dropMode(f.filterModes, fieldKey);
-        }
-      } else if (key === "exclusions" && fieldKey) {
-        if (value !== undefined) {
-          const remaining = (f.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
-          if (remaining.length === 0) {
-            const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
-            f.exclusions = rest;
-            f.exclusionModes = dropMode(f.exclusionModes, fieldKey);
-          } else {
-            f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: remaining };
-          }
-        } else {
-          const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
-          f.exclusions = rest;
-          f.exclusionModes = dropMode(f.exclusionModes, fieldKey);
-        }
-      } else if (key === "artifacts") {
-        const remaining = value !== undefined
-          ? (f.artifacts ?? []).filter((a) => a !== value)
-          : [];
-        if (remaining.length > 0) f.artifacts = remaining;
-        else delete f.artifacts;
-      } else if (key === "tagsInclude") {
-        const remaining = value !== undefined
-          ? (f.tagsInclude ?? []).filter((t) => t !== value)
-          : [];
-        if (remaining.length > 0) f.tagsInclude = remaining;
-        else delete f.tagsInclude;
-      } else if (key === "tagsExclude") {
-        const remaining = value !== undefined
-          ? (f.tagsExclude ?? []).filter((t) => t !== value)
-          : [];
-        if (remaining.length > 0) f.tagsExclude = remaining;
-        else delete f.tagsExclude;
-      } else if (key === "annotated") {
-        const remaining = value !== undefined
-          ? (f.annotated ?? []).filter((t) => t !== value)
-          : [];
-        if (remaining.length > 0) {
-          f.annotated = remaining as ("tag" | "anomaly")[];
-        } else {
-          delete f.annotated;
-          delete f.annotationTagValue;
-        }
-      } else {
-        delete f[key as keyof EventFilters];
-      }
-      setFilters(f);
+      setFilters(removeFilterEntry(filters, key, fieldKey, value));
     },
     [filters, setFilters],
   );

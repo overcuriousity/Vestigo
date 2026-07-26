@@ -75,6 +75,79 @@ export function applyFieldFilter(
   return next;
 }
 
+/**
+ * Return a copy of *f* with one filter chip's contribution removed.
+ *
+ * `key` names the `EventFilters` member; `fieldKey` picks the entry inside the
+ * `filters`/`exclusions` maps; `value` removes a single value from a multi-value
+ * entry (omit it to drop the whole entry). Emptying an entry also drops its
+ * match-mode, so a re-added value is never silently reinterpreted as a pattern.
+ *
+ * Shared by the Explorer's filter chips and Visualize's inherited-filters bar:
+ * both surfaces render the same chips, so removal must mean the same thing.
+ */
+export function removeFilterEntry(
+  f: EventFilters,
+  key: keyof EventFilters | string,
+  fieldKey?: string,
+  value?: string,
+): EventFilters {
+  const next = { ...f };
+  if (key === "filters" && fieldKey) {
+    if (value !== undefined) {
+      const remaining = (next.filters?.[fieldKey] ?? []).filter((v) => v !== value);
+      if (remaining.length === 0) {
+        const { [fieldKey]: _removed, ...rest } = next.filters ?? {};
+        next.filters = rest;
+        next.filterModes = dropMode(next.filterModes, fieldKey);
+      } else {
+        next.filters = { ...(next.filters ?? {}), [fieldKey]: remaining };
+      }
+    } else {
+      const { [fieldKey]: _removed, ...rest } = next.filters ?? {};
+      next.filters = rest;
+      next.filterModes = dropMode(next.filterModes, fieldKey);
+    }
+  } else if (key === "exclusions" && fieldKey) {
+    if (value !== undefined) {
+      const remaining = (next.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
+      if (remaining.length === 0) {
+        const { [fieldKey]: _removed, ...rest } = next.exclusions ?? {};
+        next.exclusions = rest;
+        next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
+      } else {
+        next.exclusions = {
+          ...((next.exclusions ?? {}) as Record<string, string[]>),
+          [fieldKey]: remaining,
+        };
+      }
+    } else {
+      const { [fieldKey]: _removed, ...rest } = next.exclusions ?? {};
+      next.exclusions = rest;
+      next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
+    }
+  } else if (key === "artifacts" || key === "tagsInclude" || key === "tagsExclude") {
+    const listKey = key as "artifacts" | "tagsInclude" | "tagsExclude";
+    const remaining =
+      value !== undefined ? (next[listKey] ?? []).filter((v) => v !== value) : [];
+    if (remaining.length > 0) next[listKey] = remaining;
+    else delete next[listKey];
+  } else if (key === "annotated") {
+    const remaining =
+      value !== undefined ? (next.annotated ?? []).filter((t) => t !== value) : [];
+    if (remaining.length > 0) {
+      next.annotated = remaining;
+    } else {
+      delete next.annotated;
+      // The tag-value refinement only means anything alongside `annotated`.
+      delete next.annotationTagValue;
+    }
+  } else {
+    delete next[key as keyof EventFilters];
+  }
+  return next;
+}
+
 /** Maps a backend field token (viz/anomaly form) to a filter-rail filterKey:
  * `attr:status_code` → `status_code`, `tags` → `tag`, top-level columns as-is. */
 export function mapFieldTokenToFilterKey(field: string): string {
