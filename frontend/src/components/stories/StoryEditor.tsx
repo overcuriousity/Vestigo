@@ -1,5 +1,21 @@
 import { useCallback, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { ApiError } from "@/api/client";
 import { storiesApi } from "@/api/stories";
 import type { StoryBlock, StoryBlockKind } from "@/api/types";
@@ -8,7 +24,7 @@ import { BlockFrame } from "./BlockFrame";
 import { BlockPicker } from "./BlockPicker";
 import { ChartBlockCard, EventBlockCard, ViewBlockCard } from "./EmbedCards";
 import { MarkdownBlock } from "./MarkdownBlock";
-import { sortBlocks } from "./blockOrder";
+import { afterIdForIndex, sortBlocks } from "./blockOrder";
 
 interface Props {
   caseId: string;
@@ -76,6 +92,32 @@ export function StoryEditor({ caseId, storyId }: Props) {
     onSuccess: invalidate,
   });
 
+  const moveBlock = useMutation({
+    mutationFn: (vars: { blockId: string; afterBlockId: string | null; version: number }) =>
+      storiesApi.moveBlock(caseId, storyId, vars.blockId, vars.afterBlockId, vars.version),
+    // Both outcomes reconcile against the server: a 409 means a collaborator
+    // moved it first, and their order is the one that stands.
+    onSettled: invalidate,
+  });
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const onDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const targetIndex = blocks.findIndex((b) => b.id === over.id);
+    const moving = blocks.find((b) => b.id === active.id);
+    if (!moving || targetIndex < 0) return;
+    moveBlock.mutate({
+      blockId: moving.id,
+      afterBlockId: afterIdForIndex(blocks, targetIndex, moving.id),
+      version: moving.version,
+    });
+  };
+
   const setEditing = useCallback((blockId: string, editing: boolean) => {
     setEditingIds((prev) => {
       const next = new Set(prev);
@@ -118,33 +160,37 @@ export function StoryEditor({ caseId, storyId }: Props) {
         onInsert={(kind, content) => insertAfter(null, kind, content)}
         label="Add at top"
       />
-      {blocks.map((block) => (
-        <div key={block.id} className="space-y-2">
-          <BlockFrame block={block} onDelete={() => deleteBlock.mutate(block.id)}>
-            {block.kind === "markdown" ? (
-              <MarkdownBlock
-                block={block}
-                conflict={conflicts[block.id] ?? null}
-                onEditingChange={(editing) => setEditing(block.id, editing)}
-                onSave={(text, version) =>
-                  updateBlock.mutate({ blockId: block.id, content: { text }, version })
-                }
-                onResolveConflict={(choice) => resolveConflict(block.id, choice)}
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+        <SortableContext items={blocks.map((b) => b.id)} strategy={verticalListSortingStrategy}>
+          {blocks.map((block) => (
+            <div key={block.id} className="space-y-2">
+              <SortableBlock block={block} draggable={!editingIds.has(block.id)} onDelete={() => deleteBlock.mutate(block.id)}>
+                {block.kind === "markdown" ? (
+                  <MarkdownBlock
+                    block={block}
+                    conflict={conflicts[block.id] ?? null}
+                    onEditingChange={(editing) => setEditing(block.id, editing)}
+                    onSave={(text, version) =>
+                      updateBlock.mutate({ blockId: block.id, content: { text }, version })
+                    }
+                    onResolveConflict={(choice) => resolveConflict(block.id, choice)}
+                  />
+                ) : block.kind === "view_ref" ? (
+                  <ViewBlockCard block={block} caseId={caseId} />
+                ) : block.kind === "chart_ref" ? (
+                  <ChartBlockCard block={block} caseId={caseId} />
+                ) : (
+                  <EventBlockCard block={block} caseId={caseId} />
+                )}
+              </SortableBlock>
+              <Inserter
+                caseId={caseId}
+                onInsert={(kind, content) => insertAfter(block.id, kind, content)}
               />
-            ) : block.kind === "view_ref" ? (
-              <ViewBlockCard block={block} caseId={caseId} />
-            ) : block.kind === "chart_ref" ? (
-              <ChartBlockCard block={block} caseId={caseId} />
-            ) : (
-              <EventBlockCard block={block} caseId={caseId} />
-            )}
-          </BlockFrame>
-          <Inserter
-            caseId={caseId}
-            onInsert={(kind, content) => insertAfter(block.id, kind, content)}
-          />
-        </div>
-      ))}
+            </div>
+          ))}
+        </SortableContext>
+      </DndContext>
       {blocks.length === 0 && (
         <p className="py-8 text-center text-sm text-[var(--color-fg-muted)]">
           Empty story. Write a paragraph, or push a view, chart or event into it from the
@@ -174,5 +220,39 @@ function Inserter({
     <div className="flex justify-center opacity-0 transition-opacity hover:opacity-100 focus-within:opacity-100">
       <BlockPicker caseId={caseId} onInsert={onInsert} label={label} />
     </div>
+  );
+}
+
+/**
+ * One draggable block. Dragging is disabled while its markdown is being
+ * edited — a grab gesture inside a textarea is a text selection, not a move.
+ */
+function SortableBlock({
+  block,
+  children,
+  onDelete,
+  draggable,
+}: {
+  block: StoryBlock;
+  children: React.ReactNode;
+  onDelete: () => void;
+  draggable: boolean;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: block.id,
+    disabled: !draggable,
+  });
+
+  return (
+    <BlockFrame
+      block={block}
+      onDelete={onDelete}
+      containerRef={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      dragging={isDragging}
+      handleProps={{ ...attributes, ...listeners }}
+    >
+      {children}
+    </BlockFrame>
   );
 }

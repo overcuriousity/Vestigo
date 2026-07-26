@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { Bot, GripVertical, Trash2 } from "lucide-react";
 import type { StoryBlock } from "@/api/types";
 import { Badge } from "@/components/ui/Badge";
@@ -9,8 +9,12 @@ interface Props {
   block: StoryBlock;
   children: ReactNode;
   onDelete: () => void;
-  /** dnd-kit drag-handle props; spread onto the grip (Task 14 wires them). */
+  /** dnd-kit drag-handle listeners/attributes; spread onto the grip. */
   handleProps?: Record<string, unknown>;
+  /** dnd-kit sortable node ref + transform style. */
+  containerRef?: (node: HTMLElement | null) => void;
+  style?: CSSProperties;
+  dragging?: boolean;
   /** Extra header controls (per-kind display options, open-in links). */
   headerExtra?: ReactNode;
   title?: ReactNode;
@@ -20,9 +24,27 @@ interface Props {
  * Shared chrome around every story block: drag grip, origin badge, author
  * line, delete. Content (markdown, embed card) renders inside.
  */
-export function BlockFrame({ block, children, onDelete, handleProps, headerExtra, title }: Props) {
+export function BlockFrame({
+  block,
+  children,
+  onDelete,
+  handleProps,
+  headerExtra,
+  title,
+  containerRef,
+  style,
+  dragging = false,
+}: Props) {
   return (
-    <div className="group/block rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)] transition-base hover:border-[var(--color-border-strong)]">
+    <div
+      ref={containerRef}
+      style={style}
+      className={`group/block rounded-lg border bg-[var(--color-bg-surface)] transition-base hover:border-[var(--color-border-strong)] ${
+        dragging
+          ? "border-[var(--color-accent)] opacity-60"
+          : "border-[var(--color-border)]"
+      }`}
+    >
       <div className="flex items-center gap-2 border-b border-[var(--color-border)]/60 px-3 py-1.5">
         <button
           type="button"
