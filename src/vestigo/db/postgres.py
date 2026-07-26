@@ -719,6 +719,20 @@ class StoryBlock(Base):
         }
 
 
+#: Gap between consecutive story-block positions. Insert-between takes the
+#: midpoint; when a gap closes to <2 the story is renumbered back onto this
+#: stride inside the same transaction.
+STORY_POSITION_GAP = 1024
+
+
+class StaleBlockError(Exception):
+    """A block update/move carried a stale version; ``current`` is the winner."""
+
+    def __init__(self, current: StoryBlock) -> None:
+        super().__init__(f"stale version for block {current.id}")
+        self.current = current
+
+
 class StoryExport(Base):
     """An immutable point-in-time export of a Story.
 
@@ -2950,6 +2964,161 @@ class PostgresStore:
             await session.execute(delete(StoryBlock).where(StoryBlock.story_id == story_id))
             await session.execute(delete(StoryExport).where(StoryExport.story_id == story_id))
             await session.delete(story)
+            await session.commit()
+            return True
+
+    async def list_story_blocks(self, story_id: str) -> list[StoryBlock]:
+        """Return a story's blocks in document order."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryBlock)
+                .where(StoryBlock.story_id == story_id)
+                .order_by(StoryBlock.position.asc())
+            )
+            return list(result.scalars().all())
+
+    async def get_story_block(self, block_id: str) -> StoryBlock | None:
+        """Return a block by ID."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+            return result.scalar_one_or_none()
+
+    @staticmethod
+    def _story_position_for(blocks: list[StoryBlock], after_block_id: str | None) -> int | None:
+        """Compute the gap position for an insert, or None if the gap is exhausted.
+
+        ``after_block_id=None`` appends at the end. Raises ValueError when
+        ``after_block_id`` names a block that isn't in ``blocks``.
+        """
+        if after_block_id is None:
+            return blocks[-1].position + STORY_POSITION_GAP if blocks else STORY_POSITION_GAP
+        idx = next((i for i, b in enumerate(blocks) if b.id == after_block_id), None)
+        if idx is None:
+            raise ValueError(f"after_block_id {after_block_id!r} not in story")
+        lo = blocks[idx].position
+        hi = blocks[idx + 1].position if idx + 1 < len(blocks) else lo + 2 * STORY_POSITION_GAP
+        mid = (lo + hi) // 2
+        return mid if lo < mid < hi else None
+
+    async def create_story_block(
+        self,
+        story_id: str,
+        block_id: str,
+        kind: str,
+        content: dict,
+        user: str,
+        origin: str = "user",
+        after_block_id: str | None = None,
+    ) -> StoryBlock:
+        """Insert a block; appends at the end unless ``after_block_id`` is given."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryBlock)
+                .where(StoryBlock.story_id == story_id)
+                .order_by(StoryBlock.position.asc())
+            )
+            blocks = list(result.scalars().all())
+            position = self._story_position_for(blocks, after_block_id)
+            if position is None:
+                # Gap exhausted: renumber onto the stride, then recompute.
+                for i, b in enumerate(blocks):
+                    b.position = (i + 1) * STORY_POSITION_GAP
+                await session.flush()
+                position = self._story_position_for(blocks, after_block_id)
+            block = StoryBlock(
+                id=block_id,
+                story_id=story_id,
+                position=position,
+                kind=kind,
+                content=content,
+                origin=origin,
+                created_by=user,
+                updated_by=user,
+            )
+            session.add(block)
+            await session.commit()
+            await session.refresh(block)
+            return block
+
+    async def update_story_block(
+        self, block_id: str, content: dict, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """Update a block's content under optimistic concurrency.
+
+        Raises StaleBlockError (carrying the current row) when
+        ``expected_version`` no longer matches; returns None when the block
+        doesn't exist.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+            block = result.scalar_one_or_none()
+            if block is None:
+                return None
+            if block.version != expected_version:
+                session.expunge(block)
+                raise StaleBlockError(block)
+            block.content = content
+            block.version += 1
+            block.updated_by = user
+            await session.commit()
+            await session.refresh(block)
+            return block
+
+    async def move_story_block(
+        self, block_id: str, after_block_id: str | None, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """Reposition a block; ``after_block_id=None`` moves it to the top.
+
+        Same optimistic-concurrency semantics as ``update_story_block``.
+        Renumber (when a gap is exhausted) and the move commit atomically.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+            block = result.scalar_one_or_none()
+            if block is None:
+                return None
+            if block.version != expected_version:
+                session.expunge(block)
+                raise StaleBlockError(block)
+            result = await session.execute(
+                select(StoryBlock)
+                .where(StoryBlock.story_id == block.story_id, StoryBlock.id != block_id)
+                .order_by(StoryBlock.position.asc())
+            )
+            others = list(result.scalars().all())
+            if after_block_id is None:
+                # Top of document: halve below the first block, renumbering
+                # first when there's no room left above it.
+                if not others:
+                    position = STORY_POSITION_GAP
+                else:
+                    if others[0].position < 2:
+                        for i, b in enumerate(others):
+                            b.position = (i + 2) * STORY_POSITION_GAP
+                        await session.flush()
+                    position = others[0].position // 2
+            else:
+                position = self._story_position_for(others, after_block_id)
+                if position is None:
+                    for i, b in enumerate(others):
+                        b.position = (i + 1) * STORY_POSITION_GAP
+                    await session.flush()
+                    position = self._story_position_for(others, after_block_id)
+            block.position = position
+            block.version += 1
+            block.updated_by = user
+            await session.commit()
+            await session.refresh(block)
+            return block
+
+    async def delete_story_block(self, block_id: str) -> bool:
+        """Delete a block row. Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+            block = result.scalar_one_or_none()
+            if block is None:
+                return False
+            await session.delete(block)
             await session.commit()
             return True
 
