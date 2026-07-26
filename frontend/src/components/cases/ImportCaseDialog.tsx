@@ -3,8 +3,13 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
+import { FileInput } from "@/components/ui/FileInput";
+import { JobStatusRow } from "@/components/ui/JobStatusRow";
 import { AlertTriangle, Upload } from "lucide-react";
 import { transferApi } from "@/api/transfer";
+import { useTransferRate } from "@/hooks/useTransferRate";
+import { useJobsStore } from "@/stores/jobs";
+import { jobPhaseLabel } from "@/lib/jobPhases";
 
 /** `Job.result` is loosely typed (`unknown`); this is what the import job puts there. */
 interface ImportResult {
@@ -17,9 +22,17 @@ export function ImportCaseDialog() {
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  // The ref, not the state, is what actually prevents a duplicate import: a
+  // second click can land in the same task as the first, before React has
+  // re-rendered the button as disabled. Archives are multi-GB, so that window
+  // used to stay open for the entire upload.
+  const submittingRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const upload = useTransferRate();
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const addJob = useJobsStore((s) => s.addJob);
 
   const { data: job } = useQuery({
     queryKey: ["transfer-import", jobId],
@@ -58,15 +71,39 @@ export function ImportCaseDialog() {
   }, [job, caseId, warnings.length, goToCase]);
 
   const start = () => {
-    if (!file) return;
+    if (submittingRef.current || !file) return;
+    submittingRef.current = true;
+    setUploading(true);
     setError(null);
+    upload.reset();
+    const controller = new AbortController();
+    abortRef.current = controller;
     transferApi
-      .startImport(file)
-      .then((r) => setJobId(r.job_id))
-      .catch((e) => setError((e as Error).message));
+      .startImport(file, { onProgress: upload.report, signal: controller.signal })
+      .then((r) => {
+        setJobId(r.job_id);
+        // The job outlives this dialog: hand it to the tray so closing the
+        // dialog mid-import doesn't hide a restore that's still running.
+        addJob(r.job_id, `Importing "${file.name}"`, [["cases"]]);
+        setUploading(false);
+        submittingRef.current = false;
+      })
+      .catch((e) => {
+        // A cancel is not a failure — the user asked for it.
+        if ((e as Error).name !== "AbortError") setError((e as Error).message);
+        setUploading(false);
+        submittingRef.current = false;
+        upload.reset();
+      });
   };
 
-  const running = !!jobId && (!job || (job.status !== "completed" && job.status !== "failed"));
+  const cancelUpload = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+  };
+
+  const jobRunning = !!jobId && (!job || (job.status !== "completed" && job.status !== "failed"));
+  const busy = uploading || jobRunning;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -80,13 +117,33 @@ export function ImportCaseDialog() {
         description="Restore a .vestigo archive as a new case owned by you. Nobody else gets access automatically."
       >
         <div className="space-y-3">
-          <input
-            ref={inputRef}
-            type="file"
+          <FileInput
             accept=".vestigo"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-            className="block w-full text-sm text-[var(--color-fg-primary)]"
+            disabled={busy}
+            onFiles={(files) => setFile(files[0] ?? null)}
           />
+          {uploading && upload.state && file && (
+            <JobStatusRow
+              label={`Uploading ${file.name}`}
+              status="running"
+              error={null}
+              progress={{
+                total: upload.state.total ?? file.size,
+                processed: upload.state.loaded,
+                rate_bps: upload.state.rate_bps,
+                eta_s: upload.state.eta_s,
+              }}
+            />
+          )}
+          {job && !caseId && (
+            <JobStatusRow
+              label="Restoring case"
+              status={job.status}
+              progress={job.progress}
+              error={null}
+              detail={jobPhaseLabel(job.kind, job.progress)}
+            />
+          )}
           {error && <p className="text-xs text-[var(--color-danger)]">{error}</p>}
           {warnings.length > 0 && (
             <div className="space-y-1">
@@ -107,16 +164,25 @@ export function ImportCaseDialog() {
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
-            <DialogClose asChild>
-              <Button variant="ghost" size="sm">Cancel</Button>
-            </DialogClose>
+            {uploading ? (
+              // Safe to offer: the server creates the import job only after the
+              // whole upload lands, so an aborted upload leaves no job, no
+              // case, and nothing to clean up.
+              <Button variant="ghost" size="sm" onClick={cancelUpload}>
+                Cancel upload
+              </Button>
+            ) : (
+              <DialogClose asChild>
+                <Button variant="ghost" size="sm">Cancel</Button>
+              </DialogClose>
+            )}
             {caseId && warnings.length > 0 ? (
               <Button variant="accent" size="sm" onClick={() => goToCase(caseId)}>
                 Go to case
               </Button>
             ) : (
-              <Button variant="accent" size="sm" disabled={!file || running} onClick={start}>
-                {running ? "Importing…" : "Import"}
+              <Button variant="accent" size="sm" disabled={!file || busy} onClick={start}>
+                {uploading ? "Uploading…" : jobRunning ? "Importing…" : "Import"}
               </Button>
             )}
           </div>

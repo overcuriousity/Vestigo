@@ -58,6 +58,51 @@ describe("ExportCaseDialog", () => {
     expect(downloadExportMock).toHaveBeenCalledTimes(1);
   });
 
+  it("starts exactly one export however fast the button is clicked", () => {
+    startExportMock.mockReturnValue(new Promise(() => {}));
+    renderDialog();
+    fireEvent.click(screen.getByTitle("Export case as .vestigo archive"));
+    const submit = screen.getByRole("button", { name: "Export" });
+
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    expect(startExportMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the phase the server is working on", async () => {
+    getJobMock.mockResolvedValue({
+      id: "j1",
+      kind: "case_export",
+      status: "running",
+      progress: { phase: "blobs", processed: 2, total: 4 },
+    });
+    renderDialog();
+    fireEvent.click(screen.getByTitle("Export case as .vestigo archive"));
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+
+    // Export-side copy: packing, not restoring.
+    expect(await screen.findByText(/Packing original source files/)).toBeTruthy();
+    expect(screen.getByText(/50%/)).toBeTruthy();
+  });
+
+  it("reports download bytes while the archive is streaming", async () => {
+    downloadExportMock.mockImplementation(
+      (
+        _caseId: string,
+        _jobId: string,
+        _name: string,
+        opts: { onProgress: (p: unknown) => void },
+      ) => new Promise(() => opts.onProgress({ loaded: 3_000_000, total: 4_000_000 })),
+    );
+    renderDialog();
+    fireEvent.click(screen.getByTitle("Export case as .vestigo archive"));
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+
+    expect(await screen.findByText("Downloading archive")).toBeTruthy();
+    expect(screen.getByText(/75%/)).toBeTruthy();
+  });
+
   it("offers a retry when the transfer itself fails", async () => {
     downloadExportMock.mockRejectedValueOnce(new Error("network died"));
     renderDialog();

@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Upload, FileText } from "lucide-react";
+import { Upload } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
 import { useJobsStore } from "@/stores/jobs";
 import { tourEvent } from "@/stores/tour";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
+import { FileDropZone } from "@/components/ui/FileInput";
 import { Input } from "@/components/ui/Input";
-import { fmtBytes } from "@/lib/format";
 
 interface Props {
   caseId: string;
@@ -17,8 +17,6 @@ export function UploadDialog({ caseId }: Props) {
   const [open, setOpen] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [parser, setParser] = useState("");
-  const [dragging, setDragging] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
 
@@ -66,8 +64,6 @@ export function UploadDialog({ caseId }: Props) {
     meta: { silentError: true },
   });
 
-  const handleFile = (f: File) => setFile(f);
-
   // Reset selection and the previous upload's result/error whenever the
   // dialog is reopened, so a stale duplicate warning or error doesn't linger.
   useEffect(() => {
@@ -91,62 +87,15 @@ export function UploadDialog({ caseId }: Props) {
         description="Uploading creates a new Source and adds it to the default timeline. Supported formats: Timesketch CSV, JSONL, Vestigo Parquet (from a converter script). Parser auto-detected if omitted."
       >
         <div className="space-y-4">
-          {/* Drop zone */}
-          <div
+          <FileDropZone
             data-tour="upload-dropzone"
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragging(true);
+            accept=".csv,.jsonl,.parquet,.log"
+            files={file}
+            onFiles={(picked) => {
+              if (picked[0]) setFile(picked[0]);
             }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragging(false);
-              const f = e.dataTransfer.files[0];
-              if (f) handleFile(f);
-            }}
-            onClick={() => inputRef.current?.click()}
-            className={`flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed px-6 py-8 text-center transition-base ${
-              dragging
-                ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)]"
-                : "border-[var(--color-border-strong)] bg-[var(--color-bg-base)] hover:border-[var(--color-accent)] hover:bg-[var(--color-accent-dim)]"
-            }`}
-          >
-            <FileText
-              size={28}
-              className="text-[var(--color-fg-muted)] opacity-60"
-            />
-            {file ? (
-              <div>
-                <p className="text-sm font-medium text-[var(--color-fg-primary)]">
-                  {file.name}
-                </p>
-                <p className="text-xs text-[var(--color-fg-muted)]">
-                  {fmtBytes(file.size)}
-                </p>
-              </div>
-            ) : (
-              <>
-                <p className="text-sm text-[var(--color-fg-secondary)]">
-                  Drop a file here or click to browse
-                </p>
-                <p className="text-xs text-[var(--color-fg-muted)]">
-                  .csv, .jsonl, .parquet — any size. Other formats (e.g. .log) need a
-                  parser override below.
-                </p>
-              </>
-            )}
-            <input
-              ref={inputRef}
-              type="file"
-              accept=".csv,.jsonl,.parquet,.log"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleFile(f);
-              }}
-            />
-          </div>
+            hint=".csv, .jsonl, .parquet — any size. Other formats (e.g. .log) need a parser override below."
+          />
 
           {/* Parser override */}
           <div>

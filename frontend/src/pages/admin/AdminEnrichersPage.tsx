@@ -1,8 +1,7 @@
-import { useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { UploadCloud } from "lucide-react";
 import { enrichersApi, type AdminEnricherConfig } from "@/api/enrichers";
-import { Button } from "@/components/ui/Button";
+import { FileInputButton } from "@/components/ui/FileInput";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
 import { Switch } from "@/components/ui/Switch";
@@ -15,7 +14,6 @@ function fmtBytes(bytes: number | null): string {
 
 function EnricherCard({ config }: { config: AdminEnricherConfig }) {
   const qc = useQueryClient();
-  const fileInput = useRef<HTMLInputElement>(null);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["admin", "enrichers", "config"] });
@@ -78,30 +76,17 @@ function EnricherCard({ config }: { config: AdminEnricherConfig }) {
             {asset.uploaded ? `uploaded (${fmtBytes(asset.size_bytes)})` : "not uploaded"}
           </div>
           <p className="text-xs text-[var(--color-fg-muted)]">{asset.description}</p>
-          <input
-            ref={fileInput}
-            type="file"
-            accept={asset.accepted_extensions.join(",")}
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) uploadMutation.mutate(file);
-              e.target.value = "";
-            }}
-          />
-          <Button
+          <FileInputButton
             variant="ghost"
-            size="sm"
-            disabled={uploadMutation.isPending}
-            onClick={() => fileInput.current?.click()}
+            accept={asset.accepted_extensions.join(",")}
+            pending={uploadMutation.isPending}
+            icon={<UploadCloud size={14} className="mr-1.5" />}
+            onFiles={(files) => {
+              if (files[0]) uploadMutation.mutate(files[0]);
+            }}
           >
-            <UploadCloud size={14} className="mr-1.5" />
-            {uploadMutation.isPending
-              ? "Uploading…"
-              : asset.uploaded
-                ? `Replace ${asset.name}`
-                : `Upload ${asset.name}`}
-          </Button>
+            {asset.uploaded ? `Replace ${asset.name}` : `Upload ${asset.name}`}
+          </FileInputButton>
           {uploadMutation.isError && (
             <p className="mt-2 text-xs text-[var(--color-danger)]">
               {(uploadMutation.error as Error).message}
