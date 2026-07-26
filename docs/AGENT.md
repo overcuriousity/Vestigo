@@ -562,6 +562,97 @@ model request counted against the turn limit, so not more than three.
 Whatever streamed before an early end persists with an ` [interrupted]`
 marker.
 
+### Turn checkpointing and resume
+
+`AgentConversation.history` is the only thing a follow-up turn replays; the
+`AgentMessage` rows are the human-readable record and never feed the model. It
+used to be written only when a turn reached its result, so a stop, a provider
+error or a process restart discarded the whole turn — the 2026-07-26 export
+shows 125 persisted tool rows against an empty history blob, and the next turn
+re-ran the entire orientation sweep.
+
+`stream_turn` now drives `agent.iter` and updates a caller-owned `TurnRecorder`
+after every tool result and at every node boundary, yielding a router-internal
+`checkpoint` event. Each snapshot passes through
+`agent/resume.py::repair_partial`, and any checkpoint is replayable on its own.
+
+pydantic-ai already normalizes a history before every request
+(`_clean_message_history`: drop orphaned results, answer dangling calls, merge
+adjacent same-role messages), so `repair_partial` is not there to make the blob
+sendable — it is there to make it *faithful*, and to keep it that way if a
+future version normalizes differently:
+
+- **Unpaired calls are answered with the part the tool actually produced.** The
+  library's own repair substitutes a generic stub; replaying the real
+  `ToolReturnPart` — or `RetryPromptPart`, so a rejection is never replayed as a
+  success — keeps the resumed history in agreement with the run about what each
+  tool returned, including the content's type and its `outcome`. Only a call that
+  genuinely never returned gets `INTERRUPTED_RESULT`, stamped
+  `outcome="interrupted"` so a reader of an export can tell synthesized answers
+  from real ones without parsing prose. Answers are inserted in the request
+  immediately following the response that made the call, because the Anthropic
+  protocol requires that adjacency and nothing downstream reorders across a
+  response.
+- **A truncated trailing call is kept, not dropped.** A dead model stream can
+  leave a `ToolCallPart` with half-written JSON arguments. Removing it would
+  rewrite the shape of a `ModelResponse` whose thinking signature was computed
+  over the turn that included the call, and this blob is the only place those
+  signatures live. Malformed arguments are already sendable (`args_as_dict`
+  degrades them), so the call is replayed and answered like any other — the same
+  reasoning pydantic-ai gives for its own pass.
+- **The trailing request/response pair is closed** with a `RESUME_MARKER`
+  response. On 2.17.0 this is belt-and-braces: `_merge_consecutive_messages`
+  already folds a trailing tool-return request into the next turn's prompt
+  request, so the unmerged shape is not a protocol error. But that merge is
+  private API under a `>=` pin, and a checkpoint blob shaped exactly like a
+  completed turn's is one less case for the window and the exporter to reason
+  about. `tests/test_agent_resume.py::test_the_library_still_merges_adjacent_requests`
+  fails loudly if a bump changes it.
+
+No checkpoint is taken before the model commits a response: there would be
+nothing to save, and closing the pair on a lone prompt would put a reply to the
+analyst in the model's mouth.
+
+Checkpointing is deliberately cheap. The node-boundary checkpoint is skipped
+when the node produced nothing mapped, and when its last mapped event was a
+`tool_result` (that checkpoint already captured the same state), so a
+125-tool-call turn takes ~125 snapshots rather than 250. Reaching the database is
+throttled separately, because each write is a full `dump_history` plus a
+whole-column JSON UPDATE of a monotonically growing blob on the event loop —
+writing every snapshot costs bytes quadratic in the turn's length.
+`_persist_partial` skips a write whose `recorder.revision` has not advanced, and
+skips a periodic one taken less than `_CHECKPOINT_MIN_INTERVAL` (3s) after the
+last. Every terminal exit forces the write regardless, so the floor bounds
+worst-case loss at a few seconds of tool work and never at an analyst's turn. The
+per-tool-result checkpoint stays — losing a tool batch to a `kill -9` is the
+thing this exists to prevent.
+
+The router writes each checkpoint and stamps `history_partial_at`. Only a
+completed turn clears it; a stop is treated as an interruption like any other.
+While it is set, the next turn is run with `RESUME_NOTE` as pydantic-ai
+`instructions` — it tells the model the previous turn ended early and to build
+on the history rather than re-orient, without being folded into the prompt: the
+prompt is persisted verbatim as the analyst's `UserPromptPart`, so a note there
+would claim words the analyst never wrote and stack one stale copy per
+interruption. Instructions come from the current run only (verified against
+pydantic-ai 2.17.0), so a note left on an older `ModelRequest` is never resent.
+The recorder is reset per attempt, so the reactive overflow re-run replays from
+the same pre-turn base rather than concatenating the failed attempt's messages.
+If that re-run dies before its own first checkpoint, attempt 0's stamped
+snapshot stays on the record: it is a faithful account of work that really ran,
+and the window sizes it like any other history on the next turn.
+
+`history_partial_at` is on the conversation payload (`to_dict`), so it reaches
+the list and detail responses and the JSON export alongside `raw_history` — a
+reader can tell a replayable turn boundary from a mid-turn checkpoint without
+inspecting the blob. A partial write also bumps `updated_at`, which floats an
+actively streaming conversation to the top of the list; that is the intent.
+
+No extra truncation logic: a resumed history is ordinary `message_history` and
+the sliding window (`agent/window.py`) still sizes every request. Because the
+learned budget and calibrated `chars_per_token` persist per conversation, a
+resumed turn starts with the budget the interrupted turn paid to learn.
+
 ## Provider notes
 
 ### Reasoning effort
