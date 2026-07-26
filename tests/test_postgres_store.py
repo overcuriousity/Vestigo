@@ -233,6 +233,10 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("DROP TABLE agent_proposals"))
         # 0011 adds the instance-wide agent settings table.
         await conn.execute(text("DROP TABLE agent_settings"))
+        # 0016 adds the Stories tables.
+        await conn.execute(text("DROP TABLE stories"))
+        await conn.execute(text("DROP TABLE story_blocks"))
+        await conn.execute(text("DROP TABLE story_exports"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
