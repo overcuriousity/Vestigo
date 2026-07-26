@@ -1,12 +1,12 @@
 import { useCallback, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus } from "lucide-react";
 import { ApiError } from "@/api/client";
 import { storiesApi } from "@/api/stories";
 import type { StoryBlock, StoryBlockKind } from "@/api/types";
-import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { BlockFrame } from "./BlockFrame";
+import { BlockPicker } from "./BlockPicker";
+import { ChartBlockCard, EventBlockCard, ViewBlockCard } from "./EmbedCards";
 import { MarkdownBlock } from "./MarkdownBlock";
 import { sortBlocks } from "./blockOrder";
 
@@ -105,12 +105,19 @@ export function StoryEditor({ caseId, storyId }: Props) {
     return <p className="text-sm text-[var(--color-danger)]">{(error as Error).message}</p>;
   }
 
-  const addMarkdownAfter = (afterBlockId: string | null) =>
-    createBlock.mutate({ kind: "markdown", content: { text: "" }, afterBlockId });
+  const insertAfter = (
+    afterBlockId: string | null,
+    kind: StoryBlockKind,
+    content: Record<string, unknown>,
+  ) => createBlock.mutate({ kind, content, afterBlockId });
 
   return (
     <div className="space-y-2">
-      <Inserter onAddMarkdown={() => addMarkdownAfter(null)} label="Add at top" />
+      <Inserter
+        caseId={caseId}
+        onInsert={(kind, content) => insertAfter(null, kind, content)}
+        label="Add at top"
+      />
       {blocks.map((block) => (
         <div key={block.id} className="space-y-2">
           <BlockFrame block={block} onDelete={() => deleteBlock.mutate(block.id)}>
@@ -124,11 +131,18 @@ export function StoryEditor({ caseId, storyId }: Props) {
                 }
                 onResolveConflict={(choice) => resolveConflict(block.id, choice)}
               />
+            ) : block.kind === "view_ref" ? (
+              <ViewBlockCard block={block} caseId={caseId} />
+            ) : block.kind === "chart_ref" ? (
+              <ChartBlockCard block={block} caseId={caseId} />
             ) : (
-              <EmbedBlockBody block={block} caseId={caseId} />
+              <EventBlockCard block={block} caseId={caseId} />
             )}
           </BlockFrame>
-          <Inserter onAddMarkdown={() => addMarkdownAfter(block.id)} />
+          <Inserter
+            caseId={caseId}
+            onInsert={(kind, content) => insertAfter(block.id, kind, content)}
+          />
         </div>
       ))}
       {blocks.length === 0 && (
@@ -146,29 +160,19 @@ export function StoryEditor({ caseId, storyId }: Props) {
   );
 }
 
-/** Between-block insertion affordance; embed pickers arrive with the cards. */
+/** Between-block insertion affordance: text inline, embeds via the picker. */
 function Inserter({
-  onAddMarkdown,
-  label = "Add block",
+  caseId,
+  onInsert,
+  label,
 }: {
-  onAddMarkdown: () => void;
+  caseId: string;
+  onInsert: (kind: StoryBlockKind, content: Record<string, unknown>) => void;
   label?: string;
 }) {
   return (
     <div className="flex justify-center opacity-0 transition-opacity hover:opacity-100 focus-within:opacity-100">
-      <Button variant="ghost" size="sm" onClick={onAddMarkdown} aria-label={label}>
-        <Plus size={12} /> Text
-      </Button>
+      <BlockPicker caseId={caseId} onInsert={onInsert} label={label} />
     </div>
-  );
-}
-
-/** Placeholder body for embed blocks until the cards land (Task 13). */
-function EmbedBlockBody({ block, caseId }: { block: StoryBlock; caseId: string }) {
-  void caseId;
-  return (
-    <p className="text-xs text-[var(--color-fg-muted)]">
-      {block.kind} · {JSON.stringify(block.content)}
-    </p>
   );
 }
