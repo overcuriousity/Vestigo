@@ -562,6 +562,34 @@ model request counted against the turn limit, so not more than three.
 Whatever streamed before an early end persists with an ` [interrupted]`
 marker.
 
+### Turn checkpointing and resume
+
+`AgentConversation.history` is the only thing a follow-up turn replays; the
+`AgentMessage` rows are the human-readable record and never feed the model. It
+used to be written only when a turn reached its result, so a stop, a provider
+error or a process restart discarded the whole turn — the 2026-07-26 export
+shows 125 persisted tool rows against an empty history blob, and the next turn
+re-ran the entire orientation sweep.
+
+`stream_turn` now drives `agent.iter` and updates a caller-owned `TurnRecorder`
+after every tool result and every node, yielding a router-internal `checkpoint`
+event. Each snapshot passes through `agent/resume.py::repair_partial`, which
+answers tool calls left unpaired (with the result the turn actually streamed,
+or an explicit `interrupted` marker) and drops trailing calls that never
+reached the executor — so any checkpoint is replayable on its own.
+
+The router writes each checkpoint and stamps `history_partial_at`. Only a
+completed turn clears it; a stop is treated as an interruption like any other.
+While it is set, the next turn carries `RESUME_NOTE`, which tells the model the
+previous turn ended early and to build on the history rather than re-orient.
+The recorder is reset per attempt, so the reactive overflow re-run replays from
+the same pre-turn base rather than concatenating the failed attempt's messages.
+
+No extra truncation logic: a resumed history is ordinary `message_history` and
+the sliding window (`agent/window.py`) still sizes every request. Because the
+learned budget and calibrated `chars_per_token` persist per conversation, a
+resumed turn starts with the budget the interrupted turn paid to learn.
+
 ## Provider notes
 
 ### Reasoning effort

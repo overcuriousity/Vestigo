@@ -528,6 +528,7 @@ async def stream_turn(
     window_stats: WindowStats | None = None,
     chars_per_token: float = CHARS_PER_TOKEN_DEFAULT,
     recorder: TurnRecorder | None = None,
+    resume_note: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding SSE-ready event dicts.
 
@@ -547,6 +548,11 @@ async def stream_turn(
     ``{"type": "checkpoint"}`` event is yielded alongside. The router persists
     it, so a turn that is stopped, errors, or dies with the process keeps its
     history instead of losing the whole turn.
+
+    ``resume_note`` is set by the router when ``history`` is a mid-turn
+    checkpoint rather than a completed turn; it is prefixed to the turn's
+    context so the model builds on the interrupted turn's findings instead of
+    re-running the orientation sweep it already paid for.
     """
     config = await resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
@@ -600,6 +606,9 @@ async def stream_turn(
             f"Case: {scope.case_id}. Timeline: {scope.timeline_id} "
             f"({len(scope.source_ids)} sources). {_view_context(view_filters)}\n\n{user_text}"
         )
+        if resume_note:
+            # Ahead of everything else, so the analyst's own message stays last.
+            context = f"{resume_note}\n\n{context}"
 
         track = recorder if recorder is not None else TurnRecorder()
         called_ids: set[str] = set()

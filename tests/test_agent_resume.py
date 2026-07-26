@@ -10,6 +10,8 @@ pairing invariant `agent/window.py` relies on.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic_ai.messages import (
     ModelRequest,
@@ -429,3 +431,182 @@ async def test_history_partial_at_is_set_and_cleared_independently(store):
     await store.update_agent_conversation(conversation.id, history_partial_at=None)
     fresh = await store.get_agent_conversation(case.id, conversation.id)
     assert fresh.history_partial_at is None
+
+
+# ---------------------------------------------------------------------------
+# Router: every exit path keeps the turn's history
+# ---------------------------------------------------------------------------
+
+
+async def _conversation(store):
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+    return user, case, conversation
+
+
+def _fake_turn_messages():
+    return [
+        ModelRequest(parts=[UserPromptPart(content="look into this")]),
+        ModelResponse(parts=[TextPart(content="partial answer")]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_turn_keeps_its_history_and_is_marked_partial(store, monkeypatch):
+    """The reported bug: an interrupted turn used to persist message rows and
+    nothing replayable, so the next turn started from zero."""
+    import asyncio
+    import json
+    from time import monotonic
+
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    # Fake the reservation `send_message` makes, as tests/test_agent_api.py does.
+    turn = agent_router._ActiveTurn(cancel=asyncio.Event(), started=monotonic())
+    agent_router._active_turns[conversation.id] = turn
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        yield {"type": "text_delta", "text": "partial answer"}
+        recorder.messages = _fake_turn_messages()
+        recorder.revision += 1
+        yield {"type": "checkpoint"}
+        turn.cancel.set()
+        yield {"type": "text_delta", "text": "never streamed"}
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    chunks = [
+        chunk async for chunk in agent_router._message_stream(case.id, conversation, payload, user)
+    ]
+    events = [json.loads(c.removeprefix("data: ").strip()) for c in chunks]
+
+    assert events[-1] == {"type": "cancelled"}
+    # No checkpoint leaks to the client — it is a router-internal signal.
+    assert all(e["type"] != "checkpoint" for e in events)
+
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history, "the stopped turn's history must survive"
+    assert fresh.history_partial_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_turn_keeps_its_history_and_is_marked_partial(store, monkeypatch):
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        yield {"type": "text_delta", "text": "partial answer"}
+        recorder.messages = _fake_turn_messages()
+        recorder.revision += 1
+        yield {"type": "checkpoint"}
+        raise RuntimeError("endpoint died")
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history
+    assert fresh.history_partial_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_completed_turn_clears_the_partial_mark(store, monkeypatch):
+    from vestigo.agent.runtime import TurnResult
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    await store.update_agent_conversation(conversation.id, history_partial_at=datetime.now(UTC))
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        yield {"type": "text_delta", "text": "done"}
+        yield {
+            "type": "result",
+            "turn": TurnResult(output_text="done", new_messages=_fake_turn_messages()),
+        }
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_partial_conversation_resumes_with_the_note(store, monkeypatch):
+    from vestigo.agent.resume import RESUME_NOTE
+    from vestigo.agent.runtime import TurnResult
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    await store.update_agent_conversation(conversation.id, history_partial_at=datetime.now(UTC))
+    conversation = await store.get_agent_conversation(case.id, conversation.id)
+
+    seen: dict[str, object] = {}
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        seen["resume_note"] = kwargs.get("resume_note")
+        yield {
+            "type": "result",
+            "turn": TurnResult(output_text="ok", new_messages=_fake_turn_messages()),
+        }
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="carry on")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    assert seen["resume_note"] == RESUME_NOTE
+
+
+@pytest.mark.asyncio
+async def test_the_overflow_rerun_does_not_concatenate_the_failed_attempt(store, monkeypatch):
+    """Attempt 1 replays from the same `history` base, so the recorder must be
+    reset per attempt — otherwise the persisted blob carries attempt 0's
+    messages ahead of the re-run's and the record stops being faithful."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from vestigo.agent.runtime import TurnResult
+    from vestigo.api.routers import agent as agent_router
+
+    user, case, conversation = await _conversation(store)
+    attempts: list[int] = []
+
+    async def fake_stream_turn(scope, *, user_text, history, recorder=None, **kwargs):
+        attempts.append(scope.attempt)
+        if scope.attempt == 0:
+            recorder.messages = _fake_turn_messages()
+            recorder.revision += 1
+            yield {"type": "checkpoint"}
+            raise ModelHTTPError(
+                status_code=400,
+                model_name="stub",
+                body={"error": {"message": "maximum context length is 8192 tokens"}},
+            )
+        # The re-run must start from an empty recorder.
+        assert recorder.messages == []
+        assert recorder.revision == 0
+        yield {
+            "type": "result",
+            "turn": TurnResult(output_text="ok", new_messages=_fake_turn_messages()),
+        }
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _chunk in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    assert attempts == [0, 1]
+    fresh = await store.get_agent_conversation(case.id, conversation.id)
+    assert fresh.history_partial_at is None
+    assert len(fresh.history) == 2

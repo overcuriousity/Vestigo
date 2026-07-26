@@ -32,9 +32,11 @@ from vestigo import __version__
 from vestigo.agent.availability import agent_available
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
 from vestigo.agent.fidelity import fidelity_config_warning, resolve_fidelity
+from vestigo.agent.resume import RESUME_NOTE
 from vestigo.agent.runtime import (
     LLM_TIMEOUT,
     SYSTEM_PROMPT,
+    TurnRecorder,
     dump_history,
     load_history,
     stream_turn,
@@ -537,6 +539,11 @@ async def _message_stream_inner(
         fidelity=resolve_fidelity(config.tool_fidelity, config.context_window),
     )
     history = load_history(conversation.history)
+    # Set when `history` is a mid-turn checkpoint rather than a completed turn.
+    # Telling the model keeps it from re-running the orientation sweep it
+    # already paid for (observed in the 2026-07-26 export).
+    resume_note = RESUME_NOTE if conversation.history_partial_at is not None else None
+    recorder = TurnRecorder()
 
     if (
         warning := fidelity_config_warning(config.tool_fidelity, config.context_window)
@@ -658,9 +665,30 @@ async def _message_stream_inner(
         )
         return detail
 
+    async def _persist_partial() -> None:
+        """Store what the turn has produced so far, marked as mid-turn.
+
+        Called from every exit that is not a completed turn — a stop, a
+        provider error, the checkpoints in between. A hard kill runs none of
+        them, which is exactly why the checkpoints exist.
+        """
+        if not recorder.messages:
+            return
+        await store.update_agent_conversation(
+            conversation_id,
+            history=dump_history(history + recorder.messages),
+            history_partial_at=datetime.now(UTC),
+        )
+
     for attempt in range(2):
         text_parts = []
         window_stats = WindowStats()
+        # Attempt 1 re-runs the turn from the same `history` base, so the
+        # recorder must start empty — otherwise the persisted blob would carry
+        # the failed attempt's messages ahead of the re-run's and stop being a
+        # faithful record of what ran.
+        recorder.messages = []
+        recorder.revision = 0
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return
@@ -677,6 +705,8 @@ async def _message_stream_inner(
                 window_budget=window_budget,
                 window_stats=window_stats,
                 chars_per_token=chars_per_token,
+                recorder=recorder,
+                resume_note=resume_note,
             ):
                 # A stop lands here, between streamed events — so the partial
                 # turn is persisted the same way the interrupt paths below do
@@ -693,10 +723,17 @@ async def _message_stream_inner(
                         await store.add_agent_message(
                             conversation_id, "assistant", "".join(text_parts) + " [stopped]"
                         )
+                    # A stop is an interruption like any other: the analyst's
+                    # next message must be answered against this turn's work.
+                    await _persist_partial()
                     if (stats_detail := await _persist_window_stats(attempt)) is not None:
                         yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
                     yield _sse({"type": "cancelled"})
                     return
+                if event["type"] == "checkpoint":
+                    # Router-internal: persist the snapshot, never forward it.
+                    await _persist_partial()
+                    continue
                 if event["type"] == "result":
                     turn = event["turn"]
                     await store.add_agent_message(
@@ -707,7 +744,11 @@ async def _message_stream_inner(
                         completion_tokens=turn.completion_tokens,
                     )
                     await store.update_agent_conversation(
-                        conversation_id, history=dump_history(history + turn.new_messages)
+                        conversation_id,
+                        history=dump_history(history + turn.new_messages),
+                        # Completed: the stored history is a turn boundary
+                        # again, so the next turn needs no resume note.
+                        history_partial_at=None,
                     )
                     # One honest row per turn (the stats are the turn's
                     # maxima across its requests), not one per request.
@@ -880,6 +921,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            await _persist_partial()
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if overflow:
@@ -909,6 +951,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            await _persist_partial()
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if isinstance(exc, UsageLimitExceeded):
@@ -930,6 +973,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            await _persist_partial()
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             yield _sse({"type": "error", "detail": "Agent turn failed — see server logs."})

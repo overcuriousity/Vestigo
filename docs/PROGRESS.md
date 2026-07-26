@@ -1,9 +1,49 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 104 — PR #186 review remediation).
+Last updated: 2026-07-26 (session 105 — agent turn checkpointing).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 105 — 2026-07-26: an interrupted agent turn keeps its history
+
+**Why.** `AgentConversation.history` — the only thing a follow-up turn replays — was
+written exactly once per turn, in the `result` branch. Every other exit (analyst
+presses Stop, provider 5xx, `UsageLimitExceeded`, the process dying) dropped the whole
+turn's messages, and the *next* completed turn then overwrote the blob from the
+pre-interruption base, so the work was lost permanently while the UI kept showing the
+tool rows. The 2026-07-26 export has 125 persisted tool rows against an empty history
+blob, and the follow-up turn re-ran the entire orientation sweep.
+
+- **`agent/resume.py` (new).** `repair_partial` turns a mid-turn snapshot into
+  something replayable: it answers tool calls left unpaired — with the result the turn
+  actually streamed, or an explicit `interrupted` marker, never anything invented — and
+  drops trailing `ToolCallPart`s that never reached the executor (a dead model stream
+  leaves half-written JSON arguments behind). Pure and idempotent, which is the same
+  determinism constraint the sliding window holds to. `RESUME_NOTE` lives here too.
+- **`stream_turn` now drives `agent.iter`** instead of `agent.run_stream`, so the run's
+  live message list is reachable mid-turn. It fills a caller-owned `TurnRecorder` after
+  every tool result and every completed node and yields a router-internal
+  `{"type": "checkpoint"}` alongside. Per tool result, not just per node: a batch of
+  four ClickHouse queries is seconds of work a `kill -9` must not erase.
+- **`agent_conversations.history_partial_at`** (Alembic revision) records that the
+  stored blob is a mid-turn checkpoint rather than a turn boundary. It needs the
+  store's `UNSET` sentinel, because `None` *is* its clearing value.
+- **The router persists on every non-result exit** — each checkpoint, the cancel branch,
+  and all three `except` branches — and stamps `history_partial_at`; only a completed
+  turn clears it. A stop is treated as an interruption like any other: the analyst's
+  next message must be answered against this turn's work. While the stamp is set, the
+  next turn carries `RESUME_NOTE` so the model builds on the findings instead of
+  re-orienting. The recorder is reset per attempt, so the reactive overflow re-run
+  replays from the same pre-turn base rather than concatenating attempt 0's messages.
+- **`checkpoint` never reaches the client.** The router's stream loop ends in an
+  unconditional `yield _sse(event)`, so the guard `continue`s; a test asserts no
+  checkpoint event appears in the SSE stream of a stopped turn.
+
+No new truncation logic: a resumed history is ordinary `message_history`, still sized by
+`agent/window.py`, and the learned budget and calibrated `chars_per_token` persist per
+conversation — so a resumed turn starts with the budget the interrupted turn paid to
+learn. `docs/AGENT.md` §Turn checkpointing and resume documents the mechanism.
 
 ## Session 104 — 2026-07-26: PR #186 review remediation
 
