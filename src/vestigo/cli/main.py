@@ -9,6 +9,7 @@ import typer
 
 from vestigo import __version__
 from vestigo.cli.progress import BytesProgressPrinter
+from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.db.postgres import PostgresStore, User, generate_id
 from vestigo.ingestion.files import hash_file
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -28,6 +29,21 @@ def _get_store() -> PostgresStore:
     return PostgresStore()
 
 
+async def _bootstrap(store: PostgresStore) -> None:
+    """Bring the schema up to date and apply the DB-backed settings layer.
+
+    The CLI mirrors what the API does, and that includes configuration: an
+    admin who tuned ``ingest_batch_size`` or an embedding endpoint in the web
+    console expects ``vestigo ingest`` to honour it. Without this the CLI would
+    silently run on the environment and the built-in defaults, which is a
+    different configuration than the one the deployment is showing its
+    operator. The store is passed explicitly so this never touches the API's
+    process-wide singleton (``api.deps.get_store``).
+    """
+    await store.init_schema()
+    await load_runtime_settings(store)
+
+
 @app.command()
 def version() -> None:
     """Print the Vestigo version."""
@@ -45,7 +61,7 @@ def cases_list() -> None:
     store = _get_store()
 
     async def _run() -> None:
-        await store.init_schema()
+        await _bootstrap(store)
         cases = await store.list_cases()
         users = {u.id: u for u in await store.list_users()}
         teams = {t.id: t for t in await store.list_teams()}
@@ -143,7 +159,7 @@ def ingest(
     store = _get_store()
 
     async def _run() -> None:
-        await store.init_schema()
+        await _bootstrap(store)
         resolved_user = await _resolve_actor(store, user)
         case_obj = await store.get_case(case)
         if case_obj is None:
@@ -237,7 +253,7 @@ def embed(
     store = _get_store()
 
     async def _run() -> None:
-        await store.init_schema()
+        await _bootstrap(store)
         resolved_user = await _resolve_actor(store, user)
         case_obj = await store.get_case(case)
         if case_obj is None:

@@ -35,10 +35,11 @@ function toText(setting: InstanceSetting): string {
  * than letting the backend reject the whole batch with a pydantic trace. */
 function parseValue(setting: InstanceSetting, text: string): unknown {
   const trimmed = text.trim();
-  // Empty means different things per kind: for a string it is a legitimate
-  // value (an empty sigma_rules_path disables the global set), for everything
-  // else it means "no opinion" — clear the override.
-  if (trimmed === "") return setting.kind === "str" ? "" : null;
+  // Empty is ambiguous, and the annotation resolves it: a nullable field means
+  // "unset" (storing "" there would leave it reading as customized forever),
+  // a plain string means the empty value itself — an empty sigma_rules_path
+  // disables the global ruleset. Anything else has no empty form at all.
+  if (trimmed === "") return setting.kind === "str" && !setting.nullable ? "" : null;
   if (setting.kind === "int") {
     const n = Number(trimmed);
     if (!Number.isInteger(n)) throw new Error(`${setting.label}: expected a whole number`);

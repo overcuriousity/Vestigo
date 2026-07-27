@@ -1,9 +1,51 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 109 — settings in the database, subsystem capability gating).
+Last updated: 2026-07-27 (session 110 — PR #189 review fixes).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 110 — 2026-07-27: PR #189 review fixes
+
+**Why.** A review of the session-109 branch found that generalizing "hide what isn't
+configured" had introduced a way for a *configured* subsystem to disappear, and that the
+new configuration layer had three gaps at its edges.
+
+- **A cold availability cache is not the same answer as "nothing installed".**
+  `capabilities.enrichers` read the enricher availability cache, which was filled by
+  `refresh_availability()` from inside `_startup_recovery` — a background task, behind
+  three ClickHouse-touching steps in one `try`. Any of them raising (the documented
+  reason those steps are backgrounded at all) left the cache cold for the process
+  lifetime, and the whole Enrichment UI vanished from an installation whose GeoLite2
+  database was right there. The sweep now runs in the lifespan, where a local filesystem
+  check belongs, and `_enrichers_available` fills a cold cache itself rather than
+  reporting false — so the capability no longer depends on anyone's call ordering.
+- **The CLI reads the settings layer now.** `load_runtime_settings` was called only from
+  the API lifespan, so `vestigo ingest` ran on the environment and the defaults while the
+  console showed the operator something else. It takes an optional store (the CLI owns
+  its own; going through `api.deps` would open a second engine) and a `_bootstrap` helper
+  pairs it with `init_schema` at all three command entry points.
+- **Clearing beats pinning.** `save_runtime_settings` refused *any* mention of an
+  env-pinned field, including `null`. Pinning a field that already had an override
+  therefore stranded the row: the merge ignores it forever, and the console renders no
+  reset control for a read-only field. Writes are still refused; clears are not.
+- **Empty is ambiguous, and the annotation resolves it.** The console sent `""` for every
+  emptied string, so clearing an optional field (`oidc_issuer`, `embedding_api_base_url`)
+  stored an empty string and left it reading as customized. The payload now carries
+  `nullable`, derived off the pydantic annotation like the bounds already are, and empty
+  means "unset" only where `None` is a legal value — an empty `sigma_rules_path` is still
+  the value that disables the global ruleset.
+- **`capabilities` needs a session.** `/api/health` is exempt from the auth gate because
+  the login page needs `oidc_enabled`, which meant the capability map — an inventory of
+  which optional subsystems an instance runs — was readable anonymously. The body is
+  split rather than the route closed; the frontend invalidates `["health"]` on login so
+  the map arrives immediately, and drops it on logout.
+- **Two smaller ones.** The Similarity tab could render with no tab to leave it by (the
+  initial state and the content switch weren't gated, only the tab button), fixed with a
+  derived `activeTab`. And `_require_transfer_enabled`'s docstring claimed it refused
+  every transfer route while the export *download* is deliberately exempt — an archive
+  already produced is single-use and swept shortly after, so refusing it would strand a
+  legitimate export rather than prevent a new one.
 
 ## Session 109 — 2026-07-27: every setting in the database, every subsystem gated
 

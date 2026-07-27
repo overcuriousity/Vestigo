@@ -19,13 +19,15 @@ def test_embeddings_available_true_in_dev_env():
     assert embeddings_available() is True
 
 
-def test_health_reports_embeddings_available(client):
+def test_health_reports_embeddings_available(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
     assert client.get("/api/health").json()["embeddings_available"] is True
 
 
-def test_health_reports_embeddings_unavailable(client, monkeypatch):
+def test_health_reports_embeddings_unavailable(client, admin_bootstrap, monkeypatch):
     # /api/health resolves every optional subsystem through core.capabilities,
     # which imports the predicate per call — so the patch lands on its origin.
+    as_admin(client, admin_bootstrap)
     monkeypatch.setattr(embeddings_module, "embeddings_available", lambda: False)
     body = client.get("/api/health").json()
     assert body["embeddings_available"] is False

@@ -16,6 +16,7 @@ from vestigo.core.settings_registry import (
     all_specs,
     editable_fields,
     field_kind,
+    is_nullable,
     secret_fields,
 )
 
@@ -43,6 +44,38 @@ def test_bootstrap_fields_are_env_only():
 def test_secret_fields_render_as_secrets():
     for field in secret_fields():
         assert field_kind(field) == "secret"
+
+
+def test_nullability_is_read_off_the_annotation():
+    """The console needs this to tell "unset" from a literal empty string."""
+    assert is_nullable("oidc_issuer") is True
+    assert is_nullable("embedding_api_base_url") is True
+    # A plain str: empty is a value (it disables the global ruleset), not "unset".
+    assert is_nullable("sigma_rules_path") is False
+    assert is_nullable("stat_rarity_floor") is False
+
+
+def test_clearing_a_nullable_field_stores_null_not_empty_string(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
+    client.put("/api/admin/settings", json={"values": {"oidc_issuer": "https://idp.local"}})
+
+    resp = client.put("/api/admin/settings", json={"values": {"oidc_issuer": None}})
+    assert resp.status_code == 200, resp.text
+    by_field = {f["field"]: f for f in resp.json()["settings"]}
+    assert by_field["oidc_issuer"]["source"] == "default"
+    assert by_field["oidc_issuer"]["value"] is None
+    assert by_field["oidc_issuer"]["nullable"] is True
+
+
+def test_empty_string_stays_a_value_for_a_non_nullable_field(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
+    resp = client.put("/api/admin/settings", json={"values": {"sigma_rules_path": ""}})
+    assert resp.status_code == 200, resp.text
+    by_field = {f["field"]: f for f in resp.json()["settings"]}
+    assert by_field["sigma_rules_path"]["nullable"] is False
+    # Stored as an explicit override, not treated as a clear.
+    assert by_field["sigma_rules_path"]["source"] == "db"
+    assert by_field["sigma_rules_path"]["value"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +204,56 @@ async def test_stored_override_loses_to_the_environment(store, monkeypatch):
     get_settings.cache_clear()
     await load_runtime_settings()
     assert get_settings().stat_rarity_floor == 11
+
+
+async def test_clearing_is_allowed_for_a_field_the_environment_later_pinned(store, monkeypatch):
+    """A pin must not strand the row it made irrelevant.
+
+    Writing to a pinned field is refused, but ``null`` only deletes a row the
+    merge already ignores — and the console shows no reset control for a
+    read-only field, so refusing it would leave the row uncleanable.
+    """
+    from vestigo.core.runtime_settings import (
+        SettingsValidationError,
+        load_runtime_settings,
+        save_runtime_settings,
+    )
+
+    await store.init_schema()
+    await store.set_app_settings({"stat_rarity_floor": 7}, "u1")
+
+    monkeypatch.setenv("VESTIGO_STAT_RARITY_FLOOR", "11")
+    get_settings.cache_clear()
+    await load_runtime_settings()
+    assert get_settings().stat_rarity_floor == 11
+
+    # Writing to the pinned field is still refused...
+    with pytest.raises(SettingsValidationError):
+        await save_runtime_settings({"stat_rarity_floor": 4}, "u1")
+
+    # ...but clearing the now-dead row works.
+    await save_runtime_settings({"stat_rarity_floor": None}, "u1")
+    assert await store.list_app_settings() == []
+
+
+async def test_load_accepts_an_explicit_store(store, monkeypatch):
+    """Callers that own a store pass it in — no reach for the API singleton.
+
+    The CLI builds its own ``PostgresStore``; falling through to
+    ``api.deps.get_store`` there would open a second engine for one read.
+    """
+    from vestigo.api import deps
+    from vestigo.core.runtime_settings import load_runtime_settings
+
+    await store.init_schema()
+    await store.set_app_settings({"stat_rarity_floor": 8}, "u1")
+
+    def _boom() -> None:
+        raise AssertionError("the API singleton must not be consulted")
+
+    monkeypatch.setattr(deps, "get_store", _boom)
+    assert await load_runtime_settings(store) == {"stat_rarity_floor": 8}
+    assert get_settings().stat_rarity_floor == 8
 
 
 async def test_invalid_stored_value_is_ignored_not_fatal(store, caplog):

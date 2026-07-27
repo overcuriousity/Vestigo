@@ -45,11 +45,16 @@ def _too_many_transfers(limit: int) -> HTTPException:
 
 
 def _require_transfer_enabled() -> None:
-    """Refuse every transfer route when the subsystem is switched off.
+    """Refuse to *start* a transfer when the subsystem is switched off.
 
     Paired with the ``transfer`` capability on ``/api/health``, which is what
     removes the export/import buttons from the UI — this is the enforcement
     behind that, so a hand-crafted request gets the same answer.
+
+    Deliberately not applied to the export *download* route: the archive it
+    serves was already produced under the old setting, is single-use, and is
+    swept from disk shortly after. Refusing it would strand an export that was
+    legitimately started rather than prevent anything new.
     """
     if not get_settings().transfer_enabled:
         raise HTTPException(

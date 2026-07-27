@@ -30,6 +30,7 @@ from vestigo.core.settings_registry import (
     env_var_name,
     field_constraints,
     field_kind,
+    is_nullable,
     secret_fields,
 )
 from vestigo.db.postgres import User, generate_id
@@ -557,6 +558,7 @@ def _settings_payload() -> dict[str, Any]:
             "label": spec.label,
             "help": spec.help,
             "kind": field_kind(spec.field),
+            "nullable": is_nullable(spec.field),
             "constraints": field_constraints(spec.field),
             "choices": list(spec.choices) if spec.choices else None,
             "default": default_value(spec.field),

@@ -914,22 +914,29 @@ export interface Capabilities {
   transfer: boolean;
 }
 
+/**
+ * `/api/health`. Everything below `oidc_enabled` requires a session: which
+ * optional subsystems an instance runs is an inventory of its attack surface,
+ * while the login page legitimately needs to know the app is up and whether to
+ * render the SSO button. Hence the optional fields — an anonymous response
+ * carries only the first three.
+ */
 export interface HealthResponse {
   status: "ok";
   version: string;
+  oidc_enabled: boolean;
   /** One entry per optional subsystem — false means "unconfigured", and the UI
    * renders no entry point for it. The flat flags below are older aliases. */
-  capabilities: Capabilities;
-  oidc_enabled: boolean;
+  capabilities?: Capabilities;
   /** False when neither local embedding deps nor a remote endpoint are configured. */
-  embeddings_available: boolean;
+  embeddings_available?: boolean;
   /**
    * True only when VESTIGO_AGENT_* is configured and the LLM endpoint
    * answered the backend's probe — the agent UI renders nothing otherwise.
    */
-  agent_available: boolean;
+  agent_available?: boolean;
   /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
-  mcp_enabled: boolean;
+  mcp_enabled?: boolean;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */

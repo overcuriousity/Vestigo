@@ -136,6 +136,22 @@ def test_cases_list_shows_owner_and_team(store):
     assert "Blue Team" in result.stdout
 
 
+def test_cli_applies_database_backed_settings(store):
+    """A tunable set in the web console must reach the CLI too.
+
+    Otherwise ``vestigo ingest`` runs on a different configuration than the one
+    the deployment shows its operator — the CLI is meant to mirror the API.
+    """
+    from vestigo.core.config import get_settings
+
+    run_async(store.set_app_settings({"stat_rarity_floor": 17}, "admin"))
+    assert get_settings().stat_rarity_floor != 17
+
+    result = runner.invoke(cli_main.app, ["cases", "list"])
+    assert result.exit_code == 0
+    assert get_settings().stat_rarity_floor == 17
+
+
 # --------------------------------------------------------------------------
 # vestigo ingest — case validation
 # --------------------------------------------------------------------------

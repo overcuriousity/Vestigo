@@ -19,7 +19,7 @@ Two invariants matter here:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -30,6 +30,9 @@ from vestigo.core.config import (
     set_runtime_overrides,
 )
 from vestigo.core.settings_registry import editable_fields, secret_fields
+
+if TYPE_CHECKING:
+    from vestigo.db.postgres import PostgresStore
 
 logger = logging.getLogger(__name__)
 
@@ -100,16 +103,23 @@ def _usable_overrides(stored: dict[str, Any]) -> dict[str, Any]:
     return accepted
 
 
-async def load_runtime_settings() -> dict[str, Any]:
+async def load_runtime_settings(store: PostgresStore | None = None) -> dict[str, Any]:
     """Read overrides from Postgres and apply them to this process.
 
     Best-effort, like the agent resolver: an unreachable metadata store logs
     and leaves the environment layer in place rather than blocking startup.
+
+    ``store`` lets a caller that already owns a :class:`PostgresStore` pass it
+    in — the CLI builds its own rather than going through ``api.deps``, and
+    falling through to the API's process-wide singleton there would open a
+    second engine for one read.
     """
     try:
-        from vestigo.api.deps import get_store
+        if store is None:
+            from vestigo.api.deps import get_store
 
-        rows = await get_store().list_app_settings()
+            store = get_store()
+        rows = await store.list_app_settings()
     except Exception:
         logger.warning(
             "Could not read app_settings; running on environment defaults", exc_info=True
@@ -134,7 +144,11 @@ async def save_runtime_settings(values: dict[str, Any], updated_by: str | None) 
 
     settings = get_base_settings()
     to_set = {k: v for k, v in values.items() if v is not None}
-    pinned = sorted(k for k in values if env_pinned(k))
+    # Only *writes* are refused. Clearing stays allowed even for a pinned field:
+    # pinning a field that already had a stored override leaves a dead row that
+    # the merge skips forever, and the console renders no reset control for a
+    # read-only field — so a refusal here would make that row uncleanable.
+    pinned = sorted(k for k in to_set if env_pinned(k))
     if pinned:
         raise SettingsValidationError(
             "pinned by the environment, edit the deployment instead: " + ", ".join(pinned)

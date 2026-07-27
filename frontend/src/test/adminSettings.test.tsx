@@ -28,6 +28,7 @@ function setting(over: Partial<InstanceSetting> & { field: string }): InstanceSe
     label: over.field,
     help: "",
     kind: "int",
+    nullable: false,
     constraints: {},
     choices: null,
     default: 3,
@@ -115,6 +116,41 @@ describe("AdminSettingsPage", () => {
     fireEvent.change(input, { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith({ stat_rarity_floor: null }));
+  });
+
+  it("empties a nullable string to null and a plain string to ''", async () => {
+    getMock.mockResolvedValue({
+      ...PAYLOAD,
+      settings: [
+        setting({
+          field: "oidc_issuer",
+          kind: "str",
+          nullable: true,
+          value: "https://idp.local",
+          default: null,
+          source: "db",
+        }),
+        setting({
+          field: "sigma_rules_path",
+          kind: "str",
+          nullable: false,
+          value: "/rules",
+          default: "",
+          source: "db",
+        }),
+      ],
+    });
+    renderPage();
+    fireEvent.change(await screen.findByDisplayValue("https://idp.local"), {
+      target: { value: "" },
+    });
+    fireEvent.change(screen.getByDisplayValue("/rules"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+    // Unset vs. the empty value itself — storing "" for the optional field would
+    // leave it reading as customized forever.
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith({ oidc_issuer: null, sigma_rules_path: "" }),
+    );
   });
 
   it("refuses a malformed value locally, naming the field", async () => {

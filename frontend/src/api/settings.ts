@@ -12,6 +12,10 @@ export interface InstanceSetting {
   label: string;
   help: string;
   kind: SettingKind;
+  /** Whether the field accepts `null`. Decides what an emptied text box means:
+   * "unset" for a nullable field, a literal empty value otherwise (an empty
+   * `sigma_rules_path` disables the global ruleset). */
+  nullable: boolean;
   constraints: { ge?: number; gt?: number; le?: number; lt?: number; pattern?: string };
   choices: string[] | null;
   default: unknown;

@@ -16,6 +16,7 @@ cached availability record — because health is polled every 15 seconds.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from vestigo.core.config import get_settings
@@ -32,14 +33,28 @@ CAPABILITY_KEYS: tuple[str, ...] = (
 )
 
 
-def _enrichers_available() -> bool:
-    from vestigo.enrichers.registry import all_enrichers, get_cached_availability
+async def _enrichers_available() -> bool:
+    """Whether any enricher has its runtime asset in place.
 
-    for enricher in all_enrichers():
-        availability = get_cached_availability(enricher.key)
-        if availability is not None and availability.available:
-            return True
-    return False
+    Reads the availability cache the app fills at startup. A *cold* cache is
+    not the same answer as "nothing available" — it means nobody has looked
+    yet — so it is filled here rather than reported as false, which is what
+    keeps the Enrichment UI from vanishing if the startup sweep never ran. The
+    refresh is a per-enricher filesystem check, so it happens at most once per
+    process; every later poll is a dict read.
+    """
+    from vestigo.enrichers.registry import (
+        all_enrichers,
+        get_cached_availability,
+        refresh_availability,
+    )
+
+    enrichers = all_enrichers()
+    if all(get_cached_availability(e.key) is None for e in enrichers):
+        results = await asyncio.to_thread(refresh_availability)
+    else:
+        results = {e.key: a for e in enrichers if (a := get_cached_availability(e.key))}
+    return any(a.available for a in results.values())
 
 
 def _oidc_available(settings: Any) -> bool:
@@ -63,7 +78,7 @@ async def get_capabilities() -> dict[str, bool]:
         "agent": await agent_available(),
         "mcp": settings.mcp_enabled,
         "oidc": _oidc_available(settings),
-        "enrichers": _enrichers_available(),
+        "enrichers": await _enrichers_available(),
         # Sigma needs no configuration: rules can be uploaded per case, and the
         # pysigma backend is a hard dependency. The capability exists so the
         # frontend gates every subsystem the same way, not because it varies.

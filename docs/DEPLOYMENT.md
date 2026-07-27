@@ -38,16 +38,46 @@ Three things the console handles specially:
   to refuse database storage of secrets entirely, in which case environment variables
   are the only way to supply them. (The LLM key has its own equivalent switch,
   `VESTIGO_AGENT_SECRET_MODE`, and is edited on the Agent tab.)
+- **Optional (nullable) fields** distinguish "unset" from an empty value. Emptying an
+  optional field's box clears it; emptying a plain string field stores the empty string,
+  which for `VESTIGO_SIGMA_RULES_PATH` is a meaningful value (it disables the global
+  ruleset). One asymmetry: `VESTIGO_QDRANT_URL` cannot be unset from the console —
+  clearing it restores the default endpoint. Select an embedded on-disk Qdrant with
+  `VESTIGO_QDRANT_PATH` (environment-only), which takes precedence over the URL.
+
+**Back up accordingly.** Any secret an admin stores through the console lives in the
+`app_settings` table in plaintext, so every Postgres dump, replica and filesystem
+snapshot of the metadata store now carries the ClickHouse password, the Qdrant API key,
+the embedding API key and the OIDC client secret. Treat those backups as secret
+material, or set `VESTIGO_SECRETS_MODE=env-only` and keep the credentials in the
+deployment environment.
+
+**What an administrator can now change at runtime.** The console reaches the security
+knobs too — `VESTIGO_AUDIT_ENABLED`, the login-backoff thresholds, the session TTL and
+the OIDC registration. An admin can therefore disable the audit trail without shell
+access (the PUT that does so is itself audited, so the change leaves a final record).
+Pin these in the environment on deployments where an admin account must not be able to
+weaken them.
 
 Settings are cached per process and reloaded on save, matching the single-process
 deployment model the job store already assumes. If you run more than one app process
-against one database, restart the others after a settings change.
+against one database, restart the others after a settings change. The CLI
+(`vestigo ingest`, `vestigo embed`) reads the same layer at startup, so console-tuned
+values apply to scripted runs too.
 
 **Optional subsystems are hidden when unconfigured.** `/api/health` reports a
 `capabilities` map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer);
 a subsystem that is off or unconfigured renders no entry point in the UI and — for the
 AI agent — its tools are not advertised to the model at all. The endpoints refuse
 independently, so hiding is never the only enforcement.
+
+The map requires a session: an anonymous `GET /api/health` answers with liveness,
+version and `oidc_enabled` only, since the login page needs those and an inventory of
+which subsystems an instance runs is otherwise not public. One exception to "refuses
+independently": with `VESTIGO_TRANSFER_ENABLED=false`, starting an export or import is
+refused with 503, but an archive an earlier export already produced can still be
+downloaded — it is single-use and swept from disk shortly after, so refusing it would
+only strand a legitimate export.
 
 ## Reference compose stack
 

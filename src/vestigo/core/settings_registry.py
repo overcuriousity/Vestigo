@@ -262,7 +262,9 @@ _SPECS: tuple[SettingSpec, ...] = (
         "qdrant_url",
         "stores",
         "Qdrant URL",
-        "Vector store endpoint. Clear it to use an embedded on-disk Qdrant path instead.",
+        "Vector store endpoint. Ignored entirely when the (environment-only) Qdrant local "
+        "path is set, which is how an embedded on-disk Qdrant is selected — clearing this "
+        "field here restores the default endpoint rather than unsetting it.",
         restart_required=True,
     ),
     SettingSpec(
@@ -816,6 +818,23 @@ def field_kind(field: str) -> Kind:
         if candidate in (dict, list) or typing.get_origin(candidate) in (dict, list):
             return "json"
     return "str"
+
+
+@lru_cache
+def is_nullable(field: str) -> bool:
+    """Whether ``None`` is a value this field accepts.
+
+    Read off the annotation rather than restated in the spec, for the same
+    reason as :func:`field_constraints`. The console needs it because an empty
+    text box is ambiguous: for ``sigma_rules_path`` (a plain ``str``) empty is a
+    meaningful value that disables the global ruleset, while for an optional
+    field it means "unset", and storing ``""`` there would leave the setting
+    reading as customized forever.
+    """
+    annotation = Settings.model_fields[field].annotation
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        return type(None) in typing.get_args(annotation)
+    return annotation is type(None)
 
 
 def _unwrap_optional(annotation: Any) -> tuple[Any, ...]:
