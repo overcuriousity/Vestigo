@@ -8,15 +8,26 @@ and scope binding are all exercised.
 from __future__ import annotations
 
 import json
+import typing
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
+from pydantic import BaseModel, ValidationError
 
 from vestigo.agent.fidelity import Fidelity
-from vestigo.agent.tools import AgentScope, build_tool_server, schema_chars_for_scope
+from vestigo.agent.schema_slim import SHARED_SPEC_NAMES
+from vestigo.agent.tools import (
+    AgentScope,
+    ChartSpec,
+    FilterSpec,
+    ObjectArgModel,
+    _admits_json_object,
+    build_tool_server,
+    schema_chars_for_scope,
+)
 from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
@@ -2024,6 +2035,230 @@ async def test_corr_field_list_refuses_rather_than_truncates(store, monkeypatch)
     assert not any(name == "field_correlation" for name, _, _ in fake.calls)
 
 
+# ── provider-stringified spec ───────────────────────────────────────────────
+
+
+async def test_spec_handed_over_as_a_json_string_is_parsed(store, monkeypatch):
+    """Some providers emit a nested object argument as a JSON string.
+
+    Rejecting it costs the model a retry it has to guess its way out of, and
+    the stringified args are persisted on the tool-call row either way — so
+    parse it here and keep the stored row renderable.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart('{"chart_type": "bar", "field": "attr:status", "scale": "nominal"}'),  # type: ignore[arg-type]
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["chart_type"] == "bar"
+
+
+async def test_a_stringified_filter_spec_reaches_the_query_end_to_end(store, monkeypatch):
+    """`FilterSpec` is a nested argument on 14 tools, not a chart-only shape.
+
+    The same provider that stringifies a chart spec stringifies these, so the
+    tolerance belongs to the position (nested argument) — `ObjectArgModel` —
+    rather than to any one spec. One tool end to end here, because the point
+    of this case is that the coercion survives the whole MCP argument-parsing
+    path and not just `model_validate`; that every nested-argument model is
+    covered at all is
+    `test_every_nested_argument_model_derives_from_object_arg_model`'s job.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "histogram",
+        {"filters": '{"q": "failed login", "artifacts": ["auth"]}'},
+    )
+    # Reaching the aggregation at all is the assertion: an unparsed string
+    # never gets past argument validation.
+    assert "error" not in result
+    assert "buckets" in result
+    spec = FilterSpec.model_validate('{"q": "failed login", "artifacts": ["auth"]}')
+    assert spec.q == "failed login"
+    assert spec.artifacts == ["auth"]
+
+
+def test_a_stringified_spec_still_reaches_the_legacy_kind_translation():
+    """Both before-validators run, in whichever order pydantic picks."""
+    spec = ChartSpec.model_validate('{"kind": "terms", "field": "attr:status", "limit": 5}')
+    assert spec.chart_type == "bar"
+    assert spec.options.top_n == 5
+
+
+def test_unparseable_object_arg_falls_through_to_the_normal_error():
+    with pytest.raises(ValidationError):
+        ChartSpec.model_validate("not json at all")
+
+
+def test_a_stringified_value_inside_a_spec_is_parsed_too():
+    """A provider that stringifies one level tends to stringify the next.
+
+    ``FilterSpec.filters`` is a plain ``dict`` field, not a nested model, so
+    nothing about it being a spec would have covered it — `ObjectArgModel`
+    coerces it because its *annotation* admits an object.
+    """
+    spec = FilterSpec.model_validate({"filters": '{"attr:status": ["500"]}', "q": "boom"})
+    assert spec.filters == {"attr:status": ["500"]}
+    assert spec.q == "boom"
+
+    chart = ChartSpec.model_validate(
+        {
+            "chart_type": "bar",
+            "field": "attr:status",
+            "options": '{"top_n": 7}',
+            "compare": '{"mode": "custom", "filters": {"q": "baseline"}}',
+        }
+    )
+    assert chart.options.top_n == 7
+    assert chart.compare is not None
+    assert chart.compare.mode == "custom"
+    assert chart.compare.filters is not None
+    assert chart.compare.filters.q == "baseline"
+
+
+def test_a_string_field_is_never_coerced_even_when_it_holds_json():
+    """The safety rule behind `_admits_json_object`.
+
+    ``q`` is free text an analyst may well have typed as JSON. Coercing any
+    string that happens to parse would rewrite the query into a dict and fail
+    validation on a search that is perfectly legal.
+    """
+    spec = FilterSpec.model_validate({"q": '{"chart_type": "bar"}'})
+    assert spec.q == '{"chart_type": "bar"}'
+
+
+def test_object_field_coverage_is_derived_not_hand_maintained():
+    """Pins which fields the coercion covers, so a new one is a decision.
+
+    Adding a dict-typed field to one of these specs silently widens the set;
+    adding a differently-shaped one silently doesn't. Either way this test
+    says so at the moment of the change rather than in production.
+    """
+    assert FilterSpec._object_fields() == {
+        "filters",
+        "exclusions",
+        "filter_modes",
+        "exclusion_modes",
+    }
+    assert {"filters", "compare", "options"} <= ChartSpec._object_fields()
+    # `field`/`fields`/`metric` are str/list/enum — an object is not what a
+    # string there could have meant.
+    assert not ({"field", "fields", "metric", "scale"} & ChartSpec._object_fields())
+
+
+def _nested_arg_models() -> dict[str, set[type[BaseModel]]]:
+    """Every pydantic model reachable as a *nested* tool argument, by tool name.
+
+    Walks the built server's real signatures rather than a hand-kept list: the
+    invariant is about the position an argument occupies, so it has to be read
+    off the positions that actually exist.
+    """
+
+    def models_in(annotation: Any) -> set[type[BaseModel]]:
+        found: set[type[BaseModel]] = set()
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            found.add(annotation)
+        for arg in typing.get_args(annotation):
+            found |= models_in(arg)
+        return found
+
+    scope = _scope("c1", "t1", source_ids=["s1"], fidelity=Fidelity.FULL)
+    by_tool: dict[str, set[type[BaseModel]]] = {}
+    for tool in build_tool_server(scope)._tool_manager.list_tools():
+        hints = typing.get_type_hints(tool.fn)
+        hints.pop("return", None)
+        direct: set[type[BaseModel]] = set()
+        for annotation in hints.values():
+            direct |= models_in(annotation)
+        # Transitively: a model reached through another model's field is just
+        # as nested, and `FilterSpec` inside `ChartSpec.compare` is exactly the
+        # position that broke.
+        reachable = set(direct)
+        queue = list(direct)
+        while queue:
+            for field in queue.pop().model_fields.values():
+                for model in models_in(field.annotation):
+                    if model not in reachable:
+                        reachable.add(model)
+                        queue.append(model)
+        if reachable:
+            by_tool[tool.name] = reachable
+    return by_tool
+
+
+def test_every_nested_argument_model_derives_from_object_arg_model():
+    """The invariant `ObjectArgModel` states about itself, enforced.
+
+    `docs/AGENT.md` and the class docstring both call it "the base for every
+    nested-argument model", but inheritance is a thing a future spec can
+    simply not do — and the failure mode is not a test failure, it is one
+    provider retry-looping in production on a tool it is using correctly.
+    Derived from the real signatures so a model added tomorrow is covered.
+    """
+    by_tool = _nested_arg_models()
+    assert by_tool, "no nested model arguments found — the walk is broken, not the invariant"
+    offenders = {
+        (tool, model.__name__)
+        for tool, models in by_tool.items()
+        for model in models
+        if not issubclass(model, ObjectArgModel)
+    }
+    assert not offenders, f"nested tool-argument models not based on ObjectArgModel: {offenders}"
+    # The walk must be seeing the real thing, not an empty set that trivially
+    # passes: FilterSpec is a nested argument on most of the toolset, and
+    # ChartSpec reaches FilterSpec transitively through `compare`.
+    assert sum(FilterSpec in m for m in by_tool.values()) > 10
+    assert FilterSpec in by_tool["propose_chart"]
+
+
+def test_every_nested_argument_model_has_inspectable_annotations():
+    """`_admits_json_object` raises on an annotation it cannot decide.
+
+    An unresolved forward reference would otherwise be silently read as "does
+    not admit an object" and drop that field from coercion. This asserts the
+    computation succeeds for every model actually in a nested position, which
+    is the same thing as asserting every one of them is rebuilt.
+    """
+    for models in _nested_arg_models().values():
+        for model in models:
+            assert isinstance(model._object_fields(), frozenset)
+
+
+def test_admits_json_object_refuses_an_unresolved_annotation():
+    with pytest.raises(TypeError, match="model_rebuild"):
+        _admits_json_object(typing.ForwardRef("SomeLaterSpec") | None)
+
+
+def test_spec_reference_covers_every_nested_argument_model():
+    """`SPEC_REFERENCE` renders per-field prose once, for the models slimmed
+    out of the repeated `$defs` (A13).
+
+    Its input tuple is hand-kept, so a nested-argument model added later would
+    have its schema slimmed and its prose never rendered — the model would see
+    field names with no descriptions and nothing would fail. Same walk, same
+    invariant, one layer up.
+    """
+    reachable = {model for models in _nested_arg_models().values() for model in models}
+    missing = {m.__name__ for m in reachable} - set(SHARED_SPEC_NAMES)
+    assert not missing, f"nested-argument models absent from SHARED_SPEC_NAMES: {missing}"
+
+
+def test_coercion_does_not_rewrite_the_caller_s_mapping():
+    """`tool_args` is persisted verbatim as the model emitted it.
+
+    The validator normalizes a copy: a forensic record that changed shape
+    between being stored and being validated is no longer the record.
+    """
+    raw = {"filters": '{"attr:status": ["500"]}'}
+    FilterSpec.model_validate(raw)
+    assert raw == {"filters": '{"attr:status": ["500"]}'}
+
+
 # ── retired facet spec ──────────────────────────────────────────────────────
 
 
@@ -2205,6 +2440,36 @@ async def test_propose_story_block_validates(store):
         },
     )
     assert "after_block_id" in bad_anchor["error"]
+
+
+async def test_a_stringified_top_level_argument_is_parsed_before_the_tool_body(store):
+    """Top-level arguments never reach a tool as text, which is why only
+    *nested* ones need `ObjectArgModel`.
+
+    Two independent layers parse them: pydantic-ai's ``args_as_dict`` on the
+    way in, and the MCP SDK's ``pre_parse_json``
+    (``mcp/server/fastmcp/utilities/func_metadata.py``) for any parameter
+    whose annotation is not ``str`` — the same "an object is the only thing a
+    string could have meant" rule `_admits_json_object` applies one level
+    down. So ``content`` arrives as a dict, and ``propose_story_block``'s
+    ``isinstance`` guard is unreachable belt-and-braces. Pinned here because
+    the day that stops being true, the guard is the thing standing between a
+    string and a silent substring match on ``"chart_spec" in content``.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    result = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "markdown", "content": '{"text": "## parsed"}'},
+    )
+    assert result["status"] == "proposed"
+    (p,) = await store.list_agent_proposals(conv.id)
+    assert p.payload["content"] == {"text": "## parsed"}
 
 
 async def test_propose_story_block_checks_referent_scope(store):

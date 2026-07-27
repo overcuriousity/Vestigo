@@ -289,6 +289,21 @@ Decisions, not work items — each stays as decided unless its trigger fires.
 - **M26 — the two time-histogram implementations stay separate.** After session 49 the
   only shared piece is the brush gesture; `TimelineHistogram` carries Explorer-only
   concerns that make a merge high-risk/low-payoff. Trigger: the two drift apart.
+- **react-router stays at 7.18.1 despite GHSA-qwww-vcr4-c8h2** (2026-07-27). The advisory
+  (high, CSRF in RSC mode) covers `>= 7.12.0, < 8.3.0` and is patched in `react-router`
+  8.3.0, which *is* published. Vestigo does not depend on `react-router` directly: it
+  depends on **`react-router-dom`**, whose last release is 7.18.1 — the v8 line dropped
+  that package and moved every export to `react-router`. So there is no 8.x we can take
+  without migrating 41 `react-router-dom` imports, and every installable
+  `react-router-dom` is inside the advisory range. That migration is not worth doing for
+  this advisory, because the vulnerable path is unreachable: it affects only applications
+  using the unstable RSC APIs with server actions, and Vestigo is a SPA
+  (`createBrowserRouter` + `RouterProvider`, no `unstable_*` imports, FastAPI backend).
+  `npm audit fix --force` would *downgrade* to 7.11.0, giving up seven minors of fixes to
+  step below the range. Deliberately **not** silenced via a `dependabot.yml` ignore:
+  ignoring `< 8.3.0` would also suppress real 7.x patches. Triggers: a `react-router-dom`
+  8.x publishes, or we migrate imports to `react-router` for another reason — then upgrade
+  and delete this entry. Re-evaluate immediately if RSC APIs are ever adopted.
 - **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client
   for Jupyter/pandas workflows is cheap. Trigger: a user asks.
 - **Vendored converter ports** — demand-driven only (see M25); the vendored

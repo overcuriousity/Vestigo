@@ -1,9 +1,98 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 110 — PR #189 review fixes).
+Last updated: 2026-07-27 (session 111 — stringified tool-argument crash).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 111 — 2026-07-27: a stringified tool argument took the whole app down
+
+**Why.** A production conversation crashed the SPA at the router level:
+`Cannot use 'in' operator to search for 'chart_type' in {"chart_type": "bar", ...}` —
+the `in` check in `isLegacySpec` ran against a *string*. Some providers hand a nested
+object argument back as JSON text, and `tool_args` is persisted verbatim as the model
+emitted it, so the bad row is permanent and every re-render of that conversation hit it.
+
+- **Readers of `tool_args` normalize.** `parseToolArgObject` (in `api/agent.ts`) parses a
+  stringified argument, passes an object through, and returns `null` for anything else.
+  The tolerance lives in `specToChartConfig`/`specToEventFilters` — the translation
+  boundary every consumer already goes through — so no caller has to remember it;
+  `AgentPanel` uses it additionally as the render-or-don't decision, and an unparseable
+  spec now renders no card instead of throwing through the chart card's `useMemo`.
+  It reaches inside the spec too: an unparsed `compare` made `compare?.mode` undefined
+  and silently drew one layer where the model proposed two, and `Object.keys` on an
+  unparsed `filters` map built a filter set that was wrong rather than absent.
+- **The tool accepts it too.** `ChartSpec`'s before-validator `json.loads`es a string
+  spec, which is cheaper than a validation error the model has to guess its way out of.
+
+**Then the blast radius, because that crash was one symptom of four problems.**
+
+- **The app had no error boundary at all.** `grep -rn "errorElement\|ErrorBoundary"` over
+  `frontend/src` returned nothing, so *any* render-time throw in *any* panel unmounted
+  every route — the reason one malformed row cost the whole product rather than one card.
+  `components/ui/ErrorBoundary.tsx` now contains failures at three levels: `AppShell`
+  wraps its `Outlet` (keyed by pathname, so navigating away recovers), the router carries
+  a `RouteErrorPage` as the last net, and the agent's chart/finding cards — the ones
+  rendering model-authored JSON — wrap themselves individually.
+- **`FilterSpec` is a nested argument on 14 tools.** The tolerance therefore belongs to
+  the *position*, not to `ChartSpec`: `ObjectArgModel` is the base for every nested tool
+  argument, so a provider that stringifies one stringifies none of them into a failure.
+  It covers the model *and* every field whose annotation admits a JSON object — the
+  `dict` fields inside `FilterSpec` are as reachable that way as `ChartSpec.options` is,
+  and driving it off annotations means a field added later is covered by default. Never
+  a field that also admits `str`: `q` may legitimately hold JSON as free text.
+- **`"chart_spec" in (content or {})` in `propose_story_block`** looks like the same
+  shape but is not reachable: `content` is a *top-level* argument, and both pydantic-ai
+  and the MCP SDK's `pre_parse_json` parse those. The membership test is guarded by an
+  `isinstance` anyway — Python's `in` on a string is a silent substring match that then
+  fails on `.get`, so the failure it prevents is a wrong answer, not an exception — and
+  a test pins the upstream parsing the guard's unreachability depends on.
+- **A chart card could render another proposal's spec.** Unkeyed (pre-`tool_call_id`)
+  rows were paired by FIFO order, and the call row is persisted *before* its validation
+  runs — so an `ok` result could pop a *rejected* spec and draw a chart contradicting its
+  own title. Pairing now falls back to order only when exactly one proposal is buffered;
+  ambiguous batches render nothing. A missing card is recoverable, a wrong one read as
+  evidence is not.
+
+**Review round.** Card `ErrorBoundary`s were keyed by array index, so a fallback outlived
+the card that caused it once streaming appended items — card items now carry the proposing
+call's `tool_call_id` as their identity. `ErrorBoundary` resets through
+`getDerivedStateFromProps` rather than `setState` in `componentDidUpdate`, which rendered
+the stale fallback once before replacing it. `AppShell`'s route lost its `errorElement`:
+`AppShell` wraps its own `Outlet`, so nothing reaches the router there that the
+`RequireAuth` route does not already catch. Three negative assertions that raced a
+`setTimeout(0)` against the conversation query now await a positive anchor row.
+
+**Second review round (PR #190).**
+
+- **The standing decision on GHSA-qwww-vcr4-c8h2 was argued from a false premise.** It
+  said `react-router` 8.3.0 "is not published"; `npm view react-router version` returns
+  8.3.0, and 8.0.0–8.3.0 all exist. The conclusion survives for a different reason: we
+  depend on **`react-router-dom`**, which the v8 line retired at 7.18.1 in favour of
+  `react-router`, so taking the patch means migrating 41 imports. Rewritten in
+  `ROADMAP.md` with the real blocker and a trigger that has not already fired.
+- **"`ObjectArgModel` is the base for every nested-argument model" was documentation, not
+  an invariant.** A later spec inheriting `BaseModel` would have lost the tolerance with
+  no test failing — the symptom is one provider retry-looping in production.
+  `test_every_nested_argument_model_derives_from_object_arg_model` walks the built
+  server's signatures, transitively through model fields, and enforces it. The same walk
+  found that `SHARED_SPEC_NAMES` (which decides whose `$defs` prose is slimmed and
+  re-rendered into the system prompt) is hand-kept and can drift the same way, so it is
+  pinned against the walk too.
+- **`_admits_json_object` answered "no" to questions it could not answer.** An unresolved
+  forward reference matched neither branch and the field was silently dropped from
+  coercion. It raises `TypeError` now.
+- **`FilterSpec` is on 14 tools, not "~20".** Counted off the built server; corrected in
+  `AGENT.md`, here, and a test docstring. Also renamed
+  `test_a_stringified_filter_spec_is_parsed_on_every_tool_that_takes_one`, which tested
+  one tool.
+- **A card boundary was a dead end.** `resetKey` is the only exit, and a card's `resetKey`
+  is its immutable `tool_call_id` — so its fallback lasted the life of the conversation.
+  The default notice now carries a "Try again", handed to custom fallbacks as well.
+- **The FIFO-pairing change is retroactive** — cards render from the stored transcript on
+  every open, so an affected old conversation loses cards it used to show. Stated in the
+  `CHANGELOG.md` entry, which described the new behaviour without saying it reaches
+  backwards.
 
 ## Session 110 — 2026-07-27: PR #189 review fixes
 
