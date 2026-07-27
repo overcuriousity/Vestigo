@@ -3,7 +3,10 @@
  *
  * Inherits the Explorer's current filters/time-range from the URL (same
  * `paramsToFilters` the Explorer itself reads), so a chart here always
- * matches whatever the analyst was just looking at in the grid. The analyst
+ * matches whatever the analyst was just looking at in the grid. That
+ * inheritance is stated on the canvas by `viz/InheritedFiltersBar` — the
+ * scope of an exported figure has to be legible before the chart is read,
+ * not only in the caption underneath it. The analyst
  * picks a field, declares its scale of measurement, and gets the chart
  * types appropriate to that scale — each backed by one of the `vizApi`
  * aggregations.
@@ -16,18 +19,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, HelpCircle, Lightbulb, Repeat, RotateCcw, X } from "lucide-react";
+import { ArrowLeft, HelpCircle, Lightbulb, Repeat, X } from "lucide-react";
 import { vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
 import { dispositionsApi } from "@/api/dispositions";
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { InheritedFiltersBar } from "@/components/viz/InheritedFiltersBar";
 import {
   resolveCollapseRoutine,
   routineSignature,
   type RoutineOverride,
 } from "@/lib/routineCollapse";
-import { applyFieldEntries } from "@/lib/fieldFilters";
+import { applyFieldEntries, removeFilterEntry } from "@/lib/fieldFilters";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -205,6 +209,14 @@ export function VisualizePage() {
       setSearchParams((prev) => filterParamsPreservingChartConfig(next, prev));
     },
     [setSearchParams],
+  );
+
+  // Round trip back to the grid these filters came from. Only the filter params
+  // travel — the `c_*` chart config means nothing to the Explorer.
+  const explorerHref = useMemo(
+    () =>
+      `/cases/${caseId}/timelines/${timelineId}?${filtersToParams(urlFilters).toString()}`,
+    [caseId, timelineId, urlFilters],
   );
 
   // Click-to-filter: charts report the clicked mark's field=value pair(s);
@@ -1279,6 +1291,18 @@ export function VisualizePage() {
 
       {/* Canvas */}
       <div className="flex-1 overflow-auto p-4">
+        {/* Scope first, chart second: these filters come from the Explorer via
+            the URL, and a chart that gets exported into a report has to say
+            what it covers before it is read. */}
+        <InheritedFiltersBar
+          filters={urlFilters}
+          explorerHref={explorerHref}
+          onRemove={(key, fieldKey, value) =>
+            updateFilters(removeFilterEntry(urlFilters, key, fieldKey, value))
+          }
+          onClearAll={() => updateFilters({})}
+          onResetRange={() => updateFilters({ ...urlFilters, start: undefined, end: undefined })}
+        />
         {/* Nothing hidden silently: whenever routine dispositions shape the
             charts (or have been revealed), say so — the grid's collapsed-count
             stat, one page over. Renders only when the set is non-empty, same
@@ -1311,21 +1335,6 @@ export function VisualizePage() {
                 <Repeat size={11} /> {collapseRoutine ? "Show routine events" : "Collapse routine"}
               </button>
             </Tooltip>
-          </div>
-        )}
-        {(filters.start || filters.end) && (
-          <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-            <span>
-              Time range: {filters.start ?? "…"} → {filters.end ?? "…"}
-            </span>
-            <button
-              type="button"
-              onClick={() => updateFilters({ ...filters, start: undefined, end: undefined })}
-              className="flex items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 hover:bg-[var(--color-bg-hover)]"
-              title="Clear the start/end range (set by brush-zoom or inherited from the Explorer)"
-            >
-              <RotateCcw size={11} /> Reset range
-            </button>
           </div>
         )}
         {presetsOpen && (
@@ -1400,7 +1409,7 @@ export function VisualizePage() {
                 metric={metric}
                 hasComparison={compareOn}
                 svgRef={svgRef}
-                onRangeSelect={(start, end) => updateFilters({ ...filters, start, end })}
+                onRangeSelect={(start, end) => updateFilters({ ...urlFilters, start, end })}
               />
             )}
             {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (

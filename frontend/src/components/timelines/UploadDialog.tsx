@@ -1,13 +1,15 @@
-import { useEffect, useRef, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Upload, FileText } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Upload } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
+import { useFileTransfer } from "@/hooks/useFileTransfer";
 import { useJobsStore } from "@/stores/jobs";
 import { tourEvent } from "@/stores/tour";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
+import { FileDropZone } from "@/components/ui/FileInput";
 import { Input } from "@/components/ui/Input";
-import { fmtBytes } from "@/lib/format";
+import { TransferProgressRow } from "@/components/ui/TransferProgressRow";
 
 interface Props {
   caseId: string;
@@ -17,19 +19,15 @@ export function UploadDialog({ caseId }: Props) {
   const [open, setOpen] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [parser, setParser] = useState("");
-  const [dragging, setDragging] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
 
-  const { mutate, isPending, error, data, reset } = useMutation({
-    mutationFn: () =>
-      sourcesApi.upload(
-        caseId,
-        file!,
-        file?.name,
-        parser || undefined,
-      ),
+  // The app's largest routine transfer: the server takes up to 10 GiB and the
+  // ingest job the tray polls does not exist until the whole body has landed,
+  // so the upload's own byte progress is the only feedback for what is often
+  // the longest part of the operation.
+  const upload = useFileTransfer({
+    mutationFn: (o) => sourcesApi.upload(caseId, file!, file?.name, parser || undefined, o),
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
@@ -62,12 +60,9 @@ export function UploadDialog({ caseId }: Props) {
       // and is still ingesting (status !== "ready") — the source list panel
       // shows its live "Ingesting" badge/progress, so don't claim it's done.
     },
-    // Upload failures render inline in the dialog — skip the global toast.
-    meta: { silentError: true },
   });
 
-  const handleFile = (f: File) => setFile(f);
-
+  const { reset } = upload;
   // Reset selection and the previous upload's result/error whenever the
   // dialog is reopened, so a stale duplicate warning or error doesn't linger.
   useEffect(() => {
@@ -91,62 +86,29 @@ export function UploadDialog({ caseId }: Props) {
         description="Uploading creates a new Source and adds it to the default timeline. Supported formats: Timesketch CSV, JSONL, Vestigo Parquet (from a converter script). Parser auto-detected if omitted."
       >
         <div className="space-y-4">
-          {/* Drop zone */}
-          <div
+          <FileDropZone
             data-tour="upload-dropzone"
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragging(true);
+            accept=".csv,.jsonl,.parquet,.log"
+            files={file}
+            disabled={upload.active}
+            onFiles={(picked) => {
+              if (picked[0]) setFile(picked[0]);
             }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragging(false);
-              const f = e.dataTransfer.files[0];
-              if (f) handleFile(f);
-            }}
-            onClick={() => inputRef.current?.click()}
-            className={`flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed px-6 py-8 text-center transition-base ${
-              dragging
-                ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)]"
-                : "border-[var(--color-border-strong)] bg-[var(--color-bg-base)] hover:border-[var(--color-accent)] hover:bg-[var(--color-accent-dim)]"
-            }`}
-          >
-            <FileText
-              size={28}
-              className="text-[var(--color-fg-muted)] opacity-60"
+            hint=".csv, .jsonl, .parquet — any size. Other formats (e.g. .log) need a parser override below."
+          />
+
+          {upload.active && file && (
+            <TransferProgressRow
+              label={`Uploading ${file.name}`}
+              state={upload.state}
+              fallbackTotal={file.size}
+              // Safe: the server streams the body to a temp file and only
+              // creates the Source row and ingest job once all of it has
+              // landed, so a cancelled upload leaves nothing behind.
+              onCancel={upload.cancel}
+              cancelLabel="Cancel upload"
             />
-            {file ? (
-              <div>
-                <p className="text-sm font-medium text-[var(--color-fg-primary)]">
-                  {file.name}
-                </p>
-                <p className="text-xs text-[var(--color-fg-muted)]">
-                  {fmtBytes(file.size)}
-                </p>
-              </div>
-            ) : (
-              <>
-                <p className="text-sm text-[var(--color-fg-secondary)]">
-                  Drop a file here or click to browse
-                </p>
-                <p className="text-xs text-[var(--color-fg-muted)]">
-                  .csv, .jsonl, .parquet — any size. Other formats (e.g. .log) need a
-                  parser override below.
-                </p>
-              </>
-            )}
-            <input
-              ref={inputRef}
-              type="file"
-              accept=".csv,.jsonl,.parquet,.log"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleFile(f);
-              }}
-            />
-          </div>
+          )}
 
           {/* Parser override */}
           <div>
@@ -165,17 +127,15 @@ export function UploadDialog({ caseId }: Props) {
           </div>
 
           {/* Result */}
-          {data && data.duplicate && (
+          {upload.data?.duplicate && (
             <div className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning-dim)] px-3 py-2 text-xs text-[var(--color-warning)]">
-              {data.status === "ready"
-                ? `This file has already been ingested (${data.events_parsed.toLocaleString()} events).`
+              {upload.data.status === "ready"
+                ? `This file has already been ingested (${upload.data.events_parsed.toLocaleString()} events).`
                 : "This file is already being ingested by another upload — check the source list for progress."}
             </div>
           )}
-          {error && (
-            <p className="text-xs text-[var(--color-danger)]">
-              {(error as Error).message}
-            </p>
+          {upload.error && (
+            <p className="text-xs text-[var(--color-danger)]">{upload.error}</p>
           )}
 
           <div className="flex justify-end gap-2">
@@ -186,10 +146,10 @@ export function UploadDialog({ caseId }: Props) {
               variant="accent"
               size="sm"
               data-tour="upload-submit"
-              disabled={!file || isPending}
-              onClick={() => mutate()}
+              disabled={!file || upload.active}
+              onClick={() => upload.submit()}
             >
-              {isPending ? "Uploading…" : "Upload"}
+              {upload.active ? "Uploading…" : "Upload"}
             </Button>
           </div>
         </div>

@@ -15,6 +15,24 @@ export function fmtBytes(bytes: number | null | undefined): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
+/** Whole-percent progress, or null when there is no usable denominator —
+ * work whose size is not (yet) known, which the UI shows as an indeterminate
+ * bar rather than as 0%. */
+export function progressPct(
+  processed: number | null | undefined,
+  total: number | null | undefined,
+): number | null {
+  if (processed == null || total == null || total <= 0) return null;
+  return Math.round((processed / total) * 100);
+}
+
+/** Format a transfer rate. Decimal MB/s, matching how transfer speeds are
+ * quoted everywhere else — deliberately not `fmtBytes`'s binary MB. */
+export function fmtRate(bytesPerSecond: number | null | undefined): string | null {
+  if (bytesPerSecond == null || bytesPerSecond <= 0) return null;
+  return `${(bytesPerSecond / 1e6).toFixed(1)} MB/s`;
+}
+
 /** Format a number with thousands separators. */
 export function fmtNum(n: number | null | undefined): string {
   if (n == null) return "—";

@@ -1,4 +1,4 @@
-import { get, post, postForm, put } from "./client";
+import { get, post, postForm, put, type TransferOptions } from "./client";
 
 export interface EnricherInfo {
   key: string;
@@ -80,12 +80,16 @@ export const enrichersApi = {
   setAdminConfig: (key: string, body: { auto_run_default: boolean }) =>
     put(`/admin/enrichers/${key}/config`, body),
 
-  uploadAsset: (key: string, file: File) => {
+  /** Install an enricher's data asset (GeoLite mmdb and friends — tens to
+   * hundreds of MB, hence `opts`). Synchronous server-side: there is no job
+   * to poll afterwards, so the upload's own progress is the only feedback. */
+  uploadAsset: (key: string, file: File, opts?: TransferOptions) => {
     const form = new FormData();
     form.append("file", file);
     return postForm<{ available: boolean; reason: string | null }>(
       `/admin/enrichers/${key}/asset`,
       form,
+      opts,
     );
   },
 };

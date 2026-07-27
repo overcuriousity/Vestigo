@@ -15,7 +15,7 @@ import pyarrow as pa
 import pytest
 from sqlalchemy import delete, func, select
 
-from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
+from tests.transfer_fakes import FakeClickHouse, ProgressRecorder, _add, _event_rows
 from vestigo.core.config import get_settings
 from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
@@ -992,3 +992,68 @@ class TestBlobFiltering:
         assert not retention_path(sha).exists()
         assert any("no source references" in w for w in result.warnings)
         assert result.counts["blobs"] == 1  # the legitimate one still landed
+
+
+class TestProgress:
+    async def test_phases_reset_counters_and_complete(self, store, tmp_path, monkeypatch):
+        """Every phase entry must reset `processed`/`total` in the same write.
+
+        `JobStore.update` merges progress dicts, so a phase that published only
+        its name would inherit the previous phase's denominator and the UI
+        would render a percentage against the wrong total.
+        """
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            case = await _add(store, pg.Case, name="Progress", owner_id=alice.id)
+            rows = {}
+            for i in range(2):
+                file_hash = hashlib.sha256(f"blob{i}".encode()).hexdigest()
+                src = await _add(
+                    store, pg.Source, case_id=case.id, name=f"s{i}", file_hash=file_hash
+                )
+                rows[(case.id, src.id)] = _event_rows(case.id, src.id, n=1)
+                blob = retention_path(file_hash)
+                blob.parent.mkdir(parents=True, exist_ok=True)
+                blob.write_bytes(f"blob{i}".encode())
+            exported = await export_case(
+                store,
+                lambda: FakeClickHouse(rows),
+                case.id,
+                include_blobs=True,
+                exported_by="alice",
+                dest_dir=tmp_path / "out",
+            )
+            recorder = ProgressRecorder()
+
+            result = await import_case(
+                store,
+                lambda: FakeClickHouse(),
+                exported.path,
+                owner=alice,
+                progress=recorder,
+            )
+
+            assert result.counts["events"] == 2
+            assert recorder.phases == ["verify", "postgres", "events", "blobs", "stats"]
+            for write in recorder.writes:
+                if "phase" in write:
+                    assert write["processed"] == 0, write
+                    assert "total" in write, write
+            totals = {w["phase"]: w["total"] for w in recorder.writes if "phase" in w}
+            assert totals["events"] == 2
+            assert totals["blobs"] == 2
+            assert totals["stats"] == 2
+            # No accumulated snapshot overshoots its denominator — the check
+            # that a stale `total` from the previous phase would fail.
+            for snap in recorder.snapshots:
+                if snap.get("total"):
+                    assert snap["processed"] <= snap["total"], snap
+            for phase in ("events", "blobs", "stats"):
+                assert any(
+                    s.get("phase") == phase and s["processed"] == s["total"] > 0
+                    for s in recorder.snapshots
+                ), f"{phase} never reached its total"
+        finally:
+            get_settings.cache_clear()

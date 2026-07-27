@@ -3,7 +3,8 @@ import { Download } from "lucide-react";
 import { downloadExport } from "@/api/export";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
-import { Spinner } from "@/components/ui/Spinner";
+import { TransferProgressRow } from "@/components/ui/TransferProgressRow";
+import { useFileTransfer } from "@/hooks/useFileTransfer";
 import type { EventFilters } from "@/api/types";
 
 interface Props {
@@ -16,21 +17,15 @@ interface Props {
 export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
   const [open, setOpen] = useState(false);
   const [format, setFormat] = useState<"csv" | "jsonl">("csv");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  const handleExport = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      await downloadExport(caseId, timelineId, format, filters);
-      setOpen(false);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // The response is a chunked stream with no `Content-Length`, so progress can
+  // only ever be bytes-so-far against an unknown total — an indeterminate bar.
+  // That is still the difference between "working" and "hung" on an export of
+  // a few million events, which is the whole point.
+  const download = useFileTransfer({
+    mutationFn: (o) => downloadExport(caseId, timelineId, format, filters, o),
+    onSuccess: () => setOpen(false),
+  });
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -69,11 +64,23 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
             </div>
           </div>
           <p className="text-xs text-[var(--color-fg-muted)]">
-            Streams directly from the backend — no memory limit. Large exports may take a
-            moment to complete.
+            The server streams this with no row limit, but your browser holds the whole
+            file in memory until it finishes — an export of many million events can be
+            slow and heavy here even though the backend is fine. For a full copy of the
+            case, export the case archive instead.
           </p>
-          {error && (
-            <p className="text-xs text-[var(--color-danger)]">{error}</p>
+          {download.active && (
+            <TransferProgressRow
+              label={`Downloading .${format}`}
+              state={download.state}
+              // Nothing is written to disk until the transfer completes, so
+              // cancelling simply drops it.
+              onCancel={download.cancel}
+              cancelLabel="Cancel download"
+            />
+          )}
+          {download.error && (
+            <p className="text-xs text-[var(--color-danger)]">{download.error}</p>
           )}
           <div className="flex justify-end gap-2">
             <DialogClose asChild>
@@ -82,18 +89,11 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
             <Button
               variant="accent"
               size="sm"
-              disabled={loading}
-              onClick={handleExport}
+              disabled={download.active}
+              onClick={() => download.submit()}
             >
-              {loading ? (
-                <>
-                  <Spinner size={13} /> Downloading…
-                </>
-              ) : (
-                <>
-                  <Download size={13} /> Download .{format}
-                </>
-              )}
+              <Download size={13} />
+              {download.active ? "Downloading…" : `Download .${format}`}
             </Button>
           </div>
         </div>

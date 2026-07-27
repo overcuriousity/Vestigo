@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.2] — 2026-07-27
+
+### Fixed
+
+- **A case import can no longer be started twice** ([#184]). The Import button
+  stayed enabled for the entire upload, because the import dialog only recorded
+  the job id once the upload promise resolved — on a multi-GB archive that left
+  a minutes-long window in which a second click started a second import of the
+  same file. Submission is now blocked synchronously, so a double-click cannot
+  slip through before the button re-renders as disabled. Every transfer in the
+  app got the same guard, including the source upload, where a second click
+  previously cost a full duplicate upload of a file the server would then
+  discard as a duplicate hash.
+
+- **Every large file transfer reports progress and can be cancelled** ([#183]).
+  Uploads and downloads alike showed a disabled button and nothing else, so a
+  multi-GB transfer was indistinguishable from a hang. All of them now report
+  bytes moved with throughput and a time estimate, and can be stopped in
+  flight:
+
+  - **Uploading a log source** — the largest routine transfer in the app, and
+    previously the blindest: the ingest job that the job tray shows does not
+    exist until the whole file has landed, so on a multi-GB source everything
+    up to that point was silent.
+  - **Case export and import.** Both now also name the server-side phase —
+    "Verifying archive integrity", "Packing events", "Restoring original source
+    files" — with a percentage for the phases that process many items. Sealing
+    and hashing the finished archive shows a moving bar rather than a stalled
+    one; it counts no items, so there is no percentage to show.
+  - **Exporting events as CSV/JSONL.** The response is streamed with no length
+    known in advance, so this reports bytes received without a percentage. The
+    dialog also no longer claims there is "no memory limit": the server streams
+    it, but the browser holds the whole file until the download finishes, and
+    for a very large export a case archive is the better tool.
+  - **Uploading an enricher asset** (GeoIP and similar, hundreds of MB).
+
+  Cancelling is safe everywhere it is offered: the server streams an upload to
+  a temporary file and creates rows and jobs only once all of it has arrived,
+  so a cancelled upload leaves nothing behind, and a cancelled export download
+  leaves the archive on the server for a retry. A running import is tracked in
+  the job tray, so closing the dialog no longer hides it.
+
+- **Re-selecting the same file after a failed case import works.** The import
+  dialog never cleared its file input, so picking the same archive again fired
+  no change event and the button looked dead. Fixed for every file picker in the
+  app (case import, source upload, Sigma rule upload, admin enricher assets),
+  which now share one implementation — that also means files dropped onto the
+  source-upload zone are checked against the accepted types, as they always
+  were when picked through the file dialog. Keyboard users get one tab stop per
+  picker instead of two.
+
+- **The Visualize page states the filters it inherits.** It charts exactly what
+  the Explorer grid is showing, but said so only in the caption underneath the
+  chart, so a chart of one narrow slice looked identical to a chart of the whole
+  timeline — a real risk for a figure exported into a report. The active filters
+  now appear above the chart as removable chips, with an explicit "No filters —
+  charting the whole timeline" when there are none, a one-click way to clear
+  them, and a link back to the Explorer. Removing an exclusion, tag or
+  time-range chip in the comparison-layer editor also works now; those chips
+  were inert.
+
+- **"Clear all filters" only appears when something is actually filtered.** The
+  Explorer's filter rail and toolbar decided this by counting any non-empty
+  member of the filter state, so a sort order or a leftover match-mode setting
+  was enough to offer to clear filters on an unfiltered view. All three
+  surfaces — rail, toolbar and the new Visualize bar — now share one definition
+  of "filtered", matching exactly what the filter chips render.
+
 ## [1.8.1] — 2026-07-26
 
 ### Fixed
@@ -63,6 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter's value list once per read rather than once per batch, and identical
   lists referenced by two predicates share a single upload.
 
+[#184]: https://github.com/overcuriousity/Vestigo/issues/184
+[#183]: https://github.com/overcuriousity/Vestigo/issues/183
 [#181]: https://github.com/overcuriousity/Vestigo/issues/181
 [#156]: https://github.com/overcuriousity/Vestigo/issues/156
 [#161]: https://github.com/overcuriousity/Vestigo/issues/161

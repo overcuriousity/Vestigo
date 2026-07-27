@@ -261,6 +261,31 @@ body {
     opacity 120ms ease;
 }
 
+/* ── Indeterminate progress ──────────────────────────────────────────────── */
+/* For a transfer whose length the browser cannot know — a chunked response
+   with no Content-Length, or an archive phase that hasn't counted its work
+   yet. A bar that simply disappeared would read as a stall, which is the one
+   thing progress feedback exists to prevent. */
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+.progress-indeterminate {
+  width: 33%;
+  animation: progress-indeterminate 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-indeterminate {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
 /* ── Onboarding tour ─────────────────────────────────────────────────────── */
 /* Forces hover-only controls visible while the tour spotlights them
    (overrides Tailwind's opacity-0 group-hover:opacity-100). */

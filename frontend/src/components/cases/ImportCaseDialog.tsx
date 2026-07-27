@@ -1,10 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
+import { FileInput } from "@/components/ui/FileInput";
+import { JobStatusRow } from "@/components/ui/JobStatusRow";
+import { TransferProgressRow } from "@/components/ui/TransferProgressRow";
 import { AlertTriangle, Upload } from "lucide-react";
+import { jobsApi } from "@/api/jobs";
 import { transferApi } from "@/api/transfer";
+import { useFileTransfer } from "@/hooks/useFileTransfer";
+import { useJobsStore } from "@/stores/jobs";
+import { jobPhaseLabel } from "@/lib/jobPhases";
 
 /** `Job.result` is loosely typed (`unknown`); this is what the import job puts there. */
 interface ImportResult {
@@ -17,18 +24,34 @@ export function ImportCaseDialog() {
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const addJob = useJobsStore((s) => s.addJob);
 
+  // Same query key the job tray polls under, so the two collapse into one
+  // request stream: this dialog hands the restore job to the tray, and both
+  // then watch it. Deliberately still an independent `useQuery` rather than a
+  // read of the tray's store — the dialog must not depend on another component
+  // being mounted to see the job it started.
   const { data: job } = useQuery({
-    queryKey: ["transfer-import", jobId],
-    queryFn: () => transferApi.getJob(jobId!),
+    queryKey: ["job", jobId],
+    queryFn: () => jobsApi.get(jobId!),
     enabled: !!jobId,
     refetchInterval: (query) =>
       query.state.data?.status === "completed" || query.state.data?.status === "failed"
         ? false
         : 2000,
+  });
+
+  const upload = useFileTransfer({
+    mutationFn: (o) => transferApi.startImport(file!, o),
+    onSuccess: (r) => {
+      setJobId(r.job_id);
+      // The job outlives this dialog: hand it to the tray so closing the
+      // dialog mid-import doesn't hide a restore that's still running.
+      addJob(r.job_id, `Importing "${file?.name ?? "archive"}"`, [["cases"]]);
+    },
+    onError: setError,
   });
 
   const result = job?.result as ImportResult | null | undefined;
@@ -60,13 +83,11 @@ export function ImportCaseDialog() {
   const start = () => {
     if (!file) return;
     setError(null);
-    transferApi
-      .startImport(file)
-      .then((r) => setJobId(r.job_id))
-      .catch((e) => setError((e as Error).message));
+    upload.submit();
   };
 
-  const running = !!jobId && (!job || (job.status !== "completed" && job.status !== "failed"));
+  const jobRunning = !!jobId && (!job || (job.status !== "completed" && job.status !== "failed"));
+  const busy = upload.active || jobRunning;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -80,13 +101,32 @@ export function ImportCaseDialog() {
         description="Restore a .vestigo archive as a new case owned by you. Nobody else gets access automatically."
       >
         <div className="space-y-3">
-          <input
-            ref={inputRef}
-            type="file"
+          <FileInput
             accept=".vestigo"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-            className="block w-full text-sm text-[var(--color-fg-primary)]"
+            disabled={busy}
+            onFiles={(files) => setFile(files[0] ?? null)}
           />
+          {upload.active && file && (
+            <TransferProgressRow
+              label={`Uploading ${file.name}`}
+              state={upload.state}
+              fallbackTotal={file.size}
+              // Safe to offer: the server creates the import job only after the
+              // whole upload lands, so an aborted upload leaves no job, no
+              // case, and nothing to clean up.
+              onCancel={upload.cancel}
+              cancelLabel="Cancel upload"
+            />
+          )}
+          {job && !caseId && (
+            <JobStatusRow
+              label="Restoring case"
+              status={job.status}
+              progress={job.progress}
+              error={null}
+              detail={jobPhaseLabel(job.kind, job.progress)}
+            />
+          )}
           {error && <p className="text-xs text-[var(--color-danger)]">{error}</p>}
           {warnings.length > 0 && (
             <div className="space-y-1">
@@ -108,15 +148,19 @@ export function ImportCaseDialog() {
           )}
           <div className="flex justify-end gap-2 pt-1">
             <DialogClose asChild>
-              <Button variant="ghost" size="sm">Cancel</Button>
+              <Button variant="ghost" size="sm">
+                {/* Closing does not stop the restore — the tray keeps it
+                    visible. Cancelling the *upload* is offered on its row. */}
+                {busy ? "Close" : "Cancel"}
+              </Button>
             </DialogClose>
             {caseId && warnings.length > 0 ? (
               <Button variant="accent" size="sm" onClick={() => goToCase(caseId)}>
                 Go to case
               </Button>
             ) : (
-              <Button variant="accent" size="sm" disabled={!file || running} onClick={start}>
-                {running ? "Importing…" : "Import"}
+              <Button variant="accent" size="sm" disabled={!file || busy} onClick={start}>
+                {upload.active ? "Uploading…" : jobRunning ? "Importing…" : "Import"}
               </Button>
             )}
           </div>

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
+from tests.transfer_fakes import FakeClickHouse, ProgressRecorder, _add, _event_rows
 from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
 from vestigo.db._dt import NULL_TS_SENTINEL
@@ -289,3 +289,73 @@ async def test_export_event_null_timestamp_and_nul_padded_hash(store, tmp_path):
     out = table.to_pylist()[0]
     assert out["timestamp"] == NULL_TS_SENTINEL
     assert out["content_hash"] == "abc"
+
+
+async def test_export_progress_phases_and_counters(store, tmp_path, monkeypatch):
+    """Every phase entry must reset `processed`/`total` in the same write.
+
+    `JobStore.update` merges progress dicts, so a phase that published only
+    its name would inherit the previous phase's denominator and the UI would
+    render a percentage against the wrong total.
+    """
+    monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+    from vestigo.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        owner = await _add(store, pg.User, username="gina", is_admin=False, is_active=True)
+        case = await _add(store, pg.Case, name="Progress", owner_id=owner.id)
+        s1 = await _add(store, pg.Source, case_id=case.id, name="s1", file_hash="ab" * 32)
+        s2 = await _add(store, pg.Source, case_id=case.id, name="s2", file_hash="cd" * 32)
+        # No blob on disk for s3: a skipped member must still advance the
+        # counter, or the bar stalls short of 100% on any archive with a gap.
+        s3 = await _add(store, pg.Source, case_id=case.id, name="s3", file_hash="ef" * 32)
+        for file_hash in ("ab" * 32, "cd" * 32):
+            blob = retention_path(file_hash)
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(b"bytes for " + file_hash.encode())
+        fake_ch = FakeClickHouse(
+            {(case.id, s.id): _event_rows(case.id, s.id, n=1) for s in (s1, s2, s3)}
+        )
+        recorder = ProgressRecorder()
+
+        result = await export_case(
+            store,
+            lambda: fake_ch,
+            case.id,
+            include_blobs=True,
+            exported_by="gina",
+            dest_dir=tmp_path / "out",
+            progress=recorder,
+        )
+
+        assert recorder.phases == ["postgres", "events", "blobs", "manifest"]
+        # Phase entry always carries a fresh pair of counters.
+        for write in recorder.writes:
+            if "phase" in write:
+                assert write["processed"] == 0, write
+                assert "total" in write, write
+        totals = {w["phase"]: w["total"] for w in recorder.writes if "phase" in w}
+        assert totals["events"] == 3
+        assert totals["blobs"] == 3
+        assert result.counts["blobs"] == 2  # one had no blob on disk
+        # Sealing and hashing the archive is one long operation, not N of
+        # them, so it publishes no denominator at all. `None`, never `0`: the
+        # UI reads None as "indeterminate, keep the bar moving" and 0 as
+        # nothing to show, and this is the slowest phase on a big archive.
+        assert totals["manifest"] is None
+        # No accumulated snapshot ever overshoots its denominator.
+        for snap in recorder.snapshots:
+            if snap.get("total"):
+                assert snap["processed"] <= snap["total"], snap
+        # Each counted phase actually reaches its total, so the bar completes.
+        for phase in ("events", "blobs"):
+            assert any(
+                s.get("phase") == phase and s["processed"] == s["total"] > 0
+                for s in recorder.snapshots
+            ), f"{phase} never reached its total"
+        # The archive size is published so the download bar can size itself
+        # before the response headers arrive.
+        assert recorder.snapshots[-1]["bytes_total"] == result.bytes
+    finally:
+        get_settings.cache_clear()

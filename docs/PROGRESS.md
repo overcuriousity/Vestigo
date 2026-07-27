@@ -1,9 +1,143 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-26 (session 106 — PR #187 review remediation).
+Last updated: 2026-07-27 (session 108 — PR #188 review remediation + transfer progress everywhere).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 108 — 2026-07-27: one transfer path, progress on every upload (PR #188 review)
+
+**Why.** A review of PR #188 found eight issues, and a scope question the PR did not
+answer: session 107 gave the case import/export byte progress and left three other
+transfers blind. The biggest of them is the *primary ingest path* —
+`sourcesApi.upload`, capped at 10 GiB server-side, whose drop zone advertises "any
+size" and whose ingest job does not exist until the whole body has landed
+(`api/routers/cases.py:795`). Shipping a release about transfer feedback while the
+transfer analysts perform most often stayed a disabled button was the wrong shape.
+
+- **`api/client.ts` now has one file-transfer core.** #188 added `xhrRequest` *beside*
+  the untouched `postForm`/`fetchBlob`/`fetchBlobGet`, leaving a progress-less path a new
+  call site could pick by accident. `postForm`, `fetchBlob` and `fetchBlobGet` are now
+  that core, each taking an optional `{ onProgress, signal }`; `postFormWithProgress` and
+  `getBlobWithProgress` are gone. Plain JSON verbs stay on `fetch` — no file body, nothing
+  to report. Both cores still share `apiErrorFromBody`, so there is one error surface.
+- **Fixed a latent hang in that core.** Its error branch read `xhr.responseText` even for
+  a `responseType: "blob"` request, where the getter *throws* `InvalidStateError` — inside
+  an event listener, where nothing observes it. The promise would never settle and the
+  dialog would sit on "Downloading…" forever. The test double now enforces the real getter
+  semantics, which is what makes this stay fixed.
+- **`hooks/useFileTransfer.ts` owns the guard, the abort and the rate.** Wraps
+  `useMutation` rather than replacing it. The synchronous submit ref-guard — the actual
+  #184 fix — was hand-written twice in #188 and would have been hand-written twice more
+  here; now it cannot be forgotten. `AbortError` is classified as a cancellation, never an
+  error, and `ApiError(0)` (the XHR "never reached the server" sentinel) gets its own
+  wording in one place. Replaces `useTransferRate`.
+- **Progress and cancel on every file transfer**, via a shared `ui/ProgressMeter` (pulled
+  out of `JobStatusRow`, so job rows and transfer rows cannot drift) and a new
+  `ui/TransferProgressRow`: source upload, case import, case export download, event
+  CSV/JSONL export, enricher asset. Cancelling is safe at every upload site for the reason
+  #188 gave for import — `receive_upload_to_tmp` streams to a temp file and rows/jobs
+  follow only after it all lands.
+- **Indeterminate progress is now a first-class state.** A chunked `StreamingResponse` has
+  no `Content-Length`, so the event export can only ever report bytes-so-far; the
+  exporter's `manifest` phase counts no items at all. Both previously rendered *no bar*,
+  which reads as a stall on exactly the slowest steps. `_progress(phase, total=None)`
+  replaces `total=0` for those phases, and `Progress` renders Radix's indeterminate state.
+- **The event export dialog stopped misleading.** It claimed "Streams directly from the
+  backend — no memory limit", true of the server and false of the browser, which buffers
+  the whole Blob. It now says so and points at the case archive for very large sets.
+- **`hasActiveFilters` replaces three separate answers to one question.**
+  `InheritedFiltersBar` decided its empty state by string-comparing against caption prose
+  (`describeFilters(...) !== "no filters"`); the filter rail and the Explorer toolbar each
+  hand-rolled `Object.values(filters).some(...)`, which counted `sort`/`limit`/match-mode
+  maps and so offered "Clear all filters" on unfiltered views. One predicate now, defined
+  as "FilterChips would render at least one chip".
+- **Smaller review items.** The exporter's blob loop was O(n²) (`next(s for s in sources
+  …)` per hash) — now a hash-keyed map, with a note that `ix_sources_case_id_file_hash`
+  makes the dedup defensive within a single case. `matchesAccept` treated every
+  non-extension `accept` entry as a match, so a MIME-typed drop zone filtered nothing.
+  The hidden file inputs left the tab order (`tabIndex={-1}`): a focusable input nested in
+  a `role="button"` is two tab stops for one control. The export dialog now passes the
+  abort signal it was already threading through but never using. `transferApi.getJob` was
+  a duplicate of `jobsApi.get`; both transfer dialogs now poll under the tray's `["job",
+  id]` key so TanStack collapses the import dialog and the tray into one request stream —
+  deliberately still their own `useQuery`, not a read of the tray's store, so a dialog
+  never depends on another component being mounted to see the job it started.
+- **Deviation from the plan, recorded.** The export job is *not* handed to the job tray,
+  though the import job is. The archive only becomes useful when the dialog turns it into
+  a browser download and the server unlinks it once streamed, so a tray row would announce
+  a finished export the analyst has no way to collect.
+- **Tests.** 605 frontend tests (was 559) across 68 files: new suites for
+  `useFileTransfer`, the source upload dialog, the event export dialog and the enricher
+  asset upload, plus `hasActiveFilters`, MIME `accept` matching, tab order, and the
+  reimplemented client helpers. Backend 1865 pass; the three `test_embeddings_capability`
+  /`test_uploads` failures are the pre-existing missing-extra ones that reproduce on
+  `main`.
+
+## Session 107 — 2026-07-26: transfer progress, file-input primitive, Visualize scope (B2)
+
+**Why.** Roadmap B2, the last of the reported defects with real user impact. #184: an
+analyst could start the same multi-GB case import twice. `ImportCaseDialog.start()` set
+`jobId` only inside the upload promise's `.then()`, and `running` was derived from `jobId`
+— so for the entire upload nothing disabled the Import button. #183: neither transfer
+dialog rendered anything from the job it was already polling, and the download had no
+feedback at all, so a multi-GB export was indistinguishable from a hang. Alongside it, the
+Visualize page inherits the Explorer's filters through the URL but barely said so — an
+unfiltered chart and a chart of one narrow slice looked identical, which for a figure that
+gets exported into a report is a forensic problem, not a cosmetic one.
+
+- **The submit guard is a ref, not state.** A second click can land in the same task as
+  the first, before React re-renders the button as disabled, so `submittingRef` is what
+  actually closes the window; the `uploading` state only drives the label and the
+  `disabled` attribute. `ExportCaseDialog` got the same guard — the endpoint is capped by
+  `transfer_max_concurrent`, so a double-start is a 429 rather than a duplicate, but the
+  bug class is identical.
+- **`XMLHttpRequest` for the two archive transfers.** `fetch` has no upload-progress event
+  and no sizeable request-body stream, so `client.ts` gained `postFormWithProgress` and
+  `getBlobWithProgress`. They are not duplicates of the fetch helpers: the 401 →
+  `onUnauthorized` dispatch and FastAPI's `detail` parsing (string *and* Pydantic array)
+  moved into an exported `apiErrorFromBody`, which both paths share. It returns rather than
+  throws, because an XHR event listener has no throw position a promise would observe. The
+  fetch helpers keep their own code path deliberately — they are the common case and
+  already covered by tests.
+- **Cancel aborts the upload.** Safe by construction, and worth saying why: the router
+  creates the job only *after* `receive_upload_to_tmp` returns, so an aborted upload leaves
+  no job, no case, and nothing to clean up. Once a job id exists the abort is no longer
+  offered, and the job is registered with the tray so closing the dialog stops hiding a
+  running restore.
+- **Backend progress got a denominator.** `_progress(phase, total=…)` now resets
+  `processed`/`total` in the same write as the phase name. The reset is the point:
+  `JobStore.update` *merges* progress dicts, so a phase publishing only its name inherits
+  the previous phase's total and renders a percentage against the wrong denominator.
+  Skipped members (blob missing on disk, unreferenced archive member) still advance the
+  counter, or the bar stalls short of 100% on any archive with a gap. Tests replay the
+  merge via a shared `ProgressRecorder` rather than inspecting individual writes.
+- **Phase copy is keyed on `job.kind`.** `postgres`, `events` and `blobs` are shared tokens
+  that mean opposite directions in the two jobs — packing vs. restoring — so one map would
+  actively mislead. `lib/jobPhases.ts` returns null for an unknown kind or token rather
+  than leaking a raw phase string.
+- **One `ui/FileInput` for four sites.** They had drifted: only three cleared the input's
+  value after a pick, and the one that didn't was the import dialog, where re-picking the
+  same file after a failure fired no `change` event and looked like a dead button. Three
+  exports (bare input, drop zone, picker button) cover all four call sites. The drop zone
+  now filters dropped files against `accept` — the browser only enforces it in the picker,
+  so drag-drop silently accepted what clicking could not — and stops the programmatic
+  `.click()` from bubbling back into its own handler and reopening the picker.
+- **Visualize states its scope above the chart.** `viz/InheritedFiltersBar` reuses the
+  Explorer's `FilterChips` (per-chip removal included) behind an "Inherited from Explorer"
+  label, with an explicit "No filters — charting the whole timeline" empty state, and folds
+  the old standalone time-range row in as chips plus a "Reset range" escape hatch.
+  `collapseRoutine` is deliberately *not* a chip: it is never URL-serialized, so rendering
+  it alongside shareable filters would misrepresent it. Removals route through the existing
+  `updateFilters`, so the `c_*` chart config survives them.
+- **The chip-removal reducer is now shared.** It moved out of a ~65-line inline callback in
+  `ExplorerPage` into `lib/fieldFilters.removeFilterEntry`, which also fixed
+  `CompareFilterEditor`: its hand-rolled remover knew only `q` and `filters`, so the
+  exclusion, tag and time chips it renders were inert.
+
+Three pre-existing failures (`test_embeddings_capability.py` ×2,
+`test_uploads.py::test_embed_refuses_ingesting_sources`) reproduce identically on `main`
+and are unrelated to this work.
 
 ## Session 106 — 2026-07-26: PR #187 review remediation
 
