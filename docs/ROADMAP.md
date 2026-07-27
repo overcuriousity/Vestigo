@@ -31,13 +31,12 @@ All ten open issues re-verified against `main` @ 9034609; every one still reprod
 Grouped into batches that share a file/subsystem — work a batch as one change.
 B1, B3 and B4 shipped in session 103, B2 in sessions 107–108 (see `PROGRESS.md`).
 
-- [ ] **B5 — Docs/API hygiene** ([#160], [#159]). `.env.example` covers 23 of ~96
-  `Settings` fields: keep it curated, add a header pointing at `core/config.py`, document
-  the operationally-relevant gaps (`oidc_*`, `max_upload_bytes`, `login_backoff_*`,
-  `qdrant_api_key`, `agent_*`) — an exhaustive generated file drifts just as fast.
-  Decision on `GET /api/cases/{case_id}/detector-runs/{run_id}` (`events.py:2463`, no
-  callers): **keep**, document as supported debugging API — inspecting what produced a
-  `run_id` is a forensic-explainability affordance.
+- [ ] **B5 — Docs/API hygiene** ([#160], [#159]). The `.env.example` half is **done**
+  (session 109): every field is now editable in the admin console and the file carries a
+  header explaining precedence, so it stays a curated subset by design rather than by
+  neglect. Remaining: decision on `GET /api/cases/{case_id}/detector-runs/{run_id}`
+  (`events.py:2463`, no callers) — **keep**, document as supported debugging API, since
+  inspecting what produced a `run_id` is a forensic-explainability affordance.
 - [ ] **B6 — `LoginBackoff` cap hardening** ([#158]). The filed scenario is wrong (rotating
   keys have `locked_until = 0.0`, which `_prune_expired_locked` does drop); the real
   residual is that when pruning frees nothing — all `max_entries` simultaneously locked —

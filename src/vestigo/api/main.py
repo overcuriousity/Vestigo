@@ -14,7 +14,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vestigo import __version__
-from vestigo.agent.availability import agent_available
 from vestigo.api.deps import get_store, resolve_user_optional
 from vestigo.api.routers import (
     admin,
@@ -34,11 +33,12 @@ from vestigo.api.routers import (
     transfer,
     viz,
 )
+from vestigo.core.capabilities import get_capabilities
 from vestigo.core.config import get_settings
+from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.core.security import hash_password
 from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, generate_id
 from vestigo.db.queries import QueryRequestTooLargeError
-from vestigo.models.embeddings import embeddings_available
 
 logger = logging.getLogger(__name__)
 
@@ -300,12 +300,16 @@ async def _startup_recovery(store: PostgresStore) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    _log_config_report()
     store = get_store()
-    # Only Postgres schema + admin seeding block startup — both are fast and
-    # required before the first request. Everything ClickHouse-dependent is
+    # Only Postgres schema + settings + admin seeding block startup — all fast
+    # and required before the first request. Everything ClickHouse-dependent is
     # deferred to a background task so booting can't hang behind it (502s).
     await store.init_schema()
+    # Before anything reads configuration: the DB-backed override layer is part
+    # of the effective settings, and the config report below should state what
+    # the process will actually use.
+    await load_runtime_settings()
+    _log_config_report()
     await _seed_admin()
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
@@ -502,21 +506,20 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health", response_class=JSONResponse)
     async def health() -> dict:
+        # `capabilities` is the general form: one entry per optional subsystem,
+        # false when the subsystem is unconfigured, and the frontend renders no
+        # entry point for a false one (core/capabilities.py). The four flat keys
+        # below predate it and are kept as aliases so an older client, and the
+        # login page's OIDC check, keep working.
+        caps = await get_capabilities()
         return {
             "status": "ok",
             "version": __version__,
+            "capabilities": caps,
             "oidc_enabled": get_settings().oidc_enabled,
-            # False when the 'embeddings' extra is not installed and no
-            # remote embedding endpoint is configured — embed jobs and
-            # semantic search return 503 in that state.
-            "embeddings_available": embeddings_available(),
-            # False unless VESTIGO_AGENT_* is configured and the endpoint
-            # answered the cached probe — the frontend renders no agent UI
-            # at all in that state.
-            "agent_available": await agent_available(),
-            # True only when VESTIGO_MCP_ENABLED — the external streamable-HTTP
-            # MCP endpoint at /mcp. Off by default (Bearer-token-gated when on).
-            "mcp_enabled": get_settings().mcp_enabled,
+            "embeddings_available": caps["embeddings"],
+            "agent_available": caps["agent"],
+            "mcp_enabled": caps["mcp"],
         }
 
     app.include_router(auth.router)

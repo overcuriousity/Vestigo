@@ -1,9 +1,51 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 108 — PR #188 review remediation + transfer progress everywhere).
+Last updated: 2026-07-27 (session 109 — settings in the database, subsystem capability gating).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 109 — 2026-07-27: every setting in the database, every subsystem gated
+
+**Why.** Configuration was split in two with no principle behind the split: the AI agent
+had a DB-backed, admin-editable layer with env precedence and a proper UI, and the other
+~95 `Settings` fields were environment-only — invisible to the operator running the app,
+changeable only with a restart. The same inconsistency showed up in how unconfigured
+subsystems behaved: the agent hid itself completely, while embeddings left a disabled
+button and a Similarity tab that could only fail.
+
+- **`core/settings_registry.py` is the catalog.** One `SettingSpec` per `Settings` field
+  carrying only what the model can't tell us — group, label, help, and the policy flags
+  `env_only` / `secret` / `restart_required` / `subsystem`. Kind and bounds are read back
+  off the pydantic field, so a tightened `ge=` reaches the UI without a second edit. A
+  coverage test fails the moment a field is added without a spec, which is the mechanism
+  that keeps the promise ("everything is editable in the UI") true after this session.
+- **Two layers, resolved per field: environment wins, then `app_settings`, then the
+  default.** `get_settings()` is now a cached merge rather than an `lru_cache`d
+  constructor; env-pin detection reads `get_base_settings().model_fields_set`, so
+  applying overrides can't pollute the very set that decides precedence. An override
+  stored before an operator pinned the field can never resurface — checked on save *and*
+  on load. `get_settings.cache_clear` is preserved as an alias so the ~30 test call sites
+  kept working.
+- **Bad stored values degrade, they don't crash.** Every override is validated against
+  the whole `Settings` model before it is written (the admin gets a 422, nothing is
+  persisted) and again on load, field by field if the batch fails — a row written by an
+  older version costs a warning, not a boot.
+- **`core/capabilities.py` + `capabilities` on `/api/health`.** One predicate per optional
+  subsystem. The frontend's `useCapabilities()` gates on it: no Similarity tab and no
+  embed wizard without embeddings, no enricher dialog when no asset is installed, no
+  export/import when transfer is off. The agent's tool server now *removes* the two
+  embedding tools instead of registering error stubs — an unconfigured subsystem should
+  not cost schema tokens or invite a call that can only fail. `schema_chars_for_scope`'s
+  cache key grew the availability flag accordingly, since settings can now change under a
+  running process.
+- **`transfer_enabled` is a real switch.** `transfer_max_concurrent=0` already meant "no
+  cap", so gating on it would have inverted the meaning; case transfer got its own master
+  switch instead, enforced in the router (503) as well as hidden in the UI.
+- **`.env.example` stopped pinning things by accident.** Copying it used to set ~20
+  variables to their own defaults, which under the new precedence would make them
+  permanently read-only in the console. Fields that only restated a default are now
+  commented out; connection strings and the admin seed stay.
 
 ## Session 108 — 2026-07-27: one transfer path, progress on every upload (PR #188 review)
 

@@ -1715,17 +1715,34 @@ async def test_list_sigma_runs_not_starved_by_other_timelines(store):
 # ---------------------------------------------------------------------------
 
 
-async def test_tool_registry_matches_registered_tools(store):
+async def test_tool_registry_matches_registered_tools(store, monkeypatch):
     """TOOL_REGISTRY is the single source of truth for toggle UIs — it must
     exactly mirror what build_tool_server registers (with a conversation
-    scope, where every tool incl. propose_annotation exists)."""
+    scope and embeddings configured, where every tool exists)."""
+    import vestigo.agent.tools as tools_module
     from vestigo.agent.tools import TOOL_NAMES
 
+    monkeypatch.setattr(tools_module, "embeddings_available", lambda: True)
     await store.init_schema()
     server = build_tool_server(_scope_with_conversation("c1", "t1", "conv1"))
     async with FastMCPClient(server) as client:
         names = {t.name for t in await client.list_tools()}
     assert names == TOOL_NAMES
+
+
+async def test_embeddings_tools_absent_when_embeddings_unconfigured(store, monkeypatch):
+    """An unconfigured subsystem is invisible to the model, not an error stub:
+    without embeddings the two vector tools are never advertised."""
+    import vestigo.agent.tools as tools_module
+
+    monkeypatch.setattr(tools_module, "embeddings_available", lambda: False)
+    await store.init_schema()
+    server = build_tool_server(_scope_with_conversation("c1", "t1", "conv1"))
+    async with FastMCPClient(server) as client:
+        names = {t.name for t in await client.list_tools()}
+    assert "semantic_search" not in names
+    assert "similar_events" not in names
+    assert "search_events" in names
 
 
 def test_tool_tiers_are_valid_and_core_is_workable():

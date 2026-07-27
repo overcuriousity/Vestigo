@@ -8,9 +8,9 @@ consumer's import site.
 from __future__ import annotations
 
 from tests.conftest import as_admin
-from vestigo.api import main as api_main
 from vestigo.api.routers import cases as cases_router
 from vestigo.api.routers import events as events_router
+from vestigo.models import embeddings as embeddings_module
 from vestigo.models.embeddings import embeddings_available
 
 
@@ -24,8 +24,12 @@ def test_health_reports_embeddings_available(client):
 
 
 def test_health_reports_embeddings_unavailable(client, monkeypatch):
-    monkeypatch.setattr(api_main, "embeddings_available", lambda: False)
-    assert client.get("/api/health").json()["embeddings_available"] is False
+    # /api/health resolves every optional subsystem through core.capabilities,
+    # which imports the predicate per call — so the patch lands on its origin.
+    monkeypatch.setattr(embeddings_module, "embeddings_available", lambda: False)
+    body = client.get("/api/health").json()
+    assert body["embeddings_available"] is False
+    assert body["capabilities"]["embeddings"] is False
 
 
 def test_embed_start_returns_503_without_embeddings(client, admin_bootstrap, monkeypatch):

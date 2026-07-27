@@ -902,9 +902,24 @@ export interface UploadResult {
   job_id?: string | null;
 }
 
+/** Optional subsystems that are hidden entirely when unconfigured. Keys match
+ * `CAPABILITY_KEYS` in `src/vestigo/core/capabilities.py`. */
+export interface Capabilities {
+  embeddings: boolean;
+  agent: boolean;
+  mcp: boolean;
+  oidc: boolean;
+  enrichers: boolean;
+  sigma: boolean;
+  transfer: boolean;
+}
+
 export interface HealthResponse {
   status: "ok";
   version: string;
+  /** One entry per optional subsystem — false means "unconfigured", and the UI
+   * renders no entry point for it. The flat flags below are older aliases. */
+  capabilities: Capabilities;
   oidc_enabled: boolean;
   /** False when neither local embedding deps nor a remote endpoint are configured. */
   embeddings_available: boolean;

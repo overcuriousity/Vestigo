@@ -58,11 +58,15 @@ function TimelineRow({
   tl,
   sourcesById,
   mcpEnabled,
+  enrichersAvailable,
 }: {
   caseId: string;
   tl: Timeline;
   sourcesById: Map<string, Source>;
   mcpEnabled: boolean;
+  /** No enricher has its data asset installed — the dialog would list nothing
+   * actionable, so it is absent rather than empty. */
+  enrichersAvailable: boolean;
 }) {
   return (
     <div
@@ -113,7 +117,7 @@ function TimelineRow({
         {tl.source_ids.length > 0 && (
           <EmbedWizard caseId={caseId} timeline={tl} iconTrigger />
         )}
-        {tl.source_ids.length > 0 && (
+        {tl.source_ids.length > 0 && enrichersAvailable && (
           <EnrichersDialog caseId={caseId} timeline={tl} />
         )}
         {mcpEnabled && <AgentTokensDialog caseId={caseId} timeline={tl} />}
@@ -170,7 +174,8 @@ export function TimelineList({ caseId }: Props) {
               caseId={caseId}
               tl={tl}
               sourcesById={sourcesById}
-              mcpEnabled={health?.mcp_enabled ?? false}
+              mcpEnabled={health?.capabilities?.mcp ?? false}
+              enrichersAvailable={health?.capabilities?.enrichers ?? true}
             />
           ))}
         </div>

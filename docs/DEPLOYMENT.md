@@ -10,6 +10,45 @@ The application itself is a native Python app (`uv run vestigo-web`) talking to 
 existing infrastructure. Vestigo only needs connection strings (`VESTIGO_*` env vars,
 see `.env.example` and `src/vestigo/core/config.py`).
 
+## Configuration: environment vs. the admin console
+
+Every setting has two possible layers, resolved **per field**:
+
+1. **Environment** (`VESTIGO_*`, optionally via `.env`) — the deploy-time layer.
+2. **Database** (`app_settings` table) — the runtime layer, edited by an administrator
+   under **Administration → Settings** and applied without a restart.
+
+**The environment always wins.** A field pinned in the environment is shown read-only in
+the console with its variable name, and any override stored before the pin appeared is
+ignored — so a locked-down deployment stays locked down no matter who has an admin
+account. Clearing an override in the console deletes its row; the field then falls back
+to the environment value, then the built-in default.
+
+Three things the console handles specially:
+
+- **Environment-only fields** are never stored in the database: `VESTIGO_POSTGRES_URL`
+  (it is the database these settings live in), `VESTIGO_ENVIRONMENT`,
+  `VESTIGO_LOG_LEVEL`, the `VESTIGO_ADMIN_*` bootstrap seed, the data directories
+  (`SOURCE_RETENTION_PATH`, `TRANSFER_TEMP_PATH`, `ENRICHER_DATA_PATH`,
+  `QDRANT_PATH`), and `VESTIGO_SECRETS_MODE` itself. They are displayed for reference.
+- **Restart-required fields** (the ClickHouse and Qdrant connection settings) are stored
+  and shown as pending, but the running process keeps the client it built at startup.
+- **Secrets** (passwords, API keys) are stored in plaintext and never returned by the
+  API — the console shows only whether one is set. Set `VESTIGO_SECRETS_MODE=env-only`
+  to refuse database storage of secrets entirely, in which case environment variables
+  are the only way to supply them. (The LLM key has its own equivalent switch,
+  `VESTIGO_AGENT_SECRET_MODE`, and is edited on the Agent tab.)
+
+Settings are cached per process and reloaded on save, matching the single-process
+deployment model the job store already assumes. If you run more than one app process
+against one database, restart the others after a settings change.
+
+**Optional subsystems are hidden when unconfigured.** `/api/health` reports a
+`capabilities` map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer);
+a subsystem that is off or unconfigured renders no entry point in the UI and — for the
+AI agent — its tools are not advertised to the model at all. The endpoints refuse
+independently, so hiding is never the only enforcement.
+
 ## Reference compose stack
 
 `docker-compose.yml` starts the three backing services for local/dev use:

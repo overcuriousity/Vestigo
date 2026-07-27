@@ -29,6 +29,7 @@ import {
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { useCapabilities } from "@/api/health";
 import { Button } from "@/components/ui/Button";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { InfoHint } from "@/components/ui/InfoHint";
@@ -98,9 +99,14 @@ export function InvestigatePanel({
   const pendingRange = useBaselineStore((s) => s.pendingRange);
   const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
 
+  // Similarity is embedding-backed: without embeddings configured the tab is
+  // absent, not disabled — the same treatment the agent gets when no LLM
+  // endpoint is set (core/capabilities.py).
+  const embeddingsAvailable = useCapabilities().embeddings;
+
   useEffect(() => {
-    if (similarAnchor) setTab("similar");
-  }, [similarAnchor]);
+    if (similarAnchor && embeddingsAvailable) setTab("similar");
+  }, [similarAnchor, embeddingsAvailable]);
 
   // Marking on the histogram is only meaningful for building a baseline — pull
   // the user to the baseline frame. The builder drawer is deliberately NOT
@@ -201,7 +207,9 @@ export function InvestigatePanel({
             ["anomalies", AlertTriangle, "Anomalies"],
             ["patterns", Repeat, "Patterns"],
             ["sigma", Sigma, "Sigma"],
-            ["similar", Search, "Similarity"],
+            ...(embeddingsAvailable
+              ? ([["similar", Search, "Similarity"]] as [Tab, React.ElementType, string][])
+              : []),
             ["methodology", BookOpen, "Method"],
           ] as [Tab, React.ElementType, string][]
         ).map(([id, Icon, label]) => (
