@@ -2,6 +2,7 @@ import { Outlet, useLocation } from "react-router-dom";
 import { TopBar } from "./TopBar";
 import { Footer } from "./Footer";
 import { TourProvider } from "@/components/tour/TourProvider";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { ToastProvider, Toasts, ToastViewport } from "@/components/ui/Toaster";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 
@@ -24,7 +25,12 @@ export function AppShell() {
         <div className="flex h-svh flex-col overflow-hidden bg-[var(--color-bg-base)]">
           <TopBar />
           <main className="flex-1 overflow-hidden">
-            <Outlet />
+            {/* Keyed by pathname: a page that throws leaves the shell (and
+                its navigation) intact, and moving to another route clears
+                the fallback instead of stranding the user on it. */}
+            <ErrorBoundary label="This page" resetKey={pathname}>
+              <Outlet />
+            </ErrorBoundary>
           </main>
           {showFooter && <Footer />}
         </div>

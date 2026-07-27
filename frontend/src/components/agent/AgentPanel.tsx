@@ -38,6 +38,7 @@ import {
 import { useAgentStore } from "@/stores/agent";
 import { triggerDownload } from "@/lib/download";
 import { Button } from "@/components/ui/Button";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
@@ -120,7 +121,8 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   // Keyed by tool_call_id: models that batch parallel tool calls persist N
   // call rows followed by N result rows in *completion* order, so adjacency
   // pairing mislabels one card and drops the other N-1. Rows written before
-  // the tool_call_id migration fall back to FIFO order.
+  // the tool_call_id migration have no key to pair on, and are matched by
+  // FIFO order *only while that is unambiguous* — see below.
   const pendingCharts = new Map<string, PendingChart>();
   const pendingChartFifo: PendingChart[] = [];
   for (const m of messages) {
@@ -189,8 +191,16 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       if (m.tool_call_id) {
         chart = pendingCharts.get(m.tool_call_id);
         pendingCharts.delete(m.tool_call_id);
-      } else {
+      } else if (pendingChartFifo.length === 1) {
+        // Unkeyed rows can only be paired by order, and order is not a fact
+        // here: a failed call row is persisted before its validation error,
+        // so with two or more buffered an `ok` result can pop the *rejected*
+        // spec and draw a chart that does not match its own title. A card an
+        // analyst reads as evidence must never be a guess — with the pairing
+        // ambiguous, show nothing and let the transcript stand on its own.
         chart = pendingChartFifo.shift();
+      } else {
+        pendingChartFifo.length = 0;
       }
       if (result?.ok && chart) items.push({ kind: "chart", ...chart });
     } else if (m.role === "tool" && m.tool_args) {
@@ -924,28 +934,34 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           }
           if (item.kind === "finding") {
             return (
-              <FindingCard
-                key={i}
-                caseId={caseId}
-                timelineId={timelineId}
-                title={item.title}
-                description={item.description}
-                spec={item.spec}
-                total={item.total}
-                onApply={onApplyFilters}
-              />
+              <ErrorBoundary key={i} label="This finding">
+                <FindingCard
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  title={item.title}
+                  description={item.description}
+                  spec={item.spec}
+                  total={item.total}
+                  onApply={onApplyFilters}
+                />
+              </ErrorBoundary>
             );
           }
           if (item.kind === "chart") {
             return (
-              <ChartProposalCard
-                key={i}
-                caseId={caseId}
-                timelineId={timelineId}
-                title={item.title}
-                description={item.description}
-                spec={item.spec}
-              />
+              // A chart card renders model-authored JSON that was persisted
+              // verbatim and cannot be corrected after the fact, so a card
+              // that cannot be drawn degrades to a notice rather than taking
+              // the conversation — or the app — with it.
+              <ErrorBoundary key={i} label="This chart proposal">
+                <ChartProposalCard
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  title={item.title}
+                  description={item.description}
+                  spec={item.spec}
+                />
+              </ErrorBoundary>
             );
           }
           if (item.kind === "proposal") {

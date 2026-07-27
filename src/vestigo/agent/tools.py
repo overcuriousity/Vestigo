@@ -205,7 +205,39 @@ TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOL_REGISTRY)
 # beside the tiers it selects: `agent/fidelity.py::FIDELITY_TIERED_TOOLS`.
 
 
-class FilterSpec(BaseModel):
+def coerce_object_arg(data: Any) -> Any:
+    """Parse a tool argument a provider handed over as a JSON string.
+
+    Nested object arguments are not universally emitted as objects: some
+    providers stringify them, and pydantic-ai only parses the *top* level of a
+    tool call's arguments (``ToolCallPart.args_as_dict``), so the inner value
+    arrives as text. Rejecting it costs the model a retry it has to guess its
+    way out of, on tools it otherwise uses correctly — every filtered query in
+    the toolset takes a nested ``FilterSpec``. Anything that is not a JSON
+    object falls through unchanged to the normal validation error.
+    """
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except ValueError:
+            return data
+    return data
+
+
+class ObjectArgModel(BaseModel):
+    """Base for every model used as a *nested* tool argument.
+
+    Carries `coerce_object_arg` so tolerance is a property of the position
+    (nested argument) rather than something each spec remembers to add.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_stringified(cls, data: Any) -> Any:
+        return coerce_object_arg(data)
+
+
+class FilterSpec(ObjectArgModel):
     """Event filters, mirroring the Explorer's filter shape.
 
     This is the contract that makes findings applicable: the exact same spec
@@ -317,7 +349,7 @@ class FilterSpec(BaseModel):
         return self
 
 
-class ChartCompareSpec(BaseModel):
+class ChartCompareSpec(ObjectArgModel):
     """The optional second layer a chart is measured against."""
 
     mode: Literal["off", "baseline", "custom"] = Field(
@@ -334,7 +366,7 @@ class ChartCompareSpec(BaseModel):
     )
 
 
-class ChartOptionsSpec(BaseModel):
+class ChartOptionsSpec(ObjectArgModel):
     """Presentation and sizing knobs, mirroring the Visualize page's controls.
 
     Every field is optional; omitting one takes the same default the analyst
@@ -400,7 +432,7 @@ class ChartOptionsSpec(BaseModel):
     )
 
 
-class ChartSpec(BaseModel):
+class ChartSpec(ObjectArgModel):
     """A chart, described exactly as the Visualize page describes one.
 
     This mirrors the frontend's `ChartConfig` field for field, so anything an
@@ -491,15 +523,12 @@ class ChartSpec(BaseModel):
         restart, whose model still holds the previous tool schema in context —
         and is deletable once no such conversation can predate the change.
         """
-        if isinstance(data, str):
-            # Some providers hand back a nested object argument as a JSON
-            # string. Parsing it here beats a validation error the model has
-            # to guess its way out of; a string that is not JSON falls through
-            # to the normal "expected an object" error.
-            try:
-                data = json.loads(data)
-            except ValueError:
-                return data
+        # `ObjectArgModel` coerces a stringified argument too, but the two
+        # before-validators' relative order is pydantic's business — doing it
+        # here as well keeps the legacy translation below reachable for a
+        # stringified legacy spec whichever way that order falls. Parsing an
+        # already-parsed value is a no-op.
+        data = coerce_object_arg(data)
         if not isinstance(data, dict):
             return data
         kind = data.get("kind")
@@ -1732,7 +1761,15 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 blocks = await store.list_story_blocks(story_id)
                 if after_block_id not in {b.id for b in blocks}:
                     return {"error": f"after_block_id {after_block_id!r} not in this story"}
-            inline_chart = block_kind == "chart_ref" and "chart_spec" in (content or {})
+            # A stringified `content` is coerced for the same reason nested
+            # specs are (`coerce_object_arg`). The membership test below must
+            # not see a string: `in` on one is a *substring* match, which
+            # passes silently and then fails on `.get` — a wrong answer where
+            # a type error belongs.
+            content = coerce_object_arg(content)
+            if not isinstance(content, dict):
+                return {"error": "content must be a JSON object keyed for the block kind"}
+            inline_chart = block_kind == "chart_ref" and "chart_spec" in content
             try:
                 if inline_chart:
                     if not (content.get("name") or "").strip():

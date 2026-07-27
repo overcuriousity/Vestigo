@@ -14,6 +14,7 @@ import { ExplorerPage } from "@/pages/ExplorerPage";
 import { VisualizePage } from "@/pages/VisualizePage";
 import { LoginPage } from "@/pages/LoginPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { RouteErrorPage } from "@/pages/RouteErrorPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { AdminLayout } from "@/pages/admin/AdminLayout";
 import { AdminUsersPage } from "@/pages/admin/AdminUsersPage";
@@ -27,9 +28,9 @@ import { AdminSettingsPage } from "@/pages/admin/AdminSettingsPage";
 export const router = createBrowserRouter(
   createRoutesFromElements(
     <>
-      <Route path="login" element={<LoginPage />} />
-      <Route element={<RequireAuth />}>
-        <Route element={<AppShell />}>
+      <Route path="login" element={<LoginPage />} errorElement={<RouteErrorPage />} />
+      <Route element={<RequireAuth />} errorElement={<RouteErrorPage />}>
+        <Route element={<AppShell />} errorElement={<RouteErrorPage />}>
           <Route index element={<CasesPage />} />
           <Route path="cases/:caseId" element={<CaseOverviewPage />} />
           <Route path="cases/:caseId/stories" element={<StoriesPage />} />

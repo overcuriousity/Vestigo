@@ -16,7 +16,13 @@ from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
 
 from vestigo.agent.fidelity import Fidelity
-from vestigo.agent.tools import AgentScope, build_tool_server, schema_chars_for_scope
+from vestigo.agent.tools import (
+    AgentScope,
+    ChartSpec,
+    FilterSpec,
+    build_tool_server,
+    schema_chars_for_scope,
+)
 from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
@@ -2043,6 +2049,43 @@ async def test_spec_handed_over_as_a_json_string_is_parsed(store, monkeypatch):
     )
     assert result["ok"] is True
     assert result["resolved"]["chart_type"] == "bar"
+
+
+async def test_a_stringified_filter_spec_is_parsed_on_every_tool_that_takes_one(store, monkeypatch):
+    """`FilterSpec` is a nested argument on ~20 tools, not a chart-only shape.
+
+    The same provider that stringifies a chart spec stringifies these, so the
+    tolerance belongs to the position (nested argument) — `ObjectArgModel` —
+    rather than to any one spec.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "histogram",
+        {"filters": '{"q": "failed login", "artifacts": ["auth"]}'},
+    )
+    # Reaching the aggregation at all is the assertion: an unparsed string
+    # never gets past argument validation.
+    assert "error" not in result
+    assert "buckets" in result
+    spec = FilterSpec.model_validate('{"q": "failed login", "artifacts": ["auth"]}')
+    assert spec.q == "failed login"
+    assert spec.artifacts == ["auth"]
+
+
+def test_a_stringified_spec_still_reaches_the_legacy_kind_translation():
+    """Both before-validators run, in whichever order pydantic picks."""
+    spec = ChartSpec.model_validate('{"kind": "terms", "field": "attr:status", "limit": 5}')
+    assert spec.chart_type == "bar"
+    assert spec.options.top_n == 5
+
+
+def test_unparseable_object_arg_falls_through_to_the_normal_error():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ChartSpec.model_validate("not json at all")
 
 
 # ── retired facet spec ──────────────────────────────────────────────────────

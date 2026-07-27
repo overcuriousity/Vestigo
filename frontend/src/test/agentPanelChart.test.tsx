@@ -227,9 +227,26 @@ describe("AgentPanel propose_chart folding", () => {
     expect(cards.map((c) => c.textContent)).toEqual(["Good chart"]);
   });
 
-  it("legacy rows without tool_call_id pair in FIFO order", async () => {
+  it("a single legacy row without tool_call_id still pairs — order is unambiguous", async () => {
+    const charts = [{ id: null, title: "Legacy one", ok: true }];
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: batchRows(charts),
+    });
+    renderPanel();
+    const cards = await screen.findAllByTestId("chart-proposal-card");
+    expect(cards.map((c) => c.textContent)).toEqual(["Legacy one"]);
+  });
+
+  it("ambiguous legacy rows render no card rather than a mislabelled one", async () => {
+    // Two unkeyed proposals in flight: results carry no key either, so which
+    // spec belongs to which result is a guess. The call row is persisted
+    // before its validation runs, so guessing can pair an `ok` result with a
+    // *rejected* spec and draw a chart that contradicts its own title —
+    // silently, in a tool whose output is read as evidence. Showing nothing
+    // is the only honest answer; the transcript still records both calls.
     const charts = [
-      { id: null, title: "Legacy one", ok: true },
+      { id: null, title: "Legacy one", ok: false },
       { id: null, title: "Legacy two", ok: true },
     ];
     getConversationMock.mockResolvedValue({
@@ -237,7 +254,8 @@ describe("AgentPanel propose_chart folding", () => {
       messages: batchRows(charts),
     });
     renderPanel();
-    const cards = await screen.findAllByTestId("chart-proposal-card");
-    expect(cards.map((c) => c.textContent)).toEqual(["Legacy one", "Legacy two"]);
+    await screen.findByTestId("agent-panel");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 });

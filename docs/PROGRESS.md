@@ -21,6 +21,28 @@ emitted it, so the bad row is permanent and every re-render of that conversation
 - **The tool accepts it too.** `ChartSpec`'s before-validator `json.loads`es a string
   spec, which is cheaper than a validation error the model has to guess its way out of.
 
+**Then the blast radius, because that crash was one symptom of four problems.**
+
+- **The app had no error boundary at all.** `grep -rn "errorElement\|ErrorBoundary"` over
+  `frontend/src` returned nothing, so *any* render-time throw in *any* panel unmounted
+  every route — the reason one malformed row cost the whole product rather than one card.
+  `components/ui/ErrorBoundary.tsx` now contains failures at three levels: `AppShell`
+  wraps its `Outlet` (keyed by pathname, so navigating away recovers), the router carries
+  a `RouteErrorPage` as the last net, and the agent's chart/finding cards — the ones
+  rendering model-authored JSON — wrap themselves individually.
+- **`FilterSpec` is a nested argument on ~20 tools.** The tolerance therefore belongs to
+  the *position*, not to `ChartSpec`: `ObjectArgModel` is the base for every nested tool
+  argument, so a provider that stringifies one stringifies none of them into a failure.
+- **`"chart_spec" in (content or {})` in `propose_story_block`** is the same shape as the
+  frontend bug, except Python's `in` on a string is a silent substring match that then
+  fails on `.get`. `content` is coerced and type-checked before the membership test.
+- **A chart card could render another proposal's spec.** Unkeyed (pre-`tool_call_id`)
+  rows were paired by FIFO order, and the call row is persisted *before* its validation
+  runs — so an `ok` result could pop a *rejected* spec and draw a chart contradicting its
+  own title. Pairing now falls back to order only when exactly one proposal is buffered;
+  ambiguous batches render nothing. A missing card is recoverable, a wrong one read as
+  evidence is not.
+
 ## Session 110 — 2026-07-27: PR #189 review fixes
 
 **Why.** A review of the session-109 branch found that generalizing "hide what isn't
