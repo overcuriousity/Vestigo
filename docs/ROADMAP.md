@@ -289,6 +289,16 @@ Decisions, not work items — each stays as decided unless its trigger fires.
 - **M26 — the two time-histogram implementations stay separate.** After session 49 the
   only shared piece is the brush gesture; `TimelineHistogram` carries Explorer-only
   concerns that make a merge high-risk/low-payoff. Trigger: the two drift apart.
+- **react-router stays at 7.18.1 despite GHSA-qwww-vcr4-c8h2** (2026-07-27). The advisory
+  (high, CSRF in RSC mode) covers `>= 7.12.0, < 8.3.0` and is patched in 8.3.0 — which is
+  not published: 7.18.1 is the latest release that exists, so the range covers everything
+  installable. It affects only applications using the unstable RSC APIs with server
+  actions; Vestigo is a SPA (`createBrowserRouter` + `RouterProvider`, no `unstable_*`
+  imports, FastAPI backend), so the vulnerable path is unreachable. `npm audit fix --force`
+  would *downgrade* to 7.11.0, giving up seven minors of fixes to step below the range.
+  Deliberately **not** silenced via a `dependabot.yml` ignore: ignoring `< 8.3.0` would
+  also suppress real 7.x patches. Trigger: 8.3.0 (or any 8.x) publishes — then upgrade and
+  delete this entry; re-evaluate immediately if RSC APIs are ever adopted.
 - **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client
   for Jupyter/pandas workflows is cheap. Trigger: a user asks.
 - **Vendored converter ports** — demand-driven only (see M25); the vendored
