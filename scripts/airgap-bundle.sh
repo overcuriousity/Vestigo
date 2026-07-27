@@ -6,17 +6,24 @@
 #     scripts/airgap-bundle.sh                    # app + backing services
 #     scripts/airgap-bundle.sh --app-only         # app image only (services already there)
 #     scripts/airgap-bundle.sh --no-embeddings    # skip the ~2 GB torch install
-#     scripts/airgap-bundle.sh -o /media/usb      # write the tarball elsewhere
+#     scripts/airgap-bundle.sh -o /media/usb      # write the tarball straight to the drive
 #
 # What it does: builds the frontend, builds the app image from the prebuilt
 # frontend (so the far side never needs node), saves every image the stack
 # runs, and packs them with the compose file and `install.sh`.
+#
+# --app-only produces a much smaller tarball but only installs on a host that
+# already has the three backing-service images loaded — install.sh checks for
+# them and refuses rather than letting compose try to pull. Use it for repeat
+# upgrades of a host a full bundle already reached; use the full bundle when in
+# doubt, or when you cannot inspect the target before travelling.
 #
 # Verified end to end by `tests/test_airgap_bundle.py`, which asserts the
 # bundle's contents rather than its size.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SELF="$REPO/scripts/$(basename "${BASH_SOURCE[0]}")"   # absolute: --help reads it after the cd
 cd "$REPO"
 
 OUT_DIR="$REPO"
@@ -28,7 +35,8 @@ while [ $# -gt 0 ]; do
     --no-embeddings) INSTALL_EMBEDDINGS=0 ;;
     -o) shift; OUT_DIR="${1:?-o needs a directory}" ;;
     -o*) OUT_DIR="${1#-o}" ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print the header block itself, so help can never drift from it.
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -79,7 +87,7 @@ if [ "$APP_ONLY" = 0 ]; then
   # Read the tags out of the compose file rather than repeating them here:
   # one place to bump a backing service.
   while read -r img; do
-    [ -n "$img" ] && IMAGES+=("$img")
+    if [ -n "$img" ]; then IMAGES+=("$img"); fi
   done < <(sed -n 's/^ *image: \(docker\.io[^$]*\)$/\1/p' deploy/airgap/docker-compose.airgap.yml)
 fi
 for img in "${IMAGES[@]}"; do
@@ -88,22 +96,49 @@ for img in "${IMAGES[@]}"; do
     *) say "pulling $img"; "$ENGINE" pull "$img" ;;
   esac
 done
+
 say "saving ${#IMAGES[@]} image(s) — this is the slow part"
-"$ENGINE" save -o "$BUNDLE/images/vestigo-stack.tar" "${IMAGES[@]}"
+# podman needs -m for more than one image. WITHOUT it, podman does not fail: it
+# reads the extra arguments as additional *tags for the first image* and writes
+# a single-image archive carrying all four names. `podman load` on the far side
+# then produces a `postgres:17-alpine` that is actually qdrant — an airgapped
+# host, a wrong image, and no error anywhere along the way.
+SAVE_OPTS=()
+if [ "$ENGINE" = podman ] && [ "${#IMAGES[@]}" -gt 1 ]; then
+  SAVE_OPTS+=(-m)
+fi
+"$ENGINE" save "${SAVE_OPTS[@]+"${SAVE_OPTS[@]}"}" \
+  -o "$BUNDLE/images/vestigo-stack.tar" "${IMAGES[@]}"
+
+# Verify what landed in the archive rather than trusting the exit status: this
+# is the last moment the connected side can catch a short save, and `install.sh`
+# repeats the same count check before it touches anything.
+SAVED="$(tar xOf "$BUNDLE/images/vestigo-stack.tar" manifest.json 2>/dev/null \
+  | grep -o '"RepoTags"' | wc -l)"
+[ "$SAVED" = "${#IMAGES[@]}" ] || die \
+  "archive holds $SAVED image(s), expected ${#IMAGES[@]} — refusing to ship a short bundle"
 
 # ── 4. everything else the target needs ─────────────────────────────────────
 cp deploy/airgap/docker-compose.airgap.yml "$BUNDLE/docker-compose.yml"
 cp deploy/airgap/install.sh "$BUNDLE/install.sh"
 cp deploy/clickhouse/allow-default-network.xml "$BUNDLE/clickhouse/"
 cp .env.example "$BUNDLE/.env.example"
-cp docs/nginx-tls.conf "$BUNDLE/nginx-tls.conf" 2>/dev/null || true
+# Not optional: docs/DEPLOYMENT.md tells the operator this file is in the bundle,
+# and TLS is the last step of a first install.
+cp docs/nginx-tls.conf "$BUNDLE/nginx-tls.conf"
 chmod +x "$BUNDLE/install.sh"
+
+# Exactly what the archive holds, so install.sh can verify the load rather than
+# discovering a missing backing service when compose tries to pull it.
+printf '%s\n' "${IMAGES[@]}" > "$BUNDLE/images.list"
 
 # The tag the compose file resolves; install.sh seeds .env from this.
 cat > "$BUNDLE/bundle.env" <<EOF
 VESTIGO_IMAGE_TAG=$TAG
 VESTIGO_VERSION=$VERSION
 VESTIGO_COMMIT=$COMMIT
+VESTIGO_IMAGE_COUNT=${#IMAGES[@]}
+VESTIGO_BUNDLE_SCOPE=$([ "$APP_ONLY" = 1 ] && echo app-only || echo full)
 EOF
 
 printf 'Vestigo %s (%s)\nBuilt %s\nImages: %s\n' \
@@ -119,8 +154,26 @@ TARBALL="$OUT_DIR/vestigo-airgap-$TAG.tar.gz"
 say "packing $TARBALL"
 tar czf "$TARBALL" -C "$STAGE" "$(basename "$BUNDLE")"
 
+SUM="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+printf '%s  %s\n' "$SUM" "$(basename "$TARBALL")" > "$TARBALL.sha256"
+
 say "done"
-printf '\n  %s\n  %s\n\n' "$TARBALL" "$(sha256sum "$TARBALL" | cut -d' ' -f1)"
-printf 'Copy it to the airgapped host, then:\n'
-printf '  tar xzf %s\n  cd %s\n  ./install.sh\n' \
-  "$(basename "$TARBALL")" "$(basename "$BUNDLE")"
+cat <<EOF
+
+  $TARBALL
+  $TARBALL.sha256
+  $SUM
+
+Carry both files to the airgapped host (they must travel together — the .sha256
+is how the far side knows the copy survived the drive), then:
+
+  sha256sum -c $(basename "$TARBALL").sha256
+  tar xzf $(basename "$TARBALL")
+  cd $(basename "$BUNDLE")
+  ./install.sh --check     # verifies everything, changes nothing
+  ./install.sh             # installs, or upgrades an existing install
+
+An upgrade needs no other step: install.sh finds the existing install directory,
+keeps its .env, and reuses the same named volumes. docs/DEPLOYMENT.md §"Route A"
+has the full runbook, including backup and rollback.
+EOF

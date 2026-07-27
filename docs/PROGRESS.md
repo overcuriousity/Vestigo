@@ -36,6 +36,39 @@ build-time and upgrade-time were, and nothing in `docs/` admitted it.
   checkout for native) and documents in-place patching honestly, including that
   `docker cp` does not survive a recreate.
 
+**Review round (PR #191).** Four defects, all in the class where the operator finds
+out at the isolated host:
+
+- **`podman save` needs `-m`, and does not say so.** With more than one image and no
+  `-m`, podman reads the extra arguments as additional *tags for the first image* and
+  writes a single-image archive carrying all four names — exit 0, no warning. The far
+  side then loads a `postgres:17-alpine` that is really qdrant. Fixed, and both sides
+  now count the archive's `manifest.json` entries against a declared
+  `VESTIGO_IMAGE_COUNT` rather than trusting an exit status.
+- **`--app-only` could not work.** The bundle's compose file declares all four
+  services, so on a host without the backing-service images compose would go to a
+  registry — the original failure, wearing a DNS timeout as a disguise. `install.sh`
+  now verifies every referenced image exists after `load` and refuses, naming the
+  cause, before anything is copied or started.
+- **An upgrade unpacks a new directory, and compose names the project after it.**
+  Extracting `vestigo-airgap-1.9.0-abc123/` beside the old install would have created
+  a *second*, empty stack with new volumes, looking perfectly healthy. The compose
+  file pins `name: vestigo`, and `install.sh` now runs the stack from a stable
+  **install directory** (`/opt/vestigo`, `--dir`/`VESTIGO_INSTALL_DIR` to override)
+  that the bundle only feeds — which also keeps the operator's `.env` across upgrades
+  instead of regenerating it from the example. Volumes belonging to another project
+  name are detected and reported rather than silently ignored.
+- **Ordering.** Images load and are checked *before* the install directory is
+  touched, so a bundle that cannot produce a working stack leaves the running one
+  exactly as it was.
+
+Also: unknown installer arguments are fatal (`--dry-run` used to mean "install"),
+`VESTIGO_HEALTH_TIMEOUT_SECONDS` raises the health wait for slow hosts with long
+migrations, the tarball gets a `.sha256` companion, and `docs/DEPLOYMENT.md` §"Route
+A" is now a runbook — build, carry, install, upgrade, back up, roll back, diagnose.
+`tests/test_airgap_bundle.py` grows six cases that drive `install.sh` against a fake
+engine and a stub archive.
+
 ## Session 110 — 2026-07-27: PR #189 review fixes
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in

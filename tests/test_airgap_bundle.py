@@ -6,16 +6,24 @@ never reaches for the node image, that the bundle's compose file builds
 nothing, and that the three files which have to agree on a variable name
 actually do.
 
-Running the bundle end to end is a container build and several GB of image
-export — out of scope for the test suite; `scripts/airgap-bundle.sh --help`
-documents the manual rehearsal.
+The installer's decisions — refusing an --app-only bundle on a host without the
+backing services, refusing a short image archive, keeping an operator's .env
+across an upgrade — are exercised for real against a fake container engine and a
+bundle directory that carries a stub archive instead of gigabytes.
+
+Building a real bundle is a container build plus several GB of image export, so
+that stays out of the suite; `scripts/airgap-bundle.sh --help` and
+`docs/DEPLOYMENT.md` §"Route A" document the manual rehearsal.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -108,3 +116,233 @@ def test_the_installer_never_overwrites_an_existing_env():
     text = INSTALL_SH.read_text()
     assert "if [ ! -f .env ]; then" in text
     assert "keeping existing .env" in text
+
+
+def test_podman_gets_the_multi_image_flag():
+    """`podman save` without `-m` writes ONE image carrying every tag.
+
+    It does not fail. The far side loads a `postgres:17-alpine` that is really
+    qdrant, which is the worst possible place to discover a packaging bug, so
+    the flag is asserted rather than assumed.
+    """
+    text = BUNDLE_SH.read_text()
+    assert '[ "$ENGINE" = podman ]' in text
+    assert "SAVE_OPTS+=(-m)" in text
+
+
+def test_both_sides_count_the_images_in_the_archive():
+    """Builder and installer independently verify the archive's inventory.
+
+    The count is what catches a short save; checking it on both sides means a
+    bundle that was damaged in transit fails before anything is loaded.
+    """
+    assert "grep -o '\"RepoTags\"' | wc -l" in BUNDLE_SH.read_text()
+    assert "grep -o '\"RepoTags\"' | wc -l" in INSTALL_SH.read_text()
+    assert "VESTIGO_IMAGE_COUNT" in BUNDLE_SH.read_text()
+    assert "VESTIGO_IMAGE_COUNT" in INSTALL_SH.read_text()
+
+
+def test_the_compose_project_name_is_pinned():
+    """Volumes must not depend on the directory a bundle happened to unpack in.
+
+    Compose derives the project name — and every volume name with it — from the
+    directory. An upgrade unpacks a *new* directory, so without a pinned `name:`
+    the new stack comes up beside the old data, empty, and looks healthy.
+    """
+    assert re.search(r"^name: vestigo$", COMPOSE.read_text(), re.MULTILINE)
+
+
+# ── behavioral: the installer driven against a fake container engine ────────
+
+
+def _fake_bundle(tmp_path, images, *, scope="full", archive_images=None):
+    """A bundle directory complete enough for install.sh, minus the GBs."""
+    bundle = tmp_path / "bundle"
+    (bundle / "images").mkdir(parents=True)
+    (bundle / "clickhouse").mkdir()
+
+    # A docker-archive is a tar with a manifest.json at its root; install.sh
+    # only counts the entries, so a real one is unnecessary.
+    manifest = json.dumps([{"RepoTags": [image]} for image in (archive_images or images)])
+    (bundle / "manifest.json").write_text(manifest)
+    with tarfile.open(bundle / "images/vestigo-stack.tar", "w") as tar:
+        tar.add(bundle / "manifest.json", arcname="manifest.json")
+    (bundle / "manifest.json").unlink()
+
+    shutil.copy(COMPOSE, bundle / "docker-compose.yml")
+    shutil.copy(REPO / "deploy/clickhouse/allow-default-network.xml", bundle / "clickhouse")
+    shutil.copy(INSTALL_SH, bundle / "install.sh")
+    (bundle / "install.sh").chmod(0o755)
+    (bundle / ".env.example").write_text("VESTIGO_ENVIRONMENT=production\n")
+    (bundle / "nginx-tls.conf").write_text("# stub\n")
+    (bundle / "BUNDLE-INFO").write_text("Vestigo 9.9.9 (deadbee)\n")
+    (bundle / "images.list").write_text("".join(f"{image}\n" for image in images))
+    (bundle / "bundle.env").write_text(
+        "VESTIGO_IMAGE_TAG=9.9.9-deadbee\n"
+        "VESTIGO_VERSION=9.9.9\n"
+        "VESTIGO_COMMIT=deadbee\n"
+        f"VESTIGO_IMAGE_COUNT={len(archive_images or images)}\n"
+        f"VESTIGO_BUNDLE_SCOPE={scope}\n"
+    )
+    sums = subprocess.run(
+        "find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum",
+        shell=True,
+        cwd=bundle,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    (bundle / "MANIFEST.sha256").write_text(sums)
+    return bundle
+
+
+def _fake_engine(tmp_path, present_images):
+    """A podman stand-in that knows which images exist and logs `compose up`."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "engine.log"
+    known = "\n".join(present_images)
+    # `docker` must exist and be unusable: that is the case the engine probe was
+    # written for, and it keeps a real docker on the test host out of the way.
+    (bin_dir / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "podman").write_text(
+        f"""#!/bin/sh
+echo "$@" >> {log}
+case "$1 $2" in
+  "image inspect")
+    printf '%s\\n' '{known}' | grep -qxF "$3" ;;
+  "volume inspect") exit 1 ;;
+  "volume ls") exit 0 ;;
+  "compose version"|"compose up"|"info "|"load -i") exit 0 ;;
+  *) exit 0 ;;
+esac
+"""
+    )
+    for script in bin_dir.iterdir():
+        script.chmod(0o755)
+    return bin_dir, log
+
+
+def _run_install(bundle, bin_dir, install_dir, *args):
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "VESTIGO_HEALTH_TIMEOUT_SECONDS": "0",
+    }
+    return subprocess.run(
+        ["bash", str(bundle / "install.sh"), "--dir", str(install_dir), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+ALL_IMAGES = [
+    "vestigo-app:9.9.9-deadbee",
+    "docker.io/library/postgres:17-alpine",
+    "docker.io/clickhouse/clickhouse-server:26.6.1.1193-alpine",
+    "docker.io/qdrant/qdrant:v1.18.2",
+]
+
+
+def test_install_starts_the_stack_when_every_image_is_present(tmp_path):
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+    install_dir = tmp_path / "opt"
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "compose up -d --no-build" in log.read_text()
+    # The install directory, not the bundle, is what the stack runs from.
+    assert (install_dir / "docker-compose.yml").is_file()
+    assert "VESTIGO_IMAGE_TAG=9.9.9-deadbee" in (install_dir / ".env").read_text()
+
+
+def test_an_app_only_bundle_refuses_a_host_without_the_backing_services(tmp_path):
+    """The failure this whole bundle exists to prevent, caught before `up`.
+
+    A missing image sends compose to a registry the host cannot reach, so it
+    surfaces as a DNS timeout rather than as the true cause. Nothing may start.
+    """
+    install_dir = tmp_path / "opt"
+    install_dir.mkdir()
+    (install_dir / ".env").write_text("VESTIGO_IMAGE_TAG=1.0.0-oldcommit\n")
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES[:1], scope="app-only")
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES[:1])
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode != 0
+    assert "app-only" in result.stderr
+    assert "docker.io/library/postgres:17-alpine" in result.stderr
+    assert "compose up" not in log.read_text()
+    # A bundle that cannot work leaves the existing install untouched: same tag,
+    # no half-copied payload pointing at an image this host does not have.
+    assert (install_dir / ".env").read_text() == "VESTIGO_IMAGE_TAG=1.0.0-oldcommit\n"
+    assert not (install_dir / "docker-compose.yml").exists()
+
+
+def test_a_short_image_archive_is_rejected_before_anything_loads(tmp_path):
+    """The `podman save -m` failure, caught on the receiving side too."""
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES, archive_images=ALL_IMAGES[:1])
+    # bundle.env now declares 1; rewrite it to the 4 a real full bundle claims.
+    env_file = bundle / "bundle.env"
+    env_file.write_text(env_file.read_text().replace("IMAGE_COUNT=1", "IMAGE_COUNT=4"))
+    subprocess.run(
+        "find . -type f ! -name MANIFEST.sha256 -print0 | sort -z "
+        "| xargs -0 sha256sum > MANIFEST.sha256",
+        shell=True,
+        cwd=bundle,
+        check=True,
+    )
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+
+    result = _run_install(bundle, bin_dir, tmp_path / "opt")
+
+    assert result.returncode != 0
+    assert "holds 1 image(s)" in result.stderr
+    assert not log.exists() or "load" not in log.read_text()
+
+
+def test_upgrading_keeps_the_env_and_reports_both_tags(tmp_path):
+    """Carrying a newer bundle to a running host must not reset its config."""
+    install_dir = tmp_path / "opt"
+    install_dir.mkdir()
+    (install_dir / ".env").write_text(
+        "VESTIGO_IMAGE_TAG=1.0.0-oldcommit\nVESTIGO_ADMIN_PASSWORD=kept-secret\n"
+    )
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, _ = _fake_engine(tmp_path, ALL_IMAGES)
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode == 0, result.stderr
+    env_text = (install_dir / ".env").read_text()
+    assert "VESTIGO_ADMIN_PASSWORD=kept-secret" in env_text
+    assert "VESTIGO_IMAGE_TAG=9.9.9-deadbee" in env_text
+    assert "1.0.0-oldcommit" in result.stdout  # named in the upgrade and rollback lines
+
+
+def test_unknown_arguments_are_fatal(tmp_path):
+    """`--dry-run` must not be read as 'install everything'."""
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+
+    result = _run_install(bundle, bin_dir, tmp_path / "opt", "--dry-run")
+
+    assert result.returncode != 0
+    assert "unknown option" in result.stderr
+    assert not log.exists()
+
+
+def test_check_verifies_without_touching_the_host(tmp_path):
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+    install_dir = tmp_path / "opt"
+
+    result = _run_install(bundle, bin_dir, install_dir, "--check")
+
+    assert result.returncode == 0, result.stderr
+    assert not install_dir.exists()
+    assert not log.exists() or "compose up" not in log.read_text()

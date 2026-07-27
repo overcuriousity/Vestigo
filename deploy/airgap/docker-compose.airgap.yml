@@ -9,6 +9,14 @@
 # with default credentials) and a port conflict with whatever else the host
 # runs. Only the app is published — put TLS in front of it (nginx-tls.conf).
 # To inspect a service directly, use `compose exec`, or add a port yourself.
+#
+# `name:` is pinned so the project — and therefore the named volumes holding all
+# case data — does not depend on the directory this file happens to sit in. An
+# upgrade extracts a *new* bundle directory; without this, compose would derive
+# a new project name from it and bring up an empty stack next to the old data.
+# Set COMPOSE_PROJECT_NAME in .env to adopt an install that used another name.
+
+name: vestigo
 
 services:
   postgres:

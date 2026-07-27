@@ -50,3 +50,7 @@ postgres_data/
 clickhouse_data/
 qdrant_data/
 /data/
+
+# Airgap deployment bundles (scripts/airgap-bundle.sh writes here by default)
+vestigo-airgap-*.tar.gz
+vestigo-airgap-*.tar.gz.sha256
