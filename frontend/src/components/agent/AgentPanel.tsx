@@ -361,9 +361,11 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
         liveText: "",
       };
     }
-    if (e.tool === "propose_annotation") {
+    if (e.tool === "propose_annotation" || e.tool === "propose_story_block") {
       // Rendered from the paired tool_result below, once proposal_id is
-      // known — the call event only carries the proposed tag/comment.
+      // known — the call event only carries the proposed tag/comment (or the
+      // block body). Falling through to the generic row here is what showed
+      // a bare "propose_story_block" line instead of the card.
       return { ...s, items: flushed, liveText: "" };
     }
     if (e.tool === "propose_chart") {
@@ -392,15 +394,16 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     };
   }
   if (e.type === "tool_result") {
-    // Most tool_result rows stay invisible (results feed the model, not
-    // the analyst) — propose_annotation/propose_chart are exceptions, since
-    // what they render is only known once the result lands.
-    if (e.tool === "propose_annotation") {
+    // Most tool_result rows stay invisible (results feed the model, not the
+    // analyst) — propose_annotation/propose_story_block/propose_chart are
+    // exceptions, since what they render is only known once the result lands.
+    if (e.tool === "propose_annotation" || e.tool === "propose_story_block") {
+      const kind = e.tool === "propose_story_block" ? "storyProposal" : "proposal";
       const result = e.result as { proposal_id?: string } | null;
       return {
         ...s,
         items: result?.proposal_id
-          ? [...flushed, { kind: "proposal", proposalId: result.proposal_id }]
+          ? [...flushed, { kind, proposalId: result.proposal_id }]
           : flushed,
         liveText: "",
       };
@@ -590,7 +593,13 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           (event) => {
             if (event.type === "error") failed = true;
             setStream((prev) => foldStreamEvent(prev, event));
-            if (event.type === "tool_result" && event.tool === "propose_annotation") {
+            if (
+              event.type === "tool_result" &&
+              (event.tool === "propose_annotation" || event.tool === "propose_story_block")
+            ) {
+              // Both proposal kinds are rendered from this query — without the
+              // refetch the card resolves against a list fetched before the
+              // proposal existed and degrades to a bare tool row.
               queryClient.invalidateQueries({
                 queryKey: ["agent-proposals", caseId, conversationId],
               });

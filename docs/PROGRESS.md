@@ -1,9 +1,30 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 113 — the 1.8.4 bundle meets a real isolated host).
+Last updated: 2026-07-27 (session 114 — agent story-block proposals render live).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 114 — 2026-07-27: the proposal card the analyst never saw
+
+**Why.** An agent turn proposed three story blocks and the chat showed three bare
+`propose_story_block` tool rows instead of three cards.
+
+- **W7 wired the tool into one of four render paths.** `AgentPanel` decides what a
+  tool call looks like in four independent per-tool allowlists — the persisted
+  transcript (`itemsFromMessages`), the live `tool_call` fold, the live `tool_result`
+  fold, and the proposals-query invalidation. `propose_story_block` was added to the
+  first only. Live, the call row fell through to the generic tool row and the result
+  row produced nothing; after the turn, the transcript refetch *did* emit a
+  `storyProposal` item, but the proposals list was the one fetched before the
+  proposal existed, so the card hit its `!proposal` fallback — the same bare row,
+  until the panel remounted. Both live folds and the invalidation now cover it,
+  sharing `propose_annotation`'s branches (identical shape: rendered from the result
+  row, which carries `proposal_id`).
+- **How it slipped:** every frontend test for the agent panel covers the persisted
+  path. `src/test/agentPanelStoryProposal.test.tsx` now drives a real streamed turn
+  and asserts the card renders, the raw tool row does not, and the proposals query is
+  refetched.
 
 ## Session 113 — 2026-07-27: what the first real install found
 
