@@ -3,12 +3,26 @@
 # (see README "Quick start"). This image exists for operators who prefer to run the
 # whole stack — backing services plus the app — via docker-compose.
 
+# Where the built frontend comes from. Two stages provide it:
+#   frontend-build     (default) builds it here, needs the node base image.
+#   frontend-prebuilt  takes `frontend/dist` from the build context, so an
+#                      offline host never resolves node:22-alpine at all —
+#                      BuildKit skips a stage no reachable stage copies from.
+# `docs/DEPLOYMENT.md` §Airgapped drives this; `scripts/airgap-bundle.sh`
+# builds the dist on the connected side.
+ARG FRONTEND_STAGE=frontend-build
+
 FROM node:22-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
+
+# No base image of its own — `scratch` is empty, so this stage costs nothing
+# to resolve and carries only what the context already holds.
+FROM scratch AS frontend-prebuilt
+COPY frontend/dist /frontend/dist
 
 FROM python:3.13-slim AS app
 WORKDIR /app
@@ -26,7 +40,9 @@ COPY README.md LICENSE ./
 ARG INSTALL_EMBEDDINGS=0
 RUN uv sync --frozen --no-dev $(test "$INSTALL_EMBEDDINGS" = "1" && echo "--extra embeddings")
 
-COPY --from=frontend-build /frontend/dist ./frontend/dist
+# Re-declared: an ARG from before the first FROM is not in scope inside a stage.
+ARG FRONTEND_STAGE
+COPY --from=${FRONTEND_STAGE} /frontend/dist ./frontend/dist
 
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8080

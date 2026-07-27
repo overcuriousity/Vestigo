@@ -1,7 +1,9 @@
 .git
 .venv
 frontend/node_modules
-frontend/dist
+# frontend/dist is deliberately NOT ignored: the `frontend-prebuilt` stage
+# copies it out of the build context so an airgapped build needs no node image.
+# The default build ignores it and builds the frontend itself.
 data/
 tests/
 docs/

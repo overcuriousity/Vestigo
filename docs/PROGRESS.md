@@ -1,6 +1,42 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 110 — PR #189 review fixes).
+Last updated: 2026-07-27 (session 112 — reproducible airgapped deployment).
+
+## Session 112 — 2026-07-27: the airgap promise, made true for containers
+
+**Why.** Patching a production host exposed that "airgapped" only ever covered the
+*native* install. The container path pulled `node:22-alpine` and `python:3.13-slim`
+unconditionally, so `docker compose up -d --build app` on the isolated host failed at
+DNS — and the follow-up `docker compose up -d` silently restarted the *old* image,
+which looks exactly like a successful deploy. Runtime egress was never the problem;
+build-time and upgrade-time were, and nothing in `docs/` admitted it.
+
+- **`FRONTEND_STAGE` makes the node stage unreachable.** The Dockerfile gains a
+  `frontend-prebuilt` stage that is `FROM scratch` and copies `frontend/dist` out of
+  the build context. BuildKit skips a stage nothing reachable copies from, so selecting
+  it means `node:22-alpine` is never resolved — verified by pointing the node stage at
+  a nonexistent tag and watching the prebuilt build succeed anyway. `.dockerignore` had
+  to stop ignoring `frontend/dist` for this to work at all.
+- **`scripts/airgap-bundle.sh` produces one tarball.** Frontend, app image built from
+  that frontend, every backing-service image, the compose file, `.env.example`,
+  `nginx-tls.conf`, checksums, installer. Backing-service tags are grepped out of the
+  compose file rather than repeated, so bumping one is a single edit.
+- **`deploy/airgap/install.sh` is the whole far side.** Verifies its own checksums,
+  loads images, creates `.env` only when there is none, repoints the image tag, starts
+  the stack, waits for `/api/health`, and says so plainly when the wait times out.
+  Re-running it *is* the upgrade path. Rehearsed end to end here: bundle built, stack
+  loaded and started from it, `/api/health` answered, second run a clean no-op.
+- **Two things the rehearsal caught that review would not have.** A `docker` binary
+  with an unreachable daemon beat a working `podman` in both scripts' engine detection
+  (now an `info` probe, not a `command -v`); and the backing services published host
+  ports they never needed — a port conflict on any host already running Postgres, and
+  an attack surface for services holding default credentials. They publish nothing now;
+  the app reaches them over the compose network.
+- **`docs/DEPLOYMENT.md` now names both routes** (bundle for containers, carried
+  checkout for native) and documents in-place patching honestly, including that
+  `docker cp` does not survive a recreate.
+
+## Session 110 — 2026-07-27: PR #189 review fixes
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).

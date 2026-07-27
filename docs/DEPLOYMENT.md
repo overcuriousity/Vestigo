@@ -113,9 +113,64 @@ image from the local checkout (`Dockerfile`) and reaches the backing services ov
 compose-internal network. Uncomment it, then `docker compose up -d` brings up the full
 stack in one command.
 
+The build takes `FRONTEND_STAGE`: the default (`frontend-build`) builds the frontend
+in a node stage, while `--build-arg FRONTEND_STAGE=frontend-prebuilt` copies an
+already-built `frontend/dist` out of the build context instead. The prebuilt stage is
+`FROM scratch`, so selecting it means the node base image is never resolved — which is
+what makes an offline build possible at all. `scripts/airgap-bundle.sh` uses it.
+
 ## Airgapped installation
 
-Vestigo's application layer (backend + frontend) can be installed fully offline.
+Two supported routes. Pick by how the host runs Vestigo:
+
+- **Containers → the bundle.** One tarball carries every image, the compose file and
+  an installer. Nothing is built, pulled or resolved on the isolated host. This is the
+  route to take unless you have a reason not to.
+- **Native (`uv run vestigo-web`) → the carried checkout**, further below.
+
+### Route A: the deployment bundle (containers)
+
+On a machine **with network access**, from a checkout of the version you want to ship:
+
+```bash
+scripts/airgap-bundle.sh                 # app + all three backing services
+scripts/airgap-bundle.sh --app-only      # app only (services already deployed)
+scripts/airgap-bundle.sh --no-embeddings # skip the ~2 GB local embedding stack
+```
+
+It builds the frontend, builds the app image **from that prebuilt frontend** (the
+`frontend-prebuilt` Dockerfile stage, so the isolated host never resolves
+`node:22-alpine`), saves every image, and packs them with the compose file,
+`.env.example`, `nginx-tls.conf` and `install.sh`. Output is
+`vestigo-airgap-<version>-<commit>.tar.gz` plus its SHA-256.
+
+On the **airgapped host**:
+
+```bash
+tar xzf vestigo-airgap-<version>-<commit>.tar.gz
+cd vestigo-airgap-<version>-<commit>
+./install.sh --check      # verify the transfer, change nothing
+./install.sh
+```
+
+`install.sh` verifies its own checksums, loads the images, creates `.env` from the
+example **only if there is none**, points the image tag at the version it carries,
+starts the stack and waits for `/api/health`. It is safe to re-run — that is also how
+an **upgrade** works: copy the new bundle over, run `./install.sh`, and the same named
+volumes are picked up by the new image (migrations run on startup). Nothing in this
+path removes data; the volumes are only ever deleted by you.
+
+First install prints the two things left to do: set `VESTIGO_ADMIN_PASSWORD` in `.env`
+(then `docker compose up -d app`), and put TLS in front of the app before analysts use
+it (§TLS reverse proxy below).
+
+**What still has to come from you:** a container engine on the host (Docker with the
+compose plugin, or podman with podman-compose) — the bundle installs Vestigo, not
+Docker.
+
+### Route B: native install from a carried checkout
+
+Use this when the host runs the app directly rather than in a container.
 **The three backing services are out of scope for this procedure**: provision them on
 the airgapped network however you normally handle offline service deployment (e.g.
 `podman load` of pre-pulled images, or native packages).
@@ -154,6 +209,19 @@ On the **airgapped machine**:
    build and run on matching OS/architecture (e.g. build on the same Linux
    distribution/glibc version you'll run on), since the `.venv/` carries compiled
    wheels (PyTorch, onnxruntime, etc.).
+
+### Patching an airgapped host in place
+
+Applying a fix without a full bundle: carry the `git format-patch` output plus a
+prebuilt `frontend/dist`, `git am` the patches, replace `frontend/dist`, restart.
+
+For a **container** deployment that is only a stopgap — `docker cp` into a running
+container survives `restart` but not `up --force-recreate` or a rebuild, so the image
+still holds the old code. Follow it with a proper bundle (Route A) at the next
+opportunity, or the fix silently disappears the next time the stack is recreated.
+A rebuilt frontend is not optional for any change under `frontend/`: the app serves
+`frontend/dist`, and `docker compose up -d` after a **failed** build happily keeps
+serving the previous image.
 
 ## TLS reverse proxy (nginx)
 
