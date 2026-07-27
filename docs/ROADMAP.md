@@ -29,7 +29,7 @@ round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up oppor
 
 All ten open issues re-verified against `main` @ 9034609; every one still reproduced.
 Grouped into batches that share a file/subsystem — work a batch as one change.
-B1, B3 and B4 shipped in session 103, B2 in session 107 (see `PROGRESS.md`).
+B1, B3 and B4 shipped in session 103, B2 in sessions 107–108 (see `PROGRESS.md`).
 
 - [ ] **B5 — Docs/API hygiene** ([#160], [#159]). `.env.example` covers 23 of ~96
   `Settings` fields: keep it curated, add a header pointing at `core/config.py`, document
@@ -112,6 +112,12 @@ round — the data model migrates once, not twice.
   UploadDialog`'s duplicate warning and a handful of other sites hand-roll the same
   border/dim-background/icon banner shape with per-site colour tokens (deferred out of the
   B2 batch, which touched three of them).
+- [ ] Decide whether the story artifact upload (`api/stories.ts:82`) should join the
+  progress-reporting transfer path. It posts a rendered HTML string as a JSON body field
+  rather than as `FormData`, and is capped at `story_max_artifact_bytes` (20 MiB), so it
+  was deliberately left off the session-108 rollout — every *other* file-bearing request
+  now runs on `client.ts`'s XHR core with byte progress and an abort signal. Revisit if
+  the cap rises or artifacts start carrying embedded evidence.
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 

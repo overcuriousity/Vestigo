@@ -98,6 +98,42 @@ describe("FileDropZone", () => {
     expect(onFiles).not.toHaveBeenCalled();
   });
 
+  it("matches a MIME `accept` entry against the file's type, not everything", () => {
+    // The original rule was `startsWith(".") ? endsWith(ext) : true`, so any
+    // non-extension entry accepted every dropped file — a filter that silently
+    // filtered nothing.
+    const onFiles = vi.fn();
+    render(<FileDropZone accept="text/csv" onFiles={onFiles} />);
+    const zone = screen.getByRole("button");
+
+    fireEvent.drop(zone, {
+      dataTransfer: { files: [new File(["x"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(onFiles).not.toHaveBeenCalled();
+
+    fireEvent.drop(zone, {
+      dataTransfer: { files: [new File(["x"], "log.csv", { type: "text/csv" })] },
+    });
+    expect(onFiles.mock.calls[0][0].map((f: File) => f.name)).toEqual(["log.csv"]);
+  });
+
+  it("honours a `type/*` accept entry", () => {
+    const onFiles = vi.fn();
+    render(<FileDropZone accept="image/*" onFiles={onFiles} />);
+    fireEvent.drop(screen.getByRole("button"), {
+      dataTransfer: { files: [new File(["x"], "shot.png", { type: "image/png" })] },
+    });
+    expect(onFiles.mock.calls[0][0].map((f: File) => f.name)).toEqual(["shot.png"]);
+  });
+
+  it("keeps the hidden input out of the tab order", () => {
+    // The zone is the tab stop and handles Enter/Space itself. A focusable
+    // input nested inside a `role="button"` is two tab stops for one control.
+    render(<FileDropZone accept=".csv" onFiles={vi.fn()} />);
+    expect(theInput().tabIndex).toBe(-1);
+    expect(screen.getByRole("button").tabIndex).toBe(0);
+  });
+
   it("keeps only the first dropped file unless multiple is set", () => {
     const onFiles = vi.fn();
     render(<FileDropZone accept=".csv" onFiles={onFiles} />);
@@ -146,5 +182,10 @@ describe("FileInputButton", () => {
     );
     expect(screen.getByRole("button", { name: "Uploading…" })).toBeDisabled();
     expect(theInput()).toBeDisabled();
+  });
+
+  it("keeps the hidden input out of the tab order", () => {
+    render(<FileInputButton onFiles={vi.fn()}>Upload asset</FileInputButton>);
+    expect(theInput().tabIndex).toBe(-1);
   });
 });

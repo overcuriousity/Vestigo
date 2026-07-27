@@ -339,6 +339,11 @@ async def test_export_progress_phases_and_counters(store, tmp_path, monkeypatch)
         assert totals["events"] == 3
         assert totals["blobs"] == 3
         assert result.counts["blobs"] == 2  # one had no blob on disk
+        # Sealing and hashing the archive is one long operation, not N of
+        # them, so it publishes no denominator at all. `None`, never `0`: the
+        # UI reads None as "indeterminate, keep the bar moving" and 0 as
+        # nothing to show, and this is the slowest phase on a big archive.
+        assert totals["manifest"] is None
         # No accumulated snapshot ever overshoots its denominator.
         for snap in recorder.snapshots:
             if snap.get("total"):

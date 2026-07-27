@@ -5,8 +5,8 @@
  */
 import { Loader2, CheckCircle, XCircle, X } from "lucide-react";
 import type { Job } from "@/api/types";
-import { Progress } from "@/components/ui/Progress";
-import { fmtDuration } from "@/lib/time";
+import { ProgressMeter } from "@/components/ui/ProgressMeter";
+import { progressPct } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
 interface Props {
@@ -31,20 +31,9 @@ export function JobStatusRow({
   className,
 }: Props) {
   const isTerminal = status === "completed" || status === "failed";
-
-  const pct =
-    progress?.total != null && progress.total > 0 && progress.processed != null
-      ? Math.round((progress.processed / progress.total) * 100)
-      : null;
-
-  const rate = progress?.rate_bps;
-  const etaS = progress?.eta_s;
-  const showEta = status === "running" && rate != null && rate > 0;
-  const etaLine = showEta
-    ? [`${(rate / 1e6).toFixed(1)} MB/s`, etaS != null ? `~${fmtDuration(etaS)} left` : null]
-        .filter(Boolean)
-        .join(" · ")
-    : null;
+  const pct = progressPct(progress?.processed, progress?.total);
+  // A finished or failed job's rate is history, not a live reading.
+  const running = status === "running";
 
   const icon =
     status === "completed" ? (
@@ -73,12 +62,16 @@ export function JobStatusRow({
           {detail && ` · ${detail}`}
           {pct != null && ` · ${pct}%`}
         </div>
-        {pct != null && status !== "failed" && <Progress value={pct} className="mt-1.5" />}
-        {etaLine && (
-          <div className="mt-1 font-mono text-[10px] text-[var(--color-fg-muted)] tabular-nums">
-            {etaLine}
-          </div>
-        )}
+        <ProgressMeter
+          processed={progress?.processed}
+          total={progress?.total}
+          rate_bps={running ? progress?.rate_bps : null}
+          eta_s={running ? progress?.eta_s : null}
+          // A running job always shows a moving bar, even mid-phase before that
+          // phase knows how many items it covers.
+          indeterminate={running}
+          barHidden={status === "failed"}
+        />
         {error && <div className="mt-1 text-[var(--color-danger)] line-clamp-2 break-all">{error}</div>}
       </div>
       {isTerminal && onDismiss && (

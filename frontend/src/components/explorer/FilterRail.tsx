@@ -6,6 +6,7 @@ import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
 import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
 import { findOrCreateView } from "@/lib/storyViews";
+import { hasActiveFilters } from "@/lib/fieldFilters";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
@@ -283,9 +284,10 @@ export function FilterRail({
     onChange(f);
   };
 
-  const hasFilters = Object.values(filters).some((v) =>
-    v && (typeof v === "string" ? v.length > 0 : Object.keys(v).length > 0),
-  );
+  // Shared with the Explorer toolbar and Visualize's inherited-filters bar.
+  // The old inline version counted any non-empty member, so a `sort` or a
+  // leftover match-mode map offered "Clear all filters" on an unfiltered view.
+  const hasFilters = hasActiveFilters(filters);
 
   return (
     <aside className="flex h-full w-72 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg-surface)]">

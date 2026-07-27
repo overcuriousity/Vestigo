@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.8.2] — 2026-07-26
+## [1.8.2] — 2026-07-27
 
 ### Fixed
 
@@ -16,28 +16,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the job id once the upload promise resolved — on a multi-GB archive that left
   a minutes-long window in which a second click started a second import of the
   same file. Submission is now blocked synchronously, so a double-click cannot
-  slip through before the button re-renders as disabled. The export dialog got
-  the same guard.
+  slip through before the button re-renders as disabled. Every transfer in the
+  app got the same guard, including the source upload, where a second click
+  previously cost a full duplicate upload of a file the server would then
+  discard as a duplicate hash.
 
-- **Case export and import report progress** ([#183]). Both transfer dialogs
-  polled the job and rendered nothing from it, and the download had no feedback
-  at all, so a multi-GB transfer was indistinguishable from a hang. They now
-  show what the server is doing — "Verifying archive integrity", "Packing
-  events", "Restoring original source files" — with a percentage for the phases
-  that process many items, plus byte progress with throughput and a time
-  estimate for the upload and the download themselves. An import upload can be
-  cancelled while it is in flight; because the server creates the job only after
-  the whole archive has landed, cancelling leaves no job and no partially
-  restored case. A running import is also tracked in the job tray, so closing
-  the dialog no longer hides it.
+- **Every large file transfer reports progress and can be cancelled** ([#183]).
+  Uploads and downloads alike showed a disabled button and nothing else, so a
+  multi-GB transfer was indistinguishable from a hang. All of them now report
+  bytes moved with throughput and a time estimate, and can be stopped in
+  flight:
+
+  - **Uploading a log source** — the largest routine transfer in the app, and
+    previously the blindest: the ingest job that the job tray shows does not
+    exist until the whole file has landed, so on a multi-GB source everything
+    up to that point was silent.
+  - **Case export and import.** Both now also name the server-side phase —
+    "Verifying archive integrity", "Packing events", "Restoring original source
+    files" — with a percentage for the phases that process many items. Sealing
+    and hashing the finished archive shows a moving bar rather than a stalled
+    one; it counts no items, so there is no percentage to show.
+  - **Exporting events as CSV/JSONL.** The response is streamed with no length
+    known in advance, so this reports bytes received without a percentage. The
+    dialog also no longer claims there is "no memory limit": the server streams
+    it, but the browser holds the whole file until the download finishes, and
+    for a very large export a case archive is the better tool.
+  - **Uploading an enricher asset** (GeoIP and similar, hundreds of MB).
+
+  Cancelling is safe everywhere it is offered: the server streams an upload to
+  a temporary file and creates rows and jobs only once all of it has arrived,
+  so a cancelled upload leaves nothing behind, and a cancelled export download
+  leaves the archive on the server for a retry. A running import is tracked in
+  the job tray, so closing the dialog no longer hides it.
 
 - **Re-selecting the same file after a failed case import works.** The import
   dialog never cleared its file input, so picking the same archive again fired
   no change event and the button looked dead. Fixed for every file picker in the
   app (case import, source upload, Sigma rule upload, admin enricher assets),
   which now share one implementation — that also means files dropped onto the
-  source-upload zone are checked against the accepted extensions, as they always
-  were when picked through the file dialog.
+  source-upload zone are checked against the accepted types, as they always
+  were when picked through the file dialog. Keyboard users get one tab stop per
+  picker instead of two.
 
 - **The Visualize page states the filters it inherits.** It charts exactly what
   the Explorer grid is showing, but said so only in the caption underneath the
@@ -48,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them, and a link back to the Explorer. Removing an exclusion, tag or
   time-range chip in the comparison-layer editor also works now; those chips
   were inert.
+
+- **"Clear all filters" only appears when something is actually filtered.** The
+  Explorer's filter rail and toolbar decided this by counting any non-empty
+  member of the filter state, so a sort order or a leftover match-mode setting
+  was enough to offer to clear filters on an unfiltered view. All three
+  surfaces — rail, toolbar and the new Visualize bar — now share one definition
+  of "filtered", matching exactly what the filter chips render.
 
 ## [1.8.1] — 2026-07-26
 

@@ -21,8 +21,11 @@ vi.mock("@/api/transfer", () => ({
   transferApi: {
     startExport: (...a: unknown[]) => startExportMock(...a),
     downloadExport: (...a: unknown[]) => downloadExportMock(...a),
-    getJob: (...a: unknown[]) => getJobMock(...a),
   },
+}));
+
+vi.mock("@/api/jobs", () => ({
+  jobsApi: { get: (...a: unknown[]) => getJobMock(...a) },
 }));
 
 const CASE = { id: "c1", name: "Roundtrip" } as Case;
@@ -58,7 +61,7 @@ describe("ExportCaseDialog", () => {
     expect(downloadExportMock).toHaveBeenCalledTimes(1);
   });
 
-  it("starts exactly one export however fast the button is clicked", () => {
+  it("starts exactly one export however fast the button is clicked", async () => {
     startExportMock.mockReturnValue(new Promise(() => {}));
     renderDialog();
     fireEvent.click(screen.getByTitle("Export case as .vestigo archive"));
@@ -67,7 +70,7 @@ describe("ExportCaseDialog", () => {
     fireEvent.click(submit);
     fireEvent.click(submit);
     fireEvent.click(submit);
-    expect(startExportMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(startExportMock).toHaveBeenCalledTimes(1));
   });
 
   it("names the phase the server is working on", async () => {
@@ -100,7 +103,36 @@ describe("ExportCaseDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Export" }));
 
     expect(await screen.findByText("Downloading archive")).toBeTruthy();
-    expect(screen.getByText(/75%/)).toBeTruthy();
+    expect(screen.getByText(/2\.9 MB \/ 3\.8 MB/)).toBeTruthy();
+  });
+
+  it("aborts a download in flight and keeps the retry available", async () => {
+    // The server only unlinks the archive after a *completed* stream, so a
+    // cancelled download leaves it there and the retry is still good.
+    let abortSignal: AbortSignal | undefined;
+    downloadExportMock.mockImplementation(
+      (
+        _caseId: string,
+        _jobId: string,
+        _name: string,
+        opts: { signal: AbortSignal; onProgress: (p: unknown) => void },
+      ) => {
+        abortSignal = opts.signal;
+        opts.onProgress({ loaded: 1_000, total: 4_000_000 });
+        return new Promise((_resolve, reject) => {
+          opts.signal.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        });
+      },
+    );
+    renderDialog();
+    fireEvent.click(screen.getByTitle("Export case as .vestigo archive"));
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+
+    fireEvent.click(await screen.findByText("Cancel download"));
+    expect(abortSignal?.aborted).toBe(true);
+    await waitFor(() => expect(screen.queryByText("Downloading archive")).toBeNull());
   });
 
   it("offers a retry when the transfer itself fails", async () => {
@@ -110,7 +142,9 @@ describe("ExportCaseDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Export" }));
 
     const retry = await screen.findByRole("button", { name: "Retry download" });
-    expect(screen.getByText("network died")).toBeTruthy();
+    // The failure is worded with what it means for the analyst: the archive
+    // survives a transfer that died, so retrying is cheaper than re-exporting.
+    expect(screen.getByText(/network died.*still on the server/)).toBeTruthy();
 
     downloadExportMock.mockResolvedValueOnce(undefined);
     fireEvent.click(retry);

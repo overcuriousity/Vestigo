@@ -420,13 +420,17 @@ async def import_case(
 ) -> ImportResult:
     """Restore an archive as a new case owned by `owner`. All-or-nothing."""
 
-    def _progress(phase: str, total: int = 0) -> None:
+    def _progress(phase: str, total: int | None = None) -> None:
         """Enter a phase, resetting the unit counters in the same write.
 
         ``JobStore.update`` *merges* progress dicts, so a phase that only sets
         ``phase`` inherits the previous phase's ``processed``/``total`` and the
         UI shows a percentage from the wrong denominator. Always reset both
         here, and let ``_advance`` move ``processed`` within the phase.
+
+        ``total=None`` means "this phase does not count items" (verifying the
+        archive's manifest is one operation, not N of them). The UI renders
+        that as an indeterminate bar rather than as a stuck 0%.
         """
         if progress:
             progress({"phase": phase, "processed": 0, "total": total})

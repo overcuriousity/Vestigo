@@ -76,6 +76,35 @@ export function applyFieldFilter(
 }
 
 /**
+ * Does *f* narrow the event set at all?
+ *
+ * "At all" means exactly "`FilterChips` would render at least one chip" — the
+ * two must agree, because every surface that asks this question does so in
+ * order to decide between showing chips and showing an empty state. Keep this
+ * list in step with `components/explorer/FilterChips.tsx`.
+ *
+ * Time bounds count: a chart of one brushed hour is not an unfiltered chart.
+ * Presentation-only members (`limit`, `sort`, the match-mode maps, and
+ * `collapseRoutine`, which is not URL-serialized) deliberately do not.
+ */
+export function hasActiveFilters(f: EventFilters): boolean {
+  return Boolean(
+    f.q ||
+      f.artifact ||
+      f.artifacts?.length ||
+      f.sourceId ||
+      f.tag ||
+      f.tagsInclude?.length ||
+      f.tagsExclude?.length ||
+      f.annotated?.length ||
+      f.start ||
+      f.end ||
+      Object.keys(f.filters ?? {}).length ||
+      Object.keys(f.exclusions ?? {}).length,
+  );
+}
+
+/**
  * Return a copy of *f* with one filter chip's contribution removed.
  *
  * `key` names the `EventFilters` member; `fieldKey` picks the entry inside the

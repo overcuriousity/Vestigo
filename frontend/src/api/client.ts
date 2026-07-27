@@ -159,52 +159,21 @@ export const put = <T>(path: string, body?: unknown) =>
 export const del = <T>(path: string, params?: Record<string, string | number | boolean | undefined | null>) =>
   request<T>("DELETE", path, { params });
 
-/** POST with multipart form data (for file upload). */
-export async function postForm<T>(path: string, form: FormData): Promise<T> {
-  const url = BASE + path;
-  const res = await fetch(url, { method: "POST", body: form, credentials: "include" });
-  await checkResponse(res, path);
-  return res.json() as Promise<T>;
-}
-
-/** Trigger a streaming download (JSON POST body). Returns a Blob. */
-export async function fetchBlob(path: string, body: unknown): Promise<Blob> {
-  const res = await fetch(BASE + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    credentials: "include",
-  });
-  await checkResponse(res, path);
-  return res.blob();
-}
-
-/** GET a resource as a Blob (e.g. a CSV/JSONL download via query params). */
-export async function fetchBlobGet(
-  path: string,
-  params?: Record<string, string | number | boolean | undefined | null>,
-): Promise<Blob> {
-  const url = new URL(BASE + path, window.location.href);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
-      if (v != null && v !== "") url.searchParams.set(k, String(v));
-    }
-  }
-  const res = await fetch(url.toString(), { credentials: "include" });
-  await checkResponse(res, path);
-  return res.blob();
-}
-
 // ---------------------------------------------------------------------------
-// Progress-reporting transfer path (XMLHttpRequest)
+// File-transfer path (XMLHttpRequest)
 //
 // `fetch` cannot report *upload* progress — there is no event for bytes sent,
 // and a ReadableStream request body is not supported without HTTP/2 duplex.
-// Case import/export archives are multi-GB, so the two transfer calls go
-// through XHR instead. Everything that matters (401 handling, error detail
-// parsing, ApiError shape) is shared via `apiErrorFromBody`; only the ~6 lines
-// of request wiring are duplicated. The `fetch` helpers above are deliberately
-// left alone — they are the common path and are covered by existing tests.
+// Every file-bearing call therefore goes through XHR: uploads (multi-GB log
+// sources, case archives, enricher assets) and blob downloads (case archives,
+// event exports) alike. There is deliberately no second, progress-less way to
+// send a file — `postForm`/`fetchBlob`/`fetchBlobGet` below *are* this path,
+// so a new call site cannot opt out of progress by picking the wrong helper.
+//
+// Plain JSON verbs (`get`/`post`/`patch`/`put`/`del`) stay on `fetch` above:
+// they carry no file body, so there is nothing to report, and `fetch` is the
+// better-supported primitive for them. Both cores share `apiErrorFromBody`,
+// so there is one error surface regardless of which one ran the request.
 // ---------------------------------------------------------------------------
 
 /** Bytes moved so far. `total` is null when the length is not computable
@@ -216,6 +185,12 @@ export interface TransferProgress {
 
 export type ProgressHandler = (p: TransferProgress) => void;
 
+/** Byte-progress + cancellation, accepted by every file-bearing helper. */
+export interface TransferOptions {
+  onProgress?: ProgressHandler;
+  signal?: AbortSignal;
+}
+
 interface XhrOptions {
   method: string;
   /** API path (no BASE prefix) — used for the `/auth/login` 401 exemption. */
@@ -223,10 +198,25 @@ interface XhrOptions {
   url: string;
   /** Narrower than `fetch`'s BodyInit: XHR cannot send a ReadableStream. */
   body?: XMLHttpRequestBodyInit | null;
+  headers?: Record<string, string>;
   responseType?: "" | "blob";
   onUploadProgress?: ProgressHandler;
   onDownloadProgress?: ProgressHandler;
   signal?: AbortSignal;
+}
+
+/** Absolute URL for an API path, with `request()`'s query-param semantics
+ * (arrays repeat the key, empty/nullish values are dropped). */
+function apiUrl(path: string, params?: QueryParams): string {
+  const url = new URL(BASE + path, window.location.href);
+  for (const [k, v] of Object.entries(params ?? {})) {
+    if (Array.isArray(v)) {
+      for (const item of v) url.searchParams.append(k, String(item));
+    } else if (v != null && v !== "") {
+      url.searchParams.set(k, String(v));
+    }
+  }
+  return url.toString();
 }
 
 function progressOf(e: ProgressEvent): TransferProgress {
@@ -246,8 +236,12 @@ function xhrRequest<T>(opts: XhrOptions): Promise<T> {
     // needed both same-origin (:8080) and via the Vite dev proxy (:5173).
     xhr.withCredentials = true;
     if (opts.responseType) xhr.responseType = opts.responseType;
-    // No Content-Type is ever set: a FormData body needs the browser to write
-    // the multipart boundary itself.
+    // Headers are opt-in per caller, never defaulted: a FormData body must go
+    // out with no Content-Type at all so the browser writes the multipart
+    // boundary itself.
+    for (const [k, v] of Object.entries(opts.headers ?? {})) {
+      xhr.setRequestHeader(k, v);
+    }
 
     if (opts.onUploadProgress) {
       const onUpload = opts.onUploadProgress;
@@ -279,8 +273,16 @@ function xhrRequest<T>(opts: XhrOptions): Promise<T> {
       // Error bodies are JSON even when the success path is a blob.
       const rejectWith = (text: string) =>
         reject(apiErrorFromBody(xhr.status, xhr.statusText, text, opts.path));
-      if (opts.responseType === "blob" && xhr.response instanceof Blob) {
-        xhr.response.text().then(rejectWith, () => rejectWith(""));
+      if (opts.responseType === "blob") {
+        // `responseText` *throws* InvalidStateError unless responseType is ""
+        // or "text", and this is an event listener — the throw would escape
+        // into nothing and leave the promise forever pending. So a blob
+        // request only ever reads its body through `response`.
+        if (xhr.response instanceof Blob) {
+          xhr.response.text().then(rejectWith, () => rejectWith(""));
+        } else {
+          rejectWith("");
+        }
       } else {
         rejectWith(xhr.responseText ?? "");
       }
@@ -303,32 +305,53 @@ function xhrRequest<T>(opts: XhrOptions): Promise<T> {
   });
 }
 
-/** POST multipart form data, reporting upload progress. Abortable — callers
- * that abort before the server responds leave nothing behind. */
-export function postFormWithProgress<T>(
-  path: string,
-  form: FormData,
-  opts?: { onProgress?: ProgressHandler; signal?: AbortSignal },
-): Promise<T> {
+/**
+ * POST multipart form data. `onProgress` reports bytes *sent*; `signal`
+ * aborts the upload.
+ *
+ * Aborting is safe at every current call site by construction: the server
+ * streams the body to a temp file (`api/uploads.py::receive_upload_to_tmp`)
+ * and only creates rows and jobs once the whole thing has landed, so an
+ * upload cut short leaves nothing behind.
+ */
+export function postForm<T>(path: string, form: FormData, opts?: TransferOptions): Promise<T> {
   return xhrRequest<T>({
     method: "POST",
     path,
-    url: BASE + path,
+    url: apiUrl(path),
     body: form,
     onUploadProgress: opts?.onProgress,
     signal: opts?.signal,
   });
 }
 
+/** POST a JSON body and read the response as a Blob (streamed exports).
+ * `onProgress` reports bytes *received* — for a chunked response with no
+ * `Content-Length` its `total` is null, which the UI renders as an
+ * indeterminate bar rather than a percentage. */
+export function fetchBlob(path: string, body: unknown, opts?: TransferOptions): Promise<Blob> {
+  return xhrRequest<Blob>({
+    method: "POST",
+    path,
+    url: apiUrl(path),
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    responseType: "blob",
+    onDownloadProgress: opts?.onProgress,
+    signal: opts?.signal,
+  });
+}
+
 /** GET a resource as a Blob, reporting download progress. */
-export function getBlobWithProgress(
+export function fetchBlobGet(
   path: string,
-  opts?: { onProgress?: ProgressHandler; signal?: AbortSignal },
+  params?: QueryParams,
+  opts?: TransferOptions,
 ): Promise<Blob> {
   return xhrRequest<Blob>({
     method: "GET",
     path,
-    url: new URL(BASE + path, window.location.href).toString(),
+    url: apiUrl(path, params),
     responseType: "blob",
     onDownloadProgress: opts?.onProgress,
     signal: opts?.signal,

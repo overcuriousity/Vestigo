@@ -1409,7 +1409,7 @@ export function VisualizePage() {
                 metric={metric}
                 hasComparison={compareOn}
                 svgRef={svgRef}
-                onRangeSelect={(start, end) => updateFilters({ ...filters, start, end })}
+                onRangeSelect={(start, end) => updateFilters({ ...urlFilters, start, end })}
               />
             )}
             {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (

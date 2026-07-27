@@ -16,7 +16,7 @@ import { Filter, RotateCcw } from "lucide-react";
 import type { EventFilters } from "@/api/types";
 import { FilterChips } from "@/components/explorer/FilterChips";
 import { InfoHint } from "@/components/ui/InfoHint";
-import { describeFilters } from "@/components/viz/lib/caption";
+import { hasActiveFilters } from "@/lib/fieldFilters";
 
 interface Props {
   /** The URL-derived filters. Pass the raw set, not one augmented with
@@ -43,9 +43,11 @@ export function InheritedFiltersBar({
   onResetRange,
 }: Props) {
   const hasRange = !!(filters.start || filters.end);
-  // Must agree with what FilterChips actually renders, which includes the time
-  // bounds `describeFilters` (a caption helper) leaves out.
-  const hasFilters = hasRange || describeFilters(filters) !== "no filters";
+  // Shares `FilterChips`'s own definition of "filtered" rather than comparing
+  // against caption prose: this decides between the chips and the "no filters"
+  // empty state, so disagreeing with what the chips render would leave an
+  // empty chip row or hide real ones.
+  const hasFilters = hasActiveFilters(filters);
 
   return (
     <div

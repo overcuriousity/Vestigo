@@ -17,8 +17,13 @@ const navigateMock = vi.fn();
 vi.mock("@/api/transfer", () => ({
   transferApi: {
     startImport: (...a: unknown[]) => startImportMock(...a),
-    getJob: (...a: unknown[]) => getJobMock(...a),
   },
+}));
+
+// The restore job is polled under the job tray's own key/queryFn, so the two
+// share one request stream instead of asking about the same job twice.
+vi.mock("@/api/jobs", () => ({
+  jobsApi: { get: (...a: unknown[]) => getJobMock(...a) },
 }));
 
 vi.mock("react-router-dom", async () => ({
@@ -89,21 +94,23 @@ describe("ImportCaseDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/cases/c9"));
   });
 
-  it("cannot be submitted twice while the archive is still uploading (#184)", () => {
+  it("cannot be submitted twice while the archive is still uploading (#184)", async () => {
     // The original defect: `jobId` was only set in the upload promise's
     // `.then()`, so nothing disabled the button for the whole multi-GB upload
-    // and a second click started a second import of the same archive.
+    // and a second click started a second import of the same archive. The
+    // clicks below all land in one task, before React can re-render the
+    // button as disabled — only the synchronous ref guard stops them.
     startImportMock.mockReturnValue(new Promise(() => {}));
     renderDialog();
     pickFile();
     const submit = screen.getByRole("button", { name: "Import" });
     fireEvent.click(submit);
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    fireEvent.click(submit);
 
+    await waitFor(() => expect(startImportMock).toHaveBeenCalledTimes(1));
     expect(submit).toBeDisabled();
-    fireEvent.click(submit);
-    fireEvent.click(submit);
-    fireEvent.click(submit);
-    expect(startImportMock).toHaveBeenCalledTimes(1);
   });
 
   it("reports upload bytes while the archive is in flight", async () => {
@@ -115,7 +122,34 @@ describe("ImportCaseDialog", () => {
     pickFileAndImport();
 
     expect(await screen.findByText(/Uploading backup\.vestigo/)).toBeTruthy();
-    expect(screen.getByText(/50%/)).toBeTruthy();
+    // Bytes, not a bare percentage: "how much of my 4 GB archive has gone" is
+    // the question, and the bar already carries the proportion.
+    expect(screen.getByText(/4\.8 MB \/ 9\.5 MB/)).toBeTruthy();
+  });
+
+  it("aborts the upload when the analyst cancels, without reporting a failure", async () => {
+    let abortSignal: AbortSignal | undefined;
+    startImportMock.mockImplementation(
+      (_file: File, opts: { signal: AbortSignal; onProgress: (p: unknown) => void }) => {
+        abortSignal = opts.signal;
+        opts.onProgress({ loaded: 1_000_000, total: 10_000_000 });
+        return new Promise((_resolve, reject) => {
+          opts.signal.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        });
+      },
+    );
+    renderDialog();
+    pickFileAndImport();
+
+    fireEvent.click(await screen.findByText("Cancel upload"));
+    expect(abortSignal?.aborted).toBe(true);
+    // A cancel is the analyst's own decision, not an error to report back.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Import" })).not.toBeDisabled(),
+    );
+    expect(screen.queryByText(/Aborted/)).toBeNull();
   });
 
   it("names the server-side phase once the archive has landed", async () => {

@@ -265,13 +265,18 @@ async def export_case(
     """Build the archive for one case. ClickHouse is only constructed when
     the case has sources (keeps empty-case export — and unit tests — CH-free)."""
 
-    def _progress(phase: str, total: int = 0) -> None:
+    def _progress(phase: str, total: int | None = None) -> None:
         """Enter a phase, resetting the unit counters in the same write.
 
         ``JobStore.update`` *merges* progress dicts, so a phase that only sets
         ``phase`` inherits the previous phase's ``processed``/``total`` and the
         UI shows a percentage from the wrong denominator. Always reset both
         here, and let ``_advance`` move ``processed`` within the phase.
+
+        ``total=None`` means "this phase does not count items" (sealing and
+        hashing the archive is one long operation, not N of them). The UI
+        renders that as an indeterminate bar — deliberately not as ``0``, which
+        would read as a finished bar or no bar at all.
         """
         if progress:
             progress({"phase": phase, "processed": 0, "total": total})
@@ -342,12 +347,19 @@ async def export_case(
                 dest.unlink(missing_ok=True)
             _advance(done)
         if include_blobs:
-            # Content-addressed: two sources can share a blob, so the unique
-            # hashes — not the sources — are the denominator.
-            blob_hashes = list(dict.fromkeys(s["file_hash"] for s in sources))
+            # Content-addressed, so unique hashes — not sources — are the
+            # denominator. Defensive within one case: `ix_sources_case_id_
+            # file_hash` is unique, so two sources here cannot actually share a
+            # hash (the sharing happens across cases, in the instance-global
+            # retention dir). Kept because the counter and the archive member
+            # names must stay correct if that ever relaxes.
+            source_by_hash: dict[str, dict[str, Any]] = {}
+            for s in sources:
+                source_by_hash.setdefault(s["file_hash"], s)
+            blob_hashes = list(source_by_hash)
             _progress("blobs", total=len(blob_hashes))
             for done, file_hash in enumerate(blob_hashes, start=1):
-                source = next(s for s in sources if s["file_hash"] == file_hash)
+                source = source_by_hash[file_hash]
                 blob = retention_path(file_hash)
                 if blob.exists():
                     # Original source files, routinely the largest members in

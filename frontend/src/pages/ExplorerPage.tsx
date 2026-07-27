@@ -69,6 +69,7 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import type { AnomalyMarker, Disposition, Event, EventFilters, EventPage, Annotation } from "@/api/types";
 import {
   applyFieldFilter,
+  hasActiveFilters,
   mapFieldTokenToFilterKey,
   removeFilterEntry,
 } from "@/lib/fieldFilters";
@@ -1055,9 +1056,7 @@ export function ExplorerPage() {
     pendingSoftAnchorRef.current = null;
   }, [events]);
 
-  const hasActiveFilters = Object.values(filters).some((v) =>
-    v && (typeof v === "string" ? v.length > 0 : Object.keys(v).length > 0),
-  );
+  const filtersActive = hasActiveFilters(filters);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1092,7 +1091,7 @@ export function ExplorerPage() {
               variant="ghost"
               size="icon"
               onClick={() => setFilterRailOpen(!filterRailOpen)}
-              className={hasActiveFilters && !filterRailOpen ? "text-[var(--color-accent)]" : ""}
+              className={filtersActive && !filterRailOpen ? "text-[var(--color-accent)]" : ""}
             >
               {filterRailOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
             </Button>

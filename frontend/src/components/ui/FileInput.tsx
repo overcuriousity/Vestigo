@@ -4,8 +4,8 @@
  * Four sites used to hand-roll `<input type="file">` and had drifted: only
  * three cleared the input's value after a pick (without it, re-picking the
  * same file after a failed upload fires no `change` event and looks like a
- * dead button), only one filtered dropped files, and none of the
- * button-triggered ones were reachable by keyboard through the input itself.
+ * dead button), only one filtered dropped files, and the hidden inputs sat in
+ * the tab order beside the visible control that opens them.
  *
  * Three exports, one per shape actually in use: the bare input, a drop zone,
  * and a button that opens the picker. No `cva` — none of these has a variant
@@ -28,10 +28,15 @@ export interface FileInputProps
   /** Picked files, always an array (empty when the dialog was dismissed). */
   onFiles: (files: File[]) => void;
   /**
-   * Visually hidden but still a real, focusable input the caller can `.click()`
-   * — for button- and drop-zone-triggered pickers. Deliberately not the native
+   * Visually hidden but still a real input the caller can `.click()` — for
+   * button- and drop-zone-triggered pickers. Deliberately not the native
    * `hidden` attribute (it would collide with the prop spread) and not
    * `display: none` (which makes `.click()` unreliable in some browsers).
+   *
+   * Callers must keep it out of the tab order (`tabIndex={-1}`): the visible
+   * control they wrap it in is the focusable one, and two tab stops for one
+   * control — with an interactive element nested inside a `role="button"` —
+   * is worse for keyboard users than none.
    */
   srOnly?: boolean;
   /**
@@ -62,15 +67,28 @@ export const FileInput = forwardRef<HTMLInputElement, FileInputProps>(
 );
 FileInput.displayName = "FileInput";
 
-/** True when `name` matches one entry of a comma-separated `accept` list. */
-function matchesAccept(name: string, accept: string | undefined): boolean {
+/**
+ * True when `file` matches one entry of a comma-separated `accept` list —
+ * `.ext`, `type/subtype`, or `type/*`, the three forms the HTML attribute
+ * takes. An unrecognized entry matches nothing rather than everything: this
+ * gate exists to make drag-drop agree with the picker, and a rule nobody can
+ * satisfy is safer than one everybody satisfies.
+ */
+function matchesAccept(file: File, accept: string | undefined): boolean {
   if (!accept) return true;
-  const lower = name.toLowerCase();
+  const name = file.name.toLowerCase();
+  const type = file.type.toLowerCase();
   return accept
     .split(",")
     .map((a) => a.trim().toLowerCase())
     .filter(Boolean)
-    .some((a) => (a.startsWith(".") ? lower.endsWith(a) : true));
+    .some((a) => {
+      if (a.startsWith(".")) return name.endsWith(a);
+      if (a.endsWith("/*")) return !!type && type.startsWith(a.slice(0, -1));
+      // A MIME rule can only be checked when the browser guessed a type; it
+      // routinely doesn't for forensic formats (.jsonl, .parquet, .vestigo).
+      return !!type && type === a;
+    });
 }
 
 export interface FileDropZoneProps {
@@ -123,7 +141,7 @@ export function FileDropZone({
         // The browser only enforces `accept` in the picker, so filter here too
         // — otherwise drag-drop silently accepts what clicking cannot.
         const dropped = Array.from(e.dataTransfer.files).filter((f) =>
-          matchesAccept(f.name, accept),
+          matchesAccept(f, accept),
         );
         if (dropped.length > 0) onFiles(multiple ? dropped : dropped.slice(0, 1));
       }}
@@ -166,6 +184,8 @@ export function FileDropZone({
       <FileInput
         ref={inputRef}
         srOnly
+        // The zone itself is the tab stop and handles Enter/Space.
+        tabIndex={-1}
         accept={accept}
         multiple={multiple}
         disabled={disabled}
@@ -223,6 +243,8 @@ export function FileInputButton({
       <FileInput
         ref={inputRef}
         srOnly
+        // The Button is the tab stop; this input is reached through it.
+        tabIndex={-1}
         accept={accept}
         multiple={multiple}
         disabled={blocked}

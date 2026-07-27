@@ -3,6 +3,7 @@ import {
   applyFieldEntries,
   applyFieldFilter,
   dropMode,
+  hasActiveFilters,
   mapFieldTokenToFilterKey,
   removeFilterEntry,
 } from "@/lib/fieldFilters";
@@ -152,5 +153,45 @@ describe("removeFilterEntry", () => {
     const f: EventFilters = { filters: { user: ["alice"] } };
     removeFilterEntry(f, "filters", "user", "alice");
     expect(f.filters).toEqual({ user: ["alice"] });
+  });
+});
+
+describe("hasActiveFilters", () => {
+  // This decides between rendering filter chips and rendering an empty state,
+  // so it has to agree with what FilterChips actually renders — including the
+  // time bounds a caption helper leaves out, and excluding the presentation
+  // members that narrow nothing.
+  it("is false for an empty filter set", () => {
+    expect(hasActiveFilters({})).toBe(false);
+  });
+
+  it.each([
+    ["q", { q: "failed login" }],
+    ["artifact", { artifact: "webhistory" }],
+    ["artifacts", { artifacts: ["evtx"] }],
+    ["sourceId", { sourceId: "src-1" }],
+    ["tag", { tag: "suspicious" }],
+    ["tagsInclude", { tagsInclude: ["ioc"] }],
+    ["tagsExclude", { tagsExclude: ["noise"] }],
+    ["annotated", { annotated: ["tag"] as ("tag" | "anomaly")[] }],
+    ["filters", { filters: { user: ["alice"] } }],
+    ["exclusions", { exclusions: { host: ["srv1"] } }],
+  ])("is true for %s", (_label, f) => {
+    expect(hasActiveFilters(f as EventFilters)).toBe(true);
+  });
+
+  it("counts a time range — a brushed hour is not an unfiltered view", () => {
+    expect(hasActiveFilters({ start: "2026-01-01T00:00:00Z" })).toBe(true);
+    expect(hasActiveFilters({ end: "2026-01-02T00:00:00Z" })).toBe(true);
+  });
+
+  it("ignores presentation-only members", () => {
+    // The old inline version counted any non-empty key, so a sort order or a
+    // stale match-mode map offered "Clear all filters" on an unfiltered view.
+    expect(hasActiveFilters({ limit: 100, sort: "asc" } as EventFilters)).toBe(false);
+    expect(hasActiveFilters({ filterModes: { path: "wildcard" } })).toBe(false);
+    expect(hasActiveFilters({ filters: {}, exclusions: {} })).toBe(false);
+    // Not URL-serialized, and it has its own row on the Visualize canvas.
+    expect(hasActiveFilters({ collapseRoutine: true })).toBe(false);
   });
 });

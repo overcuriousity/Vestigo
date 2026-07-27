@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { FileInput } from "@/components/ui/FileInput";
 import { JobStatusRow } from "@/components/ui/JobStatusRow";
+import { TransferProgressRow } from "@/components/ui/TransferProgressRow";
 import { AlertTriangle, Upload } from "lucide-react";
+import { jobsApi } from "@/api/jobs";
 import { transferApi } from "@/api/transfer";
-import { useTransferRate } from "@/hooks/useTransferRate";
+import { useFileTransfer } from "@/hooks/useFileTransfer";
 import { useJobsStore } from "@/stores/jobs";
 import { jobPhaseLabel } from "@/lib/jobPhases";
 
@@ -22,26 +24,34 @@ export function ImportCaseDialog() {
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
-  // The ref, not the state, is what actually prevents a duplicate import: a
-  // second click can land in the same task as the first, before React has
-  // re-rendered the button as disabled. Archives are multi-GB, so that window
-  // used to stay open for the entire upload.
-  const submittingRef = useRef(false);
-  const abortRef = useRef<AbortController | null>(null);
-  const upload = useTransferRate();
   const qc = useQueryClient();
   const navigate = useNavigate();
   const addJob = useJobsStore((s) => s.addJob);
 
+  // Same query key the job tray polls under, so the two collapse into one
+  // request stream: this dialog hands the restore job to the tray, and both
+  // then watch it. Deliberately still an independent `useQuery` rather than a
+  // read of the tray's store — the dialog must not depend on another component
+  // being mounted to see the job it started.
   const { data: job } = useQuery({
-    queryKey: ["transfer-import", jobId],
-    queryFn: () => transferApi.getJob(jobId!),
+    queryKey: ["job", jobId],
+    queryFn: () => jobsApi.get(jobId!),
     enabled: !!jobId,
     refetchInterval: (query) =>
       query.state.data?.status === "completed" || query.state.data?.status === "failed"
         ? false
         : 2000,
+  });
+
+  const upload = useFileTransfer({
+    mutationFn: (o) => transferApi.startImport(file!, o),
+    onSuccess: (r) => {
+      setJobId(r.job_id);
+      // The job outlives this dialog: hand it to the tray so closing the
+      // dialog mid-import doesn't hide a restore that's still running.
+      addJob(r.job_id, `Importing "${file?.name ?? "archive"}"`, [["cases"]]);
+    },
+    onError: setError,
   });
 
   const result = job?.result as ImportResult | null | undefined;
@@ -71,39 +81,13 @@ export function ImportCaseDialog() {
   }, [job, caseId, warnings.length, goToCase]);
 
   const start = () => {
-    if (submittingRef.current || !file) return;
-    submittingRef.current = true;
-    setUploading(true);
+    if (!file) return;
     setError(null);
-    upload.reset();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    transferApi
-      .startImport(file, { onProgress: upload.report, signal: controller.signal })
-      .then((r) => {
-        setJobId(r.job_id);
-        // The job outlives this dialog: hand it to the tray so closing the
-        // dialog mid-import doesn't hide a restore that's still running.
-        addJob(r.job_id, `Importing "${file.name}"`, [["cases"]]);
-        setUploading(false);
-        submittingRef.current = false;
-      })
-      .catch((e) => {
-        // A cancel is not a failure — the user asked for it.
-        if ((e as Error).name !== "AbortError") setError((e as Error).message);
-        setUploading(false);
-        submittingRef.current = false;
-        upload.reset();
-      });
-  };
-
-  const cancelUpload = () => {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    upload.submit();
   };
 
   const jobRunning = !!jobId && (!job || (job.status !== "completed" && job.status !== "failed"));
-  const busy = uploading || jobRunning;
+  const busy = upload.active || jobRunning;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -122,17 +106,16 @@ export function ImportCaseDialog() {
             disabled={busy}
             onFiles={(files) => setFile(files[0] ?? null)}
           />
-          {uploading && upload.state && file && (
-            <JobStatusRow
+          {upload.active && file && (
+            <TransferProgressRow
               label={`Uploading ${file.name}`}
-              status="running"
-              error={null}
-              progress={{
-                total: upload.state.total ?? file.size,
-                processed: upload.state.loaded,
-                rate_bps: upload.state.rate_bps,
-                eta_s: upload.state.eta_s,
-              }}
+              state={upload.state}
+              fallbackTotal={file.size}
+              // Safe to offer: the server creates the import job only after the
+              // whole upload lands, so an aborted upload leaves no job, no
+              // case, and nothing to clean up.
+              onCancel={upload.cancel}
+              cancelLabel="Cancel upload"
             />
           )}
           {job && !caseId && (
@@ -164,25 +147,20 @@ export function ImportCaseDialog() {
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
-            {uploading ? (
-              // Safe to offer: the server creates the import job only after the
-              // whole upload lands, so an aborted upload leaves no job, no
-              // case, and nothing to clean up.
-              <Button variant="ghost" size="sm" onClick={cancelUpload}>
-                Cancel upload
+            <DialogClose asChild>
+              <Button variant="ghost" size="sm">
+                {/* Closing does not stop the restore — the tray keeps it
+                    visible. Cancelling the *upload* is offered on its row. */}
+                {busy ? "Close" : "Cancel"}
               </Button>
-            ) : (
-              <DialogClose asChild>
-                <Button variant="ghost" size="sm">Cancel</Button>
-              </DialogClose>
-            )}
+            </DialogClose>
             {caseId && warnings.length > 0 ? (
               <Button variant="accent" size="sm" onClick={() => goToCase(caseId)}>
                 Go to case
               </Button>
             ) : (
               <Button variant="accent" size="sm" disabled={!file || busy} onClick={start}>
-                {uploading ? "Uploading…" : jobRunning ? "Importing…" : "Import"}
+                {upload.active ? "Uploading…" : jobRunning ? "Importing…" : "Import"}
               </Button>
             )}
           </div>
