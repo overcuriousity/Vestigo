@@ -17,6 +17,9 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import types
+import typing
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -224,17 +227,73 @@ def coerce_object_arg(data: Any) -> Any:
     return data
 
 
+def _admits_json_object(annotation: Any) -> bool:
+    """True when a field accepts a JSON object and never a plain string.
+
+    The ``str`` exclusion is the whole safety argument: ``q: str | None`` may
+    legitimately hold ``'{"a": 1}'`` as a free-text search, and coercing it
+    would silently rewrite the analyst's query into a dict. A field is only
+    coerced when an object is the *only* thing a string could have meant.
+    """
+    origin = typing.get_origin(annotation)
+    members = (
+        [m for m in typing.get_args(annotation) if m is not type(None)]
+        if origin in (typing.Union, types.UnionType)
+        else [annotation]
+    )
+    if any(m is str for m in members):
+        return False
+    return any(
+        typing.get_origin(m) in (dict, Mapping)
+        or (isinstance(m, type) and issubclass(m, BaseModel))
+        for m in members
+    )
+
+
+# Keyed by field *name*, so a `Field(alias=...)` on a nested-argument model
+# would need this revisited — none of them use one today.
+_OBJECT_FIELDS: dict[type[BaseModel], frozenset[str]] = {}
+
+
 class ObjectArgModel(BaseModel):
     """Base for every model used as a *nested* tool argument.
 
     Carries `coerce_object_arg` so tolerance is a property of the position
-    (nested argument) rather than something each spec remembers to add.
+    (nested argument) rather than something each spec remembers to add — for
+    the model itself *and* for every field of it that admits a JSON object.
+    A provider that stringifies one level tends to stringify the next, and
+    ``FilterSpec.filters`` (a plain ``dict``, not a model) is as reachable
+    that way as ``ChartSpec.options`` is.
     """
+
+    @classmethod
+    def _object_fields(cls) -> frozenset[str]:
+        """Field names whose annotation admits a JSON object; see `_admits_json_object`."""
+        cached = _OBJECT_FIELDS.get(cls)
+        if cached is None:
+            cached = frozenset(
+                name for name, f in cls.model_fields.items() if _admits_json_object(f.annotation)
+            )
+            _OBJECT_FIELDS[cls] = cached
+        return cached
 
     @model_validator(mode="before")
     @classmethod
     def _coerce_stringified(cls, data: Any) -> Any:
-        return coerce_object_arg(data)
+        data = coerce_object_arg(data)
+        if not isinstance(data, dict):
+            return data
+        fields = cls._object_fields()
+        stringified = [k for k in fields if isinstance(data.get(k), str)]
+        if not stringified:
+            return data
+        # Copied, never mutated in place: the same mapping is the tool call's
+        # `tool_args`, persisted verbatim as the model emitted it. Normalizing
+        # for validation must not rewrite the forensic record.
+        data = dict(data)
+        for key in stringified:
+            data[key] = coerce_object_arg(data[key])
+        return data
 
 
 class FilterSpec(ObjectArgModel):
@@ -1761,12 +1820,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 blocks = await store.list_story_blocks(story_id)
                 if after_block_id not in {b.id for b in blocks}:
                     return {"error": f"after_block_id {after_block_id!r} not in this story"}
-            # A stringified `content` is coerced for the same reason nested
-            # specs are (`coerce_object_arg`). The membership test below must
-            # not see a string: `in` on one is a *substring* match, which
-            # passes silently and then fails on `.get` — a wrong answer where
-            # a type error belongs.
-            content = coerce_object_arg(content)
+            # `content` is a *top-level* argument, so it arrives parsed even
+            # from a provider that stringifies it: pydantic-ai parses the top
+            # level, and the MCP SDK's `pre_parse_json` parses any non-`str`
+            # parameter again. The guard is stated anyway because the failure
+            # it would prevent is silent rather than loud — `in` on a string
+            # is a *substring* match, which passes and then fails on `.get`.
             if not isinstance(content, dict):
                 return {"error": "content must be a JSON object keyed for the block kind"}
             inline_chart = block_kind == "chart_ref" and "chart_spec" in content

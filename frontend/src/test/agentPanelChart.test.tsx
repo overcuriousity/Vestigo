@@ -97,6 +97,30 @@ function chartMessages(resultOk: boolean | "missing"): AgentMessage[] {
   return [call, result];
 }
 
+/**
+ * A trailing assistant row, appended to fixtures whose assertion is that *no*
+ * card rendered. Awaiting its text is a positive signal that the conversation
+ * query resolved and the transcript rendered — a timer tick is not, since a
+ * `queryBy…` for something that never appears passes before the fetch lands.
+ */
+const TRANSCRIPT_ANCHOR = "transcript rendered";
+
+function anchored(messages: AgentMessage[]): AgentMessage[] {
+  return [
+    ...messages,
+    {
+      id: "anchor",
+      conversation_id: CONV_ID,
+      role: "assistant",
+      content: TRANSCRIPT_ANCHOR,
+      tool_name: null,
+      tool_args: null,
+      tool_result: null,
+      created_at: null,
+    } as AgentMessage,
+  ];
+}
+
 function renderPanel() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -168,19 +192,23 @@ describe("AgentPanel propose_chart folding", () => {
   });
 
   it("a result with ok:false renders no card", async () => {
-    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages(false) });
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: anchored(chartMessages(false)),
+    });
     renderPanel();
-    // Let the conversation query settle, then assert nothing appeared.
-    await screen.findByTestId("agent-panel");
-    await new Promise((r) => setTimeout(r, 0));
+    // Wait for the transcript itself, then assert nothing appeared alongside it.
+    await screen.findByText(TRANSCRIPT_ANCHOR);
     expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 
   it("a call row with no paired result renders no card", async () => {
-    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages("missing") });
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: anchored(chartMessages("missing")),
+    });
     renderPanel();
-    await screen.findByTestId("agent-panel");
-    await new Promise((r) => setTimeout(r, 0));
+    await screen.findByText(TRANSCRIPT_ANCHOR);
     expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 
@@ -251,11 +279,10 @@ describe("AgentPanel propose_chart folding", () => {
     ];
     getConversationMock.mockResolvedValue({
       ...conversation(),
-      messages: batchRows(charts),
+      messages: anchored(batchRows(charts)),
     });
     renderPanel();
-    await screen.findByTestId("agent-panel");
-    await new Promise((r) => setTimeout(r, 0));
+    await screen.findByText(TRANSCRIPT_ANCHOR);
     expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 });

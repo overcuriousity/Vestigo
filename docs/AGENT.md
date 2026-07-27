@@ -199,6 +199,39 @@ system prompt's evidence rule forbids.
 frontend renders an "Apply to Explorer" card (`run_id` maps onto
 `EventFilters.anomalyRunId`).
 
+### Nested arguments a provider stringified
+
+Not every provider emits a nested object argument as an object; some hand it
+back as JSON *text*. pydantic-ai parses only the **top** level of a tool
+call's arguments (`ToolCallPart.args_as_dict`), and the MCP SDK's
+`pre_parse_json` likewise only covers top-level parameters — so a top-level
+argument always arrives parsed, and anything nested arrives exactly as the
+provider sent it. Rejecting that costs a retry the model has to guess its way
+out of, on tools it is otherwise using correctly (`FilterSpec` is a nested
+argument on ~20 of them).
+
+`ObjectArgModel` in `agent/tools.py` is the base for every nested-argument
+model and the single place this is handled. It coerces the model itself and
+every **field** whose annotation admits a JSON object — so `ChartSpec.options`
+(a model) and `FilterSpec.filters` (a plain `dict`) are covered by the same
+mechanism, no per-field opt-in. The rule is `_admits_json_object`: a field
+qualifies when some union member is a mapping or `BaseModel` and **no** member
+is `str`. That exclusion is the whole safety argument — `q: str | None` may
+legitimately hold `'{"a": 1}'` as a free-text search, and coercing it would
+rewrite the analyst's query. Coercion works on a copy: the same mapping is the
+call's `tool_args`, persisted verbatim, and a forensic record must not change
+shape between being stored and being validated.
+
+The frontend needs the mirror image, because `tool_args` is persisted exactly
+as emitted — a bad row is permanent and every re-render of that conversation
+reads it. `specToChartConfig` and `specToEventFilters` (`api/agent.ts`)
+normalize through `parseToolArgObject` at the translation boundary, so no
+caller has to remember to; `AgentPanel` additionally uses it as the render-or-
+don't decision, and an unusable spec produces no card rather than a throw.
+A stringified `compare` is the reason this is not optional: unparsed, it made
+`compare?.mode` undefined and silently drew one layer where the model proposed
+two.
+
 ### `propose_chart` — isomorphic with the analyst's `ChartConfig`
 
 `propose_chart(title, description, spec)` mirrors the Visualize page's

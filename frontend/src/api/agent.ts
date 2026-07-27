@@ -159,12 +159,20 @@ const SCALE_BY_KIND: Record<AgentChartSpecLegacy["kind"], ChartConfig["scale"]> 
  * Map a `propose_chart` spec onto the Visualize page's `ChartConfig` — the
  * shape every chart component, "Open in Visualize", and "Save" consume.
  * Mirrors `specToEventFilters` above: agent shapes translate to UI shapes at
- * the frontend boundary.
+ * the frontend boundary — which is also where a provider-stringified nested
+ * value is normalized (`parseToolArgObject`), so no caller has to remember to.
+ *
+ * Throws when the spec is neither an object nor JSON that parses to one.
+ * `AgentPanel` filters those out before an item is ever created, so this is
+ * the far side of that guard: an `ErrorBoundary` showing why one card is
+ * missing beats a chart drawn from nothing.
  */
-export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
+export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
+  const spec = parseToolArgObject<AgentChartSpec>(raw);
+  if (!spec) throw new Error("chart spec is not a JSON object");
   if (isLegacySpec(spec)) return specToChartConfigLegacy(spec);
 
-  const o = spec.options ?? {};
+  const o = parseToolArgObject<NonNullable<AgentChartSpecV2["options"]>>(spec.options) ?? {};
   const options: ChartConfig["options"] = {};
   // `!= null` rather than a truthiness check: an explicit 0 is a value the
   // caller chose, and the old falsy guards silently dropped it.
@@ -183,7 +191,7 @@ export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
   if (o.show_points != null) options.showPoints = o.show_points;
   if (o.show_density != null) options.showDensity = o.show_density;
 
-  const compare = spec.compare;
+  const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
   return {
     v: 1,
     field: spec.field ?? null,
@@ -397,12 +405,24 @@ export function formatTokenCount(n: number): string {
   return String(n);
 }
 
-/** Map a backend FilterSpec onto the Explorer's EventFilters (camelCase). */
-export function specToEventFilters(spec: AgentFilterSpec): EventFilters {
-  const modes = (m?: Record<string, string>): Record<string, FieldMatchMode> | undefined => {
-    if (!m) return undefined;
+/**
+ * Map a backend FilterSpec onto the Explorer's EventFilters (camelCase).
+ *
+ * Tolerant of a provider-stringified spec *and* of stringified values inside
+ * it: `filters` and friends are maps, and `Object.keys` on a string yields
+ * character indices — a filter set built from those is wrong rather than
+ * absent, which is the failure this whole path exists to prevent. Mirrors
+ * `ObjectArgModel` on the backend, which coerces the same positions on write.
+ */
+export function specToEventFilters(raw: AgentFilterSpec | string | null | undefined): EventFilters {
+  const spec = parseToolArgObject<AgentFilterSpec>(raw) ?? {};
+  const fieldMap = (m: unknown): Record<string, string[]> | undefined =>
+    parseToolArgObject<Record<string, string[]>>(m) ?? undefined;
+  const modes = (m: unknown): Record<string, FieldMatchMode> | undefined => {
+    const parsed = parseToolArgObject<Record<string, string>>(m);
+    if (!parsed) return undefined;
     const out: Record<string, FieldMatchMode> = {};
-    for (const [k, v] of Object.entries(m)) {
+    for (const [k, v] of Object.entries(parsed)) {
       if (v === "wildcard" || v === "regex") out[k] = v;
     }
     return Object.keys(out).length > 0 ? out : undefined;
@@ -414,8 +434,10 @@ export function specToEventFilters(spec: AgentFilterSpec): EventFilters {
   if (spec.source_id) f.sourceId = spec.source_id;
   if (spec.start) f.start = spec.start;
   if (spec.end) f.end = spec.end;
-  if (spec.filters && Object.keys(spec.filters).length > 0) f.filters = spec.filters;
-  if (spec.exclusions && Object.keys(spec.exclusions).length > 0) f.exclusions = spec.exclusions;
+  const filters = fieldMap(spec.filters);
+  if (filters && Object.keys(filters).length > 0) f.filters = filters;
+  const exclusions = fieldMap(spec.exclusions);
+  if (exclusions && Object.keys(exclusions).length > 0) f.exclusions = exclusions;
   const fm = modes(spec.filter_modes);
   if (fm) f.filterModes = fm;
   const em = modes(spec.exclusion_modes);

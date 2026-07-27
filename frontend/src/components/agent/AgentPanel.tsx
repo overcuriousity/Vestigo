@@ -86,14 +86,20 @@ type ChatItem =
       duplicateCalls: number;
       resultsCapped: number;
     }
+  /** `id` is the proposing call's `tool_call_id` where one exists. Card items
+   * are the only ones wrapped in an ErrorBoundary, and a boundary keyed by
+   * array index keeps its fallback when a later item shifts into that slot —
+   * so these two carry an identity of their own. Null on pre-`tool_call_id`
+   * rows, which fall back to the index like every other item. */
   | {
       kind: "finding";
+      id?: string | null;
       title: string;
       description: string;
       spec: AgentFilterSpec;
       total?: number | null;
     }
-  | { kind: "chart"; title: string; description: string; spec: AgentChartSpec }
+  | { kind: "chart"; id?: string | null; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
   | { kind: "storyProposal"; proposalId: string }
   | { kind: "error"; detail: string }
@@ -107,6 +113,7 @@ interface ProposeChartArgs {
 }
 
 interface PendingChart {
+  id?: string | null;
   title: string;
   description: string;
   spec: AgentChartSpec;
@@ -214,6 +221,7 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         };
         items.push({
           kind: "finding",
+          id: m.tool_call_id,
           title: args.title ?? "Finding",
           description: args.description ?? "",
           spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
@@ -226,6 +234,7 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         const spec = parseToolArgObject<AgentChartSpec>(args.spec);
         if (spec) {
           const chart: PendingChart = {
+            id: m.tool_call_id,
             title: args.title ?? "Chart",
             description: args.description ?? "",
             spec,
@@ -343,6 +352,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           ...flushed,
           {
             kind: "finding",
+            id: e.tool_call_id,
             title: args.title ?? "Finding",
             description: args.description ?? "",
             spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
@@ -366,6 +376,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
       if (spec) {
         const next = new Map(s.pendingCharts);
         next.set(e.tool_call_id, {
+          id: e.tool_call_id,
           title: args.title ?? "Chart",
           description: args.description ?? "",
           spec,
@@ -934,7 +945,11 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           }
           if (item.kind === "finding") {
             return (
-              <ErrorBoundary key={i} label="This finding">
+              <ErrorBoundary
+                key={item.id ?? `i${i}`}
+                resetKey={item.id ?? item.title}
+                label="This finding"
+              >
                 <FindingCard
                   caseId={caseId}
                   timelineId={timelineId}
@@ -953,7 +968,11 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
               // verbatim and cannot be corrected after the fact, so a card
               // that cannot be drawn degrades to a notice rather than taking
               // the conversation — or the app — with it.
-              <ErrorBoundary key={i} label="This chart proposal">
+              <ErrorBoundary
+                key={item.id ?? `i${i}`}
+                resetKey={item.id ?? item.title}
+                label="This chart proposal"
+              >
                 <ChartProposalCard
                   caseId={caseId}
                   timelineId={timelineId}

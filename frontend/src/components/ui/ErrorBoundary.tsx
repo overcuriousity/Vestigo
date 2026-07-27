@@ -22,28 +22,33 @@ interface Props {
   /** Replaces the default inline notice. Receives the thrown error. */
   fallback?: (error: Error) => ReactNode;
   /**
-   * Changing this remounts the boundary and clears the error. Pass the route
-   * path (or any identity of what is being rendered) so navigating away from
-   * a broken view recovers instead of staying stuck on the fallback.
+   * Changing this clears the error — children are *not* remounted, so their
+   * own state survives. Pass the route path (or any identity of what is being
+   * rendered) so navigating away from a broken view recovers instead of
+   * staying stuck on the fallback.
    */
   resetKey?: string;
 }
 
 interface State {
   error: Error | null;
+  /** The `resetKey` the current error was recorded under; see below. */
+  resetKey?: string;
 }
 
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(error: Error): Partial<State> {
     return { error };
   }
 
-  componentDidUpdate(prev: Props): void {
-    if (prev.resetKey !== this.props.resetKey && this.state.error) {
-      this.setState({ error: null });
-    }
+  /** Clears the error when `resetKey` changes, during the render that
+   * observes the change — rather than setting state from componentDidUpdate,
+   * which would render the stale fallback once before replacing it. */
+  static getDerivedStateFromProps(props: Props, state: State): Partial<State> | null {
+    if (props.resetKey === state.resetKey) return null;
+    return { error: null, resetKey: props.resetKey };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {

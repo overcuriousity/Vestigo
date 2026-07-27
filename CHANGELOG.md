@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.4] — 2026-07-27
+
+### Fixed
+
+- **One malformed agent tool argument no longer takes down the whole app.** A provider
+  returned a `propose_chart` spec as a JSON *string*; the chart card's shape check ran
+  `'chart_type' in spec` against it and threw, and with no error boundary anywhere in the
+  frontend that unmounted **every** route — Explorer, Cases, Admin — not just the card.
+  Tool arguments are stored verbatim as the model emitted them, so the row was permanent
+  and every re-render of that conversation hit it. Render failures are now contained at
+  three levels (the page inside the app shell, the router, and each agent card that draws
+  model-authored JSON), a contained failure shows a notice naming what could not be
+  displayed, and the rest of the page keeps working. **Rebuild the frontend when
+  upgrading** — the crash was in shipped JS, and a stale `frontend/dist` hides the fix.
+
+- **A nested tool argument handed over as JSON text is now accepted, not rejected.** Some
+  providers stringify nested object arguments; only the top level of a tool call's
+  arguments is parsed for us, so the inner value arrived as text and failed validation on
+  tools the model was otherwise using correctly — every filtered query in the toolset
+  takes a nested filter spec. Both sides now normalize: the agent's tool models parse a
+  stringified value at any position that can only have meant an object (never a free-text
+  field, so a search for `{"a": 1}` still searches for that text), and the frontend does
+  the same when reading stored calls back. Previously a stringified comparison layer was
+  silently dropped from a chart, and a stringified filter map produced filters that were
+  wrong rather than absent.
+
+### Changed
+
+- **Chart cards in agent conversations predating per-call tool ids.** Where two or more
+  chart proposals were in flight without ids, the card and its validation result could
+  only be paired by order — and a call is recorded *before* its validation runs, so a
+  successful result could pop a *rejected* spec and draw a chart contradicting its own
+  title. Such batches now render no card; the transcript still records every call. Single
+  proposals are unaffected, as are all conversations since ids were added. A missing card
+  is recoverable; a wrong one, read as evidence, is not.
+
 ## [1.8.3] — 2026-07-27
 
 ### Added

@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
+from pydantic import ValidationError
 
 from vestigo.agent.fidelity import Fidelity
 from vestigo.agent.tools import (
@@ -2082,10 +2083,75 @@ def test_a_stringified_spec_still_reaches_the_legacy_kind_translation():
 
 
 def test_unparseable_object_arg_falls_through_to_the_normal_error():
-    from pydantic import ValidationError
-
     with pytest.raises(ValidationError):
         ChartSpec.model_validate("not json at all")
+
+
+def test_a_stringified_value_inside_a_spec_is_parsed_too():
+    """A provider that stringifies one level tends to stringify the next.
+
+    ``FilterSpec.filters`` is a plain ``dict`` field, not a nested model, so
+    nothing about it being a spec would have covered it — `ObjectArgModel`
+    coerces it because its *annotation* admits an object.
+    """
+    spec = FilterSpec.model_validate({"filters": '{"attr:status": ["500"]}', "q": "boom"})
+    assert spec.filters == {"attr:status": ["500"]}
+    assert spec.q == "boom"
+
+    chart = ChartSpec.model_validate(
+        {
+            "chart_type": "bar",
+            "field": "attr:status",
+            "options": '{"top_n": 7}',
+            "compare": '{"mode": "custom", "filters": {"q": "baseline"}}',
+        }
+    )
+    assert chart.options.top_n == 7
+    assert chart.compare is not None
+    assert chart.compare.mode == "custom"
+    assert chart.compare.filters is not None
+    assert chart.compare.filters.q == "baseline"
+
+
+def test_a_string_field_is_never_coerced_even_when_it_holds_json():
+    """The safety rule behind `_admits_json_object`.
+
+    ``q`` is free text an analyst may well have typed as JSON. Coercing any
+    string that happens to parse would rewrite the query into a dict and fail
+    validation on a search that is perfectly legal.
+    """
+    spec = FilterSpec.model_validate({"q": '{"chart_type": "bar"}'})
+    assert spec.q == '{"chart_type": "bar"}'
+
+
+def test_object_field_coverage_is_derived_not_hand_maintained():
+    """Pins which fields the coercion covers, so a new one is a decision.
+
+    Adding a dict-typed field to one of these specs silently widens the set;
+    adding a differently-shaped one silently doesn't. Either way this test
+    says so at the moment of the change rather than in production.
+    """
+    assert FilterSpec._object_fields() == {
+        "filters",
+        "exclusions",
+        "filter_modes",
+        "exclusion_modes",
+    }
+    assert {"filters", "compare", "options"} <= ChartSpec._object_fields()
+    # `field`/`fields`/`metric` are str/list/enum — an object is not what a
+    # string there could have meant.
+    assert not ({"field", "fields", "metric", "scale"} & ChartSpec._object_fields())
+
+
+def test_coercion_does_not_rewrite_the_caller_s_mapping():
+    """`tool_args` is persisted verbatim as the model emitted it.
+
+    The validator normalizes a copy: a forensic record that changed shape
+    between being stored and being validated is no longer the record.
+    """
+    raw = {"filters": '{"attr:status": ["500"]}'}
+    FilterSpec.model_validate(raw)
+    assert raw == {"filters": '{"attr:status": ["500"]}'}
 
 
 # ── retired facet spec ──────────────────────────────────────────────────────
@@ -2269,6 +2335,36 @@ async def test_propose_story_block_validates(store):
         },
     )
     assert "after_block_id" in bad_anchor["error"]
+
+
+async def test_a_stringified_top_level_argument_is_parsed_before_the_tool_body(store):
+    """Top-level arguments never reach a tool as text, which is why only
+    *nested* ones need `ObjectArgModel`.
+
+    Two independent layers parse them: pydantic-ai's ``args_as_dict`` on the
+    way in, and the MCP SDK's ``pre_parse_json``
+    (``mcp/server/fastmcp/utilities/func_metadata.py``) for any parameter
+    whose annotation is not ``str`` — the same "an object is the only thing a
+    string could have meant" rule `_admits_json_object` applies one level
+    down. So ``content`` arrives as a dict, and ``propose_story_block``'s
+    ``isinstance`` guard is unreachable belt-and-braces. Pinned here because
+    the day that stops being true, the guard is the thing standing between a
+    string and a silent substring match on ``"chart_spec" in content``.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    result = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "markdown", "content": '{"text": "## parsed"}'},
+    )
+    assert result["status"] == "proposed"
+    (p,) = await store.list_agent_proposals(conv.id)
+    assert p.payload["content"] == {"text": "## parsed"}
 
 
 async def test_propose_story_block_checks_referent_scope(store):

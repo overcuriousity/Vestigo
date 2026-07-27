@@ -388,6 +388,42 @@ describe("parseToolArgObject", () => {
   });
 });
 
+describe("stringified values nested inside a spec", () => {
+  it("specToEventFilters takes a stringified spec and stringified maps inside it", () => {
+    // `Object.keys` on a string yields character indices, so an unparsed map
+    // built a filter set that was *wrong* rather than absent — the failure
+    // mode this whole path exists to prevent.
+    const f = specToEventFilters(
+      '{"q": "boom", "filters": "{\\"attr:status\\": [\\"500\\"]}", "filter_modes": "{\\"attr:status\\": \\"wildcard\\"}"}',
+    );
+    expect(f.q).toBe("boom");
+    expect(f.filters).toEqual({ "attr:status": ["500"] });
+    expect(f.filterModes).toEqual({ "attr:status": "wildcard" });
+  });
+
+  it("specToChartConfig keeps the comparison layer when `compare` arrives stringified", () => {
+    // Silently the worst of the family: an unparsed `compare` made
+    // `compare?.mode` undefined, so the chart drew one layer where the model
+    // proposed two, with no error anywhere.
+    const config = specToChartConfig({
+      chart_type: "bar",
+      field: "attr:status",
+      compare: '{"mode": "custom", "filters": {"q": "baseline"}}',
+      options: '{"top_n": 7}',
+    } as unknown as AgentChartSpec);
+    expect(config.compare).toEqual({ mode: "custom", filters: { q: "baseline" } });
+    expect(config.options.topN).toBe(7);
+  });
+
+  it("specToChartConfig throws on a spec that is not an object", () => {
+    // AgentPanel filters these out before an item exists; the throw is the
+    // far side of that guard, contained by the card's ErrorBoundary.
+    expect(() => specToChartConfig("not json" as unknown as AgentChartSpec)).toThrow(
+      /not a JSON object/,
+    );
+  });
+});
+
 describe("specToChartConfig (current shape)", () => {
   it("reaches every chart type, including the six the old `kind` enum could not", () => {
     for (const chartType of CHART_TYPES) {

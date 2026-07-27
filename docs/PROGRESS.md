@@ -15,9 +15,13 @@ emitted it, so the bad row is permanent and every re-render of that conversation
 
 - **Readers of `tool_args` normalize.** `parseToolArgObject` (in `api/agent.ts`) parses a
   stringified argument, passes an object through, and returns `null` for anything else.
-  Both the persisted path (`itemsFromMessages`) and the live SSE path use it for
-  `propose_chart`'s `spec` and `propose_finding`'s `filters`; an unparseable spec now
-  renders no card instead of throwing through the chart card's `useMemo`.
+  The tolerance lives in `specToChartConfig`/`specToEventFilters` — the translation
+  boundary every consumer already goes through — so no caller has to remember it;
+  `AgentPanel` uses it additionally as the render-or-don't decision, and an unparseable
+  spec now renders no card instead of throwing through the chart card's `useMemo`.
+  It reaches inside the spec too: an unparsed `compare` made `compare?.mode` undefined
+  and silently drew one layer where the model proposed two, and `Object.keys` on an
+  unparsed `filters` map built a filter set that was wrong rather than absent.
 - **The tool accepts it too.** `ChartSpec`'s before-validator `json.loads`es a string
   spec, which is cheaper than a validation error the model has to guess its way out of.
 
@@ -33,15 +37,31 @@ emitted it, so the bad row is permanent and every re-render of that conversation
 - **`FilterSpec` is a nested argument on ~20 tools.** The tolerance therefore belongs to
   the *position*, not to `ChartSpec`: `ObjectArgModel` is the base for every nested tool
   argument, so a provider that stringifies one stringifies none of them into a failure.
-- **`"chart_spec" in (content or {})` in `propose_story_block`** is the same shape as the
-  frontend bug, except Python's `in` on a string is a silent substring match that then
-  fails on `.get`. `content` is coerced and type-checked before the membership test.
+  It covers the model *and* every field whose annotation admits a JSON object — the
+  `dict` fields inside `FilterSpec` are as reachable that way as `ChartSpec.options` is,
+  and driving it off annotations means a field added later is covered by default. Never
+  a field that also admits `str`: `q` may legitimately hold JSON as free text.
+- **`"chart_spec" in (content or {})` in `propose_story_block`** looks like the same
+  shape but is not reachable: `content` is a *top-level* argument, and both pydantic-ai
+  and the MCP SDK's `pre_parse_json` parse those. The membership test is guarded by an
+  `isinstance` anyway — Python's `in` on a string is a silent substring match that then
+  fails on `.get`, so the failure it prevents is a wrong answer, not an exception — and
+  a test pins the upstream parsing the guard's unreachability depends on.
 - **A chart card could render another proposal's spec.** Unkeyed (pre-`tool_call_id`)
   rows were paired by FIFO order, and the call row is persisted *before* its validation
   runs — so an `ok` result could pop a *rejected* spec and draw a chart contradicting its
   own title. Pairing now falls back to order only when exactly one proposal is buffered;
   ambiguous batches render nothing. A missing card is recoverable, a wrong one read as
   evidence is not.
+
+**Review round.** Card `ErrorBoundary`s were keyed by array index, so a fallback outlived
+the card that caused it once streaming appended items — card items now carry the proposing
+call's `tool_call_id` as their identity. `ErrorBoundary` resets through
+`getDerivedStateFromProps` rather than `setState` in `componentDidUpdate`, which rendered
+the stale fallback once before replacing it. `AppShell`'s route lost its `errorElement`:
+`AppShell` wraps its own `Outlet`, so nothing reaches the router there that the
+`RequireAuth` route does not already catch. Three negative assertions that raced a
+`setTimeout(0)` against the conversation query now await a positive anchor row.
 
 ## Session 110 — 2026-07-27: PR #189 review fixes
 
