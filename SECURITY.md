@@ -33,3 +33,9 @@ authentication/RBAC/audit layer, and the reference `docker-compose.yml`
 deployment. Out of scope: vulnerabilities in third-party dependencies
 (PostgreSQL, ClickHouse, Qdrant) — report those upstream; Dependabot tracks
 known CVEs in this repo's dependency graph.
+
+A dependency advisory that does not apply to Vestigo — because the affected
+code path is unreachable in this application, or because no fixed version has
+been published yet — is recorded with that reasoning and a revisit trigger
+under "standing decisions" in [`docs/ROADMAP.md`](docs/ROADMAP.md), never
+silently ignored.

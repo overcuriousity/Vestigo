@@ -17,6 +17,9 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import types
+import typing
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -205,7 +208,111 @@ TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOL_REGISTRY)
 # beside the tiers it selects: `agent/fidelity.py::FIDELITY_TIERED_TOOLS`.
 
 
-class FilterSpec(BaseModel):
+def coerce_object_arg(data: Any) -> Any:
+    """Parse a tool argument a provider handed over as a JSON string.
+
+    Nested object arguments are not universally emitted as objects: some
+    providers stringify them, and pydantic-ai only parses the *top* level of a
+    tool call's arguments (``ToolCallPart.args_as_dict``), so the inner value
+    arrives as text. Rejecting it costs the model a retry it has to guess its
+    way out of, on tools it otherwise uses correctly — every filtered query in
+    the toolset takes a nested ``FilterSpec``. Anything that is not a JSON
+    object falls through unchanged to the normal validation error.
+    """
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        # `json.JSONDecodeError` subclasses `ValueError`; catching the base also
+        # covers the `str`-subclass edge cases `json.loads` raises it for.
+        except ValueError:
+            return data
+    return data
+
+
+def _admits_json_object(annotation: Any) -> bool:
+    """True when a field accepts a JSON object and never a plain string.
+
+    The ``str`` exclusion is the whole safety argument: ``q: str | None`` may
+    legitimately hold ``'{"a": 1}'`` as a free-text search, and coercing it
+    would silently rewrite the analyst's query into a dict. A field is only
+    coerced when an object is the *only* thing a string could have meant.
+
+    Raises:
+        TypeError: if an annotation cannot be inspected (an unresolved forward
+            reference, i.e. a model whose `model_rebuild()` has not run). The
+            honest answers are "yes", "no" and "cannot tell", and silently
+            folding the third into "no" would drop a field from coercion with
+            no signal anywhere — exactly the failure this whole path exists to
+            make loud. Reached at class-inspection time, not per call.
+    """
+    origin = typing.get_origin(annotation)
+    members = (
+        [m for m in typing.get_args(annotation) if m is not type(None)]
+        if origin in (typing.Union, types.UnionType)
+        else [annotation]
+    )
+    unresolved = [m for m in members if isinstance(m, str | typing.ForwardRef)]
+    if unresolved:
+        raise TypeError(
+            f"cannot decide object-coercion for unresolved annotation {annotation!r} "
+            f"({unresolved!r}) — call model_rebuild() on the owning model first"
+        )
+    if any(m is str for m in members):
+        return False
+    return any(
+        typing.get_origin(m) in (dict, Mapping)
+        or (isinstance(m, type) and issubclass(m, BaseModel))
+        for m in members
+    )
+
+
+# Keyed by field *name*, so a `Field(alias=...)` on a nested-argument model
+# would need this revisited — none of them use one today.
+_OBJECT_FIELDS: dict[type[BaseModel], frozenset[str]] = {}
+
+
+class ObjectArgModel(BaseModel):
+    """Base for every model used as a *nested* tool argument.
+
+    Carries `coerce_object_arg` so tolerance is a property of the position
+    (nested argument) rather than something each spec remembers to add — for
+    the model itself *and* for every field of it that admits a JSON object.
+    A provider that stringifies one level tends to stringify the next, and
+    ``FilterSpec.filters`` (a plain ``dict``, not a model) is as reachable
+    that way as ``ChartSpec.options`` is.
+    """
+
+    @classmethod
+    def _object_fields(cls) -> frozenset[str]:
+        """Field names whose annotation admits a JSON object; see `_admits_json_object`."""
+        cached = _OBJECT_FIELDS.get(cls)
+        if cached is None:
+            cached = frozenset(
+                name for name, f in cls.model_fields.items() if _admits_json_object(f.annotation)
+            )
+            _OBJECT_FIELDS[cls] = cached
+        return cached
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_stringified(cls, data: Any) -> Any:
+        data = coerce_object_arg(data)
+        if not isinstance(data, dict):
+            return data
+        fields = cls._object_fields()
+        stringified = [k for k in fields if isinstance(data.get(k), str)]
+        if not stringified:
+            return data
+        # Copied, never mutated in place: the same mapping is the tool call's
+        # `tool_args`, persisted verbatim as the model emitted it. Normalizing
+        # for validation must not rewrite the forensic record.
+        data = dict(data)
+        for key in stringified:
+            data[key] = coerce_object_arg(data[key])
+        return data
+
+
+class FilterSpec(ObjectArgModel):
     """Event filters, mirroring the Explorer's filter shape.
 
     This is the contract that makes findings applicable: the exact same spec
@@ -317,7 +424,7 @@ class FilterSpec(BaseModel):
         return self
 
 
-class ChartCompareSpec(BaseModel):
+class ChartCompareSpec(ObjectArgModel):
     """The optional second layer a chart is measured against."""
 
     mode: Literal["off", "baseline", "custom"] = Field(
@@ -334,7 +441,7 @@ class ChartCompareSpec(BaseModel):
     )
 
 
-class ChartOptionsSpec(BaseModel):
+class ChartOptionsSpec(ObjectArgModel):
     """Presentation and sizing knobs, mirroring the Visualize page's controls.
 
     Every field is optional; omitting one takes the same default the analyst
@@ -400,7 +507,7 @@ class ChartOptionsSpec(BaseModel):
     )
 
 
-class ChartSpec(BaseModel):
+class ChartSpec(ObjectArgModel):
     """A chart, described exactly as the Visualize page describes one.
 
     This mirrors the frontend's `ChartConfig` field for field, so anything an
@@ -491,6 +598,12 @@ class ChartSpec(BaseModel):
         restart, whose model still holds the previous tool schema in context —
         and is deletable once no such conversation can predate the change.
         """
+        # `ObjectArgModel` coerces a stringified argument too, but the two
+        # before-validators' relative order is pydantic's business — doing it
+        # here as well keeps the legacy translation below reachable for a
+        # stringified legacy spec whichever way that order falls. Parsing an
+        # already-parsed value is a no-op.
+        data = coerce_object_arg(data)
         if not isinstance(data, dict):
             return data
         kind = data.get("kind")
@@ -1723,7 +1836,15 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 blocks = await store.list_story_blocks(story_id)
                 if after_block_id not in {b.id for b in blocks}:
                     return {"error": f"after_block_id {after_block_id!r} not in this story"}
-            inline_chart = block_kind == "chart_ref" and "chart_spec" in (content or {})
+            # `content` is a *top-level* argument, so it arrives parsed even
+            # from a provider that stringifies it: pydantic-ai parses the top
+            # level, and the MCP SDK's `pre_parse_json` parses any non-`str`
+            # parameter again. The guard is stated anyway because the failure
+            # it would prevent is silent rather than loud — `in` on a string
+            # is a *substring* match, which passes and then fails on `.get`.
+            if not isinstance(content, dict):
+                return {"error": "content must be a JSON object keyed for the block kind"}
+            inline_chart = block_kind == "chart_ref" and "chart_spec" in content
             try:
                 if inline_chart:
                     if not (content.get("name") or "").strip():

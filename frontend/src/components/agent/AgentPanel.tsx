@@ -28,6 +28,7 @@ import {
 import {
   agentApi,
   formatTokenCount,
+  parseToolArgObject,
   type AgentChartSpec,
   type AgentFilterSpec,
   type AgentMessage,
@@ -37,6 +38,7 @@ import {
 import { useAgentStore } from "@/stores/agent";
 import { triggerDownload } from "@/lib/download";
 import { Button } from "@/components/ui/Button";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
@@ -84,14 +86,20 @@ type ChatItem =
       duplicateCalls: number;
       resultsCapped: number;
     }
+  /** `id` is the proposing call's `tool_call_id` where one exists. Card items
+   * are the only ones wrapped in an ErrorBoundary, and a boundary keyed by
+   * array index keeps its fallback when a later item shifts into that slot —
+   * so these two carry an identity of their own. Null on pre-`tool_call_id`
+   * rows, which fall back to the index like every other item. */
   | {
       kind: "finding";
+      id?: string | null;
       title: string;
       description: string;
       spec: AgentFilterSpec;
       total?: number | null;
     }
-  | { kind: "chart"; title: string; description: string; spec: AgentChartSpec }
+  | { kind: "chart"; id?: string | null; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
   | { kind: "storyProposal"; proposalId: string }
   | { kind: "error"; detail: string }
@@ -105,6 +113,7 @@ interface ProposeChartArgs {
 }
 
 interface PendingChart {
+  id?: string | null;
   title: string;
   description: string;
   spec: AgentChartSpec;
@@ -119,7 +128,8 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   // Keyed by tool_call_id: models that batch parallel tool calls persist N
   // call rows followed by N result rows in *completion* order, so adjacency
   // pairing mislabels one card and drops the other N-1. Rows written before
-  // the tool_call_id migration fall back to FIFO order.
+  // the tool_call_id migration have no key to pair on, and are matched by
+  // FIFO order *only while that is unambiguous* — see below.
   const pendingCharts = new Map<string, PendingChart>();
   const pendingChartFifo: PendingChart[] = [];
   for (const m of messages) {
@@ -188,8 +198,16 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       if (m.tool_call_id) {
         chart = pendingCharts.get(m.tool_call_id);
         pendingCharts.delete(m.tool_call_id);
-      } else {
+      } else if (pendingChartFifo.length === 1) {
+        // Unkeyed rows can only be paired by order, and order is not a fact
+        // here: a failed call row is persisted before its validation error,
+        // so with two or more buffered an `ok` result can pop the *rejected*
+        // spec and draw a chart that does not match its own title. A card an
+        // analyst reads as evidence must never be a guess — with the pairing
+        // ambiguous, show nothing and let the transcript stand on its own.
         chart = pendingChartFifo.shift();
+      } else {
+        pendingChartFifo.length = 0;
       }
       if (result?.ok && chart) items.push({ kind: "chart", ...chart });
     } else if (m.role === "tool" && m.tool_args) {
@@ -203,17 +221,23 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         };
         items.push({
           kind: "finding",
+          id: m.tool_call_id,
           title: args.title ?? "Finding",
           description: args.description ?? "",
-          spec: args.filters ?? {},
+          spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
         });
       } else if (m.tool_name === "propose_chart") {
         const args = m.tool_args as ProposeChartArgs;
-        if (args.spec) {
+        // A spec the provider stringified is still a usable spec; one that is
+        // neither object nor parseable JSON renders nothing rather than
+        // taking the whole conversation down.
+        const spec = parseToolArgObject<AgentChartSpec>(args.spec);
+        if (spec) {
           const chart: PendingChart = {
+            id: m.tool_call_id,
             title: args.title ?? "Chart",
             description: args.description ?? "",
-            spec: args.spec,
+            spec,
           };
           if (m.tool_call_id) pendingCharts.set(m.tool_call_id, chart);
           else pendingChartFifo.push(chart);
@@ -328,9 +352,10 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           ...flushed,
           {
             kind: "finding",
+            id: e.tool_call_id,
             title: args.title ?? "Finding",
             description: args.description ?? "",
-            spec: args.filters ?? {},
+            spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
           },
         ],
         liveText: "",
@@ -346,13 +371,15 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
       // shows no card, same contract as itemsFromMessages. Keyed by
       // tool_call_id: parallel batches keep several proposals in flight.
       const args = e.args as { title?: string; description?: string; spec?: AgentChartSpec };
+      const spec = parseToolArgObject<AgentChartSpec>(args.spec);
       let pendingCharts = s.pendingCharts;
-      if (args.spec) {
+      if (spec) {
         const next = new Map(s.pendingCharts);
         next.set(e.tool_call_id, {
+          id: e.tool_call_id,
           title: args.title ?? "Chart",
           description: args.description ?? "",
-          spec: args.spec,
+          spec,
         });
         pendingCharts = next;
       }
@@ -918,28 +945,42 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           }
           if (item.kind === "finding") {
             return (
-              <FindingCard
-                key={i}
-                caseId={caseId}
-                timelineId={timelineId}
-                title={item.title}
-                description={item.description}
-                spec={item.spec}
-                total={item.total}
-                onApply={onApplyFilters}
-              />
+              <ErrorBoundary
+                key={item.id ?? `i${i}`}
+                resetKey={item.id ?? item.title}
+                label="This finding"
+              >
+                <FindingCard
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  title={item.title}
+                  description={item.description}
+                  spec={item.spec}
+                  total={item.total}
+                  onApply={onApplyFilters}
+                />
+              </ErrorBoundary>
             );
           }
           if (item.kind === "chart") {
             return (
-              <ChartProposalCard
-                key={i}
-                caseId={caseId}
-                timelineId={timelineId}
-                title={item.title}
-                description={item.description}
-                spec={item.spec}
-              />
+              // A chart card renders model-authored JSON that was persisted
+              // verbatim and cannot be corrected after the fact, so a card
+              // that cannot be drawn degrades to a notice rather than taking
+              // the conversation — or the app — with it.
+              <ErrorBoundary
+                key={item.id ?? `i${i}`}
+                resetKey={item.id ?? item.title}
+                label="This chart proposal"
+              >
+                <ChartProposalCard
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  title={item.title}
+                  description={item.description}
+                  spec={item.spec}
+                />
+              </ErrorBoundary>
             );
           }
           if (item.kind === "proposal") {

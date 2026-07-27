@@ -38,7 +38,7 @@ interface Props {
 
 export function ChartProposalCard({ caseId, timelineId, title, description, spec }: Props) {
   const config = useMemo(() => specToChartConfig(spec), [spec]);
-  const filters = useMemo(() => specToEventFilters(spec.filters ?? {}), [spec]);
+  const filters = useMemo(() => specToEventFilters(spec.filters), [spec]);
 
   const qc = useQueryClient();
   const [name, setName] = useState("");
