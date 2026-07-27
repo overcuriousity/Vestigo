@@ -143,7 +143,10 @@ propose→confirm annotation path and `run_anomaly_detector`'s persisted run.
 `TOOL_REGISTRY` is the single source of truth for the catalog (name,
 description, `embeddings_gated`, `requires_conversation`, `tier`); a
 registry-parity test keeps it in sync with the actual `@server.tool()`
-registrations. `tier="core"` marks the 11-tool lean profile for
+registrations. The two `embeddings_gated` tools are **removed** from the
+server when embeddings are unconfigured, not left as error stubs — an
+unavailable subsystem costs no schema tokens and gets no calls
+(`core/capabilities.py`). `tier="core"` marks the 11-tool lean profile for
 small-context local models.
 
 | Tool | Tier | Purpose |
@@ -168,8 +171,8 @@ small-context local models.
 | `propose_chart` | | Chart card, validated by executing the underlying query. |
 | `propose_annotation` | core | Propose tagging/commenting events; conversation-bound only, analyst must confirm. |
 | `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
-| `semantic_search` | | Events similar to free text (embeddings-gated). |
-| `similar_events` | | Events similar to an existing event (embeddings-gated). |
+| `semantic_search` | | Events similar to free text (embeddings-gated: absent when embeddings are unconfigured). |
+| `similar_events` | | Events similar to an existing event (embeddings-gated: absent when embeddings are unconfigured). |
 | `list_baselines` | | Saved baseline definitions — unlocks the temporal-only detectors. |
 | `list_dispositions` | | Analyst verdicts on anomaly findings. |
 | `list_saved_views` | | The analyst's saved filter views. |
@@ -324,8 +327,8 @@ pydantic-ai history blob (the only place thinking signatures live).
 | `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset = the sliding window engages only reactively after an overflow. |
 | `VESTIGO_AGENT_TOOL_FIDELITY` | How much of an example record tool results carry: `full` (default) / `message` / `minimal` / `auto`. |
 | `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`). |
-| `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
-| `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Env-only, not admin-editable. |
+| `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). Edited on `Admin → Settings`, not the Agent tab. |
+| `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Edited on `Admin → Settings`. |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
 
 Works with any OpenAI-compatible endpoint (ollama, vllm, llama.cpp server,
@@ -337,8 +340,12 @@ operator decision.
 ### DB-backed settings, env-wins precedence
 
 Every field above except `VESTIGO_AGENT_PROBE_TTL_SECONDS`,
-`VESTIGO_AGENT_SECRET_MODE`, and `VESTIGO_MCP_ENABLED` is also editable from
-`Admin → Agent`, backed by a singleton `agent_settings` row.
+`VESTIGO_AGENT_SECRET_MODE`, and `VESTIGO_MCP_ENABLED` is editable from
+`Admin → Agent`, backed by a singleton `agent_settings` row. Those three live
+on `Admin → Settings` instead, in the generic `app_settings` layer
+(`core/settings_registry.py`); the agent's own row predates it and keeps its
+purpose-built resolver, so the two coexist deliberately — same precedence
+rules, same "pinned by environment" semantics, different storage.
 `resolve_agent_config()` (`agent/config.py`) resolves **per field**: env var
 if set, else DB value, else hardcoded default — so an operator can pin
 `VESTIGO_AGENT_API_KEY` while leaving `model` admin-editable. The resolved

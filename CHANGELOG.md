@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3] — 2026-07-27
+
+### Added
+
+- **Every setting is editable in the admin console** (`Administration → Settings`),
+  stored in the database and applied without a restart. Configuration now resolves per
+  field: an environment variable pins the field (shown read-only, with its variable
+  name), otherwise the stored override applies, otherwise the built-in default. Values
+  are validated against the same rules the environment layer gets, before anything is
+  written; a stored value that a later version rejects is ignored with a warning rather
+  than blocking startup. Bootstrap configuration stays environment-only —
+  `VESTIGO_POSTGRES_URL`, `VESTIGO_ENVIRONMENT`, `VESTIGO_LOG_LEVEL`, the
+  `VESTIGO_ADMIN_*` seed, and the data directories. Secrets are never returned by the
+  API and can be refused database storage entirely with `VESTIGO_SECRETS_MODE=env-only`.
+  Console-stored secrets live in the metadata database in plaintext — treat Postgres
+  backups accordingly. The CLI reads the same layer, so a console-tuned value applies to
+  `vestigo ingest` and `vestigo embed` too. See `docs/DEPLOYMENT.md`.
+
+- **`VESTIGO_TRANSFER_ENABLED`** — master switch for case export/import. When off, the
+  feature is absent from the UI and starting an export or import answers 503. An archive
+  a previous export already produced stays downloadable; it is single-use and swept from
+  disk shortly after.
+
+### Changed
+
+- **Unconfigured subsystems are now hidden consistently.** `/api/health` reports a
+  `capabilities` map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer) and
+  the UI renders no entry point for an unavailable one — previously only the AI agent
+  behaved this way, while embeddings left a disabled embed wizard and a Similarity tab
+  that could only fail. The agent's two embedding-backed tools are likewise removed from
+  its tool server instead of answering with an error. The map requires a session:
+  an anonymous `GET /api/health` still answers with liveness, version and `oidc_enabled`,
+  which is what the login page needs.
+
+- **`.env.example` no longer pins settings by accident.** Variables that only restated
+  their own default are commented out, since a set variable now makes that field
+  read-only in the console. Connection strings and the admin bootstrap are unchanged.
+
 ## [1.8.2] — 2026-07-27
 
 ### Fixed

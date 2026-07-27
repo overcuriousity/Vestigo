@@ -102,8 +102,17 @@ instead of rebuilding.
 - `api/main.py` — FastAPI app factory; mounts routers, CORS, serves `frontend/dist` as a
   catch-all SPA route when built.
 - `api/routers/` — `cases.py`, `events.py`, `jobs.py` — thin HTTP layer over `db/` and `core/`.
-- `core/config.py` — single `Settings` object (pydantic-settings, `VESTIGO_` env prefix), cached via
-  `get_settings()`. Add new tunables here, not as scattered `os.environ` reads.
+- `core/config.py` — single `Settings` object (pydantic-settings, `VESTIGO_` env prefix), read via
+  `get_settings()`. Add new tunables here, not as scattered `os.environ` reads. Settings resolve
+  per field: **environment wins**, then the DB-backed `app_settings` overrides an admin edits in
+  the web console, then the built-in default. Every new field also needs a `SettingSpec` in
+  `core/settings_registry.py` (group, help text, `env_only`/`secret`/`restart_required`) — a
+  coverage test fails otherwise, which is what keeps "every setting is editable in the UI" true.
+  `core/runtime_settings.py` owns loading/validating/persisting that layer.
+- `core/capabilities.py` — one predicate per optional subsystem (embeddings, agent, MCP, OIDC,
+  enrichers, Sigma, case transfer), served as `capabilities` on `/api/health`. An unconfigured
+  subsystem renders **no** UI entry point and its agent tools are not advertised to the model;
+  its endpoints refuse independently, so hiding is never the only enforcement.
 - `core/jobs.py` — in-memory, ephemeral `JobStore` for long-running background work (embedding,
   large ingests). Jobs do **not** survive a process restart — this is intentional for the
   current single-process deployment, not an oversight.

@@ -7,14 +7,13 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vestigo import __version__
-from vestigo.agent.availability import agent_available
 from vestigo.api.deps import get_store, resolve_user_optional
 from vestigo.api.routers import (
     admin,
@@ -34,11 +33,12 @@ from vestigo.api.routers import (
     transfer,
     viz,
 )
+from vestigo.core.capabilities import get_capabilities
 from vestigo.core.config import get_settings
+from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.core.security import hash_password
-from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, generate_id
+from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, User, generate_id
 from vestigo.db.queries import QueryRequestTooLargeError
-from vestigo.models.embeddings import embeddings_available
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +256,24 @@ def _log_config_report() -> None:
         )
 
 
+async def _refresh_enricher_availability() -> None:
+    """Fill the enricher availability cache before the first request.
+
+    Deliberately *not* part of ``_startup_recovery``: an enricher's
+    ``check_availability()`` is a local filesystem check, so it neither needs
+    nor deserves the ClickHouse-deferred treatment, and the ``enrichers``
+    capability reads that cache — leaving it cold made the whole Enrichment UI
+    disappear whenever a recovery step above it raised. Recovery still refreshes
+    it again before scheduling re-runs; the call is idempotent.
+    """
+    try:
+        from vestigo.enrichers.registry import refresh_availability
+
+        await asyncio.to_thread(refresh_availability)
+    except Exception:
+        logger.exception("Could not determine enricher availability at startup.")
+
+
 async def _startup_recovery(store: PostgresStore) -> None:
     """Best-effort recovery + housekeeping, run *after* the app is serving.
 
@@ -300,13 +318,18 @@ async def _startup_recovery(store: PostgresStore) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    _log_config_report()
     store = get_store()
-    # Only Postgres schema + admin seeding block startup — both are fast and
-    # required before the first request. Everything ClickHouse-dependent is
+    # Only Postgres schema + settings + admin seeding block startup — all fast
+    # and required before the first request. Everything ClickHouse-dependent is
     # deferred to a background task so booting can't hang behind it (502s).
     await store.init_schema()
+    # Before anything reads configuration: the DB-backed override layer is part
+    # of the effective settings, and the config report below should state what
+    # the process will actually use.
+    await load_runtime_settings()
+    _log_config_report()
     await _seed_admin()
+    await _refresh_enricher_availability()
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
     try:
@@ -501,23 +524,37 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/health", response_class=JSONResponse)
-    async def health() -> dict:
-        return {
+    async def health(user: User | None = Depends(resolve_user_optional)) -> dict:
+        """Liveness, plus what this instance can actually do.
+
+        The route is exempt from the auth gate because the login page needs it
+        (``oidc_enabled`` decides whether the SSO button renders), so the body
+        is split: anonymous callers learn the app is up and which login methods
+        exist, and nothing else. Which optional subsystems an instance runs is
+        an inventory of its attack surface, so `capabilities` — and the three
+        flat aliases that predate it — need a session.
+
+        The middleware already resolved and cached this user on
+        ``request.state``, so the dependency costs no extra query.
+        """
+        body: dict = {
             "status": "ok",
             "version": __version__,
             "oidc_enabled": get_settings().oidc_enabled,
-            # False when the 'embeddings' extra is not installed and no
-            # remote embedding endpoint is configured — embed jobs and
-            # semantic search return 503 in that state.
-            "embeddings_available": embeddings_available(),
-            # False unless VESTIGO_AGENT_* is configured and the endpoint
-            # answered the cached probe — the frontend renders no agent UI
-            # at all in that state.
-            "agent_available": await agent_available(),
-            # True only when VESTIGO_MCP_ENABLED — the external streamable-HTTP
-            # MCP endpoint at /mcp. Off by default (Bearer-token-gated when on).
-            "mcp_enabled": get_settings().mcp_enabled,
         }
+        if user is None:
+            return body
+        # `capabilities` is the general form: one entry per optional subsystem,
+        # false when the subsystem is unconfigured, and the frontend renders no
+        # entry point for a false one (core/capabilities.py). The flat keys
+        # below predate it and are kept as aliases so an older client keeps
+        # working.
+        caps = await get_capabilities()
+        body["capabilities"] = caps
+        body["embeddings_available"] = caps["embeddings"]
+        body["agent_available"] = caps["agent"]
+        body["mcp_enabled"] = caps["mcp"]
+        return body
 
     app.include_router(auth.router)
     app.include_router(admin.router)

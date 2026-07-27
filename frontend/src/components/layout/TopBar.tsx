@@ -101,6 +101,8 @@ function UserMenu() {
     onSuccess: () => {
       clear();
       qc.setQueryData(["auth", "me"], null);
+      // The capability map is session-scoped; don't let it outlive the session.
+      qc.removeQueries({ queryKey: ["health"] });
       navigate("/login");
     },
   });

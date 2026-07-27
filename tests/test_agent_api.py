@@ -159,7 +159,8 @@ async def test_probe_bearer_header_only_for_kimi(store, monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer sk-secret"
 
 
-def test_health_reports_agent_available(client):
+def test_health_reports_agent_available(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
     resp = client.get("/api/health")
     assert resp.status_code == 200
     assert resp.json()["agent_available"] is False

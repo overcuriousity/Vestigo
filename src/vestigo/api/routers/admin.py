@@ -20,8 +20,19 @@ from vestigo.agent.fidelity import FIDELITY_VALUES, fidelity_config_warning
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
 from vestigo.api.deps import get_store, require_admin
 from vestigo.api.uploads import receive_upload_to_tmp
-from vestigo.core.config import get_settings
+from vestigo.core.config import env_pinned, get_settings, runtime_overrides
+from vestigo.core.runtime_settings import SettingsValidationError, save_runtime_settings
 from vestigo.core.security import hash_password
+from vestigo.core.settings_registry import (
+    GROUPS,
+    all_specs,
+    default_value,
+    env_var_name,
+    field_constraints,
+    field_kind,
+    is_nullable,
+    secret_fields,
+)
 from vestigo.db.postgres import User, generate_id
 
 # Fields resolved by resolve_agent_config / persisted by update_agent_settings,
@@ -501,6 +512,115 @@ async def upload_enricher_asset(
         "reason": availability.reason if availability else None,
         "detail": install_detail,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Instance settings (every VESTIGO_* tunable, DB-backed)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class SettingsUpdate(BaseModel):
+    """Payload to change instance settings.
+
+    ``values`` maps field name to new value; ``null`` clears that field's
+    stored override so it falls back to the environment, then the built-in
+    default. A field absent from the mapping is left untouched — the console
+    only ever sends what the admin edited.
+    """
+
+    values: dict[str, Any]
+
+
+def _settings_payload() -> dict[str, Any]:
+    """Describe every setting: metadata, effective value, and where it came from.
+
+    ``source`` is ``"env"`` when the operator pinned the field (it then ignores
+    anything stored), ``"db"`` when an admin override is applied, ``"default"``
+    otherwise — the same vocabulary the agent settings endpoint uses. Secret
+    values are replaced by a ``value_set`` boolean and never leave the process.
+    """
+    settings = get_settings()
+    overrides = runtime_overrides()
+    secrets = secret_fields()
+    fields: list[dict[str, Any]] = []
+    for spec in all_specs():
+        pinned = env_pinned(spec.field)
+        if pinned:
+            source = "env"
+        elif spec.field in overrides:
+            source = "db"
+        else:
+            source = "default"
+        value = getattr(settings, spec.field, None)
+        entry: dict[str, Any] = {
+            "field": spec.field,
+            "group": spec.group,
+            "label": spec.label,
+            "help": spec.help,
+            "kind": field_kind(spec.field),
+            "nullable": is_nullable(spec.field),
+            "constraints": field_constraints(spec.field),
+            "choices": list(spec.choices) if spec.choices else None,
+            "default": default_value(spec.field),
+            "source": source,
+            "env_var": env_var_name(spec.field),
+            "env_only": spec.env_only,
+            "restart_required": spec.restart_required,
+            "subsystem": spec.subsystem,
+            "managed_by": spec.managed_by,
+            "editable": not spec.env_only and spec.managed_by is None and not pinned,
+        }
+        if spec.field in secrets:
+            entry["value"] = None
+            entry["value_set"] = bool(value)
+        else:
+            entry["value"] = value
+        fields.append(entry)
+    return {
+        "groups": [{"key": g.key, "label": g.label, "description": g.description} for g in GROUPS],
+        "settings": fields,
+        # env-only refuses secret storage instance-wide; the console disables
+        # those inputs instead of letting the PUT fail.
+        "secrets_mode": settings.secrets_mode,
+    }
+
+
+@router.get("/settings")
+async def get_instance_settings(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Return every configurable setting with its effective value and source."""
+    return _settings_payload()
+
+
+@router.put("/settings")
+async def set_instance_settings(
+    payload: SettingsUpdate, admin: User = Depends(require_admin)
+) -> dict[str, Any]:
+    """Persist settings overrides and apply them to the running process.
+
+    Validation runs against the whole merged ``Settings`` model before
+    anything is written, so a rejected change leaves both the database and the
+    process untouched. Audited with field *names* only — values may include
+    secrets, which never enter the audit trail.
+    """
+    if not payload.values:
+        return _settings_payload()
+    try:
+        applied = await save_runtime_settings(payload.values, admin.id)
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # A changed endpoint changes what the availability probe would answer;
+    # drop its cache so /api/health reflects the edit at once instead of
+    # after the TTL.
+    reset_probe_cache()
+    await get_store().record_audit(
+        action="admin.settings_update",
+        actor=admin,
+        target_type="app_settings",
+        target_id="global",
+        detail={"fields": sorted(payload.values)},
+    )
+    return {**_settings_payload(), "applied": sorted(applied)}
 
 
 # ═════════════════════════════════════════════════════════════════════════════

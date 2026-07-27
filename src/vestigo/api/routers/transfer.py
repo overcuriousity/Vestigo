@@ -44,6 +44,25 @@ def _too_many_transfers(limit: int) -> HTTPException:
     )
 
 
+def _require_transfer_enabled() -> None:
+    """Refuse to *start* a transfer when the subsystem is switched off.
+
+    Paired with the ``transfer`` capability on ``/api/health``, which is what
+    removes the export/import buttons from the UI — this is the enforcement
+    behind that, so a hand-crafted request gets the same answer.
+
+    Deliberately not applied to the export *download* route: the archive it
+    serves was already produced under the old setting, is single-use, and is
+    swept from disk shortly after. Refusing it would strand an export that was
+    legitimately started rather than prevent anything new.
+    """
+    if not get_settings().transfer_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Case export/import is disabled on this instance.",
+        )
+
+
 def _admit_transfer_job(**create_kwargs) -> Job:
     """Create a transfer job, or raise 429 if the instance is already full.
 
@@ -155,6 +174,7 @@ async def export_case_endpoint(
     case: Case = Depends(require_case_manage),
     user: User = Depends(get_current_user),
 ):
+    _require_transfer_enabled()
     include_blobs = body.include_blobs if body else False
     job = _admit_transfer_job(
         kind="case_export",
@@ -261,6 +281,7 @@ async def import_case_endpoint(
     # whole upload is already on disk. The authoritative check is the create
     # below — a slot can free up or fill during the upload either way, so the
     # temp file has to be cleaned up if this one loses the race.
+    _require_transfer_enabled()
     _precheck_transfer_slot()
     max_bytes = get_settings().max_upload_bytes or None
     tmp_path, _file_hash, size_bytes = await receive_upload_to_tmp(

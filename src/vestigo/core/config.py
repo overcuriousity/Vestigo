@@ -1,6 +1,25 @@
-"""Application configuration loaded from environment variables."""
+"""Application configuration: environment variables plus DB-backed overrides.
 
+Two layers, resolved per field. The environment (``VESTIGO_*``, optionally via
+``.env``) is the deploy-time layer; the ``app_settings`` table is the runtime
+layer an admin edits from the web console without a restart. **Environment
+always wins**: a field the operator pinned in the environment ignores any
+stored override, so a locked-down deployment stays locked down.
+
+:func:`get_settings` returns the merged view and is what the whole application
+calls. The merge is cheap (a cached ``model_copy``) and synchronous, because
+the DB layer is not read here — it is loaded once at startup and re-applied
+whenever an admin saves (:func:`set_runtime_overrides`, driven by
+``core/runtime_settings.py``). Overrides are process-local, matching the
+single-process deployment model that ``core/jobs.py`` already assumes.
+
+Which fields may be overridden, and how they are presented, is declared in
+``core/settings_registry.py`` — not here.
+"""
+
+from collections.abc import Mapping
 from functools import lru_cache
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,6 +38,16 @@ class Settings(BaseSettings):
     environment: str = "development"
     log_level: str = "INFO"
     allow_online: bool = False
+
+    # Where secrets edited in the admin console may live. "db" (default):
+    # admins may store passwords/API keys in the app_settings table (plaintext
+    # at rest — acceptable only if Postgres itself is trusted). "env-only":
+    # the settings API refuses to store any secret and the resolver ignores
+    # previously stored ones, leaving the environment as the only source.
+    # Deliberately env-only itself: a mode meant to constrain the console must
+    # not be editable from it. Its agent-scoped predecessor
+    # (`agent_secret_mode`) still applies to the LLM key on its own page.
+    secrets_mode: str = Field(default="db", pattern="^(db|env-only)$")
 
     # Login backoff: after `threshold` consecutive failures per
     # (username, client IP), attempts are rejected with 429 for
@@ -197,6 +226,10 @@ class Settings(BaseSettings):
     # forced on an existing directory; startup fails only if the path is owned
     # by another user or is not a real directory. Size it for the largest case
     # exported, not for the average one.
+    # Master switch for case export/import. Off hides the feature entirely
+    # (no buttons in the UI, 503 from the router) — for deployments where a
+    # whole-case archive leaving the box is a policy problem, not a feature.
+    transfer_enabled: bool = True
     transfer_temp_path: str = "data/transfer"
     # Ceiling on an imported archive's total *uncompressed* size; 0 disables.
     # Events and blobs travel ZIP_STORED, so a legitimate archive expands by
@@ -333,6 +366,64 @@ class Settings(BaseSettings):
 
 
 @lru_cache
-def get_settings() -> Settings:
-    """Return cached application settings."""
+def get_base_settings() -> Settings:
+    """Return the environment/default layer alone, with no DB overrides applied.
+
+    This is what tells "the operator set VESTIGO_X" apart from "the field
+    carries its own default": pydantic-settings only records a field in
+    ``model_fields_set`` when something actually supplied it. Applying
+    overrides on top would pollute that set, so env-pin checks must always ask
+    this object, never the merged one.
+    """
     return Settings()
+
+
+#: DB-backed overrides for fields the environment did not pin. Process-local
+#: and replaced wholesale by :func:`set_runtime_overrides`.
+_overrides: dict[str, Any] = {}
+_effective: Settings | None = None
+
+
+def env_pinned(field: str) -> bool:
+    """Whether the environment explicitly supplied this field."""
+    return field in get_base_settings().model_fields_set
+
+
+def get_settings() -> Settings:
+    """Return the effective settings: environment first, then DB overrides."""
+    global _effective
+    if _effective is None:
+        base = get_base_settings()
+        applicable = {k: v for k, v in _overrides.items() if not env_pinned(k)}
+        _effective = base.model_copy(update=applicable) if applicable else base
+    return _effective
+
+
+def set_runtime_overrides(values: Mapping[str, Any]) -> None:
+    """Replace the DB-backed override layer and invalidate the merged view.
+
+    Values are expected to have been validated already (the settings API
+    validates a full candidate ``Settings`` before persisting) — ``model_copy``
+    does not re-run validators.
+    """
+    global _overrides, _effective
+    _overrides = dict(values)
+    _effective = None
+
+
+def runtime_overrides() -> dict[str, Any]:
+    """The currently applied DB-backed override layer (read-only copy)."""
+    return dict(_overrides)
+
+
+def _clear_settings_cache() -> None:
+    """Drop both layers. Used by tests that mutate the environment."""
+    global _overrides, _effective
+    get_base_settings.cache_clear()
+    _overrides = {}
+    _effective = None
+
+
+# Preserved so the many `get_settings.cache_clear()` calls in the test suite
+# keep working now that get_settings is a merge rather than an lru_cache.
+get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]

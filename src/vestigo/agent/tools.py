@@ -2083,7 +2083,18 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             return {"error": f"no sigma run with id {run_id} in this timeline"}
         return row.to_dict()
 
-    if scope.disabled_tools:
+    # An unconfigured subsystem is invisible, not broken: a tool that could
+    # only answer "embeddings are not available" costs schema tokens on every
+    # request and invites the model to try it. Same treatment the whole agent
+    # gets when no LLM endpoint is configured (core/capabilities.py).
+    unavailable = (
+        frozenset()
+        if embeddings_available()
+        else frozenset(t.name for t in TOOL_REGISTRY if t.embeddings_gated)
+    )
+    removable = scope.disabled_tools | unavailable
+
+    if removable:
         # Remove after registration rather than skipping registration: the
         # closures stay uniform above, and the intersection guards names that
         # were never registered for this scope (propose_annotation outside a
@@ -2096,7 +2107,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             for t in TOOL_REGISTRY
             if not t.requires_conversation or scope.conversation_id is not None
         }
-        for name in scope.disabled_tools & registered:
+        for name in removable & registered:
             server.remove_tool(name)
 
     _apply_schema_slimming(server)
@@ -2137,14 +2148,20 @@ _TOOL_ENVELOPE_CHARS = 96
 
 
 @lru_cache(maxsize=32)
-def _schema_chars_for(disabled: frozenset[str], with_conversation: bool) -> int:
+def _schema_chars_for(
+    disabled: frozenset[str], with_conversation: bool, embeddings: bool = True
+) -> int:
     """Measure the advertised tool list for one *shape* of scope.
 
-    The tool set depends on exactly two things — which tools are disabled, and
+    The tool set depends on exactly three things — which tools are disabled,
     whether the scope has a conversation (``propose_annotation`` is only
-    registered when it does) — so the measurement is cached on that pair
-    rather than recomputed per turn. Nothing case-specific enters the key,
-    because nothing case-specific changes the schemas.
+    registered when it does), and whether embeddings are available (their two
+    tools are absent when they are not) — so the measurement is cached on that
+    triple rather than recomputed per turn. Embeddings are part of the key
+    because settings are now runtime-editable: a cache keyed without them
+    would keep reporting the old tool list after an admin configured an
+    embedding endpoint. Nothing case-specific enters the key, because nothing
+    case-specific changes the schemas.
     """
     probe = AgentScope(
         case_id="_measure",
@@ -2166,7 +2183,9 @@ def schema_chars_for_scope(scope: AgentScope) -> int:
     tool list (30 tools, ~12.9k tokens) was the difference between a budget
     that fit and a provider 400.
     """
-    return _schema_chars_for(scope.disabled_tools, scope.conversation_id is not None)
+    return _schema_chars_for(
+        scope.disabled_tools, scope.conversation_id is not None, embeddings_available()
+    )
 
 
 def _apply_schema_slimming(server: FastMCP) -> None:

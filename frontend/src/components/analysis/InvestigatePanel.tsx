@@ -29,6 +29,7 @@ import {
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { useCapabilities } from "@/api/health";
 import { Button } from "@/components/ui/Button";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { InfoHint } from "@/components/ui/InfoHint";
@@ -98,9 +99,20 @@ export function InvestigatePanel({
   const pendingRange = useBaselineStore((s) => s.pendingRange);
   const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
 
+  // Similarity is embedding-backed: without embeddings configured the tab is
+  // absent, not disabled — the same treatment the agent gets when no LLM
+  // endpoint is set (core/capabilities.py).
+  const embeddingsAvailable = useCapabilities().embeddings;
+
+  // Never render the similarity view without a tab to leave it by: the initial
+  // state can land on "similar" (mounted with an anchor before health answers)
+  // and the capability can flip while it is open. Falling back here rather than
+  // rewriting `tab` keeps the choice: re-enabling embeddings restores it.
+  const activeTab: Tab = tab === "similar" && !embeddingsAvailable ? "anomalies" : tab;
+
   useEffect(() => {
-    if (similarAnchor) setTab("similar");
-  }, [similarAnchor]);
+    if (similarAnchor && embeddingsAvailable) setTab("similar");
+  }, [similarAnchor, embeddingsAvailable]);
 
   // Marking on the histogram is only meaningful for building a baseline — pull
   // the user to the baseline frame. The builder drawer is deliberately NOT
@@ -201,7 +213,9 @@ export function InvestigatePanel({
             ["anomalies", AlertTriangle, "Anomalies"],
             ["patterns", Repeat, "Patterns"],
             ["sigma", Sigma, "Sigma"],
-            ["similar", Search, "Similarity"],
+            ...(embeddingsAvailable
+              ? ([["similar", Search, "Similarity"]] as [Tab, React.ElementType, string][])
+              : []),
             ["methodology", BookOpen, "Method"],
           ] as [Tab, React.ElementType, string][]
         ).map(([id, Icon, label]) => (
@@ -209,7 +223,7 @@ export function InvestigatePanel({
             key={id}
             className={cn(
               "flex flex-1 items-center justify-center gap-1.5 py-2.5 text-xs font-medium transition-base border-b-2",
-              tab === id
+              activeTab === id
                 ? "border-[var(--color-accent)] text-[var(--color-accent)]"
                 : "border-transparent text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
             )}
@@ -222,7 +236,7 @@ export function InvestigatePanel({
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        {tab === "anomalies" && (
+        {activeTab === "anomalies" && (
           <>
             {/* First-run explainer — folds away permanently once dismissed. */}
             <div className="mb-3">
@@ -317,7 +331,7 @@ export function InvestigatePanel({
           </>
         )}
 
-        {tab === "patterns" && (
+        {activeTab === "patterns" && (
           <div className="space-y-3">
             <div className="flex gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-0.5 text-xs">
               {(
@@ -355,11 +369,11 @@ export function InvestigatePanel({
           </div>
         )}
 
-        {tab === "sigma" && (
+        {activeTab === "sigma" && (
           <SigmaPanel caseId={caseId} timelineId={timelineId} onTagFilter={onTagFilter} />
         )}
 
-        {tab === "similar" && (
+        {activeTab === "similar" && (
           <div className="space-y-5">
             {showBanner && (
               <EmbeddingStatusBanner
@@ -387,7 +401,7 @@ export function InvestigatePanel({
           </div>
         )}
 
-        {tab === "methodology" && (
+        {activeTab === "methodology" && (
           <MethodologyPanel
             caseId={caseId}
             timelineId={timelineId}

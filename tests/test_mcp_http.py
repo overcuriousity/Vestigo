@@ -59,10 +59,12 @@ def _rpc_initialize(client, token: str | None, path: str = "/mcp"):
 def test_mcp_absent_when_disabled(client, admin_bootstrap):
     resp = _rpc_initialize(client, token=None)
     assert resp.status_code == 404
+    as_admin(client, admin_bootstrap)
     assert client.get("/api/health").json()["mcp_enabled"] is False
 
 
 def test_mcp_requires_valid_token(mcp_client, admin_bootstrap):
+    as_admin(mcp_client, admin_bootstrap)
     assert mcp_client.get("/api/health").json()["mcp_enabled"] is True
     assert _rpc_initialize(mcp_client, token=None).status_code == 401
     assert _rpc_initialize(mcp_client, token="vgo_wrong").status_code == 401

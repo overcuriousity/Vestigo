@@ -241,6 +241,8 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("DROP TABLE agent_proposals"))
         # 0011 adds the instance-wide agent settings table.
         await conn.execute(text("DROP TABLE agent_settings"))
+        # 0020 adds the instance settings table.
+        await conn.execute(text("DROP TABLE app_settings"))
         # 0016 adds the Stories tables.
         await conn.execute(text("DROP TABLE stories"))
         await conn.execute(text("DROP TABLE story_blocks"))

@@ -336,6 +336,43 @@ class EnricherGlobalConfig(Base):
         }
 
 
+class AppSettingRow(Base):
+    """One admin-edited override of a ``Settings`` field.
+
+    Key/value rather than a wide column-per-setting table: the set of settings
+    is declared in ``core/settings_registry.py`` and changes with the code, so
+    a schema that mirrored it would need a migration per tunable. The value is
+    stored as JSON so an int stays an int across a round-trip.
+
+    A row exists only for a field an admin actually set — clearing an override
+    deletes the row rather than storing NULL, which keeps "no opinion" and
+    "explicitly empty" distinguishable (an empty *string* is a legitimate
+    stored value, e.g. ``sigma_rules_path``). The environment still wins over
+    anything here; see ``core/config.py``.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "key": self.key,
+            "value": self.value,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class AgentSettingsRow(Base):
     """Instance-wide AI agent configuration, set by admins (A7, docs/AGENT.md).
 
@@ -2114,6 +2151,40 @@ class PostgresStore:
             await session.commit()
             await session.refresh(row)
             return row
+
+    async def list_app_settings(self) -> list[AppSettingRow]:
+        """Return every stored settings override."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(AppSettingRow))
+            return list(result.scalars().all())
+
+    async def set_app_settings(
+        self, values: dict[str, Any], updated_by: str | None
+    ) -> list[AppSettingRow]:
+        """Upsert the given overrides; a value of ``None`` deletes that row.
+
+        Only keys present in ``values`` are touched — a key absent from the
+        mapping keeps whatever is stored. Returns the full override set after
+        the write, which the caller applies to the process (see
+        ``core/runtime_settings.py``).
+        """
+        async with self.session_factory() as session:
+            for key, value in values.items():
+                row = await session.get(AppSettingRow, key)
+                if value is None:
+                    if row is not None:
+                        await session.delete(row)
+                    continue
+                if row is None:
+                    row = AppSettingRow(key=key, value=value, updated_by=updated_by)
+                    session.add(row)
+                else:
+                    row.value = value
+                    row.updated_by = updated_by
+                    row.updated_at = datetime.now(UTC)
+            await session.commit()
+            result = await session.execute(select(AppSettingRow))
+            return list(result.scalars().all())
 
     async def get_agent_settings(self) -> AgentSettingsRow | None:
         """Return the single instance-wide agent settings row, if it exists."""

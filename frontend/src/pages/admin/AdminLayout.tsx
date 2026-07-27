@@ -8,6 +8,7 @@ const TABS = [
   { to: "/admin/audit", label: "Audit log" },
   { to: "/admin/enrichers", label: "Enrichers" },
   { to: "/admin/agent", label: "Agent" },
+  { to: "/admin/settings", label: "Settings" },
 ];
 
 export function AdminLayout() {
@@ -21,7 +22,7 @@ export function AdminLayout() {
               Administration
             </h1>
             <p className="mt-0.5 text-sm text-[var(--color-fg-muted)]">
-              Manage users, investigation teams, and the audit trail.
+              Manage users, investigation teams, the audit trail, and instance configuration.
             </p>
           </div>
         </div>
