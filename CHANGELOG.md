@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The airgapped installer no longer trusts a container engine that says "loaded" and
+  means "registered".** `docker load` writes an image's metadata before unpacking its
+  layers and exits 0 even when every layer fails — so on a host that cannot mount
+  overlay, four images arrived that `docker image inspect` was perfectly happy with and
+  no container could start from. `install.sh` believed them, copied the payload over a
+  running install and started a stack in which nothing ran. It now reads the engine's
+  output and treats an unpack error as fatal, and proves each image is *usable* by
+  preparing a throwaway container from it rather than only checking that it exists.
+  A host that cannot unpack is now reported as such, with the engine's own error quoted,
+  before anything on the install is touched.
+
+- **The bundle no longer carries a compose file that `docker compose` auto-discovers.**
+  It shipped as `docker-compose.yml`, and the compose project name is pinned, so a
+  command run from the extracted bundle rather than the install directory targeted the
+  real stack with no `.env` beside it. It travels as `compose.airgap.yml` and only
+  `install.sh` puts the canonical name in the install directory.
+
+- **`docs/DEPLOYMENT.md` gains a container-install troubleshooting section** for the two
+  host problems that look like bundle problems: Docker's containerd image store (the
+  default since Docker 28) failing to mount overlay inside an unprivileged LXC guest,
+  and runc being unable to mount `/proc` when that guest is not allowed to nest.
+
 ## [1.8.4] — 2026-07-27
 
 ### Added

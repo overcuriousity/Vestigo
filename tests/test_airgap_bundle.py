@@ -192,7 +192,7 @@ def _fake_bundle(tmp_path, images, *, scope="full", archive_images=None):
         tar.add(bundle / "manifest.json", arcname="manifest.json")
     (bundle / "manifest.json").unlink()
 
-    shutil.copy(COMPOSE, bundle / "docker-compose.yml")
+    shutil.copy(COMPOSE, bundle / "compose.airgap.yml")
     shutil.copy(REPO / "deploy/clickhouse/allow-default-network.xml", bundle / "clickhouse")
     shutil.copy(INSTALL_SH, bundle / "install.sh")
     (bundle / "install.sh").chmod(0o755)
@@ -219,12 +219,19 @@ def _fake_bundle(tmp_path, images, *, scope="full", archive_images=None):
     return bundle
 
 
-def _fake_engine(tmp_path, present_images):
-    """A podman stand-in that knows which images exist and logs `compose up`."""
+def _fake_engine(tmp_path, present_images, *, load_output="", unusable_images=()):
+    """A podman stand-in that knows which images exist and logs `compose up`.
+
+    `load_output` and `unusable_images` model the split the installer now has to
+    survive: an engine that registers an image's metadata (so `image inspect`
+    passes) while its layers never extracted (so `create` cannot prepare a
+    snapshot), reporting the failure on stderr and exiting 0 regardless.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "engine.log"
     known = "\n".join(present_images)
+    broken = "\n".join(unusable_images)
     # `docker` must exist and be unusable: that is the case the engine probe was
     # written for, and it keeps a real docker on the test host out of the way.
     (bin_dir / "docker").write_text("#!/bin/sh\nexit 1\n")
@@ -234,9 +241,21 @@ echo "$@" >> {log}
 case "$1 $2" in
   "image inspect")
     printf '%s\\n' '{known}' | grep -qxF "$3" ;;
+  "create ")
+    # A container can only be created from an image whose layers unpacked.
+    printf '%s\\n' '{broken}' | grep -qxF "$2" && exit 125
+    echo probe-container-id ;;
+  "rm -f") exit 0 ;;
   "volume inspect") exit 1 ;;
   "volume ls") exit 0 ;;
-  "compose version"|"compose up"|"info "|"load -i") exit 0 ;;
+  "compose version"|"compose up"|"info ") exit 0 ;;
+  "load -i")
+    # Exit 0 even when it reports failures — the behaviour that fooled the
+    # first version of the check.
+    cat <<'LOADOUT'
+{load_output}
+LOADOUT
+    exit 0 ;;
   *) exit 0 ;;
 esac
 """
@@ -357,6 +376,95 @@ def test_unknown_arguments_are_fatal(tmp_path):
     assert result.returncode != 0
     assert "unknown option" in result.stderr
     assert not log.exists()
+
+
+# The real thing, from a fresh Docker 29 inside an unprivileged LXC. `load`
+# printed one of these per image and exited 0.
+UNPACK_FAILURE = (
+    "Loaded image: vestigo-app:9.9.9-deadbee\n"
+    'Error unpacking image vestigo-app:9.9.9-deadbee: apply layer error for '
+    '"docker.io/library/vestigo-app:9.9.9-deadbee": failed to extract layer '
+    "sha256:5b21fa92fbc3: failed to mount /var/lib/containerd/tmpmounts/containerd-mount1: "
+    'mount source: "overlay", target: "/var/lib/containerd/tmpmounts/containerd-mount1", '
+    "fstype: overlay, flags: 0, err: permission denied"
+)
+
+
+def test_images_that_register_but_do_not_unpack_stop_the_install(tmp_path):
+    """`load` exits 0 after failing to extract every layer.
+
+    It registers an image's metadata before unpacking it, so a host that cannot
+    mount overlay — a fresh Docker on the containerd snapshotter inside an
+    unprivileged LXC — leaves four images that `image inspect` is perfectly
+    happy with and no container can start from. The installer used to believe
+    them, copy the payload and start a stack in which nothing ran. Trusting an
+    exit status is what `podman save -m` already taught us one layer up.
+    """
+    install_dir = tmp_path / "opt"
+    install_dir.mkdir()
+    (install_dir / ".env").write_text("VESTIGO_IMAGE_TAG=1.0.0-oldcommit\n")
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES, load_output=UNPACK_FAILURE)
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode != 0
+    assert "could not unpack" in result.stderr
+    assert "permission denied" in result.stderr  # the operator's actual cause, quoted back
+    assert "Troubleshooting" in result.stderr
+    # Nothing started, and the running install is exactly as it was.
+    assert "compose up" not in log.read_text()
+    assert (install_dir / ".env").read_text() == "VESTIGO_IMAGE_TAG=1.0.0-oldcommit\n"
+    assert not (install_dir / "docker-compose.yml").exists()
+
+
+def test_an_image_present_but_unusable_is_caught_before_the_stack_starts(tmp_path):
+    """Belt to the load check's braces: `inspect` passes, `create` cannot.
+
+    A quieter engine might register metadata without printing anything this
+    could grep for. Preparing a snapshot is the part that actually needs the
+    layers, so the check creates a throwaway container rather than trusting
+    `image inspect`, which reads metadata alone.
+    """
+    install_dir = tmp_path / "opt"
+    install_dir.mkdir()
+    (install_dir / ".env").write_text("VESTIGO_IMAGE_TAG=1.0.0-oldcommit\n")
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(
+        tmp_path, ALL_IMAGES, unusable_images=["docker.io/qdrant/qdrant:v1.18.2"]
+    )
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode != 0
+    assert "docker.io/qdrant/qdrant:v1.18.2" in result.stderr
+    assert "compose up" not in log.read_text()
+    assert not (install_dir / "docker-compose.yml").exists()
+
+
+def test_the_bundle_holds_no_compose_file_that_compose_would_auto_discover(tmp_path):
+    """Running `docker compose` from the bundle must find nothing.
+
+    The compose file pins `name: vestigo`, so a copy named `docker-compose.yml`
+    in the extracted bundle means a command run from the wrong directory drives
+    the *real* project with no `.env` beside it. The bundle carries it under a
+    name compose does not look for; only the install directory gets the
+    canonical one.
+    """
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    autodiscovered = {"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+    assert not {p.name for p in bundle.iterdir()} & autodiscovered
+    assert (bundle / "compose.airgap.yml").is_file()
+
+    # And the builder is what puts it there under that name.
+    assert 'cp deploy/airgap/docker-compose.airgap.yml "$BUNDLE/compose.airgap.yml"' in (
+        BUNDLE_SH.read_text()
+    )
+
+    bin_dir, _ = _fake_engine(tmp_path, ALL_IMAGES)
+    install_dir = tmp_path / "opt"
+    assert _run_install(bundle, bin_dir, install_dir).returncode == 0
+    assert (install_dir / "docker-compose.yml").is_file()
 
 
 def test_check_verifies_without_touching_the_host(tmp_path):

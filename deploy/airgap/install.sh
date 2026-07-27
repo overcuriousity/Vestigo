@@ -130,20 +130,54 @@ fi
 # Loaded and checked *before* the install directory is touched, so a bundle that
 # cannot produce a working stack leaves the existing install exactly as it was —
 # same .env, same image tag, same running containers.
+# `load` reports per-image failures on stderr and still exits 0. Observed on a
+# fresh Docker 29 in an unprivileged LXC: every layer failed to extract
+# ("apply layer error … err: permission denied"), four "Error unpacking image"
+# lines went by, the exit status was 0, and `image inspect` was satisfied
+# afterwards because `load` registers an image's *metadata* before unpacking
+# its layers. The installer therefore believed all four images were present,
+# copied the payload, and started a stack in which nothing could run. Trusting
+# an exit status is the same mistake `podman save` taught us one layer up, so:
+# capture the output and treat any error line as fatal.
 say "loading images (slow — several GB)"
-$ENGINE load -i "$BUNDLE/images/vestigo-stack.tar"
+LOAD_LOG="$(mktemp)"
+trap 'rm -f "$LOAD_LOG"' EXIT
+if ! $ENGINE load -i "$BUNDLE/images/vestigo-stack.tar" 2>&1 | tee "$LOAD_LOG"; then
+  die "loading images failed — nothing was changed or started."
+fi
+LOAD_ERRORS="$(grep -iE 'error unpacking|apply layer error|failed to extract|^error' "$LOAD_LOG" || true)"
+if [ -n "$LOAD_ERRORS" ]; then
+  printf 'error: the container engine could not unpack the images it just registered:\n' >&2
+  printf '%s\n' "$LOAD_ERRORS" | sed 's/^/  /' >&2
+  die "images loaded but did not unpack — nothing was changed or started. This is a host storage/permission problem, not a damaged bundle; see docs/DEPLOYMENT.md §Troubleshooting."
+fi
 
-# Every image compose is about to reference must now exist locally. Without
-# this, a missing one sends compose to a registry that is not there — the exact
-# failure this bundle exists to prevent, surfacing as a confusing DNS timeout
-# instead of "this --app-only bundle needs a host that already has the services".
-say "checking every image the stack references is present"
+# Every image compose is about to reference must now exist locally *and be
+# usable*. Without the first, a missing image sends compose to a registry that
+# is not there — the exact failure this bundle exists to prevent, surfacing as
+# a confusing DNS timeout instead of "this --app-only bundle needs a host that
+# already has the services". Without the second, a half-loaded image passes and
+# fails at `up` instead.
+image_usable() {
+  # `image inspect` reads metadata, which survives a failed unpack. Creating a
+  # container additionally makes the engine prepare a snapshot from the image's
+  # layers, which is the part that was actually missing. The command is never
+  # run — `create` only records it — so a bogus one is fine and avoids the
+  # "no command specified" error on an image without a CMD.
+  "$ENGINE" image inspect "$1" >/dev/null 2>&1 || return 1
+  local probe
+  probe="$("$ENGINE" create "$1" /nonexistent-vestigo-probe 2>/dev/null)" || return 1
+  [ -z "$probe" ] || "$ENGINE" rm -f "$probe" >/dev/null 2>&1 || true
+  return 0
+}
+
+say "checking every image the stack references is present and usable"
 MISSING=""
 while read -r img; do
   [ -n "$img" ] || continue
-  "$ENGINE" image inspect "$img" >/dev/null 2>&1 || MISSING="$MISSING $img"
-done < <(sed -n 's/^ *image: \(docker\.io[^$]*\)$/\1/p' "$BUNDLE/docker-compose.yml")
-"$ENGINE" image inspect "vestigo-app:$VESTIGO_IMAGE_TAG" >/dev/null 2>&1 \
+  image_usable "$img" || MISSING="$MISSING $img"
+done < <(sed -n 's/^ *image: \(docker\.io[^$]*\)$/\1/p' "$BUNDLE/compose.airgap.yml")
+image_usable "vestigo-app:$VESTIGO_IMAGE_TAG" \
   || MISSING="$MISSING vestigo-app:$VESTIGO_IMAGE_TAG"
 
 if [ -n "$MISSING" ]; then
@@ -159,7 +193,15 @@ fi
 # new version. The operator's .env is the one thing that is not.
 say "copying bundle payload into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/clickhouse"
-cp docker-compose.yml "$INSTALL_DIR/docker-compose.yml"
+# Named `compose.airgap.yml` in the bundle and `docker-compose.yml` only in the
+# install directory. Compose auto-discovers the four canonical names, so a copy
+# called `docker-compose.yml` sitting in the bundle means `docker compose ps`
+# run from the extracted bundle silently targets the real project (`name:
+# vestigo` is pinned in the file) with no `.env` loaded beside it — an operator
+# gets "required variable VESTIGO_IMAGE_TAG is missing" at best, and acts on
+# the live stack from the wrong directory at worst. This name is not one compose
+# looks for, so the bundle directory has no runnable stack in it.
+cp compose.airgap.yml "$INSTALL_DIR/docker-compose.yml"
 cp clickhouse/allow-default-network.xml "$INSTALL_DIR/clickhouse/"
 cp .env.example "$INSTALL_DIR/.env.example"
 cp bundle.env BUNDLE-INFO images.list "$INSTALL_DIR/"

@@ -150,7 +150,11 @@ It builds the frontend, builds the app image **from that prebuilt frontend** (th
 `frontend-prebuilt` Dockerfile stage, so the isolated host never resolves
 `node:22-alpine`), saves every image the stack runs, verifies the resulting archive
 really holds that many images, and packs everything with the compose file,
-`.env.example`, `nginx-tls.conf` and `install.sh`. Output is
+`.env.example`, `nginx-tls.conf` and `install.sh`. The compose file travels as
+`compose.airgap.yml` — not one of the names `docker compose` auto-discovers — and only
+`install.sh` renames it to `docker-compose.yml` in the install directory, so a compose
+command run from the extracted bundle cannot reach the live stack from the wrong
+directory. Output is
 `vestigo-airgap-<version>-<commit>.tar.gz` **and** a matching `.sha256`.
 
 Copy **both files** to the drive. The `.sha256` is how the far side distinguishes a
@@ -314,6 +318,60 @@ opportunity, or the fix silently disappears the next time the stack is recreated
 A rebuilt frontend is not optional for any change under `frontend/`: the app serves
 `frontend/dist`, and `docker compose up -d` after a **failed** build happily keeps
 serving the previous image.
+
+### Troubleshooting a container install
+
+Both of these were hit on a first install into a fresh, unprivileged **LXC** guest and
+neither is a bundle problem — the bundle is fine, the host cannot run containers yet.
+`install.sh` refuses on the first and compose fails on the second; in both cases fix
+the host and re-run the installer, which is idempotent.
+
+**`Error unpacking image … err: permission denied`, on every image.**
+
+```
+apply layer error for "docker.io/library/postgres:17-alpine": failed to extract layer
+sha256:…: failed to mount /var/lib/containerd/tmpmounts/containerd-mount…:
+mount source: "overlay", … userxattr,index=off, err: permission denied
+```
+
+The `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/` path is the tell:
+this is Docker's **containerd image store**, the default since Docker 28 and therefore
+what any *fresh* install gets. It mounts overlay with `userxattr`, which an
+unprivileged LXC guest refuses. An older Docker on the same kind of host works
+because it used the classic `overlay2` graphdriver — so "Docker has always worked in
+my LXC containers" and this failing are consistent.
+
+Confirm with `docker info | grep 'Storage Driver'`: `overlayfs` is the containerd
+snapshotter, `overlay2` is the graphdriver. To go back to the graphdriver:
+
+```json
+/* /etc/docker/daemon.json */
+{ "features": { "containerd-snapshotter": false } }
+```
+
+```bash
+sudo systemctl restart docker
+docker info | grep 'Storage Driver'   # want: overlay2
+```
+
+Images already registered live in the containerd store and do not carry over; re-run
+`install.sh` and it reloads them.
+
+**`error mounting "proc" to rootfs at "/proc": … permission denied`.**
+
+Images unpack, containers are created, and every one fails to start. runc mounts a
+fresh procfs into the container, which an unprivileged LXC guest blocks unless the
+guest is allowed to nest. `sudo` inside the guest changes nothing — root there is not
+root on the LXC host — so this is fixed **on the host**, followed by a guest restart:
+
+```bash
+pct set <vmid> --features nesting=1 && pct reboot <vmid>   # Proxmox
+lxc config set <name> security.nesting true                # LXD/Incus
+```
+
+Plain LXC: `lxc.apparmor.profile = generated` plus `lxc.apparmor.allow_nesting = 1`.
+`systemd-detect-virt` confirms you are in an LXC guest; `cat /proc/self/attr/current`
+shows which AppArmor profile is in force.
 
 ## TLS reverse proxy (nginx)
 

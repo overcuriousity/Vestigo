@@ -119,7 +119,11 @@ SAVED="$(tar xOf "$BUNDLE/images/vestigo-stack.tar" manifest.json 2>/dev/null \
   "archive holds $SAVED image(s), expected ${#IMAGES[@]} — refusing to ship a short bundle"
 
 # ── 4. everything else the target needs ─────────────────────────────────────
-cp deploy/airgap/docker-compose.airgap.yml "$BUNDLE/docker-compose.yml"
+# Deliberately *not* one of the four names compose auto-discovers
+# (compose.yaml/yml, docker-compose.yaml/yml): install.sh renames it on the way
+# into the install directory, so the extracted bundle has no stack an operator
+# can accidentally drive from the wrong directory. See install.sh's copy step.
+cp deploy/airgap/docker-compose.airgap.yml "$BUNDLE/compose.airgap.yml"
 cp deploy/airgap/install.sh "$BUNDLE/install.sh"
 cp deploy/clickhouse/allow-default-network.xml "$BUNDLE/clickhouse/"
 cp .env.example "$BUNDLE/.env.example"

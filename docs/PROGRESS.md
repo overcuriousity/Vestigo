@@ -1,9 +1,47 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 112 — reproducible airgapped deployment).
+Last updated: 2026-07-27 (session 113 — the 1.8.4 bundle meets a real isolated host).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 113 — 2026-07-27: what the first real install found
+
+**Why.** 1.8.4 shipped, and the bundle was carried to a fresh unprivileged LXC guest.
+Two host problems and one installer defect, in that order.
+
+- **The installer believed an engine that had failed.** `docker load` registers an
+  image's metadata *before* unpacking its layers and exits 0 either way. On a host
+  that could not mount overlay, four `Error unpacking image … err: permission denied`
+  lines scrolled past, the exit status was 0, and `image inspect` — which reads
+  metadata — passed for all four. So the check that exists specifically to prevent
+  "start a stack that cannot run" waved it through, copied the payload over a running
+  install and started it. This is the `podman save -m` lesson from session 112's review
+  round, one layer down and missed: **an exit status is not a result.** `install.sh`
+  now captures the load output and treats an unpack error as fatal, and `image_usable`
+  creates and removes a throwaway container, because preparing a snapshot is what
+  actually needs the layers. The install directory is untouched in both refusals.
+- **`docker compose` from the bundle directory drove the real project.** The bundle
+  shipped its compose file as `docker-compose.yml`, one of the four names compose
+  auto-discovers, and the project name is pinned to `vestigo` inside it — so a command
+  run one directory too high found a stack, with no `.env` next to it. It travels as
+  `compose.airgap.yml` now; only `install.sh` writes the canonical name, into the
+  install directory.
+
+**The two host problems, now in `docs/DEPLOYMENT.md` §Troubleshooting**, because both
+present as bundle failures and neither is one:
+
+- **Docker's containerd image store is the default from Docker 28**, so a *fresh*
+  install gets it while long-lived hosts still run the classic `overlay2` graphdriver.
+  It mounts overlay with `userxattr`, which an unprivileged LXC guest refuses — which
+  is exactly why "Docker has always worked in my LXC containers" and this failing are
+  both true. `{"features":{"containerd-snapshotter":false}}` in `daemon.json` restores
+  the graphdriver. Verified against a real Docker 29.6.2: no `daemon.json`, and
+  `docker info` reports `Storage Driver: overlayfs`.
+- **runc cannot mount `/proc` in a guest that is not allowed to nest.** Images unpack,
+  containers get created, every one fails to start. Fixed on the LXC host
+  (`nesting=1` / `security.nesting`), not inside the guest — `sudo` there is not root
+  on the host, which is why escalating changes nothing.
 
 ## Session 112 — 2026-07-27: the airgap promise, made true for containers
 
