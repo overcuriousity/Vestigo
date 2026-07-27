@@ -107,6 +107,28 @@ export type AgentChartSpec = AgentChartSpecV2 | AgentChartSpecLegacy;
 const isLegacySpec = (spec: AgentChartSpec): spec is AgentChartSpecLegacy =>
   !("chart_type" in spec);
 
+/**
+ * Coerce a persisted tool-call argument into an object.
+ *
+ * Tool args are stored verbatim as the model emitted them, and some providers
+ * hand back a nested object as a JSON *string*. A stored row like
+ * `{"spec": "{\"chart_type\": ...}"}` is not rewritable after the fact, so
+ * every reader of `tool_args` normalizes here rather than trusting the shape.
+ * Returns null for anything that is not (or does not parse to) an object.
+ */
+export function parseToolArgObject<T>(raw: unknown): T | null {
+  let value = raw;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as T;
+}
+
 /** Which `ChartType` (and matching `Scale`, per `CHART_META`) renders each
  * retired `propose_chart` kind. Frozen: these pairs are what historical chart
  * cards rendered as, so changing one rewrites the past. */

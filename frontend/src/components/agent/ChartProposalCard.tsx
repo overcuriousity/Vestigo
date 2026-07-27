@@ -26,7 +26,13 @@ import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { Markdown } from "./Markdown";
-import { specToChartConfig, specToEventFilters, type AgentChartSpec } from "@/api/agent";
+import {
+  parseToolArgObject,
+  specToChartConfig,
+  specToEventFilters,
+  type AgentChartSpec,
+  type AgentFilterSpec,
+} from "@/api/agent";
 import { filtersToParams } from "@/lib/queryParams";
 interface Props {
   caseId: string;
@@ -38,7 +44,10 @@ interface Props {
 
 export function ChartProposalCard({ caseId, timelineId, title, description, spec }: Props) {
   const config = useMemo(() => specToChartConfig(spec), [spec]);
-  const filters = useMemo(() => specToEventFilters(spec.filters ?? {}), [spec]);
+  const filters = useMemo(
+    () => specToEventFilters(parseToolArgObject<AgentFilterSpec>(spec.filters) ?? {}),
+    [spec],
+  );
 
   const qc = useQueryClient();
   const [name, setName] = useState("");

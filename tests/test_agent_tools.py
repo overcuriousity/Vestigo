@@ -2024,6 +2024,27 @@ async def test_corr_field_list_refuses_rather_than_truncates(store, monkeypatch)
     assert not any(name == "field_correlation" for name, _, _ in fake.calls)
 
 
+# ── provider-stringified spec ───────────────────────────────────────────────
+
+
+async def test_spec_handed_over_as_a_json_string_is_parsed(store, monkeypatch):
+    """Some providers emit a nested object argument as a JSON string.
+
+    Rejecting it costs the model a retry it has to guess its way out of, and
+    the stringified args are persisted on the tool-call row either way — so
+    parse it here and keep the stored row renderable.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart('{"chart_type": "bar", "field": "attr:status", "scale": "nominal"}'),  # type: ignore[arg-type]
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["chart_type"] == "bar"
+
+
 # ── retired facet spec ──────────────────────────────────────────────────────
 
 

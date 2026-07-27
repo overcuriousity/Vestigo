@@ -1,9 +1,25 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 110 — PR #189 review fixes).
+Last updated: 2026-07-27 (session 111 — stringified tool-argument crash).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 111 — 2026-07-27: a stringified tool argument took the whole app down
+
+**Why.** A production conversation crashed the SPA at the router level:
+`Cannot use 'in' operator to search for 'chart_type' in {"chart_type": "bar", ...}` —
+the `in` check in `isLegacySpec` ran against a *string*. Some providers hand a nested
+object argument back as JSON text, and `tool_args` is persisted verbatim as the model
+emitted it, so the bad row is permanent and every re-render of that conversation hit it.
+
+- **Readers of `tool_args` normalize.** `parseToolArgObject` (in `api/agent.ts`) parses a
+  stringified argument, passes an object through, and returns `null` for anything else.
+  Both the persisted path (`itemsFromMessages`) and the live SSE path use it for
+  `propose_chart`'s `spec` and `propose_finding`'s `filters`; an unparseable spec now
+  renders no card instead of throwing through the chart card's `useMemo`.
+- **The tool accepts it too.** `ChartSpec`'s before-validator `json.loads`es a string
+  spec, which is cheaper than a validation error the model has to guess its way out of.
 
 ## Session 110 — 2026-07-27: PR #189 review fixes
 

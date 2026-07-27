@@ -491,6 +491,15 @@ class ChartSpec(BaseModel):
         restart, whose model still holds the previous tool schema in context —
         and is deletable once no such conversation can predate the change.
         """
+        if isinstance(data, str):
+            # Some providers hand back a nested object argument as a JSON
+            # string. Parsing it here beats a validation error the model has
+            # to guess its way out of; a string that is not JSON falls through
+            # to the normal "expected an object" error.
+            try:
+                data = json.loads(data)
+            except ValueError:
+                return data
         if not isinstance(data, dict):
             return data
         kind = data.get("kind")

@@ -28,6 +28,7 @@ import {
 import {
   agentApi,
   formatTokenCount,
+  parseToolArgObject,
   type AgentChartSpec,
   type AgentFilterSpec,
   type AgentMessage,
@@ -205,15 +206,19 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
           kind: "finding",
           title: args.title ?? "Finding",
           description: args.description ?? "",
-          spec: args.filters ?? {},
+          spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
         });
       } else if (m.tool_name === "propose_chart") {
         const args = m.tool_args as ProposeChartArgs;
-        if (args.spec) {
+        // A spec the provider stringified is still a usable spec; one that is
+        // neither object nor parseable JSON renders nothing rather than
+        // taking the whole conversation down.
+        const spec = parseToolArgObject<AgentChartSpec>(args.spec);
+        if (spec) {
           const chart: PendingChart = {
             title: args.title ?? "Chart",
             description: args.description ?? "",
-            spec: args.spec,
+            spec,
           };
           if (m.tool_call_id) pendingCharts.set(m.tool_call_id, chart);
           else pendingChartFifo.push(chart);
@@ -330,7 +335,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
             kind: "finding",
             title: args.title ?? "Finding",
             description: args.description ?? "",
-            spec: args.filters ?? {},
+            spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
           },
         ],
         liveText: "",
@@ -346,13 +351,14 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
       // shows no card, same contract as itemsFromMessages. Keyed by
       // tool_call_id: parallel batches keep several proposals in flight.
       const args = e.args as { title?: string; description?: string; spec?: AgentChartSpec };
+      const spec = parseToolArgObject<AgentChartSpec>(args.spec);
       let pendingCharts = s.pendingCharts;
-      if (args.spec) {
+      if (spec) {
         const next = new Map(s.pendingCharts);
         next.set(e.tool_call_id, {
           title: args.title ?? "Chart",
           description: args.description ?? "",
-          spec: args.spec,
+          spec,
         });
         pendingCharts = next;
       }
