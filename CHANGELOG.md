@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proposals are unaffected, as are all conversations since ids were added. A missing card
   is recoverable; a wrong one, read as evidence, is not.
 
+  **This applies retroactively**: cards are rendered from the stored transcript on every
+  open, so an affected conversation that showed a batch of chart cards yesterday will
+  show none of them after this upgrade. Nothing was deleted — the calls, their arguments
+  and their results are all still in the transcript, and the charts can be rebuilt from
+  the Visualize page. What is gone is the claim that a given card belonged to a given
+  proposal, which was never something the stored rows could support.
+
 ## [1.8.3] — 2026-07-27
 
 ### Added

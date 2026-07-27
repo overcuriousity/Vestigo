@@ -8,19 +8,23 @@ and scope binding are all exercised.
 from __future__ import annotations
 
 import json
+import typing
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from vestigo.agent.fidelity import Fidelity
+from vestigo.agent.schema_slim import SHARED_SPEC_NAMES
 from vestigo.agent.tools import (
     AgentScope,
     ChartSpec,
     FilterSpec,
+    ObjectArgModel,
+    _admits_json_object,
     build_tool_server,
     schema_chars_for_scope,
 )
@@ -2052,12 +2056,16 @@ async def test_spec_handed_over_as_a_json_string_is_parsed(store, monkeypatch):
     assert result["resolved"]["chart_type"] == "bar"
 
 
-async def test_a_stringified_filter_spec_is_parsed_on_every_tool_that_takes_one(store, monkeypatch):
-    """`FilterSpec` is a nested argument on ~20 tools, not a chart-only shape.
+async def test_a_stringified_filter_spec_reaches_the_query_end_to_end(store, monkeypatch):
+    """`FilterSpec` is a nested argument on 14 tools, not a chart-only shape.
 
     The same provider that stringifies a chart spec stringifies these, so the
     tolerance belongs to the position (nested argument) — `ObjectArgModel` —
-    rather than to any one spec.
+    rather than to any one spec. One tool end to end here, because the point
+    of this case is that the coercion survives the whole MCP argument-parsing
+    path and not just `model_validate`; that every nested-argument model is
+    covered at all is
+    `test_every_nested_argument_model_derives_from_object_arg_model`'s job.
     """
     _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
@@ -2141,6 +2149,103 @@ def test_object_field_coverage_is_derived_not_hand_maintained():
     # `field`/`fields`/`metric` are str/list/enum — an object is not what a
     # string there could have meant.
     assert not ({"field", "fields", "metric", "scale"} & ChartSpec._object_fields())
+
+
+def _nested_arg_models() -> dict[str, set[type[BaseModel]]]:
+    """Every pydantic model reachable as a *nested* tool argument, by tool name.
+
+    Walks the built server's real signatures rather than a hand-kept list: the
+    invariant is about the position an argument occupies, so it has to be read
+    off the positions that actually exist.
+    """
+
+    def models_in(annotation: Any) -> set[type[BaseModel]]:
+        found: set[type[BaseModel]] = set()
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            found.add(annotation)
+        for arg in typing.get_args(annotation):
+            found |= models_in(arg)
+        return found
+
+    scope = _scope("c1", "t1", source_ids=["s1"], fidelity=Fidelity.FULL)
+    by_tool: dict[str, set[type[BaseModel]]] = {}
+    for tool in build_tool_server(scope)._tool_manager.list_tools():
+        hints = typing.get_type_hints(tool.fn)
+        hints.pop("return", None)
+        direct: set[type[BaseModel]] = set()
+        for annotation in hints.values():
+            direct |= models_in(annotation)
+        # Transitively: a model reached through another model's field is just
+        # as nested, and `FilterSpec` inside `ChartSpec.compare` is exactly the
+        # position that broke.
+        reachable = set(direct)
+        queue = list(direct)
+        while queue:
+            for field in queue.pop().model_fields.values():
+                for model in models_in(field.annotation):
+                    if model not in reachable:
+                        reachable.add(model)
+                        queue.append(model)
+        if reachable:
+            by_tool[tool.name] = reachable
+    return by_tool
+
+
+def test_every_nested_argument_model_derives_from_object_arg_model():
+    """The invariant `ObjectArgModel` states about itself, enforced.
+
+    `docs/AGENT.md` and the class docstring both call it "the base for every
+    nested-argument model", but inheritance is a thing a future spec can
+    simply not do — and the failure mode is not a test failure, it is one
+    provider retry-looping in production on a tool it is using correctly.
+    Derived from the real signatures so a model added tomorrow is covered.
+    """
+    by_tool = _nested_arg_models()
+    assert by_tool, "no nested model arguments found — the walk is broken, not the invariant"
+    offenders = {
+        (tool, model.__name__)
+        for tool, models in by_tool.items()
+        for model in models
+        if not issubclass(model, ObjectArgModel)
+    }
+    assert not offenders, f"nested tool-argument models not based on ObjectArgModel: {offenders}"
+    # The walk must be seeing the real thing, not an empty set that trivially
+    # passes: FilterSpec is a nested argument on most of the toolset, and
+    # ChartSpec reaches FilterSpec transitively through `compare`.
+    assert sum(FilterSpec in m for m in by_tool.values()) > 10
+    assert FilterSpec in by_tool["propose_chart"]
+
+
+def test_every_nested_argument_model_has_inspectable_annotations():
+    """`_admits_json_object` raises on an annotation it cannot decide.
+
+    An unresolved forward reference would otherwise be silently read as "does
+    not admit an object" and drop that field from coercion. This asserts the
+    computation succeeds for every model actually in a nested position, which
+    is the same thing as asserting every one of them is rebuilt.
+    """
+    for models in _nested_arg_models().values():
+        for model in models:
+            assert isinstance(model._object_fields(), frozenset)
+
+
+def test_admits_json_object_refuses_an_unresolved_annotation():
+    with pytest.raises(TypeError, match="model_rebuild"):
+        _admits_json_object(typing.ForwardRef("SomeLaterSpec") | None)
+
+
+def test_spec_reference_covers_every_nested_argument_model():
+    """`SPEC_REFERENCE` renders per-field prose once, for the models slimmed
+    out of the repeated `$defs` (A13).
+
+    Its input tuple is hand-kept, so a nested-argument model added later would
+    have its schema slimmed and its prose never rendered — the model would see
+    field names with no descriptions and nothing would fail. Same walk, same
+    invariant, one layer up.
+    """
+    reachable = {model for models in _nested_arg_models().values() for model in models}
+    missing = {m.__name__ for m in reachable} - set(SHARED_SPEC_NAMES)
+    assert not missing, f"nested-argument models absent from SHARED_SPEC_NAMES: {missing}"
 
 
 def test_coercion_does_not_rewrite_the_caller_s_mapping():

@@ -34,7 +34,7 @@ emitted it, so the bad row is permanent and every re-render of that conversation
   wraps its `Outlet` (keyed by pathname, so navigating away recovers), the router carries
   a `RouteErrorPage` as the last net, and the agent's chart/finding cards — the ones
   rendering model-authored JSON — wrap themselves individually.
-- **`FilterSpec` is a nested argument on ~20 tools.** The tolerance therefore belongs to
+- **`FilterSpec` is a nested argument on 14 tools.** The tolerance therefore belongs to
   the *position*, not to `ChartSpec`: `ObjectArgModel` is the base for every nested tool
   argument, so a provider that stringifies one stringifies none of them into a failure.
   It covers the model *and* every field whose annotation admits a JSON object — the
@@ -62,6 +62,37 @@ the stale fallback once before replacing it. `AppShell`'s route lost its `errorE
 `AppShell` wraps its own `Outlet`, so nothing reaches the router there that the
 `RequireAuth` route does not already catch. Three negative assertions that raced a
 `setTimeout(0)` against the conversation query now await a positive anchor row.
+
+**Second review round (PR #190).**
+
+- **The standing decision on GHSA-qwww-vcr4-c8h2 was argued from a false premise.** It
+  said `react-router` 8.3.0 "is not published"; `npm view react-router version` returns
+  8.3.0, and 8.0.0–8.3.0 all exist. The conclusion survives for a different reason: we
+  depend on **`react-router-dom`**, which the v8 line retired at 7.18.1 in favour of
+  `react-router`, so taking the patch means migrating 41 imports. Rewritten in
+  `ROADMAP.md` with the real blocker and a trigger that has not already fired.
+- **"`ObjectArgModel` is the base for every nested-argument model" was documentation, not
+  an invariant.** A later spec inheriting `BaseModel` would have lost the tolerance with
+  no test failing — the symptom is one provider retry-looping in production.
+  `test_every_nested_argument_model_derives_from_object_arg_model` walks the built
+  server's signatures, transitively through model fields, and enforces it. The same walk
+  found that `SHARED_SPEC_NAMES` (which decides whose `$defs` prose is slimmed and
+  re-rendered into the system prompt) is hand-kept and can drift the same way, so it is
+  pinned against the walk too.
+- **`_admits_json_object` answered "no" to questions it could not answer.** An unresolved
+  forward reference matched neither branch and the field was silently dropped from
+  coercion. It raises `TypeError` now.
+- **`FilterSpec` is on 14 tools, not "~20".** Counted off the built server; corrected in
+  `AGENT.md`, here, and a test docstring. Also renamed
+  `test_a_stringified_filter_spec_is_parsed_on_every_tool_that_takes_one`, which tested
+  one tool.
+- **A card boundary was a dead end.** `resetKey` is the only exit, and a card's `resetKey`
+  is its immutable `tool_call_id` — so its fallback lasted the life of the conversation.
+  The default notice now carries a "Try again", handed to custom fallbacks as well.
+- **The FIFO-pairing change is retroactive** — cards render from the stored transcript on
+  every open, so an affected old conversation loses cards it used to show. Stated in the
+  `CHANGELOG.md` entry, which described the new behaviour without saying it reaches
+  backwards.
 
 ## Session 110 — 2026-07-27: PR #189 review fixes
 

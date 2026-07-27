@@ -222,6 +222,8 @@ def coerce_object_arg(data: Any) -> Any:
     if isinstance(data, str):
         try:
             return json.loads(data)
+        # `json.JSONDecodeError` subclasses `ValueError`; catching the base also
+        # covers the `str`-subclass edge cases `json.loads` raises it for.
         except ValueError:
             return data
     return data
@@ -234,6 +236,14 @@ def _admits_json_object(annotation: Any) -> bool:
     legitimately hold ``'{"a": 1}'`` as a free-text search, and coercing it
     would silently rewrite the analyst's query into a dict. A field is only
     coerced when an object is the *only* thing a string could have meant.
+
+    Raises:
+        TypeError: if an annotation cannot be inspected (an unresolved forward
+            reference, i.e. a model whose `model_rebuild()` has not run). The
+            honest answers are "yes", "no" and "cannot tell", and silently
+            folding the third into "no" would drop a field from coercion with
+            no signal anywhere — exactly the failure this whole path exists to
+            make loud. Reached at class-inspection time, not per call.
     """
     origin = typing.get_origin(annotation)
     members = (
@@ -241,6 +251,12 @@ def _admits_json_object(annotation: Any) -> bool:
         if origin in (typing.Union, types.UnionType)
         else [annotation]
     )
+    unresolved = [m for m in members if isinstance(m, str | typing.ForwardRef)]
+    if unresolved:
+        raise TypeError(
+            f"cannot decide object-coercion for unresolved annotation {annotation!r} "
+            f"({unresolved!r}) — call model_rebuild() on the owning model first"
+        )
     if any(m is str for m in members):
         return False
     return any(

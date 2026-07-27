@@ -208,7 +208,7 @@ call's arguments (`ToolCallPart.args_as_dict`), and the MCP SDK's
 argument always arrives parsed, and anything nested arrives exactly as the
 provider sent it. Rejecting that costs a retry the model has to guess its way
 out of, on tools it is otherwise using correctly (`FilterSpec` is a nested
-argument on ~20 of them).
+argument on 14 of them — every filtered query and aggregation in the toolset).
 
 `ObjectArgModel` in `agent/tools.py` is the base for every nested-argument
 model and the single place this is handled. It coerces the model itself and
@@ -221,6 +221,19 @@ legitimately hold `'{"a": 1}'` as a free-text search, and coercing it would
 rewrite the analyst's query. Coercion works on a copy: the same mapping is the
 call's `tool_args`, persisted verbatim, and a forensic record must not change
 shape between being stored and being validated.
+
+Both halves of that are enforced rather than merely documented, because both
+fail *silently* — one provider retry-looping on a tool it is using correctly
+is not something a test suite notices on its own.
+`test_every_nested_argument_model_derives_from_object_arg_model` walks the
+built server's real signatures (and transitively through model fields, which
+is how `FilterSpec` inside `ChartSpec.compare` is reached) and fails if any
+model in a nested position is a bare `BaseModel`; the same walk feeds
+`test_spec_reference_covers_every_nested_argument_model`, so a new spec cannot
+have its `$defs` prose slimmed away without being added to `SHARED_SPEC_NAMES`.
+And `_admits_json_object` **raises** on an annotation it cannot decide (an
+unresolved forward reference) rather than answering "no": quietly dropping a
+field from coercion is the failure mode this whole path exists to make loud.
 
 The frontend needs the mirror image, because `tool_args` is persisted exactly
 as emitted — a bad row is permanent and every re-render of that conversation

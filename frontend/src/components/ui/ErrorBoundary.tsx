@@ -19,13 +19,21 @@ interface Props {
   children: ReactNode;
   /** Names what failed, for the console record and the default fallback. */
   label: string;
-  /** Replaces the default inline notice. Receives the thrown error. */
-  fallback?: (error: Error) => ReactNode;
+  /**
+   * Replaces the default inline notice. Receives the thrown error and the
+   * same retry the default notice offers — a custom fallback should not have
+   * to reimplement the only way out of a dead end.
+   */
+  fallback?: (error: Error, retry: () => void) => ReactNode;
   /**
    * Changing this clears the error — children are *not* remounted, so their
    * own state survives. Pass the route path (or any identity of what is being
    * rendered) so navigating away from a broken view recovers instead of
    * staying stuck on the fallback.
+   *
+   * Not every boundary has a `resetKey` that ever changes: a card keyed by its
+   * `tool_call_id` is rendering one immutable spec forever, so navigation is
+   * no way out of its fallback. That is what `retry` is for.
    */
   resetKey?: string;
 }
@@ -57,10 +65,20 @@ export class ErrorBoundary extends Component<Props, State> {
     console.error(`[${this.props.label}] render failed`, error, info.componentStack);
   }
 
+  /** Re-render the children once more. `resetKey` is untouched, so
+   * `getDerivedStateFromProps` sees no change and leaves the cleared error
+   * cleared; a child that throws again simply lands back on the fallback.
+   * Worth offering because most of what trips a boundary is a transient the
+   * caller can do nothing else about, and a boundary whose `resetKey` never
+   * changes has no other exit. */
+  private retry = (): void => {
+    this.setState({ error: null });
+  };
+
   render(): ReactNode {
     const { error } = this.state;
     if (!error) return this.props.children;
-    if (this.props.fallback) return this.props.fallback(error);
+    if (this.props.fallback) return this.props.fallback(error, this.retry);
     return (
       <div className="flex items-start gap-1.5 rounded-md border border-[var(--color-danger)] bg-[var(--color-bg-elevated)] px-2.5 py-2 text-xs text-[var(--color-fg-secondary)]">
         <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--color-danger)]" />
@@ -72,6 +90,14 @@ export class ErrorBoundary extends Component<Props, State> {
           <div className="mt-0.5">
             The rest of the page is unaffected. Details are in the browser console.
           </div>
+          <button
+            type="button"
+            onClick={this.retry}
+            data-testid="error-boundary-retry"
+            className="mt-1.5 rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--color-fg-primary)] hover:bg-[var(--color-bg-hover)]"
+          >
+            Try again
+          </button>
         </div>
       </div>
     );
