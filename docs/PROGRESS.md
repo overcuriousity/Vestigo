@@ -69,6 +69,25 @@ A" is now a runbook — build, carry, install, upgrade, back up, roll back, diag
 `tests/test_airgap_bundle.py` grows six cases that drive `install.sh` against a fake
 engine and a stub archive.
 
+**Second review round (PR #191): CI caught what the local builds could not.**
+
+- **`COPY --from=${FRONTEND_STAGE}` never worked on Docker.** Buildah/podman expands
+  the variable; Docker refuses it outright — *"variable expansion is not supported for
+  --from, define a new stage with FROM using ARG from global scope as a workaround"* —
+  so every Docker build of this branch failed at parse time while the podman builds
+  used to develop it passed. Exactly the asymmetry the rest of this session was about,
+  one layer down. Now an alias stage, `FROM ${FRONTEND_STAGE} AS frontend` plus a
+  literal `COPY --from=frontend`; the unaliased stage stays unreachable, so the
+  offline property is unchanged. Verified against real Docker on both paths: the
+  default build succeeds, and `--build-arg FRONTEND_STAGE=frontend-prebuilt` completes
+  with `node:22-alpine` removed from the local store and never pulled. A test pins the
+  alias form, since the terser one is an easy edit to make again.
+- **CodeQL flagged `image.startswith("docker.io/")`** (`py/incomplete-url-substring-
+  sanitization`, high). A test assertion, so not exploitable — but the rule is right
+  about the shape: a reference is a structured name, so the check now splits it and
+  compares the registry component exactly. Same for the `"vestigo-app" in image` guard
+  beside it.
+
 ## Session 110 — 2026-07-27: PR #189 review fixes
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in

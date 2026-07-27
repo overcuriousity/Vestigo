@@ -119,6 +119,11 @@ already-built `frontend/dist` out of the build context instead. The prebuilt sta
 `FROM scratch`, so selecting it means the node base image is never resolved — which is
 what makes an offline build possible at all. `scripts/airgap-bundle.sh` uses it.
 
+The selection is an alias stage (`FROM ${FRONTEND_STAGE} AS frontend`) rather than a
+`COPY --from=${FRONTEND_STAGE}`, because Docker refuses variable expansion in `--from`
+while buildah/podman performs it — the terser form builds locally under podman and
+fails every Docker build. Keep the alias if you edit this.
+
 ## Airgapped installation
 
 Two supported routes. Pick by how the host runs Vestigo:

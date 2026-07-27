@@ -24,6 +24,16 @@ RUN npm run build
 FROM scratch AS frontend-prebuilt
 COPY frontend/dist /frontend/dist
 
+# The selection happens here rather than at the `COPY --from` below, because
+# `COPY --from=${VAR}` is not expanded by Docker's BuildKit ("variable
+# expansion is not supported for --from, define a new stage with FROM using
+# ARG from global scope as a workaround") — buildah/podman does expand it,
+# which is why this only ever failed on the Docker path. `FROM ${VAR}` is
+# expanded by every builder, and an alias stage costs nothing: it adds no
+# layer, and the stage it does *not* alias stays unreachable and unresolved,
+# which is the whole point of `frontend-prebuilt` for an offline host.
+FROM ${FRONTEND_STAGE} AS frontend
+
 FROM python:3.13-slim AS app
 WORKDIR /app
 
@@ -40,9 +50,7 @@ COPY README.md LICENSE ./
 ARG INSTALL_EMBEDDINGS=0
 RUN uv sync --frozen --no-dev $(test "$INSTALL_EMBEDDINGS" = "1" && echo "--extra embeddings")
 
-# Re-declared: an ARG from before the first FROM is not in scope inside a stage.
-ARG FRONTEND_STAGE
-COPY --from=${FRONTEND_STAGE} /frontend/dist ./frontend/dist
+COPY --from=frontend /frontend/dist ./frontend/dist
 
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8080

@@ -45,10 +45,28 @@ def test_prebuilt_frontend_stage_needs_no_base_image():
     text = DOCKERFILE.read_text()
     assert "ARG FRONTEND_STAGE=frontend-build" in text
     assert "FROM scratch AS frontend-prebuilt" in text
-    assert "COPY --from=${FRONTEND_STAGE} /frontend/dist ./frontend/dist" in text
-    # The ARG must be re-declared inside the app stage or it expands to empty.
+
+
+def test_the_stage_is_selected_by_from_and_never_by_copy_from():
+    """Docker refuses `COPY --from=${VAR}`; buildah expands it happily.
+
+    That asymmetry is why the first version of this Dockerfile passed a local
+    podman build and failed every Docker one with "variable expansion is not
+    supported for --from". The supported form — Docker's own suggested
+    workaround — is an alias stage: `FROM ${ARG} AS frontend`, then a literal
+    `COPY --from=frontend`. Pinned because reverting to the terser form is an
+    easy and entirely plausible edit.
+    """
+    text = DOCKERFILE.read_text()
+    assert "FROM ${FRONTEND_STAGE} AS frontend\n" in text
+    assert "COPY --from=frontend /frontend/dist ./frontend/dist" in text
+    assert not re.search(r"COPY --from=\$\{?FRONTEND_STAGE", text)
+    # `FROM` reads the ARG from global scope, so it must be declared before
+    # the first stage — and needs no re-declaration inside the app stage,
+    # which is where a re-declaration would now be dead weight.
+    assert text.index("ARG FRONTEND_STAGE=") < text.index("FROM node:")
     app_stage = text.split("FROM python:")[1]
-    assert re.search(r"^ARG FRONTEND_STAGE$", app_stage, re.MULTILINE)
+    assert not re.search(r"^ARG FRONTEND_STAGE$", app_stage, re.MULTILINE)
 
 
 def test_dockerignore_lets_the_prebuilt_dist_through():
@@ -100,9 +118,14 @@ def test_the_builder_finds_every_backing_service_image_in_the_compose_file():
         check=True,
     ).stdout.split()
     assert len(found) == 3
-    assert all(image.startswith("docker.io/") for image in found)
+    # Split on `/` and compare the registry component exactly rather than
+    # prefix-matching the whole reference: `startswith("docker.io/")` is the
+    # shape CodeQL flags as `py/incomplete-url-substring-sanitization`, and it
+    # is right that the anchored form is the one to write — a reference is a
+    # structured name, so check the field, not the text around it.
+    assert all(image.split("/", 1)[0] == "docker.io" for image in found)
     # The app image is built, not pulled, so it must not appear here.
-    assert not any("vestigo-app" in image for image in found)
+    assert all(image.rsplit("/", 1)[-1].split(":")[0] != "vestigo-app" for image in found)
 
 
 @pytest.mark.parametrize("script", [BUNDLE_SH, INSTALL_SH])
