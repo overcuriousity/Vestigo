@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.8.4] — 2026-07-27
 
+### Added
+
+- **Airgapped installation now covers the container path, not just the native one.**
+  "Airgapped" previously meant the `uv` install: the image build pulled `node:22-alpine`
+  and `python:3.13-slim` unconditionally, so building on an isolated host failed at DNS —
+  and the obvious retry, `docker compose up -d`, silently restarted the *old* image,
+  which is indistinguishable from a successful deploy. `scripts/airgap-bundle.sh` now
+  produces a single verifiable tarball on the connected side (application image, all
+  three backing-service images, compose file, `.env.example`, `nginx-tls.conf`,
+  checksums, installer), and `deploy/airgap/install.sh` is the whole far side: it
+  verifies its own checksums, loads and confirms every referenced image *before*
+  touching the running stack, creates `.env` only when there is none so an upgrade keeps
+  the operator's configuration, and installs into a stable directory (`/opt/vestigo`, or
+  `--dir`/`VESTIGO_INSTALL_DIR`) so a new bundle upgrades the existing stack instead of
+  standing up a second empty one beside it. `--app-only` upgrades the application alone.
+  The image build takes `--build-arg FRONTEND_STAGE=frontend-prebuilt`, which sources
+  `frontend/dist` from the build context through a `FROM scratch` stage so the node base
+  image is never resolved. See `docs/DEPLOYMENT.md` §Airgapped installation, now a
+  runbook covering build, carry, install, upgrade, back up, roll back and diagnose.
+
 ### Fixed
 
 - **One malformed agent tool argument no longer takes down the whole app.** A provider

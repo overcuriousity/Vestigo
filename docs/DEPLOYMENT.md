@@ -113,9 +113,156 @@ image from the local checkout (`Dockerfile`) and reaches the backing services ov
 compose-internal network. Uncomment it, then `docker compose up -d` brings up the full
 stack in one command.
 
+The build takes `FRONTEND_STAGE`: the default (`frontend-build`) builds the frontend
+in a node stage, while `--build-arg FRONTEND_STAGE=frontend-prebuilt` copies an
+already-built `frontend/dist` out of the build context instead. The prebuilt stage is
+`FROM scratch`, so selecting it means the node base image is never resolved — which is
+what makes an offline build possible at all. `scripts/airgap-bundle.sh` uses it.
+
+The selection is an alias stage (`FROM ${FRONTEND_STAGE} AS frontend`) rather than a
+`COPY --from=${FRONTEND_STAGE}`, because Docker refuses variable expansion in `--from`
+while buildah/podman performs it — the terser form builds locally under podman and
+fails every Docker build. Keep the alias if you edit this.
+
 ## Airgapped installation
 
-Vestigo's application layer (backend + frontend) can be installed fully offline.
+Two supported routes. Pick by how the host runs Vestigo:
+
+- **Containers → the bundle.** One tarball carries every image, the compose file and
+  an installer. Nothing is built, pulled or resolved on the isolated host. This is the
+  route to take unless you have a reason not to.
+- **Native (`uv run vestigo-web`) → the carried checkout**, further below.
+
+### Route A: the deployment bundle (containers)
+
+#### Step 1 — build the bundle (connected machine)
+
+From a checkout of the version you want to ship:
+
+```bash
+scripts/airgap-bundle.sh                    # app + all three backing services
+scripts/airgap-bundle.sh -o /media/usb      # write straight to the drive
+scripts/airgap-bundle.sh --no-embeddings    # skip the ~2 GB local embedding stack
+scripts/airgap-bundle.sh --app-only         # app image only — see the caveat below
+```
+
+It builds the frontend, builds the app image **from that prebuilt frontend** (the
+`frontend-prebuilt` Dockerfile stage, so the isolated host never resolves
+`node:22-alpine`), saves every image the stack runs, verifies the resulting archive
+really holds that many images, and packs everything with the compose file,
+`.env.example`, `nginx-tls.conf` and `install.sh`. Output is
+`vestigo-airgap-<version>-<commit>.tar.gz` **and** a matching `.sha256`.
+
+Copy **both files** to the drive. The `.sha256` is how the far side distinguishes a
+bad copy from a bad bundle.
+
+#### Step 2 — carry it
+
+Nothing on the isolated host needs a registry, npm, a build, or any name resolution.
+What the host must already have is a **container engine**: Docker with the compose
+plugin, or podman with podman-compose. The bundle installs Vestigo, not Docker.
+
+Full bundle size is roughly 2.5–5 GB (`--no-embeddings` roughly halves it), so size
+the drive before you leave.
+
+#### Step 3 — install or upgrade (airgapped host)
+
+```bash
+sha256sum -c vestigo-airgap-<version>-<commit>.tar.gz.sha256
+tar xzf vestigo-airgap-<version>-<commit>.tar.gz
+cd vestigo-airgap-<version>-<commit>
+./install.sh --check      # verify everything, change nothing, touch nothing
+./install.sh
+```
+
+`install.sh`:
+
+1. verifies its own checksums and that the image archive holds the number of images
+   the bundle declares (a truncated copy or a short `save` fails here, before
+   anything is loaded or the running stack is disturbed);
+2. picks the container engine by probing `info`, not by finding a binary — a docker
+   binary whose daemon is unreachable does not beat a working podman;
+3. copies the bundle payload into the **install directory** and runs everything from
+   there (see below);
+4. creates `.env` from the example **only when there is none**, and rewrites exactly
+   one line of an existing `.env`: `VESTIGO_IMAGE_TAG`;
+5. loads the images, then checks every image the compose file references is actually
+   present — a missing one would otherwise send compose to a registry that is not
+   reachable, and the resulting DNS timeout names nothing useful;
+6. `compose up -d --no-build`, waits for `/api/health`, and says plainly when the
+   wait times out rather than reporting a success it did not observe.
+
+**The install directory.** The extracted bundle is throwaway; the stack runs from
+`/opt/vestigo` (or `~/vestigo` when `/opt` is not writable; override with `--dir` or
+`VESTIGO_INSTALL_DIR`). That directory holds `.env`, the compose file and the compose
+project — and therefore the named volumes with all case data. This is what makes an
+upgrade an upgrade: a newer bundle unpacks into a *different* directory but installs
+into the *same* one, so the operator's configuration and the existing data are picked
+up rather than replaced by an empty second stack. Run all later `compose` commands
+from there.
+
+The compose file also pins `name: vestigo` for the same reason. If a host ran Vestigo
+under a different compose project name (for example from a repository checkout named
+something else), `install.sh` notices the foreign volumes and tells you to set
+`COMPOSE_PROJECT_NAME=<that prefix>` in the install directory's `.env` before
+continuing — otherwise the upgraded stack comes up healthy, empty, and next to your
+data.
+
+First install prints the two things left to do: set `VESTIGO_ADMIN_PASSWORD` in `.env`
+(then `docker compose up -d app`), and put TLS in front of the app before analysts use
+it (§TLS reverse proxy below).
+
+#### Upgrading an existing airgapped install
+
+Same command. Build a bundle from the newer checkout, carry it over, run
+`./install.sh`. It reports `<old tag>  ->  <new tag>`, keeps the `.env`, reuses the
+volumes, and the app runs its schema migrations on startup. `--app-only` bundles are
+much smaller and are the normal choice here — but only for a host a **full** bundle
+has already reached, since they carry no backing-service images. `install.sh` checks
+for them and refuses (having started nothing) rather than letting compose try to pull.
+When you cannot verify the target's state before travelling, carry the full bundle.
+
+**Backup before an upgrade.** Nothing in this path deletes data, but a schema
+migration is not reversible, so snapshot the volumes while the stack is stopped:
+
+```bash
+cd /opt/vestigo && docker compose down
+for v in vestigo_postgres_data vestigo_clickhouse_data vestigo_qdrant_data vestigo_app_data; do
+  docker run --rm -v "$v":/from -v "$PWD/backup":/to alpine \
+    tar czf "/to/$v.tar.gz" -C /from .
+done
+```
+
+(Restore by reversing the mounts into a freshly created volume of the same name.)
+The `alpine` image must already be on the host — add it to the bundle yourself if you
+want this available offline, or use `docker compose cp` from a running service.
+
+**Rollback.** The previous image stays loaded on the host, so reverting the code is
+one line — `install.sh` prints the exact command after an upgrade:
+
+```bash
+cd /opt/vestigo
+sed -i 's|^VESTIGO_IMAGE_TAG=.*|VESTIGO_IMAGE_TAG=<previous tag>|' .env
+docker compose up -d app
+```
+
+This reverts the *code* only. If the upgrade migrated the schema, restore the backup
+instead.
+
+#### When something is wrong
+
+- `install.sh` says the bundle is damaged → the copy did not survive the drive.
+  Re-copy; the `.sha256` next to the tarball tells you whether the tarball itself
+  arrived intact.
+- The health wait times out → the stack is probably still migrating. Raise the watch
+  with `VESTIGO_HEALTH_TIMEOUT_SECONDS=600 ./install.sh`, or just follow
+  `cd /opt/vestigo && docker compose logs -f app`.
+- Anything tries to reach a registry → that is a bug in this path, not an operator
+  error. Nothing in the bundle should resolve a name; report it.
+
+### Route B: native install from a carried checkout
+
+Use this when the host runs the app directly rather than in a container.
 **The three backing services are out of scope for this procedure**: provision them on
 the airgapped network however you normally handle offline service deployment (e.g.
 `podman load` of pre-pulled images, or native packages).
@@ -154,6 +301,19 @@ On the **airgapped machine**:
    build and run on matching OS/architecture (e.g. build on the same Linux
    distribution/glibc version you'll run on), since the `.venv/` carries compiled
    wheels (PyTorch, onnxruntime, etc.).
+
+### Patching an airgapped host in place
+
+Applying a fix without a full bundle: carry the `git format-patch` output plus a
+prebuilt `frontend/dist`, `git am` the patches, replace `frontend/dist`, restart.
+
+For a **container** deployment that is only a stopgap — `docker cp` into a running
+container survives `restart` but not `up --force-recreate` or a rebuild, so the image
+still holds the old code. Follow it with a proper bundle (Route A) at the next
+opportunity, or the fix silently disappears the next time the stack is recreated.
+A rebuilt frontend is not optional for any change under `frontend/`: the app serves
+`frontend/dist`, and `docker compose up -d` after a **failed** build happily keeps
+serving the previous image.
 
 ## TLS reverse proxy (nginx)
 

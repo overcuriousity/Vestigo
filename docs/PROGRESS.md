@@ -1,9 +1,95 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 111 — stringified tool-argument crash).
+Last updated: 2026-07-27 (session 112 — reproducible airgapped deployment).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 112 — 2026-07-27: the airgap promise, made true for containers
+
+**Why.** Patching a production host exposed that "airgapped" only ever covered the
+*native* install. The container path pulled `node:22-alpine` and `python:3.13-slim`
+unconditionally, so `docker compose up -d --build app` on the isolated host failed at
+DNS — and the follow-up `docker compose up -d` silently restarted the *old* image,
+which looks exactly like a successful deploy. Runtime egress was never the problem;
+build-time and upgrade-time were, and nothing in `docs/` admitted it.
+
+- **`FRONTEND_STAGE` makes the node stage unreachable.** The Dockerfile gains a
+  `frontend-prebuilt` stage that is `FROM scratch` and copies `frontend/dist` out of
+  the build context. BuildKit skips a stage nothing reachable copies from, so selecting
+  it means `node:22-alpine` is never resolved — verified by pointing the node stage at
+  a nonexistent tag and watching the prebuilt build succeed anyway. `.dockerignore` had
+  to stop ignoring `frontend/dist` for this to work at all.
+- **`scripts/airgap-bundle.sh` produces one tarball.** Frontend, app image built from
+  that frontend, every backing-service image, the compose file, `.env.example`,
+  `nginx-tls.conf`, checksums, installer. Backing-service tags are grepped out of the
+  compose file rather than repeated, so bumping one is a single edit.
+- **`deploy/airgap/install.sh` is the whole far side.** Verifies its own checksums,
+  loads images, creates `.env` only when there is none, repoints the image tag, starts
+  the stack, waits for `/api/health`, and says so plainly when the wait times out.
+  Re-running it *is* the upgrade path. Rehearsed end to end here: bundle built, stack
+  loaded and started from it, `/api/health` answered, second run a clean no-op.
+- **Two things the rehearsal caught that review would not have.** A `docker` binary
+  with an unreachable daemon beat a working `podman` in both scripts' engine detection
+  (now an `info` probe, not a `command -v`); and the backing services published host
+  ports they never needed — a port conflict on any host already running Postgres, and
+  an attack surface for services holding default credentials. They publish nothing now;
+  the app reaches them over the compose network.
+- **`docs/DEPLOYMENT.md` now names both routes** (bundle for containers, carried
+  checkout for native) and documents in-place patching honestly, including that
+  `docker cp` does not survive a recreate.
+
+**Review round (PR #191).** Four defects, all in the class where the operator finds
+out at the isolated host:
+
+- **`podman save` needs `-m`, and does not say so.** With more than one image and no
+  `-m`, podman reads the extra arguments as additional *tags for the first image* and
+  writes a single-image archive carrying all four names — exit 0, no warning. The far
+  side then loads a `postgres:17-alpine` that is really qdrant. Fixed, and both sides
+  now count the archive's `manifest.json` entries against a declared
+  `VESTIGO_IMAGE_COUNT` rather than trusting an exit status.
+- **`--app-only` could not work.** The bundle's compose file declares all four
+  services, so on a host without the backing-service images compose would go to a
+  registry — the original failure, wearing a DNS timeout as a disguise. `install.sh`
+  now verifies every referenced image exists after `load` and refuses, naming the
+  cause, before anything is copied or started.
+- **An upgrade unpacks a new directory, and compose names the project after it.**
+  Extracting `vestigo-airgap-1.9.0-abc123/` beside the old install would have created
+  a *second*, empty stack with new volumes, looking perfectly healthy. The compose
+  file pins `name: vestigo`, and `install.sh` now runs the stack from a stable
+  **install directory** (`/opt/vestigo`, `--dir`/`VESTIGO_INSTALL_DIR` to override)
+  that the bundle only feeds — which also keeps the operator's `.env` across upgrades
+  instead of regenerating it from the example. Volumes belonging to another project
+  name are detected and reported rather than silently ignored.
+- **Ordering.** Images load and are checked *before* the install directory is
+  touched, so a bundle that cannot produce a working stack leaves the running one
+  exactly as it was.
+
+Also: unknown installer arguments are fatal (`--dry-run` used to mean "install"),
+`VESTIGO_HEALTH_TIMEOUT_SECONDS` raises the health wait for slow hosts with long
+migrations, the tarball gets a `.sha256` companion, and `docs/DEPLOYMENT.md` §"Route
+A" is now a runbook — build, carry, install, upgrade, back up, roll back, diagnose.
+`tests/test_airgap_bundle.py` grows six cases that drive `install.sh` against a fake
+engine and a stub archive.
+
+**Second review round (PR #191): CI caught what the local builds could not.**
+
+- **`COPY --from=${FRONTEND_STAGE}` never worked on Docker.** Buildah/podman expands
+  the variable; Docker refuses it outright — *"variable expansion is not supported for
+  --from, define a new stage with FROM using ARG from global scope as a workaround"* —
+  so every Docker build of this branch failed at parse time while the podman builds
+  used to develop it passed. Exactly the asymmetry the rest of this session was about,
+  one layer down. Now an alias stage, `FROM ${FRONTEND_STAGE} AS frontend` plus a
+  literal `COPY --from=frontend`; the unaliased stage stays unreachable, so the
+  offline property is unchanged. Verified against real Docker on both paths: the
+  default build succeeds, and `--build-arg FRONTEND_STAGE=frontend-prebuilt` completes
+  with `node:22-alpine` removed from the local store and never pulled. A test pins the
+  alias form, since the terser one is an easy edit to make again.
+- **CodeQL flagged `image.startswith("docker.io/")`** (`py/incomplete-url-substring-
+  sanitization`, high). A test assertion, so not exploitable — but the rule is right
+  about the shape: a reference is a structured name, so the check now splits it and
+  compares the registry component exactly. Same for the `"vestigo-app" in image` guard
+  beside it.
 
 ## Session 111 — 2026-07-27: a stringified tool argument took the whole app down
 
