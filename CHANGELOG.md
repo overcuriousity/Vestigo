@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Opening a story that contains a text block no longer freezes the story view.** (#193)
+  The block reported edit mode upward through an effect that depended on the callback's
+  identity, and the editor passed a new callback on every render and never reused its
+  edit-state `Set` — so each render caused the next, at roughly 700 a second, for a
+  single block and with no interaction at all. React reports that as a console error
+  rather than throwing, which is why it looked like a hang and not a crash. Both halves
+  are fixed, so either one alone keeps the view responsive. Deleting a block while it
+  was being edited also left the "your draft is kept" notice up permanently; it now
+  clears with the block.
+
+- **A story's embedded view rows are windowed.** A view block put up to 200 rows into a
+  short scroller and rebuilt every one of them on every render, for every such block in
+  the story. Only the visible rows are built now. The count beneath the table still
+  describes the whole embedded set — the same set the export snapshot renders — and
+  cells that no longer fit show their full text on hover.
+
 - **The agent's story-block proposals now appear as cards while the turn is running.**
   An agent turn that proposed blocks showed bare `propose_story_block` tool rows instead,
   and kept showing them after the turn until the panel was remounted. The chat panel

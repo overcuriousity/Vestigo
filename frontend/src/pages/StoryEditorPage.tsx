@@ -5,7 +5,7 @@ import { BookOpenText, ChevronLeft } from "lucide-react";
 import { storiesApi } from "@/api/stories";
 import { ExportsTab } from "@/components/stories/ExportsTab";
 import { StoryEditor } from "@/components/stories/StoryEditor";
-import { storyQueryKey, useStory } from "@/components/stories/useStory";
+import { useInvalidateStory, useStory } from "@/components/stories/useStory";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtRelative } from "@/lib/time";
@@ -17,11 +17,12 @@ export function StoryEditorPage() {
   const [tab, setTab] = useState<"editor" | "exports">("editor");
 
   const { data, isLoading, error } = useStory(caseId, storyId);
+  const invalidateStory = useInvalidateStory(caseId, storyId);
 
   const renameStory = useMutation({
     mutationFn: (title: string) => storiesApi.update(caseId!, storyId!, { title }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: storyQueryKey(caseId, storyId) });
+      invalidateStory();
       qc.invalidateQueries({ queryKey: ["stories", caseId] });
     },
   });

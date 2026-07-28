@@ -66,6 +66,20 @@ function OpenLink({ to, label }: { to: string; label: string }) {
 const ROW_HEIGHT = 22;
 const OVERSCAN = 8;
 
+/** One truncated preview cell, with the untruncated text on hover. */
+function Cell({ value }: { value: unknown }) {
+  const text = value == null ? "" : typeof value === "string" ? value : String(value);
+  return (
+    <span
+      role="cell"
+      title={text || undefined}
+      className="truncate px-2 text-[var(--color-fg-secondary)]"
+    >
+      {text}
+    </span>
+  );
+}
+
 /**
  * The embedded view's rows, windowed.
  *
@@ -103,25 +117,49 @@ function RowPreview({ rows, columns }: { rows: Event[]; columns: string[] | null
   const gridTemplate = `9.5rem repeat(${columns ? columns.length : 1}, minmax(0, 1fr))`;
 
   return (
-    <div className="rounded border border-[var(--color-border)] text-[11px]">
-      <div
-        className="grid gap-0 border-b border-[var(--color-border)] bg-[var(--color-bg-elevated)] text-left font-medium text-[var(--color-fg-muted)]"
-        style={{ gridTemplateColumns: gridTemplate }}
-      >
-        <span className="truncate px-2 py-1">Timestamp</span>
-        {(columns ?? ["Message"]).map((c) => (
-          <span key={c} className="truncate px-2 py-1">
-            {c}
+    // Divs, not a <table>, because virtualization needs absolutely positioned
+    // rows — so the table roles are spelled out by hand. `aria-rowcount` is
+    // the whole embedded set rather than what is windowed into the DOM, and
+    // each row carries its true index, which is how a screen reader is told
+    // it is reading a window rather than the lot.
+    <div
+      role="table"
+      aria-label="Embedded view rows"
+      aria-rowcount={rows.length + 1}
+      className="rounded border border-[var(--color-border)] text-[11px]"
+    >
+      <div role="rowgroup">
+        <div
+          role="row"
+          aria-rowindex={1}
+          className="grid gap-0 border-b border-[var(--color-border)] bg-[var(--color-bg-elevated)] text-left font-medium text-[var(--color-fg-muted)]"
+          style={{ gridTemplateColumns: gridTemplate }}
+        >
+          <span role="columnheader" className="truncate px-2 py-1">
+            Timestamp
           </span>
-        ))}
+          {(columns ?? ["Message"]).map((c) => (
+            <span role="columnheader" key={c} className="truncate px-2 py-1">
+              {c}
+            </span>
+          ))}
+        </div>
       </div>
-      <div ref={parentRef} className="max-h-80 overflow-auto">
-        <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+      <div ref={parentRef} role="rowgroup" className="max-h-80 overflow-auto">
+        {/* presentation: a layout box between rowgroup and row would otherwise
+            break the table's ownership chain. */}
+        <div
+          role="presentation"
+          className="relative w-full"
+          style={{ height: virtualizer.getTotalSize() }}
+        >
           {virtualItems.map((v) => {
             const ev = rows[v.index];
             return (
               <div
                 key={ev.event_id}
+                role="row"
+                aria-rowindex={v.index + 2}
                 className="absolute left-0 top-0 grid w-full items-center border-t border-[var(--color-border)]/60"
                 style={{
                   height: ROW_HEIGHT,
@@ -129,19 +167,22 @@ function RowPreview({ rows, columns }: { rows: Event[]; columns: string[] | null
                   gridTemplateColumns: gridTemplate,
                 }}
               >
-                <span className="truncate px-2 font-mono text-[var(--color-fg-muted)]">
+                <span
+                  role="cell"
+                  className="truncate px-2 font-mono text-[var(--color-fg-muted)]"
+                >
                   {ev.timestamp ? fmtTimestamp(ev.timestamp) : "—"}
                 </span>
+                {/* `title` on every cell: rows are a fixed height so the text
+                    truncates, and a log line is exactly the thing an analyst
+                    needs to read in full. Hover restores it without giving up
+                    the windowing; "Open in Explorer" is the full-size path. */}
                 {columns ? (
                   columns.map((c) => (
-                    <span key={c} className="truncate px-2 text-[var(--color-fg-secondary)]">
-                      {ev.attributes?.[c] ?? ""}
-                    </span>
+                    <Cell key={c} value={ev.attributes?.[c] ?? ""} />
                   ))
                 ) : (
-                  <span className="truncate px-2 text-[var(--color-fg-secondary)]">
-                    {ev.message}
-                  </span>
+                  <Cell value={ev.message} />
                 )}
               </div>
             );

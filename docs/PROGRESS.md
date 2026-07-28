@@ -37,6 +37,23 @@ Append-only session log, newest entry on top. Sessions 1–70 are archived in
   renders the block in isolation with a *stable* callback, so it is structurally unable to
   see a loop driven by callback identity. `storyEditorLoop.test.tsx` renders the real
   editor and asserts on React's own loop signal.
+- **Review round (PR #194).** The first pass tested the two guards only together — but
+  either one alone stops the loop, so reverting one left the suite green. Each half is now
+  pinned on its own (`editingIds.ts::nextEditingIds` returning the identical Set; a parent
+  that re-renders with a fresh closure not making the block report again), and both were
+  verified to fail with their half reverted. The loop test also counts renders through a
+  `Profiler` rather than waiting for React to complain at ~50 nested updates. Worth
+  recording: **no timeout can catch a full revert of both guards** — that loop is
+  synchronous, starves the event loop, and vitest's own timer never fires, so the runner
+  hangs until killed. That is the argument for keeping both guards, not just one.
+- **Also from the review:** `MarkdownBlock` never reported `false` on unmount, so a block
+  deleted mid-edit stayed in `editingIds` forever and left the "your draft is kept" notice
+  up with nothing to justify it. The callback ref is now kept current in an effect rather
+  than during render (a render that never commits must not leave it pointing into a
+  discarded tree). `useInvalidateStory` shipped exported but unused, with both call sites
+  still hand-rolling it — they go through it now. The row preview's `<table>` had become
+  divs for virtualization, dropping table semantics: the ARIA roles are spelled out, and
+  truncated cells carry their full text in `title`.
 
 ## Session 114 — 2026-07-27: the proposal card the analyst never saw
 

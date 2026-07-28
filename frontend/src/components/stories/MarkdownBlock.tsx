@@ -49,9 +49,19 @@ export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEd
    * keeps the latest callback without making it a dependency.
    */
   const onEditingChangeRef = useRef(onEditingChange);
-  onEditingChangeRef.current = onEditingChange;
+  // Kept current in an effect rather than during render: a render that never
+  // commits (concurrent React can throw one away) must not leave the ref
+  // pointing into a discarded tree. Declared first, so it has already run by
+  // the time the effect below fires in the same commit.
+  useEffect(() => {
+    onEditingChangeRef.current = onEditingChange;
+  });
   useEffect(() => {
     onEditingChangeRef.current(editing);
+    // Report `false` on unmount too: a block deleted mid-edit otherwise stays
+    // in the parent's editingIds forever, which leaves the "your draft is
+    // kept" banner up with no block left to justify it.
+    return () => onEditingChangeRef.current(false);
   }, [editing]);
 
   const startEdit = () => {

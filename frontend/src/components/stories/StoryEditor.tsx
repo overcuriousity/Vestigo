@@ -25,8 +25,9 @@ import { BlockFrame } from "./BlockFrame";
 import { BlockPicker } from "./BlockPicker";
 import { ChartBlockCard, EventBlockCard, ViewBlockCard } from "./EmbedCards";
 import { MarkdownBlock } from "./MarkdownBlock";
-import { storyQueryKey, useStory } from "./useStory";
+import { storyQueryKey, useInvalidateStory, useStory } from "./useStory";
 import { afterIdForIndex, reorderLocally, sortBlocks } from "./blockOrder";
+import { nextEditingIds } from "./editingIds";
 
 interface Props {
   caseId: string;
@@ -44,7 +45,7 @@ export function StoryEditor({ caseId, storyId }: Props) {
 
   const blocks = useMemo(() => sortBlocks(data?.blocks ?? []), [data?.blocks]);
 
-  const invalidate = () => qc.invalidateQueries({ queryKey: storyQueryKey(caseId, storyId) });
+  const invalidate = useInvalidateStory(caseId, storyId);
 
   const updateBlock = useMutation({
     mutationFn: (vars: { blockId: string; content: Record<string, unknown>; version: number }) =>
@@ -157,17 +158,7 @@ export function StoryEditor({ caseId, storyId }: Props) {
   };
 
   const setEditing = useCallback((blockId: string, editing: boolean) => {
-    setEditingIds((prev) => {
-      // Bail out when membership is unchanged: returning a fresh Set every
-      // time denies React its Object.is bail-out, so any caller that reports
-      // the same state twice re-renders the whole story. Paired with
-      // MarkdownBlock's ref, either one alone stops the #193 loop.
-      if (prev.has(blockId) === editing) return prev;
-      const next = new Set(prev);
-      if (editing) next.add(blockId);
-      else next.delete(blockId);
-      return next;
-    });
+    setEditingIds((prev) => nextEditingIds(prev, blockId, editing));
   }, []);
 
   const resolveConflict = (blockId: string, choice: "theirs" | "mine") => {
