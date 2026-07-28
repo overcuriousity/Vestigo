@@ -241,8 +241,12 @@ echo "$@" >> {log}
 case "$1 $2" in
   "image inspect")
     printf '%s\\n' '{known}' | grep -qxF "$3" ;;
-  "create ")
+  "create "*)
     # A container can only be created from an image whose layers unpacked.
+    # The pattern must be a prefix match: the installer probes with
+    # `create <image> <command>`, so "$1 $2" carries the image and an exact
+    # "create " never matches — it fell through to the catch-all below and
+    # reported every image usable, including the broken one.
     printf '%s\\n' '{broken}' | grep -qxF "$2" && exit 125
     echo probe-container-id ;;
   "rm -f") exit 0 ;;
