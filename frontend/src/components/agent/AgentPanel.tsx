@@ -46,6 +46,7 @@ import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
 import { StoryBlockProposalCard } from "./StoryBlockProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
+import { proposalItemKind } from "./proposalTools";
 import { Markdown } from "./Markdown";
 import { capPersistedForStream, type TurnBaseline } from "./transcript";
 import type { EventFilters } from "@/api/types";
@@ -172,21 +173,15 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
           completionTokens: m.completion_tokens,
         });
       }
-    } else if (m.role === "tool" && m.tool_name === "propose_story_block") {
-      // Same rule as propose_annotation: rendered from the result row, which
-      // carries the proposal_id the proposals query is keyed by.
+    } else if (m.role === "tool" && proposalItemKind(m.tool_name)) {
+      // A proposal tool (see PROPOSAL_TOOLS) is rendered from its *result* row
+      // — which carries proposal_id, the key into the proposals query — rather
+      // than the call row, which only carries the proposed body (tag/comment,
+      // block content). The call row intentionally produces nothing.
+      const kind = proposalItemKind(m.tool_name)!;
       const result = m.tool_result as { proposal_id?: string } | null;
       if (result?.proposal_id) {
-        items.push({ kind: "storyProposal", proposalId: result.proposal_id });
-      }
-    } else if (m.role === "tool" && m.tool_name === "propose_annotation") {
-      // propose_annotation is rendered from its *result* row (which carries
-      // proposal_id, the key into the proposals query) rather than the call
-      // row (which only carries the proposed tag/comment/event_ids) — the
-      // call row intentionally produces nothing.
-      const result = m.tool_result as { proposal_id?: string } | null;
-      if (result?.proposal_id) {
-        items.push({ kind: "proposal", proposalId: result.proposal_id });
+        items.push({ kind, proposalId: result.proposal_id });
       }
     } else if (m.role === "tool" && m.tool_name === "propose_chart" && !m.tool_args) {
       // Result row: only a successful validation ("ok": true) gets a card —
@@ -361,7 +356,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
         liveText: "",
       };
     }
-    if (e.tool === "propose_annotation" || e.tool === "propose_story_block") {
+    if (proposalItemKind(e.tool)) {
       // Rendered from the paired tool_result below, once proposal_id is
       // known — the call event only carries the proposed tag/comment (or the
       // block body). Falling through to the generic row here is what showed
@@ -395,15 +390,15 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
   }
   if (e.type === "tool_result") {
     // Most tool_result rows stay invisible (results feed the model, not the
-    // analyst) — propose_annotation/propose_story_block/propose_chart are
-    // exceptions, since what they render is only known once the result lands.
-    if (e.tool === "propose_annotation" || e.tool === "propose_story_block") {
-      const kind = e.tool === "propose_story_block" ? "storyProposal" : "proposal";
+    // analyst) — the proposal tools and propose_chart are exceptions, since
+    // what they render is only known once the result lands.
+    const proposalKind = proposalItemKind(e.tool);
+    if (proposalKind) {
       const result = e.result as { proposal_id?: string } | null;
       return {
         ...s,
         items: result?.proposal_id
-          ? [...flushed, { kind, proposalId: result.proposal_id }]
+          ? [...flushed, { kind: proposalKind, proposalId: result.proposal_id }]
           : flushed,
         liveText: "",
       };
@@ -593,11 +588,8 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           (event) => {
             if (event.type === "error") failed = true;
             setStream((prev) => foldStreamEvent(prev, event));
-            if (
-              event.type === "tool_result" &&
-              (event.tool === "propose_annotation" || event.tool === "propose_story_block")
-            ) {
-              // Both proposal kinds are rendered from this query — without the
+            if (event.type === "tool_result" && proposalItemKind(event.tool)) {
+              // Every proposal kind is rendered from this query — without the
               // refetch the card resolves against a list fetched before the
               // proposal existed and degrades to a bare tool row.
               queryClient.invalidateQueries({

@@ -1,8 +1,9 @@
 /**
- * AgentPanel (W7): a `propose_story_block` call must render its
- * StoryBlockProposalCard on the *live* stream, not only after a reload — the
- * live path is the one an analyst actually watches. Two separate ways that
- * broke, both covered here:
+ * AgentPanel: a proposal tool must render its card on the *live* stream, not
+ * only after a reload — the live path is the one an analyst actually watches.
+ *
+ * W7's `propose_story_block` shipped wired into one of the four render paths,
+ * so it broke two separate ways:
  *
  *   1. `foldStreamEvent` had no branch for the tool, so the call row fell
  *      through to the generic tool row (a bare "propose_story_block" line)
@@ -12,13 +13,18 @@
  *      proposal itself was missing from the (stale) list and the card fell
  *      back to the same bare tool row until the panel remounted.
  *
- * StoryBlockProposalCard is mocked — its own data fetching is not what's
- * under test here.
+ * Both are now driven off `PROPOSAL_TOOLS`, so this suite is parameterized
+ * over that map rather than over one tool: adding a proposal tool there is
+ * what earns it live-stream coverage of all four paths, and a tool wired into
+ * the map but not the folds fails here.
+ *
+ * The card components are mocked — their own data fetching is not under test.
  */
-import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AgentPanel } from "@/components/agent/AgentPanel";
+import { PROPOSAL_TOOLS, type ProposalItemKind } from "@/components/agent/proposalTools";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import { useAgentStore } from "@/stores/agent";
 import type { AgentConversation, AgentProposal, AgentStreamEvent } from "@/api/agent";
@@ -47,9 +53,21 @@ vi.mock("@/api/agent", async () => {
   };
 });
 
+/** One testid per ChatItem kind, so a card rendered for the wrong kind fails. */
+const CARD_TESTID: Record<ProposalItemKind, string> = {
+  proposal: "annotation-proposal-card",
+  storyProposal: "story-proposal-card",
+};
+
 vi.mock("@/components/agent/StoryBlockProposalCard", () => ({
   StoryBlockProposalCard: (props: { proposal: AgentProposal }) => (
     <div data-testid="story-proposal-card">{props.proposal.id}</div>
+  ),
+}));
+
+vi.mock("@/components/agent/ProposalCard", () => ({
+  ProposalCard: (props: { proposal: AgentProposal }) => (
+    <div data-testid="annotation-proposal-card">{props.proposal.id}</div>
   ),
 }));
 
@@ -73,22 +91,26 @@ function conversation(): AgentConversation {
   };
 }
 
-function storyProposal(): AgentProposal {
+/** A proposal of the kind the given ChatItem kind resolves against. */
+function proposal(itemKind: ProposalItemKind): AgentProposal {
+  const storyBlock = itemKind === "storyProposal";
   return {
     id: PROPOSAL_ID,
     conversation_id: CONV_ID,
     case_id: CASE,
     timeline_id: TL,
     status: "proposed",
-    kind: "story_block",
-    payload: {
-      story_id: "story1",
-      block_kind: "markdown",
-      content: { text: "Source IP country analysis" },
-      after_block_id: null,
-    },
-    tag: null,
-    comment: null,
+    kind: storyBlock ? "story_block" : "annotation",
+    payload: storyBlock
+      ? {
+          story_id: "story1",
+          block_kind: "markdown",
+          content: { text: "Source IP country analysis" },
+          after_block_id: null,
+        }
+      : null,
+    tag: storyBlock ? null : "suspicious",
+    comment: storyBlock ? null : "unusual country spread",
     rationale: "key findings",
     events: [],
     created_at: null,
@@ -97,21 +119,23 @@ function storyProposal(): AgentProposal {
   };
 }
 
-/** The SSE events a successful propose_story_block turn emits. */
-const TURN_EVENTS: AgentStreamEvent[] = [
-  {
-    type: "tool_call",
-    tool: "propose_story_block",
-    tool_call_id: "tc1",
-    args: { story_id: "story1", block_kind: "markdown", content: { text: "…" } },
-  } as AgentStreamEvent,
-  {
-    type: "tool_result",
-    tool: "propose_story_block",
-    tool_call_id: "tc1",
-    result: { proposal_id: PROPOSAL_ID },
-  } as AgentStreamEvent,
-];
+/** The SSE events a successful proposal turn emits for the given tool. */
+function turnEvents(tool: string): AgentStreamEvent[] {
+  return [
+    {
+      type: "tool_call",
+      tool,
+      tool_call_id: "tc1",
+      args: { story_id: "story1", block_kind: "markdown", content: { text: "…" } },
+    },
+    {
+      type: "tool_result",
+      tool,
+      tool_call_id: "tc1",
+      result: { proposal_id: PROPOSAL_ID },
+    },
+  ] satisfies AgentStreamEvent[];
+}
 
 function renderPanel() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -137,57 +161,79 @@ async function sendTurn() {
   fireEvent.keyDown(input, { key: "Enter" });
 }
 
-beforeEach(() => {
-  vi.clearAllMocks();
-  useAgentStore.getState().setActiveConversation(`${CASE}/${TL}`, CONV_ID);
-  listConversationsMock.mockResolvedValue({ conversations: [conversation()] });
-  getConversationMock.mockResolvedValue({ ...conversation(), messages: [] });
-  listProposalsMock.mockResolvedValue({ proposals: [storyProposal()] });
-  getInfoMock.mockResolvedValue({
-    api_base_url: "https://llm.example",
-    model: "test-model",
-    tools: [{ name: "propose_story_block", description: "", admin_disabled: false }],
-    user_disabled_tools: [],
-  });
-  streamMessageMock.mockImplementation(
-    async (
-      _case: string,
-      _conv: string,
-      _body: unknown,
-      onEvent: (e: AgentStreamEvent) => void,
-    ) => {
-      for (const e of TURN_EVENTS) onEvent(e);
-    },
-  );
-});
+describe.each(Object.entries(PROPOSAL_TOOLS))(
+  "AgentPanel %s (live stream)",
+  (tool, itemKind) => {
+    const testId = CARD_TESTID[itemKind];
+    // The panel drops its live items once the turn ends and the persisted
+    // transcript takes over, so a turn that completes instantly would let
+    // these assertions pass off the *reload* path — the one that was never
+    // broken. Hold the stream open past the events instead.
+    let releaseTurn = () => {};
 
-describe("AgentPanel propose_story_block (live stream)", () => {
-  it("renders one StoryBlockProposalCard while the turn streams", async () => {
-    renderPanel();
-    await sendTurn();
+    beforeEach(() => {
+      vi.clearAllMocks();
+      useAgentStore.getState().setActiveConversation(`${CASE}/${TL}`, CONV_ID);
+      listConversationsMock.mockResolvedValue({ conversations: [conversation()] });
+      getConversationMock.mockResolvedValue({ ...conversation(), messages: [] });
+      // The panel's first fetch predates the proposal — as it does in a real
+      // turn. Only the invalidation-driven refetch can resolve the card.
+      listProposalsMock
+        .mockResolvedValueOnce({ proposals: [] })
+        .mockResolvedValue({ proposals: [proposal(itemKind)] });
+      getInfoMock.mockResolvedValue({
+        api_base_url: "https://llm.example",
+        model: "test-model",
+        tools: [{ name: tool, description: "", admin_disabled: false }],
+        user_disabled_tools: [],
+      });
+      const held = new Promise<void>((resolve) => {
+        releaseTurn = resolve;
+      });
+      streamMessageMock.mockImplementation(
+        async (
+          _case: string,
+          _conv: string,
+          _body: unknown,
+          onEvent: (e: AgentStreamEvent) => void,
+        ) => {
+          for (const e of turnEvents(tool)) onEvent(e);
+          await held;
+        },
+      );
+    });
 
-    const cards = await screen.findAllByTestId("story-proposal-card");
-    expect(cards).toHaveLength(1);
-    expect(cards[0]).toHaveTextContent(PROPOSAL_ID);
-  });
+    afterEach(() => releaseTurn());
 
-  it("does not also render the raw tool row for the call", async () => {
-    // The generic fallback row is what the analyst saw instead of the card.
-    renderPanel();
-    await sendTurn();
+    it("renders one proposal card while the turn streams", async () => {
+      renderPanel();
+      await waitFor(() => expect(listProposalsMock).toHaveBeenCalled());
+      await sendTurn();
 
-    await screen.findAllByTestId("story-proposal-card");
-    expect(screen.queryByText(/propose_story_block/)).toBeNull();
-  });
+      const cards = await screen.findAllByTestId(testId);
+      expect(cards).toHaveLength(1);
+      expect(cards[0]).toHaveTextContent(PROPOSAL_ID);
+    });
 
-  it("refetches the proposals list so the card can resolve its proposal", async () => {
-    // Without the invalidation the list is the one fetched *before* the
-    // proposal existed, and the card falls back to a bare tool row.
-    renderPanel();
-    await waitFor(() => expect(listProposalsMock).toHaveBeenCalled());
-    const before = listProposalsMock.mock.calls.length;
+    it("does not also render the raw tool row for the call", async () => {
+      // The generic fallback row is what the analyst saw instead of the card.
+      renderPanel();
+      await sendTurn();
 
-    await sendTurn();
-    await waitFor(() => expect(listProposalsMock.mock.calls.length).toBeGreaterThan(before));
-  });
-});
+      await screen.findAllByTestId(testId);
+      expect(screen.queryByText(new RegExp(tool))).toBeNull();
+    });
+
+    it("refetches the proposals list so the card can resolve its proposal", async () => {
+      // Without the invalidation the list stays the one fetched *before* the
+      // proposal existed, and the card falls back to a bare tool row — which
+      // is why the mock above returns an empty list first.
+      renderPanel();
+      await waitFor(() => expect(listProposalsMock).toHaveBeenCalled());
+      const before = listProposalsMock.mock.calls.length;
+
+      await sendTurn();
+      await waitFor(() => expect(listProposalsMock.mock.calls.length).toBeGreaterThan(before));
+    });
+  },
+);

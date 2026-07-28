@@ -18,13 +18,25 @@ Append-only session log, newest entry on top. Sessions 1–70 are archived in
   row produced nothing; after the turn, the transcript refetch *did* emit a
   `storyProposal` item, but the proposals list was the one fetched before the
   proposal existed, so the card hit its `!proposal` fallback — the same bare row,
-  until the panel remounted. Both live folds and the invalidation now cover it,
-  sharing `propose_annotation`'s branches (identical shape: rendered from the result
-  row, which carries `proposal_id`).
+  until the panel remounted.
+- **The allowlists are now one map.** Patching each path individually would have left
+  the shape that caused the bug, so `components/agent/proposalTools.ts` holds
+  `PROPOSAL_TOOLS` (tool → the `ChatItem` kind it renders as) and all four paths derive
+  from it. There was a fifth allowlist nobody had counted: `ToolSelector`'s
+  `WORKFLOW_TOOLS` warned only for `propose_finding`/`propose_annotation`, so disabling
+  `propose_story_block` or `propose_chart` silently removed their cards. It now derives
+  from `CARD_TOOLS`, which also supplies the card's name in the warning copy. Adding a
+  proposal tool is a one-line edit in that module.
 - **How it slipped:** every frontend test for the agent panel covers the persisted
-  path. `src/test/agentPanelStoryProposal.test.tsx` now drives a real streamed turn
-  and asserts the card renders, the raw tool row does not, and the proposals query is
-  refetched.
+  path. `src/test/agentPanelStoryProposal.test.tsx` drives a real streamed turn —
+  parameterized over `PROPOSAL_TOOLS`, so a tool added to the map inherits coverage of
+  all four paths — and asserts the card renders, the raw tool row does not, and the
+  proposals query is refetched. Two details the first pass got wrong and this one
+  needs: the proposals mock must return an *empty* list first (the real fetch predates
+  the proposal, and returning it immediately let the invalidation be reverted with the
+  tests still green), and the mocked stream must stay open past its events (the panel
+  drops live items once the turn ends, so an instant turn asserts the reload path — the
+  one that was never broken).
 
 ## Session 113 — 2026-07-27: what the first real install found
 

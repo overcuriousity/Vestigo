@@ -17,9 +17,12 @@ import {
 import { Button } from "@/components/ui/Button";
 import { Checkbox } from "@/components/ui/Checkbox";
 import { Spinner } from "@/components/ui/Spinner";
+import { CARD_TOOLS } from "./proposalTools";
 
-/** Tools whose absence changes the sandbox+apply workflow, not just coverage. */
-const WORKFLOW_TOOLS = new Set(["propose_finding", "propose_annotation"]);
+/** Tools whose absence changes the sandbox+apply workflow, not just coverage
+ * — derived from CARD_TOOLS so a new proposal tool cannot silently lose its
+ * warning the way propose_story_block and propose_chart had. */
+const WORKFLOW_TOOLS: ReadonlySet<string> = new Set(Object.keys(CARD_TOOLS));
 
 interface Props {
   /** The per-chat deny list: for the next conversation to be created, or the
@@ -194,10 +197,8 @@ export function ToolSelectorPopover({
                       !t.admin_disabled && (
                         <span className="block text-[11px] text-[var(--color-warning)]">
                           Disabling this removes the{" "}
-                          {t.name === "propose_finding"
-                            ? "finding"
-                            : "annotation"}{" "}
-                          proposal cards from this chat.
+                          {CARD_TOOLS[t.name as keyof typeof CARD_TOOLS]} proposal
+                          cards from this chat.
                         </span>
                       )}
                   </span>
