@@ -49,7 +49,18 @@ Append-only session log, newest entry on top. Sessions 1–70 are archived in
   cast into `CARD_TOOLS` became `cardToolName`, so the map's safety is local to the
   lookup rather than an invariant spread across two expressions.
 - **Unrelated:** `tests/test_airgap_bundle.py` was landed unformatted on `main` and had
-  been failing `ruff format --check` in CI since session 113; reformatted here.
+  been failing `ruff format --check` in CI since session 113; reformatted here. Behind
+  it sat a test that had never passed: the fake engine's `case "$1 $2"` matched
+  `"create "` exactly, but the installer probes `create <image> <command>`, so every
+  probe fell through to the catch-all and reported the deliberately broken image usable.
+  `install.sh` was right all along.
+- **CI reported one failure at a time.** Both the backend and frontend jobs abort on the
+  first failing step, so the format slip above hid every test result behind it for a
+  session — including that never-passing test. Each verification step now carries
+  `if: !cancelled() && steps.deps.outcome == 'success'`: all of them run, the job still
+  fails if any did, and a failed dependency install still short-circuits rather than
+  cascading. `container-smoke` keeps aborting — its steps genuinely depend on the
+  previous one (build → run → health).
 
 ## Session 113 — 2026-07-27: what the first real install found
 
