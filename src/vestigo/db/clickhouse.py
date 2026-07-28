@@ -34,6 +34,7 @@ import pyarrow as pa
 
 from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
+from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
 from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 from vestigo.db._template import template_hash_expr
@@ -1018,14 +1019,7 @@ class ClickHouseStore:
             for row in result.result_rows
         ]
         for row in rows:
-            # FixedString(64) columns come back as NUL-padded raw bytes —
-            # not JSON-serializable, and an "empty" value would otherwise be
-            # a truthy string of 64 NULs. Same treatment as
-            # anomaly_stats._row_to_event.
-            for key in ("content_hash", "file_hash", "embedding_config_hash"):
-                value = row.get(key)
-                if isinstance(value, bytes):
-                    row[key] = value.decode("utf-8", "replace").rstrip("\x00")
+            decode_fixed_string_columns(row)
             row["event_id"] = str(row["event_id"])
         return {row["event_id"]: row for row in rows}
 
