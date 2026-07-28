@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   DndContext,
   KeyboardSensor,
@@ -25,6 +25,7 @@ import { BlockFrame } from "./BlockFrame";
 import { BlockPicker } from "./BlockPicker";
 import { ChartBlockCard, EventBlockCard, ViewBlockCard } from "./EmbedCards";
 import { MarkdownBlock } from "./MarkdownBlock";
+import { storyQueryKey, useStory } from "./useStory";
 import { afterIdForIndex, reorderLocally, sortBlocks } from "./blockOrder";
 
 interface Props {
@@ -32,24 +33,18 @@ interface Props {
   storyId: string;
 }
 
-/** Poll interval for the collaborative view of a story (no WebSockets). */
-const POLL_MS = 10_000;
-
 export function StoryEditor({ caseId, storyId }: Props) {
   const qc = useQueryClient();
   // Blocks under active edit: their local draft state must survive polling.
   const [editingIds, setEditingIds] = useState<Set<string>>(new Set());
   const [conflicts, setConflicts] = useState<Record<string, StoryBlockOf<"markdown">>>({});
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["story", caseId, storyId],
-    queryFn: () => storiesApi.getWithBlocks(caseId, storyId),
-    refetchInterval: POLL_MS,
-  });
+  // The editor is the consumer that needs the collaborative poll.
+  const { data, isLoading, error } = useStory(caseId, storyId, { poll: true });
 
   const blocks = useMemo(() => sortBlocks(data?.blocks ?? []), [data?.blocks]);
 
-  const invalidate = () => qc.invalidateQueries({ queryKey: ["story", caseId, storyId] });
+  const invalidate = () => qc.invalidateQueries({ queryKey: storyQueryKey(caseId, storyId) });
 
   const updateBlock = useMutation({
     mutationFn: (vars: { blockId: string; content: Record<string, unknown>; version: number }) =>
@@ -73,7 +68,7 @@ export function StoryEditor({ caseId, storyId }: Props) {
         if (winner?.kind === "markdown") {
           setConflicts((prev) => ({ ...prev, [vars.blockId]: winner }));
         }
-        qc.setQueryData(["story", caseId, storyId], fresh);
+        qc.setQueryData(storyQueryKey(caseId, storyId), fresh);
       }
     },
   });
@@ -122,10 +117,10 @@ export function StoryEditor({ caseId, storyId }: Props) {
     // snapping back for the round-trip. `onSettled` reconciles against the
     // server either way.
     onMutate: async (vars) => {
-      await qc.cancelQueries({ queryKey: ["story", caseId, storyId] });
-      const previous = qc.getQueryData<StoryWithBlocks>(["story", caseId, storyId]);
+      await qc.cancelQueries({ queryKey: storyQueryKey(caseId, storyId) });
+      const previous = qc.getQueryData<StoryWithBlocks>(storyQueryKey(caseId, storyId));
       if (previous) {
-        qc.setQueryData<StoryWithBlocks>(["story", caseId, storyId], {
+        qc.setQueryData<StoryWithBlocks>(storyQueryKey(caseId, storyId), {
           ...previous,
           blocks: reorderLocally(sortBlocks(previous.blocks), vars.blockId, vars.afterBlockId),
         });
@@ -133,7 +128,7 @@ export function StoryEditor({ caseId, storyId }: Props) {
       return { previous };
     },
     onError: (err, _vars, context) => {
-      if (context?.previous) qc.setQueryData(["story", caseId, storyId], context.previous);
+      if (context?.previous) qc.setQueryData(storyQueryKey(caseId, storyId), context.previous);
       if (err instanceof ApiError && err.status === 409) {
         toast.info("A collaborator moved that block first", "Their order stands.");
       } else {
@@ -163,6 +158,11 @@ export function StoryEditor({ caseId, storyId }: Props) {
 
   const setEditing = useCallback((blockId: string, editing: boolean) => {
     setEditingIds((prev) => {
+      // Bail out when membership is unchanged: returning a fresh Set every
+      // time denies React its Object.is bail-out, so any caller that reports
+      // the same state twice re-renders the whole story. Paired with
+      // MarkdownBlock's ref, either one alone stops the #193 loop.
+      if (prev.has(blockId) === editing) return prev;
       const next = new Set(prev);
       if (editing) next.add(blockId);
       else next.delete(blockId);

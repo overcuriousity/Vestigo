@@ -38,9 +38,21 @@ export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEd
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const text = block.content.text ?? "";
 
+  /**
+   * Report edit mode on the transition only — never on the parent re-rendering.
+   *
+   * `onEditingChange` is an inline closure in StoryEditor, so it is a new
+   * function on every render of the story. Depending on it here meant the
+   * effect fired on identity rather than on `editing`, called back into the
+   * parent's state setter, and re-rendered the story — which allocated the
+   * next closure. That loop froze the whole story view (issue #193). The ref
+   * keeps the latest callback without making it a dependency.
+   */
+  const onEditingChangeRef = useRef(onEditingChange);
+  onEditingChangeRef.current = onEditingChange;
   useEffect(() => {
-    onEditingChange(editing);
-  }, [editing, onEditingChange]);
+    onEditingChangeRef.current(editing);
+  }, [editing]);
 
   const startEdit = () => {
     setBase({ version: block.version, text });

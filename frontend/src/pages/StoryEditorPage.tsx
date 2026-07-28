@@ -1,10 +1,11 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BookOpenText, ChevronLeft } from "lucide-react";
 import { storiesApi } from "@/api/stories";
 import { ExportsTab } from "@/components/stories/ExportsTab";
 import { StoryEditor } from "@/components/stories/StoryEditor";
+import { storyQueryKey, useStory } from "@/components/stories/useStory";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtRelative } from "@/lib/time";
@@ -15,16 +16,12 @@ export function StoryEditorPage() {
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
   const [tab, setTab] = useState<"editor" | "exports">("editor");
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["story", caseId, storyId],
-    queryFn: () => storiesApi.getWithBlocks(caseId!, storyId!),
-    enabled: !!caseId && !!storyId,
-  });
+  const { data, isLoading, error } = useStory(caseId, storyId);
 
   const renameStory = useMutation({
     mutationFn: (title: string) => storiesApi.update(caseId!, storyId!, { title }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["story", caseId, storyId] });
+      qc.invalidateQueries({ queryKey: storyQueryKey(caseId, storyId) });
       qc.invalidateQueries({ queryKey: ["stories", caseId] });
     },
   });

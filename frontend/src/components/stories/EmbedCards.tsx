@@ -7,13 +7,15 @@
  * `ChartCanvas`. A reference whose target was deleted renders an explicit
  * placeholder: the block stays, visibly unresolved, rather than vanishing.
  */
+import { useEffect, useMemo, useRef } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { AlertTriangle, ExternalLink } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { savedChartsApi } from "@/api/viz";
 import { viewsApi } from "@/api/views";
-import type { StoryBlockOf } from "@/api/types";
+import type { Event, StoryBlockOf } from "@/api/types";
 import { ChartCanvas } from "@/components/viz/ChartCanvas";
 import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
 import { Spinner } from "@/components/ui/Spinner";
@@ -57,6 +59,96 @@ function OpenLink({ to, label }: { to: string; label: string }) {
     >
       {label} <ExternalLink size={10} />
     </Link>
+  );
+}
+
+/** Height of one preview row, in px — fixed, so the rows can be virtualized. */
+const ROW_HEIGHT = 22;
+const OVERSCAN = 8;
+
+/**
+ * The embedded view's rows, windowed.
+ *
+ * A view block embeds up to `display.limit` rows (200 by default, capped at
+ * VIEW_BLOCK_ROW_CAP server-side) into a 320px-tall scroller — so the card
+ * used to build every one of those rows on every render of the story, for
+ * every view block in it, to show about a dozen. Virtualizing costs nothing
+ * semantically: the row count and the "N of M rows shown" line below still
+ * describe the full embedded set, which is also what the export snapshot
+ * renders (`stories/export.py` builds that independently of this preview).
+ *
+ * Fixed row height is what makes the windowing simple, and it is why cells
+ * truncate rather than wrap here. The Explorer is where a long message is
+ * meant to be read — that is what "Open in Explorer" above is for.
+ */
+function RowPreview({ rows, columns }: { rows: Event[]; columns: string[] | null }) {
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: OVERSCAN,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+
+  // Same remount guard the Explorer grid carries: if the scroller's height
+  // settles after react-virtual's ResizeObserver first looks, the initial
+  // paint yields no virtual items and the card would stay blank until the
+  // analyst scrolled. Cheap at a fixed row height, and the condition cannot
+  // hold after a successful measure, so it cannot loop.
+  useEffect(() => {
+    if (rows.length > 0 && virtualItems.length === 0) virtualizer.measure();
+  }, [rows.length, virtualItems.length, virtualizer]);
+
+  const gridTemplate = `9.5rem repeat(${columns ? columns.length : 1}, minmax(0, 1fr))`;
+
+  return (
+    <div className="rounded border border-[var(--color-border)] text-[11px]">
+      <div
+        className="grid gap-0 border-b border-[var(--color-border)] bg-[var(--color-bg-elevated)] text-left font-medium text-[var(--color-fg-muted)]"
+        style={{ gridTemplateColumns: gridTemplate }}
+      >
+        <span className="truncate px-2 py-1">Timestamp</span>
+        {(columns ?? ["Message"]).map((c) => (
+          <span key={c} className="truncate px-2 py-1">
+            {c}
+          </span>
+        ))}
+      </div>
+      <div ref={parentRef} className="max-h-80 overflow-auto">
+        <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+          {virtualItems.map((v) => {
+            const ev = rows[v.index];
+            return (
+              <div
+                key={ev.event_id}
+                className="absolute left-0 top-0 grid w-full items-center border-t border-[var(--color-border)]/60"
+                style={{
+                  height: ROW_HEIGHT,
+                  transform: `translateY(${v.start}px)`,
+                  gridTemplateColumns: gridTemplate,
+                }}
+              >
+                <span className="truncate px-2 font-mono text-[var(--color-fg-muted)]">
+                  {ev.timestamp ? fmtTimestamp(ev.timestamp) : "—"}
+                </span>
+                {columns ? (
+                  columns.map((c) => (
+                    <span key={c} className="truncate px-2 text-[var(--color-fg-secondary)]">
+                      {ev.attributes?.[c] ?? ""}
+                    </span>
+                  ))
+                ) : (
+                  <span className="truncate px-2 text-[var(--color-fg-secondary)]">
+                    {ev.message}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -116,45 +208,7 @@ export function ViewBlockCard({
       )}
       {rowsQuery.data && (
         <>
-          <div className="max-h-80 overflow-auto rounded border border-[var(--color-border)]">
-            <table className="w-full text-[11px]">
-              <thead className="sticky top-0 bg-[var(--color-bg-elevated)] text-left text-[var(--color-fg-muted)]">
-                <tr>
-                  <th className="px-2 py-1 font-medium">Timestamp</th>
-                  {columns ? (
-                    columns.map((c) => (
-                      <th key={c} className="px-2 py-1 font-medium">
-                        {c}
-                      </th>
-                    ))
-                  ) : (
-                    <th className="px-2 py-1 font-medium">Message</th>
-                  )}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((ev) => (
-                  <tr
-                    key={ev.event_id}
-                    className="border-t border-[var(--color-border)]/60 align-top"
-                  >
-                    <td className="whitespace-nowrap px-2 py-1 font-mono text-[var(--color-fg-muted)]">
-                      {ev.timestamp ? fmtTimestamp(ev.timestamp) : "—"}
-                    </td>
-                    {columns ? (
-                      columns.map((c) => (
-                        <td key={c} className="px-2 py-1 text-[var(--color-fg-secondary)]">
-                          {ev.attributes?.[c] ?? ""}
-                        </td>
-                      ))
-                    ) : (
-                      <td className="px-2 py-1 text-[var(--color-fg-secondary)]">{ev.message}</td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <RowPreview rows={rows} columns={columns} />
           <p className="text-[10px] text-[var(--color-fg-muted)]">
             {total != null && total > rows.length
               ? `${rows.length} of ${fmtNum(total)} rows shown`
@@ -180,7 +234,13 @@ export function ChartBlockCard({
     queryFn: () => savedChartsApi.list(caseId, timelineId),
   });
   const chart = chartsQuery.data?.charts.find((c) => c.id === chartId);
-  const config = chart ? parseStoredChartConfig(chart.config) : null;
+  // Memoized because ChartCanvas puts this object in a query key: re-parsing
+  // it on every render handed the key a new object each time, so every render
+  // of the story re-hashed the whole config.
+  const config = useMemo(
+    () => (chart ? parseStoredChartConfig(chart.config) : null),
+    [chart],
+  );
 
   if (chartsQuery.isLoading) return <Spinner size={14} />;
   if (chartsQuery.isError) {

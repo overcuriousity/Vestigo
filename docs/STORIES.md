@@ -353,6 +353,17 @@ trigger: a user asks the agent to restructure a story.
 - `StoryEditor` — block list, 10s polling, conflict resolution, dnd-kit
   reorder. `MarkdownBlock` edits raw markdown (no WYSIWYG); `EmbedCards`
   renders view/chart/event blocks read-only; `BlockPicker` inserts embeds.
+  `useStory.ts` owns the story query key and the poll interval for both the
+  editor and the page — declaring it in each was how they drifted apart.
+  Edit mode is reported *upward* (`onEditingChange` → `editingIds`) so polling
+  never clobbers a draft, which makes that path loop-prone: the effect must
+  depend on `editing` alone, and `setEditingIds` must bail out when membership
+  is unchanged. Both were missing and froze the view (#193); `storyEditorLoop.test.tsx`
+  guards it.
+  A view block's rows are windowed (`useVirtualizer`, fixed row height), so
+  the preview builds a screenful rather than all 200 embedded rows. The count
+  beneath it still describes the full embedded set — the same set the export
+  snapshot renders independently.
 - `AddToStoryButton` — the push path, mounted on the Explorer filter rail,
   the saved-charts rail, event detail and agent finding cards. Pushes carrying
   live filter state need a persisted View, and go through
