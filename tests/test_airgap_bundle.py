@@ -241,8 +241,12 @@ echo "$@" >> {log}
 case "$1 $2" in
   "image inspect")
     printf '%s\\n' '{known}' | grep -qxF "$3" ;;
-  "create ")
+  "create "*)
     # A container can only be created from an image whose layers unpacked.
+    # The pattern must be a prefix match: the installer probes with
+    # `create <image> <command>`, so "$1 $2" carries the image and an exact
+    # "create " never matches — it fell through to the catch-all below and
+    # reported every image usable, including the broken one.
     printf '%s\\n' '{broken}' | grep -qxF "$2" && exit 125
     echo probe-container-id ;;
   "rm -f") exit 0 ;;
@@ -382,7 +386,7 @@ def test_unknown_arguments_are_fatal(tmp_path):
 # printed one of these per image and exited 0.
 UNPACK_FAILURE = (
     "Loaded image: vestigo-app:9.9.9-deadbee\n"
-    'Error unpacking image vestigo-app:9.9.9-deadbee: apply layer error for '
+    "Error unpacking image vestigo-app:9.9.9-deadbee: apply layer error for "
     '"docker.io/library/vestigo-app:9.9.9-deadbee": failed to extract layer '
     "sha256:5b21fa92fbc3: failed to mount /var/lib/containerd/tmpmounts/containerd-mount1: "
     'mount source: "overlay", target: "/var/lib/containerd/tmpmounts/containerd-mount1", '

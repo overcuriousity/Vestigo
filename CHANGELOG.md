@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The agent's story-block proposals now appear as cards while the turn is running.**
+  An agent turn that proposed blocks showed bare `propose_story_block` tool rows instead,
+  and kept showing them after the turn until the panel was remounted. The chat panel
+  decided what a tool call renders as in five independent per-tool lists — the persisted
+  transcript, the two live stream folds, the proposals refetch, and the tool selector's
+  warning — and the tool had been added to one. Disabling `propose_story_block` or
+  `propose_chart` in the tool selector also removed their cards with no warning. All five
+  now derive from one map, so a proposal tool is wired into every path or none.
+
 - **The airgapped installer no longer trusts a container engine that says "loaded" and
   means "registered".** `docker load` writes an image's metadata before unpacking its
   layers and exits 0 even when every layer fails — so on a host that cannot mount

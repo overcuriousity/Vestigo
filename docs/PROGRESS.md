@@ -1,9 +1,55 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 113 — the 1.8.4 bundle meets a real isolated host).
+Last updated: 2026-07-27 (session 114 — agent story-block proposals render live).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 114 — 2026-07-27: the proposal card the analyst never saw
+
+**Why.** An agent turn proposed three story blocks and the chat showed three bare
+`propose_story_block` tool rows instead of three cards.
+
+- **W7 wired the tool into one of four render paths.** `AgentPanel` decides what a
+  tool call looks like in four independent per-tool allowlists — the persisted
+  transcript (`itemsFromMessages`), the live `tool_call` fold, the live `tool_result`
+  fold, and the proposals-query invalidation. `propose_story_block` was added to the
+  first only. Live, the call row fell through to the generic tool row and the result
+  row produced nothing; after the turn, the transcript refetch *did* emit a
+  `storyProposal` item, but the proposals list was the one fetched before the
+  proposal existed, so the card hit its `!proposal` fallback — the same bare row,
+  until the panel remounted.
+- **The allowlists are now one map.** Patching each path individually would have left
+  the shape that caused the bug, so `components/agent/proposalTools.ts` holds
+  `PROPOSAL_TOOLS` (tool → the `ChatItem` kind it renders as) and all four paths derive
+  from it. There was a fifth allowlist nobody had counted: `ToolSelector`'s
+  `WORKFLOW_TOOLS` warned only for `propose_finding`/`propose_annotation`, so disabling
+  `propose_story_block` or `propose_chart` silently removed their cards. It now derives
+  from `CARD_TOOLS`, which also supplies the card's name in the warning copy. Adding a
+  proposal tool is a one-line edit in that module.
+- **How it slipped:** every frontend test for the agent panel covers the persisted
+  path. `src/test/agentPanelStoryProposal.test.tsx` drives a real streamed turn —
+  parameterized over `PROPOSAL_TOOLS`, so a tool added to the map inherits coverage of
+  all four paths — and asserts the card renders, the raw tool row does not, and the
+  proposals query is refetched. Two details the first pass got wrong and this one
+  needs: the proposals mock must return an *empty* list first (the real fetch predates
+  the proposal, and returning it immediately let the invalidation be reverted with the
+  tests still green), and the mocked stream must stay open past its events (the panel
+  drops live items once the turn ends, so an instant turn asserts the reload path — the
+  one that was never broken).
+- **Review round (PR #192).** Two substantive findings. One: two `ChatItem` kinds now
+  resolve against the *same* `agent-proposals` query, and neither card checked the
+  proposal's own `kind` — a card handed the other shape reads its payload off fields
+  that are null there. `proposalOfKind` degrades that to the same tool row a missing
+  proposal gets. Two: nothing pinned the *other* direction, so widening `PROPOSAL_TOOLS`
+  to `CARD_TOOLS` would have broken `propose_finding`'s card (it renders from call args
+  and must not touch the proposals query) with the suite still green — now covered, as is
+  `ToolSelector`'s warning, parameterized over `CARD_TOOLS`. The rest were shape: the
+  `void _unused` compile-check became a `satisfies` clause on `PROPOSAL_TOOLS`, and the
+  cast into `CARD_TOOLS` became `cardToolName`, so the map's safety is local to the
+  lookup rather than an invariant spread across two expressions.
+- **Unrelated:** `tests/test_airgap_bundle.py` was landed unformatted on `main` and had
+  been failing `ruff format --check` in CI since session 113; reformatted here.
 
 ## Session 113 — 2026-07-27: what the first real install found
 
