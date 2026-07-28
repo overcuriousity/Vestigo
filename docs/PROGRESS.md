@@ -1,9 +1,59 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-27 (session 114 — agent story-block proposals render live).
+Last updated: 2026-07-28 (session 115 — the story view stops re-rendering itself).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 115 — 2026-07-28: the story view was rendering itself to death
+
+**Why.** Issue #193: "freeze after adding a block to a story in the story view".
+
+- **It was an infinite render loop, and adding a block was incidental.**
+  `MarkdownBlock`'s effect reported edit mode with `[editing, onEditingChange]` as its
+  dependencies, `StoryEditor` passed a fresh inline closure on every render, and
+  `setEditingIds` always returned a new `Set` — so React could never bail out via
+  `Object.is`. render → new closure → effect → setState → render. Measured at ~700
+  updates/second, not settling, for **one** markdown block and no interaction. Adding a
+  block only mattered because it mounts the first `MarkdownBlock`: opening any story that
+  already contained a text block froze the same way. React reports this as a console
+  error ("Maximum update depth exceeded") rather than throwing, which is why it presented
+  as a hang and not an error screen.
+- **Fixed on both sides**, since either alone stops it and neither should depend on the
+  other staying correct: `MarkdownBlock` keeps the callback in a ref and depends on
+  `editing` only, and `setEditingIds` bails out when membership is unchanged.
+- **The aggravators are gone too.** A view block embedded up to 200 rows into a 320px
+  scroller and built every one of them on every render, per block — now windowed with
+  `useVirtualizer` (fixed 22px rows, so cells truncate; the Explorer is where a long
+  message is meant to be read). `ChartBlockCard` re-parsed its stored config into a
+  `ChartCanvas` query key every render; memoized. The row count under the table still
+  describes the whole embedded set, which is what the export snapshot renders
+  independently — `storyViewBlockRows.test.tsx` pins both halves of that.
+- **One story query, one set of options.** `StoryEditorPage` and `StoryEditor` each
+  declared `["story", …]` with different options; React Query merged them, so the
+  behaviour was right by accident and read as a bug in both files. Now
+  `components/stories/useStory.ts` owns the key and the poll.
+- **How it slipped:** there was no `StoryEditor` test at all. `markdownBlockVersion.test.tsx`
+  renders the block in isolation with a *stable* callback, so it is structurally unable to
+  see a loop driven by callback identity. `storyEditorLoop.test.tsx` renders the real
+  editor and asserts on React's own loop signal.
+- **Review round (PR #194).** The first pass tested the two guards only together — but
+  either one alone stops the loop, so reverting one left the suite green. Each half is now
+  pinned on its own (`editingIds.ts::nextEditingIds` returning the identical Set; a parent
+  that re-renders with a fresh closure not making the block report again), and both were
+  verified to fail with their half reverted. The loop test also counts renders through a
+  `Profiler` rather than waiting for React to complain at ~50 nested updates. Worth
+  recording: **no timeout can catch a full revert of both guards** — that loop is
+  synchronous, starves the event loop, and vitest's own timer never fires, so the runner
+  hangs until killed. That is the argument for keeping both guards, not just one.
+- **Also from the review:** `MarkdownBlock` never reported `false` on unmount, so a block
+  deleted mid-edit stayed in `editingIds` forever and left the "your draft is kept" notice
+  up with nothing to justify it. The callback ref is now kept current in an effect rather
+  than during render (a render that never commits must not leave it pointing into a
+  discarded tree). `useInvalidateStory` shipped exported but unused, with both call sites
+  still hand-rolling it — they go through it now. The row preview's `<table>` had become
+  divs for virtualization, dropping table semantics: the ARIA roles are spelled out, and
+  truncated cells carry their full text in `title`.
 
 ## Session 114 — 2026-07-27: the proposal card the analyst never saw
 
@@ -1201,6 +1251,7 @@ whenever `pageTotal === null`, using `pageTotal ?? countData.total` as the autho
 that already feeds the footer, banner, `selectionCount`, and confirm dialog. Tests: two new
 `count_events` router tests (returns total; resolves the same routine-collapse scope as the bulk
 write). No extra count scan on the common offset path (gated on `pageTotal === null`).
+
 ## Session 91 — 2026-07-23: `--since`/`--until` for native converters + forensic footer metadata
 
 **Why.** Ingestion does no dedup (plain `MergeTree`, a fresh `source_id` per run), so

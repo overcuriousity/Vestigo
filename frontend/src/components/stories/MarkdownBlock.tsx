@@ -38,9 +38,31 @@ export function MarkdownBlock({ block, onSave, conflict, onResolveConflict, onEd
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const text = block.content.text ?? "";
 
+  /**
+   * Report edit mode on the transition only — never on the parent re-rendering.
+   *
+   * `onEditingChange` is an inline closure in StoryEditor, so it is a new
+   * function on every render of the story. Depending on it here meant the
+   * effect fired on identity rather than on `editing`, called back into the
+   * parent's state setter, and re-rendered the story — which allocated the
+   * next closure. That loop froze the whole story view (issue #193). The ref
+   * keeps the latest callback without making it a dependency.
+   */
+  const onEditingChangeRef = useRef(onEditingChange);
+  // Kept current in an effect rather than during render: a render that never
+  // commits (concurrent React can throw one away) must not leave the ref
+  // pointing into a discarded tree. Declared first, so it has already run by
+  // the time the effect below fires in the same commit.
   useEffect(() => {
-    onEditingChange(editing);
-  }, [editing, onEditingChange]);
+    onEditingChangeRef.current = onEditingChange;
+  });
+  useEffect(() => {
+    onEditingChangeRef.current(editing);
+    // Report `false` on unmount too: a block deleted mid-edit otherwise stays
+    // in the parent's editingIds forever, which leaves the "your draft is
+    // kept" banner up with no block left to justify it.
+    return () => onEditingChangeRef.current(false);
+  }, [editing]);
 
   const startEdit = () => {
     setBase({ version: block.version, text });
