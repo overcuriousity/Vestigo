@@ -69,15 +69,25 @@ jobs:
         run: uv python install
 
       - name: Install dependencies
+        id: deps
         run: uv sync --all-extras --dev
 
+      # Every check below runs even when an earlier one failed, and the job
+      # fails if any did. A first-failure abort hides the rest: a formatting
+      # slip in a test file kept pytest from running at all for a session, and
+      # a test that had been failing since the day it landed looked green.
+      # Gated on `deps` so a failed `uv sync` still short-circuits instead of
+      # reporting three cascading "command not found"s.
       - name: Ruff lint
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: uv run ruff check .
 
       - name: Ruff format check
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: uv run ruff format --check .
 
       - name: pytest
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: uv run pytest
 
   container-smoke:
@@ -170,16 +180,24 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
+        id: deps
         run: npm ci
 
+      # Same rule as the backend job: one report per run, not one failure at a
+      # time. A type error used to hide whether the tests and the build were
+      # also broken, which turns one push into three.
       - name: Typecheck
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run typecheck
 
       - name: Lint
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run lint
 
       - name: Unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run test
 
       - name: Build
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run build
