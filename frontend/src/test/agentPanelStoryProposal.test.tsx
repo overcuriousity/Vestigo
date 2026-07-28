@@ -21,7 +21,7 @@
  * The card components are mocked — their own data fetching is not under test.
  */
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AgentPanel } from "@/components/agent/AgentPanel";
 import { PROPOSAL_TOOLS, type ProposalItemKind } from "@/components/agent/proposalTools";
@@ -62,6 +62,14 @@ const CARD_TESTID: Record<ProposalItemKind, string> = {
 vi.mock("@/components/agent/StoryBlockProposalCard", () => ({
   StoryBlockProposalCard: (props: { proposal: AgentProposal }) => (
     <div data-testid="story-proposal-card">{props.proposal.id}</div>
+  ),
+}));
+
+// Mocked for the same reason as the proposal cards, plus it routes: the real
+// one calls useNavigate and there is no Router here.
+vi.mock("@/components/agent/FindingCard", () => ({
+  FindingCard: (props: { title: string }) => (
+    <div data-testid="finding-card">{props.title}</div>
   ),
 }));
 
@@ -203,7 +211,14 @@ describe.each(Object.entries(PROPOSAL_TOOLS))(
       );
     });
 
-    afterEach(() => releaseTurn());
+    // Release before RTL's cleanup so the stream's continuation (a setState
+    // and a query invalidation) lands while the panel is still mounted,
+    // rather than as an act warning attributed to whatever test runs next.
+    afterEach(async () => {
+      await act(async () => {
+        releaseTurn();
+      });
+    });
 
     it("renders one proposal card while the turn streams", async () => {
       renderPanel();
@@ -221,7 +236,10 @@ describe.each(Object.entries(PROPOSAL_TOOLS))(
       await sendTurn();
 
       await screen.findAllByTestId(testId);
-      expect(screen.queryByText(new RegExp(tool))).toBeNull();
+      // queryAllBy, not queryBy: a regression renders the row more than once
+      // and queryBy would throw "found multiple elements" instead of failing
+      // this assertion.
+      expect(screen.queryAllByText(new RegExp(tool))).toHaveLength(0);
     });
 
     it("refetches the proposals list so the card can resolve its proposal", async () => {
@@ -235,5 +253,86 @@ describe.each(Object.entries(PROPOSAL_TOOLS))(
       await sendTurn();
       await waitFor(() => expect(listProposalsMock.mock.calls.length).toBeGreaterThan(before));
     });
+
+    it("falls back to the tool row when the proposal is of another kind", async () => {
+      // Two item kinds now resolve against one query. A card handed the other
+      // shape reads its payload off fields that are null there, so the guard
+      // degrades to the same row a missing proposal gets.
+      const otherKind: ProposalItemKind = itemKind === "proposal" ? "storyProposal" : "proposal";
+      listProposalsMock.mockReset();
+      listProposalsMock.mockResolvedValue({ proposals: [proposal(otherKind)] });
+
+      renderPanel();
+      await sendTurn();
+
+      await waitFor(() => expect(screen.getAllByText(new RegExp(tool)).length).toBeGreaterThan(0));
+      expect(screen.queryAllByTestId(testId)).toHaveLength(0);
+    });
   },
 );
+
+// The other direction: propose_finding renders from its *call* args and never
+// touches the proposals query, so widening PROPOSAL_TOOLS to CARD_TOOLS would
+// break its card. Nothing else pins that, and the suite would stay green.
+describe("AgentPanel propose_finding (live stream)", () => {
+  let releaseTurn = () => {};
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAgentStore.getState().setActiveConversation(`${CASE}/${TL}`, CONV_ID);
+    listConversationsMock.mockResolvedValue({ conversations: [conversation()] });
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: [] });
+    listProposalsMock.mockResolvedValue({ proposals: [] });
+    getInfoMock.mockResolvedValue({
+      api_base_url: "https://llm.example",
+      model: "test-model",
+      tools: [{ name: "propose_finding", description: "", admin_disabled: false }],
+      user_disabled_tools: [],
+    });
+    const held = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    streamMessageMock.mockImplementation(
+      async (
+        _case: string,
+        _conv: string,
+        _body: unknown,
+        onEvent: (e: AgentStreamEvent) => void,
+      ) => {
+        onEvent({
+          type: "tool_call",
+          tool: "propose_finding",
+          tool_call_id: "tc1",
+          args: { title: "Rare country", description: "one host", filters: {} },
+        });
+        onEvent({
+          type: "tool_result",
+          tool: "propose_finding",
+          tool_call_id: "tc1",
+          result: { proposal_id: PROPOSAL_ID },
+        });
+        await held;
+      },
+    );
+  });
+
+  afterEach(async () => {
+    await act(async () => {
+      releaseTurn();
+    });
+  });
+
+  it("renders no proposal card and does not refetch the proposals list", async () => {
+    renderPanel();
+    await waitFor(() => expect(listProposalsMock).toHaveBeenCalled());
+    const before = listProposalsMock.mock.calls.length;
+
+    await sendTurn();
+    await screen.findByText("Rare country");
+
+    for (const id of Object.values(CARD_TESTID)) {
+      expect(screen.queryAllByTestId(id)).toHaveLength(0);
+    }
+    expect(listProposalsMock.mock.calls.length).toBe(before);
+  });
+});

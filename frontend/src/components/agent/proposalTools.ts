@@ -6,8 +6,9 @@
  * (three folds in `AgentPanel`, its proposals-query invalidation, and
  * `ToolSelector`'s workflow warning). `propose_story_block` shipped in one of
  * them, so an analyst watching a live turn saw bare `propose_story_block` tool
- * rows where the proposal cards belonged. Adding a proposal tool is now a
- * one-line edit here; every path derives from these maps.
+ * rows where the proposal cards belonged. Adding a proposal tool is now an
+ * edit to the maps here — the compiler names the ones still missing it, and
+ * every path derives from them.
  *
  * Lives in its own module rather than in `AgentPanel`: `AgentPanel` imports
  * `ToolSelectorPopover`, so `ToolSelector` importing back out of `AgentPanel`
@@ -40,14 +41,15 @@ export const CARD_TOOLS = {
 export const PROPOSAL_TOOLS = {
   propose_annotation: "proposal",
   propose_story_block: "storyProposal",
-} as const;
+  // `satisfies` rather than a type annotation: it keeps the literal kinds
+  // while proving every proposal tool is also a card tool, so a tool added
+  // here but not to CARD_TOOLS fails to compile instead of losing its
+  // ToolSelector warning silently.
+} as const satisfies Partial<Record<CardTool, string>>;
 
+export type CardTool = keyof typeof CARD_TOOLS;
 export type ProposalTool = keyof typeof PROPOSAL_TOOLS;
 export type ProposalItemKind = (typeof PROPOSAL_TOOLS)[ProposalTool];
-
-/** Every proposal tool must also be a card tool — checked at compile time. */
-const _proposalToolsAreCardTools: Record<ProposalTool, string> = CARD_TOOLS;
-void _proposalToolsAreCardTools;
 
 /**
  * The `ChatItem` kind a tool's proposal renders as, or null when the tool is
@@ -57,3 +59,21 @@ export function proposalItemKind(tool: string | null | undefined): ProposalItemK
   if (!tool) return null;
   return (PROPOSAL_TOOLS as Record<string, ProposalItemKind | undefined>)[tool] ?? null;
 }
+
+/**
+ * The analyst-facing name of the card a tool renders, or null when the tool
+ * renders no card — so callers need no cast into {@link CARD_TOOLS}.
+ */
+export function cardToolName(tool: string | null | undefined): string | null {
+  if (!tool) return null;
+  return (CARD_TOOLS as Record<string, string | undefined>)[tool] ?? null;
+}
+
+/**
+ * The `AgentProposal.kind` a {@link ProposalItemKind} card expects, so a card
+ * never renders a proposal of the wrong shape.
+ */
+export const PROPOSAL_KIND_BY_ITEM: Record<ProposalItemKind, string> = {
+  proposal: "annotation",
+  storyProposal: "story_block",
+};

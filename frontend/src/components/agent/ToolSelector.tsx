@@ -17,12 +17,7 @@ import {
 import { Button } from "@/components/ui/Button";
 import { Checkbox } from "@/components/ui/Checkbox";
 import { Spinner } from "@/components/ui/Spinner";
-import { CARD_TOOLS } from "./proposalTools";
-
-/** Tools whose absence changes the sandbox+apply workflow, not just coverage
- * — derived from CARD_TOOLS so a new proposal tool cannot silently lose its
- * warning the way propose_story_block and propose_chart had. */
-const WORKFLOW_TOOLS: ReadonlySet<string> = new Set(Object.keys(CARD_TOOLS));
+import { cardToolName } from "./proposalTools";
 
 interface Props {
   /** The per-chat deny list: for the next conversation to be created, or the
@@ -164,6 +159,11 @@ export function ToolSelectorPopover({
             {info.tools.map((t) => {
               const checked =
                 !t.admin_disabled && !disabledTools.includes(t.name);
+              // A card tool's absence changes the sandbox+apply workflow, not
+              // just coverage — the name comes from the same map the panel
+              // renders from, so a new one cannot silently lose its warning
+              // the way propose_story_block and propose_chart had.
+              const cardName = cardToolName(t.name);
               return (
                 <label
                   key={t.name}
@@ -192,15 +192,12 @@ export function ToolSelectorPopover({
                     <span className="block text-[11px] text-[var(--color-fg-secondary)]">
                       {t.description}
                     </span>
-                    {WORKFLOW_TOOLS.has(t.name) &&
-                      !checked &&
-                      !t.admin_disabled && (
-                        <span className="block text-[11px] text-[var(--color-warning)]">
-                          Disabling this removes the{" "}
-                          {CARD_TOOLS[t.name as keyof typeof CARD_TOOLS]} proposal
-                          cards from this chat.
-                        </span>
-                      )}
+                    {cardName && !checked && !t.admin_disabled && (
+                      <span className="block text-[11px] text-[var(--color-warning)]">
+                        Disabling this removes the {cardName} proposal cards
+                        from this chat.
+                      </span>
+                    )}
                   </span>
                 </label>
               );

@@ -37,6 +37,19 @@ Append-only session log, newest entry on top. Sessions 1–70 are archived in
   tests still green), and the mocked stream must stay open past its events (the panel
   drops live items once the turn ends, so an instant turn asserts the reload path — the
   one that was never broken).
+- **Review round (PR #192).** Two substantive findings. One: two `ChatItem` kinds now
+  resolve against the *same* `agent-proposals` query, and neither card checked the
+  proposal's own `kind` — a card handed the other shape reads its payload off fields
+  that are null there. `proposalOfKind` degrades that to the same tool row a missing
+  proposal gets. Two: nothing pinned the *other* direction, so widening `PROPOSAL_TOOLS`
+  to `CARD_TOOLS` would have broken `propose_finding`'s card (it renders from call args
+  and must not touch the proposals query) with the suite still green — now covered, as is
+  `ToolSelector`'s warning, parameterized over `CARD_TOOLS`. The rest were shape: the
+  `void _unused` compile-check became a `satisfies` clause on `PROPOSAL_TOOLS`, and the
+  cast into `CARD_TOOLS` became `cardToolName`, so the map's safety is local to the
+  lookup rather than an invariant spread across two expressions.
+- **Unrelated:** `tests/test_airgap_bundle.py` was landed unformatted on `main` and had
+  been failing `ruff format --check` in CI since session 113; reformatted here.
 
 ## Session 113 — 2026-07-27: what the first real install found
 

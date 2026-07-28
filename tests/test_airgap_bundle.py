@@ -382,7 +382,7 @@ def test_unknown_arguments_are_fatal(tmp_path):
 # printed one of these per image and exited 0.
 UNPACK_FAILURE = (
     "Loaded image: vestigo-app:9.9.9-deadbee\n"
-    'Error unpacking image vestigo-app:9.9.9-deadbee: apply layer error for '
+    "Error unpacking image vestigo-app:9.9.9-deadbee: apply layer error for "
     '"docker.io/library/vestigo-app:9.9.9-deadbee": failed to extract layer '
     "sha256:5b21fa92fbc3: failed to mount /var/lib/containerd/tmpmounts/containerd-mount1: "
     'mount source: "overlay", target: "/var/lib/containerd/tmpmounts/containerd-mount1", '
