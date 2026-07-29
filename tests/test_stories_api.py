@@ -714,7 +714,7 @@ def test_story_lifecycle_audited(client, admin_bootstrap, store):
 
 
 def test_block_at_top_inserts_above_everything(client, admin_bootstrap, store):
-    """"Add at top" must not append at the bottom.
+    """ "Add at top" must not append at the bottom.
 
     `after_block_id: null` appends on create and moves to the top on move
     (docs/STORIES.md), so the editor's top inserter had no way to say "top"
