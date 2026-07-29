@@ -18,11 +18,16 @@ feature-shaped before the next feature batch.
   *nothing*: all `max_entries` keys locked into the future, so `setdefault` inserted past
   the cap for as long as the flood sustained those locks. Pruning now falls back to
   evicting the entry whose lock expires soonest, and the bound check is skipped entirely
-  for a key already tracked (`setdefault` on a present key cannot grow the dict). The
-  eviction hands the evicted key one free attempt — the same bounded-cache weakness the
-  existing prune already accepts, and far more expensive to mount than waiting out the
-  delay; documented where it happens rather than papered over. Two new tests pin it, both
-  failing pre-fix (4 entries where the cap is 3).
+  for a key already tracked (`setdefault` on a present key cannot grow the dict). Eviction
+  necessarily discards the evicted key's failure count — the entry *is* the slot being
+  freed — so that key gets `threshold` unthrottled attempts before a lock re-arms. That is
+  a larger concession than the existing prune makes (prune only drops keys whose delay was
+  already waited out), and it is priced: reaching the path costs ~50k requests at the
+  defaults, and the key freed is whichever lock was closest to expiring anyway, never a
+  chosen victim — a victim under active attack has an exponentially growing lock, which
+  sorts away from the minimum. Documented at the eviction site rather than papered over.
+  Three new tests pin the behaviour, two of them failing pre-fix (4 entries where the cap
+  is 3); the third guards the already-tracked-key short-circuit.
 - **The detector-run inspection API stays, and is written down** (#159).
   `GET /api/cases/{case_id}/detector-runs/{run_id}` has no frontend caller by design: it
   is the explainability affordance for a `run_id` surfaced in a filter, an audit

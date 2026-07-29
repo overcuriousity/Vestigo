@@ -14,12 +14,11 @@ resolved.
 
 Reported defects live as GitHub issues, condensed into an "Open defects" section here
 with their issue numbers while any are open — triage notes and root-cause detail stay in
-the issue threads, not here. **None are open as of 2026-07-29** (session 120), so the
-section is gone rather than left standing empty.
+the issue threads, not here.
 
-**Priority order** (verified against the codebase 2026-07-29): no defects are open —
-the last three (B5, B6) closed in session 120. Phase 3 is complete, so
-the feature queue is led, roughly by payoff-per-effort, by
+**Priority order** (verified against the codebase 2026-07-29): no defects are open, so
+the feature queue leads. Phase 3 is complete, so that queue is led, roughly by
+payoff-per-effort, by
 A12 local transform tools (low friction, no design round needed),
 A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
 D10 correlation rules (heaviest lift, last of the detector line). Milestones 6 (streaming

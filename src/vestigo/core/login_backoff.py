@@ -44,7 +44,9 @@ class LoginBackoff:
         self._threshold = threshold
         self._base = base_seconds
         self._max = max_seconds
-        self._max_entries = max_entries
+        # A cap below 1 cannot be honoured — the entry being registered has to
+        # live somewhere — so treat it as 1 rather than silently unbounding.
+        self._max_entries = max(1, max_entries)
         self._now = now
         self._entries: dict[tuple[str, str], _Entry] = {}
         self._lock = threading.Lock()
@@ -96,11 +98,23 @@ class LoginBackoff:
 
         Last resort when pruning frees nothing — every tracked key locked into
         the future — so that ``max_entries`` is an actual bound rather than a
-        hint. Evicting a live lock hands that key one free attempt, so a flood
-        of ``max_entries`` distinct keys can buy an attacker a single retry:
-        the same bounded-cache weakness ``_prune_expired_locked`` already
-        accepts, and far more work than simply waiting out the delay. Bounded
-        memory is the property worth protecting here.
+        hint. There is no way to free a slot and keep the evicted key's state:
+        the entry *is* the slot. So eviction drops its ``failures`` count too,
+        and that key gets ``threshold`` unthrottled attempts before a lock
+        re-arms — a larger concession than ``_prune_expired_locked`` makes,
+        since prune only discards keys whose delay was already waited out.
+
+        Priced accordingly: to reach this path an attacker must first push
+        ``max_entries`` distinct keys past ``threshold`` (~50k requests at the
+        defaults), and each further request buys ``threshold`` attempts on
+        whichever key is closest to being legitimately released anyway — never
+        directly on a chosen victim, whose lock grows exponentially and so
+        sorts away from the minimum. Bounded memory is worth that trade.
+
+        O(n) per call, as is ``_prune_expired_locked`` immediately before it.
+        Negligible at the default 10k cap; revisit (heap, or insertion-ordered
+        eviction) before raising ``max_entries`` by orders of magnitude, since
+        both scans run under ``self._lock`` and serialize every login.
         """
         if not self._entries:
             return
