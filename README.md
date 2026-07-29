@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/react-19-61DAFB?logo=react&logoColor=black" alt="React 19">
 </p>
 
-A local-first, forensic-grade log investigation platform for small security teams.
+A local-first, forensic-grade log investigation platform for security teams.
 
 Vestigo ingests Timesketch-compatible timelines at scale, lets analysts explore them
 through an ELK-like web interface, and surfaces anomalies with explainable statistical

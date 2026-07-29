@@ -1,9 +1,41 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 122 — dependabot triage, react-router 7.18.2).
+Last updated: 2026-07-29 (session 123 — dropped the "small teams" framing).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 123 — 2026-07-29: Vestigo is not a "small team" tool
+
+**Why.** The README's "for small security teams" was traced back to `CONCEPT.md` §3, written
+at project inception and never revisited. It was doing two jobs at once — describing who the
+tool is for, and standing in for a real deployment constraint — and only the second is true.
+
+- **The size framing is gone.** README, `CONCEPT.md` §1/§3, `CLAUDE.md` and `TECH_STACK.md`
+  no longer scope Vestigo to a headcount. Nothing in the product actually cares: case-level
+  RBAC, teams and the audit trail behave identically at any size, and the data path was
+  never sized to a team (300M-row reference case, 80 GiB+ timelines). `CONCEPT.md` §3 now
+  says a lone examiner and a large IR organization are both in scope; `TECH_STACK.md` §3.3
+  justifies Postgres-over-SQLite as "multi-user, whatever the headcount" rather than
+  "2–10 analysts".
+- **The real constraint got its own home.** New `DEPLOYMENT.md` §"Operational scale": run
+  exactly one app process per instance, because five subsystems keep state in that process's
+  memory — `core/jobs.py`, `core/events_bus.py`, `core/login_backoff.py`, `db/viz_cache.py`
+  and `get_settings`'s `lru_cache` — with a table of what a second worker breaks in each
+  (invisible jobs, one-worker SSE, a lockout threshold that multiplies by worker count, cold
+  caches, settings changes that reach one worker). Says plainly what to do instead: scale the
+  box and ClickHouse, and don't pass `--workers`. The pre-existing settings-cache paragraph
+  now points there instead of half-permitting multi-process.
+- **Two standing decisions were resting on the wrong noun.** A11's "fine for the small-team
+  threat model" became the assumption it actually makes — every authenticated user may know
+  who else has an account — with a trigger that describes a *sensitive directory*
+  (compartmented investigations, several groups sharing an instance) rather than a large org.
+  CSRF's "LAN threat model" gained an explicit trigger set: internet exposure, or moving off
+  a single trusted process. The persistent-job-store entry now links to Operational scale and
+  names multi-process scale-out as its trigger.
+
+Nothing here changes behavior; it makes the docs describe the constraint that exists instead
+of a market segment that does not.
 
 ## Session 122 — 2026-07-29: dependabot triage, and the patch the standing decision missed
 

@@ -60,10 +60,10 @@ Pin these in the environment on deployments where an admin account must not be a
 weaken them.
 
 Settings are cached per process and reloaded on save, matching the single-process
-deployment model the job store already assumes. If you run more than one app process
-against one database, restart the others after a settings change. The CLI
-(`vestigo ingest`, `vestigo embed`) reads the same layer at startup, so console-tuned
-values apply to scripted runs too.
+deployment model the job store already assumes — see
+[Operational scale](#operational-scale) for why that model is a constraint rather than a
+default. The CLI (`vestigo ingest`, `vestigo embed`) reads the same layer at startup, so
+console-tuned values apply to scripted runs too.
 
 **Optional subsystems are hidden when unconfigured.** `/api/health` reports a
 `capabilities` map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer);
@@ -467,6 +467,38 @@ redirect target must match what nginx exposes, not `http://localhost:8080`.
   attacker-controlled.
 - No upstream `Connection: upgrade`/websocket handling is configured — the app has no
   WebSocket routes today (SSE only), so ordinary HTTP/1.1 keepalive is sufficient.
+
+## Operational scale
+
+Vestigo does not care how many analysts share an instance — case-level RBAC, teams and the
+audit trail all work the same at any headcount, and nothing in the data path is sized to a
+team. What *is* bounded is the process topology: **run exactly one app process per
+instance.**
+
+Five subsystems keep state in that process's memory, so a second worker would not share it:
+
+| State | Module | What a second process breaks |
+|---|---|---|
+| Background jobs (ingest, embed, transfer) | `core/jobs.py` | A job started on worker A is invisible to a status poll that lands on worker B |
+| Live-collaboration pub/sub (SSE) | `core/events_bus.py` | Subscribers only see changes made by their own worker |
+| Failed-login backoff | `core/login_backoff.py` | Effective lockout threshold multiplies by the worker count |
+| Visualization baseline cache | `db/viz_cache.py` | Correct, just colder — each worker warms its own |
+| Merged settings cache | `core/config.py` (`get_settings`, `lru_cache`) | An admin-console change reaches only the worker that served the save |
+
+The transfer temp-path startup sweep likewise assumes one process per configured path.
+
+So do not pass `--workers`/`--reload` to uvicorn, and do not run two app containers
+against one database. To serve more concurrent analysts, scale the box (the API is async
+and I/O-bound; heavy scans are already admission-controlled by `HEAVY_SCAN_GATE`, and
+transfers by `VESTIGO_TRANSFER_MAX_CONCURRENT`) and scale ClickHouse, which is where query
+cost actually lives. Nothing here caps **data** volume — the reference case is 300M rows
+and single timelines run to 80 GiB+.
+
+Multi-process scale-out is possible but unbuilt: it means moving those state holders
+to a shared backend (Postgres or Redis for jobs and backoff, a real pub/sub for the event
+bus) and re-opening the standing decisions priced against a single trusted process — CSRF
+tokens and the full-user-directory listing (`docs/ROADMAP.md`). Treat it as a milestone,
+not a config flag.
 
 ## On-disk state outside the databases
 

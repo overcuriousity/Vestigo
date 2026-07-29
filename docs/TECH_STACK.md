@@ -2,9 +2,10 @@
 
 ## 1. Guiding Principles
 - **Local-first / airgap-friendly**: No mandatory cloud services; models download once and run offline.
-- **Low ops overhead**: single-node deployment for small teams. The app itself is a native
-  `uv` process; the three backing services are external, with a reference compose file
-  provided for them (an optional app container image exists too — see `DEPLOYMENT.md`).
+- **Low ops overhead**: single-node deployment. The app itself is one native `uv` process;
+  the three backing services are external, with a reference compose file provided for them
+  (an optional app container image exists too). One app process per instance is a real
+  constraint — see [Operational scale](./DEPLOYMENT.md#operational-scale).
 - **Python-native ML**: Reuse the proven local-inference ecosystem (PyTorch, sentence-transformers, Qdrant).
 - **Swappable embedding models**: Design the pipeline so a general model ships first and a log-specific model can be dropped in later.
 
@@ -52,9 +53,9 @@ which `vestigo-web` serves directly (auto-built on first run if missing).
 
 ### 3.3 Metadata Store — PostgreSQL
 - External service, provided by the operator.
-- Chosen over SQLite because the target user is a **team** (2–10 analysts).
+- Chosen over SQLite because Vestigo is a **multi-user** tool, whatever the headcount.
 - PostgreSQL handles concurrent writers, transactions for annotations/views, and user auth reliably.
-- SQLite with WAL mode would work for a single-user desktop tool, but becomes a concurrency bottleneck here.
+- SQLite with WAL mode would work for a single-user desktop tool, but becomes a concurrency bottleneck as soon as two analysts share an instance.
 
 ### 3.4 Event Store — ClickHouse
 - Chosen for its strength with log-shaped data: columnar compression, fast time-range scans, and built-in full-text indexing (`tokenbf_v1`).

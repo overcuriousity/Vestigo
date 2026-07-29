@@ -214,8 +214,12 @@ reworked in 1.5.0 — a sliding context window replaced compaction + fidelity la
 Decisions, not work items — each stays as decided unless its trigger fires.
 
 - **Persistent job store** — in-memory is a deliberate choice for the single-process
-  deployment model.
-- **CSRF tokens** — SameSite=Lax cookies plus the LAN threat model are adequate.
+  deployment model ([Operational scale](./DEPLOYMENT.md#operational-scale)), not an
+  oversight. Trigger: multi-process scale-out, which needs it moved to a shared backend
+  along with the event bus and login backoff.
+- **CSRF tokens** — SameSite=Lax cookies are adequate for a self-hosted instance on a
+  trusted network. Trigger: exposing Vestigo to the open internet, or moving off a single
+  trusted app process (see [Operational scale](./DEPLOYMENT.md#operational-scale)).
 - **Bespoke endpoint collection agent** (2026-07-14) — a cross-platform collector fleet is
   a whole product (Velociraptor, osquery). Vestigo stays agentless and accepts pushes from
   existing collectors instead (Milestone 6).
@@ -282,9 +286,11 @@ Decisions, not work items — each stays as decided unless its trigger fires.
 - **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client for
   Jupyter/pandas workflows is cheap. Trigger: a user asks.
 - **A11 — `/api/auth/users` full-directory listing** (id, username, display name — needed
-  to render names on annotations) is fine for the small-team threat model. Trigger:
-  multi-tenant / large-org deployments — then add a config flag or scope the listing to
-  co-case members (PR137 review follow-up).
+  to render names on annotations) assumes every authenticated user of an instance may know
+  who else has an account. Trigger: a deployment where the user directory is itself
+  sensitive — compartmented investigations, or several groups sharing one instance without
+  being meant to see each other — then add a config flag or scope the listing to co-case
+  members (PR137 review follow-up).
 - **Confirm-proposal crash gap** — a crash between the atomic proposal-decide and the
   annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
   Single-process tradeoff, deliberate. Trigger: it bites in practice.

@@ -6,7 +6,7 @@ The concept below is implemented. The open backlog lives in
 [`docs/TECH_STACK.md`](./TECH_STACK.md).
 
 ## 1. Vision (one-liner)
-A local-first, forensic-grade log investigation platform for small security teams: ingest Timesketch-compatible timelines at scale, explore them through an ELK-like web interface, and detect anomalies with statistical detectors running directly over ClickHouse plus embedding-based semantic search — with an optional AI investigation agent as analysis companion.
+A local-first, forensic-grade log investigation platform for security teams: ingest Timesketch-compatible timelines at scale, explore them through an ELK-like web interface, and detect anomalies with statistical detectors running directly over ClickHouse plus embedding-based semantic search — with an optional AI investigation agent as analysis companion.
 
 ## 2. Problem Statement
 Incident responders and forensic analysts work with massive timeline-shaped datasets (Plaso output, Windows Event Logs, endpoint telemetry, cloud audit trails). Existing options force a choice between:
@@ -17,10 +17,20 @@ Incident responders and forensic analysts work with massive timeline-shaped data
 Vestigo is a focused, self-hosted alternative: ingest huge logs, explore them like an ELK stack, and let local embeddings surface the needles in the haystack.
 
 ## 3. Target User
-**Small security team (2–10 analysts), self-hosted, often airgapped.**
+**A security or forensics team, self-hosted, often airgapped. Team size is not a design
+constraint** — a lone examiner and a large IR organization are both in scope; case-level
+RBAC, teams and the audit trail exist precisely so the tool does not care how many people
+share it.
 - Runs on the team's own hardware or a private cloud.
 - Needs forensic rigor: reproducible processing, immutable source data, audit-friendly outputs.
 - Wants minimal operational complexity and no mandatory external services.
+
+What *is* bounded is the **deployment topology**, not the headcount: today Vestigo runs as
+a single application process, because job state, the SSE collaboration bus, login backoff
+and the visualization cache all live in that process's memory. Multi-process scale-out is
+possible but unbuilt — not a claim being made here; see
+[Operational scale](./DEPLOYMENT.md#operational-scale) for what that means in practice and
+what would have to change.
 
 ## 4. Core Value Proposition
 - **Large-scale ingestion**: Process tens of gigabytes of Timesketch-compatible timeline data (CSV, JSONL, Plaso) without exhausting memory.

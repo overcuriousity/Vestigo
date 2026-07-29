@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Vestigo is a local-first, forensic-grade log investigation platform for small security
-teams. It ingests Timesketch-compatible timelines (Plaso CSV/JSONL, generic CSV/JSONL) at
+Vestigo is a local-first, forensic-grade log investigation platform for security teams
+of any size. It ingests Timesketch-compatible timelines (Plaso CSV/JSONL, generic CSV/JSONL) at
 scale, lets analysts explore events through an ELK-like web UI, and detects anomalies by
 embedding log lines into a vector database and by running statistical detectors directly
 over ClickHouse.
