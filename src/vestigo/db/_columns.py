@@ -12,6 +12,8 @@ same field.
 
 from __future__ import annotations
 
+from typing import Any
+
 SYNTHETIC_COLUMN_EXPRESSIONS: dict[str, str] = {
     # W6: template_hash is a real column, but exposed under a token that
     # doesn't share its literal name — toString() so it round-trips through
@@ -74,6 +76,34 @@ EVENT_SELECT_COLUMNS: tuple[str, ...] = (
     "embedding_model",
     "embedding_config_hash",
 )
+
+
+# The `FixedString(64)` columns. clickhouse-connect returns them as raw
+# `bytes`, NUL-padded to the full 64 when the stored value is shorter (an
+# unset `embedding_config_hash` is 64 NULs, not b""). Every read path has to
+# decode them: FastAPI's encoder turns the bytes into a string with the NUL
+# padding intact, and the export serializers (`json.dumps(..., default=str)`,
+# the CSV writer) stringify via `repr`, which wraps the hex in `b'...'`. A
+# hash that doesn't compare equal to the real SHA-256 defeats the point of
+# storing it.
+FIXED_STRING_COLUMNS: tuple[str, ...] = (
+    "content_hash",
+    "file_hash",
+    "embedding_config_hash",
+)
+
+
+def decode_fixed_string_columns(row: dict[str, Any]) -> dict[str, Any]:
+    """Decode `FixedString(64)` columns in *row* to plain hex strings, in place.
+
+    See :data:`FIXED_STRING_COLUMNS`. Non-`bytes` values are left alone, so
+    this is idempotent and safe on rows from a path that already decoded.
+    """
+    for key in FIXED_STRING_COLUMNS:
+        value = row.get(key)
+        if isinstance(value, bytes):
+            row[key] = value.decode("utf-8", "replace").rstrip("\x00")
+    return row
 
 
 def resolve_column_token(token: str) -> tuple[str | None, str | None]:

@@ -177,8 +177,10 @@ while read -r img; do
   [ -n "$img" ] || continue
   image_usable "$img" || MISSING="$MISSING $img"
 done < <(sed -n 's/^ *image: \(docker\.io[^$]*\)$/\1/p' "$BUNDLE/compose.airgap.yml")
-image_usable "vestigo-app:$VESTIGO_IMAGE_TAG" \
-  || MISSING="$MISSING vestigo-app:$VESTIGO_IMAGE_TAG"
+# Must match `image:` for the app service in the compose file byte for byte,
+# including the `localhost/` registry component — see the comment there.
+image_usable "localhost/vestigo-app:$VESTIGO_IMAGE_TAG" \
+  || MISSING="$MISSING localhost/vestigo-app:$VESTIGO_IMAGE_TAG"
 
 if [ -n "$MISSING" ]; then
   printf 'error: missing image(s) after load:\n' >&2

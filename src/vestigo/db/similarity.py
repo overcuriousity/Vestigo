@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 
+from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import ensure_utc_iso
 from vestigo.db.clickhouse import ClickHouseStore  # noqa: I001
 from vestigo.db.qdrant import QdrantStore
@@ -117,7 +118,7 @@ def _row_to_event(row: dict[str, Any]) -> dict[str, Any]:
     """Serialise a ClickHouse row to an EventRecord-compatible dict."""
     ts = ensure_utc_iso(row.get("timestamp"))
     ingest = ensure_utc_iso(row.get("ingest_time"))
-    return {
+    event = {
         "event_id": str(row.get("event_id", "")),
         "case_id": row.get("case_id", ""),
         "source_id": row.get("source_id", ""),
@@ -140,6 +141,9 @@ def _row_to_event(row: dict[str, Any]) -> dict[str, Any]:
         "embedding_config_hash": row.get("embedding_config_hash", ""),
         "ingest_time": ingest,
     }
+    # The three hash columns are FixedString(64) — NUL-padded bytes off the
+    # wire, not str.
+    return decode_fixed_string_columns(event)
 
 
 # ---------------------------------------------------------------------------
