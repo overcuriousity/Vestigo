@@ -26,6 +26,33 @@ Append-only session log, newest entry on top. Sessions 1–70 are archived in
 - Pinned at three levels: the store (stacking twelve at-top inserts forces the renumber),
   the API (order after insert, explicit `null` still appends, both-fields 422), and the
   editor (the top inserter sends `at_top`, the between-blocks one still sends its anchor).
+## Session 116 — 2026-07-29: the "freeze" after session 115 was a leaked input lock
+
+**Why.** Story view still "froze" after #193 was fixed — but only when inserting a
+**view/chart/event** block, never a text block, and aborting the picker was enough.
+
+- **It was not a render loop.** A DevTools performance capture over 27s of the hung page
+  showed 357ms of scripting and an idle main thread. Nothing was spinning: the page kept
+  rendering and polling (the ingest progress modal animated throughout) and only stopped
+  accepting *input*. That reading is what redirected the search — session 115's fix was
+  correct and unrelated.
+- **Radix modal layers leaked the body pointer-events lock.** Each modal layer sets
+  `pointer-events: none` on `<body>`, capturing the previous value and restoring it on
+  unmount. `BlockPicker`'s embed items open a modal `Dialog` from inside a modal
+  `DropdownMenu`'s `onSelect`, so the dialog mounted while the menu's lock was up and
+  captured `"none"` as its own "original". The menu unmounted and restored `""`
+  correctly; closing the dialog then restored `"none"` — with no layer open. Confirmed
+  on the live page (`bodyPE: "none"`, `openDialogs: 0`, `openMenus: 0`) and reproduced in
+  Chromium over CDP, which showed the capture order directly.
+- **Fixed by not overlapping the layers**: the menu is `modal={false}`, so the dialog is
+  the only layer managing the lock. The menu still closes on outside click and Escape and
+  only gives up a scroll lock a four-item insert menu never needed. "Text" opens no
+  dialog, which is why it was the one kind of block that still worked.
+- **Regression test** pins the invariant that makes the overlap impossible — the menu must
+  not lock `<body>` while open. jsdom is not used for the full open/abort cycle: Radix's
+  dialog under React 19 + RTL's async `act` wrapper hangs there for unrelated reasons, and
+  an async assertion would report that instead of this bug. `BlockPicker` is the only
+  menu+dialog nesting in the app; the `Popover` call sites default to non-modal.
 
 ## Session 115 — 2026-07-28: the story view was rendering itself to death
 

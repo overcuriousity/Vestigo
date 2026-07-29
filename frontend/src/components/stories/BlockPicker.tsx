@@ -41,7 +41,25 @@ export function BlockPicker({ caseId, onInsert, label = "Add block" }: Props) {
 
   return (
     <>
-      <DropdownMenu>
+      {/*
+        `modal={false}` is load-bearing, not a style choice.
+
+        A modal Radix layer locks input by setting `pointer-events: none` on
+        <body>, capturing whatever was there before and restoring it on
+        unmount. The embed items open a modal `Dialog` from inside `onSelect`,
+        so the dialog's layer mounts while this menu's lock is still up and
+        captures `"none"` as its "original". The menu then unmounts and
+        correctly restores `""` — but when the dialog closes it restores what
+        it captured, leaving <body> at `pointer-events: none` with no layer
+        open. The page keeps rendering and polling and simply stops accepting
+        input until a reload.
+
+        Non-modal here means this menu never takes the body lock, so the
+        dialog is the only layer that manages it and captures `""` correctly.
+        The menu still closes on outside click and Escape; it only gives up a
+        scroll lock that a four-item insert menu has no need for.
+      */}
+      <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button variant="ghost" size="sm" aria-label={label}>
             <Plus size={12} /> Block
