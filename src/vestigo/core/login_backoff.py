@@ -64,9 +64,12 @@ class LoginBackoff:
     def register_failure(self, username: str, ip: str | None) -> None:
         """Record a failed attempt and arm the next delay if over threshold."""
         with self._lock:
-            if len(self._entries) >= self._max_entries:
+            key = self._key(username, ip)
+            if key not in self._entries and len(self._entries) >= self._max_entries:
                 self._prune_expired_locked()
-            entry = self._entries.setdefault(self._key(username, ip), _Entry())
+                if len(self._entries) >= self._max_entries:
+                    self._evict_earliest_locked()
+            entry = self._entries.setdefault(key, _Entry())
             entry.failures += 1
             if entry.failures >= self._threshold:
                 delay = min(self._base * 2 ** (entry.failures - self._threshold), self._max)
@@ -87,6 +90,21 @@ class LoginBackoff:
         expired = [k for k, e in self._entries.items() if e.locked_until <= now]
         for key in expired:
             del self._entries[key]
+
+    def _evict_earliest_locked(self) -> None:
+        """Drop the entry whose lock expires soonest (caller holds the lock).
+
+        Last resort when pruning frees nothing — every tracked key locked into
+        the future — so that ``max_entries`` is an actual bound rather than a
+        hint. Evicting a live lock hands that key one free attempt, so a flood
+        of ``max_entries`` distinct keys can buy an attacker a single retry:
+        the same bounded-cache weakness ``_prune_expired_locked`` already
+        accepts, and far more work than simply waiting out the delay. Bounded
+        memory is the property worth protecting here.
+        """
+        if not self._entries:
+            return
+        del self._entries[min(self._entries, key=lambda k: self._entries[k].locked_until)]
 
 
 _default_backoff: LoginBackoff | None = None

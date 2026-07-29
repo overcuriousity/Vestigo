@@ -76,5 +76,39 @@ def test_pruning_bounds_memory():
         b.register_failure(f"user{i}", "1.1.1.1")
     clock.t += 100.0  # all locks expired
     b.register_failure("fresh", "1.1.1.1")
-    assert len(b._entries) <= 5 + 1
+    assert len(b._entries) <= 5
     assert b.retry_after("fresh", "1.1.1.1") > 0
+
+
+def test_cap_holds_when_nothing_is_prunable():
+    """All entries locked into the future: pruning frees nothing, so evict instead."""
+    clock = FakeClock()
+    b = _backoff(threshold=1, base=1000.0, maximum=1000.0, max_entries=5, clock=clock)
+    for i in range(5):
+        b.register_failure(f"user{i}", "1.1.1.1")
+    b.register_failure("fresh", "1.1.1.1")
+    assert len(b._entries) == 5
+    assert b.retry_after("fresh", "1.1.1.1") > 0
+
+
+def test_eviction_drops_the_earliest_expiring_lock():
+    clock = FakeClock()
+    b = _backoff(threshold=1, base=1000.0, maximum=1000.0, max_entries=3, clock=clock)
+    for i in range(3):
+        b.register_failure(f"user{i}", "1.1.1.1")
+        clock.t += 1.0  # stagger locked_until so user0 expires first
+    b.register_failure("fresh", "1.1.1.1")
+    assert len(b._entries) == 3
+    assert b.retry_after("user0", "1.1.1.1") == 0.0  # evicted
+    assert b.retry_after("user2", "1.1.1.1") > 0  # latest lock survives
+
+
+def test_repeated_failure_on_known_key_does_not_evict():
+    """A key already tracked cannot grow the dict, so the cap must not fire."""
+    clock = FakeClock()
+    b = _backoff(threshold=1, base=1000.0, maximum=1000.0, max_entries=3, clock=clock)
+    for i in range(3):
+        b.register_failure(f"user{i}", "1.1.1.1")
+    b.register_failure("user0", "1.1.1.1")
+    assert len(b._entries) == 3
+    assert b._entries[("user0", "1.1.1.1")].failures == 2
