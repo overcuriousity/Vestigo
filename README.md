@@ -24,13 +24,18 @@ through an ELK-like web interface, and surfaces anomalies with explainable stati
 detectors, Sigma rules, and locally-computed embeddings — reproducible and auditable at
 every step, airgapped if needed.
 
-It stands on the shoulders of two projects we admire:
-[Timesketch](https://github.com/google/timesketch), which defined what collaborative
-timeline investigation should feel like, and
-[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner), which showed
-that useful detection does not have to be a black box. Vestigo's ambition is to be the
-better tool for the analyst who wants both at once, and it takes three positions to get
-there:
+Two projects made this one possible, in different ways.
+[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner) is where our
+detection methods come from — it is a different kind of tool, an online detection engine
+watching live log streams, and we are not competing with it or replacing it. What we took
+is its conviction that a detector must be able to explain itself, and a catalogue of
+methods we then re-derived as batch SQL over an already-ingested corpus. Several of its
+detectors we deliberately do not implement.
+
+[Timesketch](https://github.com/google/timesketch) is the tool Vestigo is in the same room
+as: it defined what collaborative timeline investigation should feel like, and the
+Case/Timeline model here is descended from it. That is the comparison we invite, and on
+three axes we think we are already the better place to run an investigation:
 
 - **Detection is a first-class part of the investigation, not an add-on.** Fourteen
   analysis tools ship in the box, every one of them explainable down to the SQL it ran.
@@ -46,9 +51,8 @@ there:
   ClickHouse and Qdrant, comfortable on 300M-row cases and 80 GiB+ timelines. Offline by
   default, so it runs in an airgapped lab without special handling.
 
-We are not finished, and Timesketch is a mature project with years of production use behind
-it. But on those three axes we think Vestigo is already the better place to run an
-investigation.
+We are not finished, and Timesketch is a mature project with years of production use, a
+larger analyzer ecosystem and a community we have yet to earn.
 
 <img width="2866" height="1589" alt="Vestigo Explorer" src="https://github.com/user-attachments/assets/d505af86-9ba2-4fe1-b448-10b18ae2d409" />
 

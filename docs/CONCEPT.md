@@ -136,11 +136,22 @@ open roadmap items — see `docs/ROADMAP.md`.
 
 ## 8. Differentiation
 
-Vestigo owes its shape to Timesketch and logdata-anomaly-miner, and says so — the
-investigative model came from the first, the conviction that detection must stay
-explainable from the second. The goal is not to be a lighter Timesketch; it is to be the
-better tool for an analyst who wants the investigative UX *and* the detection depth in one
-place. Where we claim to be ahead:
+Vestigo owes its shape to two projects, and the debt is of two different kinds.
+
+**logdata-anomaly-miner is a method source, not a competitor.** It solves a different
+problem — online anomaly detection over live log streams — and it is not something Vestigo
+replaces or claims to beat. What we took is the principle that a detector must explain
+itself, plus a catalogue of methods we re-derived as batch SQL over an ingested corpus.
+We are deliberately *narrower* there: our detectors must be field-agnostic and
+SQL-explainable to meet the forensic-reproducibility requirement, which rules out
+approaches AMiner can use freely. `TSAArimaDetector` is skipped outright, and its
+`EventCorrelationDetector` (roadmap D10) is not built yet. Anyone who needs continuous,
+online detection on a live stream should run AMiner — that is what it is for.
+
+**Timesketch is the tool we are in the same category as.** The investigative model came
+from it, and the goal is not to be a lighter version: it is to be the better tool for an
+analyst who wants the investigative UX *and* the detection depth in one place. That is
+the comparison we invite, and where we claim to be ahead:
 
 - **Detection is the workflow, not a side panel.** Fourteen analysis tools ship in the box
   — statistical detectors, a Sigma runner, log-template clustering, semantic similarity —
@@ -167,4 +178,6 @@ place. Where we claim to be ahead:
 
 Where we are honestly behind: Timesketch has years of production hardening, a larger
 analyzer ecosystem and a community we do not have yet. We are earning that, not claiming
-it.
+it. And against AMiner we are behind by construction, not by accident — no online
+detection, no live-stream operation, and a smaller detector catalogue that we hold
+smaller on purpose.

@@ -1,9 +1,31 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 124 — positioning against prior art).
+Last updated: 2026-07-29 (session 125 — AMiner positioning correction).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 125 — 2026-07-29: AMiner is a method source, not a competitor
+
+**Why.** Sanity check on session 124's positioning: had the new copy claimed superiority
+over logdata-anomaly-miner? Audit says no — every explicit "better"/"ahead" either named
+Timesketch or was scoped to "the analyst who wants both at once". But the framing was
+sloppy in a way worth fixing.
+
+- **The two projects were introduced in one breath as prior art we improve on.** They are
+  not the same relationship. AMiner solves a different problem — online detection over live
+  log streams — and is not in our category at all. Timesketch is.
+- **The real bug was the asymmetry.** "Where we are honestly behind" named only Timesketch,
+  which implies we are behind AMiner on nothing. False, and false *by construction*: per
+  ROADMAP M4 our detectors are deliberately narrowed to field-agnostic and SQL-explainable
+  to meet the forensic-reproducibility requirement, `TSAArimaDetector` is skipped outright,
+  and D10 (their `EventCorrelationDetector`) is unbuilt.
+- **Fixed in all three places.** README now separates the two relationships into their own
+  paragraphs and says plainly that we are not competing with or replacing AMiner; CONCEPT
+  §8 opens with "the debt is of two different kinds", states that anyone needing live-stream
+  detection should run AMiner, and its behind-paragraph now names both projects; CLAUDE.md's
+  References section splits into "same category" vs "method source, not a competitor" and
+  the tone rule gained an explicit prohibition on lumping the two together.
 
 ## Session 124 — 2026-07-29: say what we are better at, and what we are not
 
