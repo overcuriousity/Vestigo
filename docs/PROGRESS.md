@@ -1,9 +1,31 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-28 (session 115 — the story view stops re-rendering itself).
+Last updated: 2026-07-29 (session 117 — "Add at top" adds at the top).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 117 — 2026-07-29: "Add at top" was adding at the bottom
+
+**Why.** The story editor's top inserter put its block last. Found while reading
+`BlockPicker`/`StoryEditor` for an unrelated defect; confirmed against a live story
+(`[(1024,'first'), (2048,'second'), (3072,'ADD AT TOP')]`).
+
+- **`after_block_id: null` means opposite things on two endpoints.** On create it appends
+  at the end; on move it goes to the top. That split is deliberate and documented — every
+  append caller depends on the create meaning (the "Add to story" pushes, the agent's
+  `propose_story_block` default) — so flipping it would silently prepend for all of them.
+  The real gap was that create could not express "top" **at all**: a block going above
+  everything has no anchor to name. The button therefore sent `null` and got an append.
+- **Create takes an explicit `at_top`**, mutually exclusive with `after_block_id` (422 if
+  both, enforced in the router so the contract shows up in the OpenAPI schema). Default
+  behaviour is untouched, which is what the append callers keep relying on.
+- **One definition of "top of document."** `PostgresStore._story_top_position` — halve
+  below the first block, renumbering from index 2 when there is no room — is now shared by
+  insert-at-top and move-to-top instead of the move path owning a private copy.
+- Pinned at three levels: the store (stacking twelve at-top inserts forces the renumber),
+  the API (order after insert, explicit `null` still appends, both-fields 422), and the
+  editor (the top inserter sends `at_top`, the between-blocks one still sends its anchor).
 
 ## Session 115 — 2026-07-28: the story view was rendering itself to death
 

@@ -711,3 +711,62 @@ def test_story_lifecycle_audited(client, admin_bootstrap, store):
     actions = [r["action"] for r in rows]
     assert "story.create" in actions
     assert "story.delete" in actions
+
+
+def test_block_at_top_inserts_above_everything(client, admin_bootstrap, store):
+    """"Add at top" must not append at the bottom.
+
+    `after_block_id: null` appends on create and moves to the top on move
+    (docs/STORIES.md), so the editor's top inserter had no way to say "top"
+    and its block landed last. `at_top` is that placement.
+    """
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}/blocks"
+
+    first = client.post(base, json={"kind": "markdown", "content": {"text": "a"}}).json()["block"]
+    second = client.post(base, json={"kind": "markdown", "content": {"text": "b"}}).json()["block"]
+
+    resp = client.post(base, json={"kind": "markdown", "content": {"text": "top"}, "at_top": True})
+    assert resp.status_code == 200, resp.text
+    top = resp.json()["block"]
+
+    detail = client.get(f"/api/cases/{case_id}/stories/{story['id']}").json()
+    assert [b["id"] for b in detail["blocks"]] == [top["id"], first["id"], second["id"]]
+
+
+def test_block_create_without_placement_still_appends(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}/blocks"
+
+    first = client.post(base, json={"kind": "markdown", "content": {"text": "a"}}).json()["block"]
+    second = client.post(base, json={"kind": "markdown", "content": {"text": "b"}}).json()["block"]
+    # Explicit null must keep meaning "append", not silently become "top".
+    third = client.post(
+        base, json={"kind": "markdown", "content": {"text": "c"}, "after_block_id": None}
+    ).json()["block"]
+
+    detail = client.get(f"/api/cases/{case_id}/stories/{story['id']}").json()
+    assert [b["id"] for b in detail["blocks"]] == [first["id"], second["id"], third["id"]]
+
+
+def test_block_at_top_with_after_block_id_is_422(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}/blocks"
+
+    anchor = client.post(base, json={"kind": "markdown", "content": {"text": "a"}}).json()["block"]
+    resp = client.post(
+        base,
+        json={
+            "kind": "markdown",
+            "content": {"text": "b"},
+            "after_block_id": anchor["id"],
+            "at_top": True,
+        },
+    )
+    assert resp.status_code == 422, resp.text

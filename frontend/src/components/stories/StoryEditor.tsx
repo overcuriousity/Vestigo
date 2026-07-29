@@ -79,11 +79,15 @@ export function StoryEditor({ caseId, storyId }: Props) {
       kind: StoryBlockKind;
       content: Record<string, unknown>;
       afterBlockId: string | null;
+      atTop?: boolean;
     }) =>
       storiesApi.createBlock(caseId, storyId, {
         kind: vars.kind,
         content: vars.content,
-        after_block_id: vars.afterBlockId,
+        // `after_block_id: null` appends on create (it only means "top" on
+        // move), so the top inserter has to say so explicitly or its block
+        // lands at the bottom.
+        ...(vars.atTop ? { at_top: true } : { after_block_id: vars.afterBlockId }),
       }),
     onSuccess: invalidate,
     // Without this a rejected insert is completely silent: the picker closes
@@ -185,13 +189,14 @@ export function StoryEditor({ caseId, storyId }: Props) {
     afterBlockId: string | null,
     kind: StoryBlockKind,
     content: Record<string, unknown>,
-  ) => createBlock.mutate({ kind, content, afterBlockId });
+    atTop = false,
+  ) => createBlock.mutate({ kind, content, afterBlockId, atTop });
 
   return (
     <div className="space-y-2">
       <Inserter
         caseId={caseId}
-        onInsert={(kind, content) => insertAfter(null, kind, content)}
+        onInsert={(kind, content) => insertAfter(null, kind, content, true)}
         label="Add at top"
       />
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>

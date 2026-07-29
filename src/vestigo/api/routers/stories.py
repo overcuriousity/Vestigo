@@ -40,6 +40,11 @@ class BlockCreateBody(BaseModel):
     kind: str
     content: dict[str, Any]
     after_block_id: str | None = None
+    #: Place the block above every existing one. Needed because
+    #: ``after_block_id: null`` means "append at end" here while it means
+    #: "top" on the move endpoint — so on create there is no anchor that can
+    #: name the top. Mutually exclusive with ``after_block_id``.
+    at_top: bool = False
 
 
 class BlockUpdateBody(BaseModel):
@@ -186,8 +191,18 @@ async def create_block(
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Append or insert a block (also the push target for "Add to story")."""
+    """Append or insert a block (also the push target for "Add to story").
+
+    Appends at the end by default; ``after_block_id`` inserts after that
+    block and ``at_top`` puts it above every existing one. The mutual
+    exclusion is enforced here as a 422 rather than left to the store's
+    ValueError, so the contract is visible in the OpenAPI schema.
+    """
     story = await _get_story_or_404(case.id, story_id)
+    if body.at_top and body.after_block_id is not None:
+        raise HTTPException(
+            status_code=422, detail="at_top and after_block_id are mutually exclusive"
+        )
     try:
         content = validate_block_content(body.kind, body.content)
         await validate_block_scope(case.id, body.kind, content)
@@ -198,6 +213,7 @@ async def create_block(
             content,
             user=user.username,
             after_block_id=body.after_block_id,
+            at_top=body.at_top,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
