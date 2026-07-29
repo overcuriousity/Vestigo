@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.5] — 2026-07-28
+
 ### Fixed
+
+- **A bundle built with podman now installs on a docker host.** Podman stores a locally
+  built, unqualified image as `localhost/vestigo-app:<tag>` and saves it under that name;
+  docker `load` keeps the name verbatim but resolves the bare `vestigo-app:<tag>` the
+  compose file and the installer asked for to `docker.io/library/vestigo-app` — so the
+  install aborted with `missing image(s) after load` for the image whose load the log had
+  just reported, on an intact bundle with a matching checksum. Only docker targets saw it:
+  podman resolves the same short name to `localhost/`. The app image is now written fully
+  qualified in the builder, the compose file, and the installer's check, and a test fails
+  if any of the three drifts. Existing bundles install after one
+  `docker tag localhost/vestigo-app:<tag> vestigo-app:<tag>`; `docs/DEPLOYMENT.md`
+  §Troubleshooting records it.
 
 - **Opening a story that contains a text block no longer freezes the story view.** (#193)
   The block reported edit mode upward through an effect that depended on the callback's

@@ -63,7 +63,16 @@ services:
   app:
     # Tag written by scripts/airgap-bundle.sh and recorded in the bundle's
     # .env — an upgrade is: load the new image, bump this, `up -d`.
-    image: vestigo-app:${VESTIGO_IMAGE_TAG:?set VESTIGO_IMAGE_TAG in .env}
+    #
+    # `localhost/` is not decoration. Podman stores a locally built, unqualified
+    # image as `localhost/vestigo-app:TAG` and writes that name into the archive;
+    # docker `load` keeps it verbatim but resolves a *bare* `vestigo-app:TAG` to
+    # `docker.io/library/vestigo-app` — so a podman-built bundle installed on a
+    # docker host looked like "missing image(s) after load" for an image the log
+    # had just said it loaded. Podman resolves the same short name to
+    # `localhost/`, which is why only docker hosts saw it. Writing the name fully
+    # qualified makes both engines agree, and nothing ever pulls it.
+    image: localhost/vestigo-app:${VESTIGO_IMAGE_TAG:?set VESTIGO_IMAGE_TAG in .env}
     ports:
       - "${VESTIGO_BIND:-0.0.0.0}:${VESTIGO_PORT:-8080}:8080"
     env_file:

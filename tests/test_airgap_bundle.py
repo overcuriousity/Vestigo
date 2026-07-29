@@ -165,6 +165,29 @@ def test_both_sides_count_the_images_in_the_archive():
     assert "VESTIGO_IMAGE_COUNT" in INSTALL_SH.read_text()
 
 
+def test_the_app_image_is_fully_qualified_in_all_three_files():
+    """Bare `vestigo-app:TAG` means one thing to podman and another to docker.
+
+    Podman stores a locally built unqualified image as `localhost/vestigo-app`
+    and `podman save` writes that name into the archive. `docker load` keeps it
+    verbatim, but resolves a bare reference to `docker.io/library/vestigo-app` —
+    so a podman-built bundle installed on a docker host reported "missing
+    image(s) after load" for the image the load log had just listed, and refused
+    to install. Every one of the three files that names the image must therefore
+    carry the registry component, and carry the same one.
+    """
+    build, compose, check = BUNDLE_SH.read_text(), COMPOSE.read_text(), INSTALL_SH.read_text()
+    assert 'APP_IMAGE="localhost/vestigo-app:$TAG"' in build
+    assert re.search(
+        r"^\s*image: localhost/vestigo-app:\$\{VESTIGO_IMAGE_TAG", compose, re.MULTILINE
+    )
+    assert 'image_usable "localhost/vestigo-app:$VESTIGO_IMAGE_TAG"' in check
+    # And no unqualified reference survives anywhere: one missed spot is the
+    # whole bug back again.
+    for name, text in (("bundle", build), ("compose", compose), ("install", check)):
+        assert not re.search(r"(?<![\w/])vestigo-app:\$", text), f"unqualified image in {name}"
+
+
 def test_the_compose_project_name_is_pinned():
     """Volumes must not depend on the directory a bundle happened to unpack in.
 
@@ -284,7 +307,7 @@ def _run_install(bundle, bin_dir, install_dir, *args):
 
 
 ALL_IMAGES = [
-    "vestigo-app:9.9.9-deadbee",
+    "localhost/vestigo-app:9.9.9-deadbee",
     "docker.io/library/postgres:17-alpine",
     "docker.io/clickhouse/clickhouse-server:26.6.1.1193-alpine",
     "docker.io/qdrant/qdrant:v1.18.2",
@@ -385,8 +408,8 @@ def test_unknown_arguments_are_fatal(tmp_path):
 # The real thing, from a fresh Docker 29 inside an unprivileged LXC. `load`
 # printed one of these per image and exited 0.
 UNPACK_FAILURE = (
-    "Loaded image: vestigo-app:9.9.9-deadbee\n"
-    "Error unpacking image vestigo-app:9.9.9-deadbee: apply layer error for "
+    "Loaded image: localhost/vestigo-app:9.9.9-deadbee\n"
+    "Error unpacking image localhost/vestigo-app:9.9.9-deadbee: apply layer error for "
     '"docker.io/library/vestigo-app:9.9.9-deadbee": failed to extract layer '
     "sha256:5b21fa92fbc3: failed to mount /var/lib/containerd/tmpmounts/containerd-mount1: "
     'mount source: "overlay", target: "/var/lib/containerd/tmpmounts/containerd-mount1", '

@@ -67,7 +67,15 @@ trap 'rm -rf "$STAGE"' EXIT
 BUNDLE="$STAGE/vestigo-airgap-$TAG"
 mkdir -p "$BUNDLE/images" "$BUNDLE/clickhouse"
 
-say "version $VERSION, commit $COMMIT -> image tag vestigo-app:$TAG"
+# Fully qualified, and matching `image:` in the compose file exactly. Podman
+# stores an unqualified local build as `localhost/vestigo-app:TAG` and saves it
+# under that name; docker resolves a bare `vestigo-app:TAG` to
+# `docker.io/library/...` instead, so a podman-built bundle failed its own
+# post-load check on a docker host. Building under the qualified name makes the
+# archive carry one name both engines read the same way.
+APP_IMAGE="localhost/vestigo-app:$TAG"
+
+say "version $VERSION, commit $COMMIT -> image tag $APP_IMAGE"
 
 # ── 1. frontend, built here so the target needs no node ─────────────────────
 say "building frontend"
@@ -79,10 +87,10 @@ say "building app image (embeddings=$INSTALL_EMBEDDINGS)"
 "$ENGINE" build \
   --build-arg FRONTEND_STAGE=frontend-prebuilt \
   --build-arg "INSTALL_EMBEDDINGS=$INSTALL_EMBEDDINGS" \
-  --target app -t "vestigo-app:$TAG" -f Dockerfile .
+  --target app -t "$APP_IMAGE" -f Dockerfile .
 
 # ── 3. every image the stack runs ───────────────────────────────────────────
-IMAGES=("vestigo-app:$TAG")
+IMAGES=("$APP_IMAGE")
 if [ "$APP_ONLY" = 0 ]; then
   # Read the tags out of the compose file rather than repeating them here:
   # one place to bump a backing service.
@@ -92,7 +100,7 @@ if [ "$APP_ONLY" = 0 ]; then
 fi
 for img in "${IMAGES[@]}"; do
   case "$img" in
-    vestigo-app:*) ;;
+    localhost/vestigo-app:*) ;;
     *) say "pulling $img"; "$ENGINE" pull "$img" ;;
   esac
 done

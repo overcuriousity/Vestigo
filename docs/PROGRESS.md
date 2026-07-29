@@ -1,9 +1,36 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-28 (session 115 — the story view stops re-rendering itself).
+Last updated: 2026-07-28 (session 116 — the airgap bundle's image name works on docker too).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 116 — 2026-07-28: a podman-built bundle could not install on a docker host
+
+**Why.** Operator report from the field: `install.sh` on an intact, checksum-matching
+1.8.4 bundle printed `Loaded image: localhost/vestigo-app:1.8.4-1a1690c` and then
+`error: missing image(s) after load: vestigo-app:1.8.4-1a1690c`, and refused.
+
+- **Image reference resolution differs between the two engines, and we wrote the name
+  the ambiguous way.** `podman build -t vestigo-app:TAG` stores `localhost/vestigo-app`
+  and `podman save` writes *that* into the archive. `docker load` keeps the name
+  verbatim, but resolves a bare `vestigo-app:TAG` — what `compose.airgap.yml` and the
+  installer's `image_usable` check both asked for — to `docker.io/library/vestigo-app`.
+  Different image, absent, correct refusal. Podman on the far side resolves the short
+  name to `localhost/`, which is exactly why every rehearsal passed: podman-built,
+  podman-installed. The three backing services were already `docker.io/`-qualified and
+  loaded fine either way, which made the app image look singled out.
+- **Fixed by removing the ambiguity rather than by teaching the check to guess.**
+  `APP_IMAGE="localhost/vestigo-app:$TAG"` in the builder, the same string in the compose
+  file's `image:`, the same in the installer's check. Nothing pulls it, so the registry
+  component costs nothing. A retag on the target unblocks bundles already carried out;
+  `docs/DEPLOYMENT.md` §Troubleshooting has it, as the third entry that looks like a
+  damaged bundle and isn't.
+- **Guarded.** `test_the_app_image_is_fully_qualified_in_all_three_files` pins each of the
+  three spellings and additionally fails on *any* surviving unqualified `vestigo-app:$`
+  reference in those files — one missed spot restores the bug whole.
+- **Released as 1.8.5**, since a fix that only ships inside a bundle needs a version an
+  operator can name.
 
 ## Session 115 — 2026-07-28: the story view was rendering itself to death
 

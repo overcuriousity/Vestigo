@@ -321,10 +321,11 @@ serving the previous image.
 
 ### Troubleshooting a container install
 
-Both of these were hit on a first install into a fresh, unprivileged **LXC** guest and
+The first two were hit on a first install into a fresh, unprivileged **LXC** guest and
 neither is a bundle problem — the bundle is fine, the host cannot run containers yet.
 `install.sh` refuses on the first and compose fails on the second; in both cases fix
-the host and re-run the installer, which is idempotent.
+the host and re-run the installer, which is idempotent. The third is a packaging bug in
+bundles built before 1.8.5.
 
 **`Error unpacking image … err: permission denied`, on every image.**
 
@@ -372,6 +373,26 @@ lxc config set <name> security.nesting true                # LXD/Incus
 Plain LXC: `lxc.apparmor.profile = generated` plus `lxc.apparmor.allow_nesting = 1`.
 `systemd-detect-virt` confirms you are in an LXC guest; `cat /proc/self/attr/current`
 shows which AppArmor profile is in force.
+
+**`missing image(s): vestigo-app:<tag>`, right after the log said it loaded it.**
+
+Bundles built **before 1.8.5** on a podman host and installed on a **docker** host.
+Podman stores a locally built, unqualified image as `localhost/vestigo-app:<tag>` and
+saves it under that name; docker `load` keeps the name verbatim, but resolves the bare
+`vestigo-app:<tag>` the old compose file asked for to `docker.io/library/vestigo-app` —
+a different image, absent, so the installer correctly refused. Podman on the far side
+resolved the short name to `localhost/` and never saw it.
+
+The bundle is intact; verify its checksum if you like, it will match. Either build a
+current bundle, or retag once on the target and re-run the (idempotent) installer:
+
+```bash
+docker tag localhost/vestigo-app:<tag> vestigo-app:<tag>
+./install.sh --dir <install dir>
+```
+
+From 1.8.5 the app image is `localhost/vestigo-app:<tag>` in the builder, the compose
+file, and the installer's check alike, which both engines read the same way.
 
 ## TLS reverse proxy (nginx)
 
