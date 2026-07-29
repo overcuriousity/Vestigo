@@ -7,9 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.8.5] — 2026-07-28
+## [1.8.5] — 2026-07-29
 
 ### Fixed
+
+- **Exported events carry real hashes again, not a Python `bytes` repr.** `content_hash`,
+  `file_hash` and `embedding_config_hash` are ClickHouse `FixedString(64)` columns and
+  arrive as NUL-padded `bytes`; the row normalizer decoded `datetime` and `UUID` but not
+  these, so both the CSV and the JSONL export stringified them through `repr` and every
+  exported hash read `b'028ab6…'` — a value that can never compare equal to the SHA-256 of
+  the evidence it exists to verify. The Explorer's event responses shipped an unset
+  `embedding_config_hash` as 64 literal NUL characters for the same reason. All three read
+  paths (query, similarity, fetch-by-id) now decode and strip through one idempotent helper.
+  Re-export any file whose hashes were meant to be checked against the original.
+
+- **Inserting a view, chart or event block no longer leaves the story view unclickable.**
+  Every modal Radix layer sets `pointer-events: none` on `<body>` and restores the value it
+  captured on mount. `BlockPicker` opened a modal dialog from inside a modal dropdown's
+  `onSelect`, so the dialog captured the menu's own `"none"` as its "original" and put it
+  back when it closed — with no layer left open. The page kept rendering and polling
+  throughout, which is why it read as a freeze rather than a lock; text blocks, the only
+  item that opens no dialog, were unaffected. The menu is now non-modal, so the dialog is
+  the only layer managing the lock, and a test fails if the menu ever locks `<body>` again.
+
+- **"Add at top" adds at the top.** `after_block_id: null` deliberately means *append* on
+  create and *top of document* on move, so the editor's top inserter had no way to say
+  "top" — a block above everything has no anchor to name — and sent the append. Create now
+  takes an explicit `at_top`, rejected with 422 alongside `after_block_id` so the contract
+  is visible in the OpenAPI schema; the default append that "Add to story" and the agent's
+  `propose_story_block` rely on is unchanged. Both top-of-document paths share one
+  position calculation instead of the move path owning a private copy.
+
+- **Exported stories draw their charts.** (#197) `ChartFrame` starts at zero width, learns
+  its real width from a `ResizeObserver` and renders nothing until it has one — and the
+  export runs through `renderToStaticMarkup`, which runs no effects and has no
+  `ResizeObserver`, so every chart block emitted an empty `<div>` and nothing errored. The
+  snapshot renderer now supplies a starting width (848px, the article width minus its
+  gutters) that a live `ResizeObserver` still overrides, so on-screen charts are unchanged.
+  Exports stay real `<svg>`: selectable text, no resolution ceiling, still self-contained.
 
 - **A bundle built with podman now installs on a docker host.** Podman stores a locally
   built, unqualified image as `localhost/vestigo-app:<tag>` and saves it under that name;
