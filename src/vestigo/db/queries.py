@@ -24,6 +24,7 @@ from vestigo.db._buckets import (
 from vestigo.db._columns import (
     EVENT_SELECT_COLUMNS,
     TOP_LEVEL_NON_STRING_COLUMNS,
+    decode_fixed_string_columns,
     resolve_column_token,
 )
 from vestigo.db._dt import (
@@ -552,7 +553,7 @@ def _glob_to_like(value: str) -> str:
 def _normalize_event_row(
     row: dict[str, Any], source_offsets: dict[str, int] | None = None
 ) -> dict[str, Any]:
-    """Attach an explicit UTC offset to timestamps and stringify `event_id`.
+    """Attach an explicit UTC offset to timestamps, stringify `event_id`, decode hashes.
 
     The `events` table's `timestamp`/`ingest_time` columns have no explicit
     timezone component, so clickhouse-connect returns naive `datetime`
@@ -568,6 +569,13 @@ def _normalize_event_row(
     `str`. Stringify it here so callers never have to remember to do it
     themselves — e.g. export's annotation lookup keys its dict by `str`
     annotation `event_id`s and would silently miss every match otherwise.
+
+    The `FixedString(64)` hash columns arrive as NUL-padded `bytes` — see
+    `_columns.decode_fixed_string_columns`. Both callers of this function
+    (the Explorer page and the streaming export) shipped them undecoded:
+    the export's `json.dumps(..., default=str)` / CSV writer rendered
+    `content_hash` and `file_hash` as the Python repr `b'<hex>'`, so an
+    exported hash never compared equal to the real SHA-256.
     """
     offset = 0
     if source_offsets:
@@ -590,7 +598,7 @@ def _normalize_event_row(
             row[key] = ensure_utc_iso(value)
     if "event_id" in row:
         row["event_id"] = str(row["event_id"])
-    return row
+    return decode_fixed_string_columns(row)
 
 
 # SQL column list for every event query (shared between paginated query and
