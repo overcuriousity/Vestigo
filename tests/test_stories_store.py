@@ -268,3 +268,67 @@ async def test_story_to_dict_shape(store):
     assert d["case_id"] == case.id
     assert d["description"] == "desc"
     assert "created_at" in d and "updated_at" in d
+
+
+# ── insert at top ────────────────────────────────────────────────────────────
+#
+# `after_block_id=None` means "append at end" on create and "top of document"
+# on move, so create had no way to express "above everything" at all — the
+# story editor's "Add at top" button sent None and the block landed at the
+# bottom. `at_top` is that missing placement.
+
+
+async def test_at_top_puts_the_block_first(store):
+    story = await _story(store)
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "a"}, user="alice")
+    await store.create_story_block(story.id, "b2", "markdown", {"text": "b"}, user="alice")
+    top = await store.create_story_block(
+        story.id, "b0", "markdown", {"text": "first"}, user="alice", at_top=True
+    )
+    assert top.position < STORY_POSITION_GAP
+    assert [b.id for b in await store.list_story_blocks(story.id)] == ["b0", "b1", "b2"]
+
+
+async def test_at_top_on_an_empty_story_is_the_first_stride(store):
+    story = await _story(store)
+    block = await store.create_story_block(
+        story.id, "b0", "markdown", {"text": "only"}, user="alice", at_top=True
+    )
+    assert block.position == STORY_POSITION_GAP
+
+
+async def test_repeated_at_top_inserts_keep_stacking_above(store):
+    # Each insert halves the gap below the first block; once it closes the
+    # story renumbers rather than colliding on the unique (story, position).
+    story = await _story(store)
+    await store.create_story_block(story.id, "base", "markdown", {"text": "x"}, user="alice")
+    for i in range(12):
+        await store.create_story_block(
+            story.id, f"t{i}", "markdown", {"text": str(i)}, user="alice", at_top=True
+        )
+    order = [b.id for b in await store.list_story_blocks(story.id)]
+    assert order == [f"t{i}" for i in reversed(range(12))] + ["base"]
+
+
+async def test_default_still_appends(store):
+    # The regression that would break every "Add to story" push and the
+    # agent's propose_story_block default.
+    story = await _story(store)
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "a"}, user="alice")
+    await store.create_story_block(story.id, "b2", "markdown", {"text": "b"}, user="alice")
+    assert [b.id for b in await store.list_story_blocks(story.id)] == ["b1", "b2"]
+
+
+async def test_at_top_and_after_block_id_are_mutually_exclusive(store):
+    story = await _story(store)
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "a"}, user="alice")
+    with pytest.raises(ValueError):
+        await store.create_story_block(
+            story.id,
+            "b2",
+            "markdown",
+            {"text": "b"},
+            user="alice",
+            after_block_id="b1",
+            at_top=True,
+        )

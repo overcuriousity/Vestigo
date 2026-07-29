@@ -49,7 +49,8 @@ data from a case the operator believes is gone.
 | `version` | optimistic-concurrency counter |
 | `created_by`/`updated_by`, timestamps | |
 
-**Ordering.** New blocks append at `last + 1024`; an insert between two blocks
+**Ordering.** New blocks append at `last + 1024` (or below the first block with
+`at_top`); an insert between two blocks
 takes the midpoint. When a gap closes to nothing the store renumbers the whole
 story back onto the stride inside the same transaction and recomputes — order
 and uniqueness are preserved, and no client ever sees a fractional position.
@@ -151,7 +152,7 @@ GET    /api/cases/{case}/stories/{story}               → story + ordered block
 PATCH  /api/cases/{case}/stories/{story}
 DELETE /api/cases/{case}/stories/{story}
 
-POST   .../stories/{story}/blocks                      {kind, content, after_block_id?}
+POST   .../stories/{story}/blocks              {kind, content, after_block_id?, at_top?}
 PATCH  .../stories/{story}/blocks/{block}              {content, version}   409 on stale
 POST   .../stories/{story}/blocks/{block}/move         {after_block_id, version}
 DELETE .../stories/{story}/blocks/{block}?version=N                  409 on stale
@@ -164,7 +165,15 @@ GET    .../stories/{story}/exports/{export}/artifact
 DELETE .../stories/{story}/exports/{export}            admin only
 ```
 
-`after_block_id: null` appends on create and moves to the top on move.
+`after_block_id: null` appends on create and moves to the top on move. The two
+endpoints genuinely differ, and create keeps its meaning because every append
+caller relies on it — the "Add to story" pushes and the agent's
+`propose_story_block` default. Create therefore cannot name the top with an
+anchor, so it takes **`at_top`** for that placement (mutually exclusive with
+`after_block_id`, 422 if both). Without it the story editor's "Add at top"
+button sent `null` and its block landed at the bottom. Both "top of document"
+paths share one implementation (`PostgresStore._story_top_position`): halve
+below the first block, renumbering from index 2 when there is no room left.
 
 Every block mutation carries the optimistic `version`, **delete included** — it
 rides as a query parameter there because DELETE bodies are not reliably carried
@@ -388,6 +397,15 @@ trigger: a user asks the agent to restructure a story.
   through the shared `lib/download.ts::triggerDownload`, which attaches the
   anchor to the DOM before clicking it (Firefox/Safari need this) and sanitizes
   the filename.
+
+  Charts export as real `<svg>`, drawn at a **pinned width**:
+  `SnapshotRenderer` provides `ChartStaticWidthContext` (848px — the
+  `max-w-4xl` article minus its `p-6` gutters), which `ChartFrame` uses as its
+  starting width. Without it the export drew no charts at all (issue #197):
+  `ChartFrame` normally learns its width from a `ResizeObserver` in an effect
+  and gates on `width > 0`, and `renderToStaticMarkup` runs neither. A live
+  `ResizeObserver` still overrides the pinned value, so on-screen charts are
+  unaffected.
 
 Embed cards distinguish **"the target was deleted"** from **"the lookup
 failed"**. A 500 or a network blip reported as a deletion is worse than

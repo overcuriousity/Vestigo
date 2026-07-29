@@ -3285,6 +3285,30 @@ class PostgresStore:
         mid = (lo + hi) // 2
         return mid if lo < mid < hi else None
 
+    async def _story_top_position(
+        self,
+        session: AsyncSession,
+        story_id: str,
+        order: list[tuple[str, int]],
+    ) -> tuple[int, list[tuple[str, int]]]:
+        """A position sorting before every block in ``order``, renumbering if needed.
+
+        Halves below the first block, and when there is no room left above it
+        (``position < 2``) renumbers the story onto the stride from index 2 so
+        there is. Returns the position together with the (possibly rewritten)
+        order, since the caller's copy is stale after a renumber.
+
+        Shared by insert-at-top and move-to-top so "top of document" has one
+        definition. ``after_block_id`` cannot express it: on create that value
+        means "append at end" (see :meth:`create_story_block`), so a block
+        going above every existing one has no anchor to name.
+        """
+        if not order:
+            return STORY_POSITION_GAP, order
+        if order[0][1] < 2:
+            order = await self._renumber_story_blocks(session, story_id, order, start_index=2)
+        return order[0][1] // 2, order
+
     async def create_story_block(
         self,
         story_id: str,
@@ -3294,17 +3318,26 @@ class PostgresStore:
         user: str,
         origin: str = "user",
         after_block_id: str | None = None,
+        at_top: bool = False,
     ) -> StoryBlock | None:
-        """Insert a block; appends at the end unless ``after_block_id`` is given.
+        """Insert a block; appends at the end unless placed explicitly.
+
+        ``after_block_id`` inserts directly after that block. ``at_top`` puts
+        the block above every existing one — the placement ``after_block_id``
+        has no way to name, since on create ``None`` means "append at end"
+        (it means "top" on :meth:`move_story_block`, which is why the two are
+        not interchangeable). The two are mutually exclusive.
 
         Returns None when the story doesn't exist. Positions are computed under
         the story row lock and guarded by the unique index; losing the race for
         a slot is retried (see ``STORY_POSITION_ATTEMPTS``), not surfaced.
         """
+        if at_top and after_block_id is not None:
+            raise ValueError("at_top and after_block_id are mutually exclusive")
         for _attempt in range(STORY_POSITION_ATTEMPTS):
             try:
                 return await self._create_story_block_once(
-                    story_id, block_id, kind, content, user, origin, after_block_id
+                    story_id, block_id, kind, content, user, origin, after_block_id, at_top
                 )
             except IntegrityError as exc:
                 if not _is_position_conflict(exc):
@@ -3324,17 +3357,21 @@ class PostgresStore:
         user: str,
         origin: str,
         after_block_id: str | None,
+        at_top: bool = False,
     ) -> StoryBlock | None:
         """One insert attempt; raises IntegrityError if the position was taken."""
         async with self.session_factory() as session:
             if not await self._lock_story(session, story_id):
                 return None
             order = await self._story_block_order(session, story_id)
-            position = self._story_position_for(order, after_block_id)
-            if position is None:
-                # Gap exhausted: renumber onto the stride, then recompute.
-                order = await self._renumber_story_blocks(session, story_id, order)
+            if at_top:
+                position, order = await self._story_top_position(session, story_id, order)
+            else:
                 position = self._story_position_for(order, after_block_id)
+                if position is None:
+                    # Gap exhausted: renumber onto the stride, then recompute.
+                    order = await self._renumber_story_blocks(session, story_id, order)
+                    position = self._story_position_for(order, after_block_id)
             if position is None:  # pragma: no cover - unreachable after a renumber
                 raise RuntimeError(f"no free position in story {story_id!r} even after renumbering")
             block = StoryBlock(
@@ -3441,16 +3478,8 @@ class PostgresStore:
                 if row[0] != block_id
             ]
             if after_block_id is None:
-                # Top of document: halve below the first block, renumbering
-                # first when there's no room left above it.
-                if not order:
-                    position = STORY_POSITION_GAP
-                else:
-                    if order[0][1] < 2:
-                        order = await self._renumber_story_blocks(
-                            session, story_id, order, start_index=2
-                        )
-                    position = order[0][1] // 2
+                # Top of document — same definition insert-at-top uses.
+                position, order = await self._story_top_position(session, story_id, order)
             else:
                 try:
                     position = self._story_position_for(order, after_block_id)

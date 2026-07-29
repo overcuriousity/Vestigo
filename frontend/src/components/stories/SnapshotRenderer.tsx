@@ -15,6 +15,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { SnapshotBlock, StorySnapshot } from "@/api/types";
 import { ChartMarks } from "@/components/viz/ChartCanvas";
+import { ChartStaticWidthContext } from "@/components/viz/primitives/chartStaticWidth";
 import { snapshotToChartResult } from "@/components/viz/chartFetch";
 import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
 import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
@@ -211,21 +212,35 @@ function Block({ block }: { block: SnapshotBlock }) {
   );
 }
 
+/**
+ * Chart width for the exported document: the `max-w-4xl` article (56rem =
+ * 896px) minus its `p-6` gutters (24px a side).
+ *
+ * Needed because this tree is rendered with `renderToStaticMarkup`, which
+ * runs no effects — `ChartFrame`'s ResizeObserver never fires, so without a
+ * pinned width every chart stayed behind its `width > 0` gate and the export
+ * shipped prose with no diagrams (issue #197). A `ResizeObserver` still wins
+ * where there is one, so this only decides the static case.
+ */
+const EXPORT_CHART_WIDTH = 848;
+
 export function SnapshotRenderer({ snapshot }: { snapshot: StorySnapshot }) {
   return (
-    <article className="mx-auto max-w-4xl space-y-4 p-6 text-[var(--color-fg-primary)]">
-      <header className="space-y-1 border-b border-[var(--color-border)] pb-3">
-        <h1 className="text-xl font-semibold">{snapshot.story.title}</h1>
-        <p className="text-xs text-[var(--color-fg-muted)]">
-          Exported {fmtTimestamp(snapshot.story.exported_at)} by {snapshot.story.exported_by} ·
-          case <span className="font-mono">{snapshot.story.case_id}</span>
-        </p>
-      </header>
-      {snapshot.blocks.map((block) => (
-        <section key={block.id}>
-          <Block block={block} />
-        </section>
-      ))}
-    </article>
+    <ChartStaticWidthContext.Provider value={EXPORT_CHART_WIDTH}>
+      <article className="mx-auto max-w-4xl space-y-4 p-6 text-[var(--color-fg-primary)]">
+        <header className="space-y-1 border-b border-[var(--color-border)] pb-3">
+          <h1 className="text-xl font-semibold">{snapshot.story.title}</h1>
+          <p className="text-xs text-[var(--color-fg-muted)]">
+            Exported {fmtTimestamp(snapshot.story.exported_at)} by {snapshot.story.exported_by} ·
+            case <span className="font-mono">{snapshot.story.case_id}</span>
+          </p>
+        </header>
+        {snapshot.blocks.map((block) => (
+          <section key={block.id}>
+            <Block block={block} />
+          </section>
+        ))}
+      </article>
+    </ChartStaticWidthContext.Provider>
   );
 }

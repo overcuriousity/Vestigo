@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
+import { ChartStaticWidthContext } from "./chartStaticWidth";
 
 export interface ChartMargin {
   top: number;
@@ -47,7 +48,8 @@ export function ChartFrame({
   children,
 }: ChartFrameProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [width, setWidth] = useState(0);
+  const staticWidth = useContext(ChartStaticWidthContext);
+  const [width, setWidth] = useState(staticWidth ?? 0);
   const margin = { ...DEFAULT_MARGIN, ...marginOverride };
 
   useEffect(() => {

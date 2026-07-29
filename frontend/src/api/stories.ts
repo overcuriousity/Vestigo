@@ -37,7 +37,12 @@ export const storiesApi = {
     body: {
       kind: StoryBlockKind;
       content: Record<string, unknown>;
+      /** Insert after this block. Null/absent appends at the end — it does
+       *  *not* mean "top" here, unlike on `moveBlock`. */
       after_block_id?: string | null;
+      /** Insert above every existing block; mutually exclusive with
+       *  `after_block_id`. */
+      at_top?: boolean;
     },
   ) =>
     post<{ block: StoryBlock }>(`/cases/${caseId}/stories/${storyId}/blocks`, body).then(

@@ -1,10 +1,80 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-28 (session 116 — the airgap bundle's image name works on docker too).
+Last updated: 2026-07-29 (session 119 — story exports draw their charts again).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
 
+## Session 119 — 2026-07-29: story exports were dropping every chart
+
+**Why.** Issue #197: "story exports dont render diagrams, only the sections."
+
+- **The charts were never in the file.** `ChartFrame` starts at `width = 0` and learns
+  its real width from a `ResizeObserver` in an effect, gating on `{width > 0 && <svg/>}`.
+  The export renders through `renderToStaticMarkup`, which runs no effects and has no
+  `ResizeObserver`, so the width stayed 0 and each chart block emitted an empty `<div>`.
+  Nothing errored, which is why it read as "only the sections".
+- **Fixed with a pinned static width**, not a raster fallback: `ChartStaticWidthContext`
+  supplies `ChartFrame`'s *starting* width, and `SnapshotRenderer` provides 848px (the
+  `max-w-4xl` article minus its `p-6` gutters). A live `ResizeObserver` still overrides
+  it, so nothing about the on-screen charts changes. The export stays real `<svg>` —
+  selectable text, no resolution ceiling, and still self-contained, which a PNG/SVG
+  round-trip through the server would have complicated for no gain.
+- **Verified by rendering it**, not just by asserting a tag: the exported document
+  screenshots with both charts drawn — bar chart with category labels and value
+  annotations, time histogram with axes and rotated tick labels. The regression test
+  requires at least one `<svg>` per resolved chart block plus actual drawn geometry, and
+  fails on the pre-fix build (1 svg — a lucide icon — for 2 chart blocks).
+
+## Session 118 — 2026-07-29: "Add at top" was adding at the bottom
+
+**Why.** The story editor's top inserter put its block last. Found while reading
+`BlockPicker`/`StoryEditor` for an unrelated defect; confirmed against a live story
+(`[(1024,'first'), (2048,'second'), (3072,'ADD AT TOP')]`).
+
+- **`after_block_id: null` means opposite things on two endpoints.** On create it appends
+  at the end; on move it goes to the top. That split is deliberate and documented — every
+  append caller depends on the create meaning (the "Add to story" pushes, the agent's
+  `propose_story_block` default) — so flipping it would silently prepend for all of them.
+  The real gap was that create could not express "top" **at all**: a block going above
+  everything has no anchor to name. The button therefore sent `null` and got an append.
+- **Create takes an explicit `at_top`**, mutually exclusive with `after_block_id` (422 if
+  both, enforced in the router so the contract shows up in the OpenAPI schema). Default
+  behaviour is untouched, which is what the append callers keep relying on.
+- **One definition of "top of document."** `PostgresStore._story_top_position` — halve
+  below the first block, renumbering from index 2 when there is no room — is now shared by
+  insert-at-top and move-to-top instead of the move path owning a private copy.
+- Pinned at three levels: the store (stacking twelve at-top inserts forces the renumber),
+  the API (order after insert, explicit `null` still appends, both-fields 422), and the
+  editor (the top inserter sends `at_top`, the between-blocks one still sends its anchor).
+
+## Session 117 — 2026-07-29: the "freeze" after session 115 was a leaked input lock
+
+**Why.** Story view still "froze" after #193 was fixed — but only when inserting a
+**view/chart/event** block, never a text block, and aborting the picker was enough.
+
+- **It was not a render loop.** A DevTools performance capture over 27s of the hung page
+  showed 357ms of scripting and an idle main thread. Nothing was spinning: the page kept
+  rendering and polling (the ingest progress modal animated throughout) and only stopped
+  accepting *input*. That reading is what redirected the search — session 115's fix was
+  correct and unrelated.
+- **Radix modal layers leaked the body pointer-events lock.** Each modal layer sets
+  `pointer-events: none` on `<body>`, capturing the previous value and restoring it on
+  unmount. `BlockPicker`'s embed items open a modal `Dialog` from inside a modal
+  `DropdownMenu`'s `onSelect`, so the dialog mounted while the menu's lock was up and
+  captured `"none"` as its own "original". The menu unmounted and restored `""`
+  correctly; closing the dialog then restored `"none"` — with no layer open. Confirmed
+  on the live page (`bodyPE: "none"`, `openDialogs: 0`, `openMenus: 0`) and reproduced in
+  Chromium over CDP, which showed the capture order directly.
+- **Fixed by not overlapping the layers**: the menu is `modal={false}`, so the dialog is
+  the only layer managing the lock. The menu still closes on outside click and Escape and
+  only gives up a scroll lock a four-item insert menu never needed. "Text" opens no
+  dialog, which is why it was the one kind of block that still worked.
+- **Regression test** pins the invariant that makes the overlap impossible — the menu must
+  not lock `<body>` while open. jsdom is not used for the full open/abort cycle: Radix's
+  dialog under React 19 + RTL's async `act` wrapper hangs there for unrelated reasons, and
+  an async assertion would report that instead of this bug. `BlockPicker` is the only
+  menu+dialog nesting in the app; the `Popover` call sites default to non-modal.
 ## Session 116 — 2026-07-28: a podman-built bundle could not install on a docker host
 
 **Why.** Operator report from the field: `install.sh` on an intact, checksum-matching
