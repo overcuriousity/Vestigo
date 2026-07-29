@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`react-router-dom` upgraded 7.18.1 → 7.18.2**, picking up the 7.x backport of the RSC
+  CSRF fix for GHSA-qwww-vcr4-c8h2. No source changes. Vestigo was never exposed — the
+  advisory covers the unstable RSC APIs with server actions, and Vestigo is a SPA with no
+  `unstable_*` imports — so this is defense in depth. Note that security tooling may keep
+  flagging the advisory: its published range (`>= 7.12.0, < 8.3.0`) was never amended to
+  exclude 7.18.2. Do not "fix" it by downgrading; `npm audit fix --force` installs 7.11.0.
+
 ### Fixed
 
 - **The login-backoff tracker's entry cap is now an actual bound.** `LoginBackoff` pruned

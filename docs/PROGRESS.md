@@ -1,9 +1,40 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 121 — backlog triage + documentation audit).
+Last updated: 2026-07-29 (session 122 — dependabot triage, react-router 7.18.2).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 122 — 2026-07-29: dependabot triage, and the patch the standing decision missed
+
+**Why.** The push in session 121 surfaced two open Dependabot alerts. Both were assessed
+for real exposure rather than taken at face value.
+
+- **`react-router` GHSA-qwww-vcr4-c8h2 (high) is patched on 7.x, and we had missed it.**
+  The 2026-07-27 standing decision rested on "the last `react-router-dom` release is 7.18.1,
+  so no installable version sits outside the advisory range". That premise expired on
+  2026-07-28, when `react-router@7.18.2` shipped PR #15353 — *"Harden RSC CSRF codepaths"*,
+  the backport of #15311, which is the fix released in 8.3.0 on 07-22. Upgraded
+  `react-router-dom` 7.18.1 → 7.18.2: a lockfile and manifest bump with **zero source
+  changes**, `tsc -b --noEmit` and `oxlint` clean, 75 test files / 653 tests passing.
+  The alert will probably persist anyway — GitHub and npm still range the advisory
+  `>= 7.12.0, < 8.3.0` and never carved out 7.18.2 — so the ROADMAP entry now says to
+  dismiss it as "fix already applied" instead of acting on it. It also records *why* the
+  `dependabot.yml` ignore was refused, which is the reason this patch was catchable at all:
+  ignoring `< 8.3.0` would have suppressed 7.18.2 along with the noise.
+  The pre-existing unreachability argument still holds independently (SPA, zero
+  `unstable_*` imports, upstream files the fix under "unstable features"), so this was
+  defense in depth, not an incident.
+- **`diskcache` GHSA-w8v5-vhqr-4h9v (medium) needs no action, and cannot get one.** No patch
+  exists (`first_patched_version: null`). It arrives as `pysigma → diskcache` and is used
+  only by `sigma/data/mitre_attack.py` and `sigma/data/mitre_d3fend.py`, which we never
+  import — verified by constructing the app plus our sigma modules and confirming
+  `diskcache` and both modules are absent from `sys.modules`, rather than by reading
+  imports. The attack additionally needs write access to `~/.cache/pysigma/`, which already
+  implies code execution as that user. Filed as a standing decision to dismiss. Noted
+  alongside it: those two pysigma modules `urlopen` MITRE data from GitHub, so pulling them
+  in would break the airgap guarantee — a second reason to keep them out of the import
+  graph.
 
 ## Session 121 — 2026-07-29: backlog triage + documentation audit
 

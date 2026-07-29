@@ -249,19 +249,36 @@ Decisions, not work items — each stays as decided unless its trigger fires.
 - **M26 — the two time-histogram implementations stay separate.** After session 49 the only
   shared piece is the brush gesture; `TimelineHistogram` carries Explorer-only concerns
   that make a merge high-risk/low-payoff. Trigger: the two drift apart.
-- **react-router stays at 7.18.1 despite GHSA-qwww-vcr4-c8h2** (2026-07-27). The advisory
-  (high, CSRF in RSC mode) covers `>= 7.12.0, < 8.3.0`, patched in `react-router` 8.3.0.
-  Vestigo depends on **`react-router-dom`**, whose last release is 7.18.1 — the v8 line
-  dropped that package and moved every export to `react-router`. So no installable
-  `react-router-dom` sits outside the advisory range, and taking 8.x means migrating 41
-  imports. Not worth it here because the vulnerable path is unreachable: it affects only
-  apps using the unstable RSC APIs with server actions, and Vestigo is a SPA
-  (`createBrowserRouter` + `RouterProvider`, no `unstable_*` imports, FastAPI backend).
-  `npm audit fix --force` would *downgrade* to 7.11.0, giving up seven minors of fixes to
-  step below the range. Deliberately not silenced via a `dependabot.yml` ignore — ignoring
-  `< 8.3.0` would also suppress real 7.x patches. Triggers: a `react-router-dom` 8.x
-  publishes, or we migrate imports for another reason; re-evaluate immediately if RSC APIs
-  are ever adopted.
+- **react-router stays on the 7.x line; GHSA-qwww-vcr4-c8h2 is patched there** (revised
+  2026-07-29). The advisory (high, CSRF in RSC mode) is fixed by PR #15311, shipped in
+  `react-router` 8.3.0 (2026-07-22) and **backported to 7.18.2** as PR #15353, same title,
+  published 2026-07-28. Vestigo is on `react-router-dom@7.18.2` → `react-router@7.18.2`, so
+  the fix is in. Staying on 7.x rather than migrating to v8 is the standing part of this
+  decision: the v8 line dropped `react-router-dom` and moved every export to
+  `react-router`, so taking it means migrating 41 imports for no security benefit.
+  **Expect the alert to persist**: GitHub and npm both still range the advisory
+  `>= 7.12.0, < 8.3.0` and have not amended it to carve out 7.18.2, so tooling keeps
+  flagging a version that carries the fix. Dismiss as "fix already applied" rather than
+  acting on it, and never run `npm audit fix --force` — it *downgrades* to 7.11.0, giving
+  up seven minors of fixes to step below the range. Deliberately not silenced via a
+  `dependabot.yml` ignore either: ignoring `< 8.3.0` would also suppress real 7.x patches,
+  which is exactly how 7.18.2 would have been missed. Independently, the vulnerable surface
+  is unreachable here — it is an unstable RSC API (upstream files the fix under "unstable
+  features, not recommended for production"), and Vestigo is a SPA (`createBrowserRouter` +
+  `RouterProvider`, zero `unstable_*` imports, FastAPI backend). Triggers: we migrate
+  imports to `react-router` for another reason, or RSC APIs are ever adopted — re-evaluate
+  immediately in that second case.
+- **`diskcache` GHSA-w8v5-vhqr-4h9v / CVE-2025-69872 needs no action** (2026-07-29). Unsafe
+  pickle deserialization, medium, *no patch exists* (affects "through 5.6.3",
+  `first_patched_version: null`). It reaches us transitively as `pysigma → diskcache` and is
+  used by exactly two pysigma modules, `sigma/data/mitre_attack.py` and
+  `sigma/data/mitre_d3fend.py`, which Vestigo never imports — verified empirically:
+  constructing the app plus `vestigo.sigma.backend`/`rules` leaves `diskcache` and both
+  modules absent from `sys.modules`. The attack also requires write access to
+  `~/.cache/pysigma/`, which already implies code execution as that user. Dismiss as
+  "vulnerable code not used". Separately worth knowing: those two modules `urlopen` MITRE
+  data from GitHub, so pulling them in would be an unconditional network call and an airgap
+  violation — a second reason to keep them out.
 - **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client for
   Jupyter/pandas workflows is cheap. Trigger: a user asks.
 - **A11 — `/api/auth/users` full-directory listing** (id, username, display name — needed
