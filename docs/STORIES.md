@@ -1,4 +1,4 @@
-# Stories (W7)
+# Stories
 
 Reference for the Stories subsystem: the per-case block document where the
 investigation's narrative and its evidence live together. Design round:

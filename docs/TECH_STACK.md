@@ -2,7 +2,9 @@
 
 ## 1. Guiding Principles
 - **Local-first / airgap-friendly**: No mandatory cloud services; models download once and run offline.
-- **Container-first, low ops overhead**: Single-node Docker Compose deployment for small teams.
+- **Low ops overhead**: single-node deployment for small teams. The app itself is a native
+  `uv` process; the three backing services are external, with a reference compose file
+  provided for them (an optional app container image exists too — see `DEPLOYMENT.md`).
 - **Python-native ML**: Reuse the proven local-inference ecosystem (PyTorch, sentence-transformers, Qdrant).
 - **Swappable embedding models**: Design the pipeline so a general model ships first and a log-specific model can be dropped in later.
 

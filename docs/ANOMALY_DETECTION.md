@@ -5,11 +5,9 @@ every formula is explained in plain language before the notation.
 
 This document covers every detector actually running in the codebase today. If
 a detector described here changes (formula, default, field name), update this
-file and the "Method" tab copy in the same commit — see
-[Reality check](#reality-check-2026-07) at the bottom for the audit that
-produced this file and what was fixed as part of it.
+file and the "Method" tab copy in the same commit.
 
-There are twelve independent analysis tools in Vestigo:
+There are fourteen independent analysis tools in Vestigo:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -23,14 +21,17 @@ There are twelve independent analysis tools in Vestigo:
 10. [Value-distribution drift](#10-value-distribution-drift-whole-field-shape-changes-between-windows) — fields whose *whole value distribution* changed between the baseline and a suspect window (ClickHouse + significance tests, no ML)
 11. [Semantic similarity search](#11-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 12. [Repeating sequences](#12-repeating-sequences-motif-mining) — recurring time-ordered n-grams of a field's values, ranked by support and cadence regularity; the discovery/mining complement of detector 9 (ClickHouse, no ML)
+13. [Sigma rule runner](#13-sigma-rule-runner-signature-matching) — signature matching: community/custom Sigma rules compiled to ClickHouse predicates (ClickHouse, no ML)
+14. [Log templates](#14-log-templates-structural-line-clustering) — structural clustering of raw lines into templates, so rare *shapes* surface without naming a field (ClickHouse, no ML)
 
-All but the eleventh are **statistical detectors**: pure counting and
-arithmetic over already-ingested events, no machine learning, no network
-calls, work the instant ingestion finishes. The eleventh needs an explicit
-embedding step first.
+All but the eleventh are **statistical or rule-based**: pure counting,
+arithmetic and predicate matching over already-ingested events — no machine
+learning, no network calls, working the instant ingestion finishes. The
+eleventh needs an explicit embedding step first.
 
-Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12),
-`src/vestigo/db/similarity.py` (detector 11). UI: `frontend/src/components/analysis/`.
+Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14),
+`src/vestigo/db/similarity.py` (detector 11), `src/vestigo/sigma/`
+(detector 13). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -1615,74 +1616,28 @@ flag.
 
 ---
 
-## Reality check (2026-07)
+## Dispositions and normality (implementation notes)
 
-This document was written alongside an audit of every statistical detector's
-implementation against its own module docstring, its Method-tab description,
-and its formula's mathematical soundness. Findings:
-
-- **Confirmed correct:** the surprise score (`−log(count/total)`), the
-  self-baseline rarity floor semantics, the temporal "absent from baseline,
-  present in detect" semantics, the field cardinality classifier, the
-  leave-one-out variance formula (`(Σx² − n·mean²)/(n−1)` computed over the
-  n−1 remaining points — standard sample-variance algebra, verified by hand),
-  and the shared bucket-interval formula between the histogram and the
-  frequency detector.
-- **Bug fixed:** `FrequencyView.tsx`'s self-baseline explanation text said the
-  per-window "expected" baseline *includes* the flagged window itself. The
-  backend does the opposite on purpose (leave-one-out, to avoid a spike
-  suppressing its own detection) — the UI copy had drifted out of sync with
-  the implementation. Corrected in both `FrequencyView.tsx` and
-  `MethodologyPanel.tsx`.
-- **Bug fixed:** `ValueNoveltyView.tsx`'s footer note unconditionally
-  mentioned the "rarity floor," even in temporal mode, where the backend
-  explicitly ignores the rarity floor entirely. Copy now branches on the
-  active mode.
-- **Bug fixed:** frequency-finding severity color bands (low/medium/high)
-  were hardcoded at fixed |z| constants (3, 5) regardless of the analyst's
-  chosen `z_threshold`. Raising the threshold above 5 made every returned
-  finding read as "high" trivially; lowering it below 3 made every finding
-  read as "low" regardless of how extreme relative to the chosen cutoff.
-  Severity now scales off the active threshold.
-- **Known limitation, not fixed (documented above instead):** z-scoring's
-  normality assumption is shaky for short (3–5 bucket) or low-count series,
-  and the Method tab doesn't say so. Flagged in this doc's z-score section
-  rather than papered over — the fix is honest documentation, not a code
-  change, since the alternative (a different statistical test per series
-  length) would be real added complexity for a niche edge case.
-
-## Explicit baseline + suspect windows (2026-07)
-
-The single-`baseline_end` split point was replaced by explicit
-[baseline definitions](#baseline-definitions-suspect-windows-and-the-normality-model):
-a named baseline window plus 1..N labeled suspect windows per timeline, marked
-on the histogram. Every temporal detector now scores each suspect window
-against the baseline with per-window statistics (surprise denominators are the
-suspect window's own event count; frequency derives its bucket interval from
-the baseline and excludes partial/edge buckets), attributes each finding to its
-window, and warns on windows too small to score. The old whole-corpus surprise
-denominator and whole-timeline frequency buckets — both of which overstated
-significance when the analysis covered only part of the timeline — are gone.
-Per-event "mark normal" was unified into the value-level detector allowlist
-(roadmap D11); the legacy `normal` annotation was still honored but no longer
-created outside timestamp-order findings. Schema for both new tables is managed
-by Alembic (`src/vestigo/db/migrations`), which this change also adopted.
-
-## Unified disposition taxonomy (2026-07)
-
-The remaining fragmentation — `detector_allowlist` table, per-event `normal`
-annotation (the timestamp-order fallback), and the `pinned` flag on system
-annotations — was replaced by the single `finding_dispositions` table
-(migration `0004`, which moves all legacy rows) and the audited
-`/dispositions` endpoints. See
+Analyst verdicts on findings live in one `finding_dispositions` table with the
+taxonomy `normal` / `dismissed` / `confirmed`, served by the audited
+`/dispositions` endpoints — see
 [the normality model](#baseline-definitions-suspect-windows-and-the-normality-model)
-for the taxonomy (`normal` / `dismissed` / `confirmed`). Two behavior gaps
-closed with it: per-event normality is now audited and hashed into
-`DetectorRun.params` (`dispositions_hash` replaces `allowlist_hash`), and
-"hide as noise without blessing it into the baseline" exists at all
-(`dismissed`, with an explicit `dismissed_count` so nothing is silently
-hidden). Annotation types tightened to `tag`/`comment` (user) and `anomaly`
-(system); the `/allowlist` endpoints are gone.
+for what each verdict means. Two consequences worth knowing:
+
+- Per-event normality is audited and hashed into `DetectorRun.params` as
+  `dispositions_hash`, so a run's identity includes which findings were already
+  blessed when it ran.
+- `dismissed` means "hide as noise **without** blessing it into the baseline",
+  and every scan reports an explicit `dismissed_count` so nothing is silently
+  hidden.
+
+Predecessors, for readers of old data or old code: the `detector_allowlist`
+table, the per-event `normal` annotation, the `pinned` flag on system
+annotations and the `/allowlist` endpoints are all gone — migration `0004`
+moved every legacy row into `finding_dispositions`. Likewise the single
+`baseline_end` split point was replaced by named baseline definitions plus
+1..N labeled suspect windows; annotation types are now `tag`/`comment` (user)
+and `anomaly` (system).
 
 ## Persisted detector runs (`run_id`)
 

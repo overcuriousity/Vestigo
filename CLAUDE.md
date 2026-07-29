@@ -17,18 +17,18 @@ Frontend: React 19 + Vite 8 + TypeScript, in `frontend/`.
 
 Read `docs/CONCEPT.md` and `docs/MODEL_REFINEMENT.md` before touching the data model
 (Case/Source/Timeline/Event/Artifact) — the vocabulary is deliberate and recently refactored.
-`docs/TECH_STACK.md` records *why* each backing service was chosen. Auth backend and frontend
-stack were both TBD in that doc but have since been decided and implemented — session-cookie
-auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/auth.py`,
-`admin.py`, `deps.py`) and React 19 + Vite (see `frontend/`).
+`docs/TECH_STACK.md` records *why* each backing service was chosen; every choice in it is
+resolved. Auth is session-cookie based with optional OIDC, case-RBAC, teams and an audit
+trail (`api/routers/auth.py`, `admin.py`, `deps.py`).
 
 ### `docs/` map
 
 - `CONCEPT.md` / `MODEL_REFINEMENT.md` — product vision and the Case/Source/Timeline/Event/
   Artifact data model. Read before touching the model; rarely changes.
 - `TECH_STACK.md` — backing-service decision record (*why*, not *what's shipped*).
-- `ANOMALY_DETECTION.md` — reference for every detector actually running (value novelty,
-  frequency, semantic similarity). Update alongside any detector change in the same commit.
+- `ANOMALY_DETECTION.md` — reference for all fourteen analysis tools actually running
+  (statistical detectors, Sigma runner, log templates, semantic similarity), plus the
+  baseline/disposition model. Update alongside any detector change in the same commit.
 - `AGENT.md` — the optional AI investigation agent (design invariants, MCP tools, provider
   config incl. Kimi coding plan). Update alongside any `src/vestigo/agent/` change.
 - `STORIES.md` — the Stories subsystem (block model, collaboration and export semantics,
@@ -101,7 +101,10 @@ instead of rebuilding.
 ### Backend layout (`src/vestigo/`)
 - `api/main.py` — FastAPI app factory; mounts routers, CORS, serves `frontend/dist` as a
   catch-all SPA route when built.
-- `api/routers/` — `cases.py`, `events.py`, `jobs.py` — thin HTTP layer over `db/` and `core/`.
+- `api/routers/` — one module per surface (`cases`, `events`, `jobs`, `auth`, `admin`,
+  `agent`, `agent_tokens`, `baselines`, `converters`, `dispositions`, `enrichers`, `sigma`,
+  `stories`, `stream` (SSE collaboration), `transfer`, `viz`) — thin HTTP layer over `db/`
+  and `core/`. `api/deps.py` holds auth/case-access dependencies.
 - `core/config.py` — single `Settings` object (pydantic-settings, `VESTIGO_` env prefix), read via
   `get_settings()`. Add new tunables here, not as scattered `os.environ` reads. Settings resolve
   per field: **environment wins**, then the DB-backed `app_settings` overrides an admin edits in
@@ -122,12 +125,14 @@ instead of rebuilding.
 - `db/qdrant.py` — vector storage (`QdrantStore`); one collection per
   `(case_id, embedding_config_hash)`.
 - `db/queries.py` — cross-cutting query building for the Explorer (filters, histogram).
-- `db/anomaly_stats.py` — statistical (non-embedding) anomaly detectors run directly against
-  ClickHouse: `value_novelty` (rare/first-seen field values) and `frequency`
-  (z-score spikes/silences over time buckets). Both support a self-baseline mode and a
-  temporal mode (`baseline_end` splits baseline vs. detect window). Read the module docstring
-  before changing bucket math — it deliberately does **not** reuse the events-view filters that
-  `QueryService.histogram` applies.
+- `db/anomaly_stats.py` — every statistical (non-embedding) detector, run directly against
+  ClickHouse, plus log-template clustering. Temporal detectors score analyst-declared
+  **baseline definitions** (one baseline window + 1..N labeled suspect windows, in Postgres)
+  rather than a single split point; findings carry `normal`/`dismissed`/`confirmed`
+  dispositions. `docs/ANOMALY_DETECTION.md` is the contract for all of them — update it in the
+  same commit as any detector change. Read the module docstring before changing bucket math or
+  scan-cost machinery (`HEAVY_SCAN_SETTINGS`, `HEAVY_SCAN_GATE`); it deliberately does **not**
+  reuse the events-view filters that `QueryService.histogram` applies.
 - `db/similarity.py` / `db/field_recommend.py` — embedding-based nearest-neighbor search and
   field-selection heuristics for the embedding wizard.
 - `ingestion/parser.py` — format detection + streaming parsers (Plaso CSV/JSONL, generic
@@ -140,15 +145,22 @@ instead of rebuilding.
   (`config_hash()`) for forensic reproducibility. Changing a parser/embedding config's fields
   changes its hash and therefore its identity (new Qdrant collection, etc.) — treat these
   dataclasses as append-only where possible.
+- `agent/` — the optional AI investigation agent (pydantic-ai runtime, `tools.py` tool
+  registry, MCP exposure). See `docs/AGENT.md`.
+- `sigma/` — Sigma rule loader/compiler/router (`docs/ANOMALY_DETECTION.md` §13).
+- `stories/` — the Stories subsystem (blocks, snapshots, export). See `docs/STORIES.md`.
+- `transfer/` — case export/import (`.vestigo` archive).
+- `enrichers/` — post-ingest attribute enrichment (GeoIP via a local MaxMind DB).
 - `cli/main.py` — Typer CLI (`vestigo`), mirrors what the API/UI does for scriptable/offline use.
 
 ### Frontend layout (`frontend/src/`)
 - `api/` — one file per resource (`cases.ts`, `events.ts`, `anomalies.ts`, ...), thin fetch
   wrappers; `client.ts` holds the shared base client.
 - `components/` grouped by feature area: `explorer/` (event grid, filters, histogram),
-  `analysis/` (anomaly/frequency/value-novelty views, semantic search, similarity),
-  `cases/`, `timelines/`, `sources/`, `triage/`, `layout/` (app shell, top bar, job tray),
-  `ui/` (design-system primitives on top of Radix).
+  `analysis/` (detector views, Sigma, templates, semantic search, similarity), `viz/`
+  (charts), `agent/`, `stories/`, `cases/`, `timelines/`, `sources/`, `auth/`, `jobs/`,
+  `tour/`, `layout/` (app shell, top bar, job tray), `ui/` (design-system primitives on top
+  of Radix).
 - State: Zustand for client state, TanStack Query for server state, TanStack Table/Virtual for
   the event grid.
 

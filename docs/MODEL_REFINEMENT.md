@@ -3,6 +3,11 @@
 > **Status:** Approved and implemented (2026-06-29). This defines the canonical
 > Case / Source / Timeline / Event / Artifact vocabulary — the backend, tests, and
 > frontend follow the definitions below. Read this before touching the data model.
+>
+> **Pending revision:** roadmap Milestone 7 (E1) proposes redefining **Artifact** as *a
+> file* and renaming the per-event `artifact`/`artifact_long` columns to a type/kind
+> concept, jointly with the stream-source model (S1). Until that design round lands and is
+> approved, the definitions here stand as written.
 
 ---
 
@@ -44,7 +49,7 @@ vocabulary with reality and with the product vision.
 | **Embedding** | A dense vector representation of an event's textual content, produced by a local model. Configuration (model, field selection) lives on the **Timeline** (`timelines.embedding_model/embedding_config/embedding_config_hash`), set per embed run — not on the Source; see [Storage placement audit](#storage-placement-audit-2026-07-05) below. | `Embedding` |
 | **Vector Collection** | A Qdrant collection holding event embeddings, keyed by `(case_id, embedding_config_hash)` — shared across all Sources in a case, not per-source. | `Vector Collection` (rescoped) |
 | **View** | A saved set of filters (time range, full-text, artifact, source toggle, field values) applied to a Timeline. | `View` |
-| **Annotation** | A comment, tag, or highlight attached to one or more Events. Origin is either `user` or `system` (machine-generated outlier). | `Annotation` |
+| **Annotation** | A `tag` or `comment` attached to one or more Events (`origin: user`), or an `anomaly` marker written by a detector run (`origin: system`). Analyst verdicts on findings are *not* annotations — they live in `finding_dispositions`, see `docs/ANOMALY_DETECTION.md`. | `Annotation` |
 
 ### Relationship summary
 
