@@ -2478,6 +2478,10 @@ async def get_detector_run(
     ``run_id`` — as referenced by ``list_events``/``histogram``/bulk-annotate/
     export's ``run_id`` filter param — actually contains, without re-running
     the detector.
+
+    Supported with no frontend caller by design: it is the explainability
+    affordance for a run id surfaced in a filter, an audit entry or an export.
+    See "Persisted detector runs" in ``docs/ANOMALY_DETECTION.md``.
     """
     store = get_store()
     run = await store.get_detector_run(case_id, run_id)
