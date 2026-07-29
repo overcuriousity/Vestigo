@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The login-backoff tracker's entry cap is now an actual bound.** `LoginBackoff` pruned
+  expired entries when full, then inserted unconditionally — so when pruning could free
+  nothing, because all `max_entries` keys were simultaneously locked into the future, the
+  in-memory table grew past its cap for as long as the flood sustained those locks.
+  Pruning now falls back to evicting the entry whose lock expires soonest, and a key that
+  is already tracked skips the bound check entirely. Failed-login throttling itself is
+  unchanged. Eviction necessarily discards the evicted key's failure count — the entry is
+  the slot being freed — so that key gets `login_backoff_threshold` unthrottled attempts
+  before a lock re-arms. Reaching that path costs an attacker ~50k requests at the
+  defaults, and the freed key is whichever lock was closest to expiring anyway.
+
 ## [1.8.5] — 2026-07-29
 
 ### Fixed

@@ -1683,3 +1683,31 @@ closed with it: per-event normality is now audited and hashed into
 (`dismissed`, with an explicit `dismissed_count` so nothing is silently
 hidden). Annotation types tightened to `tag`/`comment` (user) and `anomaly`
 (system); the `/allowlist` endpoints are gone.
+
+## Persisted detector runs (`run_id`)
+
+Every successful scan (`GET .../anomalies` with the default `persist=true`, and
+always for `tag_anomalies`) writes a `DetectorRun` row: the request params it
+ran with — fields, `series_field`, thresholds, `baseline_id`, resolved windows,
+`windows_hash`, `dispositions_hash`, the per-source clock-skew offsets in
+effect — plus the serialized result, and returns its id as `run_id`. Rows
+accumulate rather than being overwritten, so a case keeps an auditable history
+of what was scanned, with which parameters, and what it found
+(`db/postgres.py::DetectorRun`).
+
+`run_id` is then a first-class **filter param**, not just a receipt. Passing it
+to the events list, `count`, `histogram`, bulk-annotate, export or the
+visualization aggregations (`api/routers/viz.py`) unions that run's finding
+event IDs into the `anomaly` branch of the annotation filter, which is how the
+Explorer scopes a view to "the events this scan flagged" without re-uploading
+the id list on every request. An unknown or foreign-case `run_id` 404s rather
+than silently matching nothing — a stale id is a client bug worth surfacing
+(`events.py::_resolve_run_event_ids`).
+
+**`GET /api/cases/{case_id}/detector-runs/{run_id}`** returns a run's params and
+findings without re-running the detector. It is a supported API with no frontend
+caller by design: it is the explainability affordance for a `run_id` that
+appears in a filter, an audit entry (`_persist_detector_run` stamps the run id
+as the audit `target_id`) or an exported view — an analyst or script can ask
+what produced it, months later, and get the exact parameter set back. Requires
+case-read access like every other case route.
