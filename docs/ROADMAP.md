@@ -12,40 +12,19 @@ Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_F
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
 resolved.
 
-Reported defects live as GitHub issues, condensed into the "Open defects" section below
-with their issue numbers — triage notes and root-cause detail stay in the issue threads,
-not here.
+Reported defects live as GitHub issues, condensed into an "Open defects" section here
+with their issue numbers while any are open — triage notes and root-cause detail stay in
+the issue threads, not here. **None are open as of 2026-07-29** (session 120), so the
+section is gone rather than left standing empty.
 
-**Priority order** (verified against the codebase 2026-07-26): the remaining open defects
-(B5, B6) are low-priority polish. Phase 3 is complete, so
+**Priority order** (verified against the codebase 2026-07-29): no defects are open —
+the last three (B5, B6) closed in session 120. Phase 3 is complete, so
 the feature queue is led, roughly by payoff-per-effort, by
 A12 local transform tools (low friction, no design round needed),
 A8 external MCP toolsets (needs its own design round), W8 query-time field extraction,
 D10 correlation rules (heaviest lift, last of the detector line). Milestones 6 (streaming
 ingest) and 7 (forensic examination) are future phases gated on a joint data-model design
 round (S1+E1). Everything in Milestones 2–3 is residue/polish, picked up opportunistically.
-
-## Open defects (GitHub issues, triaged 2026-07-26)
-
-All ten open issues re-verified against `main` @ 9034609; every one still reproduced.
-Grouped into batches that share a file/subsystem — work a batch as one change.
-B1, B3 and B4 shipped in session 103, B2 in sessions 107–108 (see `PROGRESS.md`).
-
-- [ ] **B5 — Docs/API hygiene** ([#160], [#159]). The `.env.example` half is **done**
-  (session 109): every field is now editable in the admin console and the file carries a
-  header explaining precedence, so it stays a curated subset by design rather than by
-  neglect. Remaining: decision on `GET /api/cases/{case_id}/detector-runs/{run_id}`
-  (`events.py:2463`, no callers) — **keep**, document as supported debugging API, since
-  inspecting what produced a `run_id` is a forensic-explainability affordance.
-- [ ] **B6 — `LoginBackoff` cap hardening** ([#158]). The filed scenario is wrong (rotating
-  keys have `locked_until = 0.0`, which `_prune_expired_locked` does drop); the real
-  residual is that when pruning frees nothing — all `max_entries` simultaneously locked —
-  `setdefault` still inserts past the cap. Evict the earliest `locked_until` instead.
-  Low priority: expensive to trigger and self-limiting.
-
-[#160]: https://github.com/overcuriousity/Vestigo/issues/160
-[#159]: https://github.com/overcuriousity/Vestigo/issues/159
-[#158]: https://github.com/overcuriousity/Vestigo/issues/158
 
 ## Phase 3 — investigation depth (complete, 2026-07-26)
 

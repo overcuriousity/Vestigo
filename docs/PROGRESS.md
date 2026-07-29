@@ -1,9 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 119 — story exports draw their charts again).
+Last updated: 2026-07-29 (session 120 — defect backlog emptied).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 120 — 2026-07-29: the last three open defects, closed
+
+**Why.** Nothing in flight; the backlog held exactly three issues (#158/#159/#160),
+all `priority: low`, triaged as ROADMAP B5/B6. Clearing them makes the backlog purely
+feature-shaped before the next feature batch.
+
+- **`LoginBackoff`'s `max_entries` is now an actual bound** (#158). The filed scenario —
+  unbounded growth via rotating usernames — does not hold: rotating keys sit at
+  `locked_until = 0.0`, which `_prune_expired_locked` drops, since it deletes everything
+  with `locked_until <= now`. The real residual was the case where pruning frees
+  *nothing*: all `max_entries` keys locked into the future, so `setdefault` inserted past
+  the cap for as long as the flood sustained those locks. Pruning now falls back to
+  evicting the entry whose lock expires soonest, and the bound check is skipped entirely
+  for a key already tracked (`setdefault` on a present key cannot grow the dict). The
+  eviction hands the evicted key one free attempt — the same bounded-cache weakness the
+  existing prune already accepts, and far more expensive to mount than waiting out the
+  delay; documented where it happens rather than papered over. Two new tests pin it, both
+  failing pre-fix (4 entries where the cap is 3).
+- **The detector-run inspection API stays, and is written down** (#159).
+  `GET /api/cases/{case_id}/detector-runs/{run_id}` has no frontend caller by design: it
+  is the explainability affordance for a `run_id` surfaced in a filter, an audit
+  `target_id` or an export — an analyst can ask months later what parameters produced it
+  without re-running the detector. It looked orphaned because the whole `run_id`
+  mechanism was documented nowhere but the code and an archived PR review. New
+  "Persisted detector runs" section in `docs/ANOMALY_DETECTION.md` covers what a
+  `DetectorRun` stores, `run_id` as a filter param across events/count/histogram/
+  bulk-annotate/export/viz, and the 404-on-stale-id contract.
+- **`.env.example` needed no change** (#160). The issue's "~23 of ~88" is stale: the file
+  names 66 of 98 settings fields, and all 98 are covered by a `SettingSpec`
+  (`tests/test_settings_api.py::test_registry_covers_every_settings_field`), so every
+  field is editable in the admin console whether or not it appears here. The curated
+  subset plus the precedence header shipped in session 109 is the design. The one name in
+  the file with no matching field, `VESTIGO_FRONTEND_REBUILD`, is a genuine env-only var
+  read in `web/app.py`.
+- ROADMAP's "Open defects" section is deleted rather than left standing empty.
 
 ## Session 119 — 2026-07-29: story exports were dropping every chart
 
