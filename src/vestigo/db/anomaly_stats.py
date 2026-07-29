@@ -3120,8 +3120,14 @@ class StatisticalAnomalyService:
         distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
         Values above the band look random (DGA domains, encoded payloads,
         keys); values below it look degenerate (padding, repeated-character
-        stuffing). AMiner ``EntropyDetector`` — entropy is a property of the
-        characters, never of what the value means.
+        stuffing). Entropy is a property of the characters, never of what the
+        value means.
+
+        Inspired by AMiner's ``EntropyDetector`` but **not the same statistic**:
+        AMiner scores values against a learned character-*bigram* transition
+        table, which catches ordinary-alphabet-unusual-order values (DGA
+        domains); per-value Shannon entropy does not. See
+        ``docs/ANOMALY_DETECTION.md`` §6 and roadmap D11.
 
         Two modes: *self-baseline* (``method="iqr"``) computes the fence over
         the whole corpus's per-distinct-value entropies (unlike an exact

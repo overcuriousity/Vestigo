@@ -684,6 +684,13 @@ invisible characters are visible in the report.
 
 ### Caveats
 
+- **One alphabet per field, not per identifier.** AMiner's `CharsetDetector`
+  learns a separate charset per `id_path_list` value (per host, per user, per
+  session); Vestigo learns one alphabet for the whole field across the scope.
+  A field that is legitimately Cyrillic for one host and ASCII for the rest
+  therefore has a merged reference alphabet, and neither host's characters
+  look novel. Scope the timeline to that source if the distinction matters.
+  Per-identifier scoping is roadmap D14.
 - **Free-text fields in large scripts.** A field whose reference alphabet
   exceeds 5,000 characters (CJK prose, base64 blobs mixing full alphabets) is
   skipped — "novel character" is meaningless there. Fields with fewer than 20
@@ -719,7 +726,17 @@ the field's normal values — too random, or too repetitive?" A DGA domain
 (`kq3v9xz2m8w1.com`) among human-named hosts, a base64 payload in a field of
 plain words, a padding string of one repeated character.
 
-Adapted from AMiner's `EntropyDetector`.
+Inspired by AMiner's `EntropyDetector`, but **a different statistic** — be
+precise about this when comparing the two. AMiner learns a character-*bigram*
+transition table over the field and flags values whose mean pair probability
+falls below a threshold; Vestigo measures each value's own Shannon character
+entropy against a learned band. The consequence is concrete: a value built
+from perfectly ordinary characters in an unusual *order* (a lowercase-latin
+DGA domain among English hostnames) has ordinary Shannon entropy and will
+**not** be flagged here, while AMiner's bigram model catches it. What this
+detector reliably finds is values whose character *mix* is unlike the field's
+— base64/hex blobs among words, and the degenerate low end. The bigram
+variant is roadmap D11.
 
 **Why it's useful:** Randomness is a fingerprint of machine-generated content
 — DGA domains, encoded/encrypted payloads, session keys dropped into the wrong
@@ -1101,6 +1118,12 @@ every event.
   across the whole source, or scope the timeline to per-stream sources. A
   per-stream secondary partition field is a possible follow-up, deliberately
   not implemented yet.
+- **No gap bound between n-gram members.** AMiner's `EventSequenceDetector`
+  resets an in-progress sequence when more than `timeout` seconds pass between
+  events; Vestigo has no such bound, so three consecutive records for a source
+  form an n-gram even if days separate them. On a quiet source that manufactures
+  "sequences" out of unrelated events. Prefer windows dense enough that
+  consecutive really means consecutive. A max-gap parameter is roadmap D14.
 - **Tiny baselines make everything novel.** A baseline with few complete
   n-grams vouches for almost nothing; the <50-n-gram warning fires, and n = 4
   or 5 on a short baseline mostly measures the baseline's poverty. Prefer

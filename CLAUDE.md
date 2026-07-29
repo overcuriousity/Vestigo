@@ -197,8 +197,11 @@ distinct in anything user-facing.**
   source, not a competitor.** Different problem (online detection over live streams).
   Never claim to beat it or replace it. We took the explainability principle and a
   catalogue of methods re-derived as batch SQL, and we are deliberately narrower: detectors
-  must be field-agnostic and SQL-explainable, `TSAArimaDetector` is skipped, D10 is
-  unbuilt. Someone who needs live-stream detection should run AMiner.
+  must be field-agnostic and SQL-explainable, `TSAArimaDetector`/`PCADetector` are skipped.
+  About two thirds of its catalogue has an analog here; the remaining gaps and the places
+  our analog is narrower than the original are tracked in `ROADMAP.md` Milestone 4 — keep
+  that list honest rather than claiming parity. Someone who needs live-stream detection
+  should run AMiner.
 
 Consult both for how they solve problems, and borrow freely.
 

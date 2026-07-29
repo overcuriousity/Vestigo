@@ -144,9 +144,13 @@ replaces or claims to beat. What we took is the principle that a detector must e
 itself, plus a catalogue of methods we re-derived as batch SQL over an ingested corpus.
 We are deliberately *narrower* there: our detectors must be field-agnostic and
 SQL-explainable to meet the forensic-reproducibility requirement, which rules out
-approaches AMiner can use freely. `TSAArimaDetector` is skipped outright, and its
-`EventCorrelationDetector` (roadmap D10) is not built yet. Anyone who needs continuous,
-online detection on a live stream should run AMiner — that is what it is for.
+approaches AMiner can use freely — `TSAArimaDetector` and `PCADetector` are skipped
+outright for that reason. Roughly two thirds of its detector catalogue has an analog here;
+the rest is tracked as an explicit gap list in `ROADMAP.md` Milestone 4, including
+`EventCorrelationDetector`, `VariableCorrelationDetector` and `PathValueTimeIntervalDetector`,
+and a few of our analogs are narrower than the original in ways each detector's Caveats
+section names. Anyone who needs continuous, online detection on a live stream should run
+AMiner — that is what it is for.
 
 **Timesketch is the tool we are in the same category as.** The investigative model came
 from it, and the goal is not to be a lighter version: it is to be the better tool for an

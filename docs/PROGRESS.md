@@ -1,9 +1,50 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 125 — AMiner positioning correction).
+Last updated: 2026-07-29 (session 126 — AMiner detector gap audit).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 126 — 2026-07-29: AMiner detector gap audit, and two claims that were not true
+
+**Why.** Session 125 fixed how we *talk* about logdata-anomaly-miner. This session read its
+`aminer/analysis/` source module by module and checked what we actually adapted against
+what we claim to have adapted. Coverage is roughly two thirds of the upstream catalogue,
+and the batch/forensic reframing (analyst-declared baseline definitions replacing
+`learn_mode` + persistence) holds up as the right port. Two claims did not.
+
+- **The entropy detector was mislabeled.** `docs/ANOMALY_DETECTION.md` §6 said "Adapted
+  from AMiner's `EntropyDetector`". It is a different statistic: AMiner learns a
+  character-**bigram** transition table and flags low mean pair probability; we compute
+  per-value Shannon character entropy against a Tukey fence. That difference has teeth —
+  a lowercase-latin DGA domain among English hostnames, the example the section leads with,
+  has unremarkable Shannon entropy and is **not** flagged, while AMiner's model catches it.
+  Corrected in the doc and in the `find_entropy_outliers` docstring, with the capability gap
+  filed as **D11** (ship the bigram model as a second `method` on the same detector).
+- **Two scope narrowings were undocumented.** Charset learns one alphabet per field where
+  AMiner learns one per `id_path_list` identifier, so hosts that legitimately differ get
+  merged into a reference alphabet that flags neither. Sequence n-grams have no gap bound
+  where AMiner resets a sequence after `timeout` seconds, so a quiet source manufactures
+  "sequences" from events days apart. Both are now Caveats; closing them is **D14**.
+- **Five real gaps added to Milestone 4**, ordered truth-first then payoff-per-effort:
+  D12 time-of-day habit (`PathValueTimeIntervalDetector`), D13 cross-field value correlation
+  (`VariableCorrelationDetector` — intra-record, distinct from D10's temporal rules),
+  D15 impossible-speed transitions (`MinimalTransitionTimeDetector`), D16 multivariate
+  window profiles (`EventCountClusterDetector`), D17 new field key (`NewMatchPathDetector`).
+  D12/D13/D15 are the cheap ones — they reuse the `lagInFrame` partitions, the `_col_expr`
+  field resolution and the G-test/BH pool that already ship.
+- **`PCADetector` moved to explicitly skipped**, with a reason rather than an omission: its
+  output is a reconstruction error in a rotated space that cannot be traced back to events,
+  which is exactly what the field-agnostic/SQL-explainable constraint exists to prevent.
+  D16 is the same signal, readable, cheaper.
+- **Standing requirement recorded on the milestone**: a detector is not shipped until its
+  Method-tab explanation, visible SQL/params and disposition wiring land with it. Reasoning
+  an analyst cannot read fails the reproducibility bar regardless of the statistics.
+
+Docs touched: `ANOMALY_DETECTION.md` (§6 rewrite, charset + sequence caveats), `ROADMAP.md`
+(M4 restructured into the priority tiers, priority list at top), `CONCEPT.md` §8 (gap list
+instead of a two-item omission), `CLAUDE.md` (same), `db/anomaly_stats.py` (docstring).
+No behavior change.
 
 ## Session 125 — 2026-07-29: AMiner is a method source, not a competitor
 

@@ -12,10 +12,17 @@ TODOs. Phase 3 is complete, so the queue is feature-shaped.
 
 **Priority order,** roughly by payoff-per-effort:
 
-1. **A12** local transform tools — no design round needed, no OPSEC gate.
-2. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
-3. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
-4. **D10** correlation rules — heaviest lift, last of the detector line.
+1. **D11** entropy bigram variant — closes a capability gap the shipped docs used to
+   overclaim; truth of what we ship outranks new surface.
+2. **D14** charset per-identifier scoping + sequence max-gap — same reason, two documented
+   narrowings that should not need a caveat.
+3. **A12** local transform tools — no design round needed, no OPSEC gate.
+4. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
+   transitions — cheap detectors reusing existing SQL machinery, high forensic payoff.
+5. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
+6. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
+7. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
+   the detector line.
 
 Milestone 2–3 items are polish, picked up opportunistically. Milestones 6 (streaming
 ingest) and 7 (forensic examination) are future phases gated on a joint S1+E1 design
@@ -71,14 +78,117 @@ requirement. D1–D9 plus `proportion_shift` and `sequence_motif` shipped — se
 `docs/ANOMALY_DETECTION.md` for every detector's contract, and update it in the same
 commit as any detector change. Remaining:
 
+Gap audit against the upstream `aminer/analysis/` catalogue, 2026-07-29 — the items below
+are ordered by the standing priority rule: **truth of shipped claims first**, then
+low-effort/high-value, high-effort/high-value, low-effort/low-value, high-effort/low-value.
+
+Every detector item below is incomplete until the frontend half lands with it: a Method-tab
+explanation in the same plain-language register as the existing fourteen, the SQL/params
+visible on the finding, and disposition + allowlist wiring. A detector an analyst cannot
+read the reasoning of does not meet the reproducibility bar and does not count as shipped.
+
+### Truth of shipped claims (do first)
+
+- [ ] **D11 — Entropy: add the bigram variant.** The shipped `entropy` detector measures
+  per-value Shannon character entropy against a Tukey fence; AMiner's `EntropyDetector`
+  learns a character-**bigram** transition table and flags low mean pair probability. These
+  answer different questions, and ours misses the case its own docs advertise most loudly:
+  a lowercase-latin DGA domain among English hostnames has unremarkable Shannon entropy.
+  The false "adapted from" claim is already corrected in `docs/ANOMALY_DETECTION.md` §6 and
+  the `find_entropy_outliers` docstring — this item closes the capability gap rather than
+  the wording. Expressible in SQL: learn `P(c₂|c₁)` from the baseline window's distinct
+  values via `arrayMap`/`ngrams(val, 2)` into a frequency map, score detect-window values
+  by mean pair probability, flag below `prob_thresh` (AMiner default 0.05). Ship as a
+  `method` on the existing entropy detector (`shannon-iqr` | `bigram`), not a fifteenth
+  tool — same field selection, same findings shape, one more radio in the UI.
+- [ ] **D14 — Close the two documented scope narrowings.** Both are now written down as
+  caveats; this item removes the need for the caveat.
+  - *Charset per identifier.* AMiner scopes charsets by `id_path_list`; we learn one
+    alphabet per field across the whole scope, merging hosts that legitimately differ.
+    Add an optional group-by field to `find_charset_anomalies` (the `_col_expr` mechanism
+    already resolves arbitrary fields), learn one alphabet per group.
+  - *Sequence max-gap.* AMiner resets an in-progress sequence after `timeout` seconds; our
+    n-grams have no gap bound, so a quiet source manufactures sequences from unrelated
+    events days apart. Add a `max_gap` param to `find_sequence_novelty` /
+    `find_sequence_motifs` — a `dateDiff` guard inside the existing `lagInFrame` window,
+    cheap because the partitioning is already there. Both detectors must take it, or they
+    stop agreeing on what a sequence is.
+
+### Low effort, high value
+
+- [ ] **D12 — Time-of-day habit** (AMiner `PathValueTimeIntervalDetector`): per value, learn
+  which times of day it occurs at in the baseline window, flag suspect-window occurrences
+  outside that habit. "This service account only ever authenticates 08:00–18:00" is a
+  first-order forensic signal and nothing currently covers it — `interval_periodicity`
+  measures *inter-arrival gaps*, a different question (a beacon every 300s is regular but
+  has no time-of-day habit; a 09:00 batch job has a habit but wildly irregular gaps).
+  Cheap in SQL: bucket by `toHour`/`toMinute` per value over the baseline, flag detect-window
+  events whose bucket has no baseline mass, score by distance to the nearest occupied
+  bucket (AMiner's `max_time_diff`, default 360s). Needs an explicit **timezone** decision
+  in the design — habits are local-time facts and the corpus is UTC; whatever is chosen has
+  to be stamped into `DetectorRun.params` or the run is not reproducible.
+- [ ] **D13 — Cross-field value correlation** (AMiner `VariableCorrelationDetector`): learn
+  which field-value pairs co-occur *within the same event* in the baseline, flag
+  suspect-window events that violate an established association. "This user is always on
+  this subnet", "this process always has this parent". Distinct from D10, which is temporal
+  (A *then* B); this is intra-record. Reuses machinery wholesale — `GROUP BY a, b` plus the
+  G-test and Benjamini–Hochberg pool that `proportion_shift` already has, and AMiner's own
+  "Rel" method (deterministic one-to-one mapping violated) is the trivially explainable
+  case worth building first. Field-pair explosion is the real design problem: needs a
+  preselection rule (AMiner uses distribution matching) and a candidate cap in the
+  `HEAVY_SCAN_SETTINGS` family, honestly reported like the other caps.
+- [ ] **D15 — Impossible-speed transitions** (AMiner `MinimalTransitionTimeDetector`): learn
+  the minimum observed time between consecutive values of a field for a given identifier,
+  flag a suspect-window transition faster than the baseline ever saw. Impossible travel,
+  automation posing as a human. `find_sequence_novelty`'s ordered `lagInFrame` partitions
+  already produce consecutive pairs with their timestamps — this is a `min(dateDiff)`
+  aggregate over the same shape, so the incremental cost is small. Score = AMiner's
+  `1 − (observed / learned_min)`, which is already a 0–1 confidence.
+
+### High effort, high value
+
 - [ ] **D10 — Event correlation rules** (AMiner `EventCorrelationDetector`): mine baseline
   implication rules "value A is followed by value B within Δt", flag violations in the
   detect window. Highest analytical payoff, heaviest lift (rule mining + hypothesis
   testing). Stepping stone shipped: `sequence_motif`'s recurring n-grams are the natural
-  antecedent set.
+  antecedent set. AMiner's online form generates hypotheses randomly and confirms them with
+  a binomial test (`p0` 0.9, `alpha` 0.05) — the batch re-derivation should mine candidate
+  antecedents deterministically instead, since random hypothesis generation is not
+  reproducible and reproducibility is non-negotiable here.
+- [ ] **D16 — Multivariate window profiles** (AMiner `EventCountClusterDetector`): build a
+  count vector per time bucket (one dimension per value of the series field), compare each
+  suspect bucket against the baseline buckets by normalized Manhattan distance, flag beyond
+  `confidence_factor` (AMiner default 0.33). Catches what `frequency` structurally cannot: a
+  change in the *mix* of event types at constant total volume, which is what a compromised
+  host looks like when the attacker keeps the noise floor steady. Effort is in making it
+  explainable — a distance is not a p-value, so the finding must name the dimensions that
+  contributed most of the distance, or it fails the explainability bar. Optional IDF
+  weighting is upstream's answer to rare-event dominance and worth carrying.
 
-Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — the z-score `frequency`
-detector covers most of it and stays explainable).
+### Low effort, low value
+
+- [ ] **D17 — New field key** (AMiner `NewMatchPathDetector`): flag *attribute keys* that
+  appear in a suspect window but never in the baseline — a new field, not a new value.
+  Nothing covers it today. Genuinely trivial (`arrayJoin` over attribute keys, set
+  difference), and genuinely marginal: for most sources a new key means a format change or
+  a converter update, not an intrusion. Build it when touching field inventory anyway.
+
+Skipped deliberately:
+
+- `TSAArimaDetector` / `PathArimaDetector` — ARIMA forecasting; the z-score `frequency`
+  detector covers most of it and stays explainable.
+- `PCADetector` — principal-component analysis over event count vectors. High effort, and
+  the output is a reconstruction error in a rotated space that no analyst can trace back to
+  events. It fails the explainability requirement by construction, which is the whole reason
+  the field-agnostic/SQL-explainable constraint exists. D16 is the same signal at a fraction
+  of the cost with findings you can read. Revisit trigger: D16 ships and demonstrably misses
+  correlated multi-field drift that only a rotation exposes.
+- `HistogramAnalysis` / `ParserCount` — descriptive statistics, not detection; the Explorer
+  histogram and field inventory already serve this.
+- Every `learn_mode` / persistence / `stop_learning_*` mechanism — replaced wholesale by
+  analyst-declared baseline definitions. This is the core adaptation, not a gap: it is what
+  turns an online detector into a reproducible forensic one, and it is why no Vestigo
+  detector has hidden state carried between runs.
 
 ## Milestone 5 — post-mortem workflow depth (Timesketch-inspired, then past it)
 
