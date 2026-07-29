@@ -398,6 +398,15 @@ trigger: a user asks the agent to restructure a story.
   anchor to the DOM before clicking it (Firefox/Safari need this) and sanitizes
   the filename.
 
+  Charts export as real `<svg>`, drawn at a **pinned width**:
+  `SnapshotRenderer` provides `ChartStaticWidthContext` (848px — the
+  `max-w-4xl` article minus its `p-6` gutters), which `ChartFrame` uses as its
+  starting width. Without it the export drew no charts at all (issue #197):
+  `ChartFrame` normally learns its width from a `ResizeObserver` in an effect
+  and gates on `width > 0`, and `renderToStaticMarkup` runs neither. A live
+  `ResizeObserver` still overrides the pinned value, so on-screen charts are
+  unaffected.
+
 Embed cards distinguish **"the target was deleted"** from **"the lookup
 failed"**. A 500 or a network blip reported as a deletion is worse than
 silence, given the subsystem's promise that a story degrades visibly rather

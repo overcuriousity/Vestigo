@@ -1,9 +1,30 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 117 — "Add at top" adds at the top).
+Last updated: 2026-07-29 (session 118 — story exports draw their charts again).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 118 — 2026-07-29: story exports were dropping every chart
+
+**Why.** Issue #197: "story exports dont render diagrams, only the sections."
+
+- **The charts were never in the file.** `ChartFrame` starts at `width = 0` and learns
+  its real width from a `ResizeObserver` in an effect, gating on `{width > 0 && <svg/>}`.
+  The export renders through `renderToStaticMarkup`, which runs no effects and has no
+  `ResizeObserver`, so the width stayed 0 and each chart block emitted an empty `<div>`.
+  Nothing errored, which is why it read as "only the sections".
+- **Fixed with a pinned static width**, not a raster fallback: `ChartStaticWidthContext`
+  supplies `ChartFrame`'s *starting* width, and `SnapshotRenderer` provides 848px (the
+  `max-w-4xl` article minus its `p-6` gutters). A live `ResizeObserver` still overrides
+  it, so nothing about the on-screen charts changes. The export stays real `<svg>` —
+  selectable text, no resolution ceiling, and still self-contained, which a PNG/SVG
+  round-trip through the server would have complicated for no gain.
+- **Verified by rendering it**, not just by asserting a tag: the exported document
+  screenshots with both charts drawn — bar chart with category labels and value
+  annotations, time histogram with axes and rotated tick labels. The regression test
+  requires at least one `<svg>` per resolved chart block plus actual drawn geometry, and
+  fails on the pre-fix build (1 svg — a lucide icon — for 2 chart blocks).
 
 ## Session 117 — 2026-07-29: "Add at top" was adding at the bottom
 

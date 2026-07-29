@@ -92,4 +92,22 @@ describe("SnapshotRenderer", () => {
     expect(html).not.toMatch(/<link[^>]+href=/i);
     expect(html).not.toMatch(/(?:src|href)="https?:\/\//i);
   });
+
+  it("draws the charts, not just the prose around them (issue #197)", () => {
+    // `renderToStaticMarkup` runs no effects and jsdom's ResizeObserver stub
+    // is irrelevant to it, so `ChartFrame` sat at width 0 and its
+    // `{width > 0 && <svg/>}` gate emitted nothing. Every exported report
+    // carried its sections and silently dropped every diagram.
+    const html = renderExportHtml(snapshot, "a".repeat(64));
+
+    const chartBlocks = snapshot.blocks.filter(
+      (b) => b.kind === "chart_ref" && (b.data as { chart?: unknown } | null)?.chart != null,
+    );
+    expect(chartBlocks.length).toBeGreaterThan(0);
+
+    const svgCount = (html.match(/<svg/g) ?? []).length;
+    expect(svgCount).toBeGreaterThanOrEqual(chartBlocks.length);
+    // Drawn geometry, not just an empty framed <svg>.
+    expect(html).toMatch(/<(?:rect|path|circle|line)\b/);
+  });
 });
