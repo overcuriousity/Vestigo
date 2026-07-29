@@ -12,7 +12,10 @@ A local-first, forensic-grade log investigation platform for security teams: ing
 Incident responders and forensic analysts work with massive timeline-shaped datasets (Plaso output, Windows Event Logs, endpoint telemetry, cloud audit trails). Existing options force a choice between:
 - **Full SIEMs** that are expensive, noisy, and not timeline-investigation native.
 - **Notebook scripts** that are flexible but not reproducible or team-friendly.
-- **Timesketch** which is powerful but operationally heavy and broad.
+- **Timesketch**, which got the investigative model right and is the reason this category
+  exists at all — but which asks for a search cluster, a broker and a worker fleet before
+  the first event lands, and treats detection as analyzers bolted beside the timeline
+  rather than as the thing the analyst is doing.
 
 Vestigo is a focused, self-hosted alternative: ingest huge logs, explore them like an ELK stack, and let local embeddings surface the needles in the haystack.
 
@@ -132,6 +135,36 @@ Formerly listed here but since taken on: the story/report builder shipped (see
 open roadmap items — see `docs/ROADMAP.md`.
 
 ## 8. Differentiation
-- **Scale + simplicity**: Designed from the start for 80 GiB+ timelines while staying a single native app that's easy to operate.
-- **Embedding-native investigation**: Vectors are not an afterthought; they power anomaly detection and semantic search inside the same UI used for filtering.
-- **Forensic rigor by default**: Immutable sources, provenance metadata, model-config stability checks, offline-first operation.
+
+Vestigo owes its shape to Timesketch and logdata-anomaly-miner, and says so — the
+investigative model came from the first, the conviction that detection must stay
+explainable from the second. The goal is not to be a lighter Timesketch; it is to be the
+better tool for an analyst who wants the investigative UX *and* the detection depth in one
+place. Where we claim to be ahead:
+
+- **Detection is the workflow, not a side panel.** Fourteen analysis tools ship in the box
+  — statistical detectors, a Sigma runner, log-template clustering, semantic similarity —
+  and every one is explainable down to the SQL it ran. Temporal detectors score against an
+  analyst-declared baseline window rather than a global notion of "normal", and findings
+  carry `normal`/`dismissed`/`confirmed` verdicts that survive re-scans, so triage
+  accumulates instead of being redone.
+- **Provenance at event granularity.** Every event carries a SHA-256 of its own raw content
+  and the byte offset it was read from; sources are immutable and hashed whole; parser and
+  embedding configurations are hashed into the identity of what they produce, so a
+  reproduced run is provably the same run. Chain of custody survives to the individual
+  record, not just the import.
+- **Operational floor low enough to actually deploy.** One native application process
+  against PostgreSQL, ClickHouse and Qdrant — no search cluster, no message broker, no
+  worker fleet — while handling 300M-row cases. Airgapped by default rather than as a
+  hardening exercise, which matters in the labs this tool is for.
+- **Embedding-native, but never embedding-dependent.** Vectors power semantic search and
+  similarity inside the same UI used for filtering, yet every statistical detector works
+  the instant ingestion finishes, with no model and no GPU. The optional half stays
+  optional.
+- **The report is part of the tool.** Stories compose an investigation write-up from live
+  view, chart and event blocks that track the data as it changes, then freeze to a
+  hashed, reproducible snapshot on export.
+
+Where we are honestly behind: Timesketch has years of production hardening, a larger
+analyzer ecosystem and a community we do not have yet. We are earning that, not claiming
+it.

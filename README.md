@@ -22,10 +22,33 @@ A local-first, forensic-grade log investigation platform for security teams.
 Vestigo ingests Timesketch-compatible timelines at scale, lets analysts explore them
 through an ELK-like web interface, and surfaces anomalies with explainable statistical
 detectors, Sigma rules, and locally-computed embeddings — reproducible and auditable at
-every step, airgapped if needed. It sits between a heavyweight SIEM and one-off notebook
-scripts: [Timesketch](https://github.com/google/timesketch)'s investigative UX combined
-with [logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner)'s
-lightweight, explainable detection, without needing a cluster to run it.
+every step, airgapped if needed.
+
+It stands on the shoulders of two projects we admire:
+[Timesketch](https://github.com/google/timesketch), which defined what collaborative
+timeline investigation should feel like, and
+[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner), which showed
+that useful detection does not have to be a black box. Vestigo's ambition is to be the
+better tool for the analyst who wants both at once, and it takes three positions to get
+there:
+
+- **Detection is a first-class part of the investigation, not an add-on.** Fourteen
+  analysis tools ship in the box, every one of them explainable down to the SQL it ran.
+  Each temporal detector scores against an analyst-declared baseline window, and each
+  finding carries a verdict that survives re-scans — so "why is this flagged?" always has
+  an answer, and answering it once is not wasted work.
+- **Provenance goes all the way down.** Not just "this file was imported": every single
+  event carries a SHA-256 of its own raw content and the byte offset it came from, and
+  parser and embedding configurations are hashed into the identity of what they produce.
+  A finding is traceable to a byte range in an immutable, hashed original, months later.
+- **One process, three services, no cluster.** No search cluster, no message broker, no
+  worker fleet — the whole application is a single native process against PostgreSQL,
+  ClickHouse and Qdrant, comfortable on 300M-row cases and 80 GiB+ timelines. Offline by
+  default, so it runs in an airgapped lab without special handling.
+
+We are not finished, and Timesketch is a mature project with years of production use behind
+it. But on those three axes we think Vestigo is already the better place to run an
+investigation.
 
 <img width="2866" height="1589" alt="Vestigo Explorer" src="https://github.com/user-attachments/assets/d505af86-9ba2-4fe1-b448-10b18ae2d409" />
 

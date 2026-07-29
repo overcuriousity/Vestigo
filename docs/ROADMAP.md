@@ -80,7 +80,7 @@ commit as any detector change. Remaining:
 Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — the z-score `frequency`
 detector covers most of it and stays explainable).
 
-## Milestone 5 — post-mortem workflow parity (Timesketch-inspired)
+## Milestone 5 — post-mortem workflow depth (Timesketch-inspired, then past it)
 
 - [ ] **W5 residue — Sigma `logsource` scoping.** The runner shipped (session 63:
   `src/vestigo/sigma/`, `docs/ANOMALY_DETECTION.md` §13) but rules always run over the

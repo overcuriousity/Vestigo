@@ -1,9 +1,39 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 123 — dropped the "small teams" framing).
+Last updated: 2026-07-29 (session 124 — positioning against prior art).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 124 — 2026-07-29: say what we are better at, and what we are not
+
+**Why.** The positioning undersold the project. "Sits between a heavyweight SIEM and one-off
+notebook scripts" describes a gap being filled, not a tool worth choosing, and CONCEPT.md
+dismissed Timesketch in five words ("powerful but operationally heavy and broad") — both
+too timid and, in being that terse, faintly rude about the project we borrowed the entire
+investigative model from.
+
+- **README leads with three positions instead of a gap.** Detection as a first-class part
+  of the investigation (fourteen tools, explainable to the SQL, baseline-scored, verdicts
+  that survive re-scans); provenance at event granularity (per-event content SHA-256 +
+  byte offset, hashed configs, immutable hashed sources); and one process against three
+  services with no cluster, broker or worker fleet. Credit to Timesketch and
+  logdata-anomaly-miner is now explicit and warm rather than a parenthetical, and the
+  section closes by naming Timesketch's maturity as real.
+- **CONCEPT.md §8 rewritten from three bland bullets to five grounded ones**, plus an
+  explicit "where we are honestly behind" (production hardening, analyzer ecosystem,
+  community). §2's one-line dismissal became a specific, fair critique — the deployment
+  floor and detection-as-side-panel — rather than an adjective.
+- **Every claim was checked against code before it was written**: 98 settings fields, no
+  celery/redis anywhere in `pyproject.toml`, `byte_offset`/`content_hash`/`file_hash` on
+  `models/event.py` and folded into `derive_event_id`, reproducible canonical-JSON snapshot
+  hashing in `stories/schemas.py`. Deliberately avoided any assertion about Timesketch's
+  *current* feature set, since nothing in this session verified one — the comparative claims
+  are about architecture and about what Vestigo ships, which are checkable.
+- **CLAUDE.md gained a tone rule** so this does not drift either way later: confident about
+  what ships, never dismissive of prior art, never a claim without code behind it, and no
+  unverified comparative statements about another project's features.
+- Milestone 5's heading dropped "parity" — W8 (schema-on-read) was never parity work.
 
 ## Session 123 — 2026-07-29: Vestigo is not a "small team" tool
 

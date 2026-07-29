@@ -183,4 +183,21 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
   (`VESTIGO_OIDC_ENABLED`) is deliberately independent of `VESTIGO_ALLOW_ONLINE` — see `TECH_STACK.md` §6.
   
 ## References
-This project is inspired heavily by the existing projects https://github.com/ait-aecid/logdata-anomaly-miner and google/timesketch. Our goal is to become the perfect combination of them, evolving to the best forensic log analysis system in existence. Consult these for how they solve problems and their features and get inspiration there.
+
+Vestigo builds on two projects: [timesketch](https://github.com/google/timesketch) (the
+investigative model — cases, timelines, collaborative annotation) and
+[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner) (field-agnostic,
+explainable detectors). Consult both for how they solve problems, and borrow freely.
+
+The goal is not to clone either: it is to be the better tool for an analyst who wants the
+investigative UX *and* the detection depth in one place, at a deployment footprint a
+two-person lab can run. `docs/CONCEPT.md` §8 lists where we currently claim to be ahead
+(detection as the workflow, event-granular provenance, low operational floor,
+embeddings optional not required, reporting built in) and where we are honestly behind
+(production hardening, analyzer ecosystem, community).
+
+**Tone rule for anything user-facing** (README, docs, UI copy): confident about what we
+actually ship, never dismissive of prior art, and never a claim we cannot point at code
+for. Credit the inspiration explicitly. "We think we are better at X, here is why" is
+fine; "project Y is bad" is not, and neither is a comparative claim about another
+project's current feature set that nobody verified.
