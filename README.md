@@ -17,23 +17,23 @@
   <img src="https://img.shields.io/badge/react-19-61DAFB?logo=react&logoColor=black" alt="React 19">
 </p>
 
-A local-first, forensic-grade log investigation platform for security teams.
+A local-first, large-scale log investigation platform for forensic investigators.
 
-Vestigo ingests Timesketch-compatible timelines at scale, lets analysts explore them
-through an ELK-like web interface, and surfaces anomalies with explainable statistical
-detectors, Sigma rules, and locally-computed embeddings — reproducible and auditable at
-every step, airgapped if needed.
+Vestigo ingests Timesketch-compatible timelines.
+Analysts can inspect them throug a web interface, which inherits established UX from ELK-Style interfaces.
+It surfaces anomalies with explainable statistical detectors and/or Sigma rules.
+The methods are documented, and explained right in the web interface for peer review.
+The complete application writes a granular audit trail and can enforce offline deployment, for an optimal chain of custody preservation.
 
-Two projects made this one possible, in different ways.
-[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner) is where our
-detection methods come from — it is a different kind of tool, an online detection engine
-watching live log streams, and we are not competing with it or replacing it. What we took
-is its conviction that a detector must be able to explain itself, and a catalogue of
-methods we then re-derived as batch SQL over an already-ingested corpus. Several of its
+Two projects inspired the creation of this:
+[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner) is where the statistical
+detection methods come from. Aminer is an online detection engine
+for live log streams. We try to adapt the premise that a detector must be able to be reproducible, and we implement multiple
+methods which are executed as batch SQL over an already-ingested corpus. Several of its
 detectors we deliberately do not implement.
 
-[Timesketch](https://github.com/google/timesketch) is the tool Vestigo is in the same room
-as: it defined what collaborative timeline investigation should feel like, and the
+[Timesketch](https://github.com/google/timesketch) is the main inspiration.
+Timesketch defined what collaborative timeline investigation should feel like, and the
 Case/Timeline model here is descended from it. That is the comparison we invite, and on
 three axes we think we are already the better place to run an investigation:
 
