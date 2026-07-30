@@ -212,6 +212,22 @@ Parquet supports arbitrary key-value footer metadata; Vestigo requires these key
 | `vestigo.converter_version`      | Converter version string, e.g. `"1.0.0"`. Becomes the event's `parser_version`. |
 | `vestigo.original_files`         | JSON array of `{"name": str, "sha256": str, "size_bytes": int}` — one entry per raw input file (a directory input yields several). |
 
+### Optional forensic footer metadata (converters >= 1.3.0)
+
+Converters >= 1.3.0 also write additive, self-documenting chain-of-custody footer keys.
+The reader does not require them (`validate_parquet_source` ignores them), but they are
+readable from the Parquet footer:
+
+| Key                            | Content                                                        |
+| ------------------------------ | -------------------------------------------------------------- |
+| `vestigo.converted_at`         | ISO-8601 UTC timestamp of the conversion run.                  |
+| `vestigo.row_counts`           | JSON `{"parsed", "skipped_malformed", "skipped_by_time"}`.     |
+| `vestigo.timezone_assumption`  | Free-text note on any timezone/year assumption.                |
+| `vestigo.parse_decisions`      | JSON of format-specific parsing choices.                       |
+
+`vestigo.original_files` entries likewise gained `path` (absolute source path) and
+`mtime` (ISO-8601 UTC) in 1.3.0; older files without them remain valid.
+
 ### Minimal example (Python / pyarrow)
 
 ```python

@@ -93,7 +93,7 @@ COLUMN SEMANTICS
 - content_hash: SHA-256 hex digest of the original raw line/record text. Never null.
 - (The four provenance columns above anchor forensic event identity — the server rejects the whole file if any row has a null in them.)
 - message: human-readable one-line summary of the event (fall back to the raw line if in doubt).
-- timestamp: millisecond-precision, UTC-tagged Arrow timestamp. Convert to UTC; document any input-timezone assumption at the top of the script. If a timestamp cannot be parsed, write null — do not guess and do not drop the row.
+- timestamp: millisecond-precision, UTC-tagged Arrow timestamp. Convert to UTC; record any input-timezone assumption in the "vestigo.timezone_assumption" footer metadata key. If a timestamp cannot be parsed, write null — do not guess and do not drop the row.
 - timestamp_desc: short label for what the timestamp means, e.g. "Event Logged" ("" if absent).
 - artifact: short artifact/source type, e.g. "myapp:auth" ("" if absent).
 - artifact_long: long-form artifact type, e.g. "application:auth:login" ("" if absent).
@@ -105,7 +105,13 @@ REQUIRED FOOTER METADATA (schema.with_metadata({...}))
 - "vestigo.format_version": "1"
 - "vestigo.converter_name": a short converter identifier, e.g. "myapp2vestigo"
 - "vestigo.converter_version": a version string, e.g. "1.0.0"
-- "vestigo.original_files": JSON array of {"name": str, "sha256": str, "size_bytes": int}, one entry per raw input file
+- "vestigo.original_files": JSON array of {"name": str, "sha256": str, "size_bytes": int, "path": str, "mtime": str}, one entry per raw input file. "path" is the absolute source path, "mtime" its ISO-8601 UTC mtime.
+
+OPTIONAL FORENSIC FOOTER METADATA (self-documenting chain of custody; the server reads but does not require these)
+- "vestigo.converted_at": ISO-8601 UTC timestamp of the conversion run.
+- "vestigo.row_counts": JSON {"parsed": int, "skipped_malformed": int, "skipped_by_time": int}.
+- "vestigo.timezone_assumption": free-text note on any timezone or year assumption the parser made ("" if none).
+- "vestigo.parse_decisions": JSON object of format-specific parsing choices.
 
 CLI CONVENTION
 - argparse with: -i/--input (required; file, directory, or glob), -o/--output (required; .parquet path), -v/--verbose (progress to stderr).
@@ -130,7 +136,7 @@ OUTPUT FORMAT
   - source: short artifact/source type, e.g. "myapp:auth".
   - source_long: long-form artifact type, e.g. "application:auth:login".
   - display_name: optional display label for the source.
-  - tag: comma-separated tags, e.g. "ssh,brute-force" (in JSONL, "tags" as a JSON array of strings is also fine).
+  - tag: comma-separated or pipe-separated tags, e.g. "ssh,brute-force" or "ssh|brute-force" (in JSONL, "tags" as a JSON array of strings is also fine).
 - Every OTHER column/key is preserved verbatim as a free-form attribute — put all format-specific fields (IPs, status codes, usernames, ...) in extra columns/keys with snake_case names. Keep each value atomic — no packed/pipe-joined fields.
 - CSV specifics: header row first, comma delimiter, RFC 4180 quoting ("" escapes embedded quotes).
 
