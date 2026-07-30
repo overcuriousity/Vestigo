@@ -1,9 +1,46 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 128 — EVTX converter review fixes).
+Last updated: 2026-07-30 (session 129 — PR #208 review fixes).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 129 — 2026-07-30: PR #208 review findings
+
+**Why.** Full review of the 1.8.6 release PR: two scale/semantics problems in the new
+grouped charset path plus a tail of validation and perf items. No shape from the PR was
+redesigned.
+
+- **A reviewed "defect" in the gap segmentation was not one.** The review argued that
+  `gap_s` being NULL on a partition's first row made `if(NULL, 1, 0)` NULL, the window `sum`
+  NULL, and a NULL `seg` its own partition — losing the n-gram over rows 1..`ngram`.
+  ClickHouse takes the *else* branch for a NULL condition (`if(NULL > n, 1, 0)` is `0`,
+  `UInt8`), so segments already started at 0. Checked live on 26.6 against a 9-event series
+  with a 3-day gap: 7 complete 3-grams unbounded, 5 with a 1 h bound, `a→b→c` present both
+  ways, and byte-identical results with and without a defaulted lag. The comment now records
+  the semantics it relies on, with the measurement behind it.
+- **Grouped charset scanned `events` once per group.** Group cardinality is caller-chosen
+  and unbounded, so `group_field=attr:src_ip` meant one heavy scan per host per field. It is
+  now one scan per field: the per-group reference alphabets go in as parallel
+  `{grps, sets}` arrays, each row picks its own by `indexOf` (`greatest(gidx, 1)` because
+  ClickHouse evaluates both `if` branches and rejects index 0), and `LIMIT plim BY grp`
+  preserves the per-group finding budget.
+- **A group the baseline window never saw was silently unevaluated** — the newly-provisioned
+  host, i.e. the interesting one. Those groups are now scored against a fallback reference
+  learned *outside* the suspect windows (learning it over the whole scope would let the
+  suspect values into their own reference and mask themselves), findings carry
+  `details.group_basis` so a report never conflates the two references, and the row shows it.
+  Guard-skipped groups and an unusable fallback are reported in `warnings` instead of
+  vanishing; events missing the grouping field stay a real group, rendered `(no value)`.
+- **Smaller items.** A non-string `group_field` is refused with 422 rather than reaching
+  ClickHouse as a type error (group expressions are also `toString`-wrapped); `view_filters`
+  is size-bounded at 16 KiB now that it is persisted per message; agent tool rows only format
+  their payload once expanded (a `<details>` renders children regardless of state) and only
+  pair a streamed result on a non-empty `tool_call_id`; `evtx2vestigo` gained a `DataN`
+  collision rule (named field wins, positional moves to `DataN_pos`), a corrected header
+  layout comment, and an explicit note that fallback rows' `byte_offset` is not a file
+  offset. `scripts/vendor_evtx_maps.py --manifest-only` refreshes the converter's manifest
+  hash without an upstream checkout.
 
 ## Session 128 — 2026-07-30: `evtx2vestigo` review findings
 

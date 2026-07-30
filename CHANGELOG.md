@@ -32,7 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the transcript instead of silently shifting the agent's ground. (#205)
 - **Charset detector: per-identifier scoping.** `group_field` learns one alphabet per
   value of a second field (e.g. per host), retiring the merged-alphabet caveat.
-  Suppressions stay keyed on `(field, value)` and apply across groups. (D14)
+  Suppressions stay keyed on `(field, value)` and apply across groups. Group count costs
+  rows, not queries: the per-group alphabets travel into one scan per field as array
+  parameters, with `LIMIT … BY grp` keeping each group's budget. A group the baseline
+  window never saw is scored against a reference learned *outside* the suspect windows
+  rather than skipped, every finding records which reference scored it
+  (`details.group_basis`, shown on the row), and groups the skip guards drop are named in
+  the run's `warnings`. A non-string `group_field` is refused with 422. (D14)
 - **Sequence detectors: `max_gap_seconds`.** `sequence_novelty` and `sequence_motif`
   break an n-gram when consecutive events are farther apart than the bound, retiring
   the manufactured-sequence caveat. Unset keeps the pre-1.8.6 behavior bit-identical.
@@ -49,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A grouped charset run no longer scans `events` once per group.** With a high-cardinality
+  `group_field` that was one heavy scan per group per field; it is now one scan per field.
+  (D14)
+- **A tool row in the agent panel no longer formats its payload while collapsed.** A
+  `<details>` renders its children regardless of state, so every row was stringifying its
+  full tool result on every panel render. (#203)
+- **A streamed tool result is only paired on a non-empty `tool_call_id`**, so a provider
+  that emitted an empty id could not splash one result across every unkeyed row. (#203)
+- **`view_filters` is bounded (16 KiB serialized, 422 above it).** It is persisted per user
+  message, so an unvalidated client dict could grow the transcript at will. (#205)
+- **`evtx2vestigo`: a named `DataN` field no longer collides with an unnamed positional
+  one.** The named value keeps the plain key — that is what Sigma rules address — and the
+  positional value moves to `DataN_pos`.
 - **The downloadable converter LLM prompts match the data contract again.** The Parquet
   prompt documented the pre-1.3.0 footer: it omitted the forensic metadata keys
   (`converted_at`, `row_counts`, `timezone_assumption`, `parse_decisions`) and the
