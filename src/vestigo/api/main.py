@@ -23,6 +23,7 @@ from vestigo.api.routers import (
     baselines,
     cases,
     converters,
+    demo,
     dispositions,
     enrichers,
     events,
@@ -573,6 +574,7 @@ def create_app() -> FastAPI:
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)
     app.include_router(transfer.router)
+    app.include_router(demo.router)
 
     # External streamable-HTTP MCP endpoint (Bearer-token-gated), off by default.
     # Registered outside /api/, so AuthAuditMiddleware's session gate does not

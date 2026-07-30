@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import time
 
-from tests.conftest import login
+from tests.conftest import as_admin, login
+from vestigo.core.config import get_settings
 
 
 def _wait_for_imports(imports, expected, timeout=5.0):
@@ -47,3 +48,35 @@ def test_login_still_works_without_an_archive(client, admin_bootstrap, imports):
     assert resp.status_code == 200
     _wait_for_imports(imports, 1, timeout=0.5)
     assert imports == []
+
+
+def test_restore_endpoint_seeds_again(client, admin_bootstrap, fake_archive, imports):
+    # as_admin also rotates the bootstrap password, which every mutating
+    # endpoint requires before it will answer.
+    as_admin(client, admin_bootstrap)
+    _wait_for_imports(imports, 1)
+    assert len(imports) == 1
+
+    resp = client.post("/api/demo/seed")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["job_id"]
+    _wait_for_imports(imports, 2)
+    assert len(imports) == 2, "restore is explicit, so the once-only claim does not apply"
+
+
+def test_restore_endpoint_requires_auth(client, fake_archive):
+    assert client.post("/api/demo/seed").status_code == 401
+
+
+def test_restore_endpoint_503_when_disabled(client, admin_bootstrap, fake_archive, monkeypatch):
+    as_admin(client, admin_bootstrap)
+    monkeypatch.setenv("VESTIGO_DEMO_CASE_ENABLED", "false")
+    get_settings.cache_clear()
+    assert client.post("/api/demo/seed").status_code == 503
+    monkeypatch.delenv("VESTIGO_DEMO_CASE_ENABLED")
+    get_settings.cache_clear()
+
+
+def test_restore_endpoint_503_without_an_archive(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
+    assert client.post("/api/demo/seed").status_code == 503
