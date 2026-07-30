@@ -1,9 +1,9 @@
 """Demo case: seeding on login and the explicit restore endpoint.
 
-Drives the real HTTP layer (see ``tests/conftest.py``) with ``import_case``
-faked, so these assert the *dispatch* path — that a login seeds exactly once
-and a restore seeds again — not the archive restore itself. That lives in
-``tests/test_demo_archive_clickhouse.py``.
+Drives the real HTTP layer (see ``tests/conftest.py``) with the build faked, so
+these assert the *dispatch* path — that a login seeds exactly once and a restore
+seeds again — not the build itself. That lives in
+``tests/test_demo_build_clickhouse.py``.
 """
 
 from __future__ import annotations

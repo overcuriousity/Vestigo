@@ -47,8 +47,8 @@ async def maybe_seed_demo_case(user: User) -> str | None:
         user: The account whose session was just issued.
 
     Returns:
-        The background job's id, or None when seeding is disabled, the archive
-        is absent, or this user already had their turn.
+        The background job's id, or None when seeding is disabled or this user
+        already had their turn.
 
     Never raises: a login must not fail because of the demo case.
     """

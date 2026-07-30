@@ -33,6 +33,40 @@ Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14),
 `src/vestigo/db/similarity.py` (detector 11), `src/vestigo/sigma/`
 (detector 13). UI: `frontend/src/components/analysis/`.
 
+### The demo case: a worked example of all of them
+
+Every user is seeded a fabricated demo case on their first login
+(`src/vestigo/demo/`, gated by `VESTIGO_DEMO_CASE_ENABLED`). It is generated
+rather than shipped as data: 251k events over 30 days, four sources, a quiet
+three-week baseline and a seven-day intrusion split into four labeled suspect
+windows. Deleting it is final unless the analyst restores it explicitly.
+
+Nothing in that case is labeled with the detector it triggers — the annotations
+read as an analyst's notes, because a demo that narrates its own tooling
+teaches the tooling instead of the work. What each tool has to find:
+
+| # | Tool | The fabricated signal |
+|---|---|---|
+| 1 | Value novelty | A 7045 service name (`WinSysHealthSvc`) absent from three weeks of baseline; the contractor account on hosts it has never used. The `value_combo` variant sees the (user, host) pairs. |
+| 2 | Frequency | Failed-logon volume during the spray, ~40/minute against a baseline of a couple hundred a day. |
+| 3 | Timestamp order | `APP-01` drifts against NTP and chronyd's corrections arrive stamped behind the line before them. Benign, deliberately. |
+| 4 | Numeric range | `bytes_out` in the exfil uploads: tens of megabytes against a baseline browsing distribution centred near 1.5 KB. |
+| 5 | Charset novelty | A user agent containing guillemets, and a staged archive filename with a Cyrillic `о`. |
+| 6 | Entropy | Base64-encoded PowerShell in a 4688 command line; the beacon's sixteen-character random subdomain. |
+| 7 | Proportion shift | The file-sharing destination's share of proxy traffic during exfil; the sudo command mix on the file server. |
+| 8 | Interval cadence | A 300s ± 8s beacon on a host whose baseline was irregular human browsing — plus a nightly backup that legitimately moves from 02:15 to 03:40, so the tool has a benign hit too. |
+| 9 | Event sequences | Host orderings the contractor account has never taken. Score over `attr:computer_name`; the default `artifact` is degenerate here, since each source carries one artifact value. |
+| 10 | Distribution drift | The whole `bytes_out` distribution changing shape during exfil. |
+| 11 | Semantic similarity | **Not covered.** The demo deliberately requires no embeddings. |
+| 12 | Repeating sequences | The beacon motif (proxy request + matching firewall allow in the same second), alongside a benign nightly-backup motif. |
+| 13 | Sigma | Four case-scoped rules ship inside the case: encoded PowerShell, suspicious service install, wmic remote process creation, failed-logon burst. |
+| 14 | Log templates | ~40 syslog templates, with an `unattended-upgrade` shape that appears only in the suspect window. |
+
+`tests/test_demo_detector_coverage_clickhouse.py` asserts that each of these
+actually returns findings. If a retuned threshold silences one of them, that
+test fails — which is the point: the demo's promise is only true as long as it
+is checked.
+
 ### Query-cost discipline (all statistical detectors)
 
 Three cross-cutting rules keep detector scans survivable on 100M+-row cases

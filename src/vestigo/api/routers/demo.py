@@ -25,7 +25,7 @@ async def restore_demo_case(user: User = Depends(get_current_user)) -> dict[str,
 
     Returns:
         The background job's id, pollable through the jobs router like any
-        other case import.
+        other background job.
     """
     if not get_settings().demo_case_enabled:
         raise HTTPException(status_code=503, detail="Demo case seeding is disabled")

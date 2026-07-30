@@ -1,9 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 132 — PR #208 fourth review pass, 1.8.6 released).
+Last updated: 2026-07-30 (session 133 — the demo case).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 133 — 2026-07-30: a demo case for every new user
+
+**Why.** A new user's first screen was an empty case list, which is the worst possible
+introduction to a tool whose whole argument is detection-as-workflow. Every user now finds
+a fabricated investigation waiting for them: 251k events, four sources, 30 days, a quiet
+three-week baseline and a seven-day intrusion, with an analyst's notes, tags, saved views,
+a baseline definition, four Sigma rules and a story already in place. Spec:
+`docs/superpowers/specs/2026-07-30-demo-case-design.md`.
+
+- **Realism over meta-labels.** Nothing in the case names the detector it triggers. The
+  annotations read as one investigator's working notes, and the story explains the incident,
+  not the product. Two of the findings are deliberately benign and called out as such (an
+  NTP-drifting host, a backup job whose schedule legitimately moved) — a demo where every
+  anomaly is malicious teaches the wrong reflex.
+- **Generated, not shipped.** The first cut built a prebuilt `.vestigo` archive, which came
+  out at **146 MiB** — events travel uncompressed inside the archive by design, so the
+  "10–15 MB" the design assumed was off by an order of magnitude. Committing that on every
+  regeneration was not acceptable in a repo that has to stay airgap-shippable, so the
+  generator moved into `src/vestigo/demo/` and runs per user instead: ~2.5s to fabricate the
+  four source files, a few seconds to ingest them through the real `IngestionPipeline`. It is
+  deterministic, so every copy is identical down to the source files' SHA-256 hashes, and the
+  provenance story is the one an ordinary ingest tells.
+- **Seeded once per user, ever.** `users.demo_case_seeded_at` is claimed with a conditional
+  UPDATE, so two simultaneous logins cannot both dispatch, and the stamp survives deletion —
+  a deleted demo stays deleted. Existing users backfill through the same path at their next
+  login, since their stamp is null. `POST /api/demo/seed` is the way back, offered from the
+  empty case list. Hooked into `_issue_session` rather than the login handler, so OIDC
+  behaves identically; the call swallows its own errors, because no demo case is worth a
+  failed login. Two builds run concurrently instance-wide; the rest get a 429.
+- **The coverage test is the actual deliverable.** `tests/test_demo_detector_coverage_clickhouse.py`
+  runs all thirteen non-embedding tools plus the four Sigma rules over the seeded case and
+  asserts each returns real findings. The first version of that test passed vacuously — it
+  fell back to the result *object*, which is always truthy — and once fixed it immediately
+  caught that event sequences found nothing over the default `series_field`. The demo's
+  promise is only true for as long as something checks it.
 
 ## Session 132 — 2026-07-30: PR #208 fourth review pass, and the 1.8.6 merge
 
