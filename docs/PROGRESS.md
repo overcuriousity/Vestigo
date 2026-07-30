@@ -1,9 +1,58 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 130 — PR #208 second review pass).
+Last updated: 2026-07-30 (session 131 — PR #208 third review pass, 1.8.6 cut).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 131 — 2026-07-30: PR #208 third review pass, and the 1.8.6 version cut
+
+**Why.** A third review of the 1.8.6 PR. Six findings, all fixed. The one that mattered
+most was the least interesting: the release PR had no release in it.
+
+- **Nothing was bumped.** `pyproject.toml`, `src/vestigo/__init__.py`,
+  `frontend/package.json` (and its lockfile) all still read 1.8.5 and the changelog
+  section was still `[Unreleased]`, on a branch titled `release: 1.8.6`. Prior releases
+  land as a `chore(release): X` commit; this one had none. Now 1.8.6 everywhere.
+- **The grouped charset row ceiling truncated in silence.** `LIMIT plim BY grp` preserves
+  each group's budget, but the 5,000-row ceiling *under* it orders by novelty length
+  across every group — so hitting it drops whole low-novelty groups, not a slice of each.
+  The rest of that code path is scrupulous about naming every deviation in `warnings`;
+  this was the one that vanished, and a truncated run came back looking like a clean one.
+  It reports now, and says which fields.
+- **Two of the grouped warnings had lost their field.** `wide_dropped` and
+  `thin_unevaluated` were keyed by field; `fallback_absent`/`fallback_thin` were flat sets
+  merged across every scanned field. The same group can be thin for one field and absent
+  from the baseline window for another, so the merged form put a group in both sentences
+  with no way to tell which field either was about. All four are per-field now.
+- **The gap bound measured the wrong thing.** `dateDiff('second', …)` counts second
+  *boundaries crossed*, so a 1.2 s step straddling two of them reported 2 and
+  `max_gap_seconds=1` segmented a burst whose every step was barely over a second.
+  `age` counts complete elapsed units, which is what "farther apart than N seconds" means.
+  NULL-on-first-row behavior is identical (measured on 26.6.1, through the whole
+  `Nullable(Int64)` → `UInt8` → `UInt64` chain), so the segment-start comment still holds.
+  The live test that pins it was written twice: the first fixture used 200 ms steps and
+  passed under *both* functions — 1.2 s steps are what actually discriminate, and the
+  test now fails if the call is reverted.
+- **An orphaned tool result rendered as a call.** Pairing answers by identity, and a
+  result row whose call row is missing from the transcript matches nothing — it then fell
+  through to the call branch and drew an argument-less row for a call the agent never
+  made. `tool_result` settles it without reopening the zero-argument-call ambiguity that
+  session 130 closed: the server writes args on a call row and a result on a result row,
+  never both.
+- **`evtx2vestigo` still had one silent overwrite.** EVTX permits a repeated
+  `<Data Name="X">` in one `<EventData>`, and `UserData`'s recursive `iter()` can put two
+  same-named tags on one key; both kept only the last value. Given how deliberately the
+  `DataN` positional/named collision is resolved, this was the collision that wasn't.
+  First occurrence keeps the plain spelling Sigma addresses, the rest are numbered in
+  document order, probing for a free key so a literal `X_2` in the same record doesn't
+  collapse into it.
+
+**Verification.** Backend suite and `ruff check`/`ruff format --check` clean; frontend
+`typecheck`, `lint` and 674 tests pass. The `age` change is covered live against
+ClickHouse 26.6.1, not by SQL-text assertion. Still not re-run: `vendor_evtx_maps.py
+--check` (needs an upstream checkout) — the blob region was untouched and the manifest
+hash was refreshed with `--manifest-only`.
 
 ## Session 130 — 2026-07-30: PR #208 second review pass
 

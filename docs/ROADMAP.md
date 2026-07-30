@@ -107,8 +107,10 @@ read the reasoning of does not meet the reproducibility bar and does not count a
   `max_gap_seconds` (the n-gram assembly partitions on a running count of over-gap
   boundaries, so sequences no longer span quiet gaps). Both caveats in
   `docs/ANOMALY_DETECTION.md` are rewritten to describe the opt-in. Review fixes on the
-  same branch: one scan per field rather than per group, and a fallback reference for
-  groups absent from the baseline window (`details.group_basis`).
+  same branch: one scan per field rather than per group, a fallback reference for groups
+  absent from the baseline window (`details.group_basis`), per-field warning attribution
+  plus a warning when the grouped scan hits its row ceiling, and `age` rather than
+  `dateDiff` for the gap so the bound measures elapsed seconds, not boundaries crossed.
 
 ### Low effort, high value
 

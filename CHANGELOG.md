@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.6] — 2026-07-30
 
 ### Added
 
@@ -77,17 +77,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full tool result on every panel render. (#203)
 - **A streamed tool result is only paired on a non-empty `tool_call_id`**, so a provider
   that emitted an empty id could not splash one result across every unkeyed row. (#203)
+- **An orphaned tool result passes silently instead of rendering as a call.** A result row
+  whose call row is missing from the transcript found no open call to pair with and fell
+  through to the call branch, drawing an argument-less tool row for a call the agent never
+  made. `tool_result` settles it — the server writes args on a call row and a result on a
+  result row, never both. (#203)
 - **`view_filters` is bounded (16 KiB serialized, 422 above it).** It is persisted per user
   message, so an unvalidated client dict could grow the transcript at will. (#205)
 - **`evtx2vestigo`: a named `DataN` field no longer collides with an unnamed positional
   one.** The named value keeps the plain key — that is what Sigma rules address — and the
   positional value moves to `DataN_pos`, decided from the record as a whole so it does not
   depend on which element the writer emitted first.
+- **`evtx2vestigo`: no `EventData`/`UserData` element overwrites another.** A repeated
+  `<Data Name="X">` — which EVTX permits — silently kept only the last value. The first
+  occurrence now keeps the plain spelling and the rest are numbered in document order
+  (`X_2`, `X_3`, …), probing for a free key so a record carrying a literal `X_2` does not
+  collapse into it.
 - **A grouped charset run's `warnings` describe what it actually did.** Groups routed to
   the fallback were reported as "not evaluated", and a field whose fallback could not be
   learned reported absent groups as unevaluated even when none existed. Warnings now name
   the groups, separate "no baseline values" from "too few baseline values", and state
-  which guard the fallback itself tripped. (D14)
+  which guard the fallback itself tripped. Every one of those warnings names its *field*:
+  the same group can be thin for one field and absent from the baseline window for
+  another, and a merged count left no way to tell which. A run that hits the grouped
+  scan's 5,000-row ceiling says so too — that ceiling orders by novelty across all groups,
+  so hitting it drops whole low-novelty groups and a silent result would read as "these
+  are the groups with novel characters". (D14)
+- **`max_gap_seconds` measures elapsed seconds, not second boundaries crossed.** The gap
+  used ClickHouse `dateDiff`, which reports 2 for a 1.2 s step that straddles two
+  boundaries — so a bound of 1 s broke bursts whose steps were barely over a second. It
+  uses `age` now. (D14)
 - **A tool row in the agent panel pairs on `tool_call_id` rather than on whether the row
   carries arguments.** A zero-argument call persisted with `null` args read as a result
   row, consumed its sibling's pending entry and folded a result onto the wrong call. The
