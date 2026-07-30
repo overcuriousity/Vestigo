@@ -34,6 +34,9 @@ const ASSUME_AVAILABLE: Capabilities = {
   enrichers: true,
   sigma: true,
   transfer: true,
+  // Like the agent: stays hidden until probed. The restore offer is only
+  // honest once health confirms the archive is actually packaged.
+  demo_case: false,
 };
 
 /**

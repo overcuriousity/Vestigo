@@ -912,6 +912,8 @@ export interface Capabilities {
   enrichers: boolean;
   sigma: boolean;
   transfer: boolean;
+  /** Demo seeding is on *and* the archive is packaged with this build. */
+  demo_case: boolean;
 }
 
 /**
