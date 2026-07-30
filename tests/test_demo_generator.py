@@ -6,7 +6,7 @@ makes of them (that is ``tests/test_demo_detector_coverage_clickhouse.py``).
 
 from __future__ import annotations
 
-from tools.demo_case import scenario
+from tools.demo_case import metadata, scenario
 from tools.demo_case.sources import linux, netflow, proxy, windows
 
 
@@ -89,6 +89,7 @@ def test_staged_archive_filename_carries_the_homoglyph():
 
 def test_contractor_gains_new_host_pairs_only_during_the_intrusion():
     rows = list(windows.windows_rows())
+
     def hosts(before: bool) -> set[str]:
         return {
             r["computer_name"]
@@ -213,5 +214,63 @@ def test_netflow_denies_spike_on_the_file_server_during_lateral_movement():
         if r["action"] == "deny" and r["dst_ip"] == netflow.FILE_SERVER_IP
     ]
     lateral = scenario.PHASES[2]
-    inside = [r for r in rows if lateral.start.isoformat() <= r["datetime"] < lateral.end.isoformat()]
+    inside = [
+        r for r in rows if lateral.start.isoformat() <= r["datetime"] < lateral.end.isoformat()
+    ]
     assert len(inside) > 100
+
+
+def test_annotations_read_as_analyst_notes():
+    assert 20 <= len(metadata.ANNOTATIONS) <= 30
+    banned = ("detector", "value novelty", "z-score", "proportion shift", "demo", "vestigo")
+    for annotation in metadata.ANNOTATIONS:
+        lowered = annotation.note.lower()
+        assert not any(term in lowered for term in banned), annotation.note
+        assert annotation.tags
+        assert scenario.SCENARIO_START <= annotation.after <= scenario.SCENARIO_END
+
+
+def test_tag_vocabulary_is_closed():
+    used = {tag for a in metadata.ANNOTATIONS for tag in a.tags}
+    assert used <= set(metadata.TAGS)
+    assert used == set(metadata.TAGS), "every documented tag should actually be used"
+
+
+def test_every_source_carries_notes():
+    keys = {a.source_key for a in metadata.ANNOTATIONS}
+    assert keys == {"windows", "linux", "proxy", "netflow"}
+
+
+def test_sigma_rules_are_valid_yaml_with_the_expected_titles():
+    import yaml
+
+    titles = set()
+    for title, text in metadata.SIGMA_RULES:
+        parsed = yaml.safe_load(text)
+        assert parsed["title"] == title
+        assert parsed["detection"] and parsed["logsource"]
+        titles.add(title)
+    assert len(titles) == 4
+
+
+def test_baseline_windows_match_the_phases_and_avoid_the_baseline():
+    windows_json = metadata.baseline_windows()
+    assert len(windows_json) == 4
+    assert [w["label"] for w in windows_json] == [p.label for p in scenario.PHASES]
+    assert all(w["start"] >= scenario.BASELINE_END.isoformat() for w in windows_json)
+
+
+def test_views_carry_the_full_frontend_payload():
+    expected_keys = set(metadata._view_payload().keys())
+    assert len(metadata.VIEWS) == 5
+    for view in metadata.VIEWS:
+        assert set(view.payload) == expected_keys
+
+
+def test_story_has_a_narrative_arc():
+    kinds = [kind for kind, _ in metadata.STORY_BLOCKS]
+    assert kinds[0] == "heading"
+    assert len(metadata.STORY_BLOCKS) >= 8
+    body = " ".join(text for _, text in metadata.STORY_BLOCKS).lower()
+    assert "recommend" in body
+    assert "unrelated" in body, "the benign findings must be called out as benign"
