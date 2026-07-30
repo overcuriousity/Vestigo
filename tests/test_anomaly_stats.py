@@ -4666,3 +4666,78 @@ def test_list_log_templates_empty_result_reports_zero_total():
     result = svc.list_log_templates("c1", ["s1"])
     assert result.total_templates == 0
     assert result.templates == []
+
+
+def test_charset_group_field_partitions_alphabets():
+    """group_field learns one alphabet per group: a char common for host-a but
+    unseen for host-b flags only on host-b's values (D14)."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        # Grouped learning scan: (grp, c, n_vals_with_c, n_vals). NUL is common
+        # for host-a (50 distinct values) but never seen for host-b.
+        FakeQueryResult(
+            result_rows=[
+                ("host-a", "a", 90, 100),
+                ("host-a", "b", 85, 100),
+                ("host-a", "\x00", 50, 100),
+                ("host-b", "a", 95, 100),
+                ("host-b", "b", 90, 100),
+            ],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        # One violation scan per evaluated group, in learning order.
+        FakeQueryResult(result_rows=[], column_names=[]),  # host-a: clean
+        FakeQueryResult(
+            result_rows=[("ab\x00", ["\x00"], 2, fs, "evt-nul")],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty(
+        "c1", ["s1"], fields=["attr:user"], group_field="attr:host"
+    )
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    f = result.results[0]
+    assert f.details["group_field"] == "attr:host"
+    assert f.details["group_value"] == "host-b"
+    # Allowlist identity is unchanged: (field, value), group-independent, so
+    # existing suppressions keep matching.
+    assert f.details["allowlist_field"] == "attr:user"
+    assert f.details["allowlist_value"] == "ab\x00"
+    # Each group's violation scan carried its own reference set.
+    base_params = [p["base"] for p in svc.ch.client._all_parameters if "base" in p]
+    assert sorted("\x00" in p for p in base_params) == [False, True]
+    # …and was pinned to its group value.
+    gvals = [p["gval"] for p in svc.ch.client._all_parameters if "gval" in p]
+    assert gvals == ["host-a", "host-b"]
+
+
+def test_charset_group_field_sql_groups_learning_scan():
+    """With group_field, the learning scans and the skip guards go per-group."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    joined = "\n".join(client.full_queries)
+    assert "AS grp" in joined
+    assert "GROUP BY grp" in joined
+    # The group column resolves through _col_expr with its own param prefix.
+    assert "attributes[{gk:String}]" in joined
+
+
+def test_charset_no_group_field_keeps_current_sql():
+    """Default (no group_field) is bit-identical to the pre-D14 shape."""
+    client = RecordingClient([FakeQueryResult(result_rows=[], column_names=[])])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"])
+    joined = "\n".join(client.full_queries)
+    assert "grp" not in joined
+    assert "{gk:String}" not in joined

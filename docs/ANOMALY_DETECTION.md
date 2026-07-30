@@ -684,13 +684,15 @@ invisible characters are visible in the report.
 
 ### Caveats
 
-- **One alphabet per field, not per identifier.** AMiner's `CharsetDetector`
-  learns a separate charset per `id_path_list` value (per host, per user, per
-  session); Vestigo learns one alphabet for the whole field across the scope.
-  A field that is legitimately Cyrillic for one host and ASCII for the rest
-  therefore has a merged reference alphabet, and neither host's characters
-  look novel. Scope the timeline to that source if the distinction matters.
-  Per-identifier scoping is roadmap D14.
+- **Per-identifier scoping is opt-in via `group_field`.** AMiner's
+  `CharsetDetector` always learns a separate charset per `id_path_list` value;
+  Vestigo learns one alphabet per field across the scope by default, and
+  `group_field` (e.g. `attr:host`) learns one alphabet per value of that field
+  instead — a field that is legitimately Cyrillic for one host and ASCII for
+  the rest no longer merges into a reference alphabet that flags neither. Both
+  modes honor it, the skip guards below apply per group, and suppressions stay
+  keyed on `(field, value)`, applying across groups. Findings name their group
+  in `details.group_field`/`details.group_value`.
 - **Free-text fields in large scripts.** A field whose reference alphabet
   exceeds 5,000 characters (CJK prose, base64 blobs mixing full alphabets) is
   skipped — "novel character" is meaningless there. Fields with fewer than 20

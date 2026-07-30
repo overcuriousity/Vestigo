@@ -2840,6 +2840,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        group_field: str | None = None,
     ) -> StatAnomalyResult:
         """Return values containing characters outside a field's reference charset.
 
@@ -2872,6 +2873,13 @@ class StatisticalAnomalyService:
         values or a reference charset larger than ``_MAX_CHARSET_SIZE`` are
         skipped; when every scanned field skips the status is
         ``insufficient_data``.
+
+        ``group_field`` (D14) scopes the learning per value of a second field
+        — one alphabet per host, per user, per session — instead of one
+        merged alphabet across the whole scope, so groups that legitimately
+        differ no longer mask each other. Both modes honor it, and the skip
+        guards apply per group. Suppressions stay keyed on ``(field, value)``
+        and apply across groups.
         """
         self.ch.init_schema()
         db = self.ch.database
@@ -2899,185 +2907,273 @@ class StatisticalAnomalyService:
         evaluated_fields = 0
 
         for field_token in scan_fields:
-            # --- Learn the reference charset. ---
-            char_counts: dict[str, int] = {}
+            # --- Learn the reference charset(s). With group_field, one
+            # alphabet per value of the group field (D14); without it, a
+            # single None-grouped entry — the pre-D14 whole-scope behavior.
+            # Each learn tuple: (grp, reference, char_counts, n_vals,
+            # alphabet_size). char_counts is empty in temporal mode, where
+            # the reference already is the full baseline alphabet.
+            learns: list[tuple[str | None, list[str], dict[str, int], int, int]] = []
             if windows is None:
                 # Per-character distinct-value counts over the whole corpus,
                 # plus the total distinct-value count in the same scan: a window
                 # `count() OVER ()` over the DISTINCT subquery yields n_vals on
                 # every row, so we avoid a second whole-corpus uniqExact scan of
-                # the identical column/predicate.
+                # the identical column/predicate. Grouped: the window and the
+                # GROUP BY partition per group instead.
                 cc_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, cc_params, field_mappings)
-                cc_sql = f"""
-                    SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
-                    FROM (
-                        SELECT
-                            count() OVER () AS total,
-                            arrayDistinct(extractAll(val, '(?s).')) AS chars
+                if group_field is None:
+                    cc_sql = f"""
+                        SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
                         FROM (
-                            SELECT DISTINCT {col} AS val
-                            FROM {db}.events
-                            WHERE case_id = {{cid:String}}
-                              AND has({{src:Array(String)}}, source_id)
-                              AND {col} != ''
+                            SELECT
+                                count() OVER () AS total,
+                                arrayDistinct(extractAll(val, '(?s).')) AS chars
+                            FROM (
+                                SELECT DISTINCT {col} AS val
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {col} != ''
+                            )
                         )
-                    )
-                    ARRAY JOIN chars AS c
-                    GROUP BY c
-                    {HEAVY_SCAN_SETTINGS}
-                """
-                cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
-                char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
-                n_vals = int(cc_rows[0][2]) if cc_rows else 0
-                reference = [c for c, nv in char_counts.items() if nv > rarity_floor]
-                # Skip decision is about the field's *whole* alphabet, not just
-                # its non-rare subset: on a huge-alphabet field (CJK prose,
-                # base64 blobs) most characters are rare, so `reference` stays
-                # small while the real alphabet is enormous — "novel character"
-                # is meaningless there. Measure `char_counts`, which holds every
-                # character seen (temporal mode's `reference` already is the
-                # full baseline alphabet).
-                alphabet_size = len(char_counts)
+                        ARRAY JOIN chars AS c
+                        GROUP BY c
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
+                    char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
+                    n_vals = int(cc_rows[0][2]) if cc_rows else 0
+                    reference = [c for c, nv in char_counts.items() if nv > rarity_floor]
+                    # Skip decision is about the field's *whole* alphabet, not
+                    # just its non-rare subset: on a huge-alphabet field (CJK
+                    # prose, base64 blobs) most characters are rare, so
+                    # `reference` stays small while the real alphabet is
+                    # enormous — "novel character" is meaningless there.
+                    # Measure `char_counts`, which holds every character seen
+                    # (temporal mode's `reference` already is the full baseline
+                    # alphabet).
+                    learns.append((None, reference, char_counts, n_vals, len(char_counts)))
+                else:
+                    gcol = _col_expr(group_field, cc_params, field_mappings, prefix="gk")
+                    cc_sql = f"""
+                        SELECT grp, c, count() AS n_vals_with_c, any(total) AS n_vals
+                        FROM (
+                            SELECT
+                                grp,
+                                count() OVER (PARTITION BY grp) AS total,
+                                arrayDistinct(extractAll(val, '(?s).')) AS chars
+                            FROM (
+                                SELECT DISTINCT {col} AS val, {gcol} AS grp
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {col} != ''
+                            )
+                        )
+                        ARRAY JOIN chars AS c
+                        GROUP BY grp, c
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
+                    by_grp: dict[str, dict[str, int]] = {}
+                    n_vals_by_grp: dict[str, int] = {}
+                    for grp, c, nv, grp_total in cc_rows:
+                        by_grp.setdefault(str(grp), {})[str(c)] = int(nv)
+                        n_vals_by_grp[str(grp)] = int(grp_total)
+                    for grp, grp_counts in by_grp.items():
+                        reference = [c for c, nv in grp_counts.items() if nv > rarity_floor]
+                        learns.append(
+                            (grp, reference, grp_counts, n_vals_by_grp[grp], len(grp_counts))
+                        )
             else:
                 # Charset of the baseline window (a bounded range now, so the
                 # year-2299 sentinel can never fall inside it).
                 bs_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, bs_params, field_mappings)
                 bs_bp, _ = _window_preds(windows, bs_params, source_offsets)
-                bs_sql = f"""
-                    SELECT
-                        groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
-                        count() AS n_vals
-                    FROM (
-                        SELECT DISTINCT {col} AS val
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {col} != ''
-                          AND {bs_bp}
-                    )
-                    {HEAVY_SCAN_SETTINGS}
-                """
-                bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
-                if not bs_rows:
-                    continue
-                charset_arr, n_vals = bs_rows[0]
-                n_vals = int(n_vals)
-                reference = [str(c) for c in (charset_arr or [])]
-                alphabet_size = len(reference)
+                if group_field is None:
+                    bs_sql = f"""
+                        SELECT
+                            groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
+                            count() AS n_vals
+                        FROM (
+                            SELECT DISTINCT {col} AS val
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {col} != ''
+                              AND {bs_bp}
+                        )
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
+                    if not bs_rows:
+                        continue
+                    charset_arr, n_vals = bs_rows[0]
+                    n_vals = int(n_vals)
+                    reference = [str(c) for c in (charset_arr or [])]
+                    learns.append((None, reference, {}, n_vals, len(reference)))
+                else:
+                    gcol = _col_expr(group_field, bs_params, field_mappings, prefix="gk")
+                    bs_sql = f"""
+                        SELECT
+                            grp,
+                            groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
+                            count() AS n_vals
+                        FROM (
+                            SELECT DISTINCT {col} AS val, {gcol} AS grp
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {col} != ''
+                              AND {bs_bp}
+                        )
+                        GROUP BY grp
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
+                    for grp, charset_arr, grp_n_vals in bs_rows:
+                        reference = [str(c) for c in (charset_arr or [])]
+                        learns.append(
+                            (str(grp), reference, {}, int(grp_n_vals), len(reference))
+                        )
 
-            if n_vals < _MIN_CHARSET_BASELINE or alphabet_size > _MAX_CHARSET_SIZE:
+            # The skip guards apply per group (ungrouped: per field, as before).
+            evaluated = [
+                learn
+                for learn in learns
+                if learn[3] >= _MIN_CHARSET_BASELINE and learn[4] <= _MAX_CHARSET_SIZE
+            ]
+            if not evaluated:
                 continue
             evaluated_fields += 1
 
-            # --- Flag values containing characters outside the reference set. ---
-            viol_params: dict[str, Any] = {**base_params}
-            bind_offset_params(source_offsets, viol_params)
-            vcol = _col_expr(field_token, viol_params, field_mappings)
-            viol_params["base"] = reference
-            viol_params["plim"] = per_field_limit
-            win_idx_sel = ""
-            win_idx_group = ""
-            detect_clause = ""
-            if windows is not None:
-                _, viol_sps = _window_preds(windows, viol_params, source_offsets)
-                # Restrict the scan to the suspect-window union, tag rows with
-                # their window index for attribution, and exclude sentinel/
-                # undated rows (the year-2299 sentinel would land in any
-                # open-ended range test).
-                win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
-                win_idx_group = ", win_idx"
-                detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
-            viol_sql = f"""
-                SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
-                FROM (
-                    SELECT
-                        val,
-                        arrayFilter(
-                            c -> NOT has({{base:Array(String)}}, c),
-                            arrayDistinct(extractAll(val, '(?s).'))
-                        ) AS novel,
-                        cnt, first_seen, evt_id{win_idx_group}
+            # --- Flag values containing characters outside the reference set.
+            # One violation scan per evaluated group, pinned to the group's own
+            # reference alphabet (ungrouped: a single scan, as before). ---
+            for grp, reference, char_counts, n_vals, _alphabet_size in evaluated:
+                viol_params: dict[str, Any] = {**base_params}
+                bind_offset_params(source_offsets, viol_params)
+                vcol = _col_expr(field_token, viol_params, field_mappings)
+                group_clause = ""
+                if group_field is not None:
+                    vgcol = _col_expr(group_field, viol_params, field_mappings, prefix="gk")
+                    viol_params["gval"] = grp
+                    group_clause = f" AND {vgcol} = {{gval:String}}"
+                viol_params["base"] = reference
+                viol_params["plim"] = per_field_limit
+                win_idx_sel = ""
+                win_idx_group = ""
+                detect_clause = ""
+                if windows is not None:
+                    _, viol_sps = _window_preds(windows, viol_params, source_offsets)
+                    # Restrict the scan to the suspect-window union, tag rows with
+                    # their window index for attribution, and exclude sentinel/
+                    # undated rows (the year-2299 sentinel would land in any
+                    # open-ended range test).
+                    win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
+                    win_idx_group = ", win_idx"
+                    detect_clause = (
+                        f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
+                    )
+                viol_sql = f"""
+                    SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
                     FROM (
                         SELECT
-                            {vcol} AS val,
-                            count() AS cnt,
-                            min({eff}) AS first_seen,
-                            toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {vcol} != ''{detect_clause}
-                        GROUP BY val{win_idx_group}
+                            val,
+                            arrayFilter(
+                                c -> NOT has({{base:Array(String)}}, c),
+                                arrayDistinct(extractAll(val, '(?s).'))
+                            ) AS novel,
+                            cnt, first_seen, evt_id{win_idx_group}
+                        FROM (
+                            SELECT
+                                {vcol} AS val,
+                                count() AS cnt,
+                                min({eff}) AS first_seen,
+                                toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {vcol} != ''{detect_clause}{group_clause}
+                            GROUP BY val{win_idx_group}
+                        )
                     )
-                )
-                WHERE length(novel) > 0
-                ORDER BY length(novel) DESC, cnt ASC
-                LIMIT {{plim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
-            """
-            vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+                    WHERE length(novel) > 0
+                    ORDER BY length(novel) DESC, cnt ASC
+                    LIMIT {{plim:UInt32}}
+                    {HEAVY_SCAN_SETTINGS}
+                """
+                vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
-            for vrow in vrows:
-                if windows is None:
-                    val, novel, cnt, first_seen, evt_id = vrow
-                    window: TimeWindow | None = None
-                else:
-                    val, novel, cnt, first_seen, evt_id, win_idx = vrow
-                    wi = int(win_idx)
-                    window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
-                novel_chars = [str(c) for c in (novel or [])]
-                if not val or not novel_chars:
-                    continue
-                score = 0.0
-                for c in novel_chars:
-                    nv_c = char_counts.get(c, 0)
-                    if nv_c > 0 and n_vals > 0:
-                        score += -math.log(nv_c / n_vals)
+                for vrow in vrows:
+                    if windows is None:
+                        val, novel, cnt, first_seen, evt_id = vrow
+                        window: TimeWindow | None = None
                     else:
-                        # Never seen in the baseline: +1-smoothed surprise.
-                        score += math.log(n_vals + 1)
-                first_seen_str = _present_ts(first_seen)
-                evt_id_str = str(evt_id) if evt_id else None
-                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
+                        val, novel, cnt, first_seen, evt_id, win_idx = vrow
+                        wi = int(win_idx)
+                        window = (
+                            windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
+                        )
+                    novel_chars = [str(c) for c in (novel or [])]
+                    if not val or not novel_chars:
+                        continue
+                    score = 0.0
+                    for c in novel_chars:
+                        nv_c = char_counts.get(c, 0)
+                        if nv_c > 0 and n_vals > 0:
+                            score += -math.log(nv_c / n_vals)
+                        else:
+                            # Never seen in the baseline: +1-smoothed surprise.
+                            score += math.log(n_vals + 1)
+                    first_seen_str = _present_ts(first_seen)
+                    evt_id_str = str(evt_id) if evt_id else None
+                    mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
 
-                details: dict[str, Any] = {
-                    "detector": "charset",
-                    "method": method,
-                    "field": field_token,
-                    "value": str(val),
-                    "novel_chars": novel_chars,
-                    "codepoints": [f"U+{ord(c):04X}" for c in novel_chars if len(c) == 1],
-                    "count": int(cnt),
-                    "baseline_distinct_values": n_vals,
-                    "allowlist_field": field_token,
-                    "allowlist_value": str(val),
-                }
-                if windows is None:
-                    details["rarity_floor"] = rarity_floor
-                    details["char_value_counts"] = {c: char_counts.get(c, 0) for c in novel_chars}
-                if window is not None:
-                    details.update(
-                        {
-                            "window_label": window.label,
-                            "window_start": ensure_utc(window.start).isoformat(),
-                            "window_end": ensure_utc(window.end).isoformat(),
+                    details: dict[str, Any] = {
+                        "detector": "charset",
+                        "method": method,
+                        "field": field_token,
+                        "value": str(val),
+                        "novel_chars": novel_chars,
+                        "codepoints": [f"U+{ord(c):04X}" for c in novel_chars if len(c) == 1],
+                        "count": int(cnt),
+                        "baseline_distinct_values": n_vals,
+                        "allowlist_field": field_token,
+                        "allowlist_value": str(val),
+                    }
+                    if group_field is not None:
+                        details["group_field"] = group_field
+                        details["group_value"] = grp
+                    if windows is None:
+                        details["rarity_floor"] = rarity_floor
+                        details["char_value_counts"] = {
+                            c: char_counts.get(c, 0) for c in novel_chars
                         }
+                    if window is not None:
+                        details.update(
+                            {
+                                "window_label": window.label,
+                                "window_start": ensure_utc(window.start).isoformat(),
+                                "window_end": ensure_utc(window.end).isoformat(),
+                            }
+                        )
+                    all_findings.append(
+                        CharsetFinding(
+                            field=field_token,
+                            value=str(val),
+                            novel_chars=novel_chars,
+                            count=int(cnt),
+                            score=round(score, 4),
+                            first_seen=first_seen_str,
+                            event_id=evt_id_str,
+                            event=mini_event,
+                            details=details,
+                        )
                     )
-                all_findings.append(
-                    CharsetFinding(
-                        field=field_token,
-                        value=str(val),
-                        novel_chars=novel_chars,
-                        count=int(cnt),
-                        score=round(score, 4),
-                        first_seen=first_seen_str,
-                        event_id=evt_id_str,
-                        event=mini_event,
-                        details=details,
-                    )
-                )
 
         return self._finalize_findings(
             all_findings,

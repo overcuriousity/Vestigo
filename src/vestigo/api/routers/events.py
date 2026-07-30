@@ -1708,6 +1708,7 @@ async def _run_stat_detector(
     min_support: int | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    group_field: str | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -1908,6 +1909,9 @@ async def _run_stat_detector(
         )
 
     if detector == "charset":
+        # D14: per-identifier scoping — one learned alphabet per group value
+        # (None = one merged alphabet per field, the pre-1.8.6 behavior).
+        resolution["charset_group_field"] = group_field
         result = await run_in_threadpool(
             svc.find_charset_novelty,
             case_id=case_id,
@@ -1923,6 +1927,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            group_field=group_field,
         )
         return result, resolution
 
@@ -2452,6 +2457,8 @@ async def _persist_detector_run(
             or resolution.get("interval_min_rate_ratio"),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
+            # charset: per-identifier scoping (None = one alphabet per field).
+            "group_field": resolution.get("charset_group_field"),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
@@ -2558,6 +2565,14 @@ async def list_anomalies(
         description=(
             "sequence_motif only: minimum occurrences before an n-gram counts "
             "as a recurring motif. Omit to use the server default."
+        ),
+    ),
+    group_field: str | None = Query(
+        default=None,
+        description=(
+            "charset only: learn one reference alphabet per value of this field "
+            "(e.g. per host) instead of one merged alphabet per field. Omit for "
+            "whole-scope learning."
         ),
     ),
     start: datetime | None = Query(
@@ -2672,6 +2687,7 @@ async def list_anomalies(
         min_support=min_support,
         start=start,
         end=end,
+        group_field=group_field,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2846,6 +2862,10 @@ class TagAnomaliesRequest(BaseModel):
         ge=2,
         description="sequence_motif only: minimum occurrences for a recurring motif.",
     )
+    group_field: str | None = Field(
+        default=None,
+        description="charset only: learn one reference alphabet per value of this field.",
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -2910,6 +2930,7 @@ async def tag_anomalies(
         min_support=body.min_support,
         start=body.start,
         end=body.end,
+        group_field=body.group_field,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
