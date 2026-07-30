@@ -98,6 +98,11 @@ function renderPanel(currentFilters: EventFilters) {
   };
 }
 
+function renderPanelWithMessages(messages: AgentMessage[]) {
+  getConversationMock.mockResolvedValue({ ...conversation(), messages });
+  return renderPanel({});
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   useAgentStore.getState().setActiveConversation(`${CASE}/${TL}`, CONV_ID);
@@ -129,5 +134,44 @@ describe("agent panel inherited-filters bar (#205)", () => {
     rerenderPanel({ q: "dns" });
     expect(bar.textContent).toContain("dns");
     expect(bar.textContent).not.toContain("ssh");
+  });
+});
+
+describe("per-message filter stamp (#205)", () => {
+  it("stamps a user message with the filters sent with it", async () => {
+    renderPanelWithMessages([
+      {
+        id: "m1",
+        conversation_id: CONV_ID,
+        role: "user",
+        content: "check this",
+        tool_name: null,
+        tool_args: null,
+        tool_result: null,
+        view_filters: { q: "ssh" },
+        created_at: null,
+      } as AgentMessage,
+      ANCHOR,
+    ]);
+    const stamp = await screen.findByTestId("message-filters-m1");
+    expect(stamp.textContent).toContain("ssh");
+  });
+
+  it("renders no stamp for messages without a snapshot", async () => {
+    renderPanelWithMessages([
+      {
+        id: "m1",
+        conversation_id: CONV_ID,
+        role: "user",
+        content: "hi",
+        tool_name: null,
+        tool_args: null,
+        tool_result: null,
+        created_at: null,
+      } as AgentMessage,
+      ANCHOR,
+    ]);
+    await screen.findByText("transcript rendered");
+    expect(screen.queryByTestId("message-filters-m1")).toBeNull();
   });
 });

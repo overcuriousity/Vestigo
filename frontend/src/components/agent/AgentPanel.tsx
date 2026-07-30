@@ -47,6 +47,8 @@ import { ProposalCard } from "./ProposalCard";
 import { StoryBlockProposalCard } from "./StoryBlockProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
 import { AgentFiltersBar } from "./AgentFiltersBar";
+import { FilterChips } from "@/components/explorer/FilterChips";
+import { hasActiveFilters } from "@/lib/fieldFilters";
 import {
   PROPOSAL_KIND_BY_ITEM,
   proposalItemKind,
@@ -67,7 +69,15 @@ interface Props {
 
 /** One renderable chat item, unified over persisted rows and live stream events. */
 type ChatItem =
-  | { kind: "user"; content: string }
+  | {
+      kind: "user";
+      content: string;
+      /** Persisted row id — keys the per-message filter stamp's testid. */
+      messageId?: string;
+      /** The Explorer filters the agent received with this message (#205).
+       * Null/absent = no snapshot (pre-stamp rows, or none active). */
+      filters?: EventFilters | null;
+    }
   | {
       kind: "assistant";
       content: string;
@@ -167,7 +177,12 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   for (const m of messages) {
     const proposalKind = m.role === "tool" ? proposalItemKind(m.tool_name) : null;
     if (m.role === "user") {
-      items.push({ kind: "user", content: m.content });
+      items.push({
+        kind: "user",
+        content: m.content,
+        messageId: m.id,
+        filters: (m.view_filters as EventFilters | null) ?? null,
+      });
     } else if (m.role === "thinking") {
       if (m.content) items.push({ kind: "thinking", content: m.content });
     } else if (m.role === "compaction") {
@@ -954,6 +969,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 className="ml-6 whitespace-pre-wrap rounded-md bg-[var(--color-accent-dim)] px-2.5 py-1.5 text-xs text-[var(--color-fg-primary)]"
               >
                 {item.content}
+                {item.filters && hasActiveFilters(item.filters) && (
+                  <div
+                    data-testid={`message-filters-${item.messageId}`}
+                    className="mt-1 border-t border-[var(--color-border)]/50 pt-1"
+                  >
+                    <span className="text-[10px] text-[var(--color-fg-secondary)]">
+                      View at send:{" "}
+                    </span>
+                    <FilterChips filters={item.filters} />
+                  </div>
+                )}
               </div>
             );
           }
