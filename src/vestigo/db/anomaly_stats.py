@@ -284,13 +284,33 @@ _MAX_CHARSET_GROUPED_ROWS = 5000
 # Group values named in a charset warning before it degrades to a bare count.
 _CHARSET_WARN_GROUPS = 5
 
+# Row ceiling on the grouped charset fallback probe. The probe only answers
+# "does any group in the suspect windows have no baseline-window reference?",
+# so it stops as soon as it has enough rows to be sure — and a result that hits
+# the ceiling is treated as "yes", never as "no". Guessing "no" here would be a
+# silent blind spot, which is the whole thing the fallback exists to prevent.
+_CHARSET_GROUP_PROBE_LIMIT = 1000
+
+
+def _name_groups(names: set[str]) -> str:
+    """``a, b, c`` — capped at ``_CHARSET_WARN_GROUPS`` with a ``+N more`` tail."""
+    ordered = sorted(names)
+    named = ", ".join(ordered[:_CHARSET_WARN_GROUPS])
+    more = len(ordered) - _CHARSET_WARN_GROUPS
+    return f"{named}, +{more} more" if more > 0 else named
+
+
+def _name_groups_by_field(by_field: dict[str, set[str]]) -> str:
+    """``field: a, b; other: c`` — the per-field form of :func:`_name_groups`."""
+    return "; ".join(f"{f}: {_name_groups(names)}" for f, names in sorted(by_field.items()))
+
 
 class _CharsetLearn(NamedTuple):
     """One learned charset reference for the charset detector.
 
     ``group`` is the ``group_field`` value the reference was learned for, or
-    ``None`` for an ungrouped reference (whole scope) and for the temporal-mode
-    fallback that scores groups absent from the baseline window.
+    ``None`` for an ungrouped reference (whole scope) and for the fallback
+    references that score groups without a usable own reference.
 
     ``char_counts`` (per-character distinct-value counts) is populated only by
     the rare-chars recipe — self-baseline mode and the temporal fallback —
@@ -2966,22 +2986,46 @@ class StatisticalAnomalyService:
         ``group_field`` (D14) scopes the learning per value of a second field
         — one alphabet per host, per user, per session — instead of one
         merged alphabet across the whole scope, so groups that legitimately
-        differ no longer mask each other. Both modes honor it, and the skip
-        guards apply per group. Suppressions stay keyed on ``(field, value)``
-        and apply across groups.
+        differ no longer mask each other. Both modes honor it, and suppressions
+        stay keyed on ``(field, value)``, applying across groups.
 
-        Grouping costs one extra *learn* query per field, not one violation
-        scan per group: the per-group references travel into the single scan as
-        parallel ``{grps, sets}`` array parameters, and ``LIMIT plim BY grp``
-        preserves each group's finding budget. In temporal mode a group with no
-        baseline-window values would otherwise be silently unevaluated — the
-        newly-provisioned host is exactly where a homoglyph hides — so those
-        groups are scored against a fallback reference learned from events
-        *outside the suspect windows*. Learning it over the whole scope instead
-        would let a suspect-window value into its own reference and mask itself.
-        Every finding records which reference scored it in
-        ``details.group_basis``, and groups the guards skipped are reported in
-        ``warnings`` rather than vanishing.
+        The two skip guards apply per group, and they mean opposite things, so
+        a group failing one is not treated like a group failing the other:
+
+        * ``alphabet_size > _MAX_CHARSET_SIZE`` — *the question does not
+          apply*. Free text in a large script has no meaningful "novel
+          character" however much of it there is, so the group is **dropped**
+          and named in ``warnings``. (In practice such a group also forces the
+          fallback over the same ceiling — the fallback is learned from a
+          superset of the group's own data — so the whole field goes
+          unevaluated; the group is excluded explicitly regardless, so the
+          routing does not rest on that.)
+        * ``n_vals < _MIN_CHARSET_BASELINE`` — *not enough evidence to learn
+          this group's own alphabet*. The group is not thereby exonerated, so it
+          is scored against a **fallback** reference instead of dropped. Note
+          that "absent from the baseline window" is just ``n_vals == 0``, the
+          degenerate case of the same condition: routing 0 to a fallback but 3
+          to a blind spot would mean less evidence bought better treatment,
+          right where a freshly provisioned host would sit.
+
+        The fallback is mode-specific and learned with the rare-chars recipe:
+        temporal mode learns it from events *outside the suspect windows*
+        (``basis="outside-suspect-windows"``) — a whole-scope reference would
+        let a suspect value into its own alphabet and mask itself — and
+        self-baseline mode from the merged whole scope
+        (``basis="scope-merged"``), which is exactly the pre-``group_field``
+        reference, so enabling grouping cannot narrow coverage. Every finding
+        records which reference scored it in ``details.group_basis`` and its own
+        group's evidence count in ``details.group_baseline_distinct_values``.
+
+        Grouping costs at most one extra *learn* query per field, never one
+        violation scan per group: the per-group references travel into the
+        single scan as parallel ``{grps, sets}`` array parameters, and
+        ``LIMIT plim BY grp`` preserves each group's finding budget. The
+        fallback learn is only run when some group actually needs it — in
+        temporal mode a bounded ``SELECT DISTINCT`` probe over the suspect
+        windows answers that far more cheaply than the whole-scope scan it
+        guards.
 
         Raises:
             ValueError: if ``group_field`` resolves to a non-string column
@@ -3016,16 +3060,93 @@ class StatisticalAnomalyService:
                 case_id, source_ids, total_events, field_mappings, inventory, inventory_total
             )
 
+        def _learn_rare_chars(field: str, *, exclude_suspects: bool, basis: str) -> _CharsetLearn:
+            """Ungrouped rare-chars reference for *field* — the fallback recipe.
+
+            Shared by both grouped fallbacks. *exclude_suspects* negates the
+            suspect-window predicates (temporal mode), so a suspect value can
+            never land in the reference that is about to score it; without it
+            the reference is the merged whole scope, which is precisely what
+            self-baseline mode learned before ``group_field`` existed.
+            """
+            params: dict[str, Any] = {**base_params}
+            fcol = _col_expr(field, params, field_mappings)
+            pred = ""
+            if exclude_suspects and windows is not None:
+                _, sps = _window_preds(windows, params, source_offsets)
+                pred = f"\n                                  AND NOT ({' OR '.join(sps)})"
+            sql = f"""
+                SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
+                FROM (
+                    SELECT
+                        count() OVER () AS total,
+                        arrayDistinct(extractAll(val, '(?s).')) AS chars
+                    FROM (
+                        SELECT DISTINCT {fcol} AS val
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {fcol} != ''{pred}
+                    )
+                )
+                ARRAY JOIN chars AS c
+                GROUP BY c
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            counts = {str(c): int(nv) for c, nv, _ in rows}
+            n = int(rows[0][2]) if rows else 0
+            return _CharsetLearn(
+                None,
+                [c for c, nv in counts.items() if nv > rarity_floor],
+                counts,
+                n,
+                len(counts),
+                basis,
+            )
+
+        def _suspect_groups_without_reference(field: str, known: set[str]) -> tuple[set[str], bool]:
+            """Groups in the suspect windows with no baseline reference.
+
+            Returns ``(names, truncated)``. One bounded ``SELECT DISTINCT``
+            over the suspect windows only — far cheaper than the whole-scope
+            fallback learn it guards, which is why it is worth running to find
+            out whether that learn is needed at all. *truncated* means the
+            ceiling was hit and the answer is incomplete: callers must treat
+            that as "there may be more", never as "there are none".
+            """
+            params: dict[str, Any] = {**base_params}
+            vcol = _col_expr(field, params, field_mappings)
+            pcol = _group_expr(group_field, params, field_mappings)  # type: ignore[arg-type]
+            _, sps = _window_preds(windows, params, source_offsets)
+            params["glim"] = _CHARSET_GROUP_PROBE_LIMIT
+            sql = f"""
+                SELECT DISTINCT {pcol} AS grp
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {vcol} != ''
+                  AND ({" OR ".join(sps)})
+                LIMIT {{glim:UInt32}}
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            missing = {str(row[0]) for row in rows if str(row[0]) not in known}
+            return missing, len(rows) >= _CHARSET_GROUP_PROBE_LIMIT
+
         all_findings: list[CharsetFinding] = []
         evaluated_fields = 0
         run_warnings: list[str] = []
-        # Groups that scored against the temporal fallback, and groups the skip
-        # guards dropped — both reported in `warnings` so a grouped run never
-        # quietly narrows what it looked at.
-        fallback_groups: set[str] = set()
-        no_fallback_fields: list[str] = []
-        skipped_small: dict[str, int] = {}
-        skipped_wide: dict[str, int] = {}
+        # Every way a grouped run can deviate from "each group scored against
+        # its own alphabet" is accumulated here and reported in `warnings`, so
+        # the run never quietly narrows what it looked at — and never claims to
+        # have narrowed something it did not.
+        fallback_absent: set[str] = set()  # scored by fallback, no own reference
+        fallback_thin: set[str] = set()  # scored by fallback, own reference too thin
+        wide_dropped: dict[str, set[str]] = {}  # field -> groups dropped as free text
+        thin_unevaluated: dict[str, set[str]] = {}  # field -> thin groups with no fallback
+        absent_unevaluated: list[str] = []  # fields where absent groups had no fallback
+        fallback_failed: dict[str, str] = {}  # field -> why no fallback could be learned
 
         for field_token in scan_fields:
             # --- Learn the reference charset(s). With group_field, one
@@ -3183,65 +3304,79 @@ class StatisticalAnomalyService:
                             )
                         )
 
-                    # Fallback for groups the baseline window never saw. Learned
-                    # with the rare-chars recipe over everything *outside* the
-                    # suspect windows: a whole-scope alphabet would contain the
-                    # suspect values themselves and mask them.
-                    fb_params: dict[str, Any] = {**base_params}
-                    fcol = _col_expr(field_token, fb_params, field_mappings)
-                    _, fb_sps = _window_preds(windows, fb_params, source_offsets)
-                    fb_sql = f"""
-                        SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
-                        FROM (
-                            SELECT
-                                count() OVER () AS total,
-                                arrayDistinct(extractAll(val, '(?s).')) AS chars
-                            FROM (
-                                SELECT DISTINCT {fcol} AS val
-                                FROM {db}.events
-                                WHERE case_id = {{cid:String}}
-                                  AND has({{src:Array(String)}}, source_id)
-                                  AND {fcol} != ''
-                                  AND NOT ({" OR ".join(fb_sps)})
-                            )
-                        )
-                        ARRAY JOIN chars AS c
-                        GROUP BY c
-                        {HEAVY_SCAN_SETTINGS}
-                    """
-                    fb_rows = self.ch.client.query(fb_sql, parameters=fb_params).result_rows
-                    fb_counts = {str(c): int(nv) for c, nv, _ in fb_rows}
-                    fb_n_vals = int(fb_rows[0][2]) if fb_rows else 0
-                    if fb_n_vals >= _MIN_CHARSET_BASELINE and len(fb_counts) <= _MAX_CHARSET_SIZE:
-                        fallback = _CharsetLearn(
-                            None,
-                            [c for c, nv in fb_counts.items() if nv > rarity_floor],
-                            fb_counts,
-                            fb_n_vals,
-                            len(fb_counts),
-                            "outside-suspect-windows",
-                        )
-                    else:
-                        # No usable fallback: groups missing from the baseline
-                        # window go unevaluated for this field, which the run
-                        # has to say out loud.
-                        no_fallback_fields.append(field_token)
-
-            # The skip guards apply per group (ungrouped: per field, as before),
-            # and a group they drop is reported rather than dropped in silence.
+            # The two skip guards apply per group (ungrouped: per field, as
+            # before) and mean opposite things — see the docstring. `wide` is a
+            # statement about the *question* and drops the group; `thin` is a
+            # statement about the *evidence* and routes it to a fallback.
+            # Precedence is wide-over-thin: no amount of evidence makes "novel
+            # character" meaningful on free text in a large script.
+            wide = [learn for learn in learns if learn.alphabet_size > _MAX_CHARSET_SIZE]
+            thin = [
+                learn
+                for learn in learns
+                if learn.alphabet_size <= _MAX_CHARSET_SIZE and learn.n_vals < _MIN_CHARSET_BASELINE
+            ]
             evaluated = [
                 learn
                 for learn in learns
-                if learn.n_vals >= _MIN_CHARSET_BASELINE
-                and learn.alphabet_size <= _MAX_CHARSET_SIZE
+                if learn.alphabet_size <= _MAX_CHARSET_SIZE
+                and learn.n_vals >= _MIN_CHARSET_BASELINE
             ]
+
             if group_field is not None:
-                small = sum(1 for learn in learns if learn.n_vals < _MIN_CHARSET_BASELINE)
-                wide = sum(1 for learn in learns if learn.alphabet_size > _MAX_CHARSET_SIZE)
-                if small:
-                    skipped_small[field_token] = small
                 if wide:
-                    skipped_wide[field_token] = wide
+                    wide_dropped[field_token] = {str(learn.group) for learn in wide}
+                # Who needs a fallback, by name, *before* deciding to pay for
+                # one. The probe is only meaningful in temporal mode: the
+                # self-baseline learn scans the same corpus the violation scan
+                # does, so every group the scan will see is already in `learns`
+                # and none can be absent.
+                thin_names = {str(learn.group) for learn in thin}
+                absent_names: set[str] = set()
+                probe_truncated = False
+                if windows is not None:
+                    absent_names, probe_truncated = _suspect_groups_without_reference(
+                        field_token, {str(learn.group) for learn in learns}
+                    )
+                if thin_names or absent_names or probe_truncated:
+                    candidate = _learn_rare_chars(
+                        field_token,
+                        exclude_suspects=windows is not None,
+                        basis=(
+                            "outside-suspect-windows" if windows is not None else "scope-merged"
+                        ),
+                    )
+                    if (
+                        candidate.n_vals >= _MIN_CHARSET_BASELINE
+                        and candidate.alphabet_size <= _MAX_CHARSET_SIZE
+                    ):
+                        fallback = candidate
+                        # Reported for having been *scored differently*, not for
+                        # having produced findings: a group measured against
+                        # another reference is a fact about the run even when it
+                        # comes back clean.
+                        fallback_thin |= thin_names
+                        fallback_absent |= absent_names
+                    else:
+                        # Nothing left to score them against. They go
+                        # unevaluated, and the run names which ones and why
+                        # rather than reporting a bare field name — including
+                        # *which* guard the fallback itself tripped, since the
+                        # two failures call for different responses (widen the
+                        # baseline vs. this field is free text).
+                        fallback_failed[field_token] = (
+                            "too few distinct values to learn one from"
+                            if candidate.n_vals < _MIN_CHARSET_BASELINE
+                            else (
+                                f"the reference it would learn is itself wider than "
+                                f"{_MAX_CHARSET_SIZE} characters"
+                            )
+                        )
+                        if thin_names:
+                            thin_unevaluated[field_token] = thin_names
+                        if absent_names or probe_truncated:
+                            absent_unevaluated.append(field_token)
+
             if not evaluated and fallback is None:
                 continue
             evaluated_fields += 1
@@ -3303,13 +3438,29 @@ class StatisticalAnomalyService:
                 viol_params["sets"] = [learn.reference for learn in evaluated]
                 viol_params["fb"] = fallback.reference if fallback is not None else []
                 viol_params["has_fb"] = 1 if fallback is not None else 0
+                viol_params["skip"] = [learn.group for learn in wide]
                 viol_params["tlim"] = _MAX_CHARSET_GROUPED_ROWS
                 # `greatest(gidx, 1)` because ClickHouse evaluates both `if`
                 # branches and rejects array index 0; the guarded index is only
                 # read when gidx > 0, and an out-of-range index yields an empty
-                # array rather than an error. A group with no reference at all
-                # (guard-skipped, no fallback) is dropped by the `has_fb` test
-                # instead of being scored against someone else's alphabet.
+                # array rather than an error.
+                #
+                # Row routing: gidx > 0 is a group with its own reference.
+                # gidx = 0 covers both "too thin to learn from" and "absent from
+                # the reference scan", which the fallback is there to score —
+                # but *not* a group the wide-alphabet guard dropped, since
+                # "novel character" is meaningless for it whatever alphabet you
+                # measure against. `skip` carries those out so gidx = 0 keeps
+                # one unambiguous meaning.
+                #
+                # `skip` is belt-and-braces rather than load-bearing: the
+                # fallback is learned from a superset of every group's own data
+                # (everything outside the suspect windows, or the whole scope),
+                # so its alphabet is at least as wide as the widest group's. A
+                # group over the ceiling therefore guarantees the fallback is
+                # over it too and `has_fb` is 0 anyway. Keeping the exclusion
+                # explicit costs one array parameter and means the routing does
+                # not depend on that argument holding.
                 viol_sql = f"""
                     SELECT val, grp, novel, cnt, first_seen, evt_id{win_idx_group}
                     FROM (
@@ -3347,7 +3498,9 @@ class StatisticalAnomalyService:
                                   AND {vcol} != ''{detect_clause}
                                 GROUP BY val, grp{win_idx_group}
                             )
-                            WHERE gidx > 0 OR {{has_fb:UInt8}} = 1
+                            WHERE gidx > 0
+                               OR ({{has_fb:UInt8}} = 1
+                                   AND NOT has({{skip:Array(String)}}, grp))
                         )
                     )
                     WHERE length(novel) > 0
@@ -3358,6 +3511,10 @@ class StatisticalAnomalyService:
                 """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
             by_group = {learn.group: learn for learn in evaluated}
+            # Every learn, not just the evaluated ones — a row's own group is
+            # what distinguishes "too thin" from "absent" and stamps
+            # `group_baseline_distinct_values`.
+            by_group_all = {learn.group: learn for learn in learns}
 
             for vrow in vrows:
                 grp: str | None = None
@@ -3380,14 +3537,25 @@ class StatisticalAnomalyService:
                 if not val or not novel_chars:
                     continue
                 # The learn that scored this row: its own group's, or the
-                # fallback when the baseline window never saw the group.
+                # fallback when the group has no usable reference of its own.
+                own = by_group_all.get(grp)
+                if own is not None and own.alphabet_size > _MAX_CHARSET_SIZE:
+                    # Belt-and-braces against the `skip` array in the SQL: a
+                    # wide-alphabet group is never scored, by any reference.
+                    continue
                 learn = by_group.get(grp)
                 if learn is None:
                     learn = fallback
                     if learn is None:
                         continue
                     if grp is not None:
-                        fallback_groups.add(str(grp))
+                        # Both buckets are normally filled by name at decision
+                        # time; this catches a group the probe could not
+                        # enumerate because it hit its ceiling. `own is None` =
+                        # absent from the reference scan, otherwise present but
+                        # too thin — different sentences in the warnings.
+                        target = fallback_thin if own is not None else fallback_absent
+                        target.add(str(grp))
                 char_counts, n_vals = learn.char_counts, learn.n_vals
                 score = 0.0
                 for c in novel_chars:
@@ -3417,6 +3585,12 @@ class StatisticalAnomalyService:
                     details["group_field"] = group_field
                     details["group_value"] = grp
                     details["group_basis"] = learn.basis
+                    # This group's *own* evidence, which is what explains why a
+                    # fallback reference was used. `baseline_distinct_values`
+                    # above stays the count of whichever reference produced the
+                    # score, so the two together read as "scored against N
+                    # values, of which this group contributed M".
+                    details["group_baseline_distinct_values"] = own.n_vals if own else 0
                 # Rarity is reportable exactly when the reference came from the
                 # rare-chars recipe — self-baseline mode, or the temporal
                 # fallback (a per-group baseline alphabet carries no counts).
@@ -3445,31 +3619,51 @@ class StatisticalAnomalyService:
                     )
                 )
 
-        if fallback_groups:
-            named = ", ".join(sorted(fallback_groups)[:_CHARSET_WARN_GROUPS])
-            more = len(fallback_groups) - _CHARSET_WARN_GROUPS
+        # What the fallback reference was, in the words the analyst chose the
+        # mode in — the two modes learn it from different data.
+        fb_desc = (
+            "a reference learned outside the suspect windows"
+            if windows is not None
+            else "the merged whole-scope alphabet"
+        )
+        if fallback_absent:
             run_warnings.append(
-                f"{len(fallback_groups)} {group_field} group(s) had no baseline-window values "
-                "and were scored against a reference learned outside the suspect windows "
-                f"({named}{f', +{more} more' if more > 0 else ''})."
+                f"{len(fallback_absent)} {group_field} group(s) had no baseline-window values "
+                f"and were scored against {fb_desc} ({_name_groups(fallback_absent)})."
             )
-        if no_fallback_fields:
+        if fallback_thin:
+            run_warnings.append(
+                f"{len(fallback_thin)} {group_field} group(s) had fewer than "
+                f"{_MIN_CHARSET_BASELINE} distinct values of their own and were scored against "
+                f"{fb_desc} ({_name_groups(fallback_thin)})."
+            )
+        if wide_dropped:
+            total = sum(len(names) for names in wide_dropped.values())
+            run_warnings.append(
+                f"{total} {group_field} group(s) not evaluated: reference alphabet larger than "
+                f"{_MAX_CHARSET_SIZE} characters, where a novel character carries no signal "
+                f"({_name_groups_by_field(wide_dropped)})."
+            )
+        if thin_unevaluated:
+            total = sum(len(names) for names in thin_unevaluated.values())
+            reasons = "; ".join(
+                f"{f}: {fallback_failed.get(f, 'no fallback reference could be learned')}"
+                for f in sorted(thin_unevaluated)
+            )
+            run_warnings.append(
+                f"{total} {group_field} group(s) below the {_MIN_CHARSET_BASELINE}-value floor "
+                f"were not evaluated, because no fallback reference could be learned — {reasons} "
+                f"({_name_groups_by_field(thin_unevaluated)})."
+            )
+        if absent_unevaluated:
+            fields = sorted(set(absent_unevaluated))
+            reasons = "; ".join(
+                f"{f}: {fallback_failed.get(f, 'no fallback reference could be learned')}"
+                for f in fields
+            )
             run_warnings.append(
                 "Groups absent from the baseline window were not evaluated for "
-                f"{', '.join(no_fallback_fields)}: too few distinct values outside the "
-                "suspect windows to learn a reference from."
-            )
-        if skipped_small:
-            run_warnings.append(
-                f"{sum(skipped_small.values())} group(s) not evaluated: fewer than "
-                f"{_MIN_CHARSET_BASELINE} distinct values "
-                f"({', '.join(f'{f}: {n}' for f, n in sorted(skipped_small.items()))})."
-            )
-        if skipped_wide:
-            run_warnings.append(
-                f"{sum(skipped_wide.values())} group(s) not evaluated: reference alphabet "
-                f"larger than {_MAX_CHARSET_SIZE} characters "
-                f"({', '.join(f'{f}: {n}' for f, n in sorted(skipped_wide.items()))})."
+                f"{', '.join(fields)}, because no fallback reference could be learned — {reasons}."
             )
 
         return self._finalize_findings(

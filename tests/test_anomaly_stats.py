@@ -14,6 +14,8 @@ import pytest
 
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
+    _CHARSET_GROUP_PROBE_LIMIT,
+    _MAX_CHARSET_SIZE,
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
@@ -4798,6 +4800,12 @@ def test_charset_group_field_temporal_falls_back_outside_suspect_windows():
             column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
         ),
     ]
+    # The probe runs before the fallback learn: host-a is known, host-b is not,
+    # so the fallback is worth paying for.
+    responses.insert(
+        2,
+        FakeQueryResult(result_rows=[("host-a",), ("host-b",)], column_names=["grp"]),
+    )
     client = RecordingClient(responses)
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(client)
@@ -4820,18 +4828,273 @@ def test_charset_group_field_temporal_falls_back_outside_suspect_windows():
     # The fallback came from the rare-chars recipe, so its per-character counts
     # are reportable — a baseline-window reference has none.
     assert f.details["char_value_counts"] == {"а": 0}
+    # host-b contributed no evidence of its own — that is *why* a fallback
+    # scored it, and the finding says so rather than leaving it to be inferred.
+    assert f.details["group_baseline_distinct_values"] == 0
+    assert f.details["baseline_distinct_values"] == 90
     # The fallback learn excluded the suspect windows, or a suspect-window value
     # would sit in its own reference and mask itself.
-    assert "AND NOT (" in client.full_queries[2]
+    assert "AND NOT (" in client.full_queries[3]
     viol = client._all_parameters[-1]
     assert viol["has_fb"] == 1
     assert viol["grps"] == ["host-a"]
+    assert viol["skip"] == []
     # …and the run says so.
     assert any("no baseline-window values" in w and "host-b" in w for w in result.warnings)
 
 
+def test_charset_group_field_skips_fallback_learn_when_no_group_needs_it():
+    """The whole-scope fallback learn is a heavy scan, so it only runs when the
+    probe finds a suspect-window group with no baseline reference."""
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[("host-a", ["a", "b"], 60), ("host-b", ["a"], 40)],
+            column_names=["grp", "charset", "n_vals"],
+        ),
+        # Probe: every suspect-window group already has a baseline reference.
+        FakeQueryResult(
+            result_rows=[("host-a",), ("host-b",)],
+            column_names=["grp"],
+        ),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    client = RecordingClient(responses)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        windows=_one_suspect(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 10, tzinfo=UTC),
+            datetime(2024, 1, 11, tzinfo=UTC),
+            datetime(2024, 1, 12, tzinfo=UTC),
+        ),
+        group_field="attr:host",
+    )
+    # count + baseline learn + probe + violation — no fallback learn.
+    assert len(client.full_queries) == 4
+    assert not any("ARRAY JOIN chars" in q and "AND NOT (" in q for q in client.full_queries)
+    assert client._all_parameters[-1]["has_fb"] == 0
+    # Nothing deviated, so nothing to warn about.
+    assert result.warnings == []
+
+
+def test_charset_group_probe_at_ceiling_assumes_a_fallback_is_needed():
+    """A probe that hits its row ceiling cannot prove every group is covered,
+    so it answers 'needed' — an unchecked group is never assumed safe."""
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[(f"host-{i}", ["a"], 60) for i in range(_CHARSET_GROUP_PROBE_LIMIT)],
+            column_names=["grp", "charset", "n_vals"],
+        ),
+        # Probe returns exactly the ceiling — all known, but truncated.
+        FakeQueryResult(
+            result_rows=[(f"host-{i}",) for i in range(_CHARSET_GROUP_PROBE_LIMIT)],
+            column_names=["grp"],
+        ),
+        FakeQueryResult(
+            result_rows=[("a", 80, 90)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    client = RecordingClient(responses)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        windows=_one_suspect(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 10, tzinfo=UTC),
+            datetime(2024, 1, 11, tzinfo=UTC),
+            datetime(2024, 1, 12, tzinfo=UTC),
+        ),
+        group_field="attr:host",
+    )
+    # The fallback learn ran despite every probed group being known.
+    assert len(client.full_queries) == 5
+    assert client._all_parameters[-1]["has_fb"] == 1
+
+
+def test_charset_wide_group_is_dropped_not_scored_by_fallback():
+    """The two guards mean opposite things. A group whose alphabet is too wide
+    fails the detector's *premise* — no reference makes 'novel character'
+    meaningful there — so it is excluded from the scan rather than scored
+    against the fallback."""
+    fs = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    wide_charset = [chr(0x4E00 + i) for i in range(_MAX_CHARSET_SIZE + 1)]
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[
+                ("host-a", ["a", "b"], 60),
+                # host-prose is CJK free text: alphabet over the ceiling.
+                ("host-prose", wide_charset, 500),
+            ],
+            column_names=["grp", "charset", "n_vals"],
+        ),
+        # Probe: no group missing a reference, so no fallback learn.
+        FakeQueryResult(result_rows=[("host-a",), ("host-prose",)], column_names=["grp"]),
+        # Defensive: even if a host-prose row reached Python it is not scored.
+        FakeQueryResult(
+            result_rows=[("文字", "host-prose", ["文"], 2, fs, "evt-cjk", 0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+        ),
+    ]
+    client = RecordingClient(responses)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        windows=_one_suspect(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 10, tzinfo=UTC),
+            datetime(2024, 1, 11, tzinfo=UTC),
+            datetime(2024, 1, 12, tzinfo=UTC),
+        ),
+        group_field="attr:host",
+    )
+    assert result.results == []
+    viol = client._all_parameters[-1]
+    # Carried out of the scan explicitly, so `gidx = 0` keeps one meaning.
+    assert viol["skip"] == ["host-prose"]
+    assert "NOT has({skip:Array(String)}, grp)" in client.full_queries[-1]
+    assert any(
+        "not evaluated" in w and "host-prose" in w and "novel character carries no signal" in w
+        for w in result.warnings
+    )
+
+
+def test_charset_thin_group_is_scored_by_fallback_not_dropped():
+    """A group with too few values of its own is short of *evidence*, not
+    exonerated — 'absent from the baseline window' is just n_vals = 0, the
+    degenerate case of the same condition, so both route to the fallback."""
+    fs = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[("host-a", ["a", "b"], 60), ("host-new", ["a"], 3)],
+            column_names=["grp", "charset", "n_vals"],
+        ),
+        # Probe: both groups have a reference, thin as host-new's is.
+        FakeQueryResult(
+            result_rows=[("host-a",), ("host-new",)],
+            column_names=["grp"],
+        ),
+        FakeQueryResult(
+            result_rows=[("a", 80, 90), ("b", 70, 90)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
+        FakeQueryResult(
+            result_rows=[("abа", "host-new", ["а"], 3, fs, "evt-hom", 0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+        ),
+    ]
+    client = RecordingClient(responses)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        windows=_one_suspect(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 10, tzinfo=UTC),
+            datetime(2024, 1, 11, tzinfo=UTC),
+            datetime(2024, 1, 12, tzinfo=UTC),
+        ),
+        group_field="attr:host",
+    )
+    # count + baseline learn + probe + fallback learn + violation.
+    assert len(client.full_queries) == 5
+    f = result.results[0]
+    assert f.details["group_value"] == "host-new"
+    assert f.details["group_basis"] == "outside-suspect-windows"
+    # It had evidence, just not enough — distinct from the absent case.
+    assert f.details["group_baseline_distinct_values"] == 3
+    assert any(
+        "fewer than 20 distinct values of their own" in w and "host-new" in w
+        for w in result.warnings
+    )
+    assert not any("no baseline-window values" in w for w in result.warnings)
+
+
+def test_charset_self_baseline_thin_group_falls_back_to_merged_scope():
+    """Before group_field, a thin group was scored against the merged
+    whole-scope alphabet. Enabling grouping must not delete it from the run, so
+    self-baseline mode falls back to exactly that reference."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[
+                ("host-a", "a", 90, 100),
+                ("host-tiny", "a", 4, 5),
+            ],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        # Merged whole-scope learn — the self-baseline fallback.
+        FakeQueryResult(
+            result_rows=[("a", 95, 105), ("b", 90, 105)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
+        FakeQueryResult(
+            result_rows=[("ab\x00", "host-tiny", ["\x00"], 2, fs, "evt-nul")],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    client = RecordingClient(responses)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    f = result.results[0]
+    assert f.details["group_value"] == "host-tiny"
+    assert f.details["group_basis"] == "scope-merged"
+    assert f.details["group_baseline_distinct_values"] == 5
+    # Self-baseline has no suspect windows to exclude from the fallback learn.
+    assert "AND NOT (" not in client.full_queries[2]
+    assert any("merged whole-scope alphabet" in w and "host-tiny" in w for w in result.warnings)
+
+
+def test_charset_thin_group_without_usable_fallback_is_named_in_warnings():
+    """When the fallback itself fails the guards there is nothing left to score
+    against, and the run names the groups that lost out."""
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[("host-a", "a", 90, 100), ("host-tiny", "a", 4, 5)],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        # Fallback learn is itself too thin to be a reference.
+        FakeQueryResult(
+            result_rows=[("a", 3, 4)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    assert svc.ch.client._all_parameters[-1]["has_fb"] == 0
+    assert any(
+        "no fallback reference could be learned" in w and "host-tiny" in w for w in result.warnings
+    )
+    # Self-baseline mode has no "absent from the baseline window" case at all,
+    # so that warning must not appear.
+    assert not any("absent from the baseline window" in w for w in result.warnings)
+
+
 def test_charset_group_field_reports_skipped_groups():
-    """Groups the skip guards drop are named in warnings instead of vanishing."""
+    """Only groups with a usable reference of their own travel into the scan as
+    `grps`; a thin one is named in warnings and routed to the fallback rather
+    than sharing another group's alphabet."""
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(
@@ -4842,13 +5105,25 @@ def test_charset_group_field_reports_skipped_groups():
             ],
             column_names=["grp", "c", "n", "n_vals"],
         ),
+        # Merged whole-scope fallback, learned because host-tiny is thin.
+        FakeQueryResult(
+            result_rows=[("a", 95, 105)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
         FakeQueryResult(result_rows=[], column_names=[]),
     ]
     svc = _svc(responses)
     result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
-    assert any("fewer than 20 distinct values" in w for w in result.warnings)
-    # Only the evaluated group's reference travelled into the scan.
-    assert svc.ch.client._all_parameters[-1]["grps"] == ["host-a"]
+    assert any(
+        "fewer than 20 distinct values of their own" in w and "host-tiny" in w
+        for w in result.warnings
+    )
+    # Only the evaluated group's reference travelled into the scan; host-tiny
+    # reaches the fallback through `gidx = 0`, not through someone else's set.
+    viol = svc.ch.client._all_parameters[-1]
+    assert viol["grps"] == ["host-a"]
+    assert viol["has_fb"] == 1
+    assert viol["skip"] == []
 
 
 def test_charset_rejects_non_string_group_field():

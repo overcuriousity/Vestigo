@@ -58,14 +58,26 @@ function groupValueLabel(value: unknown): string {
   return typeof value === "string" && value !== "" ? value : "(no value)";
 }
 
-/** Which reference scored a grouped finding (D14) — a group absent from the
- * baseline window is scored against events outside the suspect windows. */
-function groupBasisHint(basis: unknown): string {
+/** Which reference scored a grouped finding (D14). A group without enough
+ * values of its own — including none at all — is scored against a fallback
+ * rather than skipped, and `own` says how much evidence it did contribute. */
+function groupBasisHint(basis: unknown, own: unknown): string {
+  const short =
+    typeof own === "number"
+      ? own === 0
+        ? "This group had no values of its own in the baseline window"
+        : `This group had only ${own} distinct values of its own, below the 20 needed`
+      : "This group had no usable reference of its own";
   if (basis === "outside-suspect-windows")
-    return "This group had no values in the baseline window; scored against a reference learned outside the suspect windows.";
+    return `${short}; scored against a reference learned outside the suspect windows.`;
+  if (basis === "scope-merged")
+    return `${short}; scored against the merged whole-scope alphabet, which is what this field was measured against before grouping.`;
   if (basis === "baseline-window") return "Scored against this group's baseline-window alphabet.";
   return "Scored against this group's alphabet learned across the scope.";
 }
+
+/** Basis values that mean "not this group's own alphabet". */
+const FALLBACK_BASES = new Set(["outside-suspect-windows", "scope-merged"]);
 
 /** "U+0000"-style codepoint label for a (possibly multi-codepoint) char. */
 function codepointLabel(c: string): string {
@@ -161,12 +173,22 @@ function CharsetRow({
         </span>
         {finding.first_seen && <span>first {fmtTs(finding.first_seen)}</span>}
         {typeof finding.details.group_field === "string" && (
-          <span title={groupBasisHint(finding.details.group_basis)}>
+          <span
+            title={groupBasisHint(
+              finding.details.group_basis,
+              finding.details.group_baseline_distinct_values,
+            )}
+          >
             per {fieldLabel(finding.details.group_field)}{" "}
             <strong className="text-[var(--color-fg-secondary)]">
               {groupValueLabel(finding.details.group_value)}
             </strong>
-            {finding.details.group_basis === "outside-suspect-windows" && " (no baseline)"}
+            {/* Why a fallback scored it: no evidence of its own, or too little.
+                Labelling a thin group "no baseline" would be wrong. */}
+            {FALLBACK_BASES.has(String(finding.details.group_basis)) &&
+              (finding.details.group_baseline_distinct_values
+                ? " (thin baseline)"
+                : " (no baseline)")}
           </span>
         )}
       </div>

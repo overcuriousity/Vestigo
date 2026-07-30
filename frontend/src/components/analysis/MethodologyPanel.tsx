@@ -235,18 +235,24 @@ export function MethodologyPanel({
               temporal learns the baseline window's character set and flags
               detect-window values with never-seen characters. The optional
               group-by scopes the learning: one alphabet per value of that
-              field (e.g. per host) instead of one merged alphabet. In temporal
-              mode a group the baseline window never saw is scored against a
-              reference learned outside the suspect windows — never skipped,
-              and the row says which reference scored it.
+              field (e.g. per host) instead of one merged alphabet. A group
+              without enough values to learn from — including one the baseline
+              window never saw at all — is scored against a fallback rather
+              than skipped: events outside the suspect windows in temporal
+              mode, the merged whole-scope alphabet in self-baseline mode. The
+              row says which reference scored it and how much the group itself
+              contributed.
             </Row>
             <Row label="Signal">
               Null bytes, unicode homoglyphs, injection metacharacters —
               detected purely by character identity, never by what a value
               means. Fields with fewer than 20 distinct baseline values or an
               alphabet over 5000 characters (free text in large scripts) are
-              skipped; under group-by these guards apply per group, and skipped
-              groups are named in the run's warnings.
+              skipped. Under group-by the two guards apply per group and mean
+              different things: an over-wide alphabet drops the group (a novel
+              character carries no signal in free text), while too few values
+              routes it to the fallback. Either way the run's warnings name the
+              groups.
             </Row>
             <Row label="Score">
               Sum over the value's novel characters of −log(values-with-char /

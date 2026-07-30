@@ -692,36 +692,48 @@ invisible characters are visible in the report.
   the rest no longer merges into a reference alphabet that flags neither. Both
   modes honor it, the skip guards below apply per group, and suppressions stay
   keyed on `(field, value)`, applying across groups. Findings name their group
-  in `details.group_field`/`details.group_value`, and which reference scored
-  them in `details.group_basis`.
-- **What grouping costs.** One extra *learn* query per field, not one violation
-  scan per group: the per-group reference alphabets travel into the single scan
-  as parallel `{grps, sets}` array parameters, each row picking its own
-  reference by `indexOf`, and `LIMIT <per_field_limit> BY grp` preserves the
+  in `details.group_field`/`details.group_value`, which reference scored them
+  in `details.group_basis`, and how much evidence the group itself contributed
+  in `details.group_baseline_distinct_values`.
+- **The two skip guards mean opposite things, so a group failing one is not
+  treated like a group failing the other.** A reference alphabet over 5,000
+  characters (CJK prose, base64 blobs mixing full alphabets) means *the
+  question does not apply* — "novel character" carries no signal there however
+  much data you have — so that group is **dropped** and named in `warnings`.
+  Fewer than 20 distinct values means *not enough evidence to learn this
+  group's own alphabet*, which does not exonerate it, so that group is scored
+  against a **fallback** reference instead. Note that "absent from the baseline
+  window" is just the `n_vals = 0` case of the same condition: routing 0 to a
+  fallback but 3 to a blind spot would mean less evidence bought better
+  treatment, right where a freshly provisioned host would sit. Ungrouped, both
+  guards skip the whole field as before; if every scanned field skips, the
+  status is `insufficient_data`.
+- **The fallback reference is mode-specific**, learned with the rare-chars
+  recipe, and named on every finding it scores:
+  - temporal → `details.group_basis = "outside-suspect-windows"`, learned from
+    events *outside* the suspect windows. Learning it over the whole scope
+    would let the suspect values into their own reference and mask themselves.
+  - self-baseline → `details.group_basis = "scope-merged"`, the merged
+    whole-scope alphabet — which is exactly what the field was scored against
+    before `group_field` existed, so enabling grouping never narrows coverage.
+
+  Groups scored this way are named in `warnings`, with "had no baseline-window
+  values" and "had fewer than 20 distinct values of their own" reported
+  separately. If no fallback can be learned either, those groups go unevaluated
+  and the run says which ones and which guard the fallback itself tripped.
+- **What grouping costs.** At most one extra *learn* query per field, never one
+  violation scan per group: the per-group reference alphabets travel into the
+  single scan as parallel `{grps, sets}` array parameters, each row picking its
+  own reference by `indexOf`, and `LIMIT <per_field_limit> BY grp` preserves the
   per-group finding budget. Group cardinality therefore costs rows, not
   queries. A pathological group count is bounded at 5,000 returned rows per
-  field.
-- **A group the baseline window never saw is scored against a fallback
-  reference** (`details.group_basis = "outside-suspect-windows"`, and a
-  `warnings` entry naming the groups). Skipping such a group would be a silent
-  false negative exactly where it hurts — a host that first appears inside the
-  suspect window is the interesting one — and learning its reference over the
-  whole scope would let the suspect values into their own reference and mask
-  themselves, so the fallback is learned from events *outside* the suspect
-  windows with the rare-chars recipe. If the data outside the suspect windows
-  is itself too thin to learn from, those groups go unevaluated and the run
-  says so in `warnings`.
+  field. The fallback learn is a whole-scope scan, so it only runs when some
+  group actually needs one — in temporal mode a bounded `SELECT DISTINCT` probe
+  over the suspect windows (1,000 rows, and a truncated result counts as "yes")
+  answers that far more cheaply than the scan it guards.
 - **Events missing the grouping field form their own group** (empty group
   value, rendered `(no value)`): excluding them would quietly drop them from
   the run.
-- **Free-text fields in large scripts.** A field whose reference alphabet
-  exceeds 5,000 characters (CJK prose, base64 blobs mixing full alphabets) is
-  skipped — "novel character" is meaningless there. Fields with fewer than 20
-  distinct baseline values are skipped too (an alphabet learned from a handful
-  of values flags everything). If every scanned field skips, the status is
-  `insufficient_data`. Under `group_field` these guards apply per group, and
-  skipped groups are counted in `warnings` — a field is still evaluated when
-  only some of its groups qualify.
 - **`group_field` must be a string field.** A non-string column (only
   `timestamp` today) is refused with 422 rather than reaching ClickHouse as a
   type error.
