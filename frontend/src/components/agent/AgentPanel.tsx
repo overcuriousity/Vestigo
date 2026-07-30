@@ -74,7 +74,16 @@ type ChatItem =
       promptTokens?: number | null;
       completionTokens?: number | null;
     }
-  | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
+  | {
+      kind: "tool";
+      /** The call's `tool_call_id` — pairs the row with its result and keys
+       * the expandable detail (`data-testid`). Null on pre-migration rows. */
+      id?: string | null;
+      tool: string;
+      args?: Record<string, unknown> | null;
+      /** What the tool returned, paired from the result row (#203). */
+      result?: unknown;
+    }
   | { kind: "thinking"; content: string; streaming?: boolean }
   /** Historical marker rows from the retired compaction/fidelity mechanisms —
    * old transcripts still carry them, so they still render. */
@@ -149,6 +158,11 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   // FIFO order *only while that is unambiguous* — see below.
   const pendingCharts = new Map<string, PendingChart>();
   const pendingChartFifo: PendingChart[] = [];
+  // Generic tool rows (#203): the call row renders immediately and the result
+  // row folds back into it. Same pairing discipline as the charts — keyed by
+  // tool_call_id, FIFO only while a single unkeyed call is in flight.
+  const openToolCalls = new Map<string, ChatItem & { kind: "tool" }>();
+  const orphanToolCalls: (ChatItem & { kind: "tool" })[] = [];
   for (const m of messages) {
     const proposalKind = m.role === "tool" ? proposalItemKind(m.tool_name) : null;
     if (m.role === "user") {
@@ -258,8 +272,30 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         // an intervening call between a chart's call row and its result row
         // is normal. An orphaned entry (result row never persisted) just
         // stays buffered and renders nothing.
-        items.push({ kind: "tool", tool: m.tool_name, args: m.tool_args });
+        const item: ChatItem & { kind: "tool" } = {
+          kind: "tool",
+          id: m.tool_call_id,
+          tool: m.tool_name,
+          args: m.tool_args,
+        };
+        if (m.tool_call_id) openToolCalls.set(m.tool_call_id, item);
+        else orphanToolCalls.push(item);
+        items.push(item);
       }
+    } else if (m.role === "tool" && !m.tool_args && m.tool_name) {
+      // Generic result row (#203): fold the result into its call row instead
+      // of passing silently. Unkeyed legacy rows pair FIFO only while that is
+      // unambiguous — same rule as the chart pairing above.
+      let target: (ChatItem & { kind: "tool" }) | undefined;
+      if (m.tool_call_id) {
+        target = openToolCalls.get(m.tool_call_id);
+        openToolCalls.delete(m.tool_call_id);
+      } else if (orphanToolCalls.length === 1) {
+        target = orphanToolCalls.shift();
+      } else {
+        orphanToolCalls.length = 0;
+      }
+      if (target) target.result = m.tool_result;
     }
   }
   return items;
@@ -400,7 +436,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     }
     return {
       ...s,
-      items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }],
+      items: [...flushed, { kind: "tool", id: e.tool_call_id, tool: e.tool, args: e.args }],
       liveText: "",
     };
   }
@@ -437,7 +473,14 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
         pendingCharts,
       };
     }
-    return s;
+    // Generic tool result (#203): fold it into the call row it answers so the
+    // row can show what the tool returned, instead of dropping it outright.
+    return {
+      ...s,
+      items: s.items.map((it) =>
+        it.kind === "tool" && it.id === e.tool_call_id ? { ...it, result: e.result } : it,
+      ),
+    };
   }
   if (e.type === "cancelled") {
     // Flush whatever streamed before the stop — the partial turn is persisted
@@ -459,16 +502,48 @@ function itemsFromStream(s: StreamState): ChatItem[] {
   return out;
 }
 
-function ToolRow({ tool, args }: { tool: string; args?: Record<string, unknown> | null }) {
+/** Cap on the rendered tool result — the full payload stays in the transcript
+ * record; the row shows enough to audit the call without flooding the panel. */
+function formatToolResult(result: unknown): string {
+  const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  return text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
+}
+
+function ToolRow({
+  id,
+  tool,
+  args,
+  result,
+}: {
+  id?: string | null;
+  tool: string;
+  args?: Record<string, unknown> | null;
+  result?: unknown;
+}) {
   const summary = args && Object.keys(args).length > 0 ? JSON.stringify(args) : "";
   return (
-    <div className="flex items-start gap-1.5 px-1 text-[11px] text-[var(--color-fg-secondary)]">
-      <Wrench size={11} className="mt-0.5 shrink-0" />
-      <span className="min-w-0 break-all font-mono">
-        {tool}
-        {summary && <span className="opacity-70"> {summary.slice(0, 200)}</span>}
-      </span>
-    </div>
+    <details
+      data-testid={id ? `tool-call-${id}` : undefined}
+      className="rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+    >
+      <summary className="flex cursor-pointer select-none items-center gap-1.5">
+        <Wrench size={11} className="shrink-0" />
+        <span className="min-w-0 break-all font-mono">
+          {tool}
+          {summary && <span className="opacity-70"> {summary.slice(0, 200)}</span>}
+        </span>
+      </summary>
+      {args && Object.keys(args).length > 0 && (
+        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words">
+          {JSON.stringify(args, null, 2)}
+        </pre>
+      )}
+      {result !== undefined && result !== null && (
+        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words">
+          {formatToolResult(result)}
+        </pre>
+      )}
+    </details>
   );
 }
 
@@ -895,7 +970,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             );
           }
           if (item.kind === "tool") {
-            return <ToolRow key={i} tool={item.tool} args={item.args} />;
+            return <ToolRow key={i} id={item.id} tool={item.tool} args={item.args} result={item.result} />;
           }
           if (item.kind === "thinking") {
             return (
