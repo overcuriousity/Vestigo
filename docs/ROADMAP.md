@@ -334,10 +334,22 @@ Decisions, not work items — each stays as decided unless its trigger fires.
   2026-07-20). `evtx2timesketch` stays for *text* exports, but binary `.evtx` now has a
   native converter (`evtx2vestigo`, 2026-07-30) — the two cover different inputs, not the
   same one twice.
-- **`evtx2vestigo` deferred items.** `.evtx.gz` input (pyevtx accepts a `BytesIO`, but
-  decompressing a routinely-hundreds-of-MB log costs whole-file RAM); `%%1833`-style
-  message-table resolution (needs the originating host's WEVT templates — pyevtx's
-  `WevtCache` could do it); EvtxECmd PayloadData slot-order parity (we emit each mapped
+- **Ship a stock Windows `vestigo-fieldmap.yml`.** `evtx2vestigo` emits Sigma-canonical
+  names, so Windows rules resolve correctly but are permanently flagged in
+  `fallback_fields` — nothing vouches for a name that is right by construction, and a
+  timeline field mapping cannot vouch for it (identity mappings are rejected as shadowing
+  the raw key). A ruleset-root fieldmap of identity entries clears the flag with identical
+  SQL — measured over SigmaHQ `rules/windows/builtin` (326 rules): 873 fallback flags → 0,
+  zero SQL differences, zero match-count differences, from 141 identity entries generated
+  straight from the rules' own field names. The open question is *delivery*, not
+  feasibility: the ruleset directory is operator-supplied via `VESTIGO_SIGMA_RULES_PATH`,
+  so the repo cannot drop a file into it — it needs shipping as a downloadable asset (like
+  the converters) or a documented snippet. See `docs/ANOMALY_DETECTION.md` §Sigma.
+- **`evtx2vestigo` deferred items.** `.evtx.gz` input (the `evtx` wheel's `PyEvtxParser`
+  accepts a `BytesIO`, but decompressing a routinely-hundreds-of-MB log costs whole-file
+  RAM); `%%1833`-style message-table resolution (needs the originating host's WEVT
+  templates, which no converter-side library has); EvtxECmd PayloadData slot-order parity
+  (we emit each mapped
   property as its own attribute instead, which is strictly more information). Trigger for
   the first: someone hands us a compressed triage collection.
 - **Converter parallelism tuning is revisit-on-demand.** Benchmarking worker-count and

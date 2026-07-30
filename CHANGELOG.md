@@ -13,12 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly (file or directory) instead of a text export, so `file_hash` anchors to the
   original evidence. `byte_offset` is a real offset into the `.evtx` and `content_hash`
   covers that same raw record span, so `dd`+`sha256sum` reproduces it without Vestigo.
-  Each 64 KiB chunk is parsed in isolation, which recovers records the whole-file path
-  loses at the first damaged chunk. Attribute names are Sigma-canonical (`EventID` as an
-  unpadded string, `Channel`, `Provider_Name`, native `EventData` names), so community
-  Windows rules match with an empty `fallback_fields`. The EvtxECmd map corpus
-  (468 maps, [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx), MIT) is embedded
-  for event descriptions; `--no-maps` opts out. Requires `pyarrow` and `evtx`.
+  Each 64 KiB chunk is handed to the parser as a complete, checksum-valid one-chunk
+  document, which recovers records the whole-file path loses at the first damaged chunk;
+  record offsets are resolved per chunk, so a record id repeated across chunks in a
+  re-chunked log still yields distinct offsets. Attribute names are Sigma-canonical
+  (`EventID` as an unpadded string, `Channel`, `Provider_Name`, native `EventData` names),
+  so community Windows rules compile to exactly the predicate they look like with no
+  field translation. The EvtxECmd map corpus (468 maps,
+  [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx), MIT) is embedded for event
+  descriptions; `--no-maps` opts out. Requires `pyarrow` and `evtx`.
 
 - **Tool calls in the agent panel are expandable.** Every tool row now unfolds to the
   exact arguments the agent sent and what the tool returned, persisted rows and live

@@ -1478,6 +1478,7 @@ disposition mechanism.
 - **Numeric equality is textual.** `EventID: 4624` compares as the string
   `'4624'` — `"04624"` does not match; `|gt`/`|lt` comparisons go through
   `toFloat64OrNull` and treat non-numeric values as no-match.
+
 - **Unsupported constructs** (correlation rules, aggregations) report the
   rule as `not_applicable` rather than failing the run.
 - **Case-uploaded rules have no ruleset fieldmap.** `vestigo-fieldmap.yml`
@@ -1490,6 +1491,50 @@ disposition mechanism.
   every listing/run (a file drop needs no restart), but a file whose
   mtime/size are unchanged reuses its parsed form — only changed files pay
   the YAML/pySigma parse.
+
+### Windows event logs need no field translation
+
+`evtx2vestigo` deliberately emits Sigma-canonical names, so a community Windows
+rule compiles to exactly the predicate it looks like and needs no mapping to
+work: `EventID` (unpadded decimal string, per the caveat above), `Channel`,
+`Provider_Name`, and every `EventData` field under its native Windows name
+(`TargetUserName`, `LogonType`, `CommandLine`, `NewProcessName`, `Image`,
+`ParentImage`, `IpAddress`, `ServiceName`, `ScriptBlockText`, ...). A stock 4672
+rule compiles to
+`attributes['EventID'] = '4672' AND attributes['Channel'] ILIKE 'Security'`.
+
+**Such rules are still flagged as fallback matches, and that is expected.**
+`fallback_fields` records "resolved through the raw attribute key, and no mapping
+vouched for that name" — it tracks the *provenance of the name*, not whether the
+match is right. Since these names are correct by construction rather than by
+declaration, nothing vouches for them:
+
+- A timeline **field mapping cannot** clear it. `validate_field_mappings` rejects
+  a canonical name that collides with an existing raw attribute key (it would
+  shadow the real field), so the identity mapping `EventID -> ["EventID"]` is
+  refused by design.
+- A **global ruleset fieldmap can**. A `vestigo-fieldmap.yml` at the ruleset root
+  containing `EventID: EventID` marks the field as vouched-for and the flag
+  clears. Measured over SigmaHQ `rules/windows/builtin` (326 rules, commit
+  `1aacbed`) against an `evtx2vestigo` timeline: adding an identity fieldmap for
+  the 141 distinct field names took the run from **873 fallback flags to 0**,
+  with **zero SQL differences and zero match-count differences**. Case-uploaded
+  rules have no fieldmap layer, so they are always flagged.
+
+Those 326 rules also compile and run with **zero errors** against `evtx2vestigo`
+output, which is the practical claim: the converter's field names are what the
+community ruleset already addresses.
+
+Three further consequences worth knowing:
+
+- System field spellings win. An `EventData` field that collides with one is
+  stored as `EventData_<name>`, so a rule matching on `Channel` can never be
+  fooled by a payload field of the same name.
+- Map-derived text is namespaced under `Map*` (`MapDescription`,
+  `MapPayloadData1`, ...). It is human-readable prose, not a raw field — rules
+  should match the underlying Windows field instead.
+- `Execution_ProcessID`/`Execution_ThreadID` carry the `<System>` values, so
+  they never collide with Sysmon's `EventData` `ProcessId`.
 
 ---
 

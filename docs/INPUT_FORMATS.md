@@ -23,6 +23,12 @@ survive as attributes so an examiner can inspect the original data later.
   [`TECH_STACK.md` §3.4a](TECH_STACK.md) for why this format was chosen over CSV/JSONL for
   bulk conversion.
 
+Binary evidence containers have no CSV/JSONL equivalent and are always the Parquet path:
+`evtx2vestigo.py` reads binary Windows Event Logs (`.evtx`) directly, while
+`evtx2timesketch.py` covers *text* exports of the same data (`wevtutil qe /f:xml`,
+`evtx_dump`). Prefer the binary path — a text export re-anchors provenance to the dump file
+rather than the original `.evtx`.
+
 Format is detected by file extension: `.csv`/`.tsv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSONL,
 `.parquet` → Parquet (`src/vestigo/ingestion/parser.py::detect_format`).
 
@@ -209,14 +215,14 @@ Parquet supports arbitrary key-value footer metadata; Vestigo requires these key
 |--------------------------------------|-------|
 | `vestigo.format_version`         | `"1"` |
 | `vestigo.converter_name`         | Converter identifier, e.g. `"nginx2vestigo"`. Becomes the event's `parser_name`. |
-| `vestigo.converter_version`      | Converter version string, e.g. `"1.0.0"`. Becomes the event's `parser_version`. |
+| `vestigo.converter_version`      | Converter version string, e.g. `"1.0.0"`. Becomes the event's `parser_version`. Versioned **per converter** — it says nothing about which optional keys below are present. |
 | `vestigo.original_files`         | JSON array of `{"name": str, "sha256": str, "size_bytes": int}` — one entry per raw input file (a directory input yields several). |
 
-### Optional forensic footer metadata (converters >= 1.3.0)
+### Optional forensic footer metadata
 
-Converters >= 1.3.0 also write additive, self-documenting chain-of-custody footer keys.
-The reader does not require them (`validate_parquet_source` ignores them), but they are
-readable from the Parquet footer:
+Converters may also write additive, self-documenting chain-of-custody footer keys. The
+reader does not require them (`validate_parquet_source` ignores them), but they are readable
+from the Parquet footer:
 
 | Key                            | Content                                                        |
 | ------------------------------ | -------------------------------------------------------------- |
@@ -225,8 +231,14 @@ readable from the Parquet footer:
 | `vestigo.timezone_assumption`  | Free-text note on any timezone/year assumption.                |
 | `vestigo.parse_decisions`      | JSON of format-specific parsing choices.                       |
 
-`vestigo.original_files` entries likewise gained `path` (absolute source path) and
-`mtime` (ISO-8601 UTC) in 1.3.0; older files without them remain valid.
+`vestigo.original_files` entries may likewise carry `path` (absolute source path) and
+`mtime` (ISO-8601 UTC); files without them remain valid.
+
+**Probe for these keys — do not infer them from `vestigo.converter_version`.** Each
+converter versions itself independently (a newly written one starts at `1.0.0` while a
+long-lived one is well past it), so the version number is not a capability marker. Every
+converter currently shipped in `src/vestigo/assets/converters/` writes the full set; older
+files, hand-written producers, and third-party ones may not.
 
 ### Minimal example (Python / pyarrow)
 
@@ -285,6 +297,44 @@ with pq.ParquetWriter("example.parquet", schema, compression="zstd") as writer:
 For a real, streaming, forensically-complete implementation see
 `src/vestigo/assets/converters/nginx2vestigo.py` — start from it rather than from
 scratch when writing a new converter.
+
+### `evtx2vestigo.py`: binary Windows Event Logs
+
+`src/vestigo/assets/converters/evtx2vestigo.py` parses the `.evtx` container itself (a file
+or a directory of them) rather than a text export. It is the only converter needing a second
+dependency — `pip install pyarrow evtx` — because binary EVTX parsing is not something the
+standard library can do.
+
+What is specific to it:
+
+- **`byte_offset` is a real offset into the original `.evtx`.** The parser exposes no file
+  offset, so the converter walks the EVTX chunk structure itself to locate each record.
+  `content_hash` is the sha256 of that same raw record span, so
+  `dd bs=1 skip=<byte_offset> count=<record_size>` against the original file reproduces it
+  with no Vestigo tooling. The `record_size` attribute carries the span length.
+  If the scan cannot locate a record, `byte_offset` degrades to the record id and the row
+  is marked `content_hash_basis=rendered_xml`; the footer counts how often that happened.
+  Offsets are scanned per chunk, so a record id duplicated across chunks (routine in a
+  re-chunked or partially overwritten log) still yields distinct offsets — two records can
+  never collapse onto one forensic identity. The footer's `chunk_scan` note reports how many
+  ids were seen twice.
+- **Damage stays local.** Each 64 KiB chunk is parsed in isolation, so one corrupt chunk
+  costs only that chunk instead of aborting the rest of the file. Each chunk is handed to
+  the parser as a complete, checksum-valid one-chunk EVTX document.
+- **Junk input is reported, not absorbed.** A directory is triage output, so a file whose
+  magic is not EVTX (a text export saved under the wrong extension, a zero-byte placeholder)
+  is named on stderr and skipped; a file that parses to zero records is warned about too. A
+  single named file still fails hard.
+- **Attribute names are Sigma-canonical** — see
+  [`ANOMALY_DETECTION.md`](ANOMALY_DETECTION.md) §Sigma.
+- **EvtxECmd maps are embedded.** The community map corpus from
+  [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx) (MIT) is compiled into the
+  script by `scripts/vendor_evtx_maps.py` and supplies `MapDescription` plus the `Map*`
+  attributes the `message` is rendered from. The corpus commit is recorded in
+  `vestigo.parse_decisions`. `--no-maps` skips it entirely and emits only what is literally
+  in the record.
+- **Not resolved:** `%%1833`-style message-table references stay as-is (rendering them needs
+  the originating host's WEVT templates), and `.evtx.gz` is not accepted.
 
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
