@@ -18,6 +18,11 @@ may also come from ``$EVTX_UPSTREAM``):
 
 ``--check`` recompiles and exits non-zero if the committed blob or the manifest hash has
 drifted, without writing anything.
+
+``--manifest-only`` skips the corpus compile and refreshes just ``manifest.json``'s
+size/sha256 for the converter — what an edit *outside* the generated map region needs, and
+the only mode that runs without an upstream checkout. Combine with ``--check`` to assert
+the manifest is current.
 """
 
 from __future__ import annotations
@@ -292,7 +297,7 @@ def main() -> int:
         "--upstream",
         type=Path,
         default=os.environ.get("EVTX_UPSTREAM"),
-        required="EVTX_UPSTREAM" not in os.environ,
+        required="EVTX_UPSTREAM" not in os.environ and "--manifest-only" not in sys.argv,
         help="path to a local EricZimmerman/evtx checkout (default: $EVTX_UPSTREAM)",
     )
     parser.add_argument(
@@ -300,7 +305,24 @@ def main() -> int:
         action="store_true",
         help="verify the committed blob and manifest hash are in sync; write nothing",
     )
+    parser.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="refresh only manifest.json's size/sha256 for evtx2vestigo (no upstream "
+        "checkout needed) — for edits to the script outside the generated map region",
+    )
     args = parser.parse_args()
+
+    if args.manifest_only:
+        changed = _refresh_manifest(check=args.check)
+        if args.check:
+            if changed:
+                print("drift: manifest.json size/sha256 is stale", file=sys.stderr)
+                return 1
+            print("ok: manifest is in sync")
+            return 0
+        print("manifest refreshed" if changed else "manifest already in sync")
+        return 0
 
     upstream = args.upstream.expanduser().resolve()
     if not upstream.is_dir():

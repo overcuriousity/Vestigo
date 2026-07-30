@@ -9,7 +9,11 @@ Forensic provenance embedded in the output:
   - per input file: name, absolute path, sha256, size, mtime
   - per event row: byte offset of the record *inside the original .evtx*, and the sha256
     of that record's raw bytes — so `dd bs=1 skip=<byte_offset> count=<record_size>`
-    against the original file reproduces `content_hash` with no Vestigo tooling
+    against the original file reproduces `content_hash` with no Vestigo tooling.
+    Exception: when the chunk walk cannot locate a record the parser did return (damaged
+    framing), the row falls back to `byte_offset` = the record id and `content_hash` over
+    the rendered XML, and says so in `content_hash_basis=rendered_xml` — those rows carry
+    no `record_size` and are counted in `vestigo.parse_decisions.byte_offset_fallback_rows`
   - converter name + version, and the EvtxECmd map corpus commit the messages came from
 
 Recovery: each 64 KiB chunk is parsed in isolation, so one corrupt chunk costs only that
@@ -2479,7 +2483,8 @@ L2sYfZJssbqzutmZyAjs1p+oZHQpSlSvZVaxXmoV1erhUvZL5rb0C/lwC7mntyPwxQ/DAR6zYlZT
 # ---------------------------------------------------------------------------
 # EVTX binary layout
 #
-# file header : 4096 bytes; magic "ElfFile\x00"; number_of_chunks u32 @42
+# file header : 4096 bytes; magic "ElfFile\x00"; number_of_chunks u16 @42;
+#               crc32 of the first 120 bytes @124
 # chunk       : 65536 bytes at 4096 + i*65536; magic "ElfChnk\x00";
 #               512-byte header; free_space_offset u32 @48 (chunk-relative)
 # record      : magic 2a 2a 00 00; size u32 @4 (header + payload + trailing
@@ -3162,6 +3167,11 @@ def _extract_event_data(root: ET.Element) -> dict[str, str]:
                     if not name:
                         unnamed += 1
                         name = f"Data{unnamed}"
+                        # A named field spelled DataN wins the plain key — that
+                        # is the name Sigma rules address — so the positional
+                        # value steps aside instead of overwriting it.
+                        if name in attrs:
+                            name = f"{name}_pos"
                     if node.text:
                         attrs[name] = node.text
                 elif node_tag == "Binary":

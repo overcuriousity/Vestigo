@@ -256,6 +256,21 @@ class TestSigmaFieldContract:
         """The converter is a standalone copy of the server's column list — pin it."""
         assert set(converter._RESERVED_ATTR_KEYS) == TOP_LEVEL_EVENT_COLUMNS
 
+    def test_named_data_field_wins_over_a_positional_key(self, converter):
+        """A record mixing a named `Data1` with unnamed positional Data must not
+        lose the named value — that is the name a Sigma rule addresses."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(
+            "<Event><EventData>"
+            '<Data Name="Data1">named</Data>'
+            "<Data>positional</Data>"
+            "</EventData></Event>"
+        )
+        attrs = converter._extract_event_data(root)
+        assert attrs["Data1"] == "named"
+        assert attrs["Data1_pos"] == "positional"
+
 
 class TestByteOffsets:
     def test_offsets_resolve_to_records_in_the_original_file(self, converter, tmp_path):
