@@ -68,18 +68,6 @@ def _oidc_available(settings: Any) -> bool:
     )
 
 
-def _demo_case_available(settings: Any) -> bool:
-    """The demo case needs the switch *and* the packaged archive on disk.
-
-    The import is function-local: ``core.demo_case`` pulls in the store and
-    transfer layers, and this module is imported while the app is still coming
-    up.
-    """
-    from vestigo.core.demo_case import demo_archive_path
-
-    return bool(settings.demo_case_enabled) and demo_archive_path().is_file()
-
-
 async def get_capabilities() -> dict[str, bool]:
     """Resolve every optional subsystem's availability for this instance."""
     from vestigo.agent.availability import agent_available
@@ -97,5 +85,8 @@ async def get_capabilities() -> dict[str, bool]:
         # frontend gates every subsystem the same way, not because it varies.
         "sigma": True,
         "transfer": settings.transfer_enabled,
-        "demo_case": _demo_case_available(settings),
+        # Nothing to configure: the case is generated on demand from code that
+        # ships with the app. The key exists so the frontend gates every
+        # subsystem the same way.
+        "demo_case": settings.demo_case_enabled,
     }

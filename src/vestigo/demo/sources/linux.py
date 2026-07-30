@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
 
-from tools.demo_case import scenario
+from vestigo.demo import scenario
 
 _SSH_CLIENTS = ("10.20.4.17", "10.20.4.31", "10.20.9.8", "10.20.11.42", "10.30.2.5")
 _ROUTINE_SUDO = (

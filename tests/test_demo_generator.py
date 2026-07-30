@@ -6,8 +6,8 @@ makes of them (that is ``tests/test_demo_detector_coverage_clickhouse.py``).
 
 from __future__ import annotations
 
-from tools.demo_case import metadata, scenario
-from tools.demo_case.sources import linux, netflow, proxy, windows
+from vestigo.demo import metadata, scenario
+from vestigo.demo.sources import linux, netflow, proxy, windows
 
 
 def test_window_is_fixed():
@@ -268,8 +268,11 @@ def test_views_carry_the_full_frontend_payload():
 
 
 def test_story_has_a_narrative_arc():
-    kinds = [kind for kind, _ in metadata.STORY_BLOCKS]
-    assert kinds[0] == "heading"
+    from vestigo.stories.schemas import BLOCK_KINDS
+
+    kinds = {kind for kind, _ in metadata.STORY_BLOCKS}
+    assert kinds <= set(BLOCK_KINDS), "story blocks must use real block kinds"
+    assert metadata.STORY_BLOCKS[0][1].startswith("## ")
     assert len(metadata.STORY_BLOCKS) >= 8
     body = " ".join(text for _, text in metadata.STORY_BLOCKS).lower()
     assert "recommend" in body

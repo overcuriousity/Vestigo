@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from vestigo.api import deps
@@ -35,7 +33,7 @@ async def test_claim_demo_seed_is_once_only(store):
 
 
 @pytest.mark.asyncio
-async def test_maybe_seed_dispatches_once(store, fake_archive, imports, monkeypatch):
+async def test_maybe_seed_dispatches_once(store, builds, monkeypatch):
     await store.init_schema()
     monkeypatch.setattr(deps, "_store", store)
     user = await store.create_user(user_id="u_seeded", username="seeded")
@@ -43,15 +41,15 @@ async def test_maybe_seed_dispatches_once(store, fake_archive, imports, monkeypa
     job_id = await demo_mod.maybe_seed_demo_case(user)
     assert job_id is not None
     await demo_mod._await_pending_seeds()
-    assert len(imports) == 1
+    assert len(builds) == 1
 
     refreshed = await store.get_user(user.id)
     assert await demo_mod.maybe_seed_demo_case(refreshed) is None
-    assert len(imports) == 1
+    assert len(builds) == 1
 
 
 @pytest.mark.asyncio
-async def test_maybe_seed_declines_when_disabled(store, fake_archive, imports, monkeypatch):
+async def test_maybe_seed_declines_when_disabled(store, builds, monkeypatch):
     await store.init_schema()
     monkeypatch.setattr(deps, "_store", store)
     monkeypatch.setenv("VESTIGO_DEMO_CASE_ENABLED", "false")
@@ -59,7 +57,7 @@ async def test_maybe_seed_declines_when_disabled(store, fake_archive, imports, m
     user = await store.create_user(user_id="u_nodemo", username="nodemo")
 
     assert await demo_mod.maybe_seed_demo_case(user) is None
-    assert imports == []
+    assert builds == []
     refreshed = await store.get_user(user.id)
     # Not consumed, so turning the setting back on still seeds this user.
     assert refreshed.demo_case_seeded_at is None
@@ -68,29 +66,18 @@ async def test_maybe_seed_declines_when_disabled(store, fake_archive, imports, m
 
 
 @pytest.mark.asyncio
-async def test_maybe_seed_declines_when_archive_missing(store, imports, monkeypatch):
-    await store.init_schema()
-    monkeypatch.setattr(deps, "_store", store)
-    monkeypatch.setattr(demo_mod, "demo_archive_path", lambda: Path("/nonexistent/demo.vestigo"))
-    user = await store.create_user(user_id="u_noarchive", username="noarchive")
-
-    assert await demo_mod.maybe_seed_demo_case(user) is None
-    assert imports == []
-
-
-@pytest.mark.asyncio
-async def test_failed_import_marks_the_job_failed(store, fake_archive, monkeypatch):
+async def test_failed_build_marks_the_job_failed(store, monkeypatch):
     await store.init_schema()
     monkeypatch.setattr(deps, "_store", store)
 
     async def _boom(*args, **kwargs):
-        raise RuntimeError("archive is corrupt")
+        raise RuntimeError("clickhouse is unreachable")
 
-    monkeypatch.setattr(demo_mod, "import_case", _boom)
+    monkeypatch.setattr(demo_mod, "build_demo_case", _boom)
     user = await store.create_user(user_id="u_broken", username="broken")
 
     job_id = await demo_mod.maybe_seed_demo_case(user)
     await demo_mod._await_pending_seeds()
     job = get_job_store().get(job_id)
     assert job.status == "failed"
-    assert "corrupt" in job.error
+    assert "unreachable" in job.error

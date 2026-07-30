@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
 
-from tools.demo_case import scenario
+from vestigo.demo import scenario
 
 PROXY_HEADER: tuple[str, ...] = (
     "datetime",

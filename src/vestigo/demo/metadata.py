@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from tools.demo_case import scenario
-from tools.demo_case.sources import netflow, proxy, windows
+from vestigo.db.postgres import generate_id
+from vestigo.demo import scenario
+from vestigo.demo.sources import netflow, proxy, windows
 
 #: The closed tag vocabulary. A demo with fifty ad-hoc tags teaches nothing
 #: about how tags are meant to be used.
@@ -41,8 +42,10 @@ class DemoAnnotation:
         tags: Tags to apply, from ``TAGS``.
         after: Only consider events at or after this instant.
         attribute: Attribute key to match on, if any.
-        value: Required value for ``attribute``.
-        contains: Substring the message must contain, if any.
+        value: Exact value ``attribute`` must equal.
+        contains: Substring to require. Applies to ``attribute`` when one is
+            named, and to the message otherwise — a Windows command line lives
+            in an attribute, a syslog line lives in the message.
     """
 
     source_key: str
@@ -101,6 +104,7 @@ ANNOTATIONS: tuple[DemoAnnotation, ...] = (
         "host gets rebuilt.",
         ("initial-access", "persistence"),
         _FOOTHOLD.start,
+        attribute="command_line",
         contains="-enc ",
     ),
     DemoAnnotation(
@@ -127,6 +131,7 @@ ANNOTATIONS: tuple[DemoAnnotation, ...] = (
         "administers anything that way; the platform team uses Ansible.",
         ("lateral-movement",),
         _LATERAL.start,
+        attribute="command_line",
         contains="wmic /node:",
     ),
     DemoAnnotation(
@@ -145,6 +150,7 @@ ANNOTATIONS: tuple[DemoAnnotation, ...] = (
         "filename will not match a naive string search.",
         ("exfil", "to-verify"),
         _EXFIL.start,
+        attribute="command_line",
         contains="7z.exe a",
     ),
     DemoAnnotation(
@@ -416,10 +422,14 @@ level: medium
 )
 
 
-#: The story, as (block kind, markdown) pairs.
+#: The story, as (block kind, markdown) pairs. Headings are markdown ``##``
+#: lines rather than a block kind of their own — see stories/schemas.py.
 STORY_TITLE = "Contractor account compromise — 24–30 May"
 STORY_BLOCKS: tuple[tuple[str, str], ...] = (
-    ("heading", "Contractor account compromise — 24–30 May"),
+    (
+        "markdown",
+        "## Contractor account compromise — 24–30 May",
+    ),
     (
         "markdown",
         "A contractor account was compromised by password spraying, used to establish a "
@@ -428,7 +438,10 @@ STORY_BLOCKS: tuple[tuple[str, str], ...] = (
         "The first three weeks of May are included deliberately: nothing in them looks "
         "like this, and being able to say that with evidence is half the report.",
     ),
-    ("heading", "24 May — credential spray"),
+    (
+        "markdown",
+        "## 24 May — credential spray",
+    ),
     (
         "markdown",
         "Just after 02:00, DC-01 logs several thousand failed logons in under an hour, "
@@ -437,7 +450,10 @@ STORY_BLOCKS: tuple[tuple[str, str], ...] = (
         "The account list argues for prior reconnaissance. The single success argues "
         "for a reused password rather than a guessed one.",
     ),
-    ("heading", "25 May — foothold and persistence"),
+    (
+        "markdown",
+        "## 25 May — foothold and persistence",
+    ),
     (
         "markdown",
         "The account logs on interactively to JUMP-01, runs a base64-encoded PowerShell "
@@ -446,7 +462,10 @@ STORY_BLOCKS: tuple[tuple[str, str], ...] = (
         "From here on, JUMP-01 calls out to a sixteen-character hostname every five "
         "minutes, to the second.",
     ),
-    ("heading", "27–28 May — lateral movement"),
+    (
+        "markdown",
+        "## 27–28 May — lateral movement",
+    ),
     (
         "markdown",
         "SMB enumeration from JUMP-01 against FILE-01 is mostly denied, but enough "
@@ -455,14 +474,20 @@ STORY_BLOCKS: tuple[tuple[str, str], ...] = (
         "The contractor account also appears on WKS-007 and WKS-009 — finance "
         "workstations it has no history with.",
     ),
-    ("heading", "29–30 May — staging and exfiltration"),
+    (
+        "markdown",
+        "## 29–30 May — staging and exfiltration",
+    ),
     (
         "markdown",
         "7-Zip archives the finance share into `Q4_repоrt_archive.7z` — note the "
         "Cyrillic character in the filename. The archive leaves in a few hundred "
         "chunked uploads to a file-sharing host overnight, paced to look unremarkable.",
     ),
-    ("heading", "What is not part of this"),
+    (
+        "markdown",
+        "## What is not part of this",
+    ),
     (
         "markdown",
         "Two things in the same window are unrelated and worth stating so nobody "
@@ -472,7 +497,10 @@ STORY_BLOCKS: tuple[tuple[str, str], ...] = (
         "- The nightly backup moved from 02:15 to 03:40 on the 25th, in an approved "
         "change window.",
     ),
-    ("heading", "Recommendations"),
+    (
+        "markdown",
+        "## Recommendations",
+    ),
     (
         "markdown",
         "1. Force a password reset for every contractor account and disable password "
@@ -518,11 +546,13 @@ def resolve_annotation_events(
             "after": annotation.after.replace(tzinfo=None),
         }
         if annotation.attribute is not None:
-            conditions.append("attributes[%(attribute)s] = %(value)s")
             params["attribute"] = annotation.attribute
-            params["value"] = annotation.value
+            if annotation.value is not None:
+                conditions.append("attributes[%(attribute)s] = %(value)s")
+                params["value"] = annotation.value
         if annotation.contains is not None:
-            conditions.append("position(message, %(contains)s) > 0")
+            target = "attributes[%(attribute)s]" if annotation.attribute else "message"
+            conditions.append(f"position({target}, %(contains)s) > 0")
             params["contains"] = annotation.contains
         sql = (
             f"SELECT toString(event_id) FROM {database}.events"
@@ -558,9 +588,12 @@ def tag_annotation_rows(
     """
     rows: list[dict[str, Any]] = []
     for index, (annotation, source_id, event_id) in enumerate(resolved):
+        # Ids must be globally unique, not merely unique within this case:
+        # every user gets their own copy of the demo, seeded from the same
+        # constants, and annotation ids are the primary key.
         rows.append(
             {
-                "annotation_id": f"demo_note_{index:03d}",
+                "annotation_id": generate_id(f"demo-note-{index:03d}"),
                 "case_id": case_id,
                 "source_id": source_id,
                 "event_id": event_id,
@@ -573,7 +606,7 @@ def tag_annotation_rows(
         for tag_index, tag in enumerate(annotation.tags):
             rows.append(
                 {
-                    "annotation_id": f"demo_tag_{index:03d}_{tag_index}",
+                    "annotation_id": generate_id(f"demo-tag-{index:03d}-{tag_index}"),
                     "case_id": case_id,
                     "source_id": source_id,
                     "event_id": event_id,

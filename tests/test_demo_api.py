@@ -14,7 +14,7 @@ from tests.conftest import as_admin, login
 from vestigo.core.config import get_settings
 
 
-def _wait_for_imports(imports, expected, timeout=5.0):
+def _wait_for_builds(builds, expected, timeout=5.0):
     """Wait for the background seed task to run in the app's event loop.
 
     The seed job is dispatched with ``asyncio.create_task`` inside the request,
@@ -23,52 +23,54 @@ def _wait_for_imports(imports, expected, timeout=5.0):
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if len(imports) >= expected:
+        if len(builds) >= expected:
             return
         time.sleep(0.02)
 
 
-def test_login_dispatches_a_seed_job_once(client, admin_bootstrap, fake_archive, imports):
+def test_login_dispatches_a_seed_job_once(client, admin_bootstrap, builds):
     login(client, admin_bootstrap["username"], admin_bootstrap["password"])
-    _wait_for_imports(imports, 1)
-    assert len(imports) == 1
+    _wait_for_builds(builds, 1)
+    assert len(builds) == 1
 
     client.post("/api/auth/logout")
     login(client, admin_bootstrap["username"], admin_bootstrap["password"])
-    _wait_for_imports(imports, 2, timeout=1.0)
-    assert len(imports) == 1, "second login must not seed again"
+    _wait_for_builds(builds, 2, timeout=1.0)
+    assert len(builds) == 1, "second login must not seed again"
 
 
-def test_login_still_works_without_an_archive(client, admin_bootstrap, imports):
-    """No packaged archive is not an error — it is simply no demo case."""
+def test_login_still_works_when_seeding_is_off(client, admin_bootstrap, builds, monkeypatch):
+    """Seeding off is not an error — it is simply no demo case."""
+    monkeypatch.setenv("VESTIGO_DEMO_CASE_ENABLED", "false")
+    get_settings.cache_clear()
     resp = client.post(
         "/api/auth/login",
         json={"username": admin_bootstrap["username"], "password": admin_bootstrap["password"]},
     )
     assert resp.status_code == 200
-    _wait_for_imports(imports, 1, timeout=0.5)
-    assert imports == []
+    _wait_for_builds(builds, 1, timeout=0.5)
+    assert builds == []
 
 
-def test_restore_endpoint_seeds_again(client, admin_bootstrap, fake_archive, imports):
+def test_restore_endpoint_seeds_again(client, admin_bootstrap, builds):
     # as_admin also rotates the bootstrap password, which every mutating
     # endpoint requires before it will answer.
     as_admin(client, admin_bootstrap)
-    _wait_for_imports(imports, 1)
-    assert len(imports) == 1
+    _wait_for_builds(builds, 1)
+    assert len(builds) == 1
 
     resp = client.post("/api/demo/seed")
     assert resp.status_code == 200, resp.text
     assert resp.json()["job_id"]
-    _wait_for_imports(imports, 2)
-    assert len(imports) == 2, "restore is explicit, so the once-only claim does not apply"
+    _wait_for_builds(builds, 2)
+    assert len(builds) == 2, "restore is explicit, so the once-only claim does not apply"
 
 
-def test_restore_endpoint_requires_auth(client, fake_archive):
+def test_restore_endpoint_requires_auth(client):
     assert client.post("/api/demo/seed").status_code == 401
 
 
-def test_restore_endpoint_503_when_disabled(client, admin_bootstrap, fake_archive, monkeypatch):
+def test_restore_endpoint_503_when_disabled(client, admin_bootstrap, monkeypatch):
     as_admin(client, admin_bootstrap)
     monkeypatch.setenv("VESTIGO_DEMO_CASE_ENABLED", "false")
     get_settings.cache_clear()
@@ -77,6 +79,23 @@ def test_restore_endpoint_503_when_disabled(client, admin_bootstrap, fake_archiv
     get_settings.cache_clear()
 
 
-def test_restore_endpoint_503_without_an_archive(client, admin_bootstrap):
-    as_admin(client, admin_bootstrap)
-    assert client.post("/api/demo/seed").status_code == 503
+def test_restore_endpoint_429_when_too_many_seeds_are_running(client, admin_bootstrap, monkeypatch):
+    """The build is CPU-heavy, so the cap is a real limit with its own code.
+
+    The fake build never finishes, which is the only way to hold jobs in a
+    running state long enough for the cap to be observable from a synchronous
+    client.
+    """
+    import asyncio
+
+    from vestigo.core import demo_case as demo_mod
+
+    async def _never_finishes(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(demo_mod, "build_demo_case", _never_finishes)
+    as_admin(client, admin_bootstrap)  # consumes one slot via the first-login seed
+
+    responses = [client.post("/api/demo/seed").status_code for _ in range(3)]
+    assert 429 in responses, responses
+    assert responses.count(200) <= demo_mod.MAX_CONCURRENT_SEEDS

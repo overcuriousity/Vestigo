@@ -31,6 +31,8 @@ async def restore_demo_case(user: User = Depends(get_current_user)) -> dict[str,
         raise HTTPException(status_code=503, detail="Demo case seeding is disabled")
     try:
         job_id = await seed_demo_case(user)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # The instance-wide concurrency cap; the build is CPU-heavy and this is
+        # a retryable condition, not a broken deployment.
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return {"job_id": job_id}

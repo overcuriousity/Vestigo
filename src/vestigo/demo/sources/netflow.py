@@ -12,8 +12,8 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from tools.demo_case import scenario
-from tools.demo_case.sources import proxy
+from vestigo.demo import scenario
+from vestigo.demo.sources import proxy
 
 NETFLOW_HEADER: tuple[str, ...] = (
     "datetime",
