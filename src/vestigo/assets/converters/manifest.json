@@ -76,6 +76,21 @@
       "sha256": "0f6e9387a61b666a4814622711cf745f9d7be9dd2be40ce23c3b011d59637204"
     },
     {
+      "name": "evtx2vestigo",
+      "filename": "evtx2vestigo.py",
+      "description": "Binary Windows Event Log (.evtx) files (file or directory) to a Vestigo Parquet file for direct upload, with EvtxECmd map-based event descriptions and Sigma-canonical Windows field names. Requires pyarrow and evtx.",
+      "inputs": [
+        "*.evtx"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow",
+        "evtx"
+      ],
+      "size_bytes": 240492,
+      "sha256": "7c576c753d5032559bc3cff796f20d6fc627e7ee8d11c7b195100b4bd78696de"
+    },
+    {
       "name": "filterlog2timesketch",
       "filename": "filterlog2timesketch.py",
       "description": "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",

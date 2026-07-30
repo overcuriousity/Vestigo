@@ -42,7 +42,8 @@ const BLURB: Record<Mode, string> = {
     "*2vestigo scripts emit a compact, typed Parquet file uploaded directly — " +
     "the server bulk-inserts it via Arrow, skipping row-by-row CSV/JSON parsing " +
     "entirely. Smaller on disk, faster to ingest, and carries forensic provenance " +
-    "(source hash, byte offset, content hash) in the schema itself. Needs pyarrow.",
+    "(source hash, byte offset, content hash) in the schema itself. Each script lists " +
+    "the packages it needs below.",
   other:
     "*2timesketch scripts are stdlib-only (no dependencies to install) and emit " +
     "Timesketch-compatible CSV/JSONL, vendored from the upstream 2timesketch project. " +
@@ -127,6 +128,18 @@ export function ParserDownloadsPanel() {
                 <p className="mt-0.5 text-[11px] leading-snug text-[var(--color-fg-muted)]">
                   {c.description} ({fmtBytes(c.size_bytes)})
                 </p>
+                {c.requires && c.requires.length > 0 && (
+                  <p className="mt-1 flex flex-wrap items-center gap-1">
+                    {c.requires.map((dep) => (
+                      <code
+                        key={dep}
+                        className="rounded bg-[var(--color-bg-surface)] px-1.5 py-0.5 text-[10px] text-[var(--color-fg-muted)]"
+                      >
+                        {dep}
+                      </code>
+                    ))}
+                  </p>
+                )}
               </div>
               <Button variant="ghost" size="icon" asChild title={`Download ${c.filename}`}>
                 <a href={convertersApi.downloadUrl(c.name)} download rel="noopener noreferrer">
