@@ -16,6 +16,7 @@ import importlib.util
 import json
 import re
 import struct
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 
@@ -246,6 +247,65 @@ class TestSigmaFieldContract:
                 if key.startswith("Map"):
                     continue
                 assert not key.startswith("PayloadData"), key
+
+    def test_derived_keys_displace_a_native_field_instead_of_overwriting_it(self, converter):
+        """``host``/``user``/``src_ip``/``Map*`` are our spellings, but the native value stays.
+
+        The platform reads these by name (the GeoIP enricher wants ``src_ip``), so
+        the derived value has to win the plain key — but a record whose EventData
+        already carried that name is still evidence, and dropping it would break
+        the same "no element is silently discarded" rule ``_free_key`` enforces
+        one level up.
+        """
+        xml = """<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+          <System>
+            <Provider Name="Test-Provider"/><EventID>1</EventID>
+            <Channel>Application</Channel><Computer>REAL-HOST</Computer>
+            <TimeCreated SystemTime="2024-01-01T00:00:00.000000Z"/>
+          </System>
+          <EventData>
+            <Data Name="host">payload-host</Data>
+            <Data Name="user">payload-user</Data>
+            <Data Name="TargetUserName">winner</Data>
+          </EventData>
+        </Event>"""
+        attrs = converter.build_row(ET.fromstring(xml), no_maps=True)["attributes"]
+        assert attrs["host"] == "REAL-HOST"
+        assert attrs["user"] == "winner"
+        # Neither payload value was lost — both moved to a numbered spelling.
+        assert attrs["host_2"] == "payload-host"
+        assert attrs["user_2"] == "payload-user"
+
+    def test_a_derived_key_matching_the_native_value_is_not_duplicated(self, converter):
+        """Displacement only happens on a real conflict — an equal value is not evidence lost."""
+        xml = """<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+          <System>
+            <Provider Name="Test-Provider"/><EventID>1</EventID>
+            <Channel>Application</Channel><Computer>SAME-HOST</Computer>
+            <TimeCreated SystemTime="2024-01-01T00:00:00.000000Z"/>
+          </System>
+          <EventData><Data Name="host">SAME-HOST</Data></EventData>
+        </Event>"""
+        attrs = converter.build_row(ET.fromstring(xml), no_maps=True)["attributes"]
+        assert attrs["host"] == "SAME-HOST"
+        assert "host_2" not in attrs
+
+    def test_prefixed_event_data_key_does_not_collide(self, converter):
+        """A literal ``EventData_Channel`` must not collapse with the prefixed form."""
+        xml = """<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+          <System>
+            <Provider Name="Test-Provider"/><EventID>1</EventID>
+            <Channel>Application</Channel>
+            <TimeCreated SystemTime="2024-01-01T00:00:00.000000Z"/>
+          </System>
+          <EventData>
+            <Data Name="Channel">shadow</Data>
+            <Data Name="EventData_Channel">literal</Data>
+          </EventData>
+        </Event>"""
+        attrs = converter.build_row(ET.fromstring(xml), no_maps=True)["attributes"]
+        assert attrs["Channel"] == "Application", "the System spelling stays authoritative"
+        assert {attrs["EventData_Channel"], attrs["EventData_Channel_2"]} == {"shadow", "literal"}
 
     def test_reserved_keys_are_prefixed(self, converter):
         assert converter._safe_attr_key("Message") == "evt_Message"
@@ -489,6 +549,45 @@ class TestChunkImages:
             "chunks_ok=2 chunks_skipped=0 duplicate_record_ids=7 truncated_chunks=0"
         )
         assert decisions["byte_offset_fallback_rows"] == 0
+
+    def test_within_chunk_duplicate_ids_keep_distinct_offsets(self, converter, tmp_path):
+        """A record id repeated *inside one chunk* must not collapse two records.
+
+        The cross-chunk case is covered above; this is the same hazard one level
+        down. A partially overwritten chunk can carry the same id twice, and the
+        parser yields both records, so keeping only the first scanned occurrence
+        would hand both the same offset, size and content hash — one forensic
+        identity for two records.
+        """
+        raw = bytearray(FIXTURE.read_bytes())
+        located = sorted(
+            converter._scan_record_offsets(bytes(raw))[0].items(), key=lambda kv: kv[1]
+        )
+        (first_id, (first_off, _)), (_, (second_off, _)) = located[0], located[1]
+        struct.pack_into("<Q", raw, second_off + 8, first_id)  # forge the duplicate
+        source = tmp_path / "dup.evtx"
+        source.write_bytes(bytes(raw))
+
+        # The scan keeps both occurrences, in document order.
+        occurrences = converter._scan_chunk(bytes(raw), 4096)[0][first_id]
+        assert [off for off, _ in occurrences] == [first_off, second_off]
+
+        rows = _rows(_convert(converter, source, tmp_path / "out.parquet"))
+        assert len(rows) == 7
+        dupes = [r for r in rows if _attrs(r)["evtx_record_id"] == str(first_id)]
+        assert len(dupes) == 2
+        # Distinct offsets, and each hash still reproduces from its own span.
+        assert sorted(r["byte_offset"] for r in dupes) == [first_off, second_off]
+        assert len({r["content_hash"] for r in dupes}) == 2
+        for row in dupes:
+            span = raw[row["byte_offset"] : row["byte_offset"] + int(_attrs(row)["record_size"])]
+            assert hashlib.sha256(bytes(span)).hexdigest() == row["content_hash"]
+        assert all("byte_offset_basis" not in _attrs(r) for r in dupes), "no fallback was needed"
+
+        pf = pq.ParquetFile(tmp_path / "out.parquet")
+        decisions = json.loads(pf.metadata.metadata[converter.META_PARSE_DECISIONS.encode()])
+        # The repeat is reported even though it never left the chunk.
+        assert "duplicate_record_ids=1" in decisions["chunk_scan"]["dup.evtx"]
 
 
 class _CapturingBuffer:

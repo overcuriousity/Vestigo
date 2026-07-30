@@ -2473,8 +2473,14 @@ async def _persist_detector_run(
             # charset: per-identifier scoping (None = one alphabet per field).
             "group_field": resolution.get("charset_group_field"),
             # sequence_novelty / sequence_motif: gap bound (None = no bound).
-            "max_gap_seconds": resolution.get("sequence_max_gap_seconds")
-            or resolution.get("motif_max_gap_seconds"),
+            # Disjoint keys, coalesced on presence rather than truthiness: the
+            # API floor is currently ge=1, but a persisted 0 must not fall
+            # through to the other detector's key if that floor ever moves.
+            "max_gap_seconds": (
+                resolution["sequence_max_gap_seconds"]
+                if "sequence_max_gap_seconds" in resolution
+                else resolution.get("motif_max_gap_seconds")
+            ),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),

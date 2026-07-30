@@ -18,8 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for an offset.
   Each 64 KiB chunk is handed to the parser as a complete, checksum-valid one-chunk
   document, which recovers records the whole-file path loses at the first damaged chunk;
-  record offsets are resolved per chunk, so a record id repeated across chunks in a
-  re-chunked log still yields distinct offsets. Attribute names are Sigma-canonical
+  record offsets are resolved per chunk *and per occurrence within a chunk*, so a record
+  id repeated in a re-chunked or partially overwritten log still yields distinct offsets
+  either way. No value is lost to a name collision: repeated `<Data Name="X">` elements
+  are numbered rather than overwritten, and where a converter-derived key (`host`, `user`,
+  `src_ip`, `Map*`) collides with a native field of the same name, the native value moves
+  to a numbered spelling instead of disappearing. Attribute names are Sigma-canonical
   (`EventID` as an unpadded string, `Channel`, `Provider_Name`, native `EventData` names),
   so community Windows rules compile to exactly the predicate they look like with no
   field translation. The EvtxECmd map corpus (468 maps,

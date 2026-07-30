@@ -2522,18 +2522,27 @@ class _ChunkScanStats:
         return f"{note} {self.first_error}" if self.first_error else note
 
 
-def _scan_chunk(data: Any, chunk_start: int) -> tuple[dict[int, tuple[int, int]], bool] | None:
-    """Locate one chunk's records as ``{record_id: (byte offset, record size)}``.
+def _scan_chunk(
+    data: Any, chunk_start: int
+) -> tuple[dict[int, list[tuple[int, int]]], bool] | None:
+    """Locate one chunk's records as ``{record_id: [(byte offset, record size), …]}``.
 
     The EVTX parser exposes no file offset, so the container is walked directly. Offsets
     are absolute within the whole file, so they stay usable as `byte_offset`. Returns
     ``None`` when the chunk magic does not validate, and ``(offsets, truncated)`` otherwise
     — record framing that stops validating mid-chunk simply ends the walk there, so damage
     stays local.
+
+    The value is a *list* because a record id can repeat inside a single chunk in a
+    partially overwritten log. Keeping only the first occurrence would hand both parsed
+    records the same offset, size and content hash — one event identity for two records,
+    which is precisely the collapse the per-chunk scan exists to prevent. Occurrences are
+    in document order, which is the order the parser yields them, so the consumer can
+    pair them off positionally.
     """
     if data[chunk_start : chunk_start + 8] != _CHUNK_MAGIC:
         return None
-    offsets: dict[int, tuple[int, int]] = {}
+    offsets: dict[int, list[tuple[int, int]]] = {}
     truncated = False
     free_space = struct.unpack_from("<I", data, chunk_start + 48)[0]
     span = min(free_space or _CHUNK_SIZE, _CHUNK_SIZE, len(data) - chunk_start)
@@ -2546,7 +2555,7 @@ def _scan_chunk(data: Any, chunk_start: int) -> tuple[dict[int, tuple[int, int]]
         if size < _RECORD_HEADER_SIZE + 4 or size % 8 or pos + size > limit:
             break
         record_id = struct.unpack_from("<Q", data, pos + 8)[0]
-        offsets.setdefault(record_id, (pos, size))
+        offsets.setdefault(record_id, []).append((pos, size))
         if struct.unpack_from("<I", data, pos + size - 4)[0] != size:
             # Last record of a partially committed chunk: the trailing size copy was
             # never written. The record itself is intact, but the next position cannot
@@ -2611,7 +2620,14 @@ def _iter_chunks(data: Any, stats: _ChunkScanStats) -> Any:
         stats.chunks_ok += 1
         if truncated:
             stats.truncated += 1
-        stats.duplicates += len(seen.intersection(offsets))
+        # A repeated id counts once per extra occurrence, wherever the repeat is:
+        # across chunks (this chunk's id was already seen) *and* within this one
+        # (the id resolved to more than one record in a single walk). Counting
+        # only the cross-chunk case would let the within-chunk repeat — the one
+        # that used to collapse two records onto one offset — go unreported.
+        stats.duplicates += len(seen.intersection(offsets)) + sum(
+            len(located) - 1 for located in offsets.values()
+        )
         seen.update(offsets)
         yield image, offsets
         chunk_start += _CHUNK_SIZE
@@ -2622,13 +2638,15 @@ def _scan_record_offsets(data: Any) -> tuple[dict[int, tuple[int, int]], str]:
 
     Kept as the readable diagnostic entry point (and for a caller that wants one file's
     offsets up front); the conversion path itself scans per chunk via ``_iter_chunks`` so
-    duplicate record ids across chunks stay distinguishable.
+    duplicate record ids across chunks stay distinguishable. This flattened view keeps
+    each id's *first* occurrence — a diagnostic answering "where does this record id
+    live", not the identity-bearing map the conversion path uses.
     """
     offsets: dict[int, tuple[int, int]] = {}
     stats = _ChunkScanStats()
     for _image, chunk_offsets in _iter_chunks(data, stats):
         for record_id, located in chunk_offsets.items():
-            offsets.setdefault(record_id, located)
+            offsets.setdefault(record_id, located[0])
     return offsets, stats.note()
 
 
@@ -3276,6 +3294,23 @@ def _build_message(
     )
 
 
+def _set_derived(attrs: dict[str, str], key: str, value: str) -> None:
+    """Write a converter-derived key, displacing rather than discarding a native one.
+
+    ``src_ip``, ``host``, ``user`` and the ``Map*`` properties are *our* spellings,
+    and the platform reads them by name (the GeoIP enricher wants ``src_ip``), so
+    unlike :func:`_free_key` the derived value has to win the plain key. A record
+    whose ``EventData`` already carried that name is still evidence, so it moves to
+    the first free numbered spelling instead of being overwritten — the same "no
+    element is silently discarded" rule, resolved the other way round because here
+    the collision is between our vocabulary and Windows', not within Windows'.
+    """
+    existing = attrs.get(key)
+    if existing is not None and existing != value:
+        attrs[_free_key(attrs, key)] = existing
+    attrs[key] = value
+
+
 def build_row(root: ET.Element, no_maps: bool = False) -> dict[str, Any]:
     """Turn one parsed record into the converter's row dict."""
     system = _extract_system(root)
@@ -3285,8 +3320,12 @@ def build_row(root: ET.Element, no_maps: bool = False) -> dict[str, Any]:
     for key, value in event_data.items():
         safe = _safe_attr_key(key)
         # System spellings stay authoritative: a record whose EventData carries a
-        # field called Channel must not be able to rewrite the real one.
-        attributes[f"EventData_{safe}" if safe in system else safe] = value
+        # field called Channel must not be able to rewrite the real one. The
+        # prefixed spelling goes through `_free_key` for the same reason the
+        # unprefixed one does — a record carrying a literal `EventData_Channel`
+        # alongside an `EventData` `Channel` must not collapse the two.
+        target = f"EventData_{safe}" if safe in system else safe
+        attributes[_free_key(attributes, target)] = value
 
     event_id = _safe_int(system.get("EventID"))
     channel = system.get("Channel", "")
@@ -3299,21 +3338,21 @@ def build_row(root: ET.Element, no_maps: bool = False) -> dict[str, Any]:
         if mapping is not None:
             map_result = _eval_map(root, mapping)
             if mapping.get("d"):
-                attributes["MapDescription"] = str(mapping["d"])
+                _set_derived(attributes, "MapDescription", str(mapping["d"]))
             for prop, value in map_result.items():
-                attributes[f"Map{prop}"] = value
+                _set_derived(attributes, f"Map{prop}", value)
 
     src_ip = normalize_ip(event_data.get("IpAddress"))
     if src_ip:
-        attributes["src_ip"] = src_ip
+        _set_derived(attributes, "src_ip", src_ip)
     src_port = _safe_int(event_data.get("IpPort"))
     if src_port is not None:
-        attributes["src_port"] = str(src_port)
+        _set_derived(attributes, "src_port", str(src_port))
     if computer:
-        attributes["host"] = computer
+        _set_derived(attributes, "host", computer)
     user = event_data.get("TargetUserName") or event_data.get("SubjectUserName")
     if user:
-        attributes["user"] = user
+        _set_derived(attributes, "user", user)
 
     timestamp = _parse_system_time(system.get("TimeCreated_SystemTime", ""))
     artifact, timestamp_desc = _artifact_for(channel, event_id)
@@ -3505,6 +3544,12 @@ def _convert_evtx(
     stats = _ChunkScanStats()
 
     for blob, offsets in _iter_chunks(data, stats):
+        # How many records with a given id this chunk has already consumed. The
+        # scan lists a repeated id's occurrences in document order and the parser
+        # yields them in that same order, so the n-th parsed record with an id
+        # takes the n-th scanned occurrence — two records that share an id inside
+        # one chunk keep distinct offsets, sizes and content hashes.
+        consumed: dict[int, int] = {}
         try:
             records = PyEvtxParser(io.BytesIO(blob)).records()
         except Exception:  # noqa: BLE001 - parser raises bare RuntimeError
@@ -3563,8 +3608,14 @@ def _convert_evtx(
             # kept so the offset is explainable from the row alone.
             row["attributes"]["evtx_record_id"] = str(record_id)
             # Only this chunk's offsets are consulted: a record id duplicated in another
-            # chunk must not resolve to that chunk's record.
-            located = offsets.get(record_id)
+            # chunk must not resolve to that chunk's record. Within the chunk, the
+            # occurrence index keeps a repeated id from resolving to the same record
+            # twice; running past the scanned occurrences takes the fallback below
+            # rather than reusing the last one.
+            seen_here = consumed.get(record_id, 0)
+            consumed[record_id] = seen_here + 1
+            candidates = offsets.get(record_id) or []
+            located = candidates[seen_here] if seen_here < len(candidates) else None
             if located is not None:
                 offset, size = located
                 content_hash = hashlib.sha256(bytes(data[offset : offset + size])).hexdigest()

@@ -318,10 +318,16 @@ What is specific to it:
   `byte_offset_basis=record_id` and `content_hash_basis=rendered_xml` (and no
   `record_size`). Those rows are never mistaken for `dd`-reproducible ones;
   `vestigo.parse_decisions.byte_offset_fallback_rows` counts them.
-  Offsets are scanned per chunk, so a record id duplicated across chunks (routine in a
-  re-chunked or partially overwritten log) still yields distinct offsets — two records can
-  never collapse onto one forensic identity. The footer's `chunk_scan` note reports how many
-  ids were seen twice.
+  Because a substituted record id occupies the same column as a real offset, `byte_offset`
+  is **not** monotone within an evtx source and a value in one row may numerically equal a
+  genuine offset in another. Event identity still holds — those rows hash different bytes,
+  so `content_hash` differs — but a reader ordering or ranging on `byte_offset` must filter
+  on `byte_offset_basis` first.
+  Offsets are scanned per chunk *and per occurrence within a chunk*, so a record id
+  duplicated across chunks or repeated inside one (both routine in a re-chunked or
+  partially overwritten log) still yields distinct offsets — two records can never collapse
+  onto one forensic identity. The footer's `chunk_scan` note reports how many repeats were
+  seen, counting each extra occurrence wherever it fell.
 - **Damage stays local.** Each 64 KiB chunk is parsed in isolation, so one corrupt chunk
   costs only that chunk instead of aborting the rest of the file. Each chunk is handed to
   the parser as a complete, checksum-valid one-chunk EVTX document.
@@ -342,6 +348,13 @@ What is specific to it:
   order — `X_2`, `X_3`, … — probing for a free key so a record that also carries a literal
   `X_2` field does not collapse into it. Losing evidence to a name collision with nothing on
   the row to say so is the one outcome the rule exists to prevent.
+  The rule also covers collisions between Windows' vocabulary and Vestigo's. The converter
+  derives `host`, `user`, `src_ip`, `src_port`, `MapDescription` and the `Map*` properties
+  under its own spellings, and those have to win the plain key because the platform reads
+  them by name (the GeoIP enricher wants `src_ip`) — so here it is the *native* value that
+  steps aside to `host_2`, `user_2`, … rather than being overwritten. Same for the
+  `EventData_`-prefixed form a field colliding with a `<System>` name gets: a record
+  carrying a literal `EventData_Channel` alongside an `EventData` `Channel` keeps both.
 - **EvtxECmd maps are embedded.** The community map corpus from
   [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx) (MIT) is compiled into the
   script by `scripts/vendor_evtx_maps.py` and supplies `MapDescription` plus the `Map*`

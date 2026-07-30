@@ -3129,6 +3129,12 @@ class StatisticalAnomalyService:
             out whether that learn is needed at all. *truncated* means the
             ceiling was hit and the answer is incomplete: callers must treat
             that as "there may be more", never as "there are none".
+
+            The predicate mirrors the violation scan's suspect-window clause,
+            sentinel guard included: a group present only in sentinel-timestamp
+            rows is one the scan will never score, so reporting it absent would
+            buy a whole-scope fallback learn and a warning naming a group no
+            finding can ever come from.
             """
             params: dict[str, Any] = {**base_params}
             vcol = _col_expr(field, params, field_mappings)
@@ -3142,6 +3148,7 @@ class StatisticalAnomalyService:
                   AND has({{src:Array(String)}}, source_id)
                   AND {vcol} != ''
                   AND ({" OR ".join(sps)})
+                  AND {VESTIGO_NOT_SENTINEL_SQL}
                 LIMIT {{glim:UInt32}}
                 {HEAVY_SCAN_SETTINGS}
             """
