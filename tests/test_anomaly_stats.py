@@ -4694,9 +4694,7 @@ def test_charset_group_field_partitions_alphabets():
         ),
     ]
     svc = _svc(responses)
-    result = svc.find_charset_novelty(
-        "c1", ["s1"], fields=["attr:user"], group_field="attr:host"
-    )
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
     assert result.status == "ok"
     assert len(result.results) == 1
     f = result.results[0]
@@ -4758,8 +4756,12 @@ def test_sequence_max_gap_adds_segment_partition():
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(client)
     result = svc.find_sequence_novelty(
-        "c1", ["s1"], series_field="attr:proc", ngram=3,
-        windows=_seq_windows(), max_gap_seconds=300,
+        "c1",
+        ["s1"],
+        series_field="attr:proc",
+        ngram=3,
+        windows=_seq_windows(),
+        max_gap_seconds=300,
     )
     assert result.status == "ok"
     joined = "\n".join(client.full_queries)

@@ -3069,9 +3069,7 @@ class StatisticalAnomalyService:
                     bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
                     for grp, charset_arr, grp_n_vals in bs_rows:
                         reference = [str(c) for c in (charset_arr or [])]
-                        learns.append(
-                            (str(grp), reference, {}, int(grp_n_vals), len(reference))
-                        )
+                        learns.append((str(grp), reference, {}, int(grp_n_vals), len(reference)))
 
             # The skip guards apply per group (ungrouped: per field, as before).
             evaluated = [
@@ -3108,9 +3106,7 @@ class StatisticalAnomalyService:
                     # open-ended range test).
                     win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
                     win_idx_group = ", win_idx"
-                    detect_clause = (
-                        f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
-                    )
+                    detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
                 viol_sql = f"""
                     SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
                     FROM (
@@ -3148,9 +3144,7 @@ class StatisticalAnomalyService:
                     else:
                         val, novel, cnt, first_seen, evt_id, win_idx = vrow
                         wi = int(win_idx)
-                        window = (
-                            windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
-                        )
+                        window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                     novel_chars = [str(c) for c in (novel or [])]
                     if not val or not novel_chars:
                         continue
@@ -5184,7 +5178,12 @@ class StatisticalAnomalyService:
         w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
 
         inner = _ngram_inner_sql(
-            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr=w_idx_expr, scope_pred=union_pred,
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=ngram,
+            w_idx_expr=w_idx_expr,
+            scope_pred=union_pred,
             max_gap=max_gap_seconds,
         )
 
@@ -5442,7 +5441,12 @@ class StatisticalAnomalyService:
         scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
 
         inner = _ngram_inner_sql(
-            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr="0", scope_pred=scope_pred,
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=ngram,
+            w_idx_expr="0",
+            scope_pred=scope_pred,
             max_gap=max_gap_seconds,
         )
 
