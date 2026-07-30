@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`evtx2vestigo`: binary Windows Event Log converter.** Parses `.evtx` containers
+  directly (file or directory) instead of a text export, so `file_hash` anchors to the
+  original evidence. `byte_offset` is a real offset into the `.evtx` and `content_hash`
+  covers that same raw record span, so `dd`+`sha256sum` reproduces it without Vestigo.
+  Each 64 KiB chunk is parsed in isolation, which recovers records the whole-file path
+  loses at the first damaged chunk. Attribute names are Sigma-canonical (`EventID` as an
+  unpadded string, `Channel`, `Provider_Name`, native `EventData` names), so community
+  Windows rules match with an empty `fallback_fields`. The EvtxECmd map corpus
+  (468 maps, [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx), MIT) is embedded
+  for event descriptions; `--no-maps` opts out. Requires `pyarrow` and `evtx`.
+
+- **Tool calls in the agent panel are expandable.** Every tool row now unfolds to the
+  exact arguments the agent sent and what the tool returned, persisted rows and live
+  stream alike. (#203)
+- **The agent panel shows which Explorer view the agent sees.** A persistent bar names
+  the filters inherited as context, and each sent message is stamped with the filter
+  snapshot the agent received with it, so a mid-investigation filter change is visible
+  in the transcript instead of silently shifting the agent's ground. (#205)
+- **Charset detector: per-identifier scoping.** `group_field` learns one alphabet per
+  value of a second field (e.g. per host), retiring the merged-alphabet caveat.
+  Suppressions stay keyed on `(field, value)` and apply across groups. (D14)
+- **Sequence detectors: `max_gap_seconds`.** `sequence_novelty` and `sequence_motif`
+  break an n-gram when consecutive events are farther apart than the bound, retiring
+  the manufactured-sequence caveat. Unset keeps the pre-1.8.6 behavior bit-identical.
+  (D14)
+
 ### Security
 
 - **`react-router-dom` upgraded 7.18.1 → 7.18.2**, picking up the 7.x backport of the RSC
@@ -17,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclude 7.18.2. Do not "fix" it by downgrading; `npm audit fix --force` installs 7.11.0.
 
 ### Fixed
+
+- **The downloadable converter LLM prompts match the data contract again.** The Parquet
+  prompt documented the pre-1.3.0 footer: it omitted the forensic metadata keys
+  (`converted_at`, `row_counts`, `timezone_assumption`, `parse_decisions`) and the
+  `path`/`mtime` provenance fields, and sent timezone assumptions into a script comment
+  the server never reads. The CSV/JSONL prompt now mentions pipe-separated tags. (#204)
 
 - **The login-backoff tracker's entry cap is now an actual bound.** `LoginBackoff` pruned
   expired entries when full, then inserted unconditionally — so when pruning could free
