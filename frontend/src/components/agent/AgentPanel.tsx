@@ -178,14 +178,22 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
    * Is this the *result* half of a tool pair?
    *
    * A keyed row answers by identity: its call row is the one already waiting on
-   * that `tool_call_id`. Only unkeyed legacy rows fall back to "has no args",
-   * which is a guess — a provider that persists `null` args for a zero-argument
-   * call would otherwise have that call row read as a result, consume a pending
-   * entry and mispair a real result onto the wrong call.
+   * that `tool_call_id`. Failing that, `tool_result` settles it — the server
+   * writes a call row with `tool_args` and a result row with `tool_result`,
+   * never both, so an orphaned result (its call row missing from the
+   * transcript) is still recognizable and passes silently instead of rendering
+   * as a bare, argument-less call.
+   *
+   * Only unkeyed legacy rows fall back to "has no args", which is a guess — a
+   * provider that persists `null` args for a zero-argument call would otherwise
+   * have that call row read as a result, consume a pending entry and mispair a
+   * real result onto the wrong call.
    */
   const isResult = (m: AgentMessage) =>
     m.tool_call_id
-      ? openToolCalls.has(m.tool_call_id) || pendingCharts.has(m.tool_call_id)
+      ? openToolCalls.has(m.tool_call_id) ||
+        pendingCharts.has(m.tool_call_id) ||
+        m.tool_result != null
       : !m.tool_args;
   for (const m of messages) {
     const proposalKind = m.role === "tool" ? proposalItemKind(m.tool_name) : null;

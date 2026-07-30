@@ -183,6 +183,22 @@ describe("AgentPanel tool-call details (#203)", () => {
     expect(row.textContent).toContain('"total": 42');
   });
 
+  it("passes an orphaned result silently instead of rendering it as a call", async () => {
+    // A result row whose call row is missing from the transcript. Identity
+    // pairing finds nothing, so `tool_result` has to settle the half — and it
+    // can, because the server writes args on a call row and a result on a
+    // result row, never both. Without that, the row falls into the call branch
+    // and renders as a bare, argument-less call the agent never made.
+    const msgs = toolPairMessages();
+    msgs.splice(1, 1); // drop tc-1's call row, keep its result
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: msgs });
+
+    renderPanel();
+    await screen.findByText("done");
+    expect(screen.queryByTestId("tool-call-tc-1")).toBeNull();
+    expect(screen.queryByText(/query_events/)).toBeNull();
+  });
+
   it("keys the row by call id so open state cannot follow a position", async () => {
     // The row owns <details> open state. With an index key, a later row
     // appearing above it would hand that state to a different tool call.
