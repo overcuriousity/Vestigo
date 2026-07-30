@@ -233,7 +233,9 @@ export function MethodologyPanel({
               Self-baseline ("rare-chars") treats characters appearing in ≤ 3
               distinct values as rare and flags values containing them;
               temporal learns the baseline window's character set and flags
-              detect-window values with never-seen characters.
+              detect-window values with never-seen characters. The optional
+              group-by scopes the learning: one alphabet per value of that
+              field (e.g. per host) instead of one merged alphabet.
             </Row>
             <Row label="Signal">
               Null bytes, unicode homoglyphs, injection metacharacters —
@@ -403,7 +405,10 @@ export function MethodologyPanel({
               One grouping field (like Frequency's group-by), not the
               multi-field picker. Sequences never mix sources or span a window
               edge; sources interleaving several independent streams can
-              produce interleaving artifacts.
+              produce interleaving artifacts. The optional max-gap bound breaks
+              a sequence when consecutive events are farther apart than the
+              chosen limit, so quiet sources can't manufacture sequences from
+              unrelated events.
             </Row>
             <Row label="Backend">
               Sequences are assembled entirely in ClickHouse (

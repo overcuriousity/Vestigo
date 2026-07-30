@@ -47,6 +47,15 @@ interface Props {
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }
 
+/** Standard grouping fields for the optional per-identifier scoping (D14) —
+ * same set the sequence view offers for its series field. */
+const GROUP_FIELD_OPTIONS = [
+  { value: "artifact", label: "Artifact type" },
+  { value: "timestamp_desc", label: "Event category" },
+  { value: "display_name", label: "Display name" },
+  { value: "parser_name", label: "Parser" },
+];
+
 /** "U+0000"-style codepoint label for a (possibly multi-codepoint) char. */
 function codepointLabel(c: string): string {
   return Array.from(c)
@@ -156,20 +165,39 @@ export function CharsetNoveltyView({
 }: Props) {
   const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
+  // D14: optional per-identifier scoping — one learned alphabet per value of
+  // this field instead of one merged alphabet across the scope.
+  const [groupField, setGroupField] = useState("");
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
   const fl = useFindingsLimit();
   const sd = useShowDismissed();
 
+  // Dynamic attribute fields extend the group-by dropdown (same source as the
+  // sequence view's grouping-field picker).
+  const { data: fieldsData } = useQuery({
+    queryKey: ["anomalies", caseId, timelineId, "fields"],
+    queryFn: () => anomaliesApi.fields(caseId, timelineId),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const groupFieldOptions = useMemo(() => {
+    const attrOptions = (fieldsData?.fields ?? [])
+      .filter((f) => f.token.startsWith("attr:"))
+      .map((f) => f.token);
+    return [...GROUP_FIELD_OPTIONS.map((o) => o.value), ...attrOptions];
+  }, [fieldsData]);
+
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "charset", blKey, fieldsParam ?? "__auto__", fl.limit, sd.keyPart],
+    queryKey: ["anomalies", caseId, timelineId, "charset", blKey, fieldsParam ?? "__auto__", groupField || "__scope__", fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "charset",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(groupField ? { group_field: groupField } : {}),
         ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
@@ -183,6 +211,7 @@ export function CharsetNoveltyView({
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(groupField ? { group_field: groupField } : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
@@ -234,6 +263,20 @@ export function CharsetNoveltyView({
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
+        <select
+          value={groupField}
+          onChange={(e) => setGroupField(e.target.value)}
+          data-testid="charset-group-select"
+          title="Group by — learn one alphabet per value of this field (e.g. per host) instead of one merged alphabet"
+          className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+        >
+          <option value="">Whole scope</option>
+          {groupFieldOptions.map((token) => (
+            <option key={token} value={token}>
+              per {fieldLabel(token)}
+            </option>
+          ))}
+        </select>
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}

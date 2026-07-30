@@ -42,6 +42,10 @@ export interface AnomalyParams {
   start?: string;
   /** sequence_motif only: scope mining to events before this time (ISO, UTC). */
   end?: string;
+  /** charset only: learn one reference alphabet per value of this field (e.g. per host). Omit for whole-scope learning. */
+  group_field?: string;
+  /** sequence_novelty / sequence_motif only: break an n-gram when consecutive events are more than this many seconds apart. Omit for no gap bound. */
+  max_gap_seconds?: number;
   /** ID of a saved baseline definition (baseline range + suspect windows). Omit for self-baseline. */
   baseline_id?: string;
   limit?: number;
