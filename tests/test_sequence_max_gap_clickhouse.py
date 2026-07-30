@@ -1,7 +1,7 @@
 """Live-ClickHouse test for the D14 ``max_gap_seconds`` sequence bound.
 
 ``_ngram_inner_sql`` grows two extra window levels when a gap bound is set: a
-``dateDiff`` over ``lagInFrame(ets, 1)``, then a running ``sum`` of over-gap
+``age`` over ``lagInFrame(ets, 1)``, then a running ``sum`` of over-gap
 boundaries that the n-gram assembly partitions by. Whether that produces the
 right segments depends on runtime behaviour the mock tests cannot see:
 
@@ -12,6 +12,9 @@ right segments depends on runtime behaviour the mock tests cannot see:
   This test fails if it does.
 * ``sum(if(gap_s > n, 1, 0)) OVER ord`` must stay a monotone per-partition
   counter for the assembly window to partition by.
+* ``age`` must measure *complete elapsed seconds*, not second boundaries
+  crossed the way ``dateDiff`` does. The difference only shows on sub-second
+  spacing straddling a boundary, which no SQL-text assertion can catch.
 
 Requires the dev compose stack (skipped when ClickHouse is unreachable), same
 pattern as ``test_novelty_batched_clickhouse.py``.
@@ -200,3 +203,73 @@ def test_motif_mining_honours_the_same_bound(svc):
     # hour apart with nothing between them; the bound removes exactly those.
     cross = {("C", "A", "B"), ("B", "C", "A")}
     assert not (cross & _grams(bounded)), _grams(bounded)
+
+
+# --- Sub-second gap semantics -------------------------------------------------
+
+SUB_CASE_ID = f"tc-seqsub-{uuid.uuid4().hex[:8]}"
+SUB_SOURCE_ID = "src-seqsub"
+SUB_START = datetime(2026, 6, 1, tzinfo=UTC)
+
+
+def _sub_event(i: int, ts: datetime, proc: str) -> Event:
+    return Event(
+        case_id=SUB_CASE_ID,
+        source_id=SUB_SOURCE_ID,
+        source_file=Path("evidence.log"),
+        byte_offset=i * 100,
+        content_hash=f"{i:064d}",
+        file_hash="b" * 64,
+        parser_name="test-seqsub",
+        parser_version="1.0.0",
+        raw_line=f"raw {i}",
+        message=f"event {i}",
+        timestamp=ts.isoformat(),
+        timestamp_desc="Test Time",
+        artifact="test:seqsub",
+        attributes={"proc": proc},
+    )
+
+
+@pytest.fixture(scope="module")
+def sub_svc():
+    """Two P→Q→R bursts whose every step is exactly 1.2 s, each straddling a
+    second boundary: …00.900 → …02.100 → …03.300 → …04.500 → …05.700 → …06.900.
+
+    1.2 s of elapsed time crosses *two* second boundaries, so
+    ``dateDiff('second', …)`` reports 2 for every step while ``age`` reports 1.
+    Under a `max_gap_seconds=1` bound that is the whole difference: `2 > 1`
+    segments the burst into single events and P→Q→R never assembles, `1 > 1`
+    does not and the burst survives. Nothing here is more than a second apart,
+    so surviving is the correct answer.
+    """
+    try:
+        store = ClickHouseStore()
+        store.init_schema()
+    except Exception:
+        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    base = SUB_START + timedelta(hours=12, milliseconds=900)
+    events = [
+        _sub_event(i, base + timedelta(milliseconds=1200 * i), proc)
+        for i, proc in enumerate(["P", "Q", "R", "P", "Q", "R"])
+    ]
+    store.insert_events(events)
+    service = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    service.ch = store
+    yield service
+    store.delete_source_events(SUB_CASE_ID, SUB_SOURCE_ID)
+
+
+def test_gap_is_elapsed_seconds_not_second_boundaries_crossed(sub_svc):
+    """A 1.2 s step crosses two second boundaries but is not a two-second gap.
+    Under `dateDiff` it read as one, so a `max_gap_seconds=1` bound erased a
+    burst whose every step is barely over a second."""
+    motifs = sub_svc.find_sequence_motifs(
+        SUB_CASE_ID,
+        [SUB_SOURCE_ID],
+        series_field="attr:proc",
+        ngram=3,
+        min_support=2,
+        max_gap_seconds=1,
+    )
+    assert ("P", "Q", "R") in _grams(motifs), _grams(motifs)

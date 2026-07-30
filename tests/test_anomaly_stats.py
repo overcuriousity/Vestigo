@@ -15,6 +15,7 @@ import pytest
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
     _CHARSET_GROUP_PROBE_LIMIT,
+    _MAX_CHARSET_GROUPED_ROWS,
     _MAX_CHARSET_SIZE,
     AnalysisWindows,
     FreqFinding,
@@ -5126,6 +5127,93 @@ def test_charset_group_field_reports_skipped_groups():
     assert viol["skip"] == []
 
 
+def test_charset_grouped_row_ceiling_is_reported_not_silent():
+    """The 5,000-row ceiling sits *under* the per-group budget and orders by
+    novelty across every group, so hitting it drops whole low-novelty groups.
+    A truncated scan that came back looking clean would read as 'these are the
+    groups with novel characters'."""
+    fs = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    ceiling = _MAX_CHARSET_GROUPED_ROWS
+    responses = [
+        FakeQueryResult(result_rows=[(1_000_000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[(f"host-{i}", "a", 90, 100) for i in range(ceiling)],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        # Exactly the ceiling: the query hit its LIMIT, so more rows existed.
+        FakeQueryResult(
+            result_rows=[
+                (f"ab\x00{i}", f"host-{i}", ["\x00"], 2, fs, f"evt-{i}") for i in range(ceiling)
+            ],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    assert result.status == "ok"
+    assert any(f"{ceiling}-row ceiling" in w and "attr:user" in w for w in result.warnings), (
+        result.warnings
+    )
+
+
+def test_charset_grouped_row_ceiling_is_quiet_below_it():
+    """The ceiling warning must not fire on a run that simply returned fewer
+    rows — it is a statement about truncation, not about volume."""
+    fs = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[("host-a", "a", 90, 100)],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        FakeQueryResult(
+            result_rows=[("ab\x00", "host-a", ["\x00"], 2, fs, "evt-nul")],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    assert not any("row ceiling" in w for w in result.warnings)
+
+
+def test_charset_fallback_warnings_name_the_field():
+    """The same group name can be thin for one field and absent from the
+    baseline window for another. Merging them into one flat count would leave
+    an analyst no way to tell which field a warning is about."""
+    fs = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        # attr:user — host-x is thin.
+        FakeQueryResult(
+            result_rows=[("host-a", "a", 90, 100), ("host-x", "a", 4, 5)],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        FakeQueryResult(
+            result_rows=[("a", 95, 105)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
+        FakeQueryResult(
+            result_rows=[("ab\x00", "host-x", ["\x00"], 2, fs, "evt-u")],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+        # attr:path — every group is well-evidenced, so no fallback is needed.
+        FakeQueryResult(
+            result_rows=[("host-a", "a", 90, 100)],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty(
+        "c1", ["s1"], fields=["attr:user", "attr:path"], group_field="attr:host"
+    )
+    thin = [w for w in result.warnings if "fewer than 20 distinct values" in w]
+    assert len(thin) == 1
+    # Named per field, in the `field: group` form the other grouped warnings use.
+    assert "attr:user: host-x" in thin[0]
+    assert "attr:path" not in thin[0]
+
+
 def test_charset_rejects_non_string_group_field():
     """A group field that is not a String column would be a ClickHouse type
     error, so it is refused before any query runs."""
@@ -5158,7 +5246,7 @@ def test_sequence_max_gap_adds_segment_partition():
     )
     assert result.status == "ok"
     joined = "\n".join(client.full_queries)
-    assert "dateDiff('second', lagInFrame(ets, 1) OVER ord, ets)" in joined
+    assert "age('second', lagInFrame(ets, 1) OVER ord, ets)" in joined
     assert "PARTITION BY source_id, w_idx, seg" in joined
     assert "if(gap_s > 300, 1, 0)" in joined
 

@@ -721,14 +721,22 @@ invisible characters are visible in the report.
   values" and "had fewer than 20 distinct values of their own" reported
   separately. If no fallback can be learned either, those groups go unevaluated
   and the run says which ones and which guard the fallback itself tripped.
+  Every one of these warnings names the *field* alongside the groups: the same
+  group can be thin for one field and absent from the baseline window for
+  another, and a merged sentence would leave no way to tell which is which.
 - **What grouping costs.** At most one extra *learn* query per field, never one
   violation scan per group: the per-group reference alphabets travel into the
   single scan as parallel `{grps, sets}` array parameters, each row picking its
   own reference by `indexOf`, and `LIMIT <per_field_limit> BY grp` preserves the
   per-group finding budget. Group cardinality therefore costs rows, not
   queries. A pathological group count is bounded at 5,000 returned rows per
-  field. The fallback learn is a whole-scope scan, so it only runs when some
-  group actually needs one — in temporal mode a bounded `SELECT DISTINCT` probe
+  field — and because that ceiling sits *under* the per-group budget, ordering
+  by novelty length across all groups, hitting it drops whole low-novelty
+  groups rather than trimming each group evenly. A run that hits it says so in
+  `warnings` and names the fields; a truncated grouped scan must never read as
+  "these are the groups with novel characters". The fallback learn is a
+  whole-scope scan, so it only runs when some group actually needs one — in
+  temporal mode a bounded `SELECT DISTINCT` probe
   over the suspect windows (1,000 rows, and a truncated result counts as "yes")
   answers that far more cheaply than the scan it guards.
 - **Events missing the grouping field form their own group** (empty group
@@ -1148,9 +1156,13 @@ suspect window with fewer than 50 complete n-grams gets a `warnings` entry.
   events are more than this many seconds apart (AMiner's `timeout` reset, in
   batch form: the assembly window partitions on a running count of over-gap
   boundaries). Unset keeps the pre-1.8.6 behavior, no gap bound. Snapshotted
-  into the persisted `DetectorRun`. Not free: setting it adds two window passes
-  over each (source, window) partition on top of the assembly pass, so on a
-  wide scope it is a deliberate choice, not a default.
+  into the persisted `DetectorRun`. The gap is *complete elapsed seconds*
+  (ClickHouse `age`, not `dateDiff` — the latter counts second boundaries
+  crossed, so a 1.2 s step straddling two of them reported 2 and
+  `max_gap_seconds=1` cut a burst that never paused for a second). Not free:
+  setting it adds two window passes over each
+  (source, window) partition on top of the assembly pass, so on a wide scope it
+  is a deliberate choice, not a default.
 
 **Allowlist key:** `(series_field, "a → b → c")` — the finding's `value` is
 the " → "-joined n-gram, so **Mark normal** suppresses that exact ordering on

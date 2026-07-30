@@ -1393,6 +1393,14 @@ def _ngram_inner_sql(
         # is 0, UInt8, and the window `sum` stays UInt64), so segments start at
         # 0 and increment after every over-gap boundary — the first row is never
         # stranded in a segment of its own.
+        #
+        # `age`, not `dateDiff`: dateDiff counts unit *boundaries crossed*, so
+        # 12:00:00.900 → 12:00:02.100 — 1.2 s of elapsed time — reports 2, and a
+        # `max_gap` of 1 segments a burst that never paused for a second. `age`
+        # counts complete elapsed units and reports 1 there, which is what
+        # "farther apart than N seconds" means. Both yield NULL on the first row
+        # identically — measured on 26.6.1, including the Nullable(Int64) →
+        # UInt8 → UInt64 chain above.
         level1 = f"""
                 SELECT
                     *,
@@ -1400,7 +1408,7 @@ def _ngram_inner_sql(
                 FROM (
                     SELECT
                         *,
-                        dateDiff('second', lagInFrame(ets, 1) OVER ord, ets) AS gap_s
+                        age('second', lagInFrame(ets, 1) OVER ord, ets) AS gap_s
                     FROM ({level1})
                     WINDOW ord AS (
                         PARTITION BY source_id, w_idx
@@ -3025,7 +3033,14 @@ class StatisticalAnomalyService:
         fallback learn is only run when some group actually needs it — in
         temporal mode a bounded ``SELECT DISTINCT`` probe over the suspect
         windows answers that far more cheaply than the whole-scope scan it
-        guards.
+        guards. A pathological group count is bounded at
+        ``_MAX_CHARSET_GROUPED_ROWS`` returned rows per field; that ceiling
+        orders by novelty across *all* groups, so hitting it drops whole
+        low-novelty groups and is therefore reported in ``warnings`` rather
+        than left to look like a clean result.
+
+        Every warning is keyed by field, since the same group name can be thin
+        for one field and absent from the baseline window for another.
 
         Raises:
             ValueError: if ``group_field`` resolves to a non-string column
@@ -3140,13 +3155,17 @@ class StatisticalAnomalyService:
         # Every way a grouped run can deviate from "each group scored against
         # its own alphabet" is accumulated here and reported in `warnings`, so
         # the run never quietly narrows what it looked at — and never claims to
-        # have narrowed something it did not.
-        fallback_absent: set[str] = set()  # scored by fallback, no own reference
-        fallback_thin: set[str] = set()  # scored by fallback, own reference too thin
+        # have narrowed something it did not. All of them are keyed by field:
+        # the same group name can be thin for one field and absent for another,
+        # and a warning that merges the two leaves an analyst no way to tell
+        # which field it is about.
+        fallback_absent: dict[str, set[str]] = {}  # field -> fallback-scored, no own reference
+        fallback_thin: dict[str, set[str]] = {}  # field -> fallback-scored, own reference thin
         wide_dropped: dict[str, set[str]] = {}  # field -> groups dropped as free text
         thin_unevaluated: dict[str, set[str]] = {}  # field -> thin groups with no fallback
         absent_unevaluated: list[str] = []  # fields where absent groups had no fallback
         fallback_failed: dict[str, str] = {}  # field -> why no fallback could be learned
+        row_ceiling_hit: list[str] = []  # fields whose grouped scan hit _MAX_CHARSET_GROUPED_ROWS
 
         for field_token in scan_fields:
             # --- Learn the reference charset(s). With group_field, one
@@ -3355,8 +3374,10 @@ class StatisticalAnomalyService:
                         # having produced findings: a group measured against
                         # another reference is a fact about the run even when it
                         # comes back clean.
-                        fallback_thin |= thin_names
-                        fallback_absent |= absent_names
+                        if thin_names:
+                            fallback_thin.setdefault(field_token, set()).update(thin_names)
+                        if absent_names:
+                            fallback_absent.setdefault(field_token, set()).update(absent_names)
                     else:
                         # Nothing left to score them against. They go
                         # unevaluated, and the run names which ones and why
@@ -3510,6 +3531,14 @@ class StatisticalAnomalyService:
                     {HEAVY_SCAN_SETTINGS}
                 """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            if group_field is not None and len(vrows) >= _MAX_CHARSET_GROUPED_ROWS:
+                # The per-group budget (`LIMIT plim BY grp`) is preserved, but the
+                # global ceiling under it is not per-group: the ordering is by
+                # novelty length across every group, so what a truncated scan
+                # drops is whole low-novelty groups. Silently returning the top
+                # slice would read as "these are the groups with novel
+                # characters" when it means "these are the first 5,000 rows".
+                row_ceiling_hit.append(field_token)
             by_group = {learn.group: learn for learn in evaluated}
             # Every learn, not just the evaluated ones — a row's own group is
             # what distinguishes "too thin" from "absent" and stamps
@@ -3555,7 +3584,7 @@ class StatisticalAnomalyService:
                         # absent from the reference scan, otherwise present but
                         # too thin — different sentences in the warnings.
                         target = fallback_thin if own is not None else fallback_absent
-                        target.add(str(grp))
+                        target.setdefault(field_token, set()).add(str(grp))
                 char_counts, n_vals = learn.char_counts, learn.n_vals
                 score = 0.0
                 for c in novel_chars:
@@ -3627,15 +3656,17 @@ class StatisticalAnomalyService:
             else "the merged whole-scope alphabet"
         )
         if fallback_absent:
+            total = sum(len(names) for names in fallback_absent.values())
             run_warnings.append(
-                f"{len(fallback_absent)} {group_field} group(s) had no baseline-window values "
-                f"and were scored against {fb_desc} ({_name_groups(fallback_absent)})."
+                f"{total} {group_field} group(s) had no baseline-window values "
+                f"and were scored against {fb_desc} ({_name_groups_by_field(fallback_absent)})."
             )
         if fallback_thin:
+            total = sum(len(names) for names in fallback_thin.values())
             run_warnings.append(
-                f"{len(fallback_thin)} {group_field} group(s) had fewer than "
+                f"{total} {group_field} group(s) had fewer than "
                 f"{_MIN_CHARSET_BASELINE} distinct values of their own and were scored against "
-                f"{fb_desc} ({_name_groups(fallback_thin)})."
+                f"{fb_desc} ({_name_groups_by_field(fallback_thin)})."
             )
         if wide_dropped:
             total = sum(len(names) for names in wide_dropped.values())
@@ -3664,6 +3695,13 @@ class StatisticalAnomalyService:
             run_warnings.append(
                 "Groups absent from the baseline window were not evaluated for "
                 f"{', '.join(fields)}, because no fallback reference could be learned — {reasons}."
+            )
+        if row_ceiling_hit:
+            run_warnings.append(
+                f"The grouped scan returned its {_MAX_CHARSET_GROUPED_ROWS}-row ceiling for "
+                f"{', '.join(sorted(set(row_ceiling_hit)))} — rows are ordered by novelty across "
+                "all groups, so lower-novelty groups may be missing entirely. Narrow the scope, "
+                "or pick a lower-cardinality group_field."
             )
 
         return self._finalize_findings(
