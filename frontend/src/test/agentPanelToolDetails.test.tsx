@@ -142,4 +142,15 @@ describe("AgentPanel tool-call details (#203)", () => {
     expect(row.textContent).toContain('"field": "user"');
     expect(row.textContent).toContain('"total": 42');
   });
+
+  it("builds no payload bodies while the row is collapsed", async () => {
+    // A <details> renders its children whether open or not, so the bodies are
+    // mounted on demand instead — tool results are event lists, and formatting
+    // every one on every panel render is a cost a folded row shouldn't pay.
+    renderPanel();
+    const row = await screen.findByTestId("tool-call-tc-1");
+    expect(row.querySelectorAll("pre")).toHaveLength(0);
+    fireEvent.click(row.querySelector("summary")!);
+    expect(row.querySelectorAll("pre")).toHaveLength(2);
+  });
 });

@@ -130,12 +130,36 @@ class UpdateConversationRequest(BaseModel):
     _check_tools = field_validator("disabled_tools")(_validate_tool_names)
 
 
+# Serialized ceiling on a view_filters snapshot. The shape is deliberately not
+# pinned (the frontend's EventFilters keeps growing, and the stamp is a context
+# record, not something agent logic reads back), but it is persisted per user
+# message, so it needs a bound like `content` has one. A realistic Explorer view
+# is a few hundred bytes.
+_VIEW_FILTERS_MAX_CHARS = 16384
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=32768)
     # Snapshot of the analyst's current Explorer filters (frontend
     # EventFilters shape) — injected as context so the agent is aware of what
-    # the analyst is looking at.
+    # the analyst is looking at, and persisted on the user message row as the
+    # per-turn stamp (#205).
     view_filters: dict[str, Any] | None = None
+
+    @field_validator("view_filters")
+    @classmethod
+    def _bound_view_filters(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        try:
+            size = len(json.dumps(value, default=str))
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+            raise ValueError("view_filters must be JSON-serializable") from exc
+        if size > _VIEW_FILTERS_MAX_CHARS:
+            raise ValueError(
+                f"view_filters snapshot too large ({size} chars, max {_VIEW_FILTERS_MAX_CHARS})"
+            )
+        return value
 
 
 def _conversation_payload(conversation: AgentConversation) -> dict[str, Any]:

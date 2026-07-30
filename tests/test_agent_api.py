@@ -12,6 +12,7 @@ import asyncio
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tests.conftest import as_admin, login
 from vestigo.agent import availability
@@ -2688,3 +2689,20 @@ async def test_user_message_view_filters_defaults_to_none(store, monkeypatch):
     user_row = (await store.list_agent_messages(conversation.id))[0]
     assert user_row.role == "user"
     assert user_row.view_filters is None
+
+
+def test_view_filters_snapshot_is_size_bounded():
+    """The snapshot is persisted per user message, so it is bounded like
+    `content` is — an unbounded client dict could grow the transcript at will.
+    The shape stays free-form (the frontend's EventFilters keeps evolving)."""
+    from vestigo.api.routers import agent as agent_router
+
+    realistic = {"q": "ssh", "tagsInclude": ["auth"], "filters": {"attr:host": "web-01"}}
+    assert (
+        agent_router.SendMessageRequest(content="hi", view_filters=realistic).view_filters
+        == realistic
+    )
+
+    oversize = {"filters": {f"attr:k{i}": "x" * 64 for i in range(1000)}}
+    with pytest.raises(ValidationError, match="too large"):
+        agent_router.SendMessageRequest(content="hi", view_filters=oversize)

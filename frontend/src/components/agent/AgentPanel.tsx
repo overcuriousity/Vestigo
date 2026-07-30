@@ -491,6 +491,9 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     }
     // Generic tool result (#203): fold it into the call row it answers so the
     // row can show what the tool returned, instead of dropping it outright.
+    // The id must be non-empty to pair on: a provider that emitted "" for every
+    // call would otherwise splash one result across every unkeyed row.
+    if (!e.tool_call_id) return s;
     return {
       ...s,
       items: s.items.map((it) =>
@@ -536,27 +539,47 @@ function ToolRow({
   args?: Record<string, unknown> | null;
   result?: unknown;
 }) {
-  const summary = args && Object.keys(args).length > 0 ? JSON.stringify(args) : "";
+  // A <details> renders its children whether or not it is open, so the bodies
+  // are mounted on demand instead: tool results are event lists, and
+  // stringifying every one of them on every panel render (there are dozens of
+  // rows in a long transcript) is a cost the collapsed row shouldn't pay.
+  const [open, setOpen] = useState(false);
+  const hasArgs = !!args && Object.keys(args).length > 0;
+  const summary = hasArgs ? JSON.stringify(args) : "";
+  const argsText = useMemo(
+    () => (open && hasArgs ? JSON.stringify(args, null, 2) : ""),
+    [open, hasArgs, args],
+  );
+  const resultText = useMemo(
+    () => (open && result !== undefined && result !== null ? formatToolResult(result) : ""),
+    [open, result],
+  );
   return (
     <details
       data-testid={id ? `tool-call-${id}` : undefined}
+      // Left uncontrolled — the element owns its open state, `open` only
+      // mirrors it to decide whether the bodies are worth building.
+      onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}
       className="rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
     >
-      <summary className="flex cursor-pointer select-none items-center gap-1.5">
+      <summary
+        onClick={() => setOpen((o) => !o)}
+        className="flex cursor-pointer select-none items-center gap-1.5"
+      >
         <Wrench size={11} className="shrink-0" />
         <span className="min-w-0 break-all font-mono">
           {tool}
           {summary && <span className="opacity-70"> {summary.slice(0, 200)}</span>}
         </span>
       </summary>
-      {args && Object.keys(args).length > 0 && (
+      {argsText && (
         <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words">
-          {JSON.stringify(args, null, 2)}
+          {argsText}
         </pre>
       )}
-      {result !== undefined && result !== null && (
+      {resultText && (
         <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words">
-          {formatToolResult(result)}
+          {resultText}
         </pre>
       )}
     </details>
