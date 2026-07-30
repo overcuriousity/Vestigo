@@ -1269,6 +1269,7 @@ def _ngram_inner_sql(
     ngram: int,
     w_idx_expr: str,
     scope_pred: str,
+    max_gap: int | None = None,
 ) -> str:
     """Two-level n-gram assembly subquery shared by the sequence detectors.
 
@@ -1281,6 +1282,13 @@ def _ngram_inner_sql(
     guard is NULL exactly on each partition's first ``ngram - 1`` rows
     (incomplete n-grams), same trick as ``find_order_violations``.
 
+    *max_gap* (seconds, D14) inserts a segmentation level between the two:
+    ``seg`` is a running count of gaps longer than *max_gap* between
+    consecutive events, and the assembly window partitions by it, so an
+    n-gram never spans a quiet gap — AMiner's ``timeout`` reset, in batch
+    form. ``None`` keeps the pre-D14 shape bit-identical. The value is an
+    int inlined as a literal, same convention as the ``ngram - 1`` frame.
+
     Callers must run the enclosing query **once per source** (window sorts
     can't spill — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
     and filter on ``guard IS NOT NULL`` to keep only complete n-grams.
@@ -1288,16 +1296,7 @@ def _ngram_inner_sql(
     gram_lags = ", ".join(
         [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
     )
-    return f"""
-            SELECT
-                val,
-                ets,
-                w_idx,
-                [{gram_lags}] AS gram,
-                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
-                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
-                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
-            FROM (
+    level1 = f"""
                 SELECT
                     source_id,
                     {col} AS val,
@@ -1313,9 +1312,43 @@ def _ngram_inner_sql(
                   AND {col} != ''
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                   AND ({scope_pred})
-            )
+            """
+    if max_gap is not None:
+        gap = int(max_gap)
+        # gap_s is NULL on each partition's first row; `if(NULL …)` is 0, so
+        # segments start at 0 and increment after every over-gap boundary.
+        level1 = f"""
+                SELECT
+                    *,
+                    sum(if(gap_s > {gap}, 1, 0)) OVER ord AS seg
+                FROM (
+                    SELECT
+                        *,
+                        dateDiff('second', lagInFrame(ets, 1) OVER ord, ets) AS gap_s
+                    FROM ({level1})
+                    WINDOW ord AS (
+                        PARTITION BY source_id, w_idx
+                        ORDER BY ets, byte_offset, line_number, event_id
+                    )
+                )
+                WINDOW ord AS (
+                    PARTITION BY source_id, w_idx
+                    ORDER BY ets, byte_offset, line_number, event_id
+                )
+            """
+    partition = "source_id, w_idx, seg" if max_gap is not None else "source_id, w_idx"
+    return f"""
+            SELECT
+                val,
+                ets,
+                w_idx,
+                [{gram_lags}] AS gram,
+                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
+                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
+                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
+            FROM ({level1})
             WINDOW w AS (
-                PARTITION BY source_id, w_idx
+                PARTITION BY {partition}
                 ORDER BY ets, byte_offset, line_number, event_id
                 ROWS BETWEEN {ngram - 1} PRECEDING AND CURRENT ROW
             )
@@ -5076,6 +5109,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        max_gap_seconds: int | None = None,
     ) -> StatAnomalyResult:
         """Return event-order n-grams present in a suspect window but absent from the baseline.
 
@@ -5150,7 +5184,8 @@ class StatisticalAnomalyService:
         w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
 
         inner = _ngram_inner_sql(
-            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr=w_idx_expr, scope_pred=union_pred
+            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr=w_idx_expr, scope_pred=union_pred,
+            max_gap=max_gap_seconds,
         )
 
         # Query A (once per source): complete-n-gram totals per window —
@@ -5340,6 +5375,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        max_gap_seconds: int | None = None,
     ) -> StatAnomalyResult:
         """Return recurring event-order n-grams (motifs), ranked by support and regularity.
 
@@ -5406,7 +5442,8 @@ class StatisticalAnomalyService:
         scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
 
         inner = _ngram_inner_sql(
-            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr="0", scope_pred=scope_pred
+            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr="0", scope_pred=scope_pred,
+            max_gap=max_gap_seconds,
         )
 
         # Pass 1 (once per source): support per complete n-gram, highest first.

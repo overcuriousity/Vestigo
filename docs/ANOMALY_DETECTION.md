@@ -1106,6 +1106,11 @@ suspect window with fewer than 50 complete n-grams gets a `warnings` entry.
 - `VESTIGO_STAT_SEQUENCE_MAX_CANDIDATES` (default 2000) — cap on novel n-grams
   fetched per run, lowest suspect volume (rarest) first; hitting it attaches a
   warning.
+- `max_gap_seconds` (request, default unset) — break an n-gram when consecutive
+  events are more than this many seconds apart (AMiner's `timeout` reset, in
+  batch form: the assembly window partitions on a running count of over-gap
+  boundaries). Unset keeps the pre-1.8.6 behavior, no gap bound. Snapshotted
+  into the persisted `DetectorRun`.
 
 **Allowlist key:** `(series_field, "a → b → c")` — the finding's `value` is
 the " → "-joined n-gram, so **Mark normal** suppresses that exact ordering on
@@ -1120,12 +1125,12 @@ every event.
   across the whole source, or scope the timeline to per-stream sources. A
   per-stream secondary partition field is a possible follow-up, deliberately
   not implemented yet.
-- **No gap bound between n-gram members.** AMiner's `EventSequenceDetector`
-  resets an in-progress sequence when more than `timeout` seconds pass between
-  events; Vestigo has no such bound, so three consecutive records for a source
-  form an n-gram even if days separate them. On a quiet source that manufactures
-  "sequences" out of unrelated events. Prefer windows dense enough that
-  consecutive really means consecutive. A max-gap parameter is roadmap D14.
+- **No gap bound unless `max_gap_seconds` is set.** AMiner's
+  `EventSequenceDetector` always resets an in-progress sequence after
+  `timeout` seconds; Vestigo's bound is opt-in, so without it three
+  consecutive records form an n-gram even if days separate them — on a quiet
+  source that manufactures "sequences" out of unrelated events. Set
+  `max_gap_seconds` when the source is sparse enough for that to matter.
 - **Tiny baselines make everything novel.** A baseline with few complete
   n-grams vouches for almost nothing; the <50-n-gram warning fires, and n = 4
   or 5 on a short baseline mostly measures the baseline's poverty. Prefer
@@ -1340,6 +1345,9 @@ ranking is reproducible arithmetic.
 - `min_support` (request) / `VESTIGO_STAT_MOTIF_MIN_SUPPORT` (default 3,
   floor 2) — occurrences below this are not motifs; snapshotted.
 - `start` / `end` (request, optional) — scope mining to a time frame.
+- `max_gap_seconds` (request, default unset) — same gap bound as detector 9;
+  both detectors share the n-gram assembly, so support mining and the cadence
+  pass segment identically. Unset = no gap bound (pre-1.8.6 behavior).
 - `VESTIGO_STAT_MOTIF_MAX_CANDIDATES` (default 1000) — per-source candidate
   cap, highest support first; hitting it attaches a warning.
 - `VESTIGO_STAT_MOTIF_CADENCE_TOP_K` (default 500) — only the top-K merged

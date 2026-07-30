@@ -1640,6 +1640,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         start: datetime | None = None,
         end: datetime | None = None,
         group_field: str | None = None,
+        max_gap_seconds: int | None = Field(default=None, ge=1),
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
@@ -1656,7 +1657,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
         (sequence_motif), start/end (sequence_motif mining window),
         group_field (charset only: learn one alphabet per value of this
-        field, e.g. per host, instead of one merged alphabet).
+        field, e.g. per host, instead of one merged alphabet),
+        max_gap_seconds (sequence_novelty/sequence_motif only: break a
+        sequence when consecutive events are farther apart than this).
         Returns findings plus a persisted run_id the analyst can open. Each
         finding carries an example `event_id`; how much of that event comes
         with it depends on the deployment, and the result's `fidelity`/`note`
@@ -1686,6 +1689,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             start=start,
             end=end,
             group_field=group_field,
+            max_gap_seconds=max_gap_seconds,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )

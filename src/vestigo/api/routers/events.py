@@ -1709,6 +1709,7 @@ async def _run_stat_detector(
     start: datetime | None = None,
     end: datetime | None = None,
     group_field: str | None = None,
+    max_gap_seconds: int | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -1797,6 +1798,8 @@ async def _run_stat_detector(
         resolution["sequence_ngram"] = (
             ngram_size if ngram_size is not None else cfg.stat_sequence_ngram
         )
+        # D14: None = no gap bound (pre-1.8.6 behavior).
+        resolution["sequence_max_gap_seconds"] = max_gap_seconds
         try:
             result = await run_in_threadpool(
                 svc.find_sequence_novelty,
@@ -1811,6 +1814,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                max_gap_seconds=max_gap_seconds,
             )
             return result, resolution
         except ValueError as exc:
@@ -1827,6 +1831,9 @@ async def _run_stat_detector(
         resolution["motif_min_support"] = (
             min_support if min_support is not None else cfg.stat_motif_min_support
         )
+        # D14: same gap bound as sequence_novelty — both detectors must agree
+        # on what a sequence is.
+        resolution["motif_max_gap_seconds"] = max_gap_seconds
         try:
             result = await run_in_threadpool(
                 svc.find_sequence_motifs,
@@ -1844,6 +1851,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                max_gap_seconds=max_gap_seconds,
             )
             return result, resolution
         except ValueError as exc:
@@ -2459,6 +2467,9 @@ async def _persist_detector_run(
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
             "group_field": resolution.get("charset_group_field"),
+            # sequence_novelty / sequence_motif: gap bound (None = no bound).
+            "max_gap_seconds": resolution.get("sequence_max_gap_seconds")
+            or resolution.get("motif_max_gap_seconds"),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
@@ -2575,6 +2586,15 @@ async def list_anomalies(
             "whole-scope learning."
         ),
     ),
+    max_gap_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "sequence_novelty and sequence_motif only: break an n-gram when "
+            "consecutive events are more than this many seconds apart. Omit "
+            "for no gap bound."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -2688,6 +2708,7 @@ async def list_anomalies(
         start=start,
         end=end,
         group_field=group_field,
+        max_gap_seconds=max_gap_seconds,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2866,6 +2887,14 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         description="charset only: learn one reference alphabet per value of this field.",
     )
+    max_gap_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "sequence_novelty and sequence_motif only: break an n-gram when "
+            "consecutive events are more than this many seconds apart."
+        ),
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -2931,6 +2960,7 @@ async def tag_anomalies(
         start=body.start,
         end=body.end,
         group_field=body.group_field,
+        max_gap_seconds=body.max_gap_seconds,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )

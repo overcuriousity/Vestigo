@@ -4741,3 +4741,66 @@ def test_charset_no_group_field_keeps_current_sql():
     joined = "\n".join(client.full_queries)
     assert "grp" not in joined
     assert "{gk:String}" not in joined
+
+
+def test_sequence_max_gap_adds_segment_partition():
+    """max_gap_seconds breaks n-grams across gaps: the assembly window
+    partitions by a segment counter incremented whenever consecutive events
+    are too far apart (D14)."""
+    client = RecordingClient(
+        _seq_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            ngram_totals=[(-1, 7998), (0, 1998)],
+            novel_rows=[],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_sequence_novelty(
+        "c1", ["s1"], series_field="attr:proc", ngram=3,
+        windows=_seq_windows(), max_gap_seconds=300,
+    )
+    assert result.status == "ok"
+    joined = "\n".join(client.full_queries)
+    assert "dateDiff('second', lagInFrame(ets, 1) OVER ord, ets)" in joined
+    assert "PARTITION BY source_id, w_idx, seg" in joined
+    assert "if(gap_s > 300, 1, 0)" in joined
+
+
+def test_sequence_no_max_gap_keeps_current_sql():
+    """Default (None) is bit-identical to the pre-D14 shape — no seg anywhere."""
+    client = RecordingClient(
+        _seq_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            ngram_totals=[(-1, 7998), (0, 1998)],
+            novel_rows=[],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_sequence_novelty(
+        "c1", ["s1"], series_field="attr:proc", ngram=3, windows=_seq_windows()
+    )
+    joined = "\n".join(client.full_queries)
+    assert "seg" not in joined
+    assert "PARTITION BY source_id, w_idx" in joined
+
+
+def test_motif_max_gap_reaches_both_passes():
+    """sequence_motif takes the same bound; the cadence pass reuses the inner
+    assembly, so one parameter covers support and cadence alike (D14)."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_sequence_motifs("c1", ["s1"], series_field="attr:proc", max_gap_seconds=300)
+    joined = "\n".join(client.full_queries)
+    assert "PARTITION BY source_id, w_idx, seg" in joined
+    assert "if(gap_s > 300, 1, 0)" in joined

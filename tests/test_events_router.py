@@ -2257,3 +2257,52 @@ def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
 
     without = list(events._stream_csv(eq, {}, None, expected=2, tally={}))
     assert not without[0].startswith("#")
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_passes_max_gap_seconds(patched_store, monkeypatch):
+    """D14: max_gap_seconds threads to both sequence detectors and their
+    resolution snapshots; unset stays None (no gap bound)."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _r1, res1 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+        max_gap_seconds=300,
+    )
+    assert fake_svc.sequence_calls[0]["max_gap_seconds"] == 300
+    assert res1["sequence_max_gap_seconds"] == 300
+
+    _r2, res2 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_motif",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+        max_gap_seconds=3600,
+    )
+    assert fake_svc.motif_calls[0]["max_gap_seconds"] == 3600
+    assert res2["motif_max_gap_seconds"] == 3600
+
+    _r3, res3 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.sequence_calls[1]["max_gap_seconds"] is None
+    assert res3["sequence_max_gap_seconds"] is None
