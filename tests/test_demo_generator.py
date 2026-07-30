@@ -7,7 +7,7 @@ makes of them (that is ``tests/test_demo_detector_coverage_clickhouse.py``).
 from __future__ import annotations
 
 from tools.demo_case import scenario
-from tools.demo_case.sources import linux, windows
+from tools.demo_case.sources import linux, netflow, proxy, windows
 
 
 def test_window_is_fixed():
@@ -153,3 +153,65 @@ def test_file_server_sudo_mix_shifts_during_the_intrusion():
         return hits / len(window)
 
     assert share(False) > 3 * share(True)
+
+
+def test_proxy_beacon_is_regular_and_only_in_the_suspect_window():
+    from datetime import datetime as _dt
+
+    beacons = [r for r in proxy.proxy_rows() if r["host"] == scenario.C2_HOST]
+    assert len(beacons) > 300
+    stamps = sorted(_dt.fromisoformat(r["datetime"]) for r in beacons)
+    gaps = [(b - a).total_seconds() for a, b in zip(stamps, stamps[1:], strict=False)]
+    inner = [g for g in gaps if g < 3600]
+    assert 280 < sum(inner) / len(inner) < 320, "beacon interval should sit near 300s"
+    assert max(inner) - min(inner) < 120, "jitter stays tight enough to look periodic"
+    assert stamps[0] >= scenario.BASELINE_END
+
+
+def test_exfil_uploads_dwarf_the_baseline_and_shift_the_destination_mix():
+    rows = list(proxy.proxy_rows())
+    baseline_max = max(
+        int(r["bytes_out"]) for r in rows if r["datetime"] < scenario.BASELINE_END.isoformat()
+    )
+    exfil = [r for r in rows if r["host"] == scenario.EXFIL_HOST]
+    assert exfil
+    assert max(int(r["bytes_out"]) for r in exfil) > 20 * baseline_max
+
+    late = [r for r in rows if r["datetime"] >= scenario.PHASES[-1].start.isoformat()]
+    share = sum(1 for r in late if r["host"] == scenario.EXFIL_HOST) / len(late)
+    assert share > 0.02, "the destination mix must actually move, not just add a tail"
+
+
+def test_proxy_carries_exactly_one_odd_user_agent():
+    odd = {r["user_agent"] for r in proxy.proxy_rows() if "«" in r["user_agent"]}
+    assert len(odd) == 1
+
+
+def test_proxy_volume_and_ordering():
+    rows = list(proxy.proxy_rows())
+    assert 65_000 < len(rows) < 78_000
+    assert [r["datetime"] for r in rows] == sorted(r["datetime"] for r in rows)
+
+
+def test_netflow_volume_and_long_sessions():
+    rows = list(netflow.netflow_rows())
+    assert 25_000 < len(rows) < 36_000
+    durations = [float(r["duration"]) for r in rows]
+    assert max(durations) > 20 * (sum(durations) / len(durations))
+
+
+def test_netflow_mirrors_every_beacon_request():
+    beacons = sum(1 for r in proxy.proxy_rows() if r["host"] == scenario.C2_HOST)
+    mirrored = sum(1 for r in netflow.netflow_rows() if r["dst_ip"] == netflow.C2_IP)
+    assert mirrored == beacons
+
+
+def test_netflow_denies_spike_on_the_file_server_during_lateral_movement():
+    rows = [
+        r
+        for r in netflow.netflow_rows()
+        if r["action"] == "deny" and r["dst_ip"] == netflow.FILE_SERVER_IP
+    ]
+    lateral = scenario.PHASES[2]
+    inside = [r for r in rows if lateral.start.isoformat() <= r["datetime"] < lateral.end.isoformat()]
+    assert len(inside) > 100
