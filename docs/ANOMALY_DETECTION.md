@@ -692,13 +692,39 @@ invisible characters are visible in the report.
   the rest no longer merges into a reference alphabet that flags neither. Both
   modes honor it, the skip guards below apply per group, and suppressions stay
   keyed on `(field, value)`, applying across groups. Findings name their group
-  in `details.group_field`/`details.group_value`.
+  in `details.group_field`/`details.group_value`, and which reference scored
+  them in `details.group_basis`.
+- **What grouping costs.** One extra *learn* query per field, not one violation
+  scan per group: the per-group reference alphabets travel into the single scan
+  as parallel `{grps, sets}` array parameters, each row picking its own
+  reference by `indexOf`, and `LIMIT <per_field_limit> BY grp` preserves the
+  per-group finding budget. Group cardinality therefore costs rows, not
+  queries. A pathological group count is bounded at 5,000 returned rows per
+  field.
+- **A group the baseline window never saw is scored against a fallback
+  reference** (`details.group_basis = "outside-suspect-windows"`, and a
+  `warnings` entry naming the groups). Skipping such a group would be a silent
+  false negative exactly where it hurts — a host that first appears inside the
+  suspect window is the interesting one — and learning its reference over the
+  whole scope would let the suspect values into their own reference and mask
+  themselves, so the fallback is learned from events *outside* the suspect
+  windows with the rare-chars recipe. If the data outside the suspect windows
+  is itself too thin to learn from, those groups go unevaluated and the run
+  says so in `warnings`.
+- **Events missing the grouping field form their own group** (empty group
+  value, rendered `(no value)`): excluding them would quietly drop them from
+  the run.
 - **Free-text fields in large scripts.** A field whose reference alphabet
   exceeds 5,000 characters (CJK prose, base64 blobs mixing full alphabets) is
   skipped — "novel character" is meaningless there. Fields with fewer than 20
   distinct baseline values are skipped too (an alphabet learned from a handful
   of values flags everything). If every scanned field skips, the status is
-  `insufficient_data`.
+  `insufficient_data`. Under `group_field` these guards apply per group, and
+  skipped groups are counted in `warnings` — a field is still evaluated when
+  only some of its groups qualify.
+- **`group_field` must be a string field.** A non-string column (only
+  `timestamp` today) is refused with 422 rather than reaching ClickHouse as a
+  type error.
 - **Characters are extracted with re2 (`extractAll(val, '(?s).')`) in UTF-8
   mode.** Codepoints — including NUL — are handled; byte sequences that are not
   valid UTF-8 may be skipped by the regex engine rather than surfaced as
@@ -1110,7 +1136,9 @@ suspect window with fewer than 50 complete n-grams gets a `warnings` entry.
   events are more than this many seconds apart (AMiner's `timeout` reset, in
   batch form: the assembly window partitions on a running count of over-gap
   boundaries). Unset keeps the pre-1.8.6 behavior, no gap bound. Snapshotted
-  into the persisted `DetectorRun`.
+  into the persisted `DetectorRun`. Not free: setting it adds two window passes
+  over each (source, window) partition on top of the assembly pass, so on a
+  wide scope it is a deliberate choice, not a default.
 
 **Allowlist key:** `(series_field, "a → b → c")` — the finding's `value` is
 the " → "-joined n-gram, so **Mark normal** suppresses that exact ordering on
@@ -1478,7 +1506,6 @@ disposition mechanism.
 - **Numeric equality is textual.** `EventID: 4624` compares as the string
   `'4624'` — `"04624"` does not match; `|gt`/`|lt` comparisons go through
   `toFloat64OrNull` and treat non-numeric values as no-match.
-
 - **Unsupported constructs** (correlation rules, aggregations) report the
   rule as `not_applicable` rather than failing the run.
 - **Case-uploaded rules have no ruleset fieldmap.** `vestigo-fieldmap.yml`

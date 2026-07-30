@@ -235,14 +235,18 @@ export function MethodologyPanel({
               temporal learns the baseline window's character set and flags
               detect-window values with never-seen characters. The optional
               group-by scopes the learning: one alphabet per value of that
-              field (e.g. per host) instead of one merged alphabet.
+              field (e.g. per host) instead of one merged alphabet. In temporal
+              mode a group the baseline window never saw is scored against a
+              reference learned outside the suspect windows — never skipped,
+              and the row says which reference scored it.
             </Row>
             <Row label="Signal">
               Null bytes, unicode homoglyphs, injection metacharacters —
               detected purely by character identity, never by what a value
               means. Fields with fewer than 20 distinct baseline values or an
               alphabet over 5000 characters (free text in large scripts) are
-              skipped.
+              skipped; under group-by these guards apply per group, and skipped
+              groups are named in the run's warnings.
             </Row>
             <Row label="Score">
               Sum over the value's novel characters of −log(values-with-char /

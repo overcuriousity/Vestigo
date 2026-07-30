@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import numpy as np
+import pytest
 
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
@@ -4686,11 +4687,11 @@ def test_charset_group_field_partitions_alphabets():
             ],
             column_names=["grp", "c", "n", "n_vals"],
         ),
-        # One violation scan per evaluated group, in learning order.
-        FakeQueryResult(result_rows=[], column_names=[]),  # host-a: clean
+        # One violation scan for every group — host-b's row is the only one
+        # whose value carries a character outside its own group's alphabet.
         FakeQueryResult(
-            result_rows=[("ab\x00", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-b", ["\x00"], 2, fs, "evt-nul")],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -4700,16 +4701,20 @@ def test_charset_group_field_partitions_alphabets():
     f = result.results[0]
     assert f.details["group_field"] == "attr:host"
     assert f.details["group_value"] == "host-b"
+    assert f.details["group_basis"] == "scope"
     # Allowlist identity is unchanged: (field, value), group-independent, so
     # existing suppressions keep matching.
     assert f.details["allowlist_field"] == "attr:user"
     assert f.details["allowlist_value"] == "ab\x00"
-    # Each group's violation scan carried its own reference set.
-    base_params = [p["base"] for p in svc.ch.client._all_parameters if "base" in p]
-    assert sorted("\x00" in p for p in base_params) == [False, True]
-    # …and was pinned to its group value.
-    gvals = [p["gval"] for p in svc.ch.client._all_parameters if "gval" in p]
-    assert gvals == ["host-a", "host-b"]
+    # Scored against host-b's own denominators, not the merged ones.
+    assert f.details["baseline_distinct_values"] == 100
+    # One scan for both groups (count + learn + violation = 3 queries), with the
+    # per-group references carried in as parallel arrays.
+    assert len(svc.ch.client._all_parameters) == 3
+    viol = svc.ch.client._all_parameters[-1]
+    assert viol["grps"] == ["host-a", "host-b"]
+    assert [("\x00" in ref) for ref in viol["sets"]] == [True, False]
+    assert viol["has_fb"] == 0
 
 
 def test_charset_group_field_sql_groups_learning_scan():
@@ -4726,8 +4731,9 @@ def test_charset_group_field_sql_groups_learning_scan():
     joined = "\n".join(client.full_queries)
     assert "AS grp" in joined
     assert "GROUP BY grp" in joined
-    # The group column resolves through _col_expr with its own param prefix.
-    assert "attributes[{gk:String}]" in joined
+    # The group column resolves through _col_expr with its own param prefix,
+    # cast so a non-String column can never blow up the comparison.
+    assert "toString(attributes[{gk:String}])" in joined
 
 
 def test_charset_no_group_field_keeps_current_sql():
@@ -4739,6 +4745,118 @@ def test_charset_no_group_field_keeps_current_sql():
     joined = "\n".join(client.full_queries)
     assert "grp" not in joined
     assert "{gk:String}" not in joined
+
+
+def test_charset_group_field_scans_once_per_field():
+    """Grouped runs scan `events` once per field, not once per group: the
+    per-group references travel in as arrays picked by indexOf, and each group
+    keeps its own finding budget via LIMIT ... BY grp."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(f"host-{i}", "a", 90, 100) for i in range(40)],
+                column_names=["grp", "c", "n", "n_vals"],
+            ),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    # 40 groups, still one violation scan (count + learn + violation).
+    assert len(client.full_queries) == 3
+    viol = client.full_queries[-1]
+    assert "indexOf({grps:Array(String)}, grp) AS gidx" in viol
+    assert "{sets:Array(Array(String))}[greatest(gidx, 1)]" in viol
+    assert "LIMIT {plim:UInt32} BY grp" in viol
+    assert "LIMIT {tlim:UInt32}" in viol
+    # No per-group equality pin — that was the per-group-scan shape.
+    assert "{gval:String}" not in viol
+
+
+def test_charset_group_field_temporal_falls_back_outside_suspect_windows():
+    """A group the baseline window never saw is scored against a reference
+    learned outside the suspect windows — not skipped, and not against a
+    whole-scope alphabet that would contain the suspect values themselves."""
+    fs = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        # Per-group baseline alphabets: only host-a is in the baseline window.
+        FakeQueryResult(
+            result_rows=[("host-a", ["a", "b"], 60)],
+            column_names=["grp", "charset", "n_vals"],
+        ),
+        # Fallback learn (rare-chars outside the suspect windows).
+        FakeQueryResult(
+            result_rows=[("a", 80, 90), ("b", 70, 90)],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
+        # host-b was never in the baseline: scored by the fallback.
+        FakeQueryResult(
+            result_rows=[("abа", "host-b", ["а"], 3, fs, "evt-hom", 0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+        ),
+    ]
+    client = RecordingClient(responses)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        windows=_one_suspect(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 10, tzinfo=UTC),
+            datetime(2024, 1, 11, tzinfo=UTC),
+            datetime(2024, 1, 12, tzinfo=UTC),
+        ),
+        group_field="attr:host",
+    )
+    assert result.status == "ok"
+    f = result.results[0]
+    assert f.details["group_value"] == "host-b"
+    assert f.details["group_basis"] == "outside-suspect-windows"
+    # The fallback came from the rare-chars recipe, so its per-character counts
+    # are reportable — a baseline-window reference has none.
+    assert f.details["char_value_counts"] == {"а": 0}
+    # The fallback learn excluded the suspect windows, or a suspect-window value
+    # would sit in its own reference and mask itself.
+    assert "AND NOT (" in client.full_queries[2]
+    viol = client._all_parameters[-1]
+    assert viol["has_fb"] == 1
+    assert viol["grps"] == ["host-a"]
+    # …and the run says so.
+    assert any("no baseline-window values" in w and "host-b" in w for w in result.warnings)
+
+
+def test_charset_group_field_reports_skipped_groups():
+    """Groups the skip guards drop are named in warnings instead of vanishing."""
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[
+                ("host-a", "a", 90, 100),
+                # host-tiny has 5 distinct values — below _MIN_CHARSET_BASELINE.
+                ("host-tiny", "a", 4, 5),
+            ],
+            column_names=["grp", "c", "n", "n_vals"],
+        ),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    assert any("fewer than 20 distinct values" in w for w in result.warnings)
+    # Only the evaluated group's reference travelled into the scan.
+    assert svc.ch.client._all_parameters[-1]["grps"] == ["host-a"]
+
+
+def test_charset_rejects_non_string_group_field():
+    """A group field that is not a String column would be a ClickHouse type
+    error, so it is refused before any query runs."""
+    svc = _svc([])
+    with pytest.raises(ValueError, match="not a string field"):
+        svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="timestamp")
 
 
 def test_sequence_max_gap_adds_segment_partition():

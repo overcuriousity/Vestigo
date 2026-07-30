@@ -196,7 +196,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -205,7 +205,7 @@ from vestigo.db._buckets import (
     bucket_interval_seconds,
     query_timestamp_range,
 )
-from vestigo.db._columns import resolve_column_token
+from vestigo.db._columns import TOP_LEVEL_NON_STRING_COLUMNS, resolve_column_token
 from vestigo.db._dt import (
     VESTIGO_NOT_SENTINEL_SQL,
     ensure_utc,
@@ -275,6 +275,42 @@ _MIN_CHARSET_BASELINE = 20
 # scripts, e.g. CJK) — a huge alphabet makes "novel character" meaningless and
 # the reference-set query parameter unreasonably large.
 _MAX_CHARSET_SIZE = 5000
+
+# Row ceiling on the grouped charset violation scan. `LIMIT plim BY grp` keeps
+# each group's budget, so this only bounds what a pathological group count can
+# materialize in one response; findings are capped again by `limit` afterwards.
+_MAX_CHARSET_GROUPED_ROWS = 5000
+
+# Group values named in a charset warning before it degrades to a bare count.
+_CHARSET_WARN_GROUPS = 5
+
+
+class _CharsetLearn(NamedTuple):
+    """One learned charset reference for the charset detector.
+
+    ``group`` is the ``group_field`` value the reference was learned for, or
+    ``None`` for an ungrouped reference (whole scope) and for the temporal-mode
+    fallback that scores groups absent from the baseline window.
+
+    ``char_counts`` (per-character distinct-value counts) is populated only by
+    the rare-chars recipe — self-baseline mode and the temporal fallback —
+    since a temporal per-group reference *is* the full baseline alphabet and
+    has no per-character rarity to report. ``alphabet_size`` measures every
+    character seen, not just the non-rare subset, because that is what the
+    "free text, novel character is meaningless" skip guard is about.
+
+    ``basis`` names the data the reference came from and is stamped onto every
+    finding it scores (``details.group_basis``), so a report never conflates a
+    baseline-window reference with the fallback.
+    """
+
+    group: str | None
+    reference: list[str]
+    char_counts: dict[str, int]
+    n_vals: int
+    alphabet_size: int
+    basis: str
+
 
 # Minimum distinct baseline values before the entropy detector trusts a
 # field's entropy distribution — quartiles over fewer points are noise.
@@ -1070,6 +1106,23 @@ def _col_expr(
     return f"attributes[{{{prefix}:String}}]"
 
 
+def _group_expr(
+    field_token: str,
+    params: dict[str, Any],
+    field_mappings: dict[str, list[str]] | None = None,
+) -> str:
+    """Return a String-typed SQL expression for a *grouping* field token.
+
+    Same resolution as :func:`_col_expr` (with the ``gk`` parameter prefix, so
+    one params dict can hold a scan field and a group field), wrapped in
+    ``toString`` so the value can be compared and returned as a string
+    whatever column it resolves to. Callers that reject non-string tokens up
+    front still get a defined query instead of a ClickHouse type error if a new
+    non-string column ever slips past them.
+    """
+    return f"toString({_col_expr(field_token, params, field_mappings, prefix='gk')})"
+
+
 def _split_novelty_fields(
     scan_fields: list[str],
     field_mappings: dict[str, list[str]] | None,
@@ -1315,8 +1368,11 @@ def _ngram_inner_sql(
             """
     if max_gap is not None:
         gap = int(max_gap)
-        # gap_s is NULL on each partition's first row; `if(NULL …)` is 0, so
-        # segments start at 0 and increment after every over-gap boundary.
+        # gap_s is NULL on each partition's first row; ClickHouse's `if` takes
+        # the else branch for a NULL condition (verified: `if(NULL > n, 1, 0)`
+        # is 0, UInt8, and the window `sum` stays UInt64), so segments start at
+        # 0 and increment after every over-gap boundary — the first row is never
+        # stranded in a segment of its own.
         level1 = f"""
                 SELECT
                     *,
@@ -2913,7 +2969,31 @@ class StatisticalAnomalyService:
         differ no longer mask each other. Both modes honor it, and the skip
         guards apply per group. Suppressions stay keyed on ``(field, value)``
         and apply across groups.
+
+        Grouping costs one extra *learn* query per field, not one violation
+        scan per group: the per-group references travel into the single scan as
+        parallel ``{grps, sets}`` array parameters, and ``LIMIT plim BY grp``
+        preserves each group's finding budget. In temporal mode a group with no
+        baseline-window values would otherwise be silently unevaluated — the
+        newly-provisioned host is exactly where a homoglyph hides — so those
+        groups are scored against a fallback reference learned from events
+        *outside the suspect windows*. Learning it over the whole scope instead
+        would let a suspect-window value into its own reference and mask itself.
+        Every finding records which reference scored it in
+        ``details.group_basis``, and groups the guards skipped are reported in
+        ``warnings`` rather than vanishing.
+
+        Raises:
+            ValueError: if ``group_field`` resolves to a non-string column
+                (string comparisons against it are a ClickHouse type error).
         """
+        if group_field is not None:
+            column, _ = resolve_column_token(group_field)
+            if column in TOP_LEVEL_NON_STRING_COLUMNS:
+                raise ValueError(
+                    f"group_field '{group_field}' is not a string field and cannot group "
+                    "charset learning; pick a categorical field or an attribute."
+                )
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
@@ -2938,15 +3018,23 @@ class StatisticalAnomalyService:
 
         all_findings: list[CharsetFinding] = []
         evaluated_fields = 0
+        run_warnings: list[str] = []
+        # Groups that scored against the temporal fallback, and groups the skip
+        # guards dropped — both reported in `warnings` so a grouped run never
+        # quietly narrows what it looked at.
+        fallback_groups: set[str] = set()
+        no_fallback_fields: list[str] = []
+        skipped_small: dict[str, int] = {}
+        skipped_wide: dict[str, int] = {}
 
         for field_token in scan_fields:
             # --- Learn the reference charset(s). With group_field, one
             # alphabet per value of the group field (D14); without it, a
             # single None-grouped entry — the pre-D14 whole-scope behavior.
-            # Each learn tuple: (grp, reference, char_counts, n_vals,
-            # alphabet_size). char_counts is empty in temporal mode, where
-            # the reference already is the full baseline alphabet.
-            learns: list[tuple[str | None, list[str], dict[str, int], int, int]] = []
+            learns: list[_CharsetLearn] = []
+            # Temporal grouped mode only: reference for groups with no
+            # baseline-window values (see the docstring).
+            fallback: _CharsetLearn | None = None
             if windows is None:
                 # Per-character distinct-value counts over the whole corpus,
                 # plus the total distinct-value count in the same scan: a window
@@ -2987,9 +3075,13 @@ class StatisticalAnomalyService:
                     # Measure `char_counts`, which holds every character seen
                     # (temporal mode's `reference` already is the full baseline
                     # alphabet).
-                    learns.append((None, reference, char_counts, n_vals, len(char_counts)))
+                    learns.append(
+                        _CharsetLearn(
+                            None, reference, char_counts, n_vals, len(char_counts), "scope"
+                        )
+                    )
                 else:
-                    gcol = _col_expr(group_field, cc_params, field_mappings, prefix="gk")
+                    gcol = _group_expr(group_field, cc_params, field_mappings)
                     cc_sql = f"""
                         SELECT grp, c, count() AS n_vals_with_c, any(total) AS n_vals
                         FROM (
@@ -3018,7 +3110,14 @@ class StatisticalAnomalyService:
                     for grp, grp_counts in by_grp.items():
                         reference = [c for c, nv in grp_counts.items() if nv > rarity_floor]
                         learns.append(
-                            (grp, reference, grp_counts, n_vals_by_grp[grp], len(grp_counts))
+                            _CharsetLearn(
+                                grp,
+                                reference,
+                                grp_counts,
+                                n_vals_by_grp[grp],
+                                len(grp_counts),
+                                "scope",
+                            )
                         )
             else:
                 # Charset of the baseline window (a bounded range now, so the
@@ -3047,9 +3146,13 @@ class StatisticalAnomalyService:
                     charset_arr, n_vals = bs_rows[0]
                     n_vals = int(n_vals)
                     reference = [str(c) for c in (charset_arr or [])]
-                    learns.append((None, reference, {}, n_vals, len(reference)))
+                    learns.append(
+                        _CharsetLearn(
+                            None, reference, {}, n_vals, len(reference), "baseline-window"
+                        )
+                    )
                 else:
-                    gcol = _col_expr(group_field, bs_params, field_mappings, prefix="gk")
+                    gcol = _group_expr(group_field, bs_params, field_mappings)
                     bs_sql = f"""
                         SELECT
                             grp,
@@ -3069,44 +3172,103 @@ class StatisticalAnomalyService:
                     bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
                     for grp, charset_arr, grp_n_vals in bs_rows:
                         reference = [str(c) for c in (charset_arr or [])]
-                        learns.append((str(grp), reference, {}, int(grp_n_vals), len(reference)))
+                        learns.append(
+                            _CharsetLearn(
+                                str(grp),
+                                reference,
+                                {},
+                                int(grp_n_vals),
+                                len(reference),
+                                "baseline-window",
+                            )
+                        )
 
-            # The skip guards apply per group (ungrouped: per field, as before).
+                    # Fallback for groups the baseline window never saw. Learned
+                    # with the rare-chars recipe over everything *outside* the
+                    # suspect windows: a whole-scope alphabet would contain the
+                    # suspect values themselves and mask them.
+                    fb_params: dict[str, Any] = {**base_params}
+                    fcol = _col_expr(field_token, fb_params, field_mappings)
+                    _, fb_sps = _window_preds(windows, fb_params, source_offsets)
+                    fb_sql = f"""
+                        SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
+                        FROM (
+                            SELECT
+                                count() OVER () AS total,
+                                arrayDistinct(extractAll(val, '(?s).')) AS chars
+                            FROM (
+                                SELECT DISTINCT {fcol} AS val
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {fcol} != ''
+                                  AND NOT ({" OR ".join(fb_sps)})
+                            )
+                        )
+                        ARRAY JOIN chars AS c
+                        GROUP BY c
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    fb_rows = self.ch.client.query(fb_sql, parameters=fb_params).result_rows
+                    fb_counts = {str(c): int(nv) for c, nv, _ in fb_rows}
+                    fb_n_vals = int(fb_rows[0][2]) if fb_rows else 0
+                    if fb_n_vals >= _MIN_CHARSET_BASELINE and len(fb_counts) <= _MAX_CHARSET_SIZE:
+                        fallback = _CharsetLearn(
+                            None,
+                            [c for c, nv in fb_counts.items() if nv > rarity_floor],
+                            fb_counts,
+                            fb_n_vals,
+                            len(fb_counts),
+                            "outside-suspect-windows",
+                        )
+                    else:
+                        # No usable fallback: groups missing from the baseline
+                        # window go unevaluated for this field, which the run
+                        # has to say out loud.
+                        no_fallback_fields.append(field_token)
+
+            # The skip guards apply per group (ungrouped: per field, as before),
+            # and a group they drop is reported rather than dropped in silence.
             evaluated = [
                 learn
                 for learn in learns
-                if learn[3] >= _MIN_CHARSET_BASELINE and learn[4] <= _MAX_CHARSET_SIZE
+                if learn.n_vals >= _MIN_CHARSET_BASELINE
+                and learn.alphabet_size <= _MAX_CHARSET_SIZE
             ]
-            if not evaluated:
+            if group_field is not None:
+                small = sum(1 for learn in learns if learn.n_vals < _MIN_CHARSET_BASELINE)
+                wide = sum(1 for learn in learns if learn.alphabet_size > _MAX_CHARSET_SIZE)
+                if small:
+                    skipped_small[field_token] = small
+                if wide:
+                    skipped_wide[field_token] = wide
+            if not evaluated and fallback is None:
                 continue
             evaluated_fields += 1
 
             # --- Flag values containing characters outside the reference set.
-            # One violation scan per evaluated group, pinned to the group's own
-            # reference alphabet (ungrouped: a single scan, as before). ---
-            for grp, reference, char_counts, n_vals, _alphabet_size in evaluated:
-                viol_params: dict[str, Any] = {**base_params}
-                bind_offset_params(source_offsets, viol_params)
-                vcol = _col_expr(field_token, viol_params, field_mappings)
-                group_clause = ""
-                if group_field is not None:
-                    vgcol = _col_expr(group_field, viol_params, field_mappings, prefix="gk")
-                    viol_params["gval"] = grp
-                    group_clause = f" AND {vgcol} = {{gval:String}}"
-                viol_params["base"] = reference
-                viol_params["plim"] = per_field_limit
-                win_idx_sel = ""
-                win_idx_group = ""
-                detect_clause = ""
-                if windows is not None:
-                    _, viol_sps = _window_preds(windows, viol_params, source_offsets)
-                    # Restrict the scan to the suspect-window union, tag rows with
-                    # their window index for attribution, and exclude sentinel/
-                    # undated rows (the year-2299 sentinel would land in any
-                    # open-ended range test).
-                    win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
-                    win_idx_group = ", win_idx"
-                    detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
+            # One scan per field either way: grouped runs carry the per-group
+            # references in as parallel arrays and pick each row's reference by
+            # `indexOf`, instead of re-scanning `events` once per group. ---
+            viol_params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, viol_params)
+            vcol = _col_expr(field_token, viol_params, field_mappings)
+            viol_params["plim"] = per_field_limit
+            win_idx_sel = ""
+            win_idx_group = ""
+            detect_clause = ""
+            if windows is not None:
+                _, viol_sps = _window_preds(windows, viol_params, source_offsets)
+                # Restrict the scan to the suspect-window union, tag rows with
+                # their window index for attribution, and exclude sentinel/
+                # undated rows (the year-2299 sentinel would land in any
+                # open-ended range test).
+                win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
+                win_idx_group = ", win_idx"
+                detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
+
+            if group_field is None:
+                viol_params["base"] = evaluated[0].reference
                 viol_sql = f"""
                     SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
                     FROM (
@@ -3126,7 +3288,7 @@ class StatisticalAnomalyService:
                             FROM {db}.events
                             WHERE case_id = {{cid:String}}
                               AND has({{src:Array(String)}}, source_id)
-                              AND {vcol} != ''{detect_clause}{group_clause}
+                              AND {vcol} != ''{detect_clause}
                             GROUP BY val{win_idx_group}
                         )
                     )
@@ -3135,9 +3297,71 @@ class StatisticalAnomalyService:
                     LIMIT {{plim:UInt32}}
                     {HEAVY_SCAN_SETTINGS}
                 """
-                vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            else:
+                vgcol = _group_expr(group_field, viol_params, field_mappings)
+                viol_params["grps"] = [learn.group for learn in evaluated]
+                viol_params["sets"] = [learn.reference for learn in evaluated]
+                viol_params["fb"] = fallback.reference if fallback is not None else []
+                viol_params["has_fb"] = 1 if fallback is not None else 0
+                viol_params["tlim"] = _MAX_CHARSET_GROUPED_ROWS
+                # `greatest(gidx, 1)` because ClickHouse evaluates both `if`
+                # branches and rejects array index 0; the guarded index is only
+                # read when gidx > 0, and an out-of-range index yields an empty
+                # array rather than an error. A group with no reference at all
+                # (guard-skipped, no fallback) is dropped by the `has_fb` test
+                # instead of being scored against someone else's alphabet.
+                viol_sql = f"""
+                    SELECT val, grp, novel, cnt, first_seen, evt_id{win_idx_group}
+                    FROM (
+                        SELECT
+                            val,
+                            grp,
+                            arrayFilter(
+                                c -> NOT has(
+                                    if(
+                                        gidx = 0,
+                                        {{fb:Array(String)}},
+                                        {{sets:Array(Array(String))}}[greatest(gidx, 1)]
+                                    ),
+                                    c
+                                ),
+                                arrayDistinct(extractAll(val, '(?s).'))
+                            ) AS novel,
+                            cnt, first_seen, evt_id{win_idx_group}
+                        FROM (
+                            SELECT
+                                val,
+                                grp,
+                                indexOf({{grps:Array(String)}}, grp) AS gidx,
+                                cnt, first_seen, evt_id{win_idx_group}
+                            FROM (
+                                SELECT
+                                    {vcol} AS val,
+                                    {vgcol} AS grp,
+                                    count() AS cnt,
+                                    min({eff}) AS first_seen,
+                                    toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {vcol} != ''{detect_clause}
+                                GROUP BY val, grp{win_idx_group}
+                            )
+                            WHERE gidx > 0 OR {{has_fb:UInt8}} = 1
+                        )
+                    )
+                    WHERE length(novel) > 0
+                    ORDER BY length(novel) DESC, cnt ASC
+                    LIMIT {{plim:UInt32}} BY grp
+                    LIMIT {{tlim:UInt32}}
+                    {HEAVY_SCAN_SETTINGS}
+                """
+            vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            by_group = {learn.group: learn for learn in evaluated}
 
-                for vrow in vrows:
+            for vrow in vrows:
+                grp: str | None = None
+                if group_field is None:
                     if windows is None:
                         val, novel, cnt, first_seen, evt_id = vrow
                         window: TimeWindow | None = None
@@ -3145,62 +3369,108 @@ class StatisticalAnomalyService:
                         val, novel, cnt, first_seen, evt_id, win_idx = vrow
                         wi = int(win_idx)
                         window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
-                    novel_chars = [str(c) for c in (novel or [])]
-                    if not val or not novel_chars:
+                elif windows is None:
+                    val, grp, novel, cnt, first_seen, evt_id = vrow
+                    window = None
+                else:
+                    val, grp, novel, cnt, first_seen, evt_id, win_idx = vrow
+                    wi = int(win_idx)
+                    window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
+                novel_chars = [str(c) for c in (novel or [])]
+                if not val or not novel_chars:
+                    continue
+                # The learn that scored this row: its own group's, or the
+                # fallback when the baseline window never saw the group.
+                learn = by_group.get(grp)
+                if learn is None:
+                    learn = fallback
+                    if learn is None:
                         continue
-                    score = 0.0
-                    for c in novel_chars:
-                        nv_c = char_counts.get(c, 0)
-                        if nv_c > 0 and n_vals > 0:
-                            score += -math.log(nv_c / n_vals)
-                        else:
-                            # Never seen in the baseline: +1-smoothed surprise.
-                            score += math.log(n_vals + 1)
-                    first_seen_str = _present_ts(first_seen)
-                    evt_id_str = str(evt_id) if evt_id else None
-                    mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
+                    if grp is not None:
+                        fallback_groups.add(str(grp))
+                char_counts, n_vals = learn.char_counts, learn.n_vals
+                score = 0.0
+                for c in novel_chars:
+                    nv_c = char_counts.get(c, 0)
+                    if nv_c > 0 and n_vals > 0:
+                        score += -math.log(nv_c / n_vals)
+                    else:
+                        # Never seen in the baseline: +1-smoothed surprise.
+                        score += math.log(n_vals + 1)
+                first_seen_str = _present_ts(first_seen)
+                evt_id_str = str(evt_id) if evt_id else None
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
 
-                    details: dict[str, Any] = {
-                        "detector": "charset",
-                        "method": method,
-                        "field": field_token,
-                        "value": str(val),
-                        "novel_chars": novel_chars,
-                        "codepoints": [f"U+{ord(c):04X}" for c in novel_chars if len(c) == 1],
-                        "count": int(cnt),
-                        "baseline_distinct_values": n_vals,
-                        "allowlist_field": field_token,
-                        "allowlist_value": str(val),
-                    }
-                    if group_field is not None:
-                        details["group_field"] = group_field
-                        details["group_value"] = grp
-                    if windows is None:
-                        details["rarity_floor"] = rarity_floor
-                        details["char_value_counts"] = {
-                            c: char_counts.get(c, 0) for c in novel_chars
+                details: dict[str, Any] = {
+                    "detector": "charset",
+                    "method": method,
+                    "field": field_token,
+                    "value": str(val),
+                    "novel_chars": novel_chars,
+                    "codepoints": [f"U+{ord(c):04X}" for c in novel_chars if len(c) == 1],
+                    "count": int(cnt),
+                    "baseline_distinct_values": n_vals,
+                    "allowlist_field": field_token,
+                    "allowlist_value": str(val),
+                }
+                if group_field is not None:
+                    details["group_field"] = group_field
+                    details["group_value"] = grp
+                    details["group_basis"] = learn.basis
+                # Rarity is reportable exactly when the reference came from the
+                # rare-chars recipe — self-baseline mode, or the temporal
+                # fallback (a per-group baseline alphabet carries no counts).
+                if char_counts:
+                    details["rarity_floor"] = rarity_floor
+                    details["char_value_counts"] = {c: char_counts.get(c, 0) for c in novel_chars}
+                if window is not None:
+                    details.update(
+                        {
+                            "window_label": window.label,
+                            "window_start": ensure_utc(window.start).isoformat(),
+                            "window_end": ensure_utc(window.end).isoformat(),
                         }
-                    if window is not None:
-                        details.update(
-                            {
-                                "window_label": window.label,
-                                "window_start": ensure_utc(window.start).isoformat(),
-                                "window_end": ensure_utc(window.end).isoformat(),
-                            }
-                        )
-                    all_findings.append(
-                        CharsetFinding(
-                            field=field_token,
-                            value=str(val),
-                            novel_chars=novel_chars,
-                            count=int(cnt),
-                            score=round(score, 4),
-                            first_seen=first_seen_str,
-                            event_id=evt_id_str,
-                            event=mini_event,
-                            details=details,
-                        )
                     )
+                all_findings.append(
+                    CharsetFinding(
+                        field=field_token,
+                        value=str(val),
+                        novel_chars=novel_chars,
+                        count=int(cnt),
+                        score=round(score, 4),
+                        first_seen=first_seen_str,
+                        event_id=evt_id_str,
+                        event=mini_event,
+                        details=details,
+                    )
+                )
+
+        if fallback_groups:
+            named = ", ".join(sorted(fallback_groups)[:_CHARSET_WARN_GROUPS])
+            more = len(fallback_groups) - _CHARSET_WARN_GROUPS
+            run_warnings.append(
+                f"{len(fallback_groups)} {group_field} group(s) had no baseline-window values "
+                "and were scored against a reference learned outside the suspect windows "
+                f"({named}{f', +{more} more' if more > 0 else ''})."
+            )
+        if no_fallback_fields:
+            run_warnings.append(
+                "Groups absent from the baseline window were not evaluated for "
+                f"{', '.join(no_fallback_fields)}: too few distinct values outside the "
+                "suspect windows to learn a reference from."
+            )
+        if skipped_small:
+            run_warnings.append(
+                f"{sum(skipped_small.values())} group(s) not evaluated: fewer than "
+                f"{_MIN_CHARSET_BASELINE} distinct values "
+                f"({', '.join(f'{f}: {n}' for f, n in sorted(skipped_small.items()))})."
+            )
+        if skipped_wide:
+            run_warnings.append(
+                f"{sum(skipped_wide.values())} group(s) not evaluated: reference alphabet "
+                f"larger than {_MAX_CHARSET_SIZE} characters "
+                f"({', '.join(f'{f}: {n}' for f, n in sorted(skipped_wide.items()))})."
+            )
 
         return self._finalize_findings(
             all_findings,
@@ -3213,6 +3483,7 @@ class StatisticalAnomalyService:
             case_id=case_id,
             source_ids=source_ids,
             allowlist=allowlist,
+            warnings=run_warnings,
             windows=windows,
         )
 

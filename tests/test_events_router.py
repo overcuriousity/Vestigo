@@ -1104,6 +1104,33 @@ async def test_run_stat_detector_charset_passes_group_field(patched_store, monke
 
 
 @pytest.mark.asyncio
+async def test_run_stat_detector_charset_rejects_bad_group_field(patched_store, monkeypatch):
+    """A group_field the detector refuses (non-string column) surfaces as 422,
+    not as a ClickHouse type error behind a 500."""
+
+    class _Refusing(_FakeStatAnomalyService):
+        def find_charset_novelty(self, **kwargs):
+            raise ValueError("group_field 'timestamp' is not a string field")
+
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: _Refusing())
+
+    with pytest.raises(HTTPException) as excinfo:
+        await events._run_stat_detector(
+            "c1",
+            "t1",
+            ["s1"],
+            detector="charset",
+            fields="attr:user",
+            series_field="artifact",
+            z_threshold=None,
+            limit=50,
+            group_field="timestamp",
+        )
+    assert excinfo.value.status_code == 422
+    assert "not a string field" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatch):
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)

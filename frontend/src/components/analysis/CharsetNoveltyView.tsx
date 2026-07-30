@@ -48,13 +48,24 @@ interface Props {
 }
 
 /** Standard grouping fields for the optional per-identifier scoping (D14) —
- * same set the sequence view offers for its series field. */
-const GROUP_FIELD_OPTIONS = [
-  { value: "artifact", label: "Artifact type" },
-  { value: "timestamp_desc", label: "Event category" },
-  { value: "display_name", label: "Display name" },
-  { value: "parser_name", label: "Parser" },
-];
+ * same set the sequence view offers for its series field. Labels come from
+ * `anomalyFieldLabel`, so these are tokens only. */
+const GROUP_FIELD_TOKENS = ["artifact", "timestamp_desc", "display_name", "parser_name"];
+
+/** A group value as shown to the analyst — events missing the grouping field
+ * form a real group of their own, so it is named rather than hidden. */
+function groupValueLabel(value: unknown): string {
+  return typeof value === "string" && value !== "" ? value : "(no value)";
+}
+
+/** Which reference scored a grouped finding (D14) — a group absent from the
+ * baseline window is scored against events outside the suspect windows. */
+function groupBasisHint(basis: unknown): string {
+  if (basis === "outside-suspect-windows")
+    return "This group had no values in the baseline window; scored against a reference learned outside the suspect windows.";
+  if (basis === "baseline-window") return "Scored against this group's baseline-window alphabet.";
+  return "Scored against this group's alphabet learned across the scope.";
+}
 
 /** "U+0000"-style codepoint label for a (possibly multi-codepoint) char. */
 function codepointLabel(c: string): string {
@@ -149,6 +160,15 @@ function CharsetRow({
           <strong className="text-[var(--color-fg-secondary)]">{finding.score.toFixed(1)}</strong>
         </span>
         {finding.first_seen && <span>first {fmtTs(finding.first_seen)}</span>}
+        {typeof finding.details.group_field === "string" && (
+          <span title={groupBasisHint(finding.details.group_basis)}>
+            per {fieldLabel(finding.details.group_field)}{" "}
+            <strong className="text-[var(--color-fg-secondary)]">
+              {groupValueLabel(finding.details.group_value)}
+            </strong>
+            {finding.details.group_basis === "outside-suspect-windows" && " (no baseline)"}
+          </span>
+        )}
       </div>
     </FindingShell>
   );
@@ -186,7 +206,7 @@ export function CharsetNoveltyView({
     const attrOptions = (fieldsData?.fields ?? [])
       .filter((f) => f.token.startsWith("attr:"))
       .map((f) => f.token);
-    return [...GROUP_FIELD_OPTIONS.map((o) => o.value), ...attrOptions];
+    return [...GROUP_FIELD_TOKENS, ...attrOptions];
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({

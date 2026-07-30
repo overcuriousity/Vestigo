@@ -1920,23 +1920,28 @@ async def _run_stat_detector(
         # D14: per-identifier scoping — one learned alphabet per group value
         # (None = one merged alphabet per field, the pre-1.8.6 behavior).
         resolution["charset_group_field"] = group_field
-        result = await run_in_threadpool(
-            svc.find_charset_novelty,
-            case_id=case_id,
-            source_ids=source_ids,
-            source_offsets=source_offsets,
-            fields=parsed_fields,
-            limit=limit,
-            per_field_limit=cfg.stat_per_field_limit,
-            rarity_floor=cfg.stat_charset_rarity_floor,
-            windows=windows,
-            exclude_event_ids=exclude_ids,
-            allowlist=allowlist,
-            field_mappings=field_mappings,
-            inventory=inventory,
-            inventory_total=inventory_total,
-            group_field=group_field,
-        )
+        try:
+            result = await run_in_threadpool(
+                svc.find_charset_novelty,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                per_field_limit=cfg.stat_per_field_limit,
+                rarity_floor=cfg.stat_charset_rarity_floor,
+                windows=windows,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                group_field=group_field,
+            )
+        except ValueError as exc:
+            # e.g. a non-string group_field, which would otherwise reach
+            # ClickHouse as a type error.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
     if detector == "entropy":
