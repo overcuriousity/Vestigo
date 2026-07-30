@@ -23,6 +23,12 @@ survive as attributes so an examiner can inspect the original data later.
   [`TECH_STACK.md` §3.4a](TECH_STACK.md) for why this format was chosen over CSV/JSONL for
   bulk conversion.
 
+Binary evidence containers have no CSV/JSONL equivalent and are always the Parquet path:
+`evtx2vestigo.py` reads binary Windows Event Logs (`.evtx`) directly, while
+`evtx2timesketch.py` covers *text* exports of the same data (`wevtutil qe /f:xml`,
+`evtx_dump`). Prefer the binary path — a text export re-anchors provenance to the dump file
+rather than the original `.evtx`.
+
 Format is detected by file extension: `.csv`/`.tsv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSONL,
 `.parquet` → Parquet (`src/vestigo/ingestion/parser.py::detect_format`).
 
@@ -285,6 +291,35 @@ with pq.ParquetWriter("example.parquet", schema, compression="zstd") as writer:
 For a real, streaming, forensically-complete implementation see
 `src/vestigo/assets/converters/nginx2vestigo.py` — start from it rather than from
 scratch when writing a new converter.
+
+### `evtx2vestigo.py`: binary Windows Event Logs
+
+`src/vestigo/assets/converters/evtx2vestigo.py` parses the `.evtx` container itself (a file
+or a directory of them) rather than a text export. It is the only converter needing a second
+dependency — `pip install pyarrow evtx` — because binary EVTX parsing is not something the
+standard library can do.
+
+What is specific to it:
+
+- **`byte_offset` is a real offset into the original `.evtx`.** The parser exposes no file
+  offset, so the converter walks the EVTX chunk structure itself to locate each record.
+  `content_hash` is the sha256 of that same raw record span, so
+  `dd bs=1 skip=<byte_offset> count=<record_size>` against the original file reproduces it
+  with no Vestigo tooling. The `record_size` attribute carries the span length.
+  If the scan cannot locate a record, `byte_offset` degrades to the record id and the row
+  is marked `content_hash_basis=rendered_xml`; the footer counts how often that happened.
+- **Damage stays local.** Each 64 KiB chunk is parsed in isolation, so one corrupt chunk
+  costs only that chunk instead of aborting the rest of the file.
+- **Attribute names are Sigma-canonical** — see
+  [`ANOMALY_DETECTION.md`](ANOMALY_DETECTION.md) §Sigma.
+- **EvtxECmd maps are embedded.** The community map corpus from
+  [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx) (MIT) is compiled into the
+  script by `scripts/vendor_evtx_maps.py` and supplies `MapDescription` plus the `Map*`
+  attributes the `message` is rendered from. The corpus commit is recorded in
+  `vestigo.parse_decisions`. `--no-maps` skips it entirely and emits only what is literally
+  in the record.
+- **Not resolved:** `%%1833`-style message-table references stay as-is (rendering them needs
+  the originating host's WEVT templates), and `.evtx.gz` is not accepted.
 
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 

@@ -1,9 +1,80 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-29 (session 126 — AMiner detector gap audit).
+Last updated: 2026-07-30 (session 127 — binary EVTX converter).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 127 — 2026-07-30: `evtx2vestigo`, binary Windows Event Logs
+
+**Why.** Windows event logs were reachable only through `evtx2timesketch`, which takes a
+*text* export. That re-anchors provenance to the analyst's XML dump rather than
+`Security.evtx`, and pushes millions of records through the row-by-row server path. The
+Sigma runner was also aimed largely at Windows rules with no Windows data to match.
+
+**What the design turns on.**
+
+- **The parser exposes no byte offset.** `pyevtx-rs` yields `event_record_id`, `timestamp`
+  and rendered XML — nothing addressable. So the converter walks the EVTX container itself
+  (4096-byte header, 64 KiB chunks, per-record magic + size + id) and joins the resulting
+  `{record_id: (offset, size)}` onto the parsed records. `content_hash` then covers that
+  same raw span, which is what makes `dd bs=1 skip=<byte_offset> count=<record_size> |
+  sha256sum` reproduce it with no Vestigo tooling. Hashing the rendered XML instead would
+  have made event identity a function of the parser's version.
+- **Per-chunk parsing, not whole-file.** The obvious approach — hand the parser the file —
+  aborts *permanently* at the first bad chunk header, and cannot be resumed: on
+  `sample_with_a_bad_chunk_magic.evtx` it yields 14 records and stops. Feeding it one
+  chunk at a time (templates and the string cache are chunk-local, so a chunk plus a header
+  is a complete document) recovers 270. Same cost — 0.04 s either way on a 12 MB log.
+- **Sigma-canonical attribute names.** `FieldResolver.resolve` matches `attributes` keys
+  literally and case-sensitively, so `EventID` must be exactly that, unpadded. `EventData`
+  keeps native Windows names because that is already what SigmaHQ rules address; System
+  spellings win on collision (`EventData_<name>` otherwise) so a payload field cannot
+  rewrite `Channel`. Map-derived prose is namespaced under `Map*`. Snake_case duplicates
+  for evtx2timesketch parity were rejected — they double the attribute count and add a
+  spelling Sigma will never resolve.
+- **The EvtxECmd corpus is embedded, not referenced.** Converters are single-file
+  downloads, so `scripts/vendor_evtx_maps.py` parses all 468 `.map` YAML files at vendor
+  time, validates every XPath expression and `Refine` regex, and emits a zlib+base64 blob
+  (181 KB, decoded lazily). The converter therefore needs no PyYAML and can contain no
+  unsupported expression. `--check` fails the build on drift.
+
+**Things that were not true until checked.**
+
+- The record *header* id and the `<EventRecordID>` element can disagree (1 vs 319457771 in
+  the test fixture — an extracted log renumbers one but not the other). The header id is
+  the offset join key, so it is now on the row as `evtx_record_id`.
+- Some maps key their `Lookups` on the raw `%%14592` while also carrying a `Refine` that
+  strips the `%%`. Applying refine-then-lookup blanks them; the converter tries the lookup
+  before *and* after refining rather than guessing the author's intent.
+- A real 4739 record in `security.evtx` carries a raw `\x03` in EventData, which is illegal
+  in XML 1.0 — the parser renders XML no parser will read back. Rather than dropping a
+  genuine event, illegal characters are replaced with U+FFFD (the convention the CSV/JSONL
+  path already uses for undecodable bytes) and the row is flagged `xml_sanitized`.
+
+- **"Rules match with an empty `fallback_fields`" was wrong**, and the end-to-end run caught
+  it. The names resolve correctly — a stock 4672 rule compiles to
+  `attributes['EventID'] = '4672' AND attributes['Channel'] ILIKE 'Security'` and matched
+  459 events — but `fallback_fields` tracks whether a *mapping vouches for the name*, not
+  whether the match is right, so correct-by-construction names are still flagged. A
+  timeline field mapping cannot fix it (`validate_field_mappings` rejects the identity
+  mapping as shadowing the raw key); a global ruleset `vestigo-fieldmap.yml` can. Measured
+  over the real SigmaHQ `rules/windows/builtin` corpus: an identity fieldmap took the run
+  from 873 fallback flags to 0 with zero SQL and zero match-count differences. Docs now say
+  this instead of the claim that was easier to write.
+
+**Verification.** Scanner record-id sets match the parser exactly on all 8 upstream samples
+including a 12 MB dirty log (14,621 records, 10 bad chunks skipped) and the two the
+whole-file path cannot read at all. Zero records lost anywhere in that corpus.
+`tests/test_evtx_converter.py` (39 tests) covers the offset round-trip, the blob
+invariants, and the Sigma naming contract.
+
+End-to-end, the real **SigmaHQ `rules/windows/builtin` corpus (326 rules, commit
+`1aacbed`) compiled and ran against an `evtx2vestigo` timeline with zero errors**, and the
+five rules that hit were each reproduced by hand from the raw Parquet — including
+`User Added to Local Administrator Group` narrowing 6 candidate 4732 events to 2 via
+`TargetUserName`/`TargetSid`/`SubjectUserName`, which is what proves the native *EventData*
+names resolve and not just the System ones.
 
 ## Session 126 — 2026-07-29: AMiner detector gap audit, and two claims that were not true
 

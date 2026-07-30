@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each 64 KiB chunk is parsed in isolation, which recovers records the whole-file path
   loses at the first damaged chunk. Attribute names are Sigma-canonical (`EventID` as an
   unpadded string, `Channel`, `Provider_Name`, native `EventData` names), so community
-  Windows rules match with an empty `fallback_fields`. The EvtxECmd map corpus
+  Windows rules compile to exactly the predicate they look like with no field
+  translation. The EvtxECmd map corpus
   (468 maps, [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx), MIT) is embedded
   for event descriptions; `--no-maps` opts out. Requires `pyarrow` and `evtx`.
 
