@@ -8,7 +8,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import { EventSequenceView } from "@/components/analysis/EventSequenceView";
 import { useBaselineStore } from "@/stores/baseline";
-import { anomaliesApi } from "@/api/anomalies";
 import { installFakeResizeObserver } from "./helpers/resizeObserver";
 import { installRadixJsdomStubs } from "./helpers/radix";
 
