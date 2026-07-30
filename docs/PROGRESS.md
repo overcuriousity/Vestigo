@@ -1,9 +1,55 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 131 — PR #208 third review pass, 1.8.6 cut).
+Last updated: 2026-07-30 (session 132 — PR #208 fourth review pass, 1.8.6 released).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 132 — 2026-07-30: PR #208 fourth review pass, and the 1.8.6 merge
+
+**Why.** A fourth review before merging 1.8.6. Six findings raised, four real. Both of the
+substantive ones were in `evtx2vestigo`, and both were the same shape as session 131's: a
+module that states an invariant carefully, then breaks it somewhere the invariant's own
+author wasn't looking.
+
+- **Converter-derived keys overwrote native fields.** Session 131 made `_extract_event_data`
+  scrupulous about never letting one Windows element overwrite another — and then `build_row`
+  wrote `host`, `user`, `src_ip`, `src_port`, `MapDescription` and the `Map*` properties
+  straight into `attributes`, discarding an EventData field of the same name. Plausible on
+  third-party channels, and invisible on the row. The derived value still has to win the
+  plain key (the platform reads these by name — the GeoIP enricher wants `src_ip`), so this
+  resolves the opposite way from `_free_key`: the *native* value steps aside to a numbered
+  spelling. The `EventData_`-prefixed form now goes through `_free_key` too, so a record
+  carrying a literal `EventData_Channel` alongside an `EventData` `Channel` keeps both.
+- **A record id repeated inside one chunk collapsed two records.** The cross-chunk case was
+  handled deliberately and documented; one level down, `_scan_chunk`'s `setdefault` kept only
+  the first occurrence, so two records sharing an id in a partially overwritten chunk got the
+  same offset, size and `content_hash` — one forensic identity for two records, which is
+  exactly what the per-chunk scan exists to prevent. Occurrences are now listed in document
+  order and consumed positionally (the parser yields them in that order), and the footer's
+  duplicate counter reports a repeat wherever it fell instead of only across chunks. The test
+  forges a duplicate into the fixture: the parser does yield both records, and each hash
+  reproduces from its own span.
+- **The charset fallback probe omitted the sentinel guard.** The violation scan appends
+  `VESTIGO_NOT_SENTINEL_SQL` in temporal mode; the probe did not, so a group living only in
+  sentinel-timestamp rows was reported absent — buying the whole-scope fallback learn the
+  probe exists to avoid, plus a warning naming a group no finding can ever come from.
+- **`max_gap_seconds` coalesced on truthiness.** Correct only because the API floor is `ge=1`.
+  Keyed on presence now, so a future floor change can't route a persisted 0 to the other
+  detector's key.
+- **One finding was wrong and is recorded as such.** The `group_field` type guard looked
+  incomplete — `TOP_LEVEL_NON_STRING_COLUMNS` holds only `timestamp`, so `byte_offset` seemed
+  to slip through. It isn't a resolvable column token at all (`TOP_LEVEL_EVENT_COLUMNS` has no
+  numeric members besides `timestamp`), so it routes to a string `attributes` lookup and the
+  frozenset is already complete. No change.
+
+**Verification.** Full CI green on the PR head: backend lint + test, frontend
+typecheck/lint/build, container smoke test, CodeQL. Locally 467 tests across the
+converter/detector/router/agent suites, `ruff check` + `ruff format --check` clean, frontend
+674 tests. `vendor_evtx_maps.py --check` **was** re-run this session against a real
+`EricZimmerman/evtx` checkout — upstream HEAD is exactly the pinned `03a7a1f` — and reports
+the embedded maps and manifest in sync, closing the one item sessions 130 and 131 both left
+unverified.
 
 ## Session 131 — 2026-07-30: PR #208 third review pass, and the 1.8.6 version cut
 
