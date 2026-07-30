@@ -312,11 +312,12 @@ What is specific to it:
   `content_hash` is the sha256 of that same raw record span, so
   `dd bs=1 skip=<byte_offset> count=<record_size>` against the original file reproduces it
   with no Vestigo tooling. The `record_size` attribute carries the span length.
-  If the scan cannot locate a record, `byte_offset` degrades to the record id — no longer a
-  file offset — the hash covers the rendered XML instead, and the row says so with
-  `content_hash_basis=rendered_xml` and no `record_size`, so those rows are never mistaken
-  for `dd`-reproducible ones. `vestigo.parse_decisions.byte_offset_fallback_rows` counts
-  them.
+  If the scan cannot locate a record, `byte_offset` degrades to the record id and the hash
+  covers the rendered XML instead. A record id is indistinguishable from a real offset by
+  inspection, so the row states both substitutions itself:
+  `byte_offset_basis=record_id` and `content_hash_basis=rendered_xml` (and no
+  `record_size`). Those rows are never mistaken for `dd`-reproducible ones;
+  `vestigo.parse_decisions.byte_offset_fallback_rows` counts them.
   Offsets are scanned per chunk, so a record id duplicated across chunks (routine in a
   re-chunked or partially overwritten log) still yields distinct offsets — two records can
   never collapse onto one forensic identity. The footer's `chunk_scan` note reports how many
@@ -329,7 +330,12 @@ What is specific to it:
   is named on stderr and skipped; a file that parses to zero records is warned about too. A
   single named file still fails hard.
 - **Attribute names are Sigma-canonical** — see
-  [`ANOMALY_DETECTION.md`](ANOMALY_DETECTION.md) §Sigma.
+  [`ANOMALY_DETECTION.md`](ANOMALY_DETECTION.md) §Sigma. Unnamed `<Data>` elements become
+  `Data1`, `Data2`, … by position. A record that carries *both* a named `Data1` and unnamed
+  positional elements gives the plain key to the named one — that is the name a Sigma rule
+  addresses — and the positional value moves to `Data1_pos` rather than being overwritten.
+  This is decided from the record as a whole, so it does not depend on which element the
+  writer emitted first.
 - **EvtxECmd maps are embedded.** The community map corpus from
   [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx) (MIT) is compiled into the
   script by `scripts/vendor_evtx_maps.py` and supplies `MapDescription` plus the `Map*`

@@ -12,8 +12,9 @@ Forensic provenance embedded in the output:
     against the original file reproduces `content_hash` with no Vestigo tooling.
     Exception: when the chunk walk cannot locate a record the parser did return (damaged
     framing), the row falls back to `byte_offset` = the record id and `content_hash` over
-    the rendered XML, and says so in `content_hash_basis=rendered_xml` — those rows carry
-    no `record_size` and are counted in `vestigo.parse_decisions.byte_offset_fallback_rows`
+    the rendered XML, and says so on the row itself in `byte_offset_basis=record_id` and
+    `content_hash_basis=rendered_xml` — those rows carry no `record_size` and are counted
+    in `vestigo.parse_decisions.byte_offset_fallback_rows`
   - converter name + version, and the EvtxECmd map corpus commit the messages came from
 
 Recovery: each 64 KiB chunk is parsed in isolation, so one corrupt chunk costs only that
@@ -3159,6 +3160,13 @@ def _extract_event_data(root: ET.Element) -> dict[str, str]:
     for child in root:
         tag = _local(child.tag)
         if tag == "EventData":
+            # Which DataN spellings are claimed by a *named* field, collected up
+            # front. A named `Data1` wins the plain key — that is the name Sigma
+            # rules address — and the positional value steps aside to
+            # `Data1_pos`. Deciding that as we go would make it depend on
+            # document order: with the positional element first, the named one
+            # would simply overwrite it and the positional value would be lost.
+            named = {n.get("Name") for n in child if _local(n.tag) == "Data" and n.get("Name")}
             unnamed = 0
             for node in child:
                 node_tag = _local(node.tag)
@@ -3167,10 +3175,7 @@ def _extract_event_data(root: ET.Element) -> dict[str, str]:
                     if not name:
                         unnamed += 1
                         name = f"Data{unnamed}"
-                        # A named field spelled DataN wins the plain key — that
-                        # is the name Sigma rules address — so the positional
-                        # value steps aside instead of overwriting it.
-                        if name in attrs:
+                        if name in named:
                             name = f"{name}_pos"
                     if node.text:
                         attrs[name] = node.text
@@ -3544,9 +3549,14 @@ def _convert_evtx(
             else:
                 # No scanned offset: keep the row addressable by record id rather than
                 # collapsing every such row onto offset 0, which would collide in the
-                # server's event-identity derivation.
+                # server's event-identity derivation. Both substitutions are stamped
+                # on the row. `byte_offset` is no longer a file offset and is
+                # indistinguishable from one by inspection, so it says so itself
+                # rather than leaving a reader to infer it from a flag about the hash
+                # or from `record_size` being absent.
                 offset = record_id
                 content_hash = hashlib.sha256(record["data"].encode("utf-8")).hexdigest()
+                row["attributes"]["byte_offset_basis"] = "record_id"
                 row["attributes"]["content_hash_basis"] = "rendered_xml"
                 counts.offset_fallback += 1
 

@@ -271,6 +271,34 @@ class TestSigmaFieldContract:
         assert attrs["Data1"] == "named"
         assert attrs["Data1_pos"] == "positional"
 
+    def test_named_data_field_wins_regardless_of_document_order(self, converter):
+        """Same record with the positional element first. Which key each value
+        lands under is a property of the record, not of the order the writer
+        happened to emit them in — resolving it as we went would let the named
+        value overwrite the positional one and lose it silently."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(
+            "<Event><EventData>"
+            "<Data>positional</Data>"
+            '<Data Name="Data1">named</Data>'
+            "</EventData></Event>"
+        )
+        attrs = converter._extract_event_data(root)
+        assert attrs["Data1"] == "named"
+        assert attrs["Data1_pos"] == "positional"
+
+    def test_positional_keys_are_untouched_without_a_named_collision(self, converter):
+        """No named DataN in the record means the positional keys keep the plain
+        spelling — the disambiguation must not fire on every unnamed field."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(
+            "<Event><EventData><Data>one</Data><Data>two</Data></EventData></Event>"
+        )
+        attrs = converter._extract_event_data(root)
+        assert attrs == {"Data1": "one", "Data2": "two"}
+
 
 class TestByteOffsets:
     def test_offsets_resolve_to_records_in_the_original_file(self, converter, tmp_path):
@@ -466,8 +494,10 @@ class TestDegradedRecords:
         attrs = row["attributes"]
         assert attrs["xml_sanitized"] == "1"
         assert attrs["DomainPolicyChanged"] == "policy�value"
-        # A sanitized record still resolves to its raw span, so content_hash stays raw.
+        # A sanitized record still resolves to its raw span, so content_hash stays
+        # raw and byte_offset stays a real offset — neither basis flag is set.
         assert "content_hash_basis" not in attrs
+        assert "byte_offset_basis" not in attrs
 
     def test_unlocatable_record_falls_back_to_the_record_id(self, converter, monkeypatch):
         data = FIXTURE.read_bytes()
@@ -482,6 +512,10 @@ class TestDegradedRecords:
         assert counts.offset_fallback == 1
         offset, content_hash, row = buffer.rows[0]
         assert offset == 987654321
+        # A record id is indistinguishable from a real byte offset by
+        # inspection, so the row says outright that this one is not an offset —
+        # `dd bs=1 skip=<byte_offset>` against it would reproduce nothing.
+        assert row["attributes"]["byte_offset_basis"] == "record_id"
         assert row["attributes"]["content_hash_basis"] == "rendered_xml"
         assert "record_size" not in row["attributes"]
         assert content_hash == hashlib.sha256(_STUB_XML.format("-").encode()).hexdigest()
