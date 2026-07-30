@@ -7,21 +7,21 @@ outgrow a couple of lines here go to `archive/PR{N}_REVIEW_FINDINGS.md`. Reporte
 live as GitHub issues; when any are open they get an "Open defects" section here with
 issue numbers, and root-cause detail stays in the issue thread.
 
-**State (verified against the codebase 2026-07-29):** no open issues, no open PRs, no code
-TODOs. Phase 3 is complete, so the queue is feature-shaped.
+**State (verified against the codebase 2026-07-30):** open issues are the #206 1.8.6
+umbrella and its sub-issues; D14 shipped on `release/1.8.6`. Phase 3 is complete, so the
+queue is feature-shaped.
 
 **Priority order,** roughly by payoff-per-effort:
 
-1. **D11** entropy bigram variant — closes a capability gap the shipped docs used to
-   overclaim; truth of what we ship outranks new surface.
-2. **D14** charset per-identifier scoping + sequence max-gap — same reason, two documented
-   narrowings that should not need a caveat.
-3. **A12** local transform tools — no design round needed, no OPSEC gate.
-4. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
+1. **D11** entropy bigram variant — closes a capability gap the shipped docs
+   used to overclaim; truth of what we ship outranks new surface. (D14, the other
+   truth-of-claims item, shipped in 1.8.6.)
+2. **A12** local transform tools — no design round needed, no OPSEC gate.
+3. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
    transitions — cheap detectors reusing existing SQL machinery, high forensic payoff.
-5. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
-6. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
-7. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
+4. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
+5. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
+6. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
    the detector line.
 
 Milestone 2–3 items are polish, picked up opportunistically. Milestones 6 (streaming
@@ -101,18 +101,16 @@ read the reasoning of does not meet the reproducibility bar and does not count a
   by mean pair probability, flag below `prob_thresh` (AMiner default 0.05). Ship as a
   `method` on the existing entropy detector (`shannon-iqr` | `bigram`), not a fifteenth
   tool — same field selection, same findings shape, one more radio in the UI.
-- [ ] **D14 — Close the two documented scope narrowings.** Both are now written down as
-  caveats; this item removes the need for the caveat.
-  - *Charset per identifier.* AMiner scopes charsets by `id_path_list`; we learn one
-    alphabet per field across the whole scope, merging hosts that legitimately differ.
-    Add an optional group-by field to `find_charset_anomalies` (the `_col_expr` mechanism
-    already resolves arbitrary fields), learn one alphabet per group.
-  - *Sequence max-gap.* AMiner resets an in-progress sequence after `timeout` seconds; our
-    n-grams have no gap bound, so a quiet source manufactures sequences from unrelated
-    events days apart. Add a `max_gap` param to `find_sequence_novelty` /
-    `find_sequence_motifs` — a `dateDiff` guard inside the existing `lagInFrame` window,
-    cheap because the partitioning is already there. Both detectors must take it, or they
-    stop agreeing on what a sequence is.
+- [x] **D14 — Close the two documented scope narrowings.** Shipped in 1.8.6: charset
+  gains `group_field` (one learned alphabet per value of a second field; suppressions
+  stay `(field, value)`-keyed and apply across groups), and both sequence detectors gain
+  `max_gap_seconds` (the n-gram assembly partitions on a running count of over-gap
+  boundaries, so sequences no longer span quiet gaps). Both caveats in
+  `docs/ANOMALY_DETECTION.md` are rewritten to describe the opt-in. Review fixes on the
+  same branch: one scan per field rather than per group, a fallback reference for groups
+  absent from the baseline window (`details.group_basis`), per-field warning attribution
+  plus a warning when the grouped scan hits its row ceiling, and `age` rather than
+  `dateDiff` for the gap so the bound measures elapsed seconds, not boundaries crossed.
 
 ### Low effort, high value
 
@@ -337,7 +335,27 @@ Decisions, not work items — each stays as decided unless its trigger fires.
   (journal, browser, apache, cowrie, evtx, syslog, webhoneypot) are a permanent
   minimal-dependency alternative (stdlib-only, no pyarrow), listed side by side with native
   converters in `manifest.json` / `/api/converters` — not a porting queue (decided
-  2026-07-20).
+  2026-07-20). `evtx2timesketch` stays for *text* exports, but binary `.evtx` now has a
+  native converter (`evtx2vestigo`, 2026-07-30) — the two cover different inputs, not the
+  same one twice.
+- **Ship a stock Windows `vestigo-fieldmap.yml`.** `evtx2vestigo` emits Sigma-canonical
+  names, so Windows rules resolve correctly but are permanently flagged in
+  `fallback_fields` — nothing vouches for a name that is right by construction, and a
+  timeline field mapping cannot vouch for it (identity mappings are rejected as shadowing
+  the raw key). A ruleset-root fieldmap of identity entries clears the flag with identical
+  SQL — measured over SigmaHQ `rules/windows/builtin` (326 rules): 873 fallback flags → 0,
+  zero SQL differences, zero match-count differences, from 141 identity entries generated
+  straight from the rules' own field names. The open question is *delivery*, not
+  feasibility: the ruleset directory is operator-supplied via `VESTIGO_SIGMA_RULES_PATH`,
+  so the repo cannot drop a file into it — it needs shipping as a downloadable asset (like
+  the converters) or a documented snippet. See `docs/ANOMALY_DETECTION.md` §Sigma.
+- **`evtx2vestigo` deferred items.** `.evtx.gz` input (the `evtx` wheel's `PyEvtxParser`
+  accepts a `BytesIO`, but decompressing a routinely-hundreds-of-MB log costs whole-file
+  RAM); `%%1833`-style message-table resolution (needs the originating host's WEVT
+  templates, which no converter-side library has); EvtxECmd PayloadData slot-order parity
+  (we emit each mapped
+  property as its own attribute instead, which is strictly more information). Trigger for
+  the first: someone hands us a compressed triage collection.
 - **Converter parallelism tuning is revisit-on-demand.** Benchmarking worker-count and
   parallel-threshold defaults on a multi-GB log, parallel `.gz` parsing (seek-point
   indexing), and pcap/CSV intra-file record-boundary chunking (a logical CSV record can

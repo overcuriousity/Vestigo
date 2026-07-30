@@ -4,13 +4,15 @@ import type { EventFilters, FieldMatchMode } from "@/api/types";
 
 interface Props {
   filters: EventFilters;
-  onRemove: (key: keyof EventFilters | string, fieldKey?: string, value?: string) => void;
+  /** Omit for a read-only chip set (no remove buttons) — e.g. the agent
+   * panel's inherited-filters bar, where editing stays in the Explorer. */
+  onRemove?: (key: keyof EventFilters | string, fieldKey?: string, value?: string) => void;
 }
 
 interface Chip {
   label: string;
   value: string;
-  onRemove: () => void;
+  onRemove?: () => void;
   variant?: "include" | "exclude" | "neutral";
   /** Non-exact match mode of a field filter/exclusion — rendered as a badge. */
   mode?: FieldMatchMode;
@@ -24,25 +26,29 @@ const MODE_BADGE: Record<FieldMatchMode, { label: string; tooltip: string }> = {
 export function FilterChips({ filters, onRemove }: Props) {
   const chips: Chip[] = [];
 
+  /** A chip's remove handler, or undefined in the read-only chip set. */
+  const remove = (key: keyof EventFilters | string, fieldKey?: string, value?: string) =>
+    onRemove ? () => onRemove(key, fieldKey, value) : undefined;
+
   if (filters.q)
     chips.push({
       label: "search",
       value: filters.q,
-      onRemove: () => onRemove("q"),
+      onRemove: remove("q"),
       variant: "neutral",
     });
   if (filters.artifact)
     chips.push({
       label: "artifact",
       value: filters.artifact,
-      onRemove: () => onRemove("artifact"),
+      onRemove: remove("artifact"),
       variant: "include",
     });
   for (const a of filters.artifacts ?? []) {
     chips.push({
       label: "artifact",
       value: a,
-      onRemove: () => onRemove("artifacts", undefined, a),
+      onRemove: remove("artifacts", undefined, a),
       variant: "include",
     });
   }
@@ -50,21 +56,21 @@ export function FilterChips({ filters, onRemove }: Props) {
     chips.push({
       label: "sourceId",
       value: filters.sourceId,
-      onRemove: () => onRemove("sourceId"),
+      onRemove: remove("sourceId"),
       variant: "include",
     });
   if (filters.tag)
     chips.push({
       label: "tag",
       value: filters.tag,
-      onRemove: () => onRemove("tag"),
+      onRemove: remove("tag"),
       variant: "include",
     });
   for (const t of filters.tagsInclude ?? []) {
     chips.push({
       label: "tag",
       value: t,
-      onRemove: () => onRemove("tagsInclude", undefined, t),
+      onRemove: remove("tagsInclude", undefined, t),
       variant: "include",
     });
   }
@@ -72,7 +78,7 @@ export function FilterChips({ filters, onRemove }: Props) {
     chips.push({
       label: "!tag",
       value: t,
-      onRemove: () => onRemove("tagsExclude", undefined, t),
+      onRemove: remove("tagsExclude", undefined, t),
       variant: "exclude",
     });
   }
@@ -80,7 +86,7 @@ export function FilterChips({ filters, onRemove }: Props) {
     chips.push({
       label: "flagged",
       value: t === "tag" && filters.annotationTagValue ? `tag:${filters.annotationTagValue}` : t,
-      onRemove: () => onRemove("annotated", undefined, t),
+      onRemove: remove("annotated", undefined, t),
       variant: "include",
     });
   }
@@ -88,14 +94,14 @@ export function FilterChips({ filters, onRemove }: Props) {
     chips.push({
       label: "from",
       value: filters.start.replace("T", " ").replace(/\.\d+Z$/, "Z"),
-      onRemove: () => onRemove("start"),
+      onRemove: remove("start"),
       variant: "neutral",
     });
   if (filters.end)
     chips.push({
       label: "to",
       value: filters.end.replace("T", " ").replace(/\.\d+Z$/, "Z"),
-      onRemove: () => onRemove("end"),
+      onRemove: remove("end"),
       variant: "neutral",
     });
 
@@ -104,7 +110,7 @@ export function FilterChips({ filters, onRemove }: Props) {
       chips.push({
         label: k,
         value: v,
-        onRemove: () => onRemove("filters", k, v),
+        onRemove: remove("filters", k, v),
         variant: "include",
         mode: filters.filterModes?.[k],
       });
@@ -115,7 +121,7 @@ export function FilterChips({ filters, onRemove }: Props) {
       chips.push({
         label: `!${k}`,
         value: v,
-        onRemove: () => onRemove("exclusions", k, v),
+        onRemove: remove("exclusions", k, v),
         variant: "exclude",
         mode: filters.exclusionModes?.[k],
       });
@@ -148,12 +154,14 @@ export function FilterChips({ filters, onRemove }: Props) {
             </Tooltip>
           )}
           <span className="max-w-[160px] truncate">{chip.value}</span>
-          <button
-            onClick={chip.onRemove}
-            className="ml-0.5 rounded-full p-0.5 opacity-60 hover:opacity-100 transition-base"
-          >
-            <X size={10} />
-          </button>
+          {onRemove && (
+            <button
+              onClick={chip.onRemove}
+              className="ml-0.5 rounded-full p-0.5 opacity-60 hover:opacity-100 transition-base"
+            >
+              <X size={10} />
+            </button>
+          )}
         </span>
       ))}
     </div>

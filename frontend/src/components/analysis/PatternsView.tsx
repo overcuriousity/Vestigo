@@ -48,6 +48,16 @@ const SERIES_FIELD_OPTIONS = [
 
 const NGRAM_OPTIONS = [2, 3, 4, 5];
 
+/** Max-gap bound (D14): break a sequence when consecutive events are farther
+ * apart than this. Empty = no bound (pre-1.8.6 behavior). Same options as the
+ * event-sequence view — both detectors must agree on what a sequence is. */
+const MAX_GAP_OPTIONS = [
+  { value: "", label: "no gap bound" },
+  { value: "300", label: "gap ≤ 5 min" },
+  { value: "3600", label: "gap ≤ 1 h" },
+  { value: "86400", label: "gap ≤ 1 day" },
+];
+
 /**
  * Human-readable problem with a routine row's occurrence materialization, or
  * null when it completed cleanly (or hasn't reported yet). The background job
@@ -267,6 +277,7 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
   const [seriesField, setSeriesField] = useState("artifact");
   const [ngramSize, setNgramSize] = useState(3);
   const [minSupport, setMinSupport] = useState(3);
+  const [maxGap, setMaxGap] = useState("");
   const qc = useQueryClient();
 
   const fl = useFindingsLimit();
@@ -291,13 +302,14 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
 
   // Mode-less mining — deliberately ignores the detector frame/baseline.
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "sequence_motif", seriesField, ngramSize, minSupport, fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "sequence_motif", seriesField, ngramSize, minSupport, maxGap, fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "sequence_motif",
         series_field: seriesField,
         ngram_size: ngramSize,
         min_support: minSupport,
+        ...(maxGap ? { max_gap_seconds: Number(maxGap) } : {}),
         limit: fl.limit,
       }),
     staleTime: 60_000,
@@ -426,6 +438,19 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
           />
           ×
         </span>
+        <select
+          value={maxGap}
+          onChange={(e) => setMaxGap(e.target.value)}
+          data-testid="motif-max-gap-select"
+          title="Max gap — break a sequence when consecutive events are farther apart than this"
+          className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
+        >
+          {MAX_GAP_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>
 

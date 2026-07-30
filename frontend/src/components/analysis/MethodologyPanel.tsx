@@ -233,14 +233,26 @@ export function MethodologyPanel({
               Self-baseline ("rare-chars") treats characters appearing in ≤ 3
               distinct values as rare and flags values containing them;
               temporal learns the baseline window's character set and flags
-              detect-window values with never-seen characters.
+              detect-window values with never-seen characters. The optional
+              group-by scopes the learning: one alphabet per value of that
+              field (e.g. per host) instead of one merged alphabet. A group
+              without enough values to learn from — including one the baseline
+              window never saw at all — is scored against a fallback rather
+              than skipped: events outside the suspect windows in temporal
+              mode, the merged whole-scope alphabet in self-baseline mode. The
+              row says which reference scored it and how much the group itself
+              contributed.
             </Row>
             <Row label="Signal">
               Null bytes, unicode homoglyphs, injection metacharacters —
               detected purely by character identity, never by what a value
               means. Fields with fewer than 20 distinct baseline values or an
               alphabet over 5000 characters (free text in large scripts) are
-              skipped.
+              skipped. Under group-by the two guards apply per group and mean
+              different things: an over-wide alphabet drops the group (a novel
+              character carries no signal in free text), while too few values
+              routes it to the fallback. Either way the run's warnings name the
+              groups.
             </Row>
             <Row label="Score">
               Sum over the value's novel characters of −log(values-with-char /
@@ -403,7 +415,10 @@ export function MethodologyPanel({
               One grouping field (like Frequency's group-by), not the
               multi-field picker. Sequences never mix sources or span a window
               edge; sources interleaving several independent streams can
-              produce interleaving artifacts.
+              produce interleaving artifacts. The optional max-gap bound breaks
+              a sequence when consecutive events are farther apart than the
+              chosen limit, so quiet sources can't manufacture sequences from
+              unrelated events.
             </Row>
             <Row label="Backend">
               Sequences are assembled entirely in ClickHouse (

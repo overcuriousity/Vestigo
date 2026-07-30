@@ -328,6 +328,10 @@ export interface AgentMessage {
    * pairing key when a model batches parallel tool calls (results land in
    * completion order, not call order). Null on pre-migration rows. */
   tool_call_id?: string | null;
+  /** Explorer filter snapshot sent with this message (user rows only; null
+   * otherwise and on rows predating the column). Context record — the stamp
+   * shown under the message, never read back into agent logic. */
+  view_filters?: Record<string, unknown> | null;
   created_at: string | null;
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
