@@ -66,6 +66,11 @@ round — **standing rule: when either resumes, both are designed together in on
   decision; its own revisit trigger has now fired — 3100 lines on 2026-07-20, 3319 on
   2026-07-29, still growing without anyone touching it deliberately. Split along the
   read/aggregate/export seams.
+- [ ] **README screenshot grid.** The README is laid out for a 2×2 image grid but ships one
+  Explorer shot. Capture, at one consistent window size: the Analysis tab with a detector
+  run's findings and the Method panel open, a Story with a live view embed and a chart
+  block, the Agent with an applied finding, and a re-shot Explorer to match. The
+  placeholder comment in `README.md` marks where they go.
 - [ ] **Extract a `ui/Callout` primitive.** `analysis/EmbeddingStatusBanner`,
   `timelines/UploadDialog`'s duplicate warning and a handful of other sites hand-roll the
   same border/dim-background/icon banner with per-site colour tokens.
