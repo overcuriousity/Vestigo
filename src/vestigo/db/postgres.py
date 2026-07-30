@@ -1509,6 +1509,13 @@ class User(Base):
     onboarding_completed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # When this user's demo case was seeded. Null means "never" — which is also
+    # every pre-existing row, so an upgrade backfills through the same
+    # first-login path as a brand-new account. Stays stamped after the user
+    # deletes the case, so it never comes back on its own.
+    demo_case_seeded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Namespaced per-user preference blob (e.g. "agent_disabled_tools").
     # A JSON column rather than a table: per-user singleton, never queried
     # by value. Nothing secret lives here.
@@ -4981,6 +4988,23 @@ class PostgresStore:
                 update(User).where(User.id == user_id).values(last_login_at=datetime.now(UTC))
             )
             await session.commit()
+
+    async def claim_demo_seed(self, user_id: str) -> bool:
+        """Stamp the demo-seed flag, returning True only for the winning caller.
+
+        Conditional on the column still being null, so two simultaneous logins
+        cannot both dispatch a seed job. Stamped *before* the import runs: a
+        failed import leaves a failed job the user can retry explicitly, which
+        beats re-importing on every subsequent login.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(User)
+                .where(User.id == user_id, User.demo_case_seeded_at.is_(None))
+                .values(demo_case_seeded_at=datetime.now(UTC))
+            )
+            await session.commit()
+            return result.rowcount > 0
 
     async def delete_user(self, user_id: str, reassign_cases_to: str | None = None) -> bool:
         """Delete a user, cascading their sessions and team memberships.
