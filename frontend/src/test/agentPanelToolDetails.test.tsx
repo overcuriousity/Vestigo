@@ -153,4 +153,58 @@ describe("AgentPanel tool-call details (#203)", () => {
     fireEvent.click(row.querySelector("summary")!);
     expect(row.querySelectorAll("pre")).toHaveLength(2);
   });
+
+  it("pairs on tool_call_id, so a call persisted with null args is still a call", async () => {
+    // A zero-argument tool call whose provider persisted `null` rather than
+    // `{}`. Discriminating call-vs-result on "has args" would read this row as
+    // a result, let it consume the pending entry for tc-1, and fold tc-1's real
+    // result onto the wrong call.
+    const msgs = toolPairMessages();
+    msgs.splice(2, 0, {
+      id: "m1b",
+      conversation_id: CONV_ID,
+      role: "tool",
+      content: "",
+      tool_name: "list_sources",
+      tool_args: null,
+      tool_result: null,
+      tool_call_id: "tc-0",
+      created_at: null,
+    } as AgentMessage);
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: msgs });
+
+    renderPanel();
+    // Rendered as its own call row rather than swallowed as a result.
+    const noArgs = await screen.findByTestId("tool-call-tc-0");
+    expect(noArgs.textContent).toContain("list_sources");
+    // …and tc-1 still gets its own result, not nothing.
+    const row = await screen.findByTestId("tool-call-tc-1");
+    fireEvent.click(row.querySelector("summary")!);
+    expect(row.textContent).toContain('"total": 42');
+  });
+
+  it("keys the row by call id so open state cannot follow a position", async () => {
+    // The row owns <details> open state. With an index key, a later row
+    // appearing above it would hand that state to a different tool call.
+    renderPanel();
+    const row = await screen.findByTestId("tool-call-tc-1");
+    fireEvent.click(row.querySelector("summary")!);
+    expect(row).toHaveAttribute("open");
+
+    const msgs = toolPairMessages();
+    msgs.splice(1, 0, {
+      id: "m0",
+      conversation_id: CONV_ID,
+      role: "thinking",
+      content: "considering",
+      tool_name: null,
+      tool_args: null,
+      tool_result: null,
+      created_at: null,
+    } as AgentMessage);
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: msgs });
+
+    const again = await screen.findByTestId("tool-call-tc-1");
+    expect(again.textContent).toContain("query_events");
+  });
 });
