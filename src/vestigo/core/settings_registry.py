@@ -98,6 +98,7 @@ GROUPS: tuple[SettingGroup, ...] = (
     SettingGroup("stories", "Stories", "Report export and block size ceilings."),
     SettingGroup("transfer", "Case transfer", "Export/import archive limits."),
     SettingGroup("agent", "AI agent", "LLM endpoint and tool policy."),
+    SettingGroup("onboarding", "Onboarding", "What new users find the first time they log in."),
 )
 
 _SPECS: tuple[SettingSpec, ...] = (
@@ -776,6 +777,16 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Admin hard-deny list applied to the in-app agent and /mcp alike.",
         managed_by="agent",
         subsystem="agent",
+    ),
+    # ── Onboarding ───────────────────────────────────────────────────────
+    SettingSpec(
+        "demo_case_enabled",
+        "onboarding",
+        "Seed a demo case for new users",
+        "Imports a fabricated example investigation into each user's case list on their "
+        "first login. Seeded once per user; deleting it is final unless they restore it "
+        "explicitly. Turning this off stops future seeding and leaves existing copies alone.",
+        subsystem="demo_case",
     ),
 )
 

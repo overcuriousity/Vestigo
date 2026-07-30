@@ -249,6 +249,12 @@ class Settings(BaseSettings):
     # small — this is admission control, not a throughput knob.
     transfer_max_concurrent: int = Field(default=2, ge=0)
 
+    # Seeds a fabricated demo case into each user's case list the first time
+    # they log in (once per user, ever — deleting it is final unless they
+    # restore it explicitly). Off for deployments where fabricated data in a
+    # case list is a policy problem.
+    demo_case_enabled: bool = True
+
     # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
     # directory scanned for *.yml/*.yaml at run time — an offline file drop
     # (e.g. a vendored SigmaHQ clone); empty string disables the global set.
