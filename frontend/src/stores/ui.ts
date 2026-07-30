@@ -47,6 +47,40 @@ interface UiState {
   /** Persisted event grid column widths (px), keyed by column id. */
   columnWidths: Record<string, number>;
   setColumnWidth: (id: string, width: number) => void;
+
+  /**
+   * Collapsed guidance panels, keyed by `GuidancePanel` id. Lives here rather
+   * than in raw localStorage so a reset re-renders panels that are already
+   * mounted — the old implementation read its flag once into `useState`, so
+   * clearing storage left every open panel visually unchanged until remount.
+   */
+  collapsedGuidance: Record<string, boolean>;
+  setGuidanceCollapsed: (id: string, collapsed: boolean) => void;
+  /** Re-expand every guidance panel. Wired to the Settings control. */
+  resetGuidance: () => void;
+}
+
+const LEGACY_GUIDANCE_PREFIX = "vestigo-guidance-";
+
+/**
+ * Adopt the pre-v5 `vestigo-guidance-<id>` localStorage keys so nobody's
+ * dismissals resurface on upgrade, and clear them so the two stores cannot
+ * disagree later.
+ */
+function adoptLegacyGuidanceKeys(): Record<string, boolean> {
+  const adopted: Record<string, boolean> = {};
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith(LEGACY_GUIDANCE_PREFIX)) continue;
+      if (localStorage.getItem(key) === "collapsed") {
+        adopted[key.slice(LEGACY_GUIDANCE_PREFIX.length)] = true;
+      }
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // localStorage unavailable (private mode) — nothing to adopt.
+  }
+  return adopted;
 }
 
 export const DEFAULT_COLUMNS = [
@@ -115,10 +149,15 @@ export const useUiStore = create<UiState>()(
       columnWidths: {},
       setColumnWidth: (id, width) =>
         set((s) => ({ columnWidths: { ...s.columnWidths, [id]: width } })),
+
+      collapsedGuidance: {},
+      setGuidanceCollapsed: (id, collapsed) =>
+        set((s) => ({ collapsedGuidance: { ...s.collapsedGuidance, [id]: collapsed } })),
+      resetGuidance: () => set({ collapsedGuidance: {} }),
     }),
     {
       name: "vestigo-ui",
-      version: 4,
+      version: 5,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -141,6 +180,17 @@ export const useUiStore = create<UiState>()(
             .analysisPanelWidth;
           state.investigatePanelWidth = legacy ?? state.investigatePanelWidth ?? 400;
           delete (state as unknown as { analysisPanelWidth?: number }).analysisPanelWidth;
+        }
+        if (version < 5) {
+          // Guidance dismissal moved out of its own `vestigo-guidance-*` keys.
+          // Only reached when this store has persisted state to migrate; a
+          // browser that dismissed guidance without ever writing a UI
+          // preference just sees the panels once more, which is the safe
+          // direction to fail in.
+          state.collapsedGuidance = {
+            ...adoptLegacyGuidanceKeys(),
+            ...(state.collapsedGuidance ?? {}),
+          };
         }
         return state;
       },

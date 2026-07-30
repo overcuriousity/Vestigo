@@ -8,7 +8,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Download, Check, Clipboard, Wand2, Search, Zap, FileStack } from "lucide-react";
 import { convertersApi } from "@/api/converters";
-import { guidance } from "@/lib/guidance";
+import { converterCopy } from "@/lib/guidance";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
@@ -156,16 +156,16 @@ export function ParserDownloadsPanel() {
           <Wand2 size={13} className="mt-0.5 shrink-0 text-[var(--color-fg-muted)] opacity-60" />
           <div className="flex-1 space-y-2">
             <p className="text-[11px] leading-relaxed text-[var(--color-fg-muted)]">
-              {guidance.converters.hint}
+              {converterCopy.hint}
             </p>
             {mode === "optimized" ? (
               <CopyPromptButton
-                prompt={guidance.converters.llmPromptParquet}
+                prompt={converterCopy.llmPromptParquet}
                 label="Copy LLM prompt (Parquet)"
               />
             ) : (
               <CopyPromptButton
-                prompt={guidance.converters.llmPromptCsv}
+                prompt={converterCopy.llmPromptCsv}
                 label="Copy LLM prompt (CSV/JSONL)"
               />
             )}

@@ -259,7 +259,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               </Button>
             </div>
             {saveMut.isError && (
-              <div className="text-xs text-[var(--color-error)]">
+              <div className="text-xs text-[var(--color-danger)]">
                 {(saveMut.error as Error)?.message ?? "Failed to save"}
               </div>
             )}
@@ -291,7 +291,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               "flex items-center gap-2 rounded border px-2 py-1.5 transition-colors",
               d.id === activeBaselineId
                 ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)]"
-                : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+                : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]",
             )}
           >
             <button
@@ -318,7 +318,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               <Pencil size={12} />
             </button>
             <button
-              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
               onClick={() => deleteMut.mutate(d.id)}
               title="Delete definition"
             >
@@ -417,7 +417,7 @@ export function NormalValuesList({ caseId, timelineId }: Props) {
                   </span>
                 </span>
                 <button
-                  className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+                  className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
                   onClick={() => removeMut.mutate(d.id)}
                   title={KIND_META[kind].removeTitle}
                 >
@@ -491,7 +491,7 @@ function WindowRow({
         {onRemove && (
           <button
             onClick={onRemove}
-            className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+            className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
             title="Remove"
           >
             <X size={12} />

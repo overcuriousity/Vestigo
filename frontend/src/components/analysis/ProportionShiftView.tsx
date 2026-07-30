@@ -10,18 +10,10 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, TrendingUp, TrendingDown } from "lucide-react";
+import { AlertTriangle, TrendingUp, TrendingDown } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
-import {
-  DetectorStatusLine,
-  FindingRowActions,
-  FindingShell,
-  NeedsBaselinePrompt,
-  ResultsBar,
-  RefreshButton,
-  TagFindingsBar,
-} from "./detector-shared";
+import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
 import {
   useCappedFindings,
   useFindingsLimit,
@@ -107,7 +99,7 @@ function ShiftRow({
           {fieldLabel(finding.field)}
         </span>
         {up ? (
-          <TrendingUp size={12} className="shrink-0 text-[var(--color-error)]" />
+          <TrendingUp size={12} className="shrink-0 text-[var(--color-danger)]" />
         ) : (
           <TrendingDown size={12} className="shrink-0 text-[var(--color-warning)]" />
         )}
@@ -288,16 +280,21 @@ export function ProportionShiftView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No proportion shifts. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "Nothing to test — the baseline window has no events, or no scanned field produced candidate values."
-                : "No value's share of events changed significantly (and by at least the minimum ratio) between the baseline and the suspect windows."}
-          </span>
-        </div>
+                ? "The baseline window has no events, or no scanned field produced candidate values. Widen the baseline, or pick fields explicitly above."
+                : "The mix of values held steady. A shift below the minimum ratio is filtered out deliberately — lower it if small moves matter here."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "Not enough samples to test for a shift."
+              : "No value's share of events changed significantly."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

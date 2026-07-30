@@ -1,46 +1,25 @@
-import { useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, Compass } from "lucide-react";
-
-const STORAGE_PREFIX = "vestigo-guidance-";
-
-function readCollapsed(id: string): boolean {
-  try {
-    return localStorage.getItem(STORAGE_PREFIX + id) === "collapsed";
-  } catch {
-    return false;
-  }
-}
-
-function writeCollapsed(id: string, collapsed: boolean): void {
-  try {
-    if (collapsed) localStorage.setItem(STORAGE_PREFIX + id, "collapsed");
-    else localStorage.removeItem(STORAGE_PREFIX + id);
-  } catch {
-    // localStorage unavailable (private mode) — collapse state just won't persist.
-  }
-}
+import { guidance, type GuidanceId } from "@/lib/guidance";
+import { useUiStore } from "@/stores/ui";
 
 interface Props {
-  /** Stable identifier; the collapsed state persists per id in localStorage. */
-  id: string;
-  title: string;
-  children: ReactNode;
+  /** Registry key in `lib/guidance.tsx`, which supplies both title and body. */
+  id: GuidanceId;
 }
 
 /**
  * Muted, collapsible guidance side-content (issue #11). Deliberately
- * low-contrast and never modal or blocking — a hint in the margins that an
- * analyst can fold away permanently.
+ * low-contrast and never modal or blocking — a hint in the margins.
+ *
+ * The panel owns no copy: it takes an id and reads the registry, so guidance
+ * wording cannot be inlined at a call site without a type error. Collapse state
+ * lives in the UI store, which makes it restorable — "Show guidance again" in
+ * Settings clears it and every mounted panel re-expands.
  */
-export function GuidancePanel({ id, title, children }: Props) {
-  const [collapsed, setCollapsed] = useState(() => readCollapsed(id));
-
-  const toggle = () => {
-    setCollapsed((c) => {
-      writeCollapsed(id, !c);
-      return !c;
-    });
-  };
+export function GuidancePanel({ id }: Props) {
+  const { title, body } = guidance[id];
+  const collapsed = useUiStore((s) => s.collapsedGuidance[id] ?? false);
+  const setCollapsed = useUiStore((s) => s.setGuidanceCollapsed);
 
   return (
     <div
@@ -49,7 +28,7 @@ export function GuidancePanel({ id, title, children }: Props) {
     >
       <button
         type="button"
-        onClick={toggle}
+        onClick={() => setCollapsed(id, !collapsed)}
         aria-expanded={!collapsed}
         className="flex w-full items-center gap-2 text-left text-xs font-medium uppercase tracking-wider text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)] transition-base"
       >
@@ -58,9 +37,7 @@ export function GuidancePanel({ id, title, children }: Props) {
         {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
       </button>
       {!collapsed && (
-        <div className="mt-2 text-xs leading-relaxed text-[var(--color-fg-muted)]">
-          {children}
-        </div>
+        <div className="mt-2 text-xs leading-relaxed text-[var(--color-fg-muted)]">{body}</div>
       )}
     </div>
   );

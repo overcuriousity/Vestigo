@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { guidance } from "@/lib/guidance";
+import { converterCopy } from "@/lib/guidance";
 
 describe("converter LLM prompts track the data contract", () => {
   it("Parquet prompt documents the 1.3.0 forensic footer keys", () => {
-    const p = guidance.converters.llmPromptParquet;
+    const p = converterCopy.llmPromptParquet;
     expect(p).toContain("vestigo.format_version");
     expect(p).toContain("vestigo.converter_name");
     expect(p).toContain("vestigo.converter_version");
@@ -18,11 +18,11 @@ describe("converter LLM prompts track the data contract", () => {
   });
 
   it("Parquet prompt routes timezone assumptions into the footer, not a comment", () => {
-    const p = guidance.converters.llmPromptParquet;
+    const p = converterCopy.llmPromptParquet;
     expect(p).not.toContain("document any input-timezone assumption at the top of the script");
   });
 
   it("CSV prompt documents pipe-separated tags", () => {
-    expect(guidance.converters.llmPromptCsv).toContain("pipe-separated");
+    expect(converterCopy.llmPromptCsv).toContain("pipe-separated");
   });
 });

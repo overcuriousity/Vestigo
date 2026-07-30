@@ -11,18 +11,10 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowDownRight, ArrowUpRight, Info, Sigma, UnfoldVertical } from "lucide-react";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, Sigma, UnfoldVertical } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
-import {
-  DetectorStatusLine,
-  FindingRowActions,
-  FindingShell,
-  NeedsBaselinePrompt,
-  ResultsBar,
-  RefreshButton,
-  TagFindingsBar,
-} from "./detector-shared";
+import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
 import {
   useCappedFindings,
   useFindingsLimit,
@@ -63,12 +55,12 @@ function topContributor(f: DistributionDriftFinding): Contributor | undefined {
 
 function directionIcon(direction: DistributionDriftFinding["direction"]) {
   if (direction === "up")
-    return <ArrowUpRight size={12} className="shrink-0 text-[var(--color-error)]" />;
+    return <ArrowUpRight size={12} className="shrink-0 text-[var(--color-danger)]" />;
   if (direction === "down")
     return <ArrowDownRight size={12} className="shrink-0 text-[var(--color-warning)]" />;
   if (direction === "spread")
-    return <UnfoldVertical size={12} className="shrink-0 text-[var(--color-error)]" />;
-  return <Sigma size={12} className="shrink-0 text-[var(--color-error)]" />;
+    return <UnfoldVertical size={12} className="shrink-0 text-[var(--color-danger)]" />;
+  return <Sigma size={12} className="shrink-0 text-[var(--color-danger)]" />;
 }
 
 function DriftRow({
@@ -342,16 +334,21 @@ export function DistributionDriftView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No drift findings. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the baseline and suspect windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "Nothing to test — the baseline window has no events, or no scanned field had enough samples on both sides."
-                : "No field's value distribution changed significantly between the baseline and the suspect windows."}
-          </span>
-        </div>
+                ? "The baseline window has no events, or no scanned field had enough samples on both sides. Widen the windows, or pick fields explicitly above."
+                : "The suspect windows look like the baseline on every field scanned. Scanning more fields may surface a shift this selection missed."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "Not enough samples to test for drift."
+              : "No field's value distribution changed significantly."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

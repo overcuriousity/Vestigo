@@ -14,7 +14,7 @@ import { Info } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
 import { DETECTORS, type DetectorId } from "./detector-registry";
 import { SWEEP_LIMIT, useAnomalyMarkers, useCappedFindings, useDetectorSweep, useOpenEvent } from "./detector-hooks";
-import { FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar } from "./detector-shared";
+import { AnalysisEmptyState, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar } from "./detector-shared";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
 import { useTriageCoverage } from "@/hooks/useTriageCoverage";
 import { cn } from "@/lib/cn";
@@ -197,7 +197,7 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime, 
                 activeChips.has(meta.id)
                   ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-accent)]"
                   : active
-                    ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-focus)]"
+                    ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-strong)]"
                     : "border-[var(--color-border)] text-[var(--color-fg-muted)]",
               )}
             >
@@ -228,10 +228,16 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime, 
       )}
 
       {!sweep.isLoading && feed.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>No findings under the current frame{activeChips.size > 0 ? " and chip filter" : ""}.</span>
-        </div>
+        <AnalysisEmptyState
+          hint={
+            activeChips.size > 0
+              ? "Clear the detector chips to see the whole sweep."
+              : "Every detector ran and ranked nothing above its threshold. Open Advanced below to run one on specific fields, or switch the frame to compare against a baseline."
+          }
+        >
+          No findings under the current frame
+          {activeChips.size > 0 ? " and chip filter" : ""}.
+        </AnalysisEmptyState>
       )}
 
       {feed.length > 0 && (

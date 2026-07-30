@@ -130,15 +130,7 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
 
   return (
     <div className="space-y-4">
-      <GuidancePanel id="investigate-sigma" title="How Sigma scanning works">
-        <p>
-          Sigma rules are community-standard YAML signatures for suspicious log patterns.
-          Running them evaluates each rule against every event in this timeline; matches are
-          tagged <span className="font-mono">sigma: &lt;rule title&gt;</span> as system
-          annotations, filterable from the Tags panel. Signature matching is deterministic —
-          it complements, not replaces, the statistical anomaly detectors.
-        </p>
-      </GuidancePanel>
+      <GuidancePanel id="investigate-sigma" />
 
       {/* Rules */}
       <section>

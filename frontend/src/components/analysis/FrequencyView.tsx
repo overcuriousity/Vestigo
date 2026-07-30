@@ -11,7 +11,7 @@ import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
-  Info,
+  
   Pin,
   TrendingUp,
   TrendingDown,
@@ -20,14 +20,7 @@ import {
 import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
-import {
-  DetectorStatusLine,
-  FindingRowActions,
-  NeedsBaselinePrompt,
-  ResultsBar,
-  RefreshButton,
-  TagFindingsBar,
-} from "./detector-shared";
+import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
 import {
   useCappedFindings,
   useFindingsLimit,
@@ -100,10 +93,10 @@ function FreqFindingRow({
         "group flex items-start gap-2 rounded border p-2 cursor-pointer transition-colors",
         finding.dismissed && "opacity-60",
         severity === "high"
-          ? "border-[var(--color-error)]/50 bg-[var(--color-error)]/5 hover:bg-[var(--color-error)]/10"
+          ? "border-[var(--color-danger)]/50 bg-[var(--color-danger)]/5 hover:bg-[var(--color-danger)]/10"
           : severity === "medium"
             ? "border-[var(--color-warning)]/50 bg-[var(--color-warning)]/5 hover:bg-[var(--color-warning)]/10"
-            : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+            : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]",
       )}
       onClick={() =>
         onDrillField?.(
@@ -122,7 +115,7 @@ function FreqFindingRow({
             size={13}
             className={
               severity === "high"
-                ? "text-[var(--color-error)]"
+                ? "text-[var(--color-danger)]"
                 : "text-[var(--color-warning)]"
             }
           />
@@ -168,7 +161,7 @@ function FreqFindingRow({
             className={cn(
               "font-semibold",
               severity === "high"
-                ? "text-[var(--color-error)]"
+                ? "text-[var(--color-danger)]"
                 : severity === "medium"
                   ? "text-[var(--color-warning)]"
                   : "text-[var(--color-fg-muted)]",
@@ -395,15 +388,21 @@ export function FrequencyView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            No frequency anomalies detected.{" "}
-            {data?.status === "no_data"
-              ? "No events with timestamps ingested yet."
-              : "All time windows are within the normal z-score band."}
-          </span>
-        </div>
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Frequency buckets events by time, so events whose timestamp could not be parsed are invisible to it."
+              : data?.status === "insufficient_data"
+                ? "A z-score needs several time buckets to establish a normal rate. Widen the window, or use a coarser bucket."
+                : "Event volume held steady across every bucket. A change in the mix of events at constant volume would not show up here."
+          }
+        >
+          {data?.status === "no_data"
+            ? "No events carry a usable timestamp."
+            : data?.status === "insufficient_data"
+              ? "Not enough time buckets to establish a rate."
+              : "No time window fell outside the normal z-score band."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

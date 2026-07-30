@@ -11,18 +11,10 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, Radio, TimerOff, TimerReset } from "lucide-react";
+import { AlertTriangle, Radio, TimerOff, TimerReset } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
-import {
-  DetectorStatusLine,
-  FindingRowActions,
-  FindingShell,
-  NeedsBaselinePrompt,
-  ResultsBar,
-  RefreshButton,
-  TagFindingsBar,
-} from "./detector-shared";
+import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
 import {
   useCappedFindings,
   useFindingsLimit,
@@ -60,10 +52,10 @@ function fmtInterval(seconds: number | null): string {
 
 function directionIcon(direction: IntervalPeriodicityFinding["direction"]) {
   if (direction === "new_regularity")
-    return <Radio size={12} className="shrink-0 text-[var(--color-error)]" />;
+    return <Radio size={12} className="shrink-0 text-[var(--color-danger)]" />;
   if (direction === "missed")
     return <TimerOff size={12} className="shrink-0 text-[var(--color-warning)]" />;
-  return <TimerReset size={12} className="shrink-0 text-[var(--color-error)]" />;
+  return <TimerReset size={12} className="shrink-0 text-[var(--color-danger)]" />;
 }
 
 function IntervalRow({
@@ -328,16 +320,21 @@ export function IntervalPeriodicityView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No cadence findings. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "Nothing to test — the baseline window has no events, or no scanned field produced candidate values."
-                : "No value's arrival cadence changed significantly — no regular value broke rhythm, and no bursty value became suspiciously regular."}
-          </span>
-        </div>
+                ? "Cadence needs several arrivals per value to measure a gap. Widen the baseline, or pick fields explicitly above."
+                : "No regular value broke rhythm, and no bursty value became suspiciously regular. A beacon that was already beaconing in the baseline looks unchanged here."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "Not enough arrivals to measure a cadence."
+              : "No value's arrival cadence changed significantly."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

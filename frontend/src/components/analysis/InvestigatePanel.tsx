@@ -28,6 +28,7 @@ import {
   SlidersHorizontal,
   X,
 } from "lucide-react";
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { useCapabilities } from "@/api/health";
 import { Button } from "@/components/ui/Button";
@@ -38,6 +39,7 @@ import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
 import { FrameBar } from "./FrameBar";
+import { AnalysisEmptyState } from "./detector-shared";
 import { GLOSSARY } from "@/lib/glossary";
 import { DetectorAccordion } from "./DetectorAccordion";
 import { FindingsFeed } from "./FindingsFeed";
@@ -160,6 +162,19 @@ export function InvestigatePanel({
 
   const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
+  // Whether there is anything to analyse at all. Only the panel can answer this
+  // — a detector view sees its own empty response and cannot tell "nothing was
+  // ingested" from "this method found nothing", which is why thirteen views used
+  // to each claim "No events ingested yet". Said once, here, with somewhere to go.
+  // `status: "ingesting"` sources are excluded from timeline queries until ready,
+  // so a mid-ingest timeline legitimately scans zero events and must say so
+  // rather than read as empty.
+  const readyEventCount = (sources ?? [])
+    .filter((s) => s.status === "ready")
+    .reduce((n, s) => n + s.event_count, 0);
+  const stillIngesting = (sources ?? []).some((s) => s.status === "ingesting");
+  const nothingToAnalyse = sources !== undefined && readyEventCount === 0;
+
   // ── Resize drag (mirrors EventDetailPanel) ─────────────────────────────
   const { investigatePanelWidth, setInvestigatePanelWidth } = useUiStore();
   const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -238,100 +253,137 @@ export function InvestigatePanel({
       <div className="flex-1 overflow-y-auto p-4">
         {activeTab === "anomalies" && (
           <>
-            {/* First-run explainer — folds away permanently once dismissed. */}
+            {/* First-run explainer — collapsible, restorable from Settings. */}
             <div className="mb-3">
-              <GuidancePanel id="investigate-anomalies" title="How anomaly scanning works">
-                <ol className="list-decimal space-y-1 pl-4">
-                  <li>
-                    <strong>Scope</strong> — <em>Scan all events</em> compares every event
-                    against the whole corpus; <em>Compare baseline</em> scores suspect
-                    windows against a period you declare normal (build one via{" "}
-                    <em>Manage baselines</em> or by dragging on the histogram).
-                  </li>
-                  <li>
-                    <strong>Findings</strong> — every detector's best findings in one
-                    ranked feed. Chips filter by detector;{" "}
-                    <strong>Advanced</strong> opens a detector's full view with field
-                    selection and tuning.
-                  </li>
-                  <li>
-                    Disposition a finding: <strong>Normal</strong> adds it to the
-                    known-normal list (that exact value or pattern stops surfacing
-                    in future scans), <strong>Dismiss</strong> hides it as noise
-                    without changing detection, <strong>Confirm</strong> escalates
-                    it durably.
-                  </li>
-                </ol>
-              </GuidancePanel>
+              <GuidancePanel id="investigate-anomalies" />
             </div>
 
-            {/* 1. Scope */}
-            <FrameBar caseId={caseId} timelineId={timelineId} />
-
-            {/* 2. Unified findings feed. It publishes the histogram/grid
-                anomaly markers by default; while Advanced is open the expanded
-                detector view owns the markers instead (exactly one publisher,
-                so the two never fight over the shared marker state). */}
-            <FindingsFeed
-              caseId={caseId}
-              timelineId={timelineId}
-              onSelectEvent={onSelectEvent}
-              onJumpToTime={onJumpToTime}
-              onAnomalyMarkers={advancedOpen ? undefined : onAnomalyMarkers}
-            />
-
-            {/* 3. Advanced: the per-detector accordion, collapsed by default */}
-            <div className="mt-4 border-t border-[var(--color-border)] pt-3">
-              <button
-                onClick={() => setAdvancedOpen((v) => !v)}
-                className="mb-2 flex w-full items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
+            {nothingToAnalyse ? (
+              <AnalysisEmptyState
+                hint={
+                  stillIngesting ? (
+                    "The job tray in the top bar shows progress. Events become searchable as they land."
+                  ) : (
+                    <>
+                      Upload a log file on the{" "}
+                      <Link
+                        to={`/cases/${caseId}`}
+                        className="text-[var(--color-accent)] hover:underline"
+                      >
+                        case overview
+                      </Link>{" "}
+                      to begin — detectors run over a timeline's events, and this one has none
+                      yet.
+                    </>
+                  )
+                }
               >
-                {advancedOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                <SlidersHorizontal size={12} />
-                Advanced — per-detector views
-              </button>
-              {advancedOpen && (
-                <DetectorAccordion
+                {stillIngesting
+                  ? "This timeline's sources are still ingesting."
+                  : "No events in this timeline yet."}
+              </AnalysisEmptyState>
+            ) : (
+              <>
+                {/* 1. Scope */}
+                <FrameBar caseId={caseId} timelineId={timelineId} />
+
+                {/* 2. Unified findings feed. It publishes the histogram/grid
+                    anomaly markers by default; while Advanced is open the expanded
+                    detector view owns the markers instead (exactly one publisher,
+                    so the two never fight over the shared marker state). */}
+                <FindingsFeed
                   caseId={caseId}
                   timelineId={timelineId}
                   onSelectEvent={onSelectEvent}
-                  onDrillField={onDrillField}
-                  onComboDrill={onComboDrill}
-                  onFrequencyDrill={onFrequencyDrill}
-                  onAnomalyMarkers={onAnomalyMarkers}
-                  onAnomalyRunId={onAnomalyRunId}
                   onJumpToTime={onJumpToTime}
+                  onAnomalyMarkers={advancedOpen ? undefined : onAnomalyMarkers}
                 />
-              )}
-            </div>
 
-            {/* 4. Dispositions */}
-            <div className="mt-4 border-t border-[var(--color-border)] pt-3">
-              <button
-                onClick={() => setNormalOpen((v) => !v)}
-                className="mb-2 flex w-full items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
-              >
-                {normalOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                <ShieldCheck size={12} />
-                Dispositions
-                <InfoHint content={GLOSSARY.normalValues} />
-                {verdictSummary && (
-                  <span className="ml-auto font-mono text-[10px] font-normal normal-case tracking-normal text-[var(--color-fg-muted)]">
-                    {verdictSummary}
-                  </span>
-                )}
-              </button>
-              {normalOpen && (
-                <div className="space-y-3">
-                  <TriageBurndown caseId={caseId} timelineId={timelineId} />
-                  <NormalValuesList caseId={caseId} timelineId={timelineId} />
+                {/* 3. Advanced: the per-detector accordion, collapsed by default */}
+                <div className="mt-4 border-t border-[var(--color-border)] pt-3">
+                  <button
+                    onClick={() => setAdvancedOpen((v) => !v)}
+                    className="mb-2 flex w-full items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
+                  >
+                    {advancedOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    <SlidersHorizontal size={12} />
+                    Advanced — per-detector views
+                  </button>
+                  {advancedOpen && (
+                    <DetectorAccordion
+                      caseId={caseId}
+                      timelineId={timelineId}
+                      onSelectEvent={onSelectEvent}
+                      onDrillField={onDrillField}
+                      onComboDrill={onComboDrill}
+                      onFrequencyDrill={onFrequencyDrill}
+                      onAnomalyMarkers={onAnomalyMarkers}
+                      onAnomalyRunId={onAnomalyRunId}
+                      onJumpToTime={onJumpToTime}
+                    />
+                  )}
                 </div>
-              )}
-            </div>
+
+                {/* 4. Dispositions */}
+                <div className="mt-4 border-t border-[var(--color-border)] pt-3">
+                  <button
+                    onClick={() => setNormalOpen((v) => !v)}
+                    className="mb-2 flex w-full items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
+                  >
+                    {normalOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    <ShieldCheck size={12} />
+                    Dispositions
+                    <InfoHint content={GLOSSARY.normalValues} />
+                    {verdictSummary && (
+                      <span className="ml-auto font-mono text-[10px] font-normal normal-case tracking-normal text-[var(--color-fg-muted)]">
+                        {verdictSummary}
+                      </span>
+                    )}
+                  </button>
+                  {normalOpen && (
+                    <div className="space-y-3">
+                      <TriageBurndown caseId={caseId} timelineId={timelineId} />
+                      <NormalValuesList caseId={caseId} timelineId={timelineId} />
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </>
         )}
 
-        {activeTab === "patterns" && (
+        {/* Guidance still renders on an empty timeline: "what would this tab do
+            for me" is most worth answering before there is data, and the
+            Anomalies tab above keeps its explainer for the same reason. */}
+        {activeTab === "patterns" && nothingToAnalyse && (
+          <div className="mb-3">
+            <GuidancePanel id="investigate-patterns" />
+          </div>
+        )}
+
+        {activeTab === "patterns" && nothingToAnalyse && (
+          <AnalysisEmptyState
+            hint={
+              stillIngesting ? (
+                "The job tray in the top bar shows progress."
+              ) : (
+                <>
+                  Upload a log file on the{" "}
+                  <Link to={`/cases/${caseId}`} className="text-[var(--color-accent)] hover:underline">
+                    case overview
+                  </Link>{" "}
+                  to begin.
+                </>
+              )
+            }
+          >
+            {stillIngesting
+              ? "This timeline's sources are still ingesting."
+              : "No events in this timeline yet."}
+          </AnalysisEmptyState>
+        )}
+
+        {activeTab === "patterns" && !nothingToAnalyse && (
           <div className="space-y-3">
             <div className="flex gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-0.5 text-xs">
               {(

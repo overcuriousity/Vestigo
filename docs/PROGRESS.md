@@ -1,9 +1,93 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 132 — PR #208 fourth review pass, 1.8.6 released).
+Last updated: 2026-07-30 (session 133 — frontend design audit; ratchet, guidance registry,
+empty states).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 133 — 2026-07-30: frontend design audit; dead tokens and the brand mark
+
+**Why.** An out-of-band design pass before 1.9 work begins. The starting suspicion was the
+Investigate panel's user guidance; the audit found that plus a broader pattern, and one
+class of silent visual bug worth fixing immediately.
+
+**Fixed this session.**
+
+- **Three CSS custom properties were referenced but never defined.** `--color-error` in 12
+  files (`EntropyView`, `OrderViolationsView`, `DistributionDriftView`, `ProportionShiftView`
+  and others) — the real token is `--color-danger`, so every "this is the bad direction"
+  arrow in the detector views rendered in inherited body text colour instead of red. The one
+  colour-coded signal in the views whose entire job is signalling did nothing.
+  `--color-bg-subtle` (`CorrMatrix.tsx:168`, `VisualizePage.tsx:1429`) → transparent
+  correlation-matrix cell fill for the no-value case. `--color-border-focus`
+  (`FrameBar.tsx:55`) → a hover border change that was a no-op. All three now point at
+  defined tokens. Notable: all of it compiled, typechecked, linted and passed tests. Tailwind
+  emits `text-[var(--color-error)]` happily and CSS resolves an undefined var to inherit,
+  silently — which is the argument for the lint ratchet now filed in `ROADMAP.md`.
+- **The brand mark used two hues from nowhere.** `VestigoMark.tsx` hardcoded `#8b5cf6` violet
+  and `#06b6d4` cyan against an accent of `#3b6e91`/`#5aa8b0`, fixed across both themes. The
+  mark's semantics were already right — the band that is out of cadence was the odd colour —
+  so it now carries `var(--color-accent)` for the cadence bands and `var(--color-anomaly)`
+  for the offset one: the same two colours the analysis views use for "expected" and "this
+  one stands out", stated in the app's own vocabulary and following the theme.
+
+**Then tier 1: enforcement, and the copy work that needed no design round.**
+
+- **The ratchet — `frontend/src/test/designSystem.test.ts`.** Three checks over a raw glob of
+  `components/` and `pages/`, following `vizExplainers.test.ts` (the repo's only other
+  source-scanning test, whose header explains why it uses Vite's raw glob rather than
+  `node:fs`: the frontend tsconfig carries no node types). Undefined `var(--…)` is hard and
+  starts at zero; `text-[Npx]` and raw `<button>` outside `components/ui/` are budgeted per
+  file in `designSystemBudget.ts`, seeded at 119 and 119 across 66 files. Three assertions,
+  because a floor nobody lowers is not a ratchet: over budget fails, a *beatable* budget fails
+  with "lower it to N", and a budget entry for a deleted file fails. Proven in all three
+  directions before being trusted. Two things it immediately paid for: it found six further
+  `--color-border-focus` references that the morning's `grep | head` had truncated away, and
+  the budget seeding showed the real counts were 119/119, not the 118/130 the audit reported.
+  Vitest stubs CSS imports to `""` even under `?raw`, so `vite.config.ts` opts `index.css`
+  into `test.css.include` — scoped to that one file so no other test pays for the Tailwind
+  pipeline.
+- **Guidance is now unbypassable rather than merely centralized.** `lib/guidance.ts` became
+  `guidance.tsx` keyed by panel id, and `GuidancePanel` lost its `title` and `children` props
+  — it takes `id: GuidanceId` and reads both from the registry. The four Investigate panels
+  that inlined their JSX could not be fixed by convention (that is what the file already
+  asked for and did not get); with no copy props to pass, inlining is a type error. Bodies
+  stay JSX because the copy carries `<strong>`, `<em>` and a `font-mono` span. `satisfies`
+  rather than a type annotation, or the keys widen to `string` and `GuidanceId` constrains
+  nothing. Converter copy moved to a sibling `converterCopy` export — it is not panel content.
+  `guidanceCoverage.test.ts` covers only the reverse direction, copy nothing renders, which is
+  the half the type system cannot see.
+- **Dismissal is restorable.** Collapse state moved from `vestigo-guidance-*` localStorage
+  keys into the `vestigo-ui` store (v4 → v5, migrating the old keys in). The old code read its
+  flag once into `useState` at mount, so clearing storage left every open panel collapsed
+  until remount — the reason a reset button alone would have looked broken. "Show guidance
+  again" sits in the Settings *Onboarding* section beside "Restart onboarding tour": same
+  intent, and `Compass` was already both buttons' icon. Still per-browser; per-user is filed.
+- **Empty states.** `AnalysisEmptyState` joins the chrome in `detector-shared.tsx` — the one
+  piece that escaped that file's stated purpose and was hand-rolled identically thirteen
+  times. It borrows `viz/primitives/ChartEmptyState`'s contract (primary line = what happened,
+  `hint` = cause and next action, copy stays at the call site because only the detector knows
+  why it is empty). The "no events" claim lifted to `InvestigatePanel`, which is the only
+  place that can tell an un-ingested timeline from a detector that ran clean — it already
+  queries `listSources`, and it distinguishes "still ingesting" from "nothing uploaded", with
+  a link to the case overview. `components/analysis/` had contained no `Link` at all. All
+  thirty-odd strings rewritten so none states absence twice, and the `insufficient_data` arm
+  that `ValueNoveltyView` and `OrderViolationsView` were missing — silently reading as a clean
+  result when the detector never ran — was added.
+
+**Verified** on an isolated instance (`tsig_verify` databases, port 8099): a case with no
+sources yields a default timeline with `sources: []`, and a 600-row seed exercises both the
+`ok`-with-no-findings and `insufficient_data` arms the rewrite targets. The built bundle
+carries the new copy and none of the old. The browser extension was not connected, so the
+rendered panel and the reset-without-reload interaction were not driven by hand — the latter
+is asserted by a unit test that fails against the old `useState` implementation.
+
+**Filed, not fixed.** The rest is in `ROADMAP.md` Milestone 3 under "Frontend design-system
+consistency", now stated as burning the budget file down to `{}`. Two items are correctness
+rather than taste: compact density does not scale the 119 arbitrary font sizes, and the
+Investigate panel still teaches the disposition model at the moment nothing on screen
+demonstrates it — the tier-1 work fixed that panel's plumbing, not its placement.
 
 ## Session 132 — 2026-07-30: PR #208 fourth review pass, and the 1.8.6 merge
 
