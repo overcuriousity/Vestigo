@@ -46,6 +46,7 @@ import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
 import { StoryBlockProposalCard } from "./StoryBlockProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
+import { AgentFiltersBar } from "./AgentFiltersBar";
 import {
   PROPOSAL_KIND_BY_ITEM,
   proposalItemKind,
@@ -917,6 +918,10 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           Export failed: {exportError}
         </p>
       )}
+
+      {/* Inherited-filters transparency (#205): which Explorer view the next
+          message sends as context. Read-only — editing stays in the Explorer. */}
+      <AgentFiltersBar filters={currentFilters} />
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto p-2.5">

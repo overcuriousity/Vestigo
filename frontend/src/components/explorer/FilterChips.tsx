@@ -4,13 +4,15 @@ import type { EventFilters, FieldMatchMode } from "@/api/types";
 
 interface Props {
   filters: EventFilters;
-  onRemove: (key: keyof EventFilters | string, fieldKey?: string, value?: string) => void;
+  /** Omit for a read-only chip set (no remove buttons) — e.g. the agent
+   * panel's inherited-filters bar, where editing stays in the Explorer. */
+  onRemove?: (key: keyof EventFilters | string, fieldKey?: string, value?: string) => void;
 }
 
 interface Chip {
   label: string;
   value: string;
-  onRemove: () => void;
+  onRemove?: () => void;
   variant?: "include" | "exclude" | "neutral";
   /** Non-exact match mode of a field filter/exclusion — rendered as a badge. */
   mode?: FieldMatchMode;
@@ -148,12 +150,14 @@ export function FilterChips({ filters, onRemove }: Props) {
             </Tooltip>
           )}
           <span className="max-w-[160px] truncate">{chip.value}</span>
-          <button
-            onClick={chip.onRemove}
-            className="ml-0.5 rounded-full p-0.5 opacity-60 hover:opacity-100 transition-base"
-          >
-            <X size={10} />
-          </button>
+          {onRemove && (
+            <button
+              onClick={chip.onRemove}
+              className="ml-0.5 rounded-full p-0.5 opacity-60 hover:opacity-100 transition-base"
+            >
+              <X size={10} />
+            </button>
+          )}
         </span>
       ))}
     </div>
