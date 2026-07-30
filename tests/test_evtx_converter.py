@@ -288,6 +288,57 @@ class TestSigmaFieldContract:
         assert attrs["Data1"] == "named"
         assert attrs["Data1_pos"] == "positional"
 
+    def test_repeated_data_name_is_numbered_not_overwritten(self, converter):
+        """EVTX permits the same `Name` twice in one EventData. Last-wins would
+        drop evidence with nothing on the row saying so; first keeps the plain
+        spelling Sigma addresses, the rest are numbered in document order."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(
+            "<Event><EventData>"
+            '<Data Name="SubjectUserName">alice</Data>'
+            '<Data Name="SubjectUserName">bob</Data>'
+            '<Data Name="SubjectUserName">carol</Data>'
+            "</EventData></Event>"
+        )
+        attrs = converter._extract_event_data(root)
+        assert attrs["SubjectUserName"] == "alice"
+        assert attrs["SubjectUserName_2"] == "bob"
+        assert attrs["SubjectUserName_3"] == "carol"
+
+    def test_numbered_duplicate_key_steps_over_a_literal_one(self, converter):
+        """A record carrying both a repeated `X` and a literal `X_2` must not
+        collapse them — the numbering probes for a free key rather than
+        assuming `_2` is available."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(
+            "<Event><EventData>"
+            '<Data Name="Param">first</Data>'
+            '<Data Name="Param_2">literal</Data>'
+            '<Data Name="Param">second</Data>'
+            "</EventData></Event>"
+        )
+        attrs = converter._extract_event_data(root)
+        assert attrs["Param"] == "first"
+        assert attrs["Param_2"] == "literal"
+        assert attrs["Param_3"] == "second"
+
+    def test_repeated_userdata_tag_is_numbered_not_overwritten(self, converter):
+        """`container.iter()` is recursive, so same-named tags at different
+        depths share a key. Same rule as EventData: number, never overwrite."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(
+            "<Event><UserData><RuleData>"
+            "<Path>C:\\one</Path>"
+            "<Nested><Path>C:\\two</Path></Nested>"
+            "</RuleData></UserData></Event>"
+        )
+        attrs = converter._extract_event_data(root)
+        assert attrs["UserData_RuleData_Path"] == "C:\\one"
+        assert attrs["UserData_RuleData_Path_2"] == "C:\\two"
+
     def test_positional_keys_are_untouched_without_a_named_collision(self, converter):
         """No named DataN in the record means the positional keys keep the plain
         spelling — the disambiguation must not fire on every unnamed field."""

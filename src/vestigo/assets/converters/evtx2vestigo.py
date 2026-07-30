@@ -3150,11 +3150,30 @@ def _extract_system(root: ET.Element) -> dict[str, str]:
     return attrs
 
 
+def _free_key(attrs: dict[str, str], name: str) -> str:
+    """``name`` if unused, else the first free ``name_2``, ``name_3``, … .
+
+    EVTX permits repeated ``<Data Name="X">`` elements within one ``<EventData>``,
+    and a handful of providers emit them. Letting the last one win would discard
+    evidence with nothing on the row to say so, so the *first* occurrence keeps the
+    plain spelling — that is the one Sigma rules address — and the rest are numbered
+    in document order. The loop rather than a fixed suffix is what keeps a record
+    that also carries a literal ``X_2`` field from colliding into the same key.
+    """
+    if name not in attrs:
+        return name
+    index = 2
+    while f"{name}_{index}" in attrs:
+        index += 1
+    return f"{name}_{index}"
+
+
 def _extract_event_data(root: ET.Element) -> dict[str, str]:
     """Pull <EventData>/<UserData> using the native Windows field names.
 
     Native names are exactly what community Sigma rules address, so they are kept
-    verbatim rather than normalized into a house style.
+    verbatim rather than normalized into a house style. No element overwrites
+    another: a repeated name is numbered by ``_free_key`` instead.
     """
     attrs: dict[str, str] = {}
     for child in root:
@@ -3178,22 +3197,26 @@ def _extract_event_data(root: ET.Element) -> dict[str, str]:
                         if name in named:
                             name = f"{name}_pos"
                     if node.text:
-                        attrs[name] = node.text
+                        attrs[_free_key(attrs, name)] = node.text
                 elif node_tag == "Binary":
                     if node.text:
-                        attrs["Binary"] = node.text[:_BINARY_ATTR_LIMIT]
+                        attrs[_free_key(attrs, "Binary")] = node.text[:_BINARY_ATTR_LIMIT]
                 elif node.text:
-                    attrs[node_tag] = node.text
+                    attrs[_free_key(attrs, node_tag)] = node.text
         elif tag == "UserData":
             for container in child:
                 prefix = f"UserData_{_local(container.tag)}"
                 if container.text and container.text.strip():
-                    attrs[prefix] = container.text.strip()
+                    attrs[_free_key(attrs, prefix)] = container.text.strip()
                 for node in container.iter():
                     if node is container:
                         continue
+                    # `iter()` is recursive, so two same-named tags at different
+                    # depths land on the same key — numbered, not overwritten,
+                    # for the same reason as the EventData duplicates above.
                     if node.text and node.text.strip():
-                        attrs[f"{prefix}_{_local(node.tag)}"] = node.text.strip()
+                        key = f"{prefix}_{_local(node.tag)}"
+                        attrs[_free_key(attrs, key)] = node.text.strip()
     return attrs
 
 

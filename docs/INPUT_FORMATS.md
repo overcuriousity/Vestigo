@@ -336,6 +336,12 @@ What is specific to it:
   addresses — and the positional value moves to `Data1_pos` rather than being overwritten.
   This is decided from the record as a whole, so it does not depend on which element the
   writer emitted first.
+- **No element overwrites another.** EVTX permits a repeated `<Data Name="X">` within one
+  `<EventData>` (and `<UserData>` nesting can put two same-named tags on one key). The first
+  occurrence keeps the plain spelling Sigma addresses; the rest are numbered in document
+  order — `X_2`, `X_3`, … — probing for a free key so a record that also carries a literal
+  `X_2` field does not collapse into it. Losing evidence to a name collision with nothing on
+  the row to say so is the one outcome the rule exists to prevent.
 - **EvtxECmd maps are embedded.** The community map corpus from
   [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx) (MIT) is compiled into the
   script by `scripts/vendor_evtx_maps.py` and supplies `MapDescription` plus the `Map*`
