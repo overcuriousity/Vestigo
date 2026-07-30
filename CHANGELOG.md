@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`evtx2vestigo`: binary Windows Event Log converter.** Parses `.evtx` containers
   directly (file or directory) instead of a text export, so `file_hash` anchors to the
   original evidence. `byte_offset` is a real offset into the `.evtx` and `content_hash`
-  covers that same raw record span, so `dd`+`sha256sum` reproduces it without Vestigo.
+  covers that same raw record span, so `dd`+`sha256sum` reproduces it without Vestigo;
+  where a damaged chunk forces a substitute, the row says so itself in
+  `byte_offset_basis` and `content_hash_basis` rather than leaving a record id to pass
+  for an offset.
   Each 64 KiB chunk is handed to the parser as a complete, checksum-valid one-chunk
   document, which recovers records the whole-file path loses at the first damaged chunk;
   record offsets are resolved per chunk, so a record id repeated across chunks in a
@@ -34,11 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value of a second field (e.g. per host), retiring the merged-alphabet caveat.
   Suppressions stay keyed on `(field, value)` and apply across groups. Group count costs
   rows, not queries: the per-group alphabets travel into one scan per field as array
-  parameters, with `LIMIT … BY grp` keeping each group's budget. A group the baseline
-  window never saw is scored against a reference learned *outside* the suspect windows
-  rather than skipped, every finding records which reference scored it
-  (`details.group_basis`, shown on the row), and groups the skip guards drop are named in
-  the run's `warnings`. A non-string `group_field` is refused with 422. (D14)
+  parameters, with `LIMIT … BY grp` keeping each group's budget.
+
+  The two skip guards mean opposite things and are treated as such. An alphabet over
+  5,000 characters means the *question* does not apply — a novel character carries no
+  signal in free text — so that group is dropped and named in `warnings`. Fewer than 20
+  distinct values means not enough *evidence*, which does not exonerate the group, so it
+  is scored against a fallback reference: events outside the suspect windows in temporal
+  mode, or the merged whole-scope alphabet in self-baseline mode — exactly what the field
+  was measured against before grouping, so enabling grouping never narrows coverage.
+  "Absent from the baseline window" is the zero case of the same condition and takes the
+  same route. Every finding records which reference scored it and how much evidence its
+  own group contributed (`details.group_basis`,
+  `details.group_baseline_distinct_values`, both shown on the row). The fallback learn is
+  a whole-scope scan, so it runs only when some group needs one — a bounded probe over
+  the suspect windows decides that far more cheaply. A non-string `group_field` is
+  refused with 422. (D14)
 - **Sequence detectors: `max_gap_seconds`.** `sequence_novelty` and `sequence_motif`
   break an n-gram when consecutive events are farther apart than the bound, retiring
   the manufactured-sequence caveat. Unset keeps the pre-1.8.6 behavior bit-identical.
@@ -67,7 +81,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message, so an unvalidated client dict could grow the transcript at will. (#205)
 - **`evtx2vestigo`: a named `DataN` field no longer collides with an unnamed positional
   one.** The named value keeps the plain key — that is what Sigma rules address — and the
-  positional value moves to `DataN_pos`.
+  positional value moves to `DataN_pos`, decided from the record as a whole so it does not
+  depend on which element the writer emitted first.
+- **A grouped charset run's `warnings` describe what it actually did.** Groups routed to
+  the fallback were reported as "not evaluated", and a field whose fallback could not be
+  learned reported absent groups as unevaluated even when none existed. Warnings now name
+  the groups, separate "no baseline values" from "too few baseline values", and state
+  which guard the fallback itself tripped. (D14)
+- **A tool row in the agent panel pairs on `tool_call_id` rather than on whether the row
+  carries arguments.** A zero-argument call persisted with `null` args read as a result
+  row, consumed its sibling's pending entry and folded a result onto the wrong call. The
+  row is also keyed by call identity now, so its expanded state cannot follow a position
+  in the transcript, and its open state has a single owner instead of a native toggle and
+  a React handler racing on the same click. (#203)
 - **The downloadable converter LLM prompts match the data contract again.** The Parquet
   prompt documented the pre-1.3.0 footer: it omitted the forensic metadata keys
   (`converted_at`, `row_counts`, `timezone_assumption`, `parse_decisions`) and the

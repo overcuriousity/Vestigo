@@ -1,9 +1,62 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 129 — PR #208 review fixes).
+Last updated: 2026-07-30 (session 130 — PR #208 second review pass).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 130 — 2026-07-30: PR #208 second review pass
+
+**Why.** A second review of the 1.8.6 PR, after session 129's fixes. Eight findings, all
+addressed. The substantive ones were in the grouped charset path again — not in what it
+computes, but in whether its own `warnings` describe what it did.
+
+- **The two per-group skip guards meant opposite things and were treated as one.** An
+  alphabet over 5,000 characters says *the question does not apply* (a novel character
+  carries no signal in free text); fewer than 20 distinct values says *not enough
+  evidence*, which does not exonerate the group. They are split now: wide → dropped and
+  named, thin → scored against the fallback. "Absent from the baseline window" is just the
+  `n_vals = 0` case of the thin condition and takes the same route, which removes a
+  discontinuity where less evidence would have bought better treatment.
+- **The warnings lied in two directions.** Thin groups *were* being fallback-scored while
+  reported as "not evaluated", and `no_fallback_fields` claimed absent groups went
+  unevaluated whenever the fallback learn failed — including when no group was absent.
+  Warnings now name the groups, keep "no baseline values" and "too few baseline values"
+  apart, and state which guard the fallback itself tripped, since "too few distinct
+  values" would send an analyst to widen a baseline that was never the problem.
+- **Self-baseline grouped mode had no fallback at all**, so enabling `group_field` deleted
+  thin groups from a run that previously scored them against the merged whole-scope
+  alphabet — a coverage regression caused by a precision feature. It now falls back to
+  exactly that reference (`group_basis = "scope-merged"`).
+- **The fallback learn is a whole-scope heavy scan and ran unconditionally per field.** A
+  bounded `SELECT DISTINCT` probe over the suspect windows now decides whether it is
+  needed; a truncated probe counts as "needed", because an unchecked group must never be
+  assumed safe. Findings carry `details.group_baseline_distinct_values`, so a report says
+  *why* a fallback scored a row rather than leaving it to be inferred.
+- **A review finding of my own was wrong, and the code now records why.** I claimed a
+  wide-alphabet group could be scored against the fallback. It cannot: the fallback is
+  learned from a superset of every group's own data, so its alphabet is at least as wide,
+  and a group over the ceiling guarantees the fallback is refused too. Measured on 26.6.
+  The explicit `skip` exclusion is kept as belt-and-braces so the routing does not rest on
+  that argument holding, and the comment says as much.
+- **Live-ClickHouse coverage for the D14 SQL.** The D14 tests asserted SQL *text*; the new
+  constructs only fail at execution. `test_charset_group_field_clickhouse.py` and
+  `test_sequence_max_gap_clickhouse.py` exercise array-of-array parameter indexing,
+  `LIMIT … BY grp LIMIT …`, the `skip`/`has_fb` routing, and the two-level segment window —
+  including the `Nullable(DateTime64(3))` assumption behind "gap_s is NULL on each
+  partition's first row", which now fails a test if it ever stops holding.
+- **`evtx2vestigo`.** The `DataN` collision fix was order-dependent — with the positional
+  element first, the named one overwrote it and the positional value was lost. It is
+  decided from the record as a whole now. A fallback `byte_offset` also stamps
+  `byte_offset_basis=record_id`: a record id is indistinguishable from a real offset by
+  inspection, and `content_hash_basis` is a statement about the hash, not the offset.
+- **Agent panel tool rows.** Pairing discriminated call-vs-result on whether the row had
+  arguments, so a zero-argument call persisted with `null` args read as a result and
+  mispaired a real one; keyed rows now pair on `tool_call_id` and only unkeyed legacy rows
+  use the heuristic. The row is keyed by call identity rather than list position (it owns
+  `<details>` open state), and that state has one owner instead of a native toggle and a
+  React handler racing on the same click — which also makes it behave the same in jsdom,
+  where `<details>` is not natively implemented.
 
 ## Session 129 — 2026-07-30: PR #208 review findings
 
