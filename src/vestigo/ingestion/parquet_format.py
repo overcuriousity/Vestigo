@@ -36,12 +36,13 @@ META_CONVERTER_VERSION = "vestigo.converter_version"
 # JSON array of {"name": str, "sha256": str, "size_bytes": int, "path": str,
 # "mtime": str} — one entry per original raw input file (directory inputs yield
 # several). `path` (absolute source path) and `mtime` (ISO-8601 UTC) are
-# additive since converter 1.3.0; `OriginalFile` ignores them.
+# additive and optional; `OriginalFile` ignores them.
 META_ORIGINAL_FILES = "vestigo.original_files"
 
-# Additive forensic footer metadata written by converters >= 1.3.0. The reader
-# does not require these (validate_parquet_source ignores them); they are
-# self-documenting chain-of-custody data readable from the Parquet footer.
+# Additive forensic footer metadata. Optional: the reader does not require these
+# (validate_parquet_source ignores them), and their presence is not implied by
+# `converter_version` — each converter versions itself independently, so probe for
+# the keys. They are self-documenting chain-of-custody data read from the footer.
 # `converted_at`: ISO-8601 UTC timestamp of the conversion run.
 # `row_counts`: JSON {"parsed", "skipped_malformed", "skipped_by_time"}.
 # `timezone_assumption`: free-text note on any tz/year guess the parser made.

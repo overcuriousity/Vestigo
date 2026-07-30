@@ -11,7 +11,8 @@ cannot ship as 468 loose YAML files and the converter cannot depend on PyYAML at
 all YAML parsing, validation and regex compilation happens here, at vendor time. Whatever
 the converter ships with is known-good.
 
-The outputs are committed. Re-run this script to re-sync with upstream:
+The outputs are committed. Re-run this script to re-sync with upstream (the checkout path
+may also come from ``$EVTX_UPSTREAM``):
 
     uv run python scripts/vendor_evtx_maps.py --upstream /path/to/EricZimmerman-evtx
 
@@ -25,6 +26,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -81,6 +83,7 @@ class Stats:
         self.dropped_entries = 0
         self.description_only = 0
         self.alias_keys = 0
+        self.duplicate_keys = 0
 
 
 def _upstream_commit(upstream: Path) -> str:
@@ -185,7 +188,13 @@ def compile_corpus(upstream: Path) -> tuple[dict[str, Any], Stats]:
         if result is None:
             continue
         key, doc = result
-        compiled.setdefault(key, doc)
+        if key in compiled:
+            # Two .map files claiming the same (channel, provider, event id). The first
+            # wins, but never silently — upstream adding a competing map is worth seeing.
+            stats.duplicate_keys += 1
+            print(f"warning: duplicate map key {key} from {path.name}", file=sys.stderr)
+            continue
+        compiled[key] = doc
 
     # Provider-agnostic tier: only for (channel, eventid) pairs claimed by exactly one
     # provider, so a renamed or differently-cased provider still resolves. Ambiguous
@@ -282,8 +291,9 @@ def main() -> int:
     parser.add_argument(
         "--upstream",
         type=Path,
-        default=Path.home() / "Projekte" / "evtx",
-        help="path to a local EricZimmerman/evtx checkout",
+        default=os.environ.get("EVTX_UPSTREAM"),
+        required="EVTX_UPSTREAM" not in os.environ,
+        help="path to a local EricZimmerman/evtx checkout (default: $EVTX_UPSTREAM)",
     )
     parser.add_argument(
         "--check",
@@ -323,7 +333,8 @@ def main() -> int:
         f"vendored {stats.maps} maps (+{stats.alias_keys} aliases) from {upstream}\n"
         f"  dropped: {stats.dropped_values} values, {stats.dropped_refines} refines, "
         f"{stats.dropped_entries} entries, {stats.skipped_maps} maps "
-        f"({stats.description_only} kept description-only)\n"
+        f"({stats.description_only} kept description-only), "
+        f"{stats.duplicate_keys} duplicate keys\n"
         f"  blob: {blob_bytes:,} B base64  |  {CONVERTER_PATH.name}: "
         f"{CONVERTER_PATH.stat().st_size:,} B"
     )

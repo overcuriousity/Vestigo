@@ -345,10 +345,11 @@ Decisions, not work items — each stays as decided unless its trigger fires.
   feasibility: the ruleset directory is operator-supplied via `VESTIGO_SIGMA_RULES_PATH`,
   so the repo cannot drop a file into it — it needs shipping as a downloadable asset (like
   the converters) or a documented snippet. See `docs/ANOMALY_DETECTION.md` §Sigma.
-- **`evtx2vestigo` deferred items.** `.evtx.gz` input (pyevtx accepts a `BytesIO`, but
-  decompressing a routinely-hundreds-of-MB log costs whole-file RAM); `%%1833`-style
-  message-table resolution (needs the originating host's WEVT templates — pyevtx's
-  `WevtCache` could do it); EvtxECmd PayloadData slot-order parity (we emit each mapped
+- **`evtx2vestigo` deferred items.** `.evtx.gz` input (the `evtx` wheel's `PyEvtxParser`
+  accepts a `BytesIO`, but decompressing a routinely-hundreds-of-MB log costs whole-file
+  RAM); `%%1833`-style message-table resolution (needs the originating host's WEVT
+  templates, which no converter-side library has); EvtxECmd PayloadData slot-order parity
+  (we emit each mapped
   property as its own attribute instead, which is strictly more information). Trigger for
   the first: someone hands us a compressed triage collection.
 - **Converter parallelism tuning is revisit-on-demand.** Benchmarking worker-count and

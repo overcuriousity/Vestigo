@@ -1,9 +1,51 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 127 — binary EVTX converter).
+Last updated: 2026-07-30 (session 128 — EVTX converter review fixes).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 128 — 2026-07-30: `evtx2vestigo` review findings
+
+**Why.** PR #209 review of the session-127 converter. Nothing was shipped-broken, but two
+latent defects sat in the part of the design the single-chunk test fixture cannot reach.
+
+- **The synthetic one-chunk image carried an invalid header CRC32.** `_iter_chunk_blobs`
+  rewrote the first/last chunk numbers and the chunk count but not the checksum at offset
+  124 — and the count was written as `<I` into a 2-byte field. The fixture is a one-chunk
+  file whose header already reads first=last=0, count=1, so the mutation was a *no-op there*
+  and every test passed while the multi-chunk path — i.e. every real log — had no coverage at
+  all. Confirmed by hand on a synthetic two-chunk file: all emitted images had a bad CRC, and
+  the current `evtx` wheel simply tolerates it. A stricter parser release would have rejected
+  every multi-chunk file. The header checksum is now recomputed, and
+  `TestChunkImages` asserts image validity plus a 14-record round trip.
+- **Offsets are now scanned per chunk, not per file.** The whole-file
+  `{record_id: (offset, size)}` dict kept the *first* of duplicate ids, but the parser still
+  yields both records — so in a re-chunked or partially overwritten log two distinct records
+  received the same `byte_offset` *and* `content_hash`, and `derive_event_id` is a function
+  of exactly those. Two events, one identity. Scanning each chunk immediately before parsing
+  it removes the ambiguity structurally (a chunk's records can only resolve against their own
+  chunk) and drops peak memory from one file's worth of offsets to one chunk's. The footer's
+  `chunk_scan` note keeps its old key names, duplicate count included.
+
+**Also.** Directory input now runs the magic/text-export check per file — a `wevtutil` dump
+saved as `.evtx` was silently contributing zero rows with exit 0 — warning and skipping
+rather than aborting a triage collection, plus a warning for any file that parses to zero
+records. `Refine` regexes are capped at 8 KiB of input: vendor time proves a pattern
+*compiles*, not that it terminates, and EventData is evidence. `_RESERVED_ATTR_KEYS` is a
+hand-copy of the server's `TOP_LEVEL_EVENT_COLUMNS` and is now pinned to it by a test.
+
+**`converter_version` is per-script, not suite-wide.** All six converters read `1.3.0` and
+`INPUT_FORMATS.md` keyed "writes the forensic footer" on `>= 1.3.0`. `evtx2vestigo` is on its
+first version, so it is now `1.0.0` and the docs say what is actually true: probe for the
+footer keys, do not infer them from a version number that each converter advances on its own.
+
+**Verification.** 52 tests in `tests/test_evtx_converter.py` (was 39): multi-chunk images and
+their checksums, duplicate-id offset distinctness, `xml_sanitized` and the rendered-XML
+offset fallback (via a stubbed parser — byte-patching the fixture is impossible, the parser
+validates chunk checksums), `--split` size mode, `--until`, junk-directory handling. Not
+re-run: `vendor_evtx_maps.py --check`, which needs an `EricZimmerman/evtx` checkout; the
+generated blob region was untouched, and the manifest hash was refreshed directly.
 
 ## Session 127 — 2026-07-30: `evtx2vestigo`, binary Windows Event Logs
 

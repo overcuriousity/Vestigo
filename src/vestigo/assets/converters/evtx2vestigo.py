@@ -39,6 +39,7 @@ import contextlib
 import datetime
 import hashlib
 import io
+import ipaddress
 import json
 import mmap
 import multiprocessing
@@ -74,7 +75,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "evtx2vestigo"
-CONVERTER_VERSION = "1.3.0"
+CONVERTER_VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Vestigo Parquet interchange format v1 — embedded copy of the spec in
@@ -2494,83 +2495,135 @@ _CHUNK_HEADER_SIZE = 512
 _RECORD_HEADER_SIZE = 24
 
 
-def _scan_record_offsets(data: Any) -> tuple[dict[int, tuple[int, int]], str]:
-    """Map ``event_record_id -> (byte offset, record size)`` by walking the chunks.
+class _ChunkScanStats:
+    """Chunk-walk tallies, rendered into the footer's ``chunk_scan`` note."""
 
-    The EVTX parser exposes no file offset, so the container is walked directly. A chunk
-    whose magic or record framing does not validate is abandoned at that point and the
-    scan continues with the next chunk — damage stays local. Scanning runs to EOF rather
-    than to the header's declared chunk count, because a dirty file often carries records
-    beyond it.
+    def __init__(self) -> None:
+        self.chunks_ok = 0
+        self.chunks_bad = 0
+        self.duplicates = 0
+        self.truncated = 0
+        self.fatal = ""
+        self.first_error = ""
 
-    Returns the offsets and a human-readable diagnostic for the footer metadata. A total
-    failure returns ``({}, reason)`` rather than raising: callers degrade to using the
-    record id as the offset.
+    def note(self) -> str:
+        if self.fatal:
+            return self.fatal
+        note = (
+            f"chunks_ok={self.chunks_ok} chunks_skipped={self.chunks_bad} "
+            f"duplicate_record_ids={self.duplicates} truncated_chunks={self.truncated}"
+        )
+        return f"{note} {self.first_error}" if self.first_error else note
+
+
+def _scan_chunk(data: Any, chunk_start: int) -> tuple[dict[int, tuple[int, int]], bool] | None:
+    """Locate one chunk's records as ``{record_id: (byte offset, record size)}``.
+
+    The EVTX parser exposes no file offset, so the container is walked directly. Offsets
+    are absolute within the whole file, so they stay usable as `byte_offset`. Returns
+    ``None`` when the chunk magic does not validate, and ``(offsets, truncated)`` otherwise
+    — record framing that stops validating mid-chunk simply ends the walk there, so damage
+    stays local.
     """
+    if data[chunk_start : chunk_start + 8] != _CHUNK_MAGIC:
+        return None
     offsets: dict[int, tuple[int, int]] = {}
-    try:
-        if data[:8] != _EVTX_MAGIC:
-            return {}, "not an evtx file header"
-        total = len(data)
-        chunks_ok = 0
-        chunks_bad = 0
-        duplicates = 0
-        truncated = 0
-        chunk_start = _FILE_HEADER_SIZE
-        while chunk_start + _CHUNK_HEADER_SIZE <= total:
-            if data[chunk_start : chunk_start + 8] != _CHUNK_MAGIC:
-                chunks_bad += 1
-                chunk_start += _CHUNK_SIZE
-                continue
-            chunks_ok += 1
-            free_space = struct.unpack_from("<I", data, chunk_start + 48)[0]
-            span = min(free_space or _CHUNK_SIZE, _CHUNK_SIZE, total - chunk_start)
-            limit = chunk_start + span
-            pos = chunk_start + _CHUNK_HEADER_SIZE
-            while pos + _RECORD_HEADER_SIZE <= limit:
-                if data[pos : pos + 4] != _RECORD_MAGIC:
-                    break
-                size = struct.unpack_from("<I", data, pos + 4)[0]
-                if size < _RECORD_HEADER_SIZE + 4 or size % 8 or pos + size > limit:
-                    break
-                record_id = struct.unpack_from("<Q", data, pos + 8)[0]
-                if record_id in offsets:
-                    duplicates += 1
-                else:
-                    offsets[record_id] = (pos, size)
-                if struct.unpack_from("<I", data, pos + size - 4)[0] != size:
-                    # Last record of a partially committed chunk: the trailing size
-                    # copy was never written. The record itself is intact, but the
-                    # next position cannot be trusted, so stop this chunk here.
-                    truncated += 1
-                    break
-                pos += size
-            chunk_start += _CHUNK_SIZE
-    except (OSError, struct.error, ValueError, IndexError) as exc:
-        return offsets, f"scan aborted: {type(exc).__name__}: {exc}"
-    return offsets, (
-        f"chunks_ok={chunks_ok} chunks_skipped={chunks_bad} "
-        f"duplicate_record_ids={duplicates} truncated_chunks={truncated}"
-    )
+    truncated = False
+    free_space = struct.unpack_from("<I", data, chunk_start + 48)[0]
+    span = min(free_space or _CHUNK_SIZE, _CHUNK_SIZE, len(data) - chunk_start)
+    limit = chunk_start + span
+    pos = chunk_start + _CHUNK_HEADER_SIZE
+    while pos + _RECORD_HEADER_SIZE <= limit:
+        if data[pos : pos + 4] != _RECORD_MAGIC:
+            break
+        size = struct.unpack_from("<I", data, pos + 4)[0]
+        if size < _RECORD_HEADER_SIZE + 4 or size % 8 or pos + size > limit:
+            break
+        record_id = struct.unpack_from("<Q", data, pos + 8)[0]
+        offsets.setdefault(record_id, (pos, size))
+        if struct.unpack_from("<I", data, pos + size - 4)[0] != size:
+            # Last record of a partially committed chunk: the trailing size copy was
+            # never written. The record itself is intact, but the next position cannot
+            # be trusted, so stop this chunk here.
+            truncated = True
+            break
+        pos += size
+    return offsets, truncated
 
 
-def _iter_chunk_blobs(data: Any) -> Any:
-    """Yield a standalone one-chunk EVTX image for every structurally valid chunk.
+def _iter_chunks(data: Any, stats: _ChunkScanStats) -> Any:
+    """Yield ``(one-chunk EVTX image, that chunk's record offsets)`` per valid chunk.
 
-    EVTX templates and the string cache are chunk-local, so a chunk plus a file header
-    is a complete, independently parseable document. Handing the parser one chunk at a
-    time is what keeps a single corrupt chunk from killing the rest of the file.
+    EVTX templates and the string cache are chunk-local, so a chunk plus a file header is
+    a complete, independently parseable document — and the image is a *valid* one, header
+    checksum included, since that is what keeps a future stricter parser from rejecting
+    every multi-chunk file. Handing the parser one chunk at a time is what keeps a single
+    corrupt chunk from killing the rest of the file.
+
+    Offsets are scanned per chunk rather than per file so a record id duplicated across
+    chunks (routine in a re-chunked or partially overwritten log) cannot resolve to the
+    other chunk's offset — two distinct records must never end up sharing a `byte_offset`
+    and `content_hash`, because the server derives event identity from them. It also keeps
+    peak memory at one chunk's worth of offsets instead of the whole file's.
+
+    Walking runs to EOF rather than to the header's declared chunk count, because a dirty
+    file often carries records beyond it.
     """
+    if data[:8] != _EVTX_MAGIC:
+        stats.fatal = "not an evtx file header"
+        return
     total = len(data)
     header = bytearray(data[:_FILE_HEADER_SIZE])
+    struct.pack_into("<Q", header, 8, 0)  # first chunk number
+    struct.pack_into("<Q", header, 16, 0)  # last chunk number
+    struct.pack_into("<H", header, 42, 1)  # number_of_chunks
+    struct.pack_into("<I", header, 124, zlib.crc32(bytes(header[:120])))  # header checksum
+    image_header = bytes(header)
+    seen: set[int] = set()
     chunk_start = _FILE_HEADER_SIZE
     while chunk_start + _CHUNK_HEADER_SIZE <= total:
-        if data[chunk_start : chunk_start + 8] == _CHUNK_MAGIC:
-            struct.pack_into("<Q", header, 8, 0)  # first chunk number
-            struct.pack_into("<Q", header, 16, 0)  # last chunk number
-            struct.pack_into("<I", header, 42, 1)  # number_of_chunks
-            yield bytes(header) + bytes(data[chunk_start : chunk_start + _CHUNK_SIZE])
+        try:
+            scanned = _scan_chunk(data, chunk_start)
+            image = (
+                None
+                if scanned is None
+                else image_header + bytes(data[chunk_start : chunk_start + _CHUNK_SIZE])
+            )
+        except (OSError, struct.error, ValueError, IndexError) as exc:
+            # A read error (damaged media) or unreadable framing costs this chunk only —
+            # the same containment the whole design is built on. Recorded once, then on.
+            stats.chunks_bad += 1
+            if not stats.first_error:
+                stats.first_error = f"scan_error={type(exc).__name__}"
+            chunk_start += _CHUNK_SIZE
+            continue
+        if scanned is None or image is None:
+            stats.chunks_bad += 1
+            chunk_start += _CHUNK_SIZE
+            continue
+        offsets, truncated = scanned
+        stats.chunks_ok += 1
+        if truncated:
+            stats.truncated += 1
+        stats.duplicates += len(seen.intersection(offsets))
+        seen.update(offsets)
+        yield image, offsets
         chunk_start += _CHUNK_SIZE
+
+
+def _scan_record_offsets(data: Any) -> tuple[dict[int, tuple[int, int]], str]:
+    """Whole-file view of ``_scan_chunk``: every record's offset plus the scan note.
+
+    Kept as the readable diagnostic entry point (and for a caller that wants one file's
+    offsets up front); the conversion path itself scans per chunk via ``_iter_chunks`` so
+    duplicate record ids across chunks stay distinguishable.
+    """
+    offsets: dict[int, tuple[int, int]] = {}
+    stats = _ChunkScanStats()
+    for _image, chunk_offsets in _iter_chunks(data, stats):
+        for record_id, located in chunk_offsets.items():
+            offsets.setdefault(record_id, located)
+    return offsets, stats.note()
 
 
 # ---------------------------------------------------------------------------
@@ -2597,6 +2650,9 @@ _RE_SYSTEM_TEXT = re.compile(r"^/Event/System/([\w.-]+)$")
 _RE_USERDATA = re.compile(r"^/Event/UserData((?:/[\w.-]+)+)$")
 
 _MAPS_CACHE: dict[str, Any] | None = None
+
+# Longest value a ``Refine`` regex is run against (see _apply_refine).
+_REFINE_INPUT_LIMIT = 8192
 
 
 def _maps() -> dict[str, Any]:
@@ -2713,7 +2769,16 @@ def _resolve_xpath(root: ET.Element, expr: str) -> str | None:
 
 
 def _apply_refine(value: str, pattern: str) -> str:
-    """Narrow a resolved value with a map's ``Refine`` regex."""
+    """Narrow a resolved value with a map's ``Refine`` regex.
+
+    The input is capped: vendor time validates that a pattern *compiles*, not that it
+    terminates, and EventData is evidence — i.e. attacker-controlled. A catastrophically
+    backtracking upstream pattern on a megabyte-long field would hang the converter, and
+    `re` has no timeout. Refined values are short by nature, so the cap is invisible on
+    real records.
+    """
+    if len(value) > _REFINE_INPUT_LIMIT:
+        value = value[:_REFINE_INPUT_LIMIT]
     try:
         match = re.search(pattern, value, re.DOTALL)
     except re.error:
@@ -2978,8 +3043,6 @@ def _safe_int(value: Any) -> int | None:
 
 def normalize_ip(value: str | None) -> str:
     """Validate and canonicalize a single IPv4/IPv6 address string."""
-    import ipaddress
-
     if not value:
         return ""
     try:
@@ -3150,6 +3213,9 @@ def _build_message(
     provider, whereas the built-in table is keyed by event id alone.
     """
     if map_result:
+        # Every shipped property is in _MAP_PROPERTY_ORDER (asserted at vendor time and in
+        # TestMapsBlob), so a property outside it can only come from a future corpus — it
+        # is appended rather than dropped so a re-vendor cannot silently lose text.
         parts = [map_result[p] for p in _MAP_PROPERTY_ORDER if map_result.get(p)]
         extra = [v for k, v in map_result.items() if k not in _MAP_PROPERTY_ORDER and v]
         rendered = ", ".join(parts + extra)
@@ -3229,10 +3295,15 @@ def build_row(root: ET.Element, no_maps: bool = False) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _looks_like_text_export(head: bytes) -> bool:
+    """True when the leading bytes are XML or JSON rather than an EVTX container."""
+    stripped = head.lstrip()
+    return stripped[:5] in (b"<?xml", b"<Even") or stripped[:1] == b"{"
+
+
 def _reject_text_export(path: Path, head: bytes) -> None:
     """Fail loudly when handed a text export instead of a binary .evtx."""
-    stripped = head.lstrip()
-    if stripped[:5] in (b"<?xml", b"<Even") or stripped[:1] == b"{":
+    if _looks_like_text_export(head):
         raise SystemExit(
             f"error: {path.name} is a text export, not a binary .evtx container.\n"
             "Use evtx2timesketch.py for wevtutil XML and evtx_dump XML/JSONL exports."
@@ -3240,7 +3311,12 @@ def _reject_text_export(path: Path, head: bytes) -> None:
 
 
 def find_evtx_files(input_path: str) -> list[Path]:
-    """Resolve the input into a sorted list of binary .evtx files."""
+    """Resolve the input into a sorted list of binary .evtx files.
+
+    A directory is triage output: one stray file (a text export saved under the wrong
+    extension, a zero-byte placeholder) is reported and skipped rather than aborting the
+    whole collection. A single named file is a deliberate choice, so it still fails hard.
+    """
     path = Path(input_path)
     if path.is_file():
         with path.open("rb") as fh:
@@ -3250,10 +3326,29 @@ def find_evtx_files(input_path: str) -> list[Path]:
             raise SystemExit(f"error: not a binary .evtx file (bad magic): {path}")
         return [path]
     if path.is_dir():
-        files = [p for p in path.rglob("*") if p.is_file() and p.suffix.lower() == ".evtx"]
-        if not files:
+        found = sorted({p for p in path.rglob("*") if p.is_file() and p.suffix.lower() == ".evtx"})
+        if not found:
             raise SystemExit(f"error: no .evtx files found in {input_path}")
-        return sorted(set(files))
+        files = []
+        for candidate in found:
+            with candidate.open("rb") as fh:
+                head = fh.read(8)
+            if head != _EVTX_MAGIC:
+                kind = (
+                    "a text export, not a binary .evtx container (use evtx2timesketch.py)"
+                    if _looks_like_text_export(head)
+                    else "not a binary .evtx file (bad magic)"
+                )
+                sys.stderr.write(f"warning: skipping {candidate}: {kind}\n")
+                continue
+            files.append(candidate)
+        if not files:
+            raise SystemExit(
+                f"error: no binary .evtx files found in {input_path} — every candidate was "
+                "skipped. For wevtutil XML and evtx_dump XML/JSONL exports use "
+                "evtx2timesketch.py."
+            )
+        return files
     raise SystemExit(f"error: input path not found: {input_path}")
 
 
@@ -3369,9 +3464,9 @@ def _convert_evtx(
 ) -> _FileCounts:
     """Parse one memory-mapped .evtx image into the buffer."""
     counts = _FileCounts()
-    offsets, counts.scan_note = _scan_record_offsets(data)
+    stats = _ChunkScanStats()
 
-    for blob in _iter_chunk_blobs(data):
+    for blob, offsets in _iter_chunks(data, stats):
         try:
             records = PyEvtxParser(io.BytesIO(blob)).records()
         except Exception:  # noqa: BLE001 - parser raises bare RuntimeError
@@ -3429,6 +3524,8 @@ def _convert_evtx(
             # extracted or re-chunked log renumbers one but not the other). Both are
             # kept so the offset is explainable from the row alone.
             row["attributes"]["evtx_record_id"] = str(record_id)
+            # Only this chunk's offsets are consulted: a record id duplicated in another
+            # chunk must not resolve to that chunk's record.
             located = offsets.get(record_id)
             if located is not None:
                 offset, size = located
@@ -3445,6 +3542,7 @@ def _convert_evtx(
 
             buffer.append(source_file, file_hash, offset, content_hash, row)
             counts.parsed += 1
+    counts.scan_note = stats.note()
     return counts
 
 
@@ -3466,7 +3564,7 @@ def _parse_file(
     since_dt: datetime.datetime | None = None,
     until_dt: datetime.datetime | None = None,
     no_maps: bool = False,
-) -> tuple[bytes, tuple[int, int, int, int, int, str]]:
+) -> tuple[bytes, tuple[int, int, int, int, int, int, str]]:
     """Worker: parse one .evtx file, return Arrow IPC bytes + counts."""
     sink = io.BytesIO()
     writer_ipc = pa.ipc.new_stream(sink, PARQUET_EVENT_SCHEMA)
@@ -3711,6 +3809,11 @@ def convert(
         nonlocal parsed_total, skipped_total, skipped_by_time_total
         nonlocal offset_fallback_total, chunk_errors_total, sanitized_total
         parsed, skipped, by_time, fallback, chunk_errors, sanitized, note = counts
+        if parsed == 0 and not by_time:
+            # Never silent: a file that contributed nothing is either damaged beyond the
+            # chunk walk or not what it claims to be, and the run still exits 0 as long as
+            # some other file parsed.
+            sys.stderr.write(f"warning: {path_name} yielded no records ({note})\n")
         parsed_total += parsed
         skipped_total += skipped
         skipped_by_time_total += by_time
@@ -3751,21 +3854,22 @@ def convert(
                 pending: collections.deque = collections.deque()
 
                 def _submit_next() -> None:
-                    for path in file_iter:
-                        pending.append(
-                            (
-                                path.name,
-                                pool.submit(
-                                    _parse_file,
-                                    str(path),
-                                    hashes[path],
-                                    since_dt,
-                                    until_dt,
-                                    no_maps,
-                                ),
-                            )
-                        )
+                    path = next(file_iter, None)
+                    if path is None:
                         return
+                    pending.append(
+                        (
+                            path.name,
+                            pool.submit(
+                                _parse_file,
+                                str(path),
+                                hashes[path],
+                                since_dt,
+                                until_dt,
+                                no_maps,
+                            ),
+                        )
+                    )
 
                 for _ in range(workers * 2):
                     _submit_next()

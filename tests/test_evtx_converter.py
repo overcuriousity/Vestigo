@@ -16,6 +16,7 @@ import importlib.util
 import json
 import re
 import struct
+import zlib
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -53,6 +54,23 @@ def _rows(pf: pq.ParquetFile) -> list[dict]:
 
 def _attrs(row: dict) -> dict[str, str]:
     return dict(row["attributes"])
+
+
+def _two_chunk_file(dest: Path) -> Path:
+    """Write a two-chunk .evtx by repeating the fixture's single chunk.
+
+    The fixture is exactly one 4096-byte header plus one 64 KiB chunk, so appending a copy
+    of that chunk produces a structurally valid multi-chunk container — and one whose two
+    chunks carry the *same* record ids, which is what a re-chunked or partially overwritten
+    log looks like.
+    """
+    raw = bytearray(FIXTURE.read_bytes())
+    struct.pack_into("<Q", raw, 8, 0)  # first chunk number
+    struct.pack_into("<Q", raw, 16, 1)  # last chunk number
+    struct.pack_into("<H", raw, 42, 2)  # number_of_chunks
+    struct.pack_into("<I", raw, 124, zlib.crc32(bytes(raw[:120])))
+    dest.write_bytes(bytes(raw) + bytes(raw[4096 : 4096 + 65536]))
+    return dest
 
 
 class TestSpecParity:
@@ -224,16 +242,19 @@ class TestSigmaFieldContract:
         """Map-derived text must never masquerade as a raw Windows field."""
         rows = _rows(_convert(converter, FIXTURE, tmp_path / "out.parquet"))
         for row in rows:
-            for key, value in _attrs(row).items():
+            for key in _attrs(row):
                 if key.startswith("Map"):
                     continue
                 assert not key.startswith("PayloadData"), key
-                del value
 
     def test_reserved_keys_are_prefixed(self, converter):
         assert converter._safe_attr_key("Message") == "evt_Message"
         assert converter._safe_attr_key("file_hash") == "evt_file_hash"
         assert converter._safe_attr_key("TargetUserName") == "TargetUserName"
+
+    def test_reserved_keys_match_the_server_column_set(self, converter):
+        """The converter is a standalone copy of the server's column list — pin it."""
+        assert set(converter._RESERVED_ATTR_KEYS) == TOP_LEVEL_EVENT_COLUMNS
 
 
 class TestByteOffsets:
@@ -299,6 +320,176 @@ class TestChunkScanner:
         assert note == "not an evtx file header"
 
 
+class TestChunkImages:
+    """The per-chunk images handed to the parser, and the multi-chunk path in general."""
+
+    def test_every_chunk_image_is_a_valid_evtx_document(self, converter, tmp_path):
+        """Including the header checksum — a stricter parser must not reject the image."""
+        data = _two_chunk_file(tmp_path / "two.evtx").read_bytes()
+        stats = converter._ChunkScanStats()
+        images = [image for image, _offsets in converter._iter_chunks(data, stats)]
+        assert len(images) == 2
+        for image in images:
+            assert image[:8] == converter._EVTX_MAGIC
+            assert struct.unpack_from("<H", image, 42)[0] == 1, "the image holds one chunk"
+            assert struct.unpack_from("<I", image, 124)[0] == zlib.crc32(image[:120])
+        assert stats.note() == (
+            "chunks_ok=2 chunks_skipped=0 duplicate_record_ids=7 truncated_chunks=0"
+        )
+
+    def test_multi_chunk_file_parses_every_record(self, converter, tmp_path):
+        source = _two_chunk_file(tmp_path / "two.evtx")
+        rows = _rows(_convert(converter, source, tmp_path / "out.parquet"))
+        assert len(rows) == 14
+
+    def test_duplicate_record_ids_keep_distinct_offsets(self, converter, tmp_path):
+        """Two records sharing a record id must not share a forensic identity.
+
+        The server derives ``event_id`` from ``(file_hash, byte_offset, content_hash)``, so
+        a per-file offset join would collapse the second chunk's records onto the first's.
+        """
+        source = _two_chunk_file(tmp_path / "two.evtx")
+        rows = _rows(_convert(converter, source, tmp_path / "out.parquet"))
+        raw = source.read_bytes()
+        # The two chunks are byte-identical copies, so equal content_hashes are correct;
+        # the offsets are what must differ, and event identity is derived from both.
+        assert len({row["byte_offset"] for row in rows}) == 14
+        assert len({(row["byte_offset"], row["content_hash"]) for row in rows}) == 14
+        # Every offset still addresses the record it claims to.
+        for row in rows:
+            size = int(_attrs(row)["record_size"])
+            span = raw[row["byte_offset"] : row["byte_offset"] + size]
+            assert span[:4] == b"\x2a\x2a\x00\x00"
+            assert hashlib.sha256(span).hexdigest() == row["content_hash"]
+        # Both copies of record id 1 are present, at different offsets.
+        first = sorted(r["byte_offset"] for r in rows if _attrs(r)["evtx_record_id"] == "1")
+        assert len(first) == 2
+        assert first[1] - first[0] == 65536
+
+    def test_a_failing_chunk_scan_costs_only_that_chunk(self, converter, monkeypatch, tmp_path):
+        """A read error on damaged media must not end the walk (mmap raises OSError)."""
+        data = _two_chunk_file(tmp_path / "two.evtx").read_bytes()
+        real = converter._scan_chunk
+        calls = []
+
+        def _flaky(buf, chunk_start):
+            calls.append(chunk_start)
+            if len(calls) == 1:
+                raise OSError("simulated read error")
+            return real(buf, chunk_start)
+
+        monkeypatch.setattr(converter, "_scan_chunk", _flaky)
+        stats = converter._ChunkScanStats()
+        images = [image for image, _offsets in converter._iter_chunks(data, stats)]
+        assert len(calls) == 2, "the second chunk was still attempted"
+        assert len(images) == 1
+        assert stats.chunks_ok == 1
+        assert stats.chunks_bad == 1
+        assert "scan_error=OSError" in stats.note()
+
+    def test_footer_reports_the_duplicate_ids(self, converter, tmp_path):
+        source = _two_chunk_file(tmp_path / "two.evtx")
+        pf = _convert(converter, source, tmp_path / "out.parquet")
+        decisions = json.loads(pf.metadata.metadata[converter.META_PARSE_DECISIONS.encode()])
+        assert decisions["chunk_scan"]["two.evtx"] == (
+            "chunks_ok=2 chunks_skipped=0 duplicate_record_ids=7 truncated_chunks=0"
+        )
+        assert decisions["byte_offset_fallback_rows"] == 0
+
+
+class _CapturingBuffer:
+    """Stands in for _BatchBuffer: keeps what the converter appended, writes nothing."""
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[int, str, dict]] = []
+
+    def append(self, source_file, file_hash, byte_offset, content_hash, row) -> None:
+        self.rows.append((byte_offset, content_hash, row))
+
+
+def _stub_parser(converter, monkeypatch, records: list[dict]):
+    """Replace PyEvtxParser so a hand-built record can be pushed through _convert_evtx.
+
+    Byte-patching the fixture is not an option: the parser validates chunk checksums, so a
+    record carrying an XML-illegal byte cannot be produced from real chunk bytes.
+    """
+
+    class _Stub:
+        def __init__(self, _blob) -> None:
+            pass
+
+        def records(self):
+            return iter(records)
+
+    monkeypatch.setattr(converter, "PyEvtxParser", _Stub)
+
+
+_STUB_XML = (
+    '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System>'
+    '<Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4739</EventID>'
+    '<TimeCreated SystemTime="2016-06-29T15:24:34.346Z"/><Channel>Security</Channel>'
+    "<Computer>temporal</Computer></System><EventData>"
+    '<Data Name="DomainPolicyChanged">policy{}value</Data></EventData></Event>'
+)
+
+
+class TestDegradedRecords:
+    def test_illegal_xml_control_char_is_sanitized_not_dropped(self, converter, monkeypatch):
+        data = FIXTURE.read_bytes()
+        known_id = next(iter(converter._scan_record_offsets(data)[0]))
+        _stub_parser(
+            converter,
+            monkeypatch,
+            [{"data": _STUB_XML.format("\x03"), "event_record_id": known_id, "timestamp": ""}],
+        )
+        buffer = _CapturingBuffer()
+        counts = converter._convert_evtx(data, "stub.evtx", "deadbeef", buffer)
+        assert counts.parsed == 1
+        assert counts.sanitized == 1
+        assert counts.skipped == 0
+        _offset, _content_hash, row = buffer.rows[0]
+        attrs = row["attributes"]
+        assert attrs["xml_sanitized"] == "1"
+        assert attrs["DomainPolicyChanged"] == "policy�value"
+        # A sanitized record still resolves to its raw span, so content_hash stays raw.
+        assert "content_hash_basis" not in attrs
+
+    def test_unlocatable_record_falls_back_to_the_record_id(self, converter, monkeypatch):
+        data = FIXTURE.read_bytes()
+        _stub_parser(
+            converter,
+            monkeypatch,
+            [{"data": _STUB_XML.format("-"), "event_record_id": 987654321, "timestamp": ""}],
+        )
+        buffer = _CapturingBuffer()
+        counts = converter._convert_evtx(data, "stub.evtx", "deadbeef", buffer)
+        assert counts.parsed == 1
+        assert counts.offset_fallback == 1
+        offset, content_hash, row = buffer.rows[0]
+        assert offset == 987654321
+        assert row["attributes"]["content_hash_basis"] == "rendered_xml"
+        assert "record_size" not in row["attributes"]
+        assert content_hash == hashlib.sha256(_STUB_XML.format("-").encode()).hexdigest()
+
+    def test_unparseable_record_is_counted_not_written(self, converter, monkeypatch):
+        data = FIXTURE.read_bytes()
+        _stub_parser(converter, monkeypatch, [{"data": "<Event><unclosed>", "event_record_id": 1}])
+        buffer = _CapturingBuffer()
+        counts = converter._convert_evtx(data, "stub.evtx", "deadbeef", buffer)
+        assert counts.parsed == 0
+        assert counts.skipped == 1
+        assert buffer.rows == []
+
+
+class TestRefineInputCap:
+    def test_a_pathological_value_is_truncated_before_matching(self, converter):
+        assert converter._REFINE_INPUT_LIMIT == 8192
+        value = "a" * (converter._REFINE_INPUT_LIMIT + 50) + "TAIL"
+        # The tail is past the cap, so it cannot be matched — that is the point.
+        assert converter._apply_refine(value, "TAIL") == ""
+        assert converter._apply_refine("prefix TAIL", "TAIL") == "TAIL"
+
+
 class TestNoMaps:
     def test_no_maps_drops_map_attributes_but_keeps_rows(self, converter, tmp_path):
         with_maps = _rows(_convert(converter, FIXTURE, tmp_path / "a.parquet"))
@@ -347,6 +538,29 @@ class TestInputHandling:
         empty.mkdir()
         with pytest.raises(SystemExit, match="no .evtx files"):
             converter.convert(str(empty), str(tmp_path / "o.parquet"), 1, False)
+
+    def test_junk_file_in_a_directory_is_warned_about_and_skipped(
+        self, converter, tmp_path, capsys
+    ):
+        """One stray file must not cost the rest of a triage collection."""
+        source = tmp_path / "logs"
+        source.mkdir()
+        (source / "real.evtx").write_bytes(FIXTURE.read_bytes())
+        (source / "export.evtx").write_bytes((DATA / "evtx_text_export.xml").read_bytes())
+        (source / "empty.evtx").write_bytes(b"")
+        rows = _rows(_convert(converter, source, tmp_path / "out.parquet"))
+        assert {row["source_file"] for row in rows} == {"real.evtx"}
+        err = capsys.readouterr().err
+        assert "skipping" in err and "export.evtx" in err
+        assert "evtx2timesketch.py" in err
+        assert "empty.evtx" in err
+
+    def test_directory_of_only_junk_fails(self, converter, tmp_path):
+        source = tmp_path / "logs"
+        source.mkdir()
+        (source / "export.evtx").write_bytes((DATA / "evtx_text_export.xml").read_bytes())
+        with pytest.raises(SystemExit, match="every candidate was skipped"):
+            converter.convert(str(source), str(tmp_path / "o.parquet"), 1, False)
 
 
 class TestParallel:
@@ -404,6 +618,21 @@ class TestSplit:
         assert total == 7
         assert not out.exists()
 
+    def test_size_mode_rotates(self, converter, tmp_path):
+        source = tmp_path / "logs"
+        source.mkdir()
+        for i in range(20):
+            (source / f"log{i:02d}.evtx").write_bytes(FIXTURE.read_bytes())
+        out = tmp_path / "out.parquet"
+        rc = converter.convert(str(source), str(out), 1, False, split="4K")
+        assert rc == 0
+        parts = sorted(tmp_path.glob("out.part*.parquet"))
+        assert len(parts) >= 2
+        rows = [r for p in parts for r in pq.ParquetFile(p).read().to_pylist()]
+        assert len(rows) == 140
+        ref = _convert(converter, source, tmp_path / "ref.parquet")
+        assert rows == ref.read().to_pylist()
+
     def test_invalid_split_fails_before_writing(self, converter, tmp_path):
         out = tmp_path / "out.parquet"
         with pytest.raises(SystemExit, match="invalid --split"):
@@ -422,6 +651,20 @@ def test_time_window_filter(converter, tmp_path):
     assert 0 < len(rows) < 7
     counts = json.loads(pf.metadata.metadata[converter.META_ROW_COUNTS.encode()])
     assert counts["skipped_by_time"] == 7 - len(rows)
+
+
+def test_time_window_until_filter(converter, tmp_path):
+    pf = _convert(
+        converter,
+        FIXTURE,
+        tmp_path / "out.parquet",
+        until="2016-06-29T15:24:35Z",
+    )
+    rows = _rows(pf)
+    assert 0 < len(rows) < 7
+    counts = json.loads(pf.metadata.metadata[converter.META_ROW_COUNTS.encode()])
+    assert counts["skipped_by_time"] == 7 - len(rows)
+    assert all(row["timestamp"].strftime("%H:%M:%S") <= "15:24:35" for row in rows)
 
 
 def test_time_window_excluding_everything_returns_nonzero(converter, tmp_path):

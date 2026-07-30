@@ -87,8 +87,8 @@
         "pyarrow",
         "evtx"
       ],
-      "size_bytes": 240492,
-      "sha256": "7c576c753d5032559bc3cff796f20d6fc627e7ee8d11c7b195100b4bd78696de"
+      "size_bytes": 245203,
+      "sha256": "92ec14d5aee9410aeb32f817b59d3ac12772d6b82bb58fe53096702ed83fea68"
     },
     {
       "name": "filterlog2timesketch",

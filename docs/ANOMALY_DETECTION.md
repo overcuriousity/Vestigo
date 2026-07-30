@@ -1479,13 +1479,28 @@ disposition mechanism.
   `'4624'` — `"04624"` does not match; `|gt`/`|lt` comparisons go through
   `toFloat64OrNull` and treat non-numeric values as no-match.
 
-**Windows event logs need no field translation.** `evtx2vestigo` deliberately
-emits Sigma-canonical names, so a community Windows rule compiles to exactly the
-predicate it looks like and needs no mapping to work: `EventID` (unpadded decimal
-string, per the rule above), `Channel`, `Provider_Name`, and every `EventData`
-field under its native Windows name (`TargetUserName`, `LogonType`,
-`CommandLine`, `NewProcessName`, `Image`, `ParentImage`, `IpAddress`,
-`ServiceName`, `ScriptBlockText`, ...). A stock 4672 rule compiles to
+- **Unsupported constructs** (correlation rules, aggregations) report the
+  rule as `not_applicable` rather than failing the run.
+- **Case-uploaded rules have no ruleset fieldmap.** `vestigo-fieldmap.yml`
+  only applies to rules loaded from the global directory; an uploaded rule
+  resolves fields through the timeline's canonical `field_mappings` and the
+  raw-attribute fallback only. Map fields at the timeline level (or drop the
+  rule into the global directory next to a fieldmap) if an upload needs
+  Sigma-taxonomy field translation.
+- **Global rules are cached per file.** The directory is still re-read on
+  every listing/run (a file drop needs no restart), but a file whose
+  mtime/size are unchanged reuses its parsed form — only changed files pay
+  the YAML/pySigma parse.
+
+### Windows event logs need no field translation
+
+`evtx2vestigo` deliberately emits Sigma-canonical names, so a community Windows
+rule compiles to exactly the predicate it looks like and needs no mapping to
+work: `EventID` (unpadded decimal string, per the caveat above), `Channel`,
+`Provider_Name`, and every `EventData` field under its native Windows name
+(`TargetUserName`, `LogonType`, `CommandLine`, `NewProcessName`, `Image`,
+`ParentImage`, `IpAddress`, `ServiceName`, `ScriptBlockText`, ...). A stock 4672
+rule compiles to
 `attributes['EventID'] = '4672' AND attributes['Channel'] ILIKE 'Security'`.
 
 **Such rules are still flagged as fallback matches, and that is expected.**
@@ -1506,9 +1521,9 @@ declaration, nothing vouches for them:
   with **zero SQL differences and zero match-count differences**. Case-uploaded
   rules have no fieldmap layer, so they are always flagged.
 
-Those 326 rules also compile and run with **zero errors** against
-`evtx2vestigo` output, which is the practical claim: the converter's field names
-are what the community ruleset already addresses.
+Those 326 rules also compile and run with **zero errors** against `evtx2vestigo`
+output, which is the practical claim: the converter's field names are what the
+community ruleset already addresses.
 
 Three further consequences worth knowing:
 
@@ -1520,18 +1535,6 @@ Three further consequences worth knowing:
   should match the underlying Windows field instead.
 - `Execution_ProcessID`/`Execution_ThreadID` carry the `<System>` values, so
   they never collide with Sysmon's `EventData` `ProcessId`.
-- **Unsupported constructs** (correlation rules, aggregations) report the
-  rule as `not_applicable` rather than failing the run.
-- **Case-uploaded rules have no ruleset fieldmap.** `vestigo-fieldmap.yml`
-  only applies to rules loaded from the global directory; an uploaded rule
-  resolves fields through the timeline's canonical `field_mappings` and the
-  raw-attribute fallback only. Map fields at the timeline level (or drop the
-  rule into the global directory next to a fieldmap) if an upload needs
-  Sigma-taxonomy field translation.
-- **Global rules are cached per file.** The directory is still re-read on
-  every listing/run (a file drop needs no restart), but a file whose
-  mtime/size are unchanged reuses its parsed form — only changed files pay
-  the YAML/pySigma parse.
 
 ---
 
