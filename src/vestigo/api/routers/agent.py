@@ -532,7 +532,9 @@ async def _message_stream_inner(
     # streams so a stop can persist what ran and return normally — see the
     # `_cancelled` helper below.
     reservation = _active_turns.get(conversation_id)
-    await store.add_agent_message(conversation_id, "user", payload.content)
+    await store.add_agent_message(
+        conversation_id, "user", payload.content, view_filters=payload.view_filters
+    )
     if not conversation.title:
         await store.update_agent_conversation(conversation_id, title=payload.content[:_TITLE_MAX])
 

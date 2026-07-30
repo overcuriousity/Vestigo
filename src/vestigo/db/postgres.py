@@ -1350,6 +1350,10 @@ class AgentMessage(Base):
     # N result rows in *completion* order, so this id is the only reliable
     # way to pair them back up. NULL on pre-migration rows.
     tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Snapshot of the analyst's Explorer filters at send time (frontend
+    # EventFilters shape); NULL for rows that are not user messages or predate
+    # the column. Context record only — never read back into agent logic.
+    view_filters: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Measured LLM usage for this turn (assistant rows only). NULL = not
     # measured (pre-metering rows, or the endpoint reported no usage) —
     # never an estimate.
@@ -1372,6 +1376,7 @@ class AgentMessage(Base):
             "tool_args": self.tool_args,
             "tool_result": self.tool_result,
             "tool_call_id": self.tool_call_id,
+            "view_filters": self.view_filters,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -4187,6 +4192,7 @@ class PostgresStore:
         tool_args: dict | None = None,
         tool_result: dict | list | None = None,
         tool_call_id: str | None = None,
+        view_filters: dict | None = None,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
     ) -> AgentMessage:
@@ -4200,6 +4206,7 @@ class PostgresStore:
             tool_args=tool_args,
             tool_result=tool_result,
             tool_call_id=tool_call_id,
+            view_filters=view_filters,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )

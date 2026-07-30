@@ -2615,3 +2615,76 @@ def test_reject_story_block_writes_nothing(client, admin_bootstrap, agent_on, st
 
     audit_rows = asyncio.run(store.query_audit(case_id=case_id))
     assert any(a.action == "agent.story_block_reject" for a in audit_rows)
+
+
+@pytest.mark.asyncio
+async def test_user_message_persists_view_filters(store, monkeypatch):
+    """The Explorer filter snapshot sent with a message lands on its row (#205).
+
+    The agent already receives ``view_filters`` per turn for prompt context;
+    persisting it makes the transcript self-describing about what the agent
+    saw per turn, so a mid-investigation filter change is visible in the
+    record instead of silently shifting the agent's ground.
+    """
+    from vestigo.api.routers import agent as agent_router
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    _reserve_turn(agent_router, conversation.id)
+
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None, **kwargs):
+        yield {"type": "text_delta", "text": "ok"}
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    # Measuring the advertised tool schemas builds the query service, which
+    # needs a live ClickHouse; irrelevant to what this test asserts.
+    monkeypatch.setattr(agent_router, "schema_chars_for_scope", lambda scope: 0)
+
+    payload = agent_router.SendMessageRequest(
+        content="look into this", view_filters={"q": "ssh", "tagsInclude": ["auth"]}
+    )
+    async for _ in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    messages = await store.list_agent_messages(conversation.id)
+    user_rows = [m for m in messages if m.role == "user"]
+    assert len(user_rows) == 1
+    assert user_rows[0].view_filters == {"q": "ssh", "tagsInclude": ["auth"]}
+    assert user_rows[0].to_dict()["view_filters"] == {"q": "ssh", "tagsInclude": ["auth"]}
+
+
+@pytest.mark.asyncio
+async def test_user_message_view_filters_defaults_to_none(store, monkeypatch):
+    """A message sent without a snapshot stores NULL, not a fabricated filter set."""
+    from vestigo.api.routers import agent as agent_router
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    _reserve_turn(agent_router, conversation.id)
+
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None, **kwargs):
+        yield {"type": "text_delta", "text": "ok"}
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    # See above: stub the ClickHouse-dependent tool-schema measurement.
+    monkeypatch.setattr(agent_router, "schema_chars_for_scope", lambda scope: 0)
+
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _ in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    user_row = (await store.list_agent_messages(conversation.id))[0]
+    assert user_row.role == "user"
+    assert user_row.view_filters is None
