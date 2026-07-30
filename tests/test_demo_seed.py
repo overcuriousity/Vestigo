@@ -34,34 +34,6 @@ async def test_claim_demo_seed_is_once_only(store):
     assert refreshed.demo_case_seeded_at is not None
 
 
-@pytest.fixture()
-def fake_archive(tmp_path, monkeypatch):
-    """A stand-in archive file — the importer is faked, contents never read."""
-    path = tmp_path / "demo-case.vestigo"
-    path.write_bytes(b"not-a-real-archive")
-    monkeypatch.setattr(demo_mod, "demo_archive_path", lambda: path)
-    return path
-
-
-@pytest.fixture()
-def imports(monkeypatch):
-    """Record import_case calls instead of running one."""
-    calls = []
-
-    async def _fake_import(store, ch_factory, archive_path, *, owner, job_id=None, progress=None):
-        calls.append({"archive": Path(archive_path), "owner": owner.id, "job_id": job_id})
-
-        class _Result:
-            case_id = "case_demo1234"
-            counts = {"events": 3}
-            warnings = []
-
-        return _Result()
-
-    monkeypatch.setattr(demo_mod, "import_case", _fake_import)
-    return calls
-
-
 @pytest.mark.asyncio
 async def test_maybe_seed_dispatches_once(store, fake_archive, imports, monkeypatch):
     await store.init_schema()

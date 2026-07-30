@@ -11,6 +11,8 @@ directly.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
@@ -98,3 +100,40 @@ def as_admin(client: TestClient, admin_bootstrap: dict) -> dict:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["user"]
+
+
+@pytest.fixture()
+def fake_archive(tmp_path, monkeypatch):
+    """Stand in for the packaged demo archive.
+
+    Shared by the demo-seeding tests, which fake ``import_case`` — the file's
+    contents are never read, only its presence, which is what the seeding gate
+    checks.
+    """
+    from vestigo.core import demo_case as demo_mod
+
+    path = tmp_path / "demo-case.vestigo"
+    path.write_bytes(b"not-a-real-archive")
+    monkeypatch.setattr(demo_mod, "demo_archive_path", lambda: path)
+    return path
+
+
+@pytest.fixture()
+def imports(monkeypatch):
+    """Record demo ``import_case`` calls instead of running a real import."""
+    from vestigo.core import demo_case as demo_mod
+
+    calls = []
+
+    async def _fake_import(store, ch_factory, archive_path, *, owner, job_id=None, progress=None):
+        calls.append({"archive": Path(archive_path), "owner": owner.id, "job_id": job_id})
+
+        class _Result:
+            case_id = "case_demo1234"
+            counts = {"events": 3}
+            warnings = []
+
+        return _Result()
+
+    monkeypatch.setattr(demo_mod, "import_case", _fake_import)
+    return calls
