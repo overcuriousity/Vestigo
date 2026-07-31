@@ -278,6 +278,115 @@ async def test_resolve_tags_filter_resolves_only_postgres_side(patched_store):
     assert result.postgres_event_ids == ["ann-evt"]
 
 
+@pytest.mark.asyncio
+async def test_annotated_tag_matches_every_annotated_event(patched_store):
+    """The derived ``annotated`` tag spans annotation types and origins.
+
+    A comment, a detector finding and a human tag are all "somebody touched
+    this event", so all three match — which is what makes the tag mean what
+    its name says rather than "has a tag".
+    """
+    for i, (ann_type, origin) in enumerate(
+        [("tag", "user"), ("comment", "user"), ("anomaly", "system")]
+    ):
+        await patched_store.create_annotation(
+            case_id="c1",
+            source_id="s1",
+            event_id=f"evt{i}",
+            annotation_id=f"a{i}",
+            annotation_type=ann_type,
+            origin=origin,
+            content="whatever",
+        )
+
+    result = await events._resolve_tags_filter("c1", ["s1"], [events.ANNOTATED_TAG])
+    assert sorted(result.postgres_event_ids) == ["evt0", "evt1", "evt2"]
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_matches_nothing_when_nothing_is_annotated(patched_store):
+    result = await events._resolve_tags_filter("c1", ["s1"], [events.ANNOTATED_TAG])
+    assert result.postgres_event_ids == []
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_unions_with_ordinary_tag_values(patched_store):
+    """Asking for ``annotated`` plus a real tag is an OR, like any two tags."""
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="commented",
+        annotation_id="a1",
+        annotation_type="comment",
+        origin="user",
+        content="look at this",
+    )
+    await patched_store.create_annotation(
+        case_id="c2",
+        source_id="s2",
+        event_id="other-case",
+        annotation_id="a2",
+        annotation_type="tag",
+        origin="user",
+        content="suspicious",
+    )
+    result = await events._resolve_tags_filter("c1", ["s1"], [events.ANNOTATED_TAG, "suspicious"])
+    # Scoped to the case and its sources, so the other case's event is absent.
+    assert result.postgres_event_ids == ["commented"]
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_is_not_resolved_when_not_asked_for(patched_store):
+    """It costs a query, so it must only run when the filter names it."""
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="commented",
+        annotation_id="a1",
+        annotation_type="comment",
+        origin="user",
+        content="look at this",
+    )
+    result = await events._resolve_tags_filter("c1", ["s1"], ["suspicious"])
+    assert result.postgres_event_ids == []
+
+
+@pytest.mark.asyncio
+async def test_merged_tags_offers_annotated_only_when_something_is(patched_store, monkeypatch):
+    """The facet appears once the timeline has an annotation, and not before.
+
+    A filter value that is guaranteed to match nothing is noise in the panel,
+    so this follows the same rule as every other value the endpoint returns:
+    offered because something carries it.
+    """
+
+    class _Svc:
+        def list_distinct_parser_tags(self, case_id, source_ids):
+            return ["parser-tag"]
+
+    monkeypatch.setattr(events, "_get_query_service", lambda: _Svc())
+
+    async def _sources(case_id, timeline_id):
+        return ["s1"]
+
+    monkeypatch.setattr(events, "_resolve_timeline_source_ids", _sources)
+
+    before = await events.list_merged_tags("c1", "t1", case=None)
+    assert before["tags"] == ["parser-tag"]
+
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="evt0",
+        annotation_id="a0",
+        annotation_type="comment",
+        origin="user",
+        content="look at this",
+    )
+    after = await events.list_merged_tags("c1", "t1", case=None)
+    assert after["tags"] == [events.ANNOTATED_TAG, "parser-tag"]
+
+
 # ---------------------------------------------------------------------------
 # bulk_annotate_by_filter
 # ---------------------------------------------------------------------------

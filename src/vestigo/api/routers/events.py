@@ -330,6 +330,14 @@ async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[s
 
 _FIELDS_NONE_TOKEN = "__none__"
 
+# A tag every annotated event carries, derived at read time from whether the
+# event has any annotation at all rather than stored as a row of its own. It
+# therefore cannot drift from the annotations it describes: deleting the last
+# annotation removes the tag, and no write path has to remember to maintain it.
+# An analyst is free to also create a real annotation tag with this name; the
+# two populations are unioned, so that is harmless.
+ANNOTATED_TAG = "annotated"
+
 
 def _parse_novelty_fields(fields: str | None) -> list[str] | None:
     """Parse the ``fields`` param for value_novelty scans.
@@ -375,7 +383,16 @@ async def _resolve_tags_filter(
     sigma_ids = await store.list_event_ids_by_annotation_type(
         case_id, source_ids, "sigma", origins=("system",), content_in=tag_values
     )
-    return TagFilter(tag_values=tag_values, postgres_event_ids=list({*ann_ids, *sigma_ids}))
+    # A fourth population, derived rather than stored: every annotated event
+    # carries ANNOTATED_TAG. Nothing writes it, so it can never disagree with
+    # the annotations it describes.
+    annotated_ids: set[str] = set()
+    if ANNOTATED_TAG in tag_values:
+        annotated_ids = set(await store.list_event_ids_with_any_annotation(case_id, source_ids))
+    return TagFilter(
+        tag_values=tag_values,
+        postgres_event_ids=list({*ann_ids, *sigma_ids, *annotated_ids}),
+    )
 
 
 def _intersect_optional(*id_lists: list[str] | None) -> list[str] | None:
@@ -1008,7 +1025,12 @@ async def list_merged_tags(
     ann_tags = await store.list_distinct_tag_contents(case_id, source_ids)
     sigma_tags = await store.list_distinct_sigma_tags(case_id, source_ids)
     parser_tags = await run_in_threadpool(service.list_distinct_parser_tags, case_id, source_ids)
-    return {"tags": sorted(set(ann_tags) | set(sigma_tags) | set(parser_tags))}
+    tags = set(ann_tags) | set(sigma_tags) | set(parser_tags)
+    # Offered only when something in this timeline actually carries it, like
+    # every other value here — a facet that always matches nothing is noise.
+    if await store.list_event_ids_with_any_annotation(case_id, source_ids):
+        tags.add(ANNOTATED_TAG)
+    return {"tags": sorted(tags)}
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")

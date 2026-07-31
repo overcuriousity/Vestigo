@@ -1,9 +1,36 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 139 — per-request migrations, and codes in the journal).
+Last updated: 2026-07-31 (session 140 — the derived `annotated` tag).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 140 — 2026-07-31: every annotated event says so, without a row saying it
+
+**Why.** Asked for: an event that anyone or anything annotates should also carry a tag
+`annotated`. The interesting part was choosing *where* it lives.
+
+There are two independent tagging systems sharing one UI panel — `events.tags`, an
+`Array(String)` written once by the parser at ingest, and annotation rows in Postgres with
+`annotation_type="tag"`. The first was never an option: adding to it means an
+`ALTER TABLE … UPDATE` mutation over an already-ingested event, which rewrites whole parts
+and breaks the invariant that the ingested record is immutable and hash-identified.
+
+That left a stored tag row versus a derived one, and stored loses on every axis. The marker
+would itself be an annotation (recursion), would need an idempotency check, would need
+cleanup when the last real annotation is deleted or else it lies, and would add a row per
+event to every bulk detector write. Derived has none of that: `ANNOTATED_TAG` is resolved
+from "does this event have any annotation", so it is correct by construction and there is no
+write path to get wrong.
+
+- `list_event_ids_with_any_annotation` — deliberately unfiltered by type or origin. A
+  comment, an agent proposal and a detector finding all count, which is what makes the tag
+  mean what its name says rather than "has a tag".
+- `_resolve_tags_filter` unions those ids in as a fourth tag population, and only when the
+  filter actually names the tag — it costs a query.
+- The merged-tags facet offers it once the timeline has an annotation, following the same
+  rule as every other value there.
+- The grid renders the chip from the annotations it already holds, so no extra fetch.
 
 ## Session 139 — 2026-07-31: two things a deployment's own log showed
 

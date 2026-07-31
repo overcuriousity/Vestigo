@@ -4866,6 +4866,26 @@ class PostgresStore:
             )
             return [row[0] for row in result.all()]
 
+    async def list_event_ids_with_any_annotation(
+        self, case_id: str, source_ids: list[str]
+    ) -> list[str]:
+        """Return the event_ids carrying at least one annotation of any kind.
+
+        Deliberately unfiltered by type or origin: this backs the derived
+        ``annotated`` tag, which means "somebody or something has touched this
+        event" — a human tag, a comment, an agent proposal or a detector
+        finding all count.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.event_id)
+                .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
+                .distinct()
+            )
+            return [row[0] for row in result.all()]
+
     # ------------------------------------------------------------------
     # Users
     # ------------------------------------------------------------------

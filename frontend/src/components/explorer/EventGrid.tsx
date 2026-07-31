@@ -20,7 +20,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
 import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
-import { isAnalystAnnotation } from "@/api/types";
+import { ANNOTATED_TAG, isAnalystAnnotation } from "@/api/types";
 import { useUserNames } from "@/hooks/useUserNames";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
@@ -546,6 +546,11 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                   {t}
                 </Badge>
               ))}
+              {anns.length > 0 && (
+                <Badge variant="muted" className="text-xs py-0.5 px-1.5 shrink-0">
+                  {ANNOTATED_TAG}
+                </Badge>
+              )}
               {userTags.map((t) => (
                 <Badge key={t.id} variant="accent" className="text-xs py-0.5 px-1.5 shrink-0">
                   {t.content}

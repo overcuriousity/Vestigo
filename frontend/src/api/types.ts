@@ -243,6 +243,14 @@ export function isAnalystAnnotation(a: Pick<Annotation, "origin">): boolean {
   return a.origin === "user" || a.origin === "agentic-analysis";
 }
 
+/**
+ * Tag carried by every annotated event. Derived on both sides rather than
+ * stored: the backend resolves it when filtering, and the grid renders it from
+ * the annotations it already has, so it cannot disagree with them. Keep the
+ * value in step with `ANNOTATED_TAG` in `api/routers/events.py`.
+ */
+export const ANNOTATED_TAG = "annotated";
+
 export interface Job {
   id: string;
   kind: string;
