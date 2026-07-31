@@ -193,6 +193,15 @@ which caps at `MAX_LIST_ROWS` and reports **`returned` alongside `total`** —
 a silently partial set the model reasons over as whole is exactly what the
 system prompt's evidence rule forbids.
 
+`read_story` is the one read whose payload is prose rather than records, and
+it is budgeted differently for that reason: markdown is capped per block
+(`STORY_TEXT_TRUNCATE`) *and* per response (`STORY_TEXT_BUDGET`), spent in
+document order so a long story degrades block by block while every block still
+returns its id/kind/origin. Any cut carries `truncated: true` and the real
+`text_length`, with `truncated_blocks` on the response. The earlier cap
+(`ATTR_VALUE_TRUNCATE * 8`, 1600 chars) treated a report the analyst may write
+up to 256 KiB of as if it were an attribute value, and cut it unmarked.
+
 `propose_finding`'s `FilterSpec` uses the exact Explorer filter shape
 (including `annotated`, `annotation_tag_value`, `run_id`, `event_ids`,
 `collapse_routine`); the backend echoes the current hit count and the

@@ -76,6 +76,19 @@ MAX_PROPOSAL_EVENTS = 500
 # a silently partial set, which is exactly what the evidence rule forbids.
 MAX_LIST_ROWS = 200
 
+# read_story's markdown budget. A story's narrative is not incidental string
+# data like an attribute value — it is the document the agent is asked to
+# reason about and to continue writing, and a write accepts up to
+# VESTIGO_STORY_MAX_MARKDOWN_BYTES (256 KiB). Reading it back at the old
+# ATTR_VALUE_TRUNCATE * 8 (1600 chars) silently cut ordinary prose blocks, so
+# the cap is per-block *and* per-response: one long block cannot eat the whole
+# response, and a long story degrades block by block instead of all at once.
+# Every cut is stamped (`truncated`, `text_length`) — an unmarked cut is the
+# failure mode that matters, because the model then reasons over half a
+# paragraph believing it read the block.
+STORY_TEXT_TRUNCATE = 8000
+STORY_TEXT_BUDGET = 24000
+
 # A9: viz-tool result caps — tighter than the Visualize page's own bounds
 # (e.g. field_scatter's UI cap is 20000 points, series_limit up to 50) since
 # viz series are dense and every row/point/cell counts against the model's
@@ -2018,10 +2031,16 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     async def read_story(story_id: str) -> dict[str, Any]:
         """Read a story's blocks in document order.
 
-        Markdown blocks carry their text (truncated at the usual cap); embed
-        blocks carry their reference — resolve a view/chart/event through the
-        matching read tools rather than expecting inline data here. Long
-        stories are capped at the usual listing limit and say so.
+        Markdown blocks carry their text; embed blocks carry their reference —
+        resolve a view/chart/event through the matching read tools rather than
+        expecting inline data here. Long stories are capped at the usual
+        listing limit and say so.
+
+        A markdown block long enough to exhaust the response's text budget
+        comes back cut, marked `"truncated": true` with the full
+        `text_length`. Treat such a block as unread rather than summarizing
+        it: the tail is not retrievable here, and the analyst's own document
+        is the authority on what it says.
         """
         from vestigo.api.deps import get_store
 
@@ -2033,7 +2052,32 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # Individual markdown text was capped but the block *list* was not, so
         # a long report could return hundreds of entries into the context.
         shown = blocks[:MAX_LIST_ROWS]
-        return {
+
+        # Markdown is spent against a shared budget in document order: the
+        # blocks a reader would reach first are the ones that arrive whole,
+        # and a story that outruns the budget still returns every block's
+        # id/kind/origin — structure the model can act on (and re-read one
+        # block through the analyst's own surfaces) rather than a list that
+        # stops early.
+        remaining = STORY_TEXT_BUDGET
+        out_blocks: list[dict[str, Any]] = []
+        truncated_blocks = 0
+        for b in shown:
+            content: dict[str, Any]
+            if b.kind == "markdown":
+                text = b.content.get("text", "") or ""
+                limit = min(STORY_TEXT_TRUNCATE, remaining)
+                content = {"text": text[:limit]}
+                if len(text) > limit:
+                    content["truncated"] = True
+                    content["text_length"] = len(text)
+                    truncated_blocks += 1
+                remaining = max(0, remaining - limit)
+            else:
+                content = dict(b.content)
+            out_blocks.append({"id": b.id, "kind": b.kind, "origin": b.origin, "content": content})
+
+        result: dict[str, Any] = {
             "story": {
                 "id": story.id,
                 "title": story.title,
@@ -2041,20 +2085,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             },
             "block_count": len(blocks),
             "returned": len(shown),
-            "blocks": [
-                {
-                    "id": b.id,
-                    "kind": b.kind,
-                    "origin": b.origin,
-                    "content": (
-                        {"text": _truncate(b.content.get("text", ""), ATTR_VALUE_TRUNCATE * 8)}
-                        if b.kind == "markdown"
-                        else b.content
-                    ),
-                }
-                for b in shown
-            ],
+            "blocks": out_blocks,
         }
+        if truncated_blocks:
+            result["truncated_blocks"] = truncated_blocks
+        return result
 
     @server.tool()
     async def list_dispositions(

@@ -1,9 +1,39 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 142 — a saved chart keeps the filters it was built under).
+Last updated: 2026-07-31 (session 143 — read_story stops cutting the report unmarked).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 143 — 2026-07-31: the agent read the report through a keyhole
+
+**Why.** Noticed while looking at the story tools: `read_story` truncated each markdown block
+at `ATTR_VALUE_TRUNCATE * 8` — 1600 characters, roughly 400 tokens — while
+`propose_story_block` accepts up to `VESTIGO_STORY_MAX_MARKDOWN_BYTES` (256 KiB). The read was
+capped at 0.6% of what the write allows, so ordinary prose (a few paragraphs) came back cut.
+
+**What made it a correctness bug, not a tuning one.** The cut was unmarked. `_truncate`
+appends "…" and nothing else, so the payload said nothing about a block being partial, and
+there is no `read_story_block` and no offset — the tail is unreachable through any agent
+surface. A model asked to summarize or continue the analyst's narrative therefore reasoned
+over half a paragraph believing it had read the block, which is precisely what the system
+prompt's evidence rule forbids elsewhere (the `_listing` tools have always reported `returned`
+alongside `total` for exactly this reason). The agent also could not read back what it had
+itself written.
+
+**Shape of the fix.** Markdown gets its own budget, because it is the document under
+discussion rather than incidental string data like an attribute value: capped per block
+(`STORY_TEXT_TRUNCATE = 8000`) and per response (`STORY_TEXT_BUDGET = 24000`), spent in
+document order. One enormous block can no longer eat the whole response, a long story degrades
+block by block instead of all at once, and every block still returns its id/kind/origin —
+structure the model can act on beats a list that stops early. Every cut now carries
+`truncated: true` and the real `text_length`, with `truncated_blocks` on the response, and the
+docstring tells the model to treat a cut block as unread rather than summarize it.
+
+Not done, deliberately: paginated block reads. The honest marker plus a cap that fits real
+prose covers the reported problem; a `read_story_block(block_id, offset)` is only worth adding
+if the agent is asked to revise long reports, and that is a design question about write
+parity, not a truncation fix.
 
 ## Session 142 — 2026-07-31: a saved chart is the slice it was built over
 

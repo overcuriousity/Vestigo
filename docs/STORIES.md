@@ -358,7 +358,11 @@ The agent can do what an analyst can do: read directly, write through
 propose→confirm. See `docs/AGENT.md` for the tool registry and deny layers.
 
 - `list_stories` / `read_story` — read tools; also exposed on the external
-  `/mcp` endpoint.
+  `/mcp` endpoint. `read_story` returns markdown under a per-block and
+  per-response budget (`STORY_TEXT_TRUNCATE` / `STORY_TEXT_BUDGET`), and marks
+  every cut with `truncated`/`text_length` — the agent has no way to fetch a
+  cut block's tail, so a cut it cannot see is a cut it would summarize as the
+  whole block.
 - `propose_story_block(story_id, block_kind, content, after_block_id?,
   rationale)` — conversation-bound, records an `AgentProposal`
   (`kind="story_block"`, target in `payload`) and writes nothing. Confirming
