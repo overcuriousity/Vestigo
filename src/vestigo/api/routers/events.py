@@ -336,6 +336,15 @@ _FIELDS_NONE_TOKEN = "__none__"
 # annotation removes the tag, and no write path has to remember to maintain it.
 # An analyst is free to also create a real annotation tag with this name; the
 # two populations are unioned, so that is harmless.
+#
+# Not to be confused with the ``annotated`` *filter field* a few lines down (and
+# its ``FilterSpec`` twin), which selects by annotation **type**:
+# ``annotated=["tag"]`` means "has a tag annotation", while
+# ``tags_include=["annotated"]`` means "carries this derived tag". Same word,
+# different axis.
+#
+# Served to the frontend on ``/api/health`` (``annotated_tag``) rather than
+# mirrored there, because a renamed tag stops matching without raising anything.
 ANNOTATED_TAG = "annotated"
 
 
@@ -1028,7 +1037,7 @@ async def list_merged_tags(
     tags = set(ann_tags) | set(sigma_tags) | set(parser_tags)
     # Offered only when something in this timeline actually carries it, like
     # every other value here — a facet that always matches nothing is noise.
-    if await store.list_event_ids_with_any_annotation(case_id, source_ids):
+    if await store.has_any_annotation(case_id, source_ids):
         tags.add(ANNOTATED_TAG)
     return {"tags": sorted(tags)}
 

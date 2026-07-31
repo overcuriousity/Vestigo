@@ -238,14 +238,37 @@ def _redact_url(url: str | None) -> str:
 # a flaw — but uvicorn's access log writes the full query string, so without
 # this every login puts a live credential into the system journal, which is
 # routinely readable by more people than the session store is.
+#
+# This is a *name list*, not a heuristic: a parameter whose name is not here is
+# logged in full. Anything added to the API that puts a secret in a query string
+# has to be added here too — lowercase, since matching folds case.
 _SECRET_QUERY_PARAMS = frozenset(
-    {"code", "state", "token", "access_token", "id_token", "refresh_token", "session_state"}
+    {
+        "code",
+        "state",
+        "token",
+        "access_token",
+        "id_token",
+        "refresh_token",
+        "session_state",
+        "client_secret",
+        "agent_token",
+        "api_key",
+        "apikey",
+        "password",
+        "signature",
+    }
 )
 REDACTED = "***"
 
 
 def redact_query(target: str) -> str:
     """Replace the value of every sensitive query parameter in ``target``.
+
+    Matching is on the whole parameter name, folded to lowercase — a sensitive
+    name appearing as a *substring* of another parameter is not a match, and a
+    provider that capitalizes ``Code`` does not slip through. Only names in
+    ``_SECRET_QUERY_PARAMS`` are redacted; nothing is inferred from the value.
 
     Args:
         target: A request target, with or without a query string.
@@ -261,7 +284,8 @@ def redact_query(target: str) -> str:
     parts = []
     for pair in query.split("&"):
         name, eq, _value = pair.partition("=")
-        parts.append(f"{name}={REDACTED}" if eq and name in _SECRET_QUERY_PARAMS else pair)
+        secret = eq and name.lower() in _SECRET_QUERY_PARAMS
+        parts.append(f"{name}={REDACTED}" if secret else pair)
     return f"{path}?{'&'.join(parts)}"
 
 
@@ -610,6 +634,11 @@ def create_app() -> FastAPI:
         # working.
         caps = await get_capabilities()
         body["capabilities"] = caps
+        # Served rather than mirrored: the tag is a filter token the resolver
+        # and the grid must name identically, and a copy hardcoded in the
+        # frontend would drift silently — a renamed tag stops matching without
+        # raising anything. Outside `capabilities`, which is bool-only.
+        body["annotated_tag"] = events.ANNOTATED_TAG
         body["embeddings_available"] = caps["embeddings"]
         body["agent_available"] = caps["agent"]
         body["mcp_enabled"] = caps["mcp"]

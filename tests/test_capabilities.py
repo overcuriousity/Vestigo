@@ -39,6 +39,27 @@ def test_capabilities_require_a_session(client, admin_bootstrap):
     assert "capabilities" in client.get("/api/health").json()
 
 
+def test_health_names_the_annotated_tag(client, admin_bootstrap):
+    """The derived tag is served, not mirrored in the frontend.
+
+    `frontend/src/api/health.ts::useAnnotatedTag` reads this and deliberately
+    has no fallback literal: the resolver (`_resolve_tags_filter`) and the
+    grid chip must name one tag, and a renamed tag stops matching silently
+    rather than raising, so a second copy would drift undetected.
+
+    It sits beside `capabilities` rather than inside it — that dict is
+    bool-only and its key set is pinned above.
+    """
+    from vestigo.api.routers import events
+
+    assert "annotated_tag" not in client.get("/api/health").json()
+
+    as_admin(client, admin_bootstrap)
+    body = client.get("/api/health").json()
+    assert body["annotated_tag"] == events.ANNOTATED_TAG
+    assert "annotated_tag" not in body["capabilities"]
+
+
 def test_legacy_flat_flags_mirror_capabilities(client, admin_bootstrap):
     """Older clients read the flat keys; they must not disagree."""
     as_admin(client, admin_bootstrap)

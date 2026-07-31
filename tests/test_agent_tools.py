@@ -2396,6 +2396,31 @@ async def test_read_story_returns_ordinary_prose_whole(store):
     assert "truncated_blocks" not in payload
 
 
+async def test_read_story_charges_the_budget_only_for_text_taken(store):
+    """A short block costs its own length, not the per-block cap.
+
+    Charging every block ``STORY_TEXT_TRUNCATE`` regardless of how much it
+    actually holds exhausts the response budget after three paragraphs and
+    hands back later blocks as empty and ``truncated`` — the model is then told
+    to treat a complete block as unread, which is the exact failure the marker
+    exists to prevent.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    para = "The lateral movement began at 02:14. " * 5  # ~185 chars
+    for i in range(10):
+        await store.create_story_block(story.id, f"b{i}", "markdown", {"text": para}, user="alice")
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    assert len(payload["blocks"]) == 10
+    for block in payload["blocks"]:
+        assert block["content"]["text"] == para
+        assert "truncated" not in block["content"]
+    assert "truncated_blocks" not in payload
+
+
 async def test_read_story_stamps_every_cut(store):
     """An unmarked cut is the failure that matters: the model summarizes half
     a paragraph believing it read the block. Cuts carry `truncated` and the

@@ -1,9 +1,59 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 143 — read_story stops cutting the report unmarked).
+Last updated: 2026-07-31 (session 144 — review of the 1.9.0 branch, fixed in place).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 144 — 2026-07-31: reviewing the release branch against itself
+
+**Why.** A read of PR 212 before cutting 1.9.0. Four of the findings were in code sessions
+139–143 had just written, which is the useful kind: each is a case where the reasoning was
+right and one line of the implementation did not follow it.
+
+- **`read_story` spent its budget on the cap, not the text.** `remaining` was decremented by
+  `min(STORY_TEXT_TRUNCATE, remaining)` rather than by the characters actually taken, so a
+  200-character paragraph cost 8000. Four short blocks exhausted a 24000 budget and the
+  fourth came back empty and `truncated` — the marker session 143 added precisely so the
+  model would treat a cut block as unread, now firing on a complete one. The three tests
+  written with it all used full-size blocks, where the two numbers are equal; a test with ten
+  short blocks pins it.
+
+- **The merged-tags facet materialized the whole annotation table to ask a yes/no question.**
+  `list_event_ids_with_any_annotation` was called for its truthiness on the endpoint the
+  filter panel hits constantly. `has_any_annotation` is the same question as a `LIMIT 1`. (The
+  *filter* path genuinely needs the ids and is unchanged — and is no worse than any other tag
+  filter, since `bulk_annotate_by_filter` is uncapped and a bulk-tagged value reaches the same
+  size.)
+
+- **A chart's stored filters had two writers and one format.** Session 142 taught the backend
+  to carry `collapseRoutine`/`eventIds`/`runId` — "dropping them silently *widens* a chart's
+  scope" — but the frontend's `filtersToViewPayload` neither writes nor reads them. So the
+  analyst's Save on an agent chart scoped to a detector run stored the whole timeline, and a
+  chart the backend wrote drew wider on screen than the same chart frozen into its export:
+  the screen-versus-report divergence session 142 existed to close, reappearing on the agent
+  path. Fixed in a chart-only layer (`chartFiltersToStored` / `parseStoredChartFilters`) so
+  saved Views, which deliberately never freeze `collapseRoutine`, are untouched. The
+  "Open in Visualize" link stays lossy for those three — they have no URL form by design —
+  and `STORIES.md` now says so.
+
+  The same change replaced `hasActiveFilters` as the persistence gate. It is a *chip* helper
+  and omits `excludeTag` and `annotationTagValue`, so a chart whose only narrowing was an
+  excluded tag stored no filters at all. The gate is now "did anything survive
+  normalization", which cannot drift from what is actually stored.
+
+- **`ANNOTATED_TAG` is served, not mirrored.** Session 140 left the string hardcoded on both
+  sides under a "keep in step" comment; a rename would have stopped the filter matching
+  without raising anything. `/api/health` now names it (`annotated_tag`, beside
+  `capabilities`, which is bool-only) and `useAnnotatedTag` reads it with **no fallback
+  literal** — a default would be the second copy this removes. The chip waits for health
+  rather than guessing.
+
+Also: the access-log redactor's name list is wider and folds case (an IdP that capitalizes
+`Code` would have slipped through a list built for one provider); the `annotated` tag value
+versus the `annotated` filter *field* — same word, different axis — is called out in
+`MODEL_REFINEMENT.md` and at the constant; and a router-level test pins that the resolved ids
+actually reach `EventQuery`, which every previous test stopped short of.
 
 ## Session 143 — 2026-07-31: the agent read the report through a keyhole
 

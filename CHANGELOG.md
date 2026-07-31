@@ -54,6 +54,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OIDC discovery follows redirects**, which a Nextcloud IdP needs; it previously answered
   every SSO click with a 500.
 
+- **A saved chart is now the slice it was built over.** `SavedChart.config` held chart shape
+  only, so a chart built with Explorer filters active redrew over the whole timeline
+  everywhere it was reused — the story block, the frozen export, the "Open in Visualize"
+  link — showing precisely the data the analyst had excluded. The filters travel with the
+  chart now, including the scopings only an agent's `ChartSpec` can carry (a detector run,
+  an explicit event set, routine collapse), so the card, the export and the rail agree by
+  construction. Charts saved before this have no filters to recover; re-save them from the
+  filtered view.
+
+- **A story's chart block opens *that* chart.** "Open in Visualize" navigated to the right
+  timeline and then drew a default chart with the preset picker open, because the Visualize
+  page reads its entire state from `c_*` URL params and the link carried none of them.
+
+- **`read_story` no longer cuts the analyst's report unmarked.** Markdown blocks were
+  truncated at 1600 characters — 0.6% of what a write accepts — with no marker, so the agent
+  summarized half a paragraph believing it had read the block. Markdown now has its own
+  per-block and per-response budget, every cut carries `truncated` and the real
+  `text_length`, and short blocks are charged only what they hold.
+
 ## [1.8.6] — 2026-07-30
 
 ### Added

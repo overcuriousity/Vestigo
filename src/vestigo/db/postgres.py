@@ -4886,6 +4886,26 @@ class PostgresStore:
             )
             return [row[0] for row in result.all()]
 
+    async def has_any_annotation(self, case_id: str, source_ids: list[str]) -> bool:
+        """Whether anything in this scope carries an annotation at all.
+
+        Same unfiltered-by-type-or-origin question as
+        :py:meth:`list_event_ids_with_any_annotation`, asked where only the
+        answer matters — the merged-tags facet, which offers the derived
+        ``annotated`` tag once the timeline has earned it. Materializing every
+        annotated event_id to test a list for emptiness costs the whole
+        annotation table on an endpoint the filter panel hits constantly.
+        """
+        from sqlalchemy import literal, select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(literal(1))
+                .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
+                .limit(1)
+            )
+            return result.first() is not None
+
     # ------------------------------------------------------------------
     # Users
     # ------------------------------------------------------------------

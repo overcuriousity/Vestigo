@@ -2559,9 +2559,7 @@ def test_confirm_story_block_legacy_spec_keeps_its_base_filters(
 
     blocks = asyncio.run(store.list_story_blocks("s1"))
     assert len(blocks) == 1
-    chart = asyncio.run(
-        store.get_saved_chart(case_id, timeline_id, blocks[0].content["chart_id"])
-    )
+    chart = asyncio.run(store.get_saved_chart(case_id, timeline_id, blocks[0].content["chart_id"]))
     assert chart is not None
     assert chart.config["filters"] == {"q": "ssh"}
 

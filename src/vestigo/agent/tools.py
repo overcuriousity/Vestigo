@@ -2066,13 +2066,16 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             content: dict[str, Any]
             if b.kind == "markdown":
                 text = b.content.get("text", "") or ""
-                limit = min(STORY_TEXT_TRUNCATE, remaining)
-                content = {"text": text[:limit]}
-                if len(text) > limit:
+                taken = text[: min(STORY_TEXT_TRUNCATE, remaining)]
+                content = {"text": taken}
+                if len(text) > len(taken):
                     content["truncated"] = True
                     content["text_length"] = len(text)
                     truncated_blocks += 1
-                remaining = max(0, remaining - limit)
+                # Spend what was actually taken, not the cap: charging every
+                # block the full per-block limit would exhaust the budget after
+                # three short paragraphs and report whole blocks as cut.
+                remaining -= len(taken)
             else:
                 content = dict(b.content)
             out_blocks.append({"id": b.id, "kind": b.kind, "origin": b.origin, "content": content})

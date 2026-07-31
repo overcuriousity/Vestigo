@@ -327,6 +327,21 @@ def test_access_log_leaves_ordinary_query_strings_alone():
     assert redact_query("/api/x?encoded=1") == "/api/x?encoded=1"
 
 
+def test_access_log_redaction_folds_case_and_covers_more_than_oidc():
+    """The guarantee is a name list, so the list has to be the wide one.
+
+    An IdP that capitalizes its parameter, or any endpoint that grows a
+    secret-bearing query, would otherwise log the value verbatim — the same
+    failure as the OIDC code, discovered again later.
+    """
+    from vestigo.api.main import redact_query
+
+    assert redact_query("/cb?Code=abc&STATE=def") == "/cb?Code=***&STATE=***"
+    assert redact_query("/x?client_secret=s&api_key=k") == "/x?client_secret=***&api_key=***"
+    # A bare flag with no `=` is left alone rather than gaining a value.
+    assert redact_query("/x?code") == "/x?code"
+
+
 def test_listing_cases_does_not_run_migrations(client, admin_bootstrap, monkeypatch):
     """Schema upgrades belong to startup, not to the hottest endpoint.
 

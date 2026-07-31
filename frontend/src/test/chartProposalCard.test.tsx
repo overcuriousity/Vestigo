@@ -212,6 +212,29 @@ describe("ChartProposalCard", () => {
     });
   });
 
+  it("Save keeps the scoping only an agent chart can carry", async () => {
+    // A chart scoped to one detector run's events is the sharpest case: drop
+    // `run_id`/`event_ids` on Save and the analyst keeps a chart over the whole
+    // timeline, having clicked Save on a card showing a handful of events.
+    renderCard({
+      chart_type: "bar",
+      field: "artifact",
+      filters: { run_id: "run-7", event_ids: ["evt-1"], collapse_routine: true },
+    } as AgentChartSpec);
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+    fireEvent.change(screen.getByPlaceholderText("Save as…"), {
+      target: { value: "run 7" },
+    });
+    fireEvent.click(screen.getByLabelText("Save chart"));
+    await waitFor(() => expect(savedChartsCreateMock).toHaveBeenCalled());
+    const config = savedChartsCreateMock.mock.calls[0][3] as Record<string, unknown>;
+    expect(config.filters).toMatchObject({
+      runId: "run-7",
+      eventIds: ["evt-1"],
+      collapseRoutine: true,
+    });
+  });
+
   it("Open in Visualize link carries the mapped chart-config params", async () => {
     renderCard({ kind: "numeric", field: "attr:bytes" });
     await waitFor(() => expect(fieldNumericMock).toHaveBeenCalled());

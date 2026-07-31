@@ -243,14 +243,6 @@ export function isAnalystAnnotation(a: Pick<Annotation, "origin">): boolean {
   return a.origin === "user" || a.origin === "agentic-analysis";
 }
 
-/**
- * Tag carried by every annotated event. Derived on both sides rather than
- * stored: the backend resolves it when filtering, and the grid renders it from
- * the annotations it already has, so it cannot disagree with them. Keep the
- * value in step with `ANNOTATED_TAG` in `api/routers/events.py`.
- */
-export const ANNOTATED_TAG = "annotated";
-
 export interface Job {
   id: string;
   kind: string;
@@ -949,6 +941,14 @@ export interface HealthResponse {
   agent_available?: boolean;
   /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
   mcp_enabled?: boolean;
+  /**
+   * The tag every annotated event carries, derived at read time rather than
+   * stored (`ANNOTATED_TAG` in `api/routers/events.py`). Served instead of
+   * mirrored so the resolver and the grid cannot end up naming different
+   * tags — a copy here would drift silently, since a renamed tag stops
+   * matching without raising anything.
+   */
+  annotated_tag?: string;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */

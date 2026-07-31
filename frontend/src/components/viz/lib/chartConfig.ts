@@ -10,7 +10,6 @@
  */
 import type { CompareTimeResponse, EventFilters, HistogramResponse } from "@/api/types";
 import { filtersToParams, filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
-import { hasActiveFilters } from "@/lib/fieldFilters";
 import type { Metric } from "./transforms";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
@@ -275,27 +274,66 @@ export function histogramToCompare(h: HistogramResponse): CompareTimeResponse {
   };
 }
 
+/**
+ * Serialize a chart's primary filter layer for storage.
+ *
+ * Built on `filtersToViewPayload` — the same normalization a saved View uses,
+ * which is what lets the backend read both with one translator
+ * (`stories/export.py::_filter_payload_to_spec`) — with two deliberate
+ * differences, both scoped to charts so saved Views keep behaving exactly as
+ * they do today:
+ *
+ * 1. **Defaults are dropped.** A View payload always writes every key, `null`
+ *    or `false` or empty. A chart writes only what narrows, so "unfiltered"
+ *    and "saved before filters were captured" are the same bytes (no `filters`
+ *    key at all) and neither can read as the other.
+ * 2. **Three agent-only members travel too.** `eventIds`, `runId` and
+ *    `collapseRoutine` have no URL representation — the Explorer cannot
+ *    produce them and a View deliberately does not freeze `collapseRoutine`,
+ *    since it derives from live dispositions. An agent's `ChartSpec` *can*
+ *    carry all three, and `_spec_filters_to_payload` writes them, so dropping
+ *    them here would silently widen a chart the agent had scoped: the saved
+ *    chart, the story card and the frozen export would each show more than the
+ *    card the analyst clicked Save on.
+ *
+ * Returns `null` when nothing narrows.
+ */
+function chartFiltersToStored(filters: EventFilters): Record<string, unknown> | null {
+  const payload = filtersToViewPayload(filters);
+  const stored: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === null || value === undefined || value === false) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    if (typeof value === "object" && Object.keys(value).length === 0) continue;
+    stored[key] = value;
+  }
+  // Deliberately not in `filtersToViewPayload`: see (2) above.
+  if (filters.ids?.length) stored.eventIds = [...filters.ids];
+  if (filters.anomalyRunId) stored.runId = filters.anomalyRunId;
+  if (filters.collapseRoutine) stored.collapseRoutine = true;
+  return Object.keys(stored).length > 0 ? stored : null;
+}
+
 /** Shape a ChartConfig for storage (saved charts): compare filters go
  * through the same View payload normalization the Views feature uses.
  *
  * *filters* is the primary layer — the Explorer filters the chart was built
  * under. They are stored as a sibling key rather than inside `ChartConfig`
  * because on the live page the URL owns them (see `parseStoredChartFilters`),
- * and are omitted entirely when empty so an unfiltered chart stores exactly
- * what it stored before this key existed. */
+ * and are omitted entirely when nothing narrows so an unfiltered chart stores
+ * exactly what it stored before this key existed. */
 export function chartConfigToStored(
   config: ChartConfig,
   filters?: EventFilters,
 ): Record<string, unknown> {
+  const storedFilters = filters ? chartFiltersToStored(filters) : null;
   return {
     ...config,
     compare:
       config.compare.mode === "custom"
         ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
         : config.compare,
-    ...(filters && hasActiveFilters(filters)
-      ? { filters: filtersToViewPayload(filters) }
-      : {}),
+    ...(storedFilters ? { filters: storedFilters } : {}),
   };
 }
 
@@ -308,6 +346,12 @@ export function chartConfigToStored(
  * filters exist only in storage — the one place the two travel together, the
  * same way `View.view_filter` does.
  *
+ * The exact inverse of `chartFiltersToStored`, including the three members
+ * `viewPayloadToFilters` does not know about. Reading them back matters as
+ * much as writing them: `serializeEventFilterParams` does send all three to
+ * the API, so a chart block that dropped them would draw wider on screen than
+ * the same chart frozen into an export.
+ *
  * Returns `{}` for a chart saved before filters were captured, which is what
  * makes those charts keep rendering exactly as they do today.
  */
@@ -315,5 +359,15 @@ export function parseStoredChartFilters(stored: unknown): EventFilters {
   if (!stored || typeof stored !== "object") return {};
   const raw = (stored as Record<string, unknown>).filters;
   if (!raw || typeof raw !== "object") return {};
-  return viewPayloadToFilters(raw as Record<string, unknown>);
+  const payload = raw as Record<string, unknown>;
+  const filters = viewPayloadToFilters(payload);
+  const eventIds = payload.eventIds;
+  if (Array.isArray(eventIds) && eventIds.length > 0) {
+    filters.ids = eventIds.map(String);
+  }
+  if (typeof payload.runId === "string" && payload.runId) {
+    filters.anomalyRunId = payload.runId;
+  }
+  if (payload.collapseRoutine === true) filters.collapseRoutine = true;
+  return filters;
 }

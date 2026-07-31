@@ -446,6 +446,49 @@ async def test_bulk_annotate_by_filter_honors_annotated_restriction(patched_stor
 
 
 @pytest.mark.asyncio
+async def test_annotated_tag_reaches_the_event_query(patched_store, monkeypatch):
+    """The derived tag has to survive the hop into ``EventQuery``.
+
+    Every other test for it stops at ``_resolve_tags_filter``, which leaves the
+    wiring untested — a tag that resolves correctly and is then dropped on the
+    way to the store filters nothing, and nothing would have failed. Exercised
+    through ``_resolve_event_id_filters``, the resolver both this endpoint and
+    ``list_events`` share.
+    """
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="commented-evt",
+        annotation_id="ann1",
+        annotation_type="comment",
+        content="look at this",
+        origin="user",
+    )
+
+    fake_service = _FakeQueryService(refs=[("commented-evt", "s1")])
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
+
+    await events.bulk_annotate_by_filter(
+        "c1",
+        "t1",
+        events.BulkAnnotateByFilterRequest(
+            annotation_type="tag",
+            content="reviewed",
+            tags_include=events.ANNOTATED_TAG,
+        ),
+        case=Case(id="c1"),
+        user=_fake_user(),
+    )
+
+    tag_filter = fake_service.last_query.tags_include
+    assert tag_filter.tag_values == [events.ANNOTATED_TAG]
+    assert tag_filter.postgres_event_ids == ["commented-evt"]
+
+
+@pytest.mark.asyncio
 async def test_bulk_annotate_by_filter_honors_routine_collapse(patched_store, monkeypatch):
     """Bulk-tagging must act on the set the grid shows, not its uncollapsed
     superset (#147). `list_events`, `get_histogram` and `export_events` all

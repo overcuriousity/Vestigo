@@ -179,6 +179,42 @@ describe("stored (saved chart) round-trip", () => {
     expect(parseStoredChartFilters({ v: 1, filters: "nope" })).toEqual({});
   });
 
+  it("stores narrowings the presentation helpers do not count as chips", () => {
+    // Gating persistence on `hasActiveFilters` lost these two: it is a chip
+    // helper, and neither renders one. A chart whose only narrowing is an
+    // excluded tag must not silently redraw over the whole timeline.
+    for (const filters of [{ excludeTag: "known-good" }, { annotationTagValue: "triaged" }]) {
+      const stored = chartConfigToStored(fullConfig, filters);
+      expect("filters" in stored).toBe(true);
+      expect(parseStoredChartFilters(stored)).toEqual(filters);
+    }
+  });
+
+  it("round-trips the three members only an agent chart can carry", () => {
+    // `eventIds`/`runId`/`collapseRoutine` have no URL form, so the Explorer
+    // never produces them — but a ChartSpec does, and the backend writes them
+    // (`_spec_filters_to_payload`). Dropping either half would make the story
+    // card draw wider than the frozen export of the same chart.
+    const filters = {
+      q: "logon",
+      ids: ["evt-1", "evt-2"],
+      anomalyRunId: "run-7",
+      collapseRoutine: true,
+    };
+    const stored = chartConfigToStored(fullConfig, filters) as Record<string, unknown>;
+    const payload = stored.filters as Record<string, unknown>;
+    // Backend key names, not the frontend member names.
+    expect(payload.eventIds).toEqual(["evt-1", "evt-2"]);
+    expect(payload.runId).toBe("run-7");
+    expect(payload.collapseRoutine).toBe(true);
+    expect(parseStoredChartFilters(stored)).toEqual(filters);
+  });
+
+  it("writes only what narrows, so a View's null-filled defaults never appear", () => {
+    const stored = chartConfigToStored(fullConfig, { q: "logon" }) as Record<string, unknown>;
+    expect(stored.filters).toEqual({ q: "logon" });
+  });
+
   it("falls back to the default chart type for unknown stored types", () => {
     // An OLD frontend loading a NEWER config (unknown chartType) must degrade
     // gracefully, not error — this locks the forward-compat behavior in.

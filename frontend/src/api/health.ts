@@ -49,3 +49,17 @@ const ASSUME_AVAILABLE: Capabilities = {
 export function useCapabilities(): Capabilities {
   return useHealth().data?.capabilities ?? ASSUME_AVAILABLE;
 }
+
+/**
+ * The tag every annotated event carries, as the backend names it.
+ *
+ * Deliberately has no fallback default, unlike `ASSUME_AVAILABLE` above: a
+ * literal here would be a second copy of the very string this hook exists to
+ * stop duplicating, and it would be indistinguishable from a correct answer
+ * if the backend ever renamed the tag. Callers render nothing until health
+ * answers — the value only labels a chip, and health is a single app-wide
+ * cached query, so it is there by the time the grid has rows.
+ */
+export function useAnnotatedTag(): string | undefined {
+  return useHealth().data?.annotated_tag;
+}

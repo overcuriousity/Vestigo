@@ -148,10 +148,30 @@ The key is additive within `v: 1`: a chart saved before it existed has no
 charts have always had. There is no way to recover their lost filters; re-save
 them from the filtered view.
 
-Two things deliberately do **not** freeze, matching saved Views: `collapseRoutine`
-(not URL-serialized, and derived from live dispositions) and semantic-search
-mode (`qMode: "semantic"` survives the payload but the server-side `FilterSpec`
-has no semantic mode, so an export treats the query as a keyword).
+The payload is a **superset** of a View's: on top of `filtersToViewPayload` it
+carries `eventIds`, `runId` and `collapseRoutine`, three narrowings the Explorer
+cannot produce and a View deliberately never freezes. An agent's `ChartSpec`
+can, so both sides write and read them (`chartFiltersToStored` /
+`parseStoredChartFilters` on the frontend, `_spec_filters_to_payload` /
+`_filter_payload_to_spec` on the backend) — dropping them anywhere would widen
+a chart the agent had scoped to, say, one detector run's events. A chart saved
+from the Visualize page never carries them: `collapseRoutine` is not
+URL-serialized (it derives from live dispositions) and the rail is passed the
+raw URL filters, so the analyst path is unchanged.
+
+Unlike a View, the chart payload also stores only what narrows — no
+`null`/`false`/empty defaults — so "unfiltered" and "saved before the key
+existed" are the same bytes.
+
+Two things still do **not** survive:
+
+- **The "Open in Visualize" link is lossy for those same three members.** It is
+  built with `filtersToParams`, and they have no URL representation by design.
+  The link lands on the chart's shape and its URL-expressible filters; the block
+  itself, and the export, keep the full slice.
+- **Semantic-search mode.** `qMode: "semantic"` survives the payload but the
+  server-side `FilterSpec` has no semantic mode, so an export treats the query
+  as a keyword (`ROADMAP.md`, Milestone 3).
 
 Every write path runs both gates: the HTTP router (422), the agent's
 `propose_story_block` (a tool error the model can correct) **and** its confirm
