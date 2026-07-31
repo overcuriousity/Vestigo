@@ -5,6 +5,55 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] — 2026-07-31
+
+### Added
+
+- **A worked demo case, seeded for every new user.** A new account's first screen used to
+  be an empty case list, which is the worst possible introduction to a tool whose whole
+  argument is detection-as-workflow. Every user now finds a fabricated investigation
+  waiting: 251k events across four sources over 30 days, with a quiet intrusion buried in
+  it, plus the analyst artifacts that show what working the case looks like — annotations,
+  saved views, a baseline definition, a Sigma rule and a story. It is *generated* per user
+  from code that ships with the app, not shipped as a data file, so it costs nothing in the
+  repo and nothing on an airgapped host. One per account: deleting it is final, and
+  `POST /api/demo/seed` is the way back. Off with `VESTIGO_DEMO_CASE_ENABLED=0`.
+  `tests/test_demo_detector_coverage_clickhouse.py` asserts every shipped analysis tool
+  still finds something in it, so retuning a detector cannot quietly hollow the demo out.
+
+- **A derived `annotated` tag.** Any event carrying an annotation — a human tag or comment,
+  an agent proposal, or a detector finding — also carries the tag `annotated`, filterable
+  alongside parser tags and analyst tags in the same panel. It is computed at read time
+  rather than stored, so it cannot disagree with the annotations it describes: delete the
+  last annotation and the tag goes with it, with no write path to maintain.
+
+### Changed
+
+- **The frontend design system now has a ratchet.** Seven dead `var(--…)` references had
+  compiled, typechecked, linted and passed tests, because nothing checked. Undefined custom
+  properties are now a hard failure at zero across every `.ts`/`.tsx` under `src/`, and
+  arbitrary `text-[Npx]` plus raw `<button>` outside `components/ui/` are budgeted per file
+  in a list that only ever falls — exceeding an entry fails, and so does beating one without
+  lowering it. Also lands a guidance registry and actionable empty states.
+
+- **README reordered** so the tool comes before the comparison to prior art.
+
+### Fixed
+
+- **`GET /api/cases/` no longer runs `alembic upgrade head` on every request.** The endpoint
+  the UI hits most re-ran the migration machinery per call — a connection, a version-table
+  check and a migration lock on the hot path — where the startup lifespan already does it
+  once.
+
+- **OIDC authorization codes no longer reach the system journal.** Uvicorn's access log
+  writes the full request target, and the callback carries `code` and `state` as query
+  parameters, so every SSO login logged a live credential in the clear. Sensitive parameter
+  *values* are now redacted while the path and parameter names survive, so an operator can
+  still see that a callback carried a code. The audit trail was already clean.
+
+- **OIDC discovery follows redirects**, which a Nextcloud IdP needs; it previously answered
+  every SSO click with a 500.
+
 ## [1.8.6] — 2026-07-30
 
 ### Added
