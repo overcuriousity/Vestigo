@@ -9,7 +9,7 @@
  * and handle old versions explicitly instead of silently misreading them.
  */
 import type { CompareTimeResponse, EventFilters, HistogramResponse } from "@/api/types";
-import { filtersToParams, filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
+import { filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
 import type { Metric } from "./transforms";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
@@ -112,9 +112,29 @@ const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
 
 /**
+ * Names a *saved* chart in the URL instead of spelling its state out.
+ *
+ * The alternative — reconstructing `c_*` params from a saved chart's config —
+ * cannot carry the filter members that have no URL representation (`ids`,
+ * `anomalyRunId`, `collapseRoutine`), so a story block's link to an
+ * agent-scoped chart would silently open the whole timeline. Addressing the
+ * chart by id lets the page read both halves back out of storage, which is
+ * the one place a chart and the slice it describes travel together.
+ *
+ * Deliberately inside the `c_*` namespace: `chartConfigToParams` clears that
+ * namespace before writing, so every path that spells a chart out in full
+ * drops the reference by construction, and "this is saved chart X" cannot
+ * survive an edit that makes it untrue.
+ */
+export const CHART_ID_PARAM = "c_chart";
+
+/**
  * Write the chart-specific state into *params* under `c_*` keys, leaving the
  * Explorer filter params (q/filters/start/...) untouched — the two live side
  * by side in the Visualize page's URL.
+ *
+ * Clears every pre-existing `c_*` key first, :data:`CHART_ID_PARAM` included —
+ * see there for why that is the point rather than a side effect.
  */
 export function chartConfigToParams(
   config: ChartConfig,
@@ -238,24 +258,6 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
     config.options = raw.options as ChartOptions;
   }
   return config;
-}
-
-/**
- * Rebuild the URL params for a new filter set while carrying over every
- * `c_*` chart-config key from *prev*. `filtersToParams` builds a FRESH
- * URLSearchParams, so any filter write on the Visualize page (click-to-
- * filter, brush-zoom, reset range) must go through this or it silently
- * wipes the chart config out of the URL.
- */
-export function filterParamsPreservingChartConfig(
-  next: EventFilters,
-  prev: URLSearchParams,
-): URLSearchParams {
-  const params = filtersToParams(next);
-  for (const [k, v] of prev.entries()) {
-    if (k.startsWith("c_")) params.set(k, v);
-  }
-  return params;
 }
 
 /** Adapt the single-layer histogram response to the compare shape so one

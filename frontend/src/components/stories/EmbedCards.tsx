@@ -18,7 +18,7 @@ import { viewsApi } from "@/api/views";
 import type { Event, StoryBlockOf } from "@/api/types";
 import { ChartCanvas } from "@/components/viz/ChartCanvas";
 import {
-  chartConfigToParams,
+  CHART_ID_PARAM,
   parseStoredChartConfig,
   parseStoredChartFilters,
 } from "@/components/viz/lib/chartConfig";
@@ -312,11 +312,14 @@ export function ChartBlockCard({
         <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-fg-secondary)]">
           {chart.name}
         </span>
+        {/* Addresses the chart by id rather than spelling its state into
+            `c_*` params: Visualize then reads the shape *and* the filters
+            back out of storage, so a chart the agent scoped to a fixed event
+            set opens as that chart instead of widening to the timeline. */}
         <OpenLink
-          to={`/cases/${caseId}/timelines/${timelineId}/visualize?${chartConfigToParams(
-            config,
-            filtersToParams(filters),
-          ).toString()}`}
+          to={`/cases/${caseId}/timelines/${timelineId}/visualize?${CHART_ID_PARAM}=${encodeURIComponent(
+            chart.id,
+          )}`}
           label="Open in Visualize"
         />
       </div>

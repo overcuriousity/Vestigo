@@ -5,7 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -265,10 +265,14 @@ REDACTED = "***"
 def redact_query(target: str) -> str:
     """Replace the value of every sensitive query parameter in ``target``.
 
-    Matching is on the whole parameter name, folded to lowercase — a sensitive
-    name appearing as a *substring* of another parameter is not a match, and a
-    provider that capitalizes ``Code`` does not slip through. Only names in
+    Matching is on the whole parameter name, percent-decoded and folded to
+    lowercase — a sensitive name appearing as a *substring* of another
+    parameter is not a match, a provider that capitalizes ``Code`` does not
+    slip through, and neither does one that sends ``%63ode``. Only names in
     ``_SECRET_QUERY_PARAMS`` are redacted; nothing is inferred from the value.
+
+    The name is *emitted* exactly as it arrived, decoded only to decide. An
+    operator reading the journal should see what the client actually sent.
 
     Args:
         target: A request target, with or without a query string.
@@ -284,7 +288,7 @@ def redact_query(target: str) -> str:
     parts = []
     for pair in query.split("&"):
         name, eq, _value = pair.partition("=")
-        secret = eq and name.lower() in _SECRET_QUERY_PARAMS
+        secret = bool(eq) and unquote_plus(name).lower() in _SECRET_QUERY_PARAMS
         parts.append(f"{name}={REDACTED}" if secret else pair)
     return f"{path}?{'&'.join(parts)}"
 

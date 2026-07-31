@@ -1,9 +1,15 @@
 /**
- * A chart block's "Open in Visualize" link has to reconstruct *that* chart.
- * The Visualize page holds its whole chart state in `c_*` URL params, so a
- * link that only names the timeline lands the analyst on a blank Visualize
- * page with the preset picker open — the story says "this chart", the link
- * delivers something else.
+ * A chart block's "Open in Visualize" link has to open *that* chart. A link
+ * naming only the timeline lands the analyst on a blank Visualize page with
+ * the preset picker open — the story says "this chart", the link delivers
+ * something else.
+ *
+ * It names the chart by id rather than reconstructing `c_*` params, because
+ * three members of a saved chart's filter set (`ids`, `anomalyRunId`,
+ * `collapseRoutine`) have no URL representation: a reconstructed link would
+ * open an agent-scoped chart as the whole timeline, silently. The id is the
+ * only handle that carries everything, since the page reads both halves back
+ * out of storage.
  */
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -68,7 +74,7 @@ describe("ChartBlockCard open link", () => {
     });
   });
 
-  it("carries the saved chart's config into the Visualize URL", async () => {
+  it("names the saved chart by id in the Visualize URL", async () => {
     renderCard();
     const link = await screen.findByRole("link", { name: /Open in Visualize/ });
     await waitFor(() => expect(screen.getByTestId("canvas")).toBeTruthy());
@@ -76,21 +82,16 @@ describe("ChartBlockCard open link", () => {
     const href = link.getAttribute("href")!;
     const [path, query] = href.split("?");
     expect(path).toBe(`/cases/${CASE_ID}/timelines/${TIMELINE_ID}/visualize`);
-
-    const params = new URLSearchParams(query);
-    expect(params.get("c_type")).toBe("bar");
-    expect(params.get("c_scale")).toBe("nominal");
-    expect(params.get("c_field")).toBe("hostname");
+    expect(new URLSearchParams(query).get("c_chart")).toBe("chart-1");
   });
 
-  it("carries the chart's frozen filters into the Visualize URL too", async () => {
-    // The chart means the slice it was saved over. A link that restores the
-    // shape but not the filters opens a chart that shows more than the story
-    // block does.
+  it("spells nothing about the chart into the URL", async () => {
+    // The whole point of the id: a URL that described the chart would have to
+    // describe its filters too, and three of those have no param form. Only
+    // the reference travels, so nothing can be left behind.
     renderCard();
     const link = await screen.findByRole("link", { name: /Open in Visualize/ });
     const params = new URLSearchParams(link.getAttribute("href")!.split("?")[1]);
-    expect(params.get("q")).toBe("logon");
-    expect(params.toString()).toContain("svc_backup");
+    expect([...params.keys()]).toEqual(["c_chart"]);
   });
 });

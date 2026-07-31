@@ -327,6 +327,21 @@ def test_access_log_leaves_ordinary_query_strings_alone():
     assert redact_query("/api/x?encoded=1") == "/api/x?encoded=1"
 
 
+def test_access_log_redaction_decodes_the_parameter_name():
+    """Matching on the raw name would let ``%63ode`` carry a live credential.
+
+    The value is what must not be logged, and the name is only how we find it
+    — so the name is decoded to *decide* and emitted verbatim, leaving the
+    journal an honest record of what the client actually sent.
+    """
+    from vestigo.api.main import redact_query
+
+    assert redact_query("/cb?%63ode=BKnwFkda") == "/cb?%63ode=***"
+    assert redact_query("/cb?%43ODE=BKnwFkda") == "/cb?%43ODE=***"
+    # Still not a substring match once decoded.
+    assert redact_query("/api/x?en%63oded=1") == "/api/x?en%63oded=1"
+
+
 def test_access_log_redaction_folds_case_and_covers_more_than_oidc():
     """The guarantee is a name list, so the list has to be the wide one.
 

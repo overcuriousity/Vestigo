@@ -8,7 +8,6 @@ import { Input } from "@/components/ui/Input";
 import {
   chartConfigToStored,
   parseStoredChartConfig,
-  parseStoredChartFilters,
   type ChartConfig,
 } from "@/components/viz/lib/chartConfig";
 import type { EventFilters } from "@/api/types";
@@ -23,14 +22,20 @@ interface Props {
    * URL filters, not a set augmented with `collapseRoutine` — that one is not
    * URL-serialized and derives from live dispositions. */
   currentFilters: EventFilters;
-  onLoad: (config: ChartConfig, filters: EventFilters) => void;
+  /** Load a saved chart by *id*, not by value. The page addresses it as
+   * `?c_chart=<id>` and reads both halves — shape and filters — back out of
+   * storage, which is the one place they travel together. Passing a parsed
+   * config here instead would force the scope through the URL, where three
+   * of its members (`ids`, `anomalyRunId`, `collapseRoutine`) have no
+   * representation and would be silently dropped. */
+  onLoad: (chartId: string) => void;
 }
 
 /**
  * Rail footer for saved charts: name-and-save the current ChartConfig plus the
- * filters it is drawn under, load a saved one back (restoring both, with a
- * graceful message when it was saved by an incompatible config version),
- * delete stale ones.
+ * filters it is drawn under, load a saved one back by id (with a graceful
+ * message when it was saved by an incompatible config version), delete stale
+ * ones.
  */
 export function SavedChartsRail({
   caseId,
@@ -68,14 +73,16 @@ export function SavedChartsRail({
     onSuccess: () => qc.invalidateQueries({ queryKey }),
   });
 
-  const handleLoad = (stored: Record<string, unknown>) => {
-    const config = parseStoredChartConfig(stored);
-    if (config == null) {
+  // Version compatibility is checked here rather than after navigating: the
+  // rail knows the stored bytes already, and an incompatible chart should say
+  // so in place instead of loading a URL that renders nothing.
+  const handleLoad = (chartId: string, stored: Record<string, unknown>) => {
+    if (parseStoredChartConfig(stored) == null) {
       setLoadError("This chart was saved with an incompatible version and cannot be loaded.");
       return;
     }
     setLoadError(null);
-    onLoad(config, parseStoredChartFilters(stored));
+    onLoad(chartId);
   };
 
   const charts = chartsQuery.data?.charts ?? [];
@@ -119,7 +126,7 @@ export function SavedChartsRail({
           {charts.map((c) => (
             <li key={c.id} className="group flex items-center gap-1">
               <button
-                onClick={() => handleLoad(c.config)}
+                onClick={() => handleLoad(c.id, c.config)}
                 className="flex-1 truncate rounded px-1.5 py-1 text-left text-xs text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)]"
                 title={`Load "${c.name}"`}
               >

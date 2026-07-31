@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  CHART_ID_PARAM,
   chartConfigToParams,
   chartConfigToStored,
   DEFAULT_CHART_CONFIG,
-  filterParamsPreservingChartConfig,
   paramsToChartConfig,
   parseStoredChartConfig,
   parseStoredChartFilters,
@@ -92,25 +92,21 @@ describe("URL round-trip", () => {
   });
 });
 
-describe("filterParamsPreservingChartConfig", () => {
-  it("writes the new filters while carrying over every c_* key", () => {
-    const prev = chartConfigToParams(fullConfig, new URLSearchParams({ q: "old" }));
-    const next = filterParamsPreservingChartConfig(
-      { q: "dos", start: "2024-01-01T00:00:00Z", end: "2024-01-02T00:00:00Z" },
-      prev,
-    );
-    // Filters replaced wholesale…
-    expect(next.get("q")).toBe("dos");
-    expect(next.get("start")).toBe("2024-01-01T00:00:00Z");
-    // …chart config untouched (round-trips to the same object).
-    expect(paramsToChartConfig(next)).toEqual(fullConfig);
-  });
+describe("saved-chart reference", () => {
+  it("is cleared by spelling a chart out", () => {
+    // The rule the whole feature rests on. `?c_chart=<id>` claims "this is
+    // saved chart X"; writing a config out in full is the analyst taking the
+    // chart over, which makes that claim false. Because the reference lives in
+    // the `c_*` namespace that `chartConfigToParams` clears, no call site has
+    // to remember to drop it — and none can forget.
+    const params = new URLSearchParams({ [CHART_ID_PARAM]: "chart-1", q: "logon" });
+    chartConfigToParams(fullConfig, params);
 
-  it("drops removed filters instead of inheriting them", () => {
-    const prev = chartConfigToParams(fullConfig, new URLSearchParams({ q: "old" }));
-    const next = filterParamsPreservingChartConfig({}, prev);
-    expect(next.get("q")).toBeNull();
-    expect(paramsToChartConfig(next)).toEqual(fullConfig);
+    expect(params.get(CHART_ID_PARAM)).toBeNull();
+    expect(paramsToChartConfig(params)).toEqual(fullConfig);
+    // The filter params are not part of that namespace and survive, which is
+    // what keeps a takeover from also dropping the chart's slice.
+    expect(params.get("q")).toBe("logon");
   });
 });
 

@@ -65,7 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A story's chart block opens *that* chart.** "Open in Visualize" navigated to the right
   timeline and then drew a default chart with the preset picker open, because the Visualize
-  page reads its entire state from `c_*` URL params and the link carried none of them.
+  page reads its entire state from `c_*` URL params and the link carried none of them. It
+  now names the saved chart instead of describing it — `?c_chart=<id>`, resolved against
+  storage — so the shape *and* the filters come back, including the three narrowings that
+  have no URL form at all and would otherwise have widened an agent-scoped chart to the
+  whole timeline in silence. The rail's load button uses the same reference, and editing
+  either half spells the chart out in full and drops it. A link to a deleted chart says so.
 
 - **`read_story` no longer cuts the analyst's report unmarked.** Markdown blocks were
   truncated at 1600 characters — 0.6% of what a write accepts — with no marker, so the agent

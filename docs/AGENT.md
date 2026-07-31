@@ -319,6 +319,14 @@ a categorical grouping variable producing one distribution per group;
   translation for persisted old-shape `tool_args`. Virtual `time:` fields are
   analyst-facing too (`viz/lib/fieldDisplay.ts` labels tokens and values;
   canonical values, not labels, round-trip into filters/URLs/saved charts).
+- **Save** stores `spec.filters` with the chart, `event_ids`/`run_id`/
+  `collapse_routine` included — a chart the agent scoped to one detector run
+  must not widen to the whole timeline on the analyst's click. **Open in
+  Visualize** on this card cannot carry those three: the chart is not saved
+  yet, so there is no id to name, and it falls back to describing the chart in
+  `c_*` params where they have no representation. Saving first is what makes
+  the chart addressable (`?c_chart=<id>`, `docs/STORIES.md`) and its link
+  exact.
 
 ### Per-tool enable/disable (three layers)
 

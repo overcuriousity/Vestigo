@@ -4875,6 +4875,12 @@ class PostgresStore:
         ``annotated`` tag, which means "somebody or something has touched this
         event" — a human tag, a comment, an agent proposal or a detector
         finding all count.
+
+        Uncapped, like its typed siblings above. The result feeds
+        ``TagFilter.postgres_event_ids`` and reaches ClickHouse through the
+        external-table path, whose breadth is a decision already taken and
+        argued — see ``EXTERNAL_LIST_THRESHOLD`` in ``vestigo/db/queries.py``,
+        whose comment names this very filter as the case it was sized for.
         """
         from sqlalchemy import select
 
@@ -4896,11 +4902,11 @@ class PostgresStore:
         annotated event_id to test a list for emptiness costs the whole
         annotation table on an endpoint the filter panel hits constantly.
         """
-        from sqlalchemy import literal, select
+        from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(literal(1))
+                select(Annotation.id)
                 .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
                 .limit(1)
             )

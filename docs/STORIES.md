@@ -143,6 +143,18 @@ chart back into the Visualize rail. Without this a chart saved from a filtered
 view redrew over the whole timeline everywhere, showing precisely the data the
 analyst had excluded.
 
+The last two reach the filters by **naming the chart** rather than describing
+it: both navigate to `?c_chart=<id>` (`CHART_ID_PARAM`), and `VisualizePage`
+resolves the id against the saved-chart list and reads both halves out of
+storage. Describing the chart in `c_*` params instead would have to describe its
+filters too, and three of those have no URL form at all (below) — so a
+reconstructed link could restore an agent-scoped chart's shape while silently
+widening it to the whole timeline. The reference lives inside the `c_*`
+namespace that `chartConfigToParams` clears before writing, so editing the chart
+drops it by construction: `c_chart` can only ever claim "this is saved chart X"
+while that is still true. A reference to a deleted or unreadable chart says so
+and falls back to the params.
+
 The key is additive within `v: 1`: a chart saved before it existed has no
 `filters` key, and that absence means "whole timeline" — the behavior those
 charts have always had. There is no way to recover their lost filters; re-save
@@ -163,12 +175,19 @@ Unlike a View, the chart payload also stores only what narrows — no
 `null`/`false`/empty defaults — so "unfiltered" and "saved before the key
 existed" are the same bytes.
 
-Two things still do **not** survive:
+Three things still do **not** survive:
 
-- **The "Open in Visualize" link is lossy for those same three members.** It is
-  built with `filtersToParams`, and they have no URL representation by design.
-  The link lands on the chart's shape and its URL-expressible filters; the block
-  itself, and the export, keep the full slice.
+- **`collapseRoutine`, once Visualize has the chart.** The page derives it from
+  the live disposition set rather than restoring the stored value, deliberately:
+  a mute is a filter, and a shared URL should show a teammate the charts their
+  *current* dispositions produce. So a chart whose stored `collapseRoutine`
+  disagrees with today's mutes renders per the live set on Visualize, and per
+  the frozen set in the story canvas and the export. `ids` and `anomalyRunId`
+  have no such live source and are restored as stored.
+- **An unsaved chart's link.** `ChartProposalCard` shows a chart that has not
+  been saved yet, so there is no id to name and its link falls back to `c_*`
+  params — lossy for the three members above. Saving the chart is what makes it
+  addressable; the link on the resulting saved chart is exact.
 - **Semantic-search mode.** `qMode: "semantic"` survives the payload but the
   server-side `FilterSpec` has no semantic mode, so an export treats the query
   as a keyword (`ROADMAP.md`, Milestone 3).
