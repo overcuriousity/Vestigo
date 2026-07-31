@@ -8,6 +8,7 @@ gated on ``agent_available()`` and never runs in the suite.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -29,6 +30,23 @@ def _attr(coverage: int, distinct: int, samples: list[str]) -> dict[str, Any]:
 
 #: Stand-in for a ClickHouseStore the cache-hit path never dereferences.
 _NEVER_USED = object()
+
+
+@contextmanager
+def _mode(monkeypatch, value: str):
+    """Run a block with ``column_recommend_mode`` pinned to *value*.
+
+    The shipped default is ``heuristic`` — the LLM path is opt-in — so any
+    test about the advisor has to ask for ``auto`` explicitly.
+    """
+    monkeypatch.setenv("VESTIGO_COLUMN_RECOMMEND_MODE", value)
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        monkeypatch.delenv("VESTIGO_COLUMN_RECOMMEND_MODE", raising=False)
+        get_settings.cache_clear()
+
 
 RICH_ATTRIBUTES = {
     "user": _attr(1000, 12, ["alice", "bob", "carol"]),
@@ -196,6 +214,130 @@ async def test_a_failed_rerun_restores_the_previous_suggestion(store, monkeypatc
     assert (await store.get_timeline(case_id, timeline_id)).recommended_columns == good
 
 
+@pytest.mark.asyncio
+async def test_a_rerun_keeps_the_previous_columns_while_it_runs(store, monkeypatch):
+    """The 'running' placeholder carries the old answer, so the grid holds still.
+
+    It is also what makes a mid-job restart survivable: the payload a crash
+    leaves behind is still showable, and the startup sweep only relabels it.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    seen: dict[str, Any] = {}
+    real = columns_jobs.ensure_source_field_stats
+
+    async def _peek(*args, **kwargs):
+        timeline = await store.get_timeline(case_id, timeline_id)
+        seen.update(timeline.recommended_columns)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(columns_jobs, "ensure_source_field_stats", _peek)
+    await _run(store, case_id, timeline_id)
+
+    assert seen["status"] == "running"
+    assert seen["columns"] == good["columns"]
+    assert seen["reasons"] == good["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_payload_write_keeps_the_new_answer(store, monkeypatch):
+    """Only this job's own placeholder is rolled back, never a committed result."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    first = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("audit log is unavailable")
+
+    monkeypatch.setattr(store, "record_audit", _boom)
+    job_store = await _run(store, case_id, timeline_id)
+
+    recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert recommended["status"] == "ok"
+    assert recommended["columns"] == first["columns"]
+    # The audit failure is still a job failure — it just costs no data.
+    assert job_store.list_by_case(case_id)[0].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_the_job_itself_refuses_when_recommendation_is_off(store, monkeypatch):
+    """The demo build and the CLI await the job directly, bypassing the scheduler."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+
+    with _mode(monkeypatch, "off"):
+        job_store = await _run(store, case_id, timeline_id)
+
+    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns is None
+    job = job_store.list_by_case(case_id)[0]
+    assert job.status == "completed"
+    assert job.result == {"skipped": True}
+
+
+@pytest.mark.asyncio
+async def test_allow_llm_false_keeps_the_advisor_out_of_an_auto_instance(store, monkeypatch):
+    """What the demo build relies on: no model round trip during first-login seeding."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+
+    async def _never(candidates, **kwargs):
+        raise AssertionError("the advisor must not be consulted")
+
+    monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _never)
+    with _mode(monkeypatch, "auto"):
+        await _run(store, case_id, timeline_id, allow_llm=False)
+
+    recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert recommended["status"] == "ok"
+    assert recommended["method"] == "heuristic"
+
+
+# ── Recovering from a restart ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_restart_settles_a_running_recommendation(store):
+    """`JobStore` is in-memory: a job that died has to be settled, not awaited."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    orphaned = dict(good, status="running", job_id="job-that-died")
+    await store.update_timeline_recommended_columns(case_id, timeline_id, orphaned)
+
+    assert await store.clear_stale_running_recommendations() == 1
+
+    settled = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert settled["status"] == "ok"
+    assert settled["job_id"] is None
+    assert settled["columns"] == good["columns"]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_settles_an_empty_running_recommendation_as_insufficient(store):
+    """A first run that never finished has nothing to show — say so and stop."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await store.update_timeline_recommended_columns(
+        case_id,
+        timeline_id,
+        {"status": "running", "columns": [], "reasons": {}, "job_id": "job-that-died"},
+    )
+
+    assert await store.clear_stale_running_recommendations() == 1
+    settled = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert settled["status"] == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_a_restart_leaves_settled_recommendations_alone(store):
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    assert await store.clear_stale_running_recommendations() == 0
+    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns == good
+
+
 # ── The advisor hand-off ────────────────────────────────────────────────────
 
 
@@ -213,7 +355,8 @@ async def test_advisor_result_wins_when_it_validates(store, monkeypatch):
         )
 
     monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _advise)
-    await _run(store, case_id, timeline_id)
+    with _mode(monkeypatch, "auto"):
+        await _run(store, case_id, timeline_id)
 
     recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
     assert recommended["method"] == "llm"
@@ -232,7 +375,8 @@ async def test_advisor_declining_leaves_the_heuristic_answer(store, monkeypatch)
         return None
 
     monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _decline)
-    await _run(store, case_id, timeline_id)
+    with _mode(monkeypatch, "auto"):
+        await _run(store, case_id, timeline_id)
 
     recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
     assert recommended["method"] == "heuristic"

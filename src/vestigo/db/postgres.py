@@ -2869,6 +2869,42 @@ class PostgresStore:
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
 
+    async def clear_stale_running_recommendations(self) -> int:
+        """Settle column recommendations left ``running`` by a restart (#213).
+
+        ``JobStore`` is in-memory, so a process that dies mid-recommendation
+        leaves a Postgres payload claiming a job is in flight that no longer
+        exists — the explorer would poll for it forever. The job carries the
+        previous answer forward into its placeholder, so settling it is just a
+        relabel: ``ok`` when there are columns to show, ``insufficient``
+        otherwise. Nothing is recomputed here; the next ingest or a manual
+        re-suggest does that.
+
+        Filtering happens in Python rather than with a JSON path predicate:
+        the same code runs against SQLite in the test suite, and the number of
+        timelines with a stored recommendation is bounded by the number of
+        timelines. Returns the number of rows settled.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(Timeline.recommended_columns.is_not(None))
+            )
+            settled = 0
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                updated = dict(payload)
+                updated["status"] = "ok" if updated.get("columns") else "insufficient"
+                updated["job_id"] = None
+                timeline.recommended_columns = updated
+                settled += 1
+            if settled:
+                await session.commit()
+            return settled
+
     async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
         """Delete a timeline row.
 

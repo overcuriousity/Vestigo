@@ -44,6 +44,13 @@ export interface User {
   last_login_at: string | null;
   /** Only present on /auth/me and /auth/me/password responses. */
   teams?: TeamMembershipSummary[];
+  /**
+   * Per-user UI state that has to outlive one browser — currently only
+   * `column_advisor_notice_ack` (issue #213) and the agent's
+   * `agent_disabled_tools`. Written through the whitelisted
+   * `PUT /auth/me/preferences`.
+   */
+  preferences?: Record<string, unknown> | null;
 }
 
 export interface Team {
@@ -966,7 +973,17 @@ export interface HealthResponse {
   agent_available?: boolean;
   /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
   mcp_enabled?: boolean;
+  /**
+   * How this instance derives a timeline's opening columns (issue #213):
+   * `heuristic` scores locally and sends nothing anywhere, `auto` also asks
+   * the configured LLM, `off` keeps the built-in defaults. Authenticated
+   * callers only — the disclosure dialog needs it and non-admins cannot read
+   * `/api/admin/settings`.
+   */
+  column_recommend_mode?: ColumnRecommendMode;
 }
+
+export type ColumnRecommendMode = "auto" | "heuristic" | "off";
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */
 export type FieldMatchMode = "wildcard" | "regex";

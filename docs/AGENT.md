@@ -379,7 +379,7 @@ sources carry it, fill rate, distinct count, three sample values — and returns
 | Invariant | How it holds here |
 |---|---|
 | Invisible unless configured | Gated on the same cached `agent_available()` probe `/api/health` uses. Unconfigured or unreachable ⇒ never called, and the deterministic answer ships instead. |
-| Scope safety | The model is given no case, timeline, source or event id, and no event content — only field names and aggregate statistics the analyst can already read off the column picker. |
+| Scope safety | The model is given no case, timeline, source or event id, and no event row. It *is* given up to three real sample values per candidate field (40 characters each, ≤20 fields) — evidence-derived strings, which is why the path is opt-in rather than on by default. |
 | Sandbox + apply | The result is a *default*, not a mutation. It lands in `Timeline.recommended_columns`; any analyst's own column choice outranks it, and "Reset to defaults" is one click. |
 | Forensic reproducibility | Every run writes a `timeline.recommend_columns` audit row with the method, the model id, the chosen columns and the full candidate set. The heuristic half is deterministic and unit-tested; the LLM half is recorded as `method: "llm"` so a suggestion is never mistaken for a computation. |
 | Bounded trust | Every returned token is intersected with the candidate set — the model cannot introduce a field. A response that falls below the minimum after filtering is rejected whole rather than padded. Malformed, timed out (45 s ceiling), or errored is indistinguishable from "not configured". |
@@ -391,8 +391,19 @@ already holds exactly; the tools are also timeline-scoped where the evidence
 here is per-source. The tool-deny layers are not bypassed by this, because no
 tool is called.
 
-`VESTIGO_COLUMN_RECOMMEND_MODE=heuristic` switches the model call off while
-keeping the suggestions; `off` disables the feature entirely. See
+**Opt-in, with the disclosure attached to the opting.**
+`VESTIGO_COLUMN_RECOMMEND_MODE` defaults to `heuristic`: the scorer runs, the
+model is never called, and nothing leaves the machine. `auto` adds the model
+call; `off` disables suggestions entirely. Because `auto` sends evidence-derived
+sample values, the first analyst to open an Explorer on an instance with an
+agent configured gets a one-time dialog
+(`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`) naming exactly what
+would be sent, the endpoint URL and the model — an admin can switch the instance
+to `auto` from there, everyone else reads it and it is recorded per user
+(`preferences.column_advisor_notice_ack`, via `PUT /api/auth/me/preferences`).
+`/api/health` carries `column_recommend_mode` so that dialog can say which state
+the instance is in without an admin-only request. The demo build always passes
+`allow_llm=False` — seeded content never triggers egress. See
 `vestigo/columns/__init__.py` for the layering.
 
 ## Configuration

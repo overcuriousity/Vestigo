@@ -20,18 +20,42 @@
 import type { RecommendedColumns } from "@/api/types";
 import { DEFAULT_COLUMNS, sanitizeColumns } from "@/stores/ui";
 
-/** Whether a recommendation has columns ready to apply. */
+/**
+ * How long a `running` recommendation is believed before the explorer stops
+ * waiting on it. Background jobs are in-memory server-side, so a process that
+ * died mid-job leaves a payload claiming to be in flight forever; the server
+ * settles those on its next boot, and this is the client's own floor so a
+ * long-lived tab cannot poll indefinitely against one that has not restarted.
+ */
+export const STALE_SUGGESTION_MS = 10 * 60_000;
+
+/**
+ * Whether a recommendation has columns ready to apply.
+ *
+ * `running` counts when it carries columns: a recompute keeps the previous
+ * answer in the payload precisely so the grid does not fall back to the
+ * built-in defaults and re-lay out twice while it works.
+ */
 export function hasSuggestion(
   recommended: RecommendedColumns | null | undefined,
 ): recommended is RecommendedColumns {
-  return recommended?.status === "ok" && recommended.columns.length > 0;
+  if (!recommended || recommended.columns.length === 0) return false;
+  return recommended.status === "ok" || recommended.status === "running";
 }
 
-/** Whether a recommendation job is currently in flight for this timeline. */
+/**
+ * Whether a recommendation job is currently in flight for this timeline.
+ *
+ * False once the claim is older than {@link STALE_SUGGESTION_MS} — that job is
+ * not coming back, and the caller polls on this answer.
+ */
 export function isSuggesting(
   recommended: RecommendedColumns | null | undefined,
 ): boolean {
-  return recommended?.status === "running";
+  if (recommended?.status !== "running") return false;
+  const startedAt = Date.parse(recommended.generated_at);
+  if (Number.isNaN(startedAt)) return false;
+  return Date.now() - startedAt < STALE_SUGGESTION_MS;
 }
 
 /**

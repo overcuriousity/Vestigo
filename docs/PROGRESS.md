@@ -38,6 +38,23 @@ on its least informative view, every time.
   table; a malformed, short, timed-out or unreachable response is indistinguishable from
   "no LLM configured" and the deterministic ranking stands. The stored `method` says
   which one won. Documented in `AGENT.md` §"Outside the agent loop".
+- **The AI half is also opt-in, and says why.** The candidate table carries up to three
+  real sample values per field — evidence-derived strings — so `auto` is egress and the
+  default is `heuristic`: scorer only, nothing leaves the machine. The first Explorer
+  visit on an instance with an agent configured shows a one-time dialog
+  (`ColumnAdvisorNotice`) naming what would be sent, the endpoint and the model; an
+  admin can enable `auto` from it, everyone else reads it, and the acknowledgement is
+  per user (`preferences.column_advisor_notice_ack`, `PUT /api/auth/me/preferences`).
+  The demo build passes `allow_llm=False`, so seeded content never triggers a model call
+  and first-login seeding never waits on one.
+- **A `running` payload can no longer wedge a timeline.** `JobStore` is in-memory, so a
+  restart mid-job used to leave `status: "running"` in Postgres forever with the
+  explorer polling it every 3s. The placeholder now carries the previous answer forward
+  (the grid holds still during a recompute instead of flapping to the defaults), a
+  startup sweep relabels whatever a dead job left behind
+  (`clear_stale_running_recommendations`, in the lifespan rather than `_startup_recovery`
+  so a ClickHouse outage cannot skip it), and the client stops believing a `running`
+  claim older than ten minutes.
 - **Soft, never blocking.** The issue asked for the timeline to be disabled until the
   process finished; a hung LLM endpoint making a timeline unbrowsable is the wrong
   trade, so the grid renders the built-in defaults immediately and re-lays out when the
@@ -50,9 +67,11 @@ on its least informative view, every time.
   `refresh_source_field_stats`, isolated so a failure never reaches the ingest
   rollback), timeline creation, the CLI, the demo build, and a contribute-gated
   `POST .../recommend-columns` behind "Re-suggest columns" in the picker.
-- **`VESTIGO_COLUMN_RECOMMEND_MODE`** (`auto` / `heuristic` / `off`) in a new "Explorer"
-  settings group. Every run writes a `timeline.recommend_columns` audit row naming the
-  method, the model, the chosen columns and the full candidate set.
+- **`VESTIGO_COLUMN_RECOMMEND_MODE`** (`heuristic` by default, or `auto` / `off`) in a
+  new "Explorer" settings group; the job itself enforces it, so the CLI and the demo
+  build honour `off` without their own check. Every run writes a
+  `timeline.recommend_columns` audit row naming the method, the model, the chosen
+  columns and the full candidate set.
 - **Known gap, filed in `ROADMAP.md`:** timelines with `field_mappings` get no
   suggestion for the mapped fields. The grid reads `attributes[colId]` directly, so
   neither the canonical name nor one raw spelling renders correctly — recommending

@@ -665,10 +665,13 @@ _SPECS: tuple[SettingSpec, ...] = (
         "explorer",
         "Suggest event-grid columns",
         "Derives the columns a timeline opens on from its own data instead of the fixed "
-        "timestamp/artifact/message default. 'auto' scores the fields statistically and, when "
-        "an LLM endpoint is configured, lets it pick from those candidates; 'heuristic' never "
-        "calls the model; 'off' keeps the built-in defaults. Analysts can always override the "
-        "suggestion from the Columns picker.",
+        "timestamp/artifact/message default. 'heuristic' (the default) scores the fields "
+        "statistically on this machine and sends nothing anywhere. 'auto' additionally lets "
+        "the configured LLM pick from those candidates — that sends each candidate field's "
+        "name, coverage statistics and up to three real sample values from this instance's "
+        "events (at most 20 fields, 40 characters per value) to the agent endpoint; no event "
+        "rows, case identifiers or credentials are included. 'off' keeps the built-in "
+        "defaults. Analysts can always override the suggestion from the Columns picker.",
         choices=("auto", "heuristic", "off"),
     ),
     # ── AI agent ─────────────────────────────────────────────────────────

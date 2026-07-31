@@ -15,7 +15,7 @@ import httpx
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from vestigo.api.deps import get_current_user, get_store
 from vestigo.core.config import get_settings
@@ -56,6 +56,36 @@ class UpdateMeRequest(BaseModel):
     username: str | None = Field(default=None, min_length=1, max_length=255)
     display_name: str | None = Field(default=None, max_length=255)
     onboarding_completed: bool | None = Field(default=None)
+
+
+#: Keys the current user may set in their own ``preferences`` blob, with the
+#: type each must have. A whitelist rather than a free-form merge: the blob is
+#: read by feature code that assumes its own shape, and it is written from the
+#: browser — an arbitrary key/value store reachable by every session is a
+#: storage sink nobody asked for. Agent tool preferences keep their own
+#: endpoint (`/api/agent/preferences`), which validates against the registry.
+_ALLOWED_PREFERENCE_KEYS: dict[str, type] = {
+    # Set once the analyst has seen the column-suggestion disclosure dialog
+    # (issue #213) — what the LLM path sends, where, and to which model.
+    "column_advisor_notice_ack": bool,
+}
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """Payload to merge a few whitelisted keys into the user's preferences."""
+
+    preferences: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("preferences")
+    @classmethod
+    def _check_keys(cls, value: dict[str, Any]) -> dict[str, Any]:
+        for key, entry in value.items():
+            expected = _ALLOWED_PREFERENCE_KEYS.get(key)
+            if expected is None:
+                raise ValueError(f"Unknown preference: {key}")
+            if not isinstance(entry, expected):
+                raise ValueError(f"Preference {key} must be a {expected.__name__}")
+        return value
 
 
 def _user_response(user: User, teams: list[dict[str, Any]]) -> dict[str, Any]:
@@ -211,6 +241,26 @@ async def update_me(
         onboarding_completed=payload.onboarding_completed,
     )
     await store.record_audit(action="auth.update_profile", actor=user)
+    return {"user": _user_response(updated, await _teams_for_user(updated))}
+
+
+@router.put("/me/preferences")
+async def update_my_preferences(
+    payload: UpdatePreferencesRequest, user: User = Depends(get_current_user)
+) -> dict[str, Any]:
+    """Merge whitelisted keys into the current user's own preferences.
+
+    Per-user UI state that has to outlive one browser — acknowledging the
+    column-suggestion disclosure is the first of them, because a notice that
+    reappears on every machine is a notice people learn to dismiss unread.
+    Not audited: these are display preferences about the reader, not actions
+    on evidence.
+    """
+    if not payload.preferences:
+        return {"user": _user_response(user, await _teams_for_user(user))}
+    updated = await get_store().update_user_preferences(user.id, payload.preferences)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="User not found")
     return {"user": _user_response(updated, await _teams_for_user(updated))}
 
 

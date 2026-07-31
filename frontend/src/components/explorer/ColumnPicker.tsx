@@ -148,12 +148,15 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
   const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
   const setVisibleColumnsStore = useUiStore((s) => s.setVisibleColumns);
   const setVisibleColumns = (cols: string[]) => setVisibleColumnsStore(tlKey, cols);
-  const suggestion = suggestedColumns(recommended);
+  const suggestion = useMemo(() => suggestedColumns(recommended), [recommended]);
   // Through the shared resolver, not a local copy of the same three-way
   // precedence — the ticks here must match what the grid is rendering.
-  const visibleColumns = resolveVisibleColumns(storedColumns, recommended);
+  const visibleColumns = useMemo(
+    () => resolveVisibleColumns(storedColumns, recommended),
+    [storedColumns, recommended],
+  );
   const suggestedReasons = hasSuggestion(recommended) ? recommended.reasons : {};
-  const suggestedSet = new Set(suggestion ?? []);
+  const suggestedSet = useMemo(() => new Set(suggestion ?? []), [suggestion]);
 
   const queryClient = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);

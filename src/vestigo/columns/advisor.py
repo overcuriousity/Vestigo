@@ -14,9 +14,15 @@ Every agent invariant that can apply here does (`docs/AGENT.md`):
   :func:`~vestigo.agent.availability.agent_available` probe ``/api/health``
   uses, so an unconfigured or unreachable endpoint costs nothing and changes
   nothing.
-* **Scope safety.** The model never supplies a case, timeline or source id;
-  it never sees an event. It sees field names, three sample values each, and
-  aggregate statistics the analyst could read off the column picker anyway.
+* **Scope safety, stated exactly.** What crosses the wire is the candidate
+  table and nothing else: for at most
+  :data:`MAX_CANDIDATES_IN_PROMPT` fields, the field name, how many sources
+  carry it, its fill rate, its distinct count, and up to three **real sample
+  values from the case's events**, each truncated to 40 characters. Those
+  samples are evidence — usernames, hostnames, addresses, paths — so this is
+  egress, and the operator opts into it (``column_recommend_mode=auto``; the
+  default is ``heuristic``, which never calls this module). No event row, no
+  case/source/timeline id, no API key and no analyst identity are sent.
 * **Sandboxed.** The result is a *default*, not a mutation: it lands in
   ``Timeline.recommended_columns`` and any analyst's own column choice
   outranks it.
@@ -43,9 +49,10 @@ from vestigo.columns.recommend import ColumnCandidate
 
 logger = logging.getLogger(__name__)
 
-#: Hard ceiling on the whole call. A column suggestion is a nicety; it must
-#: never hold an ingest-triggered job open the way the agent's 300s turn
-#: timeout would.
+#: Hard ceiling on the whole call — the availability probe and config
+#: resolution included, not just the model request. A column suggestion is a
+#: nicety; it must never hold an ingest-triggered job open the way the agent's
+#: 300s turn timeout would.
 ADVISOR_TIMEOUT_SECONDS = 45.0
 
 #: Candidates shown to the model. Enough for a real choice, small enough that
@@ -163,33 +170,41 @@ async def rank_columns_with_llm(
     from vestigo.agent.config import resolve_agent_config
     from vestigo.agent.runtime import build_model, effort_model_settings
 
-    if not await agent_available():
-        return None
-
-    config = await resolve_agent_config()
-    if not config.model:
-        return None
-
-    shown = candidates[:MAX_CANDIDATES_IN_PROMPT]
-    prompt = _INSTRUCTIONS.format(k_min=k_min, k_max=k_max, candidates=_format_candidates(shown))
-
     http_client: httpx.AsyncClient | None = None
     try:
-        from pydantic_ai import Agent
+        # One budget for the whole call. An endpoint that accepts a connection
+        # and then stalls can hold the availability probe or config resolution
+        # open just as long as a completion, and the post-ingest job that owns
+        # this coroutine has no reason to wait for either.
+        async with asyncio.timeout(ADVISOR_TIMEOUT_SECONDS):
+            if not await agent_available():
+                return None
 
-        http_client = httpx.AsyncClient(
-            headers=probe_headers(config), timeout=ADVISOR_TIMEOUT_SECONDS
-        )
-        model = build_model(config, http_client)
-        # No toolsets and no system prompt beyond the instruction: this call
-        # has nothing to call and nothing to remember.
-        agent = Agent(
-            model,
-            output_type=ColumnChoice,
-            toolsets=[],
-            model_settings=effort_model_settings(config),
-        )
-        result = await asyncio.wait_for(agent.run(prompt), timeout=ADVISOR_TIMEOUT_SECONDS)
+            config = await resolve_agent_config()
+            if not config.model:
+                return None
+
+            shown = candidates[:MAX_CANDIDATES_IN_PROMPT]
+            prompt = _INSTRUCTIONS.format(
+                k_min=k_min, k_max=k_max, candidates=_format_candidates(shown)
+            )
+
+            from pydantic_ai import Agent
+
+            http_client = httpx.AsyncClient(
+                headers=probe_headers(config), timeout=ADVISOR_TIMEOUT_SECONDS
+            )
+            model = build_model(config, http_client)
+            # No toolsets and no system prompt beyond the instruction: this
+            # call has nothing to call and nothing to remember.
+            agent = Agent(
+                model,
+                output_type=ColumnChoice,
+                toolsets=[],
+                model_settings=effort_model_settings(config),
+            )
+            result = await agent.run(prompt)
+
         validated = _validate(result.output, shown, k_min=k_min, k_max=k_max)
         if validated is None:
             logger.info("Column advisor response did not survive validation; keeping heuristic")

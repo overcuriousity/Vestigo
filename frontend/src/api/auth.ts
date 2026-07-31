@@ -1,4 +1,4 @@
-import { BASE, fetchBlobGet, get, patch, post } from "./client";
+import { BASE, fetchBlobGet, get, patch, post, put } from "./client";
 import type { User } from "./types";
 
 export const authApi = {
@@ -20,6 +20,13 @@ export const authApi = {
     onboarding_completed?: boolean;
   }) =>
     patch<{ user: User }>("/auth/me", payload).then((r) => r.user),
+
+  /**
+   * Merge whitelisted keys into the user's own preferences blob. The backend
+   * rejects any key it does not know (`_ALLOWED_PREFERENCE_KEYS`).
+   */
+  updatePreferences: (preferences: Record<string, unknown>) =>
+    put<{ user: User }>("/auth/me/preferences", { preferences }).then((r) => r.user),
 
   changePassword: (newPassword: string, currentPassword?: string) =>
     post<{ user: User }>("/auth/me/password", {

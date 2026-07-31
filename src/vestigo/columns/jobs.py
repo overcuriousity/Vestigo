@@ -5,9 +5,14 @@ Runs on the event loop as an ordinary async coroutine — every step it needs
 async, so this needs none of the threadpool/fresh-pool ceremony the
 ClickHouse-scanning jobs do.
 
-Triggered from three places, all of which mean the same thing ("this
-timeline's source set just became knowable"): a source finishing ingestion,
-an explicitly created timeline, and the analyst pressing "Re-suggest columns".
+Triggered from everywhere a timeline's source set becomes knowable: a source
+finishing ingestion, an explicitly created timeline, the analyst pressing
+"Re-suggest columns", the CLI ingest, and the demo build. The API path goes
+through :func:`start_column_recommendation`; the CLI and the demo await
+:func:`run_column_recommendation_job` directly, which is why the
+``column_recommend_mode`` check lives in the job itself rather than only at
+the scheduling sites.
+
 Failure is always survivable — the explorer keeps its built-in defaults — so
 every trigger site isolates this from the work that actually matters.
 """
@@ -64,6 +69,27 @@ def _llm_allowed() -> bool:
     return get_settings().column_recommend_mode == "auto"
 
 
+def _carry_forward(previous: dict[str, Any] | None) -> dict[str, Any]:
+    """The parts of a previous payload a ``running`` placeholder keeps.
+
+    A recompute must not blank a good suggestion while it works: the grid
+    would re-lay out to the built-in defaults and back again, and — because
+    ``JobStore`` is in-memory — a restart mid-job would leave the timeline
+    holding a ``running`` payload with nothing in it. Carrying the previous
+    answer forward means the worst a crash can do is mislabel a still-usable
+    recommendation, which ``PostgresStore.clear_stale_running_recommendations``
+    fixes on the next boot.
+    """
+    if not isinstance(previous, dict):
+        return {"columns": [], "reasons": {}, "method": "heuristic", "model": None}
+    return {
+        "columns": list(previous.get("columns") or []),
+        "reasons": dict(previous.get("reasons") or {}),
+        "method": previous.get("method") or "heuristic",
+        "model": previous.get("model"),
+    }
+
+
 def _payload(
     *,
     status: str,
@@ -94,6 +120,31 @@ def _payload(
     }
 
 
+async def _restore_previous(
+    store: PostgresStore,
+    case_id: str,
+    timeline_id: str,
+    job_id: str,
+    previous: dict[str, Any] | None,
+) -> None:
+    """Undo this job's ``running`` placeholder, if it is still the stored one.
+
+    Re-reads rather than trusting the in-memory view: a failure raised *after*
+    the real payload was written (``record_audit`` is the realistic case) must
+    leave that payload alone, and a newer job's placeholder is that job's to
+    clean up.
+    """
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        return
+    stored = timeline.recommended_columns
+    if not isinstance(stored, dict):
+        return
+    if stored.get("status") != "running" or stored.get("job_id") != job_id:
+        return
+    await store.update_timeline_recommended_columns(case_id, timeline_id, previous)
+
+
 async def run_column_recommendation_job(
     *,
     job_id: str,
@@ -104,6 +155,7 @@ async def run_column_recommendation_job(
     ch_store: ClickHouseStore | None = None,
     actor_id: str | None = None,
     actor_username: str | None = None,
+    allow_llm: bool = True,
 ) -> None:
     """Compute, validate and persist one timeline's recommended columns.
 
@@ -111,7 +163,19 @@ async def run_column_recommendation_job(
     the constructor opens a connection, and a ClickHouse outage should fail
     this job — which nothing depends on — rather than the HTTP request or the
     ingest that scheduled it.
+
+    ``allow_llm=False`` keeps the advisor out of this run whatever the
+    instance-wide mode says — the demo build uses it so seeding a fabricated
+    case never waits on a model endpoint.
+
+    The ``column_recommend_mode`` check lives here rather than only in
+    :func:`start_column_recommendation`, because the demo build and the CLI
+    call this coroutine directly and an operator who switched suggestions off
+    means it everywhere.
     """
+    if not recommendation_enabled():
+        job_store.update(job_id, status="completed", result={"skipped": True})
+        return
     _ACTIVE[timeline_id] = job_id
     job_store.update(job_id, status="running", progress={"phase": "fields"})
     previous: dict[str, Any] | None = None
@@ -139,7 +203,9 @@ async def run_column_recommendation_job(
                     job_id=job_id,
                 ),
             )
-            job_store.update(job_id, status="completed", result={"columns": [], "method": "none"})
+            job_store.update(
+                job_id, status="completed", result={"columns": [], "method": "heuristic"}
+            )
             return
 
         # Kept so a failed *re*-run restores what the timeline already had —
@@ -151,12 +217,9 @@ async def run_column_recommendation_job(
             timeline_id,
             _payload(
                 status="running",
-                columns=[],
-                reasons={},
-                method="heuristic",
-                model=None,
                 source_ids=source_ids,
                 job_id=job_id,
+                **_carry_forward(previous),
             ),
         )
 
@@ -169,7 +232,7 @@ async def run_column_recommendation_job(
         model: str | None = None
         llm_reasons: dict[str, str] = {}
 
-        if tokens and _llm_allowed():
+        if tokens and allow_llm and _llm_allowed():
             job_store.update(job_id, progress={"phase": "model"})
             from vestigo.columns.advisor import rank_columns_with_llm
 
@@ -227,9 +290,12 @@ async def run_column_recommendation_job(
         job_store.update(job_id, status="failed", error=str(exc))
         # Roll the "running" placeholder back to whatever was there before, or
         # to null on a first run — either way the explorer stops waiting on a
-        # job that will never finish.
+        # job that will never finish. Only *this* job's placeholder, though:
+        # by the time `record_audit` runs the real payload is already
+        # committed, and an audit failure must not replace a fresh answer with
+        # the stale one it superseded.
         try:
-            await store.update_timeline_recommended_columns(case_id, timeline_id, previous)
+            await _restore_previous(store, case_id, timeline_id, job_id, previous)
         except Exception:  # noqa: BLE001
             logger.exception("Could not clear the running placeholder for %s", timeline_id)
     finally:

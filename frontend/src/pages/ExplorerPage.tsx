@@ -31,6 +31,7 @@ import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { casesApi } from "@/api/cases";
 import { canContributeToCase } from "@/lib/caseAccess";
+import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
 import { useUiStore } from "@/stores/ui";
 import { hasSuggestion, isSuggesting, resolveVisibleColumns } from "@/lib/columns";
 import { tourEvent } from "@/stores/tour";
@@ -451,6 +452,13 @@ export function ExplorerPage() {
     enabled: !!caseId,
   });
   const canRecommendColumns = case_ ? canContributeToCase(case_) : false;
+
+  // The column-suggestion disclosure (issue #213) only has anything to say
+  // once an LLM endpoint exists to disclose — with none configured, the
+  // scorer runs locally and nothing leaves the machine.
+  const health = useHealth().data;
+  const columnRecommendMode = health?.column_recommend_mode ?? "heuristic";
+  const showAdvisorNotice = (health?.capabilities?.agent ?? false) && columnRecommendMode !== "off";
 
   const { data: timelineSources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
@@ -1285,6 +1293,8 @@ export function ExplorerPage() {
             </span>
           </div>
         )}
+
+        {showAdvisorNotice && <ColumnAdvisorNotice mode={columnRecommendMode} />}
 
         {/* Column suggestion (issue #213) — never blocks the grid; the built-in
             defaults render until the job lands. aria-live so the swap is

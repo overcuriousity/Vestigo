@@ -146,6 +146,13 @@ async def _suggest_columns(store: PostgresStore, clickhouse: ClickHouseStore, ca
     for. Awaited rather than spawned, so the case is complete when the seed
     job reports done. Best-effort: a failure leaves the built-in defaults,
     which is what the demo shipped with before.
+
+    ``allow_llm=False``: this runs inline in first-login seeding, once per
+    timeline, and the advisor is allowed 45 seconds each. The demo corpus is
+    fabricated and fixed, so the deterministic scorer already knows the right
+    answer — paying a model round trip for it would buy nothing and would make
+    a new user's first minute depend on an endpoint being fast. It also keeps
+    seeded content free of any egress the user has not opted into.
     """
     from vestigo.columns.jobs import JOB_KIND, run_column_recommendation_job
     from vestigo.core.jobs import JobStore
@@ -160,6 +167,7 @@ async def _suggest_columns(store: PostgresStore, clickhouse: ClickHouseStore, ca
             job_store=job_store,
             store=store,
             ch_store=clickhouse,
+            allow_llm=False,
         )
 
 

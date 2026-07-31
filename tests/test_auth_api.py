@@ -186,6 +186,42 @@ def test_update_me_onboarding_flag(client, admin_bootstrap):
     assert resp.json()["user"]["onboarding_completed"] is False
 
 
+def test_update_my_preferences_merges_a_whitelisted_key(client, admin_bootstrap):
+    """Acknowledging the column-suggestion disclosure has to outlive one browser."""
+    as_admin(client, admin_bootstrap)
+    assert (client.get("/api/auth/me").json()["user"]["preferences"] or {}) == {}
+
+    resp = client.put(
+        "/api/auth/me/preferences",
+        json={"preferences": {"column_advisor_notice_ack": True}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["user"]["preferences"]["column_advisor_notice_ack"] is True
+    assert client.get("/api/auth/me").json()["user"]["preferences"] == {
+        "column_advisor_notice_ack": True
+    }
+
+
+def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bootstrap):
+    """The blob is feature state, not a key/value store every session can write."""
+    as_admin(client, admin_bootstrap)
+
+    assert (
+        client.put(
+            "/api/auth/me/preferences", json={"preferences": {"arbitrary": "value"}}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/auth/me/preferences",
+            json={"preferences": {"column_advisor_notice_ack": "yes"}},
+        ).status_code
+        == 422
+    )
+    assert (client.get("/api/auth/me").json()["user"]["preferences"] or {}) == {}
+
+
 def test_update_own_profile_rejects_duplicate_username(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     resp = client.post(

@@ -276,6 +276,23 @@ async def _refresh_enricher_availability() -> None:
         logger.exception("Could not determine enricher availability at startup.")
 
 
+async def _settle_orphaned_column_recommendations(store: PostgresStore) -> None:
+    """Relabel column recommendations a restart left mid-flight (issue #213).
+
+    Deliberately *not* part of ``_startup_recovery``, for the same reason as
+    ``_refresh_enricher_availability``: this is one fast Postgres statement
+    that touches no external service, and a ClickHouse-dependent step failing
+    above it must not leave a timeline polling forever for a job that died
+    with the previous process.
+    """
+    try:
+        settled = await store.clear_stale_running_recommendations()
+        if settled:
+            logger.info("Settled %d column recommendation(s) orphaned by a restart.", settled)
+    except Exception:
+        logger.exception("Could not settle orphaned column recommendations.")
+
+
 async def _startup_recovery(store: PostgresStore) -> None:
     """Best-effort recovery + housekeeping, run *after* the app is serving.
 
@@ -332,6 +349,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     _log_config_report()
     await _seed_admin()
     await _refresh_enricher_availability()
+    await _settle_orphaned_column_recommendations(store)
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
     try:
@@ -560,6 +578,11 @@ def create_app() -> FastAPI:
         body["embeddings_available"] = caps["embeddings"]
         body["agent_available"] = caps["agent"]
         body["mcp_enabled"] = caps["mcp"]
+        # Not a capability (the subsystem is always present, only its method
+        # varies), but every analyst needs it: the Explorer's column-suggestion
+        # disclosure has to say whether this instance is scoring locally or
+        # also asking the model, and only admins may read /api/admin/settings.
+        body["column_recommend_mode"] = get_settings().column_recommend_mode
         return body
 
     app.include_router(auth.router)
