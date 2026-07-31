@@ -103,14 +103,16 @@ export function CaseList() {
       ))}
       {offerDemo && (
         <div className="pt-2 text-center text-xs text-[var(--color-fg-muted)]">
-          <button
+          <Button
             type="button"
-            className="underline underline-offset-2 hover:text-[var(--color-fg)] disabled:no-underline disabled:opacity-60"
+            variant="ghost"
+            size="sm"
+            className="h-auto px-1 py-0 text-xs font-normal underline underline-offset-2 hover:bg-transparent disabled:no-underline"
             disabled={demo.running}
             onClick={demo.start}
           >
             {demo.label}
-          </button>
+          </Button>
           {demo.error && <span className="ml-2 text-[var(--color-danger)]">{demo.error}</span>}
         </div>
       )}
