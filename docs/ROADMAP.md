@@ -7,21 +7,21 @@ outgrow a couple of lines here go to `archive/PR{N}_REVIEW_FINDINGS.md`. Reporte
 live as GitHub issues; when any are open they get an "Open defects" section here with
 issue numbers, and root-cause detail stays in the issue thread.
 
-**State (verified against the codebase 2026-07-29):** no open issues, no open PRs, no code
-TODOs. Phase 3 is complete, so the queue is feature-shaped.
+**State (verified against the codebase 2026-07-30):** open issues are the #206 1.8.6
+umbrella and its sub-issues; D14 shipped on `release/1.8.6`. Phase 3 is complete, so the
+queue is feature-shaped.
 
 **Priority order,** roughly by payoff-per-effort:
 
-1. **D11** entropy bigram variant — closes a capability gap the shipped docs used to
-   overclaim; truth of what we ship outranks new surface.
-2. **D14** charset per-identifier scoping + sequence max-gap — same reason, two documented
-   narrowings that should not need a caveat.
-3. **A12** local transform tools — no design round needed, no OPSEC gate.
-4. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
+1. **D11** entropy bigram variant — closes a capability gap the shipped docs
+   used to overclaim; truth of what we ship outranks new surface. (D14, the other
+   truth-of-claims item, shipped in 1.8.6.)
+2. **A12** local transform tools — no design round needed, no OPSEC gate.
+3. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
    transitions — cheap detectors reusing existing SQL machinery, high forensic payoff.
-5. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
-6. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
-7. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
+4. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
+5. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
+6. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
    the detector line.
 
 Milestone 2–3 items are polish, picked up opportunistically. Milestones 6 (streaming
@@ -73,7 +73,102 @@ round — **standing rule: when either resumes, both are designed together in on
   placeholder comment in `README.md` marks where they go.
 - [ ] **Extract a `ui/Callout` primitive.** `analysis/EmbeddingStatusBanner`,
   `timelines/UploadDialog`'s duplicate warning and a handful of other sites hand-roll the
-  same border/dim-background/icon banner with per-site colour tokens.
+  same border/dim-background/icon banner with per-site colour tokens. Distinct from the
+  `Card` item below — a callout is a banner that interrupts, a card is a surface that
+  contains; they should not collapse into one primitive.
+
+### Frontend design-system consistency (audit 2026-07-30)
+
+Root cause, established by the audit: **the design system stops at colour.** Colour is
+tokenized and disciplined (tiered backgrounds, CVD-validated viz palette, documented
+diverging-ramp rationale); type, spacing, radius, icon size and surface treatment have no
+token layer and no primitive, so every author re-decides at the call site. Absent a token,
+`text-[10px]` is the *reasonable* thing to write — 118 reasonable moments is the drift.
+
+Seven dead-token references found and fixed the same day (`--color-error` in 12 files,
+`--color-border-focus` in 7, `--color-bg-subtle` in 2) plus the off-palette brand mark; all
+of it compiled, typechecked, linted and passed tests, because nothing checked.
+
+**The ratchet now exists** — `frontend/src/test/designSystem.test.ts`, shipped with the
+tier-1 work. Undefined `var(--…)` is a hard check at zero, over every `.ts`/`.tsx` under
+`src/` outside `src/test/` — a dead token is not a JSX-only problem, since
+`viz/lib/colors.ts` builds `var(--viz-*)` strings for the chart export path. Arbitrary
+`text-[Npx]` and raw `<button>` outside `components/ui/` are budgeted per file in
+`designSystemBudget.ts`, seeded at 119 and 119, and stay scoped to components and pages
+because only JSX has them. The budget only falls: exceeding an entry fails, and so does
+*beating* one without lowering it, which is what keeps the list shrinking. **Every item
+below burns its numbers out of that file** — closing one means deleting its budget entries,
+and the migration is done when the file is `{}`.
+
+- [ ] **Type scale in `@theme`, and burn down the 118 arbitrary font sizes.** Filed as a
+  correctness item, not an aesthetic one: `html[data-density="compact"]` (`index.css:205`)
+  rebases `font-size` to scale the whole UI, and every `text-[10px]`/`[11px]`/`[9px]`/`[8px]`
+  ignores it — **compact density does not do what it claims** on those 118 sites. Current
+  usage is `text-xs` ×565, `text-sm` ×107, arbitrary-px ×118, against `base`/`lg`/`xl` ×15
+  total: one size with ad-hoc escapes *downward*, so nothing has hierarchy and the smallest
+  text is below any legibility floor. Pick five named steps for *this* app — a dense grid
+  tool legitimately lives at 12–13px, so the scale is `micro / body / lead / section / page`,
+  not a generic 12/14/16/20/24. The point is five named decisions replacing ten anonymous
+  pixel values, not larger text. Related: 69 `uppercase` + 68 `tracking-wide/wider` + 232
+  `font-medium/semibold` are currently doing the job type size should, which is why every
+  section label reads as the same texture and the panel cannot be skimmed.
+
+- [ ] **`Card` and `SectionLabel` primitives.** 141 sites hand-roll
+  `border border-[var(--color-border)]` + `rounded` + padding as a surface; 69 hand-roll the
+  uppercase micro-label. That duplication is *why* radius is inconsistent (`rounded` ×267,
+  `-lg` ×22, `-md` ×12, `-sm` ×6, against three defined radius tokens that go largely
+  unused). Precondition for the type-scale and radius decisions landing consistently —
+  afterwards those live in one place instead of 141. Extraction is small; migration is a
+  ratcheted long tail, not a big-bang refactor. `SectionLabel` should render real heading
+  elements, which absorbs most of the heading-structure item below for free.
+
+- [ ] **Just-in-time guidance restructure (Investigate panel).** Needs its own design round;
+  the diagnosis is settled, the shape is not. The tier-1 work fixed the *plumbing* — copy is
+  now in `lib/guidance.tsx` and inlining it is a type error, dismissal is restorable — but
+  not the placement, which is the actual complaint. `guidance["investigate-anomalies"]` is
+  still ~120 words of three-step ordered list rendered in `text-xs`/`--color-fg-muted`, the
+  faintest text in the app, into a panel 320px wide by default: sized like documentation,
+  styled like a footnote, too long to skim and too faint to read. Worse, step 3 teaches
+  Normal/Dismiss/Confirm — the single most important concept in the product — at the one
+  moment nothing on screen demonstrates it, since finding cards have not rendered on first
+  run. Proposed inversion: guidance attaches to the control at the moment of use. Panel top
+  keeps one or two sentences of orientation (what this panel is *for*); scope guidance moves
+  onto `FrameBar` where the choice is made; disposition guidance moves onto the first finding
+  card, which is its referent. The registry makes this cheap to try — the copy is one file
+  and the panel is one component.
+
+- [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand store,
+  so it is per-browser: an analyst who folds a panel away at their desk meets it again on a
+  second machine, and vice versa. The backend half already exists — `User.preferences` (JSON,
+  `db/postgres.py:1515`) and `update_user_preferences` (`:4938`, where a `None` value deletes
+  the key, so reset comes free) — and `agent_disabled_tools` is the precedent for a namespaced
+  key. The work is a preferences passthrough (`PATCH /auth/me` takes only username, display
+  name and `onboarding_completed` today) plus deciding whether the frontend `User` type gains
+  `preferences` or the agent's derived-endpoint pattern is repeated. Deliberately deferred
+  from tier 1, which was scoped frontend-only.
+
+- [ ] **`IconButton` primitive / the 119 raw `<button>`s.** Across 46 files, against 57 that
+  import `Button` — roughly half the interactive surface skips the variant system, the focus
+  ring and the disabled treatment. Individually small, collectively wide. The ratchet has
+  stopped the bleeding; burn these down opportunistically rather than as one task, lowering
+  the `rawButton` budgets as files are cleaned.
+
+- [ ] **Icon size scale.** Ten distinct values in use (9, 10, 11, 12, 13, 14, 16, 18, 20,
+  24; `size={12}` ×110, `size={13}` ×102, `size={11}` ×75). 11 vs 12 vs 13 is not a decision
+  anyone can perceive — it is drift. Collapse to three (`inline` 12, `control` 16, `feature`
+  20). Nothing breaks today, so fold it into the `Card`/`SectionLabel` migration passes
+  rather than scheduling it separately.
+
+- [ ] **`aria-live` for background work.** 35 `aria-label` but exactly one `aria-live` in the
+  whole frontend: the job tray, toasts and streaming agent output announce nothing, so a
+  screen-reader user gets no signal that an ingest finished. Narrow audience, total failure
+  for that audience, small well-defined fix. The event grid's `aria-rowcount`/`aria-rowindex`
+  is the pattern to follow.
+
+- [ ] **Heading structure.** 39 heading elements (`h1` ×8, `h2` ×20, `h3` ×5, `h4` ×6)
+  across 211 component files; hierarchy is carried entirely by the uppercase micro-label
+  convention, so screen-reader navigation is effectively absent. Mostly resolved for free by
+  `SectionLabel` above — do not schedule separately, verify after that migration.
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 
@@ -106,18 +201,16 @@ read the reasoning of does not meet the reproducibility bar and does not count a
   by mean pair probability, flag below `prob_thresh` (AMiner default 0.05). Ship as a
   `method` on the existing entropy detector (`shannon-iqr` | `bigram`), not a fifteenth
   tool — same field selection, same findings shape, one more radio in the UI.
-- [ ] **D14 — Close the two documented scope narrowings.** Both are now written down as
-  caveats; this item removes the need for the caveat.
-  - *Charset per identifier.* AMiner scopes charsets by `id_path_list`; we learn one
-    alphabet per field across the whole scope, merging hosts that legitimately differ.
-    Add an optional group-by field to `find_charset_anomalies` (the `_col_expr` mechanism
-    already resolves arbitrary fields), learn one alphabet per group.
-  - *Sequence max-gap.* AMiner resets an in-progress sequence after `timeout` seconds; our
-    n-grams have no gap bound, so a quiet source manufactures sequences from unrelated
-    events days apart. Add a `max_gap` param to `find_sequence_novelty` /
-    `find_sequence_motifs` — a `dateDiff` guard inside the existing `lagInFrame` window,
-    cheap because the partitioning is already there. Both detectors must take it, or they
-    stop agreeing on what a sequence is.
+- [x] **D14 — Close the two documented scope narrowings.** Shipped in 1.8.6: charset
+  gains `group_field` (one learned alphabet per value of a second field; suppressions
+  stay `(field, value)`-keyed and apply across groups), and both sequence detectors gain
+  `max_gap_seconds` (the n-gram assembly partitions on a running count of over-gap
+  boundaries, so sequences no longer span quiet gaps). Both caveats in
+  `docs/ANOMALY_DETECTION.md` are rewritten to describe the opt-in. Review fixes on the
+  same branch: one scan per field rather than per group, a fallback reference for groups
+  absent from the baseline window (`details.group_basis`), per-field warning attribution
+  plus a warning when the grouped scan hits its row ceiling, and `age` rather than
+  `dateDiff` for the gap so the bound measures elapsed seconds, not boundaries crossed.
 
 ### Low effort, high value
 
@@ -342,7 +435,27 @@ Decisions, not work items — each stays as decided unless its trigger fires.
   (journal, browser, apache, cowrie, evtx, syslog, webhoneypot) are a permanent
   minimal-dependency alternative (stdlib-only, no pyarrow), listed side by side with native
   converters in `manifest.json` / `/api/converters` — not a porting queue (decided
-  2026-07-20).
+  2026-07-20). `evtx2timesketch` stays for *text* exports, but binary `.evtx` now has a
+  native converter (`evtx2vestigo`, 2026-07-30) — the two cover different inputs, not the
+  same one twice.
+- **Ship a stock Windows `vestigo-fieldmap.yml`.** `evtx2vestigo` emits Sigma-canonical
+  names, so Windows rules resolve correctly but are permanently flagged in
+  `fallback_fields` — nothing vouches for a name that is right by construction, and a
+  timeline field mapping cannot vouch for it (identity mappings are rejected as shadowing
+  the raw key). A ruleset-root fieldmap of identity entries clears the flag with identical
+  SQL — measured over SigmaHQ `rules/windows/builtin` (326 rules): 873 fallback flags → 0,
+  zero SQL differences, zero match-count differences, from 141 identity entries generated
+  straight from the rules' own field names. The open question is *delivery*, not
+  feasibility: the ruleset directory is operator-supplied via `VESTIGO_SIGMA_RULES_PATH`,
+  so the repo cannot drop a file into it — it needs shipping as a downloadable asset (like
+  the converters) or a documented snippet. See `docs/ANOMALY_DETECTION.md` §Sigma.
+- **`evtx2vestigo` deferred items.** `.evtx.gz` input (the `evtx` wheel's `PyEvtxParser`
+  accepts a `BytesIO`, but decompressing a routinely-hundreds-of-MB log costs whole-file
+  RAM); `%%1833`-style message-table resolution (needs the originating host's WEVT
+  templates, which no converter-side library has); EvtxECmd PayloadData slot-order parity
+  (we emit each mapped
+  property as its own attribute instead, which is strictly more information). Trigger for
+  the first: someone hands us a compressed triage collection.
 - **Converter parallelism tuning is revisit-on-demand.** Benchmarking worker-count and
   parallel-threshold defaults on a multi-GB log, parallel `.gz` parsing (seek-point
   indexing), and pcap/CSV intra-file record-boundary chunking (a logical CSV record can

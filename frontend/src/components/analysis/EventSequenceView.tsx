@@ -10,15 +10,16 @@
  */
 import { Fragment, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, ArrowRight } from "lucide-react";
+import { AlertTriangle, ArrowRight } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -53,6 +54,15 @@ const SERIES_FIELD_OPTIONS = [
 ];
 
 const NGRAM_OPTIONS = [2, 3, 4, 5];
+
+/** Max-gap bound (D14): break a sequence when consecutive events are farther
+ * apart than this. Empty = no bound (pre-1.8.6 behavior). */
+const MAX_GAP_OPTIONS = [
+  { value: "", label: "no gap bound" },
+  { value: "300", label: "gap ≤ 5 min" },
+  { value: "3600", label: "gap ≤ 1 h" },
+  { value: "86400", label: "gap ≤ 1 day" },
+];
 
 function SequenceRow({
   caseId,
@@ -142,6 +152,7 @@ export function EventSequenceView({
   const frame = useBaselineStore((s) => s.frame);
   const [seriesField, setSeriesField] = useState("artifact");
   const [ngramSize, setNgramSize] = useState(3);
+  const [maxGap, setMaxGap] = useState("");
   const qc = useQueryClient();
 
   const fl = useFindingsLimit();
@@ -168,13 +179,14 @@ export function EventSequenceView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey, fl.limit, sd.keyPart],
+    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, maxGap, blKey, fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "sequence_novelty",
         series_field: seriesField,
         ngram_size: ngramSize,
         limit: fl.limit,
+        ...(maxGap ? { max_gap_seconds: Number(maxGap) } : {}),
         ...blParams,
         ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
@@ -189,6 +201,7 @@ export function EventSequenceView({
         series_field: seriesField,
         ngram_size: ngramSize,
         limit: fl.limit,
+        ...(maxGap ? { max_gap_seconds: Number(maxGap) } : {}),
         ...blParams,
       }),
     onSuccess: () => {
@@ -294,6 +307,19 @@ export function EventSequenceView({
             ))}
           </select>
         </span>
+        <select
+          value={maxGap}
+          onChange={(e) => setMaxGap(e.target.value)}
+          data-testid="max-gap-select"
+          title="Max gap — break a sequence when consecutive events are farther apart than this"
+          className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+        >
+          {MAX_GAP_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>
 
@@ -306,16 +332,21 @@ export function EventSequenceView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No event sequences. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "Nothing to compare — the baseline window has no complete sequences of this length for the chosen field."
-                : "Every event ordering in the suspect windows also occurs in the baseline."}
-          </span>
-        </div>
+                ? "The baseline window holds no complete sequence of this length for the chosen field. Shorten the sequence, widen the baseline, or pick a field that changes more often."
+                : "The suspect windows repeat orderings the baseline already contains, so nothing here is new — not that nothing happened."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "No baseline sequence to compare against."
+              : "Every event ordering also occurs in the baseline."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

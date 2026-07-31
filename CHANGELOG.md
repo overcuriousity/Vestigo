@@ -5,7 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.6] — 2026-07-30
+
+### Added
+
+- **`evtx2vestigo`: binary Windows Event Log converter.** Parses `.evtx` containers
+  directly (file or directory) instead of a text export, so `file_hash` anchors to the
+  original evidence. `byte_offset` is a real offset into the `.evtx` and `content_hash`
+  covers that same raw record span, so `dd`+`sha256sum` reproduces it without Vestigo;
+  where a damaged chunk forces a substitute, the row says so itself in
+  `byte_offset_basis` and `content_hash_basis` rather than leaving a record id to pass
+  for an offset.
+  Each 64 KiB chunk is handed to the parser as a complete, checksum-valid one-chunk
+  document, which recovers records the whole-file path loses at the first damaged chunk;
+  record offsets are resolved per chunk *and per occurrence within a chunk*, so a record
+  id repeated in a re-chunked or partially overwritten log still yields distinct offsets
+  either way. No value is lost to a name collision: repeated `<Data Name="X">` elements
+  are numbered rather than overwritten, and where a converter-derived key (`host`, `user`,
+  `src_ip`, `Map*`) collides with a native field of the same name, the native value moves
+  to a numbered spelling instead of disappearing. Attribute names are Sigma-canonical
+  (`EventID` as an unpadded string, `Channel`, `Provider_Name`, native `EventData` names),
+  so community Windows rules compile to exactly the predicate they look like with no
+  field translation. The EvtxECmd map corpus (468 maps,
+  [EricZimmerman/evtx](https://github.com/EricZimmerman/evtx), MIT) is embedded for event
+  descriptions; `--no-maps` opts out. Requires `pyarrow` and `evtx`.
+
+- **Tool calls in the agent panel are expandable.** Every tool row now unfolds to the
+  exact arguments the agent sent and what the tool returned, persisted rows and live
+  stream alike. (#203)
+- **The agent panel shows which Explorer view the agent sees.** A persistent bar names
+  the filters inherited as context, and each sent message is stamped with the filter
+  snapshot the agent received with it, so a mid-investigation filter change is visible
+  in the transcript instead of silently shifting the agent's ground. (#205)
+- **Charset detector: per-identifier scoping.** `group_field` learns one alphabet per
+  value of a second field (e.g. per host), retiring the merged-alphabet caveat.
+  Suppressions stay keyed on `(field, value)` and apply across groups. Group count costs
+  rows, not queries: the per-group alphabets travel into one scan per field as array
+  parameters, with `LIMIT … BY grp` keeping each group's budget.
+
+  The two skip guards mean opposite things and are treated as such. An alphabet over
+  5,000 characters means the *question* does not apply — a novel character carries no
+  signal in free text — so that group is dropped and named in `warnings`. Fewer than 20
+  distinct values means not enough *evidence*, which does not exonerate the group, so it
+  is scored against a fallback reference: events outside the suspect windows in temporal
+  mode, or the merged whole-scope alphabet in self-baseline mode — exactly what the field
+  was measured against before grouping, so enabling grouping never narrows coverage.
+  "Absent from the baseline window" is the zero case of the same condition and takes the
+  same route. Every finding records which reference scored it and how much evidence its
+  own group contributed (`details.group_basis`,
+  `details.group_baseline_distinct_values`, both shown on the row). The fallback learn is
+  a whole-scope scan, so it runs only when some group needs one — a bounded probe over
+  the suspect windows decides that far more cheaply. A non-string `group_field` is
+  refused with 422. (D14)
+- **Sequence detectors: `max_gap_seconds`.** `sequence_novelty` and `sequence_motif`
+  break an n-gram when consecutive events are farther apart than the bound, retiring
+  the manufactured-sequence caveat. Unset keeps the pre-1.8.6 behavior bit-identical.
+  (D14)
 
 ### Security
 
@@ -17,6 +72,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclude 7.18.2. Do not "fix" it by downgrading; `npm audit fix --force` installs 7.11.0.
 
 ### Fixed
+
+- **A grouped charset run no longer scans `events` once per group.** With a high-cardinality
+  `group_field` that was one heavy scan per group per field; it is now one scan per field.
+  (D14)
+- **A tool row in the agent panel no longer formats its payload while collapsed.** A
+  `<details>` renders its children regardless of state, so every row was stringifying its
+  full tool result on every panel render. (#203)
+- **A streamed tool result is only paired on a non-empty `tool_call_id`**, so a provider
+  that emitted an empty id could not splash one result across every unkeyed row. (#203)
+- **An orphaned tool result passes silently instead of rendering as a call.** A result row
+  whose call row is missing from the transcript found no open call to pair with and fell
+  through to the call branch, drawing an argument-less tool row for a call the agent never
+  made. `tool_result` settles it — the server writes args on a call row and a result on a
+  result row, never both. (#203)
+- **`view_filters` is bounded (16 KiB serialized, 422 above it).** It is persisted per user
+  message, so an unvalidated client dict could grow the transcript at will. (#205)
+- **`evtx2vestigo`: a named `DataN` field no longer collides with an unnamed positional
+  one.** The named value keeps the plain key — that is what Sigma rules address — and the
+  positional value moves to `DataN_pos`, decided from the record as a whole so it does not
+  depend on which element the writer emitted first.
+- **`evtx2vestigo`: no `EventData`/`UserData` element overwrites another.** A repeated
+  `<Data Name="X">` — which EVTX permits — silently kept only the last value. The first
+  occurrence now keeps the plain spelling and the rest are numbered in document order
+  (`X_2`, `X_3`, …), probing for a free key so a record carrying a literal `X_2` does not
+  collapse into it.
+- **A grouped charset run's `warnings` describe what it actually did.** Groups routed to
+  the fallback were reported as "not evaluated", and a field whose fallback could not be
+  learned reported absent groups as unevaluated even when none existed. Warnings now name
+  the groups, separate "no baseline values" from "too few baseline values", and state
+  which guard the fallback itself tripped. Every one of those warnings names its *field*:
+  the same group can be thin for one field and absent from the baseline window for
+  another, and a merged count left no way to tell which. A run that hits the grouped
+  scan's 5,000-row ceiling says so too — that ceiling orders by novelty across all groups,
+  so hitting it drops whole low-novelty groups and a silent result would read as "these
+  are the groups with novel characters". (D14)
+- **`max_gap_seconds` measures elapsed seconds, not second boundaries crossed.** The gap
+  used ClickHouse `dateDiff`, which reports 2 for a 1.2 s step that straddles two
+  boundaries — so a bound of 1 s broke bursts whose steps were barely over a second. It
+  uses `age` now. (D14)
+- **A tool row in the agent panel pairs on `tool_call_id` rather than on whether the row
+  carries arguments.** A zero-argument call persisted with `null` args read as a result
+  row, consumed its sibling's pending entry and folded a result onto the wrong call. The
+  row is also keyed by call identity now, so its expanded state cannot follow a position
+  in the transcript, and its open state has a single owner instead of a native toggle and
+  a React handler racing on the same click. (#203)
+- **The downloadable converter LLM prompts match the data contract again.** The Parquet
+  prompt documented the pre-1.3.0 footer: it omitted the forensic metadata keys
+  (`converted_at`, `row_counts`, `timezone_assumption`, `parse_decisions`) and the
+  `path`/`mtime` provenance fields, and sent timezone assumptions into a script comment
+  the server never reads. The CSV/JSONL prompt now mentions pipe-separated tags. (#204)
 
 - **The login-backoff tracker's entry cap is now an actual bound.** `LoginBackoff` pruned
   expired entries when full, then inserted unconditionally — so when pruning could free

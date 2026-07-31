@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from vestigo.api.deps import get_current_user, get_store
 from vestigo.core.config import get_settings
+from vestigo.core.demo_case import maybe_seed_demo_case
 from vestigo.core.login_backoff import get_login_backoff
 from vestigo.core.security import (
     hash_password,
@@ -93,6 +94,12 @@ async def _issue_session(user: User, request: Request, response: Response) -> No
     )
     _set_session_cookie(response, session.id)
     await store.touch_last_login(user.id)
+    # A user's first session ever also seeds their demo case. Hooked here
+    # rather than in the login handler so the OIDC callback behaves
+    # identically; the per-user claim makes the password-change re-issue a
+    # no-op. Deliberately last and deliberately non-fatal — the call swallows
+    # its own errors, so a broken demo archive can never cost anyone a session.
+    await maybe_seed_demo_case(user)
 
 
 @router.post("/login")

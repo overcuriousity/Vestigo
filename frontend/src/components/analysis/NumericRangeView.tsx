@@ -8,16 +8,17 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, MoveUp, MoveDown } from "lucide-react";
+import { AlertTriangle, MoveUp, MoveDown } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -102,7 +103,7 @@ function RangeRow({
           {fieldLabel(finding.field)}
         </span>
         {above ? (
-          <MoveUp size={12} className="shrink-0 text-[var(--color-error)]" />
+          <MoveUp size={12} className="shrink-0 text-[var(--color-danger)]" />
         ) : (
           <MoveDown size={12} className="shrink-0 text-[var(--color-warning)]" />
         )}
@@ -242,18 +243,25 @@ export function NumericRangeView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No numeric out-of-range values. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "No numeric fields with enough baseline samples. Pick fields explicitly above."
+                ? "A numeric field needs enough baseline samples to establish a range. Pick fields explicitly above."
                 : isTemporal
-                  ? "No values outside the baseline window's min/max range."
-                  : "No numeric outliers outside the IQR fence."}
-          </span>
-        </div>
+                  ? "Every suspect-window value fell inside the range the baseline already covered."
+                  : "Every value fell inside the interquartile fence. A value can still be wrong without being extreme."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "No numeric field had enough baseline samples."
+              : isTemporal
+                ? "No values outside the baseline range."
+                : "No numeric outliers."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

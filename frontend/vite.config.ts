@@ -33,5 +33,10 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
+    // Vitest stubs every CSS import to an empty string by default, `?raw`
+    // included. `designSystem.test.ts` parses index.css for the set of defined
+    // custom properties, so it needs the real text — scoped to that one file so
+    // no other test starts paying for the Tailwind pipeline.
+    css: { include: [/index\.css/] },
   },
 });

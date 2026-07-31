@@ -10,16 +10,17 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -46,6 +47,38 @@ interface Props {
   onRunIdChange?: (runId: string | undefined) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }
+
+/** Standard grouping fields for the optional per-identifier scoping (D14) —
+ * same set the sequence view offers for its series field. Labels come from
+ * `anomalyFieldLabel`, so these are tokens only. */
+const GROUP_FIELD_TOKENS = ["artifact", "timestamp_desc", "display_name", "parser_name"];
+
+/** A group value as shown to the analyst — events missing the grouping field
+ * form a real group of their own, so it is named rather than hidden. */
+function groupValueLabel(value: unknown): string {
+  return typeof value === "string" && value !== "" ? value : "(no value)";
+}
+
+/** Which reference scored a grouped finding (D14). A group without enough
+ * values of its own — including none at all — is scored against a fallback
+ * rather than skipped, and `own` says how much evidence it did contribute. */
+function groupBasisHint(basis: unknown, own: unknown): string {
+  const short =
+    typeof own === "number"
+      ? own === 0
+        ? "This group had no values of its own in the baseline window"
+        : `This group had only ${own} distinct values of its own, below the 20 needed`
+      : "This group had no usable reference of its own";
+  if (basis === "outside-suspect-windows")
+    return `${short}; scored against a reference learned outside the suspect windows.`;
+  if (basis === "scope-merged")
+    return `${short}; scored against the merged whole-scope alphabet, which is what this field was measured against before grouping.`;
+  if (basis === "baseline-window") return "Scored against this group's baseline-window alphabet.";
+  return "Scored against this group's alphabet learned across the scope.";
+}
+
+/** Basis values that mean "not this group's own alphabet". */
+const FALLBACK_BASES = new Set(["outside-suspect-windows", "scope-merged"]);
 
 /** "U+0000"-style codepoint label for a (possibly multi-codepoint) char. */
 function codepointLabel(c: string): string {
@@ -123,7 +156,7 @@ function CharsetRow({
           <span
             key={`${c}:${i}`}
             title={codepointLabel(c)}
-            className="inline-block rounded border border-[var(--color-error)]/40 bg-[var(--color-bg-elevated)] px-1 py-0.5 font-mono text-xs text-[var(--color-error)]"
+            className="inline-block rounded border border-[var(--color-danger)]/40 bg-[var(--color-bg-elevated)] px-1 py-0.5 font-mono text-xs text-[var(--color-danger)]"
           >
             {charLabel(c)}
           </span>
@@ -140,6 +173,25 @@ function CharsetRow({
           <strong className="text-[var(--color-fg-secondary)]">{finding.score.toFixed(1)}</strong>
         </span>
         {finding.first_seen && <span>first {fmtTs(finding.first_seen)}</span>}
+        {typeof finding.details.group_field === "string" && (
+          <span
+            title={groupBasisHint(
+              finding.details.group_basis,
+              finding.details.group_baseline_distinct_values,
+            )}
+          >
+            per {fieldLabel(finding.details.group_field)}{" "}
+            <strong className="text-[var(--color-fg-secondary)]">
+              {groupValueLabel(finding.details.group_value)}
+            </strong>
+            {/* Why a fallback scored it: no evidence of its own, or too little.
+                Labelling a thin group "no baseline" would be wrong. */}
+            {FALLBACK_BASES.has(String(finding.details.group_basis)) &&
+              (finding.details.group_baseline_distinct_values
+                ? " (thin baseline)"
+                : " (no baseline)")}
+          </span>
+        )}
       </div>
     </FindingShell>
   );
@@ -156,20 +208,39 @@ export function CharsetNoveltyView({
 }: Props) {
   const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
+  // D14: optional per-identifier scoping — one learned alphabet per value of
+  // this field instead of one merged alphabet across the scope.
+  const [groupField, setGroupField] = useState("");
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
   const fl = useFindingsLimit();
   const sd = useShowDismissed();
 
+  // Dynamic attribute fields extend the group-by dropdown (same source as the
+  // sequence view's grouping-field picker).
+  const { data: fieldsData } = useQuery({
+    queryKey: ["anomalies", caseId, timelineId, "fields"],
+    queryFn: () => anomaliesApi.fields(caseId, timelineId),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const groupFieldOptions = useMemo(() => {
+    const attrOptions = (fieldsData?.fields ?? [])
+      .filter((f) => f.token.startsWith("attr:"))
+      .map((f) => f.token);
+    return [...GROUP_FIELD_TOKENS, ...attrOptions];
+  }, [fieldsData]);
+
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "charset", blKey, fieldsParam ?? "__auto__", fl.limit, sd.keyPart],
+    queryKey: ["anomalies", caseId, timelineId, "charset", blKey, fieldsParam ?? "__auto__", groupField || "__scope__", fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "charset",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(groupField ? { group_field: groupField } : {}),
         ...(sd.enabled ? { include_dismissed: true } : {}),
       }),
     staleTime: 60_000,
@@ -183,6 +254,7 @@ export function CharsetNoveltyView({
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+        ...(groupField ? { group_field: groupField } : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
@@ -234,6 +306,20 @@ export function CharsetNoveltyView({
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
+        <select
+          value={groupField}
+          onChange={(e) => setGroupField(e.target.value)}
+          data-testid="charset-group-select"
+          title="Group by — learn one alphabet per value of this field (e.g. per host) instead of one merged alphabet"
+          className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+        >
+          <option value="">Whole scope</option>
+          {groupFieldOptions.map((token) => (
+            <option key={token} value={token}>
+              per {fieldLabel(token)}
+            </option>
+          ))}
+        </select>
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -254,18 +340,25 @@ export function CharsetNoveltyView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No charset novelties. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "No fields with enough distinct baseline values (or the alphabet is too large). Pick fields explicitly above."
+                ? "A learned alphabet needs enough distinct baseline values, and stays useful only while the alphabet is small. Pick fields explicitly above."
                 : isTemporal
-                  ? "No values with characters absent from the baseline window."
-                  : "No values with rare characters."}
-          </span>
-        </div>
+                  ? "Every suspect-window value used characters the baseline had already seen."
+                  : "Every value stayed inside the alphabet the corpus already uses."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "No field had a learnable alphabet."
+              : isTemporal
+                ? "No values with characters new to the baseline."
+                : "No values with rare characters."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

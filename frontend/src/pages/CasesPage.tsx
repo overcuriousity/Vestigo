@@ -3,7 +3,6 @@ import { CreateCaseDialog } from "@/components/cases/CreateCaseDialog";
 import { ImportCaseDialog } from "@/components/cases/ImportCaseDialog";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { useCapabilities } from "@/api/health";
-import { guidance } from "@/lib/guidance";
 import { ShieldAlert } from "lucide-react";
 
 export function CasesPage() {
@@ -37,9 +36,7 @@ export function CasesPage() {
         <CaseList />
 
         <div className="mt-8">
-          <GuidancePanel id="cases-page" title={guidance.casesPage.title}>
-            <p>{guidance.casesPage.body}</p>
-          </GuidancePanel>
+          <GuidancePanel id="cases-page" />
         </div>
       </div>
     </div>

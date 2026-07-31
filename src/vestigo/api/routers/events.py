@@ -1708,6 +1708,8 @@ async def _run_stat_detector(
     min_support: int | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    group_field: str | None = None,
+    max_gap_seconds: int | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -1796,6 +1798,8 @@ async def _run_stat_detector(
         resolution["sequence_ngram"] = (
             ngram_size if ngram_size is not None else cfg.stat_sequence_ngram
         )
+        # D14: None = no gap bound (pre-1.8.6 behavior).
+        resolution["sequence_max_gap_seconds"] = max_gap_seconds
         try:
             result = await run_in_threadpool(
                 svc.find_sequence_novelty,
@@ -1810,6 +1814,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                max_gap_seconds=max_gap_seconds,
             )
             return result, resolution
         except ValueError as exc:
@@ -1826,6 +1831,9 @@ async def _run_stat_detector(
         resolution["motif_min_support"] = (
             min_support if min_support is not None else cfg.stat_motif_min_support
         )
+        # D14: same gap bound as sequence_novelty — both detectors must agree
+        # on what a sequence is.
+        resolution["motif_max_gap_seconds"] = max_gap_seconds
         try:
             result = await run_in_threadpool(
                 svc.find_sequence_motifs,
@@ -1843,6 +1851,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                max_gap_seconds=max_gap_seconds,
             )
             return result, resolution
         except ValueError as exc:
@@ -1908,22 +1917,31 @@ async def _run_stat_detector(
         )
 
     if detector == "charset":
-        result = await run_in_threadpool(
-            svc.find_charset_novelty,
-            case_id=case_id,
-            source_ids=source_ids,
-            source_offsets=source_offsets,
-            fields=parsed_fields,
-            limit=limit,
-            per_field_limit=cfg.stat_per_field_limit,
-            rarity_floor=cfg.stat_charset_rarity_floor,
-            windows=windows,
-            exclude_event_ids=exclude_ids,
-            allowlist=allowlist,
-            field_mappings=field_mappings,
-            inventory=inventory,
-            inventory_total=inventory_total,
-        )
+        # D14: per-identifier scoping — one learned alphabet per group value
+        # (None = one merged alphabet per field, the pre-1.8.6 behavior).
+        resolution["charset_group_field"] = group_field
+        try:
+            result = await run_in_threadpool(
+                svc.find_charset_novelty,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                per_field_limit=cfg.stat_per_field_limit,
+                rarity_floor=cfg.stat_charset_rarity_floor,
+                windows=windows,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                group_field=group_field,
+            )
+        except ValueError as exc:
+            # e.g. a non-string group_field, which would otherwise reach
+            # ClickHouse as a type error.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
     if detector == "entropy":
@@ -2452,6 +2470,17 @@ async def _persist_detector_run(
             or resolution.get("interval_min_rate_ratio"),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
+            # charset: per-identifier scoping (None = one alphabet per field).
+            "group_field": resolution.get("charset_group_field"),
+            # sequence_novelty / sequence_motif: gap bound (None = no bound).
+            # Disjoint keys, coalesced on presence rather than truthiness: the
+            # API floor is currently ge=1, but a persisted 0 must not fall
+            # through to the other detector's key if that floor ever moves.
+            "max_gap_seconds": (
+                resolution["sequence_max_gap_seconds"]
+                if "sequence_max_gap_seconds" in resolution
+                else resolution.get("motif_max_gap_seconds")
+            ),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
@@ -2558,6 +2587,23 @@ async def list_anomalies(
         description=(
             "sequence_motif only: minimum occurrences before an n-gram counts "
             "as a recurring motif. Omit to use the server default."
+        ),
+    ),
+    group_field: str | None = Query(
+        default=None,
+        description=(
+            "charset only: learn one reference alphabet per value of this field "
+            "(e.g. per host) instead of one merged alphabet per field. Omit for "
+            "whole-scope learning."
+        ),
+    ),
+    max_gap_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "sequence_novelty and sequence_motif only: break an n-gram when "
+            "consecutive events are more than this many seconds apart. Omit "
+            "for no gap bound."
         ),
     ),
     start: datetime | None = Query(
@@ -2672,6 +2718,8 @@ async def list_anomalies(
         min_support=min_support,
         start=start,
         end=end,
+        group_field=group_field,
+        max_gap_seconds=max_gap_seconds,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2846,6 +2894,18 @@ class TagAnomaliesRequest(BaseModel):
         ge=2,
         description="sequence_motif only: minimum occurrences for a recurring motif.",
     )
+    group_field: str | None = Field(
+        default=None,
+        description="charset only: learn one reference alphabet per value of this field.",
+    )
+    max_gap_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "sequence_novelty and sequence_motif only: break an n-gram when "
+            "consecutive events are more than this many seconds apart."
+        ),
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -2910,6 +2970,8 @@ async def tag_anomalies(
         min_support=body.min_support,
         start=body.start,
         end=body.end,
+        group_field=body.group_field,
+        max_gap_seconds=body.max_gap_seconds,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )

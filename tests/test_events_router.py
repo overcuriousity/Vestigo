@@ -1068,6 +1068,69 @@ async def test_run_stat_detector_dispatches_to_charset(patched_store, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_run_stat_detector_charset_passes_group_field(patched_store, monkeypatch):
+    """D14: group_field threads through dispatch, the resolution snapshot, and
+    the service call (None when unset)."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="charset",
+        fields="attr:user",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+        group_field="attr:host",
+    )
+    assert result == "charset-result"
+    assert fake_svc.charset_calls[0]["group_field"] == "attr:host"
+    assert resolution["charset_group_field"] == "attr:host"
+
+    _result2, resolution2 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="charset",
+        fields="attr:user",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.charset_calls[1]["group_field"] is None
+    assert resolution2["charset_group_field"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_charset_rejects_bad_group_field(patched_store, monkeypatch):
+    """A group_field the detector refuses (non-string column) surfaces as 422,
+    not as a ClickHouse type error behind a 500."""
+
+    class _Refusing(_FakeStatAnomalyService):
+        def find_charset_novelty(self, **kwargs):
+            raise ValueError("group_field 'timestamp' is not a string field")
+
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: _Refusing())
+
+    with pytest.raises(HTTPException) as excinfo:
+        await events._run_stat_detector(
+            "c1",
+            "t1",
+            ["s1"],
+            detector="charset",
+            fields="attr:user",
+            series_field="artifact",
+            z_threshold=None,
+            limit=50,
+            group_field="timestamp",
+        )
+    assert excinfo.value.status_code == 422
+    assert "not a string field" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatch):
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
@@ -2221,3 +2284,52 @@ def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
 
     without = list(events._stream_csv(eq, {}, None, expected=2, tally={}))
     assert not without[0].startswith("#")
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_passes_max_gap_seconds(patched_store, monkeypatch):
+    """D14: max_gap_seconds threads to both sequence detectors and their
+    resolution snapshots; unset stays None (no gap bound)."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _r1, res1 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+        max_gap_seconds=300,
+    )
+    assert fake_svc.sequence_calls[0]["max_gap_seconds"] == 300
+    assert res1["sequence_max_gap_seconds"] == 300
+
+    _r2, res2 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_motif",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+        max_gap_seconds=3600,
+    )
+    assert fake_svc.motif_calls[0]["max_gap_seconds"] == 3600
+    assert res2["motif_max_gap_seconds"] == 3600
+
+    _r3, res3 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.sequence_calls[1]["max_gap_seconds"] is None
+    assert res3["sequence_max_gap_seconds"] is None

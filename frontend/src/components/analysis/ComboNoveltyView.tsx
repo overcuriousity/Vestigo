@@ -12,12 +12,13 @@ import { AlertTriangle, ChevronsRight, Clock, Info } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -286,16 +287,21 @@ export function ComboNoveltyView({
       )}
 
       {!explicitTooFew && !isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No combinations detected. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "Not enough distinct fields to combine. Pick fields explicitly above."
-                : "No rare combinations detected. All field pairings appear frequently."}
-          </span>
-        </div>
+                ? "Combinations need at least two fields present on the same event. Pick fields explicitly above."
+                : "Every field pairing that occurs here occurs often. A rare pairing of common values is what this detector looks for, so a clean result means the fields move together predictably."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "Not enough distinct fields to combine."
+              : "No rare field combinations."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

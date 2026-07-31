@@ -19,6 +19,7 @@ import { useDisposition } from "@/hooks/useDisposition";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
@@ -47,6 +48,16 @@ const SERIES_FIELD_OPTIONS = [
 ];
 
 const NGRAM_OPTIONS = [2, 3, 4, 5];
+
+/** Max-gap bound (D14): break a sequence when consecutive events are farther
+ * apart than this. Empty = no bound (pre-1.8.6 behavior). Same options as the
+ * event-sequence view — both detectors must agree on what a sequence is. */
+const MAX_GAP_OPTIONS = [
+  { value: "", label: "no gap bound" },
+  { value: "300", label: "gap ≤ 5 min" },
+  { value: "3600", label: "gap ≤ 1 h" },
+  { value: "86400", label: "gap ≤ 1 day" },
+];
 
 /**
  * Human-readable problem with a routine row's occurrence materialization, or
@@ -267,6 +278,7 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
   const [seriesField, setSeriesField] = useState("artifact");
   const [ngramSize, setNgramSize] = useState(3);
   const [minSupport, setMinSupport] = useState(3);
+  const [maxGap, setMaxGap] = useState("");
   const qc = useQueryClient();
 
   const fl = useFindingsLimit();
@@ -291,13 +303,14 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
 
   // Mode-less mining — deliberately ignores the detector frame/baseline.
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "sequence_motif", seriesField, ngramSize, minSupport, fl.limit],
+    queryKey: ["anomalies", caseId, timelineId, "sequence_motif", seriesField, ngramSize, minSupport, maxGap, fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "sequence_motif",
         series_field: seriesField,
         ngram_size: ngramSize,
         min_support: minSupport,
+        ...(maxGap ? { max_gap_seconds: Number(maxGap) } : {}),
         limit: fl.limit,
       }),
     staleTime: 60_000,
@@ -353,20 +366,7 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
   return (
     <div className="space-y-3">
       {/* First-run explainer — folds away permanently once dismissed. */}
-      <GuidancePanel id="investigate-patterns" title="How pattern mining works">
-        <p>
-          This tab <strong>discovers repeating event sequences</strong> (motifs) —
-          it needs no baseline and detects nothing by itself; it shows the log's
-          routine structure so you can separate it from the interesting rest.
-        </p>
-        <p className="mt-1">
-          <strong>Mark routine</strong> when you recognize a sequence as expected
-          operations — cron jobs, heartbeats, poller loops, backup runs. Its
-          occurrences collapse in the event grid behind a visible "N routine
-          events" count, decluttering the timeline without hiding anything.
-          Routine patterns stay listed below and can be unmarked anytime.
-        </p>
-      </GuidancePanel>
+      <GuidancePanel id="investigate-patterns" />
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
@@ -426,6 +426,19 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
           />
           ×
         </span>
+        <select
+          value={maxGap}
+          onChange={(e) => setMaxGap(e.target.value)}
+          data-testid="motif-max-gap-select"
+          title="Max gap — break a sequence when consecutive events are farther apart than this"
+          className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
+        >
+          {MAX_GAP_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>
 
@@ -438,14 +451,17 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No events ingested yet."
-              : `No sequence of ${ngramSize} repeats at least ${minSupport} times for this field — the log has no routine structure at these settings.`}
-          </span>
-        </div>
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Sequence mining reads events in time order, so events whose timestamp could not be parsed are invisible to it."
+              : `Try a shorter sequence than ${ngramSize}, or a support threshold below ${minSupport}. A log with no routine structure is itself worth knowing — it means there is nothing here to collapse away.`
+          }
+        >
+          {data?.status === "no_data"
+            ? "No events carry a usable timestamp."
+            : `No sequence of ${ngramSize} repeats at least ${minSupport} times for this field.`}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

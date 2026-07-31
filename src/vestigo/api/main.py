@@ -23,6 +23,7 @@ from vestigo.api.routers import (
     baselines,
     cases,
     converters,
+    demo,
     dispositions,
     enrichers,
     events,
@@ -35,6 +36,7 @@ from vestigo.api.routers import (
 )
 from vestigo.core.capabilities import get_capabilities
 from vestigo.core.config import get_settings
+from vestigo.core.demo_case import cancel_pending_seeds
 from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.core.security import hash_password
 from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, User, generate_id
@@ -338,6 +340,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery_task.cancel()
         with suppress(asyncio.CancelledError):
             await recovery_task
+        # Demo seeds tear their partial case down when cancelled, but only if
+        # someone cancels them — an unattended shutdown mid-ingest would
+        # otherwise leave a half-populated case in a user's list.
+        await cancel_pending_seeds()
 
 
 class AuthAuditMiddleware:
@@ -573,6 +579,7 @@ def create_app() -> FastAPI:
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)
     app.include_router(transfer.router)
+    app.include_router(demo.router)
 
     # External streamable-HTTP MCP endpoint (Bearer-token-gated), off by default.
     # Registered outside /api/, so AuthAuditMiddleware's session gate does not

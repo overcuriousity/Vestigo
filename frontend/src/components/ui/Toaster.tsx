@@ -16,7 +16,7 @@ export const ToastViewport = () => (
 
 const KIND_ICON = {
   success: <CheckCircle2 size={14} className="shrink-0 text-[var(--color-success)]" />,
-  error: <CircleAlert size={14} className="shrink-0 text-[var(--color-error)]" />,
+  error: <CircleAlert size={14} className="shrink-0 text-[var(--color-danger)]" />,
   info: <Info size={14} className="shrink-0 text-[var(--color-accent)]" />,
 } as const;
 
@@ -33,7 +33,7 @@ function ToastCard({ item }: { item: ToastItem }) {
         "flex items-start gap-2 rounded border bg-[var(--color-bg-elevated)] p-3 shadow-lg",
         "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0",
         item.kind === "error"
-          ? "border-[var(--color-error)]/40"
+          ? "border-[var(--color-danger)]/40"
           : item.kind === "success"
             ? "border-[var(--color-success)]/40"
             : "border-[var(--color-border)]",

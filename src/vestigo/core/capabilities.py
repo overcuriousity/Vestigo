@@ -30,6 +30,7 @@ CAPABILITY_KEYS: tuple[str, ...] = (
     "enrichers",
     "sigma",
     "transfer",
+    "demo_case",
 )
 
 
@@ -84,4 +85,8 @@ async def get_capabilities() -> dict[str, bool]:
         # frontend gates every subsystem the same way, not because it varies.
         "sigma": True,
         "transfer": settings.transfer_enabled,
+        # Nothing to configure: the case is generated on demand from code that
+        # ships with the app. The key exists so the frontend gates every
+        # subsystem the same way.
+        "demo_case": settings.demo_case_enabled,
     }

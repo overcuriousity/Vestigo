@@ -20,7 +20,7 @@ import { anomaliesApi } from "@/api/anomalies";
 import { dispositionsApi } from "@/api/dispositions";
 import { useDisposition } from "@/hooks/useDisposition";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
-import { RefreshButton } from "./detector-shared";
+import { AnalysisEmptyState, RefreshButton } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import { truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
@@ -132,20 +132,7 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
 
   return (
     <div className="space-y-3">
-      <GuidancePanel id="investigate-templates" title="How template browsing works">
-        <p>
-          This tab <strong>collapses structurally identical log lines</strong> into
-          shapes — variable parts (timestamps, IPs, UUIDs, hex, numbers) are masked, so
-          50M repeats of one routine line group into one template while a genuinely odd
-          line stands out.
-        </p>
-        <p className="mt-1">
-          <strong>Mute</strong> a template you recognize as routine noise — its events
-          disappear from the grid immediately (no background job), always behind a
-          visible "N routine events" count. Muted templates stay listed below and can be
-          unmuted anytime.
-        </p>
-      </GuidancePanel>
+      <GuidancePanel id="investigate-templates" />
 
       <div className="flex flex-wrap items-center gap-2">
         <span className="shrink-0 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
@@ -191,10 +178,9 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
       )}
 
       {!isLoading && templates.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>No events ingested yet.</span>
-        </div>
+        <AnalysisEmptyState hint="Templates are mined from event messages, so a timeline whose events carry no message text produces none.">
+          No templates for this timeline.
+        </AnalysisEmptyState>
       )}
 
       {activeTemplates.length > 0 && (

@@ -1,0 +1,93 @@
+/**
+ * Per-file violation budget for `designSystem.test.ts` — a **migration artifact**,
+ * not a permanent fixture. Its end state is `{}`.
+ *
+ * Every other coverage assertion in this repo derives its set rather than listing
+ * it (`tests/test_settings_api.py` enumerates `Settings.model_fields`;
+ * `tests/test_chart_meta.py` derives `KNOWN_OPTION_KEYS` and says so in its
+ * docstring). This is the first hand-seeded exemption list, and it exists for one
+ * reason: the two checks it covers have no fix available yet. Arbitrary font sizes
+ * cannot be replaced until a type scale exists, and raw `<button>`s cannot be
+ * replaced until `IconButton` does — both are `docs/ROADMAP.md` Milestone 3 items
+ * under "Frontend design-system consistency". The budget stops the counts growing
+ * in the meantime, and the test forces every entry down as those land.
+ *
+ * The numbers only ever go down. Lowering one is the whole point; raising one
+ * needs a reason in the commit message.
+ */
+
+export interface FileBudget {
+  /** Arbitrary Tailwind font sizes: `text-[11px]`. Replaced by the type scale. */
+  fontSize?: number;
+  /** Raw `<button>` outside `components/ui/`. Replaced by `Button`/`IconButton`. */
+  rawButton?: number;
+}
+
+export const BUDGET: Record<string, FileBudget> = {
+  "../components/agent/AgentFiltersBar.tsx": { fontSize: 1 },
+  "../components/agent/AgentPanel.tsx": { fontSize: 14 },
+  "../components/agent/ChartProposalCard.tsx": { fontSize: 2 },
+  "../components/agent/FindingCard.tsx": { fontSize: 1 },
+  "../components/agent/Markdown.tsx": { fontSize: 1 },
+  "../components/agent/ProposalCard.tsx": { fontSize: 3 },
+  "../components/agent/StoryBlockProposalCard.tsx": { fontSize: 2 },
+  "../components/agent/ToolSelector.tsx": { fontSize: 8, rawButton: 2 },
+  "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
+  "../components/analysis/ComboNoveltyView.tsx": { fontSize: 1, rawButton: 2 },
+  "../components/analysis/DetectorAccordion.tsx": { fontSize: 6, rawButton: 1 },
+  "../components/analysis/DistributionDriftView.tsx": { fontSize: 1 },
+  "../components/analysis/FindingsFeed.tsx": { fontSize: 4, rawButton: 1 },
+  "../components/analysis/FrameBar.tsx": { fontSize: 2, rawButton: 1 },
+  "../components/analysis/FrequencyView.tsx": { fontSize: 1, rawButton: 1 },
+  "../components/analysis/InvestigatePanel.tsx": { fontSize: 1, rawButton: 4 },
+  "../components/analysis/OrderViolationsView.tsx": { fontSize: 2, rawButton: 1 },
+  "../components/analysis/PatternsView.tsx": { fontSize: 1, rawButton: 3 },
+  "../components/analysis/SemanticSearch.tsx": { rawButton: 2 },
+  "../components/analysis/SigmaPanel.tsx": { fontSize: 7, rawButton: 5 },
+  "../components/analysis/SimilarEvents.tsx": { rawButton: 1 },
+  "../components/analysis/TemplatesView.tsx": { rawButton: 3 },
+  "../components/analysis/TriageBurndown.tsx": { fontSize: 2 },
+  "../components/analysis/ValueNoveltyView.tsx": { fontSize: 1 },
+  "../components/analysis/WindowsNormality.tsx": { fontSize: 7, rawButton: 7 },
+  "../components/analysis/detector-shared.tsx": { fontSize: 3, rawButton: 10 },
+  "../components/cases/ImportCaseDialog.tsx": { fontSize: 1 },
+  "../components/explorer/ColumnPicker.tsx": { rawButton: 2 },
+  "../components/explorer/EventDetailPanel.tsx": { fontSize: 1, rawButton: 12 },
+  "../components/explorer/EventGrid.tsx": { fontSize: 1, rawButton: 4 },
+  "../components/explorer/ExportDialog.tsx": { rawButton: 1 },
+  "../components/explorer/FilterChips.tsx": { rawButton: 1 },
+  "../components/explorer/FilterRail.tsx": { rawButton: 8 },
+  "../components/explorer/RoutineCollapseStat.tsx": { rawButton: 1 },
+  "../components/explorer/TagFacetPanel.tsx": { rawButton: 1 },
+  "../components/explorer/TimelineHistogram.tsx": { fontSize: 2, rawButton: 3 },
+  "../components/layout/Footer.tsx": { fontSize: 1 },
+  "../components/layout/TopBar.tsx": { rawButton: 3 },
+  "../components/sources/ParserDownloadsPanel.tsx": { fontSize: 5 },
+  "../components/stories/AddToStoryButton.tsx": { fontSize: 2, rawButton: 1 },
+  "../components/stories/BlockFrame.tsx": { fontSize: 1, rawButton: 1 },
+  "../components/stories/BlockPicker.tsx": { rawButton: 2 },
+  "../components/stories/EmbedCards.tsx": { fontSize: 5 },
+  "../components/stories/ExportsTab.tsx": { fontSize: 1, rawButton: 2 },
+  "../components/stories/MarkdownBlock.tsx": { fontSize: 3, rawButton: 1 },
+  "../components/stories/SnapshotRenderer.tsx": { fontSize: 5 },
+  "../components/stories/StoryEditor.tsx": { fontSize: 1 },
+  "../components/timelines/CreateTimelineDialog.tsx": { fontSize: 1 },
+  "../components/timelines/EmbedWizard.tsx": { fontSize: 4, rawButton: 2 },
+  "../components/timelines/FieldMappingEditor.tsx": { fontSize: 1, rawButton: 1 },
+  "../components/tour/TourOverlay.tsx": { rawButton: 1 },
+  "../components/ui/DateTimeField.tsx": { fontSize: 4 },
+  "../components/ui/ErrorBoundary.tsx": { fontSize: 2 },
+  "../components/ui/ProgressMeter.tsx": { fontSize: 1 },
+  "../components/viz/ChartActionPopover.tsx": { rawButton: 2 },
+  "../components/viz/FieldHistogramModal.tsx": { rawButton: 4 },
+  "../components/viz/InheritedFiltersBar.tsx": { rawButton: 2 },
+  "../components/viz/SavedChartsRail.tsx": { rawButton: 2 },
+  "../components/viz/ScatterStatsPanel.tsx": { fontSize: 1 },
+  "../components/viz/primitives/ExplainerPopover.tsx": { fontSize: 1, rawButton: 1 },
+  "../components/viz/primitives/Legend.tsx": { rawButton: 1 },
+  "../pages/ExplorerPage.tsx": { rawButton: 3 },
+  "../pages/StoryEditorPage.tsx": { rawButton: 1 },
+  "../pages/VisualizePage.tsx": { rawButton: 7 },
+  "../pages/admin/AdminAgentPage.tsx": { fontSize: 2, rawButton: 1 },
+  "../pages/admin/AdminSettingsPage.tsx": { fontSize: 1 },
+};

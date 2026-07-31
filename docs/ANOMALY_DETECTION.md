@@ -33,6 +33,40 @@ Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14),
 `src/vestigo/db/similarity.py` (detector 11), `src/vestigo/sigma/`
 (detector 13). UI: `frontend/src/components/analysis/`.
 
+### The demo case: a worked example of all of them
+
+Every user is seeded a fabricated demo case on their first login
+(`src/vestigo/demo/`, gated by `VESTIGO_DEMO_CASE_ENABLED`). It is generated
+rather than shipped as data: 251k events over 30 days, four sources, a quiet
+three-week baseline and a seven-day intrusion split into four labeled suspect
+windows. Deleting it is final unless the analyst restores it explicitly.
+
+Nothing in that case is labeled with the detector it triggers — the annotations
+read as an analyst's notes, because a demo that narrates its own tooling
+teaches the tooling instead of the work. What each tool has to find:
+
+| # | Tool | The fabricated signal |
+|---|---|---|
+| 1 | Value novelty | A 7045 service name (`WinSysHealthSvc`) absent from three weeks of baseline; the contractor account on hosts it has never used. The `value_combo` variant sees the (user, host) pairs. |
+| 2 | Frequency | Failed-logon volume during the spray, ~40/minute against a baseline of a couple hundred a day. |
+| 3 | Timestamp order | `APP-01` drifts against NTP and chronyd's corrections arrive stamped behind the line before them. Benign, deliberately. |
+| 4 | Numeric range | `bytes_out` in the exfil uploads: tens of megabytes against a baseline browsing distribution centred near 1.5 KB. |
+| 5 | Charset novelty | A user agent containing guillemets, and a staged archive filename with a Cyrillic `о`. |
+| 6 | Entropy | Base64-encoded PowerShell in a 4688 command line; the beacon's sixteen-character random subdomain. |
+| 7 | Proportion shift | The file-sharing destination's share of proxy traffic during exfil; the sudo command mix on the file server. |
+| 8 | Interval cadence | A 300s ± 8s beacon on a host whose baseline was irregular human browsing — plus a nightly backup that legitimately moves from 02:15 to 03:40, so the tool has a benign hit too. |
+| 9 | Event sequences | Host orderings the contractor account has never taken. Score over `attr:computer_name`; the default `artifact` is degenerate here, since each source carries one artifact value. |
+| 10 | Distribution drift | The whole `bytes_out` distribution changing shape during exfil. |
+| 11 | Semantic similarity | **Not covered.** The demo deliberately requires no embeddings. |
+| 12 | Repeating sequences | The beacon motif (proxy request + matching firewall allow in the same second), alongside a benign nightly-backup motif. |
+| 13 | Sigma | Four case-scoped rules ship inside the case: encoded PowerShell, suspicious service install, wmic remote process creation, failed-logon burst. |
+| 14 | Log templates | ~40 syslog templates, with an `unattended-upgrade` shape that appears only in the suspect window. |
+
+`tests/test_demo_detector_coverage_clickhouse.py` asserts that each of these
+actually returns findings. If a retuned threshold silences one of them, that
+test fails — which is the point: the demo's promise is only true as long as it
+is checked.
+
 ### Query-cost discipline (all statistical detectors)
 
 Three cross-cutting rules keep detector scans survivable on 100M+-row cases
@@ -684,19 +718,67 @@ invisible characters are visible in the report.
 
 ### Caveats
 
-- **One alphabet per field, not per identifier.** AMiner's `CharsetDetector`
-  learns a separate charset per `id_path_list` value (per host, per user, per
-  session); Vestigo learns one alphabet for the whole field across the scope.
-  A field that is legitimately Cyrillic for one host and ASCII for the rest
-  therefore has a merged reference alphabet, and neither host's characters
-  look novel. Scope the timeline to that source if the distinction matters.
-  Per-identifier scoping is roadmap D14.
-- **Free-text fields in large scripts.** A field whose reference alphabet
-  exceeds 5,000 characters (CJK prose, base64 blobs mixing full alphabets) is
-  skipped — "novel character" is meaningless there. Fields with fewer than 20
-  distinct baseline values are skipped too (an alphabet learned from a handful
-  of values flags everything). If every scanned field skips, the status is
-  `insufficient_data`.
+- **Per-identifier scoping is opt-in via `group_field`.** AMiner's
+  `CharsetDetector` always learns a separate charset per `id_path_list` value;
+  Vestigo learns one alphabet per field across the scope by default, and
+  `group_field` (e.g. `attr:host`) learns one alphabet per value of that field
+  instead — a field that is legitimately Cyrillic for one host and ASCII for
+  the rest no longer merges into a reference alphabet that flags neither. Both
+  modes honor it, the skip guards below apply per group, and suppressions stay
+  keyed on `(field, value)`, applying across groups. Findings name their group
+  in `details.group_field`/`details.group_value`, which reference scored them
+  in `details.group_basis`, and how much evidence the group itself contributed
+  in `details.group_baseline_distinct_values`.
+- **The two skip guards mean opposite things, so a group failing one is not
+  treated like a group failing the other.** A reference alphabet over 5,000
+  characters (CJK prose, base64 blobs mixing full alphabets) means *the
+  question does not apply* — "novel character" carries no signal there however
+  much data you have — so that group is **dropped** and named in `warnings`.
+  Fewer than 20 distinct values means *not enough evidence to learn this
+  group's own alphabet*, which does not exonerate it, so that group is scored
+  against a **fallback** reference instead. Note that "absent from the baseline
+  window" is just the `n_vals = 0` case of the same condition: routing 0 to a
+  fallback but 3 to a blind spot would mean less evidence bought better
+  treatment, right where a freshly provisioned host would sit. Ungrouped, both
+  guards skip the whole field as before; if every scanned field skips, the
+  status is `insufficient_data`.
+- **The fallback reference is mode-specific**, learned with the rare-chars
+  recipe, and named on every finding it scores:
+  - temporal → `details.group_basis = "outside-suspect-windows"`, learned from
+    events *outside* the suspect windows. Learning it over the whole scope
+    would let the suspect values into their own reference and mask themselves.
+  - self-baseline → `details.group_basis = "scope-merged"`, the merged
+    whole-scope alphabet — which is exactly what the field was scored against
+    before `group_field` existed, so enabling grouping never narrows coverage.
+
+  Groups scored this way are named in `warnings`, with "had no baseline-window
+  values" and "had fewer than 20 distinct values of their own" reported
+  separately. If no fallback can be learned either, those groups go unevaluated
+  and the run says which ones and which guard the fallback itself tripped.
+  Every one of these warnings names the *field* alongside the groups: the same
+  group can be thin for one field and absent from the baseline window for
+  another, and a merged sentence would leave no way to tell which is which.
+- **What grouping costs.** At most one extra *learn* query per field, never one
+  violation scan per group: the per-group reference alphabets travel into the
+  single scan as parallel `{grps, sets}` array parameters, each row picking its
+  own reference by `indexOf`, and `LIMIT <per_field_limit> BY grp` preserves the
+  per-group finding budget. Group cardinality therefore costs rows, not
+  queries. A pathological group count is bounded at 5,000 returned rows per
+  field — and because that ceiling sits *under* the per-group budget, ordering
+  by novelty length across all groups, hitting it drops whole low-novelty
+  groups rather than trimming each group evenly. A run that hits it says so in
+  `warnings` and names the fields; a truncated grouped scan must never read as
+  "these are the groups with novel characters". The fallback learn is a
+  whole-scope scan, so it only runs when some group actually needs one — in
+  temporal mode a bounded `SELECT DISTINCT` probe
+  over the suspect windows (1,000 rows, and a truncated result counts as "yes")
+  answers that far more cheaply than the scan it guards.
+- **Events missing the grouping field form their own group** (empty group
+  value, rendered `(no value)`): excluding them would quietly drop them from
+  the run.
+- **`group_field` must be a string field.** A non-string column (only
+  `timestamp` today) is refused with 422 rather than reaching ClickHouse as a
+  type error.
 - **Characters are extracted with re2 (`extractAll(val, '(?s).')`) in UTF-8
   mode.** Codepoints — including NUL — are handled; byte sequences that are not
   valid UTF-8 may be skipped by the regex engine rather than surfaced as
@@ -1104,6 +1186,17 @@ suspect window with fewer than 50 complete n-grams gets a `warnings` entry.
 - `VESTIGO_STAT_SEQUENCE_MAX_CANDIDATES` (default 2000) — cap on novel n-grams
   fetched per run, lowest suspect volume (rarest) first; hitting it attaches a
   warning.
+- `max_gap_seconds` (request, default unset) — break an n-gram when consecutive
+  events are more than this many seconds apart (AMiner's `timeout` reset, in
+  batch form: the assembly window partitions on a running count of over-gap
+  boundaries). Unset keeps the pre-1.8.6 behavior, no gap bound. Snapshotted
+  into the persisted `DetectorRun`. The gap is *complete elapsed seconds*
+  (ClickHouse `age`, not `dateDiff` — the latter counts second boundaries
+  crossed, so a 1.2 s step straddling two of them reported 2 and
+  `max_gap_seconds=1` cut a burst that never paused for a second). Not free:
+  setting it adds two window passes over each
+  (source, window) partition on top of the assembly pass, so on a wide scope it
+  is a deliberate choice, not a default.
 
 **Allowlist key:** `(series_field, "a → b → c")` — the finding's `value` is
 the " → "-joined n-gram, so **Mark normal** suppresses that exact ordering on
@@ -1118,12 +1211,12 @@ every event.
   across the whole source, or scope the timeline to per-stream sources. A
   per-stream secondary partition field is a possible follow-up, deliberately
   not implemented yet.
-- **No gap bound between n-gram members.** AMiner's `EventSequenceDetector`
-  resets an in-progress sequence when more than `timeout` seconds pass between
-  events; Vestigo has no such bound, so three consecutive records for a source
-  form an n-gram even if days separate them. On a quiet source that manufactures
-  "sequences" out of unrelated events. Prefer windows dense enough that
-  consecutive really means consecutive. A max-gap parameter is roadmap D14.
+- **No gap bound unless `max_gap_seconds` is set.** AMiner's
+  `EventSequenceDetector` always resets an in-progress sequence after
+  `timeout` seconds; Vestigo's bound is opt-in, so without it three
+  consecutive records form an n-gram even if days separate them — on a quiet
+  source that manufactures "sequences" out of unrelated events. Set
+  `max_gap_seconds` when the source is sparse enough for that to matter.
 - **Tiny baselines make everything novel.** A baseline with few complete
   n-grams vouches for almost nothing; the <50-n-gram warning fires, and n = 4
   or 5 on a short baseline mostly measures the baseline's poverty. Prefer
@@ -1338,6 +1431,9 @@ ranking is reproducible arithmetic.
 - `min_support` (request) / `VESTIGO_STAT_MOTIF_MIN_SUPPORT` (default 3,
   floor 2) — occurrences below this are not motifs; snapshotted.
 - `start` / `end` (request, optional) — scope mining to a time frame.
+- `max_gap_seconds` (request, default unset) — same gap bound as detector 9;
+  both detectors share the n-gram assembly, so support mining and the cadence
+  pass segment identically. Unset = no gap bound (pre-1.8.6 behavior).
 - `VESTIGO_STAT_MOTIF_MAX_CANDIDATES` (default 1000) — per-source candidate
   cap, highest support first; hitting it attaches a warning.
 - `VESTIGO_STAT_MOTIF_CADENCE_TOP_K` (default 500) — only the top-K merged
@@ -1480,6 +1576,50 @@ disposition mechanism.
   every listing/run (a file drop needs no restart), but a file whose
   mtime/size are unchanged reuses its parsed form — only changed files pay
   the YAML/pySigma parse.
+
+### Windows event logs need no field translation
+
+`evtx2vestigo` deliberately emits Sigma-canonical names, so a community Windows
+rule compiles to exactly the predicate it looks like and needs no mapping to
+work: `EventID` (unpadded decimal string, per the caveat above), `Channel`,
+`Provider_Name`, and every `EventData` field under its native Windows name
+(`TargetUserName`, `LogonType`, `CommandLine`, `NewProcessName`, `Image`,
+`ParentImage`, `IpAddress`, `ServiceName`, `ScriptBlockText`, ...). A stock 4672
+rule compiles to
+`attributes['EventID'] = '4672' AND attributes['Channel'] ILIKE 'Security'`.
+
+**Such rules are still flagged as fallback matches, and that is expected.**
+`fallback_fields` records "resolved through the raw attribute key, and no mapping
+vouched for that name" — it tracks the *provenance of the name*, not whether the
+match is right. Since these names are correct by construction rather than by
+declaration, nothing vouches for them:
+
+- A timeline **field mapping cannot** clear it. `validate_field_mappings` rejects
+  a canonical name that collides with an existing raw attribute key (it would
+  shadow the real field), so the identity mapping `EventID -> ["EventID"]` is
+  refused by design.
+- A **global ruleset fieldmap can**. A `vestigo-fieldmap.yml` at the ruleset root
+  containing `EventID: EventID` marks the field as vouched-for and the flag
+  clears. Measured over SigmaHQ `rules/windows/builtin` (326 rules, commit
+  `1aacbed`) against an `evtx2vestigo` timeline: adding an identity fieldmap for
+  the 141 distinct field names took the run from **873 fallback flags to 0**,
+  with **zero SQL differences and zero match-count differences**. Case-uploaded
+  rules have no fieldmap layer, so they are always flagged.
+
+Those 326 rules also compile and run with **zero errors** against `evtx2vestigo`
+output, which is the practical claim: the converter's field names are what the
+community ruleset already addresses.
+
+Three further consequences worth knowing:
+
+- System field spellings win. An `EventData` field that collides with one is
+  stored as `EventData_<name>`, so a rule matching on `Channel` can never be
+  fooled by a payload field of the same name.
+- Map-derived text is namespaced under `Map*` (`MapDescription`,
+  `MapPayloadData1`, ...). It is human-readable prose, not a raw field — rules
+  should match the underlying Windows field instead.
+- `Execution_ProcessID`/`Execution_ThreadID` carry the `<System>` values, so
+  they never collide with Sysmon's `EventData` `ProcessId`.
 
 ---
 

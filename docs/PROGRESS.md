@@ -1,11 +1,11 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 127 — README reorder).
+Last updated: 2026-07-31 (session 137 — README reorder).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
 
-## Session 127 — 2026-07-30: README reordered, and a count that did not add up
+## Session 137 — 2026-07-30: README reordered, and a count that did not add up
 
 **Why.** The README read as a wall of text. The cause was ordering, not volume: the
 AMiner/Timesketch positioning occupied lines 28–55, so the screenshot (line 57) and Quick
@@ -32,6 +32,517 @@ what the tool does or seeing it run.
   search.
 - Fixed "throug" and "Aminer". Laid the screenshot out for a 2×2 grid with a placeholder
   comment; the capture list is filed under Milestone 3.
+## Session 136 — 2026-07-31: the demo case, reviewed
+
+**Why.** A review of PR #211 before merge. One bug could take a user's demo case away
+permanently, one endpoint was an authenticated storage-amplification primitive, and the
+rest were smaller correctness and honesty problems.
+
+- **A claim that never dispatched is now released.** `maybe_seed_demo_case` stamped
+  `demo_case_seeded_at` and *then* dispatched; when dispatch hit the concurrency cap the
+  `RuntimeError` was swallowed by the never-fail-a-login handler and the stamp stayed. That
+  is precisely the post-upgrade backfill case — fifty users stamped, one seeded, and no way
+  back for anyone whose case list wasn't empty. `PostgresStore.release_demo_seed` gives an
+  unspent claim back, so the next login retries.
+- **One demo case per account.** `POST /api/demo/seed` had no per-user guard: a loop over it
+  wrote a quarter of a million ClickHouse rows per call. Cases now carry `is_demo`
+  (migration 0023) and the endpoint answers 409 while the caller still has theirs. The same
+  flag keeps other users' copies out of an admin's case list, which would otherwise show one
+  per account, and drives the restore offer's visibility in the UI.
+- **Seeds are cancelled at shutdown.** Nothing cancelled the background tasks, and
+  `build_demo_case`'s teardown caught `Exception` — which `CancelledError` is not — so a
+  shutdown mid-ingest left a half-populated case in someone's list. The lifespan now calls
+  `cancel_pending_seeds()`, and the build tears down on `BaseException`.
+- **The cap is a setting, and it is 1.** The build is CPU-bound Python holding the GIL, so
+  each concurrent seed contends with the API's own loop. `demo_max_concurrent` replaces the
+  hardcoded 2, following `transfer_max_concurrent`. `DEPLOYMENT.md` said the overflow
+  "queues"; it does not.
+- **The full sweep, finally run.** It had never been: 2113 tests, one failure, and it was
+  session 135's own. `test_enrichers.py` carries a second copy of the pre-Alembic column
+  list that `test_postgres_store.py` has, and only the latter was updated for 0022 — so the
+  adoption path tried to add `demo_case_seeded_at` to a column that `create_all` had already
+  made. Both copies now drop both columns. Two copies of that list is the actual defect;
+  the next migration will trip over it again.
+- **The job store is per-test now.** `get_job_store()` is a process-wide singleton, so a
+  test leaving a job queued held an admission slot for every test after it. Invisible while
+  the demo cap was 2 and immediately fatal at 1: a seed that silently never dispatched.
+  An autouse fixture gives each test its own store, which also retires the never-finishing
+  tasks the 429 test used to leak.
+- **A flake worth naming, not fixed.** `find_value_combos` in auto mode picks its two
+  fields from `recommend_novelty_fields`, which ranks on ClickHouse's *approximate*
+  `uniq()`. The demo coverage test caught it going quiet once and never again across
+  repeated runs. The detector is fine; a canary test that can flip is not, and pinning the
+  fields there would trade the auto path — the one the UI actually uses — for a green run.
+  Left as-is deliberately, recorded here so the next flake is not mistaken for a new bug.
+- **Smaller.** Row ordering in the generators sorted ISO *strings* — correct only by
+  accident of a fixed UTC offset, now sorted on the parsed instant. Dead `noqa: BLE001`s
+  (`BLE` is not in the ruff select list) removed. Restore requests are audited at dispatch,
+  not only on success, so an abusive loop is visible. Frontend comments claiming the
+  capability meant "the archive is packaged" outlived the archive by a whole architecture.
+
+## Session 135 — 2026-07-30: a demo case for every new user
+
+**Why.** A new user's first screen was an empty case list, which is the worst possible
+introduction to a tool whose whole argument is detection-as-workflow. Every user now finds
+a fabricated investigation waiting for them: 251k events, four sources, 30 days, a quiet
+three-week baseline and a seven-day intrusion, with an analyst's notes, tags, saved views,
+a baseline definition, four Sigma rules and a story already in place. Spec:
+`docs/superpowers/specs/2026-07-30-demo-case-design.md`.
+
+- **Realism over meta-labels.** Nothing in the case names the detector it triggers. The
+  annotations read as one investigator's working notes, and the story explains the incident,
+  not the product. Two of the findings are deliberately benign and called out as such (an
+  NTP-drifting host, a backup job whose schedule legitimately moved) — a demo where every
+  anomaly is malicious teaches the wrong reflex.
+- **Generated, not shipped.** The first cut built a prebuilt `.vestigo` archive, which came
+  out at **146 MiB** — events travel uncompressed inside the archive by design, so the
+  "10–15 MB" the design assumed was off by an order of magnitude. Committing that on every
+  regeneration was not acceptable in a repo that has to stay airgap-shippable, so the
+  generator moved into `src/vestigo/demo/` and runs per user instead: ~2.5s to fabricate the
+  four source files, a few seconds to ingest them through the real `IngestionPipeline`. It is
+  deterministic, so every copy is identical down to the source files' SHA-256 hashes, and the
+  provenance story is the one an ordinary ingest tells.
+- **Seeded once per user, ever.** `users.demo_case_seeded_at` is claimed with a conditional
+  UPDATE, so two simultaneous logins cannot both dispatch, and the stamp survives deletion —
+  a deleted demo stays deleted. Existing users backfill through the same path at their next
+  login, since their stamp is null. `POST /api/demo/seed` is the way back, offered from the
+  empty case list. Hooked into `_issue_session` rather than the login handler, so OIDC
+  behaves identically; the call swallows its own errors, because no demo case is worth a
+  failed login. Two builds run concurrently instance-wide; the rest get a 429.
+- **The coverage test is the actual deliverable.** `tests/test_demo_detector_coverage_clickhouse.py`
+  runs all thirteen non-embedding tools plus the four Sigma rules over the seeded case and
+  asserts each returns real findings. The first version of that test passed vacuously — it
+  fell back to the result *object*, which is always truthy — and once fixed it immediately
+  caught that event sequences found nothing over the default `series_field`. The demo's
+  promise is only true for as long as something checks it.
+## Session 134 — 2026-07-31: PR #210 review pass — the ratchet's own blind spot
+
+**Why.** A review of the tier-1 design work before merge. Five findings, all fixed in the
+branch; nothing filed.
+
+- **The ratchet did not cover the file the same PR created.** `designSystem.test.ts` globbed
+  `components/**/*.tsx` and `pages/**/*.tsx` only, so `lib/`, `hooks/`, `stores/` and every
+  `.ts` file were unscanned — including `lib/guidance.tsx`, which the PR had just created to
+  hold JSX copy with token classes, and `components/viz/lib/colors.ts`, which returns
+  `var(--viz-*)` strings into the SVG export path where a dead token exports a blank fill
+  rather than a visibly wrong colour. Demonstrated by planting a bogus token in each and
+  watching all four assertions pass. The token check now scans every `.ts`/`.tsx` under
+  `src/` except `src/test/` (whose files quote token names in prose and fixtures); the two
+  budgeted checks stay on components and pages, since only JSX has `text-[Npx]` or
+  `<button>`. Widening it surfaced three false positives, both classes now handled: block
+  comments are stripped before the scan (`export.ts` documents `var(--x)` as a placeholder),
+  and `var(--viz-series-${slot})` is skipped as a computed name — `vizColors.test.ts` already
+  asserts that family literally.
+- **Both regexes were lowercase-only.** `--colorError` would have been invisible to the
+  definition scan and the reference scan alike, and so silently exempt. Both now take the
+  full custom-property character set.
+- **The legacy-key adoption could never run for the browsers that needed it most.** It sat in
+  `migrate`, which zustand calls only when the store already has persisted state at an older
+  version. A browser that dismissed guidance but never wrote a UI preference has
+  `vestigo-guidance-*` keys and no `vestigo-ui` entry: it lost the dismissal *and* kept the
+  keys forever, because its next preference write persists at v5 directly and `migrate` never
+  fires again. Moved to `onRehydrateStorage`, which runs on every load.
+  `guidanceLegacyAdoption.test.ts` covers all four paths and three of its cases fail against
+  the previous implementation.
+- **The Sigma tab had no empty state**, so its Run button would scan an empty timeline and
+  report zero matches — which reads as "these rules cleared you", the exact failure the PR
+  fixed in the detector views. It now gets the same guidance-plus-empty-state treatment as
+  Patterns. The duplicated hint JSX behind that (three near-identical copies) collapsed into
+  one local `NoEventsState`, and the two adjacent identical `activeTab === "patterns" &&
+  nothingToAnalyse` guards became one. `investigateEmptyTimeline.test.tsx` now covers the
+  gating with the tab bodies stubbed — the Sigma case fails against the pre-fix panel.
+- **The "events appear as they land" promise depended on the panel's host.** `InvestigatePanel`
+  set no `refetchInterval` on `["timeline-sources", …]`; it stayed fresh only because
+  `ExplorerPage` polls the same key at 4s while ingesting. Stated on both queries now, so the
+  copy does not silently rely on a caller.
+
+Also restored the multi-line `detector-shared` imports in thirteen views, which the tier-1
+commit had collapsed into ~200-character single lines directly above multi-line imports in
+the same files. `E501` is ignored by convention, but the diff was gratuitous.
+
+**Verified.** 689 frontend tests (680 + 9 new), typecheck, lint and a production build pass.
+Each fix was demonstrated failing against the pre-fix code before being trusted.
+
+## Session 133 — 2026-07-30: frontend design audit; dead tokens and the brand mark
+
+**Why.** An out-of-band design pass before 1.9 work begins. The starting suspicion was the
+Investigate panel's user guidance; the audit found that plus a broader pattern, and one
+class of silent visual bug worth fixing immediately.
+
+**Fixed this session.**
+
+- **Three CSS custom properties were referenced but never defined.** `--color-error` in 12
+  files (`EntropyView`, `OrderViolationsView`, `DistributionDriftView`, `ProportionShiftView`
+  and others) — the real token is `--color-danger`, so every "this is the bad direction"
+  arrow in the detector views rendered in inherited body text colour instead of red. The one
+  colour-coded signal in the views whose entire job is signalling did nothing.
+  `--color-bg-subtle` (`CorrMatrix.tsx:168`, `VisualizePage.tsx:1429`) → transparent
+  correlation-matrix cell fill for the no-value case. `--color-border-focus`
+  (`FrameBar.tsx:55`) → a hover border change that was a no-op. All three now point at
+  defined tokens. Notable: all of it compiled, typechecked, linted and passed tests. Tailwind
+  emits `text-[var(--color-error)]` happily and CSS resolves an undefined var to inherit,
+  silently — which is the argument for the lint ratchet now filed in `ROADMAP.md`.
+- **The brand mark used two hues from nowhere.** `VestigoMark.tsx` hardcoded `#8b5cf6` violet
+  and `#06b6d4` cyan against an accent of `#3b6e91`/`#5aa8b0`, fixed across both themes. The
+  mark's semantics were already right — the band that is out of cadence was the odd colour —
+  so it now carries `var(--color-accent)` for the cadence bands and `var(--color-anomaly)`
+  for the offset one: the same two colours the analysis views use for "expected" and "this
+  one stands out", stated in the app's own vocabulary and following the theme.
+
+**Then tier 1: enforcement, and the copy work that needed no design round.**
+
+- **The ratchet — `frontend/src/test/designSystem.test.ts`.** Three checks over a raw glob of
+  `components/` and `pages/`, following `vizExplainers.test.ts` (the repo's only other
+  source-scanning test, whose header explains why it uses Vite's raw glob rather than
+  `node:fs`: the frontend tsconfig carries no node types). Undefined `var(--…)` is hard and
+  starts at zero; `text-[Npx]` and raw `<button>` outside `components/ui/` are budgeted per
+  file in `designSystemBudget.ts`, seeded at 119 and 119 across 66 files. Three assertions,
+  because a floor nobody lowers is not a ratchet: over budget fails, a *beatable* budget fails
+  with "lower it to N", and a budget entry for a deleted file fails. Proven in all three
+  directions before being trusted. Two things it immediately paid for: it found six further
+  `--color-border-focus` references that the morning's `grep | head` had truncated away, and
+  the budget seeding showed the real counts were 119/119, not the 118/130 the audit reported.
+  Vitest stubs CSS imports to `""` even under `?raw`, so `vite.config.ts` opts `index.css`
+  into `test.css.include` — scoped to that one file so no other test pays for the Tailwind
+  pipeline.
+- **Guidance is now unbypassable rather than merely centralized.** `lib/guidance.ts` became
+  `guidance.tsx` keyed by panel id, and `GuidancePanel` lost its `title` and `children` props
+  — it takes `id: GuidanceId` and reads both from the registry. The four Investigate panels
+  that inlined their JSX could not be fixed by convention (that is what the file already
+  asked for and did not get); with no copy props to pass, inlining is a type error. Bodies
+  stay JSX because the copy carries `<strong>`, `<em>` and a `font-mono` span. `satisfies`
+  rather than a type annotation, or the keys widen to `string` and `GuidanceId` constrains
+  nothing. Converter copy moved to a sibling `converterCopy` export — it is not panel content.
+  `guidanceCoverage.test.ts` covers only the reverse direction, copy nothing renders, which is
+  the half the type system cannot see.
+- **Dismissal is restorable.** Collapse state moved from `vestigo-guidance-*` localStorage
+  keys into the `vestigo-ui` store (v4 → v5, migrating the old keys in). The old code read its
+  flag once into `useState` at mount, so clearing storage left every open panel collapsed
+  until remount — the reason a reset button alone would have looked broken. "Show guidance
+  again" sits in the Settings *Onboarding* section beside "Restart onboarding tour": same
+  intent, and `Compass` was already both buttons' icon. Still per-browser; per-user is filed.
+- **Empty states.** `AnalysisEmptyState` joins the chrome in `detector-shared.tsx` — the one
+  piece that escaped that file's stated purpose and was hand-rolled identically thirteen
+  times. It borrows `viz/primitives/ChartEmptyState`'s contract (primary line = what happened,
+  `hint` = cause and next action, copy stays at the call site because only the detector knows
+  why it is empty). The "no events" claim lifted to `InvestigatePanel`, which is the only
+  place that can tell an un-ingested timeline from a detector that ran clean — it already
+  queries `listSources`, and it distinguishes "still ingesting" from "nothing uploaded", with
+  a link to the case overview. `components/analysis/` had contained no `Link` at all. All
+  thirty-odd strings rewritten so none states absence twice, and the `insufficient_data` arm
+  that `ValueNoveltyView` and `OrderViolationsView` were missing — silently reading as a clean
+  result when the detector never ran — was added.
+
+**Verified** on an isolated instance (`tsig_verify` databases, port 8099): a case with no
+sources yields a default timeline with `sources: []`, and a 600-row seed exercises both the
+`ok`-with-no-findings and `insufficient_data` arms the rewrite targets. The built bundle
+carries the new copy and none of the old. The browser extension was not connected, so the
+rendered panel and the reset-without-reload interaction were not driven by hand — the latter
+is asserted by a unit test that fails against the old `useState` implementation.
+
+**Filed, not fixed.** The rest is in `ROADMAP.md` Milestone 3 under "Frontend design-system
+consistency", now stated as burning the budget file down to `{}`. Two items are correctness
+rather than taste: compact density does not scale the 119 arbitrary font sizes, and the
+Investigate panel still teaches the disposition model at the moment nothing on screen
+demonstrates it — the tier-1 work fixed that panel's plumbing, not its placement.
+
+## Session 132 — 2026-07-30: PR #208 fourth review pass, and the 1.8.6 merge
+
+**Why.** A fourth review before merging 1.8.6. Six findings raised, four real. Both of the
+substantive ones were in `evtx2vestigo`, and both were the same shape as session 131's: a
+module that states an invariant carefully, then breaks it somewhere the invariant's own
+author wasn't looking.
+
+- **Converter-derived keys overwrote native fields.** Session 131 made `_extract_event_data`
+  scrupulous about never letting one Windows element overwrite another — and then `build_row`
+  wrote `host`, `user`, `src_ip`, `src_port`, `MapDescription` and the `Map*` properties
+  straight into `attributes`, discarding an EventData field of the same name. Plausible on
+  third-party channels, and invisible on the row. The derived value still has to win the
+  plain key (the platform reads these by name — the GeoIP enricher wants `src_ip`), so this
+  resolves the opposite way from `_free_key`: the *native* value steps aside to a numbered
+  spelling. The `EventData_`-prefixed form now goes through `_free_key` too, so a record
+  carrying a literal `EventData_Channel` alongside an `EventData` `Channel` keeps both.
+- **A record id repeated inside one chunk collapsed two records.** The cross-chunk case was
+  handled deliberately and documented; one level down, `_scan_chunk`'s `setdefault` kept only
+  the first occurrence, so two records sharing an id in a partially overwritten chunk got the
+  same offset, size and `content_hash` — one forensic identity for two records, which is
+  exactly what the per-chunk scan exists to prevent. Occurrences are now listed in document
+  order and consumed positionally (the parser yields them in that order), and the footer's
+  duplicate counter reports a repeat wherever it fell instead of only across chunks. The test
+  forges a duplicate into the fixture: the parser does yield both records, and each hash
+  reproduces from its own span.
+- **The charset fallback probe omitted the sentinel guard.** The violation scan appends
+  `VESTIGO_NOT_SENTINEL_SQL` in temporal mode; the probe did not, so a group living only in
+  sentinel-timestamp rows was reported absent — buying the whole-scope fallback learn the
+  probe exists to avoid, plus a warning naming a group no finding can ever come from.
+- **`max_gap_seconds` coalesced on truthiness.** Correct only because the API floor is `ge=1`.
+  Keyed on presence now, so a future floor change can't route a persisted 0 to the other
+  detector's key.
+- **One finding was wrong and is recorded as such.** The `group_field` type guard looked
+  incomplete — `TOP_LEVEL_NON_STRING_COLUMNS` holds only `timestamp`, so `byte_offset` seemed
+  to slip through. It isn't a resolvable column token at all (`TOP_LEVEL_EVENT_COLUMNS` has no
+  numeric members besides `timestamp`), so it routes to a string `attributes` lookup and the
+  frozenset is already complete. No change.
+
+**Verification.** Full CI green on the PR head: backend lint + test, frontend
+typecheck/lint/build, container smoke test, CodeQL. Locally 467 tests across the
+converter/detector/router/agent suites, `ruff check` + `ruff format --check` clean, frontend
+674 tests. `vendor_evtx_maps.py --check` **was** re-run this session against a real
+`EricZimmerman/evtx` checkout — upstream HEAD is exactly the pinned `03a7a1f` — and reports
+the embedded maps and manifest in sync, closing the one item sessions 130 and 131 both left
+unverified.
+
+## Session 131 — 2026-07-30: PR #208 third review pass, and the 1.8.6 version cut
+
+**Why.** A third review of the 1.8.6 PR. Six findings, all fixed. The one that mattered
+most was the least interesting: the release PR had no release in it.
+
+- **Nothing was bumped.** `pyproject.toml`, `src/vestigo/__init__.py`,
+  `frontend/package.json` (and its lockfile) all still read 1.8.5 and the changelog
+  section was still `[Unreleased]`, on a branch titled `release: 1.8.6`. Prior releases
+  land as a `chore(release): X` commit; this one had none. Now 1.8.6 everywhere.
+- **The grouped charset row ceiling truncated in silence.** `LIMIT plim BY grp` preserves
+  each group's budget, but the 5,000-row ceiling *under* it orders by novelty length
+  across every group — so hitting it drops whole low-novelty groups, not a slice of each.
+  The rest of that code path is scrupulous about naming every deviation in `warnings`;
+  this was the one that vanished, and a truncated run came back looking like a clean one.
+  It reports now, and says which fields.
+- **Two of the grouped warnings had lost their field.** `wide_dropped` and
+  `thin_unevaluated` were keyed by field; `fallback_absent`/`fallback_thin` were flat sets
+  merged across every scanned field. The same group can be thin for one field and absent
+  from the baseline window for another, so the merged form put a group in both sentences
+  with no way to tell which field either was about. All four are per-field now.
+- **The gap bound measured the wrong thing.** `dateDiff('second', …)` counts second
+  *boundaries crossed*, so a 1.2 s step straddling two of them reported 2 and
+  `max_gap_seconds=1` segmented a burst whose every step was barely over a second.
+  `age` counts complete elapsed units, which is what "farther apart than N seconds" means.
+  NULL-on-first-row behavior is identical (measured on 26.6.1, through the whole
+  `Nullable(Int64)` → `UInt8` → `UInt64` chain), so the segment-start comment still holds.
+  The live test that pins it was written twice: the first fixture used 200 ms steps and
+  passed under *both* functions — 1.2 s steps are what actually discriminate, and the
+  test now fails if the call is reverted.
+- **An orphaned tool result rendered as a call.** Pairing answers by identity, and a
+  result row whose call row is missing from the transcript matches nothing — it then fell
+  through to the call branch and drew an argument-less row for a call the agent never
+  made. `tool_result` settles it without reopening the zero-argument-call ambiguity that
+  session 130 closed: the server writes args on a call row and a result on a result row,
+  never both.
+- **`evtx2vestigo` still had one silent overwrite.** EVTX permits a repeated
+  `<Data Name="X">` in one `<EventData>`, and `UserData`'s recursive `iter()` can put two
+  same-named tags on one key; both kept only the last value. Given how deliberately the
+  `DataN` positional/named collision is resolved, this was the collision that wasn't.
+  First occurrence keeps the plain spelling Sigma addresses, the rest are numbered in
+  document order, probing for a free key so a literal `X_2` in the same record doesn't
+  collapse into it.
+
+**Verification.** Backend suite and `ruff check`/`ruff format --check` clean; frontend
+`typecheck`, `lint` and 674 tests pass. The `age` change is covered live against
+ClickHouse 26.6.1, not by SQL-text assertion. Still not re-run: `vendor_evtx_maps.py
+--check` (needs an upstream checkout) — the blob region was untouched and the manifest
+hash was refreshed with `--manifest-only`.
+
+## Session 130 — 2026-07-30: PR #208 second review pass
+
+**Why.** A second review of the 1.8.6 PR, after session 129's fixes. Eight findings, all
+addressed. The substantive ones were in the grouped charset path again — not in what it
+computes, but in whether its own `warnings` describe what it did.
+
+- **The two per-group skip guards meant opposite things and were treated as one.** An
+  alphabet over 5,000 characters says *the question does not apply* (a novel character
+  carries no signal in free text); fewer than 20 distinct values says *not enough
+  evidence*, which does not exonerate the group. They are split now: wide → dropped and
+  named, thin → scored against the fallback. "Absent from the baseline window" is just the
+  `n_vals = 0` case of the thin condition and takes the same route, which removes a
+  discontinuity where less evidence would have bought better treatment.
+- **The warnings lied in two directions.** Thin groups *were* being fallback-scored while
+  reported as "not evaluated", and `no_fallback_fields` claimed absent groups went
+  unevaluated whenever the fallback learn failed — including when no group was absent.
+  Warnings now name the groups, keep "no baseline values" and "too few baseline values"
+  apart, and state which guard the fallback itself tripped, since "too few distinct
+  values" would send an analyst to widen a baseline that was never the problem.
+- **Self-baseline grouped mode had no fallback at all**, so enabling `group_field` deleted
+  thin groups from a run that previously scored them against the merged whole-scope
+  alphabet — a coverage regression caused by a precision feature. It now falls back to
+  exactly that reference (`group_basis = "scope-merged"`).
+- **The fallback learn is a whole-scope heavy scan and ran unconditionally per field.** A
+  bounded `SELECT DISTINCT` probe over the suspect windows now decides whether it is
+  needed; a truncated probe counts as "needed", because an unchecked group must never be
+  assumed safe. Findings carry `details.group_baseline_distinct_values`, so a report says
+  *why* a fallback scored a row rather than leaving it to be inferred.
+- **A review finding of my own was wrong, and the code now records why.** I claimed a
+  wide-alphabet group could be scored against the fallback. It cannot: the fallback is
+  learned from a superset of every group's own data, so its alphabet is at least as wide,
+  and a group over the ceiling guarantees the fallback is refused too. Measured on 26.6.
+  The explicit `skip` exclusion is kept as belt-and-braces so the routing does not rest on
+  that argument holding, and the comment says as much.
+- **Live-ClickHouse coverage for the D14 SQL.** The D14 tests asserted SQL *text*; the new
+  constructs only fail at execution. `test_charset_group_field_clickhouse.py` and
+  `test_sequence_max_gap_clickhouse.py` exercise array-of-array parameter indexing,
+  `LIMIT … BY grp LIMIT …`, the `skip`/`has_fb` routing, and the two-level segment window —
+  including the `Nullable(DateTime64(3))` assumption behind "gap_s is NULL on each
+  partition's first row", which now fails a test if it ever stops holding.
+- **`evtx2vestigo`.** The `DataN` collision fix was order-dependent — with the positional
+  element first, the named one overwrote it and the positional value was lost. It is
+  decided from the record as a whole now. A fallback `byte_offset` also stamps
+  `byte_offset_basis=record_id`: a record id is indistinguishable from a real offset by
+  inspection, and `content_hash_basis` is a statement about the hash, not the offset.
+- **Agent panel tool rows.** Pairing discriminated call-vs-result on whether the row had
+  arguments, so a zero-argument call persisted with `null` args read as a result and
+  mispaired a real one; keyed rows now pair on `tool_call_id` and only unkeyed legacy rows
+  use the heuristic. The row is keyed by call identity rather than list position (it owns
+  `<details>` open state), and that state has one owner instead of a native toggle and a
+  React handler racing on the same click — which also makes it behave the same in jsdom,
+  where `<details>` is not natively implemented.
+
+## Session 129 — 2026-07-30: PR #208 review findings
+
+**Why.** Full review of the 1.8.6 release PR: two scale/semantics problems in the new
+grouped charset path plus a tail of validation and perf items. No shape from the PR was
+redesigned.
+
+- **A reviewed "defect" in the gap segmentation was not one.** The review argued that
+  `gap_s` being NULL on a partition's first row made `if(NULL, 1, 0)` NULL, the window `sum`
+  NULL, and a NULL `seg` its own partition — losing the n-gram over rows 1..`ngram`.
+  ClickHouse takes the *else* branch for a NULL condition (`if(NULL > n, 1, 0)` is `0`,
+  `UInt8`), so segments already started at 0. Checked live on 26.6 against a 9-event series
+  with a 3-day gap: 7 complete 3-grams unbounded, 5 with a 1 h bound, `a→b→c` present both
+  ways, and byte-identical results with and without a defaulted lag. The comment now records
+  the semantics it relies on, with the measurement behind it.
+- **Grouped charset scanned `events` once per group.** Group cardinality is caller-chosen
+  and unbounded, so `group_field=attr:src_ip` meant one heavy scan per host per field. It is
+  now one scan per field: the per-group reference alphabets go in as parallel
+  `{grps, sets}` arrays, each row picks its own by `indexOf` (`greatest(gidx, 1)` because
+  ClickHouse evaluates both `if` branches and rejects index 0), and `LIMIT plim BY grp`
+  preserves the per-group finding budget.
+- **A group the baseline window never saw was silently unevaluated** — the newly-provisioned
+  host, i.e. the interesting one. Those groups are now scored against a fallback reference
+  learned *outside* the suspect windows (learning it over the whole scope would let the
+  suspect values into their own reference and mask themselves), findings carry
+  `details.group_basis` so a report never conflates the two references, and the row shows it.
+  Guard-skipped groups and an unusable fallback are reported in `warnings` instead of
+  vanishing; events missing the grouping field stay a real group, rendered `(no value)`.
+- **Smaller items.** A non-string `group_field` is refused with 422 rather than reaching
+  ClickHouse as a type error (group expressions are also `toString`-wrapped); `view_filters`
+  is size-bounded at 16 KiB now that it is persisted per message; agent tool rows only format
+  their payload once expanded (a `<details>` renders children regardless of state) and only
+  pair a streamed result on a non-empty `tool_call_id`; `evtx2vestigo` gained a `DataN`
+  collision rule (named field wins, positional moves to `DataN_pos`), a corrected header
+  layout comment, and an explicit note that fallback rows' `byte_offset` is not a file
+  offset. `scripts/vendor_evtx_maps.py --manifest-only` refreshes the converter's manifest
+  hash without an upstream checkout.
+
+## Session 128 — 2026-07-30: `evtx2vestigo` review findings
+
+**Why.** PR #209 review of the session-127 converter. Nothing was shipped-broken, but two
+latent defects sat in the part of the design the single-chunk test fixture cannot reach.
+
+- **The synthetic one-chunk image carried an invalid header CRC32.** `_iter_chunk_blobs`
+  rewrote the first/last chunk numbers and the chunk count but not the checksum at offset
+  124 — and the count was written as `<I` into a 2-byte field. The fixture is a one-chunk
+  file whose header already reads first=last=0, count=1, so the mutation was a *no-op there*
+  and every test passed while the multi-chunk path — i.e. every real log — had no coverage at
+  all. Confirmed by hand on a synthetic two-chunk file: all emitted images had a bad CRC, and
+  the current `evtx` wheel simply tolerates it. A stricter parser release would have rejected
+  every multi-chunk file. The header checksum is now recomputed, and
+  `TestChunkImages` asserts image validity plus a 14-record round trip.
+- **Offsets are now scanned per chunk, not per file.** The whole-file
+  `{record_id: (offset, size)}` dict kept the *first* of duplicate ids, but the parser still
+  yields both records — so in a re-chunked or partially overwritten log two distinct records
+  received the same `byte_offset` *and* `content_hash`, and `derive_event_id` is a function
+  of exactly those. Two events, one identity. Scanning each chunk immediately before parsing
+  it removes the ambiguity structurally (a chunk's records can only resolve against their own
+  chunk) and drops peak memory from one file's worth of offsets to one chunk's. The footer's
+  `chunk_scan` note keeps its old key names, duplicate count included.
+
+**Also.** Directory input now runs the magic/text-export check per file — a `wevtutil` dump
+saved as `.evtx` was silently contributing zero rows with exit 0 — warning and skipping
+rather than aborting a triage collection, plus a warning for any file that parses to zero
+records. `Refine` regexes are capped at 8 KiB of input: vendor time proves a pattern
+*compiles*, not that it terminates, and EventData is evidence. `_RESERVED_ATTR_KEYS` is a
+hand-copy of the server's `TOP_LEVEL_EVENT_COLUMNS` and is now pinned to it by a test.
+
+**`converter_version` is per-script, not suite-wide.** All six converters read `1.3.0` and
+`INPUT_FORMATS.md` keyed "writes the forensic footer" on `>= 1.3.0`. `evtx2vestigo` is on its
+first version, so it is now `1.0.0` and the docs say what is actually true: probe for the
+footer keys, do not infer them from a version number that each converter advances on its own.
+
+**Verification.** 52 tests in `tests/test_evtx_converter.py` (was 39): multi-chunk images and
+their checksums, duplicate-id offset distinctness, `xml_sanitized` and the rendered-XML
+offset fallback (via a stubbed parser — byte-patching the fixture is impossible, the parser
+validates chunk checksums), `--split` size mode, `--until`, junk-directory handling. Not
+re-run: `vendor_evtx_maps.py --check`, which needs an `EricZimmerman/evtx` checkout; the
+generated blob region was untouched, and the manifest hash was refreshed directly.
+
+## Session 127 — 2026-07-30: `evtx2vestigo`, binary Windows Event Logs
+
+**Why.** Windows event logs were reachable only through `evtx2timesketch`, which takes a
+*text* export. That re-anchors provenance to the analyst's XML dump rather than
+`Security.evtx`, and pushes millions of records through the row-by-row server path. The
+Sigma runner was also aimed largely at Windows rules with no Windows data to match.
+
+**What the design turns on.**
+
+- **The parser exposes no byte offset.** `pyevtx-rs` yields `event_record_id`, `timestamp`
+  and rendered XML — nothing addressable. So the converter walks the EVTX container itself
+  (4096-byte header, 64 KiB chunks, per-record magic + size + id) and joins the resulting
+  `{record_id: (offset, size)}` onto the parsed records. `content_hash` then covers that
+  same raw span, which is what makes `dd bs=1 skip=<byte_offset> count=<record_size> |
+  sha256sum` reproduce it with no Vestigo tooling. Hashing the rendered XML instead would
+  have made event identity a function of the parser's version.
+- **Per-chunk parsing, not whole-file.** The obvious approach — hand the parser the file —
+  aborts *permanently* at the first bad chunk header, and cannot be resumed: on
+  `sample_with_a_bad_chunk_magic.evtx` it yields 14 records and stops. Feeding it one
+  chunk at a time (templates and the string cache are chunk-local, so a chunk plus a header
+  is a complete document) recovers 270. Same cost — 0.04 s either way on a 12 MB log.
+- **Sigma-canonical attribute names.** `FieldResolver.resolve` matches `attributes` keys
+  literally and case-sensitively, so `EventID` must be exactly that, unpadded. `EventData`
+  keeps native Windows names because that is already what SigmaHQ rules address; System
+  spellings win on collision (`EventData_<name>` otherwise) so a payload field cannot
+  rewrite `Channel`. Map-derived prose is namespaced under `Map*`. Snake_case duplicates
+  for evtx2timesketch parity were rejected — they double the attribute count and add a
+  spelling Sigma will never resolve.
+- **The EvtxECmd corpus is embedded, not referenced.** Converters are single-file
+  downloads, so `scripts/vendor_evtx_maps.py` parses all 468 `.map` YAML files at vendor
+  time, validates every XPath expression and `Refine` regex, and emits a zlib+base64 blob
+  (181 KB, decoded lazily). The converter therefore needs no PyYAML and can contain no
+  unsupported expression. `--check` fails the build on drift.
+
+**Things that were not true until checked.**
+
+- The record *header* id and the `<EventRecordID>` element can disagree (1 vs 319457771 in
+  the test fixture — an extracted log renumbers one but not the other). The header id is
+  the offset join key, so it is now on the row as `evtx_record_id`.
+- Some maps key their `Lookups` on the raw `%%14592` while also carrying a `Refine` that
+  strips the `%%`. Applying refine-then-lookup blanks them; the converter tries the lookup
+  before *and* after refining rather than guessing the author's intent.
+- A real 4739 record in `security.evtx` carries a raw `\x03` in EventData, which is illegal
+  in XML 1.0 — the parser renders XML no parser will read back. Rather than dropping a
+  genuine event, illegal characters are replaced with U+FFFD (the convention the CSV/JSONL
+  path already uses for undecodable bytes) and the row is flagged `xml_sanitized`.
+
+- **"Rules match with an empty `fallback_fields`" was wrong**, and the end-to-end run caught
+  it. The names resolve correctly — a stock 4672 rule compiles to
+  `attributes['EventID'] = '4672' AND attributes['Channel'] ILIKE 'Security'` and matched
+  459 events — but `fallback_fields` tracks whether a *mapping vouches for the name*, not
+  whether the match is right, so correct-by-construction names are still flagged. A
+  timeline field mapping cannot fix it (`validate_field_mappings` rejects the identity
+  mapping as shadowing the raw key); a global ruleset `vestigo-fieldmap.yml` can. Measured
+  over the real SigmaHQ `rules/windows/builtin` corpus: an identity fieldmap took the run
+  from 873 fallback flags to 0 with zero SQL and zero match-count differences. Docs now say
+  this instead of the claim that was easier to write.
+
+**Verification.** Scanner record-id sets match the parser exactly on all 8 upstream samples
+including a 12 MB dirty log (14,621 records, 10 bad chunks skipped) and the two the
+whole-file path cannot read at all. Zero records lost anywhere in that corpus.
+`tests/test_evtx_converter.py` (39 tests) covers the offset round-trip, the blob
+invariants, and the Sigma naming contract.
+
+End-to-end, the real **SigmaHQ `rules/windows/builtin` corpus (326 rules, commit
+`1aacbed`) compiled and ran against an `evtx2vestigo` timeline with zero errors**, and the
+five rules that hit were each reproduced by hand from the raw Parquet — including
+`User Added to Local Administrator Group` narrowing 6 candidate 4732 events to 2 via
+`TargetUserName`/`TargetSid`/`SubjectUserName`, which is what proves the native *EventData*
+names resolve and not just the System ones.
 
 ## Session 126 — 2026-07-29: AMiner detector gap audit, and two claims that were not true
 
