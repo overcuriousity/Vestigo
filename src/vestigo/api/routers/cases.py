@@ -156,11 +156,20 @@ async def list_cases(user: User = Depends(get_current_user)) -> dict[str, Any]:
     Each case carries the caller's resolved ``access_level``
     (``none|read|contribute|manage``) so clients don't have to re-implement
     the access rules.
+
+    An admin sees every case except other users' seeded demo cases: those are
+    identical fabricated copies, one per account, and listing fifty of them
+    buries the real work. They remain reachable by id, and deleting a user
+    still cascades theirs.
     """
     store = get_store()
     await store.init_schema()
     if user.is_admin:
-        cases = await store.list_cases()
+        cases = [
+            case
+            for case in await store.list_cases()
+            if not case.is_demo or case.owner_id == user.id
+        ]
         role_by_team: dict[str, str] = {}
     else:
         memberships = await store.list_user_memberships(user.id)

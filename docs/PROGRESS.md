@@ -1,10 +1,93 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 134 — PR #210 review pass).
+Last updated: 2026-07-31 (session 136 — PR #211 review pass).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
 
+## Session 136 — 2026-07-31: the demo case, reviewed
+
+**Why.** A review of PR #211 before merge. One bug could take a user's demo case away
+permanently, one endpoint was an authenticated storage-amplification primitive, and the
+rest were smaller correctness and honesty problems.
+
+- **A claim that never dispatched is now released.** `maybe_seed_demo_case` stamped
+  `demo_case_seeded_at` and *then* dispatched; when dispatch hit the concurrency cap the
+  `RuntimeError` was swallowed by the never-fail-a-login handler and the stamp stayed. That
+  is precisely the post-upgrade backfill case — fifty users stamped, one seeded, and no way
+  back for anyone whose case list wasn't empty. `PostgresStore.release_demo_seed` gives an
+  unspent claim back, so the next login retries.
+- **One demo case per account.** `POST /api/demo/seed` had no per-user guard: a loop over it
+  wrote a quarter of a million ClickHouse rows per call. Cases now carry `is_demo`
+  (migration 0023) and the endpoint answers 409 while the caller still has theirs. The same
+  flag keeps other users' copies out of an admin's case list, which would otherwise show one
+  per account, and drives the restore offer's visibility in the UI.
+- **Seeds are cancelled at shutdown.** Nothing cancelled the background tasks, and
+  `build_demo_case`'s teardown caught `Exception` — which `CancelledError` is not — so a
+  shutdown mid-ingest left a half-populated case in someone's list. The lifespan now calls
+  `cancel_pending_seeds()`, and the build tears down on `BaseException`.
+- **The cap is a setting, and it is 1.** The build is CPU-bound Python holding the GIL, so
+  each concurrent seed contends with the API's own loop. `demo_max_concurrent` replaces the
+  hardcoded 2, following `transfer_max_concurrent`. `DEPLOYMENT.md` said the overflow
+  "queues"; it does not.
+- **The full sweep, finally run.** It had never been: 2113 tests, one failure, and it was
+  session 135's own. `test_enrichers.py` carries a second copy of the pre-Alembic column
+  list that `test_postgres_store.py` has, and only the latter was updated for 0022 — so the
+  adoption path tried to add `demo_case_seeded_at` to a column that `create_all` had already
+  made. Both copies now drop both columns. Two copies of that list is the actual defect;
+  the next migration will trip over it again.
+- **The job store is per-test now.** `get_job_store()` is a process-wide singleton, so a
+  test leaving a job queued held an admission slot for every test after it. Invisible while
+  the demo cap was 2 and immediately fatal at 1: a seed that silently never dispatched.
+  An autouse fixture gives each test its own store, which also retires the never-finishing
+  tasks the 429 test used to leak.
+- **A flake worth naming, not fixed.** `find_value_combos` in auto mode picks its two
+  fields from `recommend_novelty_fields`, which ranks on ClickHouse's *approximate*
+  `uniq()`. The demo coverage test caught it going quiet once and never again across
+  repeated runs. The detector is fine; a canary test that can flip is not, and pinning the
+  fields there would trade the auto path — the one the UI actually uses — for a green run.
+  Left as-is deliberately, recorded here so the next flake is not mistaken for a new bug.
+- **Smaller.** Row ordering in the generators sorted ISO *strings* — correct only by
+  accident of a fixed UTC offset, now sorted on the parsed instant. Dead `noqa: BLE001`s
+  (`BLE` is not in the ruff select list) removed. Restore requests are audited at dispatch,
+  not only on success, so an abusive loop is visible. Frontend comments claiming the
+  capability meant "the archive is packaged" outlived the archive by a whole architecture.
+
+## Session 135 — 2026-07-30: a demo case for every new user
+
+**Why.** A new user's first screen was an empty case list, which is the worst possible
+introduction to a tool whose whole argument is detection-as-workflow. Every user now finds
+a fabricated investigation waiting for them: 251k events, four sources, 30 days, a quiet
+three-week baseline and a seven-day intrusion, with an analyst's notes, tags, saved views,
+a baseline definition, four Sigma rules and a story already in place. Spec:
+`docs/superpowers/specs/2026-07-30-demo-case-design.md`.
+
+- **Realism over meta-labels.** Nothing in the case names the detector it triggers. The
+  annotations read as one investigator's working notes, and the story explains the incident,
+  not the product. Two of the findings are deliberately benign and called out as such (an
+  NTP-drifting host, a backup job whose schedule legitimately moved) — a demo where every
+  anomaly is malicious teaches the wrong reflex.
+- **Generated, not shipped.** The first cut built a prebuilt `.vestigo` archive, which came
+  out at **146 MiB** — events travel uncompressed inside the archive by design, so the
+  "10–15 MB" the design assumed was off by an order of magnitude. Committing that on every
+  regeneration was not acceptable in a repo that has to stay airgap-shippable, so the
+  generator moved into `src/vestigo/demo/` and runs per user instead: ~2.5s to fabricate the
+  four source files, a few seconds to ingest them through the real `IngestionPipeline`. It is
+  deterministic, so every copy is identical down to the source files' SHA-256 hashes, and the
+  provenance story is the one an ordinary ingest tells.
+- **Seeded once per user, ever.** `users.demo_case_seeded_at` is claimed with a conditional
+  UPDATE, so two simultaneous logins cannot both dispatch, and the stamp survives deletion —
+  a deleted demo stays deleted. Existing users backfill through the same path at their next
+  login, since their stamp is null. `POST /api/demo/seed` is the way back, offered from the
+  empty case list. Hooked into `_issue_session` rather than the login handler, so OIDC
+  behaves identically; the call swallows its own errors, because no demo case is worth a
+  failed login. Two builds run concurrently instance-wide; the rest get a 429.
+- **The coverage test is the actual deliverable.** `tests/test_demo_detector_coverage_clickhouse.py`
+  runs all thirteen non-embedding tools plus the four Sigma rules over the seeded case and
+  asserts each returns real findings. The first version of that test passed vacuously — it
+  fell back to the result *object*, which is always truthy — and once fixed it immediately
+  caught that event sequences found nothing over the default `series_field`. The demo's
+  promise is only true for as long as something checks it.
 ## Session 134 — 2026-07-31: PR #210 review pass — the ratchet's own blind spot
 
 **Why.** A review of the tier-1 design work before merge. Five findings, all fixed in the

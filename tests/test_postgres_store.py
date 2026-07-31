@@ -258,6 +258,10 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
         # 0012 adds the per-user preferences blob.
         await conn.execute(text("ALTER TABLE users DROP COLUMN preferences"))
+        # 0022 adds the demo-case seed stamp.
+        await conn.execute(text("ALTER TABLE users DROP COLUMN demo_case_seeded_at"))
+        # 0023 marks seeded demo cases.
+        await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
     await s.init_schema()
     async with s.engine.begin() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()

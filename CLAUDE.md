@@ -151,6 +151,11 @@ instead of rebuilding.
 - `stories/` — the Stories subsystem (blocks, snapshots, export). See `docs/STORIES.md`.
 - `transfer/` — case export/import (`.vestigo` archive).
 - `enrichers/` — post-ingest attribute enrichment (GeoIP via a local MaxMind DB).
+- `demo/` — the fabricated demo case every user is seeded on first login: a deterministic
+  generator (`scenario.py`, `sources/`), the analyst artifacts (`metadata.py`), and the
+  build that ingests it through the real pipeline (`build.py`). Generated per user rather
+  than shipped as data. `tests/test_demo_detector_coverage_clickhouse.py` asserts every
+  analysis tool still finds something in it — keep that green when retuning a detector.
 - `cli/main.py` — Typer CLI (`vestigo`), mirrors what the API/UI does for scriptable/offline use.
 
 ### Frontend layout (`frontend/src/`)

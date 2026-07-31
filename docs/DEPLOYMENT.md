@@ -500,6 +500,42 @@ bus) and re-opening the standing decisions priced against a single trusted proce
 tokens and the full-user-directory listing (`docs/ROADMAP.md`). Treat it as a milestone,
 not a config flag.
 
+## The demo case
+
+New users are seeded a fabricated example investigation the first time they log
+in — 251k events across four sources, with the analyst's notes, tags, saved
+views, a baseline definition, four Sigma rules and a story already in place.
+`docs/ANOMALY_DETECTION.md` describes what it contains and why.
+
+Operationally there are four things worth knowing:
+
+- **It is generated, not shipped.** The generator (`src/vestigo/demo/`) runs
+  per user as a background job: roughly 2.5s to fabricate the four source files
+  and a few seconds more to ingest them through the normal pipeline. It is
+  deterministic, so every user's copy is identical down to the source files'
+  SHA-256 hashes.
+- **It costs CPU while it runs.** Generating and ingesting a quarter of a
+  million events is CPU-bound Python, so a build competes with the rest of the
+  app on a single-process deployment. One runs at a time by default
+  (`VESTIGO_DEMO_MAX_CONCURRENT=1`); raise it on a box with cores to spare, or
+  set it to 0 to remove the cap. A first login that finds the cap full is not
+  seeded and is not marked as seeded — it simply tries again at the next login.
+  An explicit restore gets a 429 instead.
+- **It costs storage per user.** ~251k events per seeded user in ClickHouse —
+  about 12.5M rows across 50 users. Turn seeding off on large instances, or on
+  any deployment where fabricated data sitting in a case list is a policy
+  problem: `VESTIGO_DEMO_CASE_ENABLED=false` (also editable in the admin
+  console, under Onboarding). Demo cases are flagged as such (`cases.is_demo`),
+  and administrators do not see other users' copies in their case list — with
+  one per account they would otherwise bury the real work.
+- **Seeding happens once per user, ever.** The stamp (`users.demo_case_seeded_at`)
+  survives the user deleting the case, so a deleted demo stays deleted. Users
+  can ask for a fresh copy from the case list, which is the only way it comes
+  back, and only while they do not already have one — the endpoint answers 409
+  otherwise. Turning the setting off stops future seeding and leaves existing
+  copies alone; upgrading an instance backfills every existing user at their
+  next login, since their stamp is null.
+
 ## On-disk state outside the databases
 
 Two directories hold case data on the app host itself, both `VESTIGO_*`-configurable

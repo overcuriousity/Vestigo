@@ -56,6 +56,13 @@ class Case(Base):
     # Investigation team this case belongs to, or None for a personal case
     # (visible only to its owner and admins).
     team_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # A seeded demo case (``core/demo_case.py``). Marks fabricated data as such:
+    # admins do not see other users' copies in the case list, and the restore
+    # endpoint refuses while the caller still has one. Otherwise an ordinary
+    # case — nothing downstream branches on this.
+    is_demo: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -76,6 +83,7 @@ class Case(Base):
             "description": self.description,
             "owner_id": self.owner_id,
             "team_id": self.team_id,
+            "is_demo": self.is_demo,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -1509,6 +1517,13 @@ class User(Base):
     onboarding_completed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # When this user's demo case was seeded. Null means "never" — which is also
+    # every pre-existing row, so an upgrade backfills through the same
+    # first-login path as a brand-new account. Stays stamped after the user
+    # deletes the case, so it never comes back on its own.
+    demo_case_seeded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Namespaced per-user preference blob (e.g. "agent_disabled_tools").
     # A JSON column rather than a table: per-user singleton, never queried
     # by value. Nothing secret lives here.
@@ -1813,10 +1828,16 @@ class PostgresStore:
         description: str | None = None,
         owner_id: str | None = None,
         team_id: str | None = None,
+        is_demo: bool = False,
     ) -> Case:
         """Create a new case and its default timeline."""
         case = Case(
-            id=case_id, name=name, description=description, owner_id=owner_id, team_id=team_id
+            id=case_id,
+            name=name,
+            description=description,
+            owner_id=owner_id,
+            team_id=team_id,
+            is_demo=is_demo,
         )
         default_timeline = Timeline(
             id=generate_id("all-sources"),
@@ -4981,6 +5002,57 @@ class PostgresStore:
                 update(User).where(User.id == user_id).values(last_login_at=datetime.now(UTC))
             )
             await session.commit()
+
+    async def claim_demo_seed(self, user_id: str) -> bool:
+        """Stamp the demo-seed flag, returning True only for the winning caller.
+
+        Conditional on the column still being null, so two simultaneous logins
+        cannot both dispatch a seed job. Stamped *before* the import runs: a
+        failed import leaves a failed job the user can retry explicitly, which
+        beats re-importing on every subsequent login.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(User)
+                .where(User.id == user_id, User.demo_case_seeded_at.is_(None))
+                .values(demo_case_seeded_at=datetime.now(UTC))
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def release_demo_seed(self, user_id: str) -> None:
+        """Clear the demo-seed flag, so this user is seeded at their next login.
+
+        The claim is stamped before the build is dispatched, which leaves a
+        window: if dispatch itself fails — the concurrency cap is full during a
+        post-upgrade burst of logins, say — the user would be marked as seeded
+        without a job ever having run, and would never be offered the case
+        again. Releasing an unspent claim is strictly better than holding it.
+        Not used once a build has started: from that point a failed job is the
+        record, and the user restores explicitly.
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                update(User).where(User.id == user_id).values(demo_case_seeded_at=None)
+            )
+            await session.commit()
+
+    async def find_demo_case_for_owner(self, owner_id: str) -> Case | None:
+        """Return this user's seeded demo case, if they still have one.
+
+        The restore endpoint's guard: each user gets one demo case at a time,
+        and a fresh copy is only reachable after deleting the old one.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Case)
+                .where(Case.owner_id == owner_id, Case.is_demo.is_(True))
+                .order_by(Case.created_at.desc())
+                .limit(1)
+            )
+            return result.scalars().first()
 
     async def delete_user(self, user_id: str, reassign_cases_to: str | None = None) -> bool:
         """Delete a user, cascading their sessions and team memberships.
