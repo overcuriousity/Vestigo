@@ -284,3 +284,70 @@ async def test_oidc_discovery_failure_is_a_502_not_a_traceback():
 
     assert excinfo.value.status_code == 502
     assert "cloud.example.org" in excinfo.value.detail
+
+
+def test_access_log_redacts_the_oidc_authorization_code():
+    """The callback's code and state are credentials in a URL uvicorn logs.
+
+    They are single-use and short-lived, but the journal is readable by more
+    people than the session store is, so they must not land there in the
+    clear.
+    """
+    import logging
+
+    from vestigo.api.main import AccessLogRedactor, redact_query
+
+    target = "/api/auth/oidc/callback?state=Fb8wUjkc&code=BKnwFkdaDaZxDQ"
+    assert redact_query(target) == "/api/auth/oidc/callback?state=***&code=***"
+
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("10.0.13.1:0", "GET", target, "1.1", 307),
+        exc_info=None,
+    )
+    assert AccessLogRedactor().filter(record) is True
+    assert record.args is not None
+    assert record.args[2] == "/api/auth/oidc/callback?state=***&code=***"
+    # The path and the parameter names survive: an operator can still see that
+    # a callback happened and that it carried a code.
+    assert "/api/auth/oidc/callback" in record.args[2]
+    assert "BKnwFkdaDaZxDQ" not in record.args[2]
+
+
+def test_access_log_leaves_ordinary_query_strings_alone():
+    from vestigo.api.main import redact_query
+
+    assert redact_query("/api/cases/") == "/api/cases/"
+    assert redact_query("/api/events?limit=50&offset=100") == "/api/events?limit=50&offset=100"
+    # A sensitive name as a *substring* of another parameter is not a match.
+    assert redact_query("/api/x?encoded=1") == "/api/x?encoded=1"
+
+
+def test_listing_cases_does_not_run_migrations(client, admin_bootstrap, monkeypatch):
+    """Schema upgrades belong to startup, not to the hottest endpoint.
+
+    ``init_schema`` runs ``alembic upgrade head``, which opens a connection and
+    takes a migration lock. On every ``GET /api/cases/`` that is a per-request
+    cost and a contention point on the path the UI hits most.
+    """
+    from vestigo.api import deps
+
+    store = deps.get_store()
+    calls = []
+    original = store.init_schema
+
+    async def _counting():
+        calls.append(1)
+        return await original()
+
+    monkeypatch.setattr(store, "init_schema", _counting)
+
+    as_admin(client, admin_bootstrap)
+    assert client.get("/api/cases/").status_code == 200
+    assert client.post("/api/cases/", json={"name": "c1"}).status_code == 200
+    assert client.get("/api/cases/").status_code == 200
+    assert calls == []

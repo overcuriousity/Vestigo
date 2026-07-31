@@ -233,6 +233,54 @@ def _redact_url(url: str | None) -> str:
     return url
 
 
+# Query parameters whose *value* is a credential. The OIDC redirect carries an
+# authorization code and its CSRF state in the URL — that is the protocol, not
+# a flaw — but uvicorn's access log writes the full query string, so without
+# this every login puts a live credential into the system journal, which is
+# routinely readable by more people than the session store is.
+_SECRET_QUERY_PARAMS = frozenset(
+    {"code", "state", "token", "access_token", "id_token", "refresh_token", "session_state"}
+)
+REDACTED = "***"
+
+
+def redact_query(target: str) -> str:
+    """Replace the value of every sensitive query parameter in ``target``.
+
+    Args:
+        target: A request target, with or without a query string.
+
+    Returns:
+        The same target with sensitive values replaced by ``***``. Parameter
+        names, order and the path are preserved, so the log stays readable and
+        an operator can still see *that* a callback carried a code.
+    """
+    path, sep, query = target.partition("?")
+    if not sep or not query:
+        return target
+    parts = []
+    for pair in query.split("&"):
+        name, eq, _value = pair.partition("=")
+        parts.append(f"{name}={REDACTED}" if eq and name in _SECRET_QUERY_PARAMS else pair)
+    return f"{path}?{'&'.join(parts)}"
+
+
+class AccessLogRedactor(logging.Filter):
+    """Scrub credentials out of uvicorn's access log records.
+
+    Uvicorn formats access lines from the record's ``args``, where the third
+    item is the request target including its query string. Rewriting the tuple
+    here catches every route at once, which is what makes this hold for
+    whatever query parameter the next subsystem adds.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], redact_query(args[2]), *args[3:])
+        return True
+
+
 def _log_config_report() -> None:
     """One startup block stating the resolved deployment-critical config."""
     settings = get_settings()
@@ -472,6 +520,11 @@ def create_app() -> FastAPI:
         level=get_settings().log_level.upper(),
         format="%(levelname)s:     %(name)s — %(message)s",
     )
+    # Attached to the logger rather than to a handler: uvicorn owns the
+    # handler, and an embedding process may replace it.
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, AccessLogRedactor) for f in access_logger.filters):
+        access_logger.addFilter(AccessLogRedactor())
     app = FastAPI(
         title="Vestigo",
         description="Local-first forensic log investigation platform.",

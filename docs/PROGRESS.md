@@ -1,9 +1,34 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 138 — OIDC discovery redirects).
+Last updated: 2026-07-31 (session 139 — per-request migrations, and codes in the journal).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 139 — 2026-07-31: two things a deployment's own log showed
+
+**Why.** Reading the journal of a live instance, not a test run. Both findings
+predate today's merges; neither would ever fail a test, because both are about what
+the app does *around* a correct response.
+
+- **`GET /api/cases/` ran `alembic upgrade head` on every request.** `list_cases` and
+  `create_case` each opened with `await store.init_schema()`, so the busiest endpoint in
+  the UI re-ran the migration machinery per call — a connection, a version-table check
+  and a migration lock, on the hot path. The startup lifespan already does this once,
+  which is the documented contract; the handler calls were redundant, and under
+  concurrency the lock is a contention point rather than just noise. Both removed. The
+  `Context impl PostgresqlImpl` / `Will assume transactional DDL` pair that bracketed
+  every case-list hit in the journal is gone with them.
+
+- **OIDC authorization codes were logged in the clear.** Uvicorn's access log writes the
+  full request target, and the callback carries `code` and `state` as query parameters —
+  that is the protocol working as designed, but it put a live credential into the system
+  journal on every SSO login. `AccessLogRedactor`, attached to the `uvicorn.access`
+  logger at app creation, replaces the value of every sensitive parameter name while
+  keeping the path and the parameter names, so an operator can still see that a callback
+  carried a code. Attached to the logger rather than a handler, since uvicorn owns the
+  handler and an embedding process may replace it. The audit trail was already clean —
+  it records `request.url.path`, never the query.
 
 ## Session 138 — 2026-07-31: OIDC discovery followed a redirect it should have followed
 

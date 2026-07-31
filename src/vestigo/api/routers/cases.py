@@ -163,7 +163,6 @@ async def list_cases(user: User = Depends(get_current_user)) -> dict[str, Any]:
     still cascades theirs.
     """
     store = get_store()
-    await store.init_schema()
     if user.is_admin:
         cases = [
             case
@@ -194,7 +193,6 @@ async def create_case(
     (or an admin); plain team members cannot create team cases.
     """
     store = get_store()
-    await store.init_schema()
     if payload.team_id:
         if not user.is_admin:
             membership = await store.get_membership(payload.team_id, user.id)
