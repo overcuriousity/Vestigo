@@ -8,6 +8,13 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { useUiStore } from "@/stores/ui";
+import type { RecommendedColumns } from "@/api/types";
+
+vi.mock("@/api/timelines", () => ({
+  timelinesApi: {
+    recommendColumns: vi.fn().mockResolvedValue({ job_id: "job-1", enabled: true }),
+  },
+}));
 
 vi.mock("@/api/events", () => ({
   eventsApi: {
@@ -115,5 +122,90 @@ describe("ColumnPicker derived-key grouping", () => {
 
     expect(screen.getByText("event_data:AccountName")).toBeInTheDocument();
     expect(screen.queryByText(/^Derived \(/)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * The suggestion surface (issue #213): a suggested column is marked with its
+ * evidence, adopting the suggestion clears the local override rather than
+ * copying it in, and recomputing is contribute-gated.
+ */
+const SUGGESTION: RecommendedColumns = {
+  status: "ok",
+  columns: ["timestamp", "src_ip"],
+  reasons: { src_ip: "in 2/2 sources · 98% filled · 41 distinct values" },
+  method: "heuristic",
+  model: null,
+  source_ids: ["s1"],
+  generated_at: "2026-07-31T00:00:00Z",
+  job_id: null,
+};
+
+async function renderWithSuggestion(props: {
+  recommended?: RecommendedColumns | null;
+  canRecommend?: boolean;
+}) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={qc}>
+      <ColumnPicker caseId="c1" timelineId="t1" {...props} />
+    </QueryClientProvider>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: /columns/i }));
+  await waitFor(() => expect(screen.getByText("src_ip")).toBeInTheDocument());
+}
+
+describe("ColumnPicker suggestions", () => {
+  it("marks suggested columns with the evidence behind them", async () => {
+    await renderWithSuggestion({ recommended: SUGGESTION });
+
+    expect(
+      screen.getByLabelText(/Suggested column: in 2\/2 sources/),
+    ).toBeInTheDocument();
+  });
+
+  it("ticks the suggested columns when the analyst has not chosen any", async () => {
+    await renderWithSuggestion({ recommended: SUGGESTION });
+
+    const row = screen.getByText("src_ip").closest("label")!;
+    expect(row.querySelector("input")!).toBeChecked();
+  });
+
+  it("adopting the suggestion clears the local override", async () => {
+    useUiStore.setState({ visibleColumnsByTimeline: { "c1/t1": ["message"] } });
+    await renderWithSuggestion({ recommended: SUGGESTION });
+
+    fireEvent.click(screen.getByRole("button", { name: /use suggested/i }));
+
+    // Absent, not equal-to-the-suggestion: a later recomputation must still
+    // reach this browser.
+    expect(useUiStore.getState().visibleColumnsByTimeline).not.toHaveProperty("c1/t1");
+  });
+
+  it("offers no suggestion actions when the timeline has none", async () => {
+    await renderWithSuggestion({ recommended: null, canRecommend: true });
+
+    expect(screen.queryByRole("button", { name: /use suggested/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /re-suggest columns/i })).toBeInTheDocument();
+  });
+
+  it("hides the re-suggest action without contribute access", async () => {
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: false });
+
+    expect(
+      screen.queryByRole("button", { name: /re-suggest columns/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("re-suggesting starts a job and tracks it in the tray", async () => {
+    const { timelinesApi } = await import("@/api/timelines");
+    const { useJobsStore } = await import("@/stores/jobs");
+    useJobsStore.setState({ jobs: {} });
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /re-suggest columns/i }));
+
+    await waitFor(() => expect(useJobsStore.getState().jobs).toHaveProperty("job-1"));
+    expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1");
   });
 });

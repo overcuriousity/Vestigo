@@ -12,9 +12,16 @@ interface UiState {
   density: Density;
   setDensity: (density: Density) => void;
 
-  /** Per-timeline column selections, keyed by "caseId/timelineId". */
+  /**
+   * Per-timeline column selections, keyed by "caseId/timelineId".
+   *
+   * A key that is *absent* means "no analyst override" — not "empty" — which
+   * is what lets the timeline's server-side suggestion (issue #213) apply.
+   * Passing `undefined` to `setVisibleColumns` restores that state, so a later
+   * recomputed suggestion still reaches this browser.
+   */
   visibleColumnsByTimeline: Record<string, string[]>;
-  setVisibleColumns: (key: string, cols: string[]) => void;
+  setVisibleColumns: (key: string, cols: string[] | undefined) => void;
 
   /** Whether the Investigate panel (frame + detectors + windows) is open. */
   investigatePanelOpen: boolean;
@@ -111,13 +118,24 @@ const KNOWN_COLUMN_IDS = new Set([
   "_annotations",
 ]);
 
-function migrateColumns(cols: string[] | undefined): string[] {
-  if (!Array.isArray(cols)) return [...DEFAULT_COLUMNS];
+/**
+ * Sanitize a column-id list: remap retired ids, drop grid-internal ids that
+ * aren't real columns, dedupe. Returns an empty array when nothing survives —
+ * callers decide what "nothing" means, which is what lets a server-supplied
+ * suggestion (`lib/columns.ts`) tell "sanitized to nothing" apart from
+ * "sanitized to the built-in default".
+ */
+export function sanitizeColumns(cols: string[] | undefined): string[] {
+  if (!Array.isArray(cols)) return [];
   const mapped = cols
     .map((id) => RETIRED_COLUMN_IDS[id] || id)
     .filter((id) => KNOWN_COLUMN_IDS.has(id) || !id.startsWith("_"));
-  const deduped = [...new Set(mapped)];
-  return deduped.length > 0 ? deduped : [...DEFAULT_COLUMNS];
+  return [...new Set(mapped)];
+}
+
+function migrateColumns(cols: string[] | undefined): string[] {
+  const sanitized = sanitizeColumns(cols);
+  return sanitized.length > 0 ? sanitized : [...DEFAULT_COLUMNS];
 }
 
 export const useUiStore = create<UiState>()(
@@ -128,9 +146,15 @@ export const useUiStore = create<UiState>()(
 
       visibleColumnsByTimeline: {},
       setVisibleColumns: (key, cols) =>
-        set((s) => ({
-          visibleColumnsByTimeline: { ...s.visibleColumnsByTimeline, [key]: cols },
-        })),
+        set((s) => {
+          if (cols === undefined) {
+            const { [key]: _dropped, ...rest } = s.visibleColumnsByTimeline;
+            return { visibleColumnsByTimeline: rest };
+          }
+          return {
+            visibleColumnsByTimeline: { ...s.visibleColumnsByTimeline, [key]: cols },
+          };
+        }),
 
       investigatePanelOpen: false,
       setInvestigatePanelOpen: (open) => set({ investigatePanelOpen: open }),

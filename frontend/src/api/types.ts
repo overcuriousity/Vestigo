@@ -132,8 +132,33 @@ export interface Timeline {
   embedded_at: string | null;
   /** Canonical field name -> ordered raw attribute keys (query-time merge). */
   field_mappings: Record<string, string[]> | null;
+  /** Data-derived default grid columns, shared by everyone with access. */
+  recommended_columns: RecommendedColumns | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * A timeline's suggested event-grid columns (issue #213), derived from its own
+ * field statistics rather than a fixed default.
+ *
+ * `status` is the whole contract: `running` while a job is in flight,
+ * `ok` when `columns` should be applied, and `insufficient` when the backend
+ * looked and found nothing worth suggesting — in which case the grid keeps
+ * `DEFAULT_COLUMNS`. A per-user column choice always outranks this.
+ */
+export interface RecommendedColumns {
+  status: "ok" | "insufficient" | "running";
+  /** Grid column ids, `timestamp` first. Empty unless `status === "ok"`. */
+  columns: string[];
+  /** Column id -> why it was chosen; shown as a tooltip in the picker. */
+  reasons: Record<string, string>;
+  /** Which path produced this — the deterministic scorer, or the LLM on top. */
+  method: "heuristic" | "llm";
+  model: string | null;
+  source_ids: string[];
+  generated_at: string;
+  job_id: string | null;
 }
 
 /** Per-source presence of one raw attribute key (timeline wizard). */

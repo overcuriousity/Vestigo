@@ -9,6 +9,12 @@ export function canManageCase(case_: Case): boolean {
   return case_.access_level === "manage";
 }
 
+/** Whether the caller may change shared case content (annotations, timeline
+ * metadata, the column suggestion) rather than only read it. */
+export function canContributeToCase(case_: Case): boolean {
+  return case_.access_level === "contribute" || case_.access_level === "manage";
+}
+
 /** Teams the user may create a *team* case for, based on their own memberships
  * (must be a manager of the team). Admins are not necessarily a member of any
  * team, so callers should combine this with the full team list (fetched via

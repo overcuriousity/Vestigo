@@ -219,6 +219,13 @@ class Timeline(Base):
     # ingested events are never rewritten; None/empty means no mapping.
     field_mappings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Recommended event-grid columns (issue #213): the derived-from-the-data
+    # answer to "what should this timeline open on", shared by every user with
+    # access. Display metadata only — a per-user column choice in the browser
+    # always outranks it, and the events are never touched. See
+    # ``vestigo/columns/`` for the payload shape and how it is produced.
+    recommended_columns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # --- Embedding state (all nullable; None → not yet embedded) -------------
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -245,6 +252,7 @@ class Timeline(Base):
             "is_default": self.is_default,
             "source_ids": [s.id for s in self.sources],
             "field_mappings": self.field_mappings,
+            "recommended_columns": self.recommended_columns,
             "is_embedded": is_embedded,
             "is_stale": is_stale,
             "embedding_model": self.embedding_model,
@@ -2825,6 +2833,37 @@ class PostgresStore:
             if timeline is None:
                 return None
             timeline.field_mappings = field_mappings or None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
+    async def update_timeline_recommended_columns(
+        self,
+        case_id: str,
+        timeline_id: str,
+        recommended_columns: dict[str, Any] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's recommended event-grid columns (issue #213).
+
+        Written only by the recommendation job (``vestigo/columns/jobs.py``),
+        which owns the payload shape. Returns the updated timeline with sources
+        eagerly loaded, or None if it doesn't exist — a timeline deleted while
+        its job was running is an ordinary outcome, not an error.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.recommended_columns = recommended_columns or None
             await session.commit()
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])

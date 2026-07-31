@@ -1,9 +1,62 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 138 — OIDC discovery redirects).
+Last updated: 2026-07-31 (session 139 — suggested event-grid columns).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 139 — 2026-07-31: the grid opens on columns the corpus actually has (issue #213)
+
+**Why.** Every timeline opened on `timestamp / artifact / message`. One of those three
+earns its place: `artifact` usually restates a filter the analyst already set, and
+`message` truncates to nothing in a 160px cell. The fields that would tell them
+something — `user`, `src_ip`, `event_id`, whatever this corpus has — were a popover
+away and only if you knew to look. So the most important screen in the product opened
+on its least informative view, every time.
+
+- **`Timeline.recommended_columns`** (migration `0024`, one nullable JSON column on the
+  `field_mappings` precedent). Derived per timeline, shared by everyone with access,
+  carrying the columns, a per-column reason, which method produced them, and the source
+  set it was computed over. `status` is the contract with the frontend: `running` while
+  a job is in flight, `ok` to apply, `insufficient` for "we looked and found nothing" —
+  recorded rather than left null, so the explorer stops waiting and the job is not
+  re-run hoping for a different answer.
+- **`src/vestigo/columns/`**, three layers so the expensive part stays optional.
+  `recommend.py` scores candidates off the existing per-source field-stats cache
+  (`db/field_stats.py`) — **zero new ClickHouse scans on the common path** — weighting
+  breadth across sources highest, then fill rate, then a cardinality band that rejects
+  both the constant and the per-row-unique, with hashes/GUIDs/paragraph-length values
+  gated out and a small name vocabulary as the tie-breaker. Pure, deterministic, 24 unit
+  tests. `advisor.py` is one typed LLM call that **reorders and selects from** those
+  candidates; `jobs.py` orchestrates and persists.
+- **Not a different recommender by accident.** `db/field_recommend.py` answers "what is
+  worth vectorizing" and therefore rejects precisely the fields an analyst wants on
+  screen — ports, status codes, IPs. Only its value-shape regexes are shared.
+- **The AI half is bounded by code, not by prompt.** Gated on the same cached
+  `agent_available()` probe `/api/health` uses; the model sees a candidate table and
+  nothing else — no ids, no events; every token it returns is intersected with that
+  table; a malformed, short, timed-out or unreachable response is indistinguishable from
+  "no LLM configured" and the deterministic ranking stands. The stored `method` says
+  which one won. Documented in `AGENT.md` §"Outside the agent loop".
+- **Soft, never blocking.** The issue asked for the timeline to be disabled until the
+  process finished; a hung LLM endpoint making a timeline unbrowsable is the wrong
+  trade, so the grid renders the built-in defaults immediately and re-lays out when the
+  job lands, behind a `role="status" aria-live="polite"` line.
+- **Precedence is one function** (`lib/columns.ts`): the analyst's own choice, then the
+  suggestion, then `DEFAULT_COLUMNS`. Read by both `ExplorerPage` and `ColumnPicker` so
+  the ticks always match the grid. "Use suggested" *clears* the local override rather
+  than copying it in, so a later recomputation still reaches that browser.
+- **Scheduled from every path that creates a knowable source set**: post-ingest (beside
+  `refresh_source_field_stats`, isolated so a failure never reaches the ingest
+  rollback), timeline creation, the CLI, the demo build, and a contribute-gated
+  `POST .../recommend-columns` behind "Re-suggest columns" in the picker.
+- **`VESTIGO_COLUMN_RECOMMEND_MODE`** (`auto` / `heuristic` / `off`) in a new "Explorer"
+  settings group. Every run writes a `timeline.recommend_columns` audit row naming the
+  method, the model, the chosen columns and the full candidate set.
+- **Known gap, filed in `ROADMAP.md`:** timelines with `field_mappings` get no
+  suggestion for the mapped fields. The grid reads `attributes[colId]` directly, so
+  neither the canonical name nor one raw spelling renders correctly — recommending
+  either would recommend a column that looks broken.
 
 ## Session 138 — 2026-07-31: OIDC discovery followed a redirect it should have followed
 

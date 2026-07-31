@@ -358,6 +358,43 @@ the conversation row (incl. `model_id`, `disabled_tools`), every message row
 token usage), the proposals, and `raw_history` — the provider-wire
 pydantic-ai history blob (the only place thinking signatures live).
 
+## Outside the agent loop: the column advisor
+
+One feature reaches the configured LLM endpoint without being an agent turn:
+the event-grid column suggestion (`src/vestigo/columns/advisor.py`, issue
+#213). It is documented here because it shares this subsystem's configuration
+and its availability gate — not because it shares its machinery. It has no
+conversation, no tool server, no history, no proposals, and writes nothing an
+analyst has to decide on.
+
+**What it does.** A deterministic sweep over the per-source field-statistics
+cache (`db/field_stats.py`) has already scored every candidate column before
+the model is involved. The model receives a candidate table — token, how many
+sources carry it, fill rate, distinct count, three sample values — and returns
+3–5 of those tokens in a useful order, as a pydantic `output_type`
+(`ColumnChoice`). That is the whole interaction: one request, no tools.
+
+**How the invariants apply.**
+
+| Invariant | How it holds here |
+|---|---|
+| Invisible unless configured | Gated on the same cached `agent_available()` probe `/api/health` uses. Unconfigured or unreachable ⇒ never called, and the deterministic answer ships instead. |
+| Scope safety | The model is given no case, timeline, source or event id, and no event content — only field names and aggregate statistics the analyst can already read off the column picker. |
+| Sandbox + apply | The result is a *default*, not a mutation. It lands in `Timeline.recommended_columns`; any analyst's own column choice outranks it, and "Reset to defaults" is one click. |
+| Forensic reproducibility | Every run writes a `timeline.recommend_columns` audit row with the method, the model id, the chosen columns and the full candidate set. The heuristic half is deterministic and unit-tested; the LLM half is recorded as `method: "llm"` so a suggestion is never mistaken for a computation. |
+| Bounded trust | Every returned token is intersected with the candidate set — the model cannot introduce a field. A response that falls below the minimum after filtering is rejected whole rather than padded. Malformed, timed out (45 s ceiling), or errored is indistinguishable from "not configured". |
+
+**What it deliberately does not do.** It does not go through `build_tool_server`
+or `FastMCPClient`. Driving the real tools would mean `describe_field`'s two
+live ClickHouse scans per field across ~50 candidates, for data the stats cache
+already holds exactly; the tools are also timeline-scoped where the evidence
+here is per-source. The tool-deny layers are not bypassed by this, because no
+tool is called.
+
+`VESTIGO_COLUMN_RECOMMEND_MODE=heuristic` switches the model call off while
+keeping the suggestions; `off` disables the feature entirely. See
+`vestigo/columns/__init__.py` for the layering.
+
 ## Configuration
 
 | Variable | Meaning |

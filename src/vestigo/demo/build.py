@@ -137,6 +137,32 @@ async def _timelines(
     return timeline_ids
 
 
+async def _suggest_columns(store: PostgresStore, clickhouse: ClickHouseStore, case_id: str) -> None:
+    """Give every demo timeline its recommended columns (issue #213).
+
+    The demo case never passes through the upload endpoint or the timeline
+    router, so it would otherwise miss both scheduling hooks — and the very
+    first timeline a new user opens is exactly the one the suggestion exists
+    for. Awaited rather than spawned, so the case is complete when the seed
+    job reports done. Best-effort: a failure leaves the built-in defaults,
+    which is what the demo shipped with before.
+    """
+    from vestigo.columns.jobs import JOB_KIND, run_column_recommendation_job
+    from vestigo.core.jobs import JobStore
+
+    job_store = JobStore()
+    for timeline in await store.list_timelines(case_id):
+        job = job_store.create(kind=JOB_KIND, case_id=case_id)
+        await run_column_recommendation_job(
+            job_id=job.id,
+            case_id=case_id,
+            timeline_id=timeline.id,
+            job_store=job_store,
+            store=store,
+            ch_store=clickhouse,
+        )
+
+
 async def _artifacts(
     store: PostgresStore,
     clickhouse: ClickHouseStore,
@@ -263,6 +289,8 @@ async def build_demo_case(
         _phase("ingest", len(SOURCES))
         ingested = await _ingest(store, clickhouse, case_id, owner_id, paths, progress)
         timeline_ids = await _timelines(store, case_id, ingested)
+        _phase("columns")
+        await _suggest_columns(store, clickhouse, case_id)
 
         _phase("annotate")
         annotations = await _artifacts(store, clickhouse, case_id, owner_id, ingested, timeline_ids)

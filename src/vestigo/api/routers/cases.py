@@ -25,6 +25,7 @@ from vestigo.api.deps import (
     resolve_case_access,
 )
 from vestigo.api.uploads import receive_upload_to_tmp
+from vestigo.columns.jobs import schedule_for_source, start_column_recommendation
 from vestigo.core.config import get_settings
 from vestigo.core.eta import ThroughputMeter
 from vestigo.core.events_bus import publish_annotation_change
@@ -594,6 +595,21 @@ async def _run_ingestion_job(
                 case_id,
             )
         await _revalidate_stale_field_mappings(store, case_id, source_id)
+        # Recommended columns follow the field-stats precompute above, since
+        # that is what they read. Isolated for the same reason as the
+        # auto-enrichment trigger below: a failure here must never fall through
+        # to the ingest rollback, which would delete a fully-ingested source
+        # over a cosmetic suggestion. A missed run self-heals on the next
+        # ingest or a manual re-run from the Columns picker.
+        try:
+            await schedule_for_source(store, clickhouse, job_store, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Column recommendation scheduling failed for source %s (case %s); "
+                "the explorer falls back to its built-in default columns",
+                source_id,
+                case_id,
+            )
         # Auto-enrichment scheduling runs *after* the source is committed
         # "ready"; a failure here must never fall through to the ingest
         # rollback below (which would delete a fully-ingested source). Isolate
@@ -1019,7 +1035,52 @@ async def create_timeline(
         target_id=timeline_id,
         detail={"field_mappings": payload.field_mappings} if payload.field_mappings else None,
     )
+    # A timeline built from already-ingested sources never passes the
+    # post-ingest hook, so it would otherwise open on the built-in defaults
+    # until someone asked for a suggestion by hand.
+    start_column_recommendation(
+        case_id=case.id,
+        timeline_id=timeline_id,
+        job_store=get_job_store(),
+        store=store,
+        actor_id=user.id,
+        actor_username=user.username,
+    )
     return {"timeline": timeline.to_dict()}
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/recommend-columns")
+async def recommend_timeline_columns(
+    timeline_id: str,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Re-derive this timeline's recommended event-grid columns (issue #213).
+
+    The same job the post-ingest hook runs, started by hand from the Columns
+    picker. Contribute access, because the result is shared with everyone who
+    can see the timeline — a read-only member changing what the timeline opens
+    on for the whole case would be a surprise. Returns ``job_id: null`` when a
+    job for this timeline is already in flight or recommendation is switched
+    off instance-wide, so the caller can say so rather than showing a job that
+    never appears.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    job_id = start_column_recommendation(
+        case_id=case.id,
+        timeline_id=timeline_id,
+        job_store=get_job_store(),
+        store=store,
+        actor_id=user.id,
+        actor_username=user.username,
+    )
+    return {
+        "job_id": job_id,
+        "enabled": get_settings().column_recommend_mode != "off",
+    }
 
 
 @router.patch("/{case_id}/timelines/{timeline_id}/field-mappings")

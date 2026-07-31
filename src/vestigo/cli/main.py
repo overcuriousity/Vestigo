@@ -121,6 +121,50 @@ async def _resolve_actor(store: PostgresStore, username: str | None) -> User:
     raise typer.Exit(code=1)
 
 
+async def _suggest_columns(store: PostgresStore, case_id: str, source_id: str, actor: User) -> None:
+    """Recompute recommended grid columns for the timelines holding *source_id*.
+
+    Awaited rather than spawned: the CLI is a one-shot process, so a
+    fire-and-forget task the way the API schedules it would be cancelled at
+    exit and the case would open on the built-in defaults for an operator who
+    only ever ingests from the command line. Best-effort — a suggestion is
+    never worth failing an ingest that already succeeded.
+    """
+    from vestigo.columns.jobs import (
+        JOB_KIND,
+        recommendation_enabled,
+        run_column_recommendation_job,
+    )
+    from vestigo.core.jobs import JobStore
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    if not recommendation_enabled():
+        return
+    try:
+        job_store = JobStore()
+        # One client for every timeline this source belongs to, rather than
+        # one connection per job.
+        ch_store = ClickHouseStore()
+        for timeline in await store.list_timelines_for_source(case_id, source_id):
+            job = job_store.create(kind=JOB_KIND, case_id=case_id, created_by=actor.id)
+            await run_column_recommendation_job(
+                job_id=job.id,
+                case_id=case_id,
+                timeline_id=timeline.id,
+                job_store=job_store,
+                store=store,
+                ch_store=ch_store,
+                actor_id=actor.id,
+                actor_username=actor.username,
+            )
+            recommendation = (await store.get_timeline(case_id, timeline.id)) or timeline
+            columns = (recommendation.recommended_columns or {}).get("columns") or []
+            if columns:
+                typer.echo(f"Suggested columns for '{timeline.name}': {', '.join(columns)}")
+    except Exception as exc:  # noqa: BLE001 — advisory step, never fails the ingest
+        typer.echo(f"WARNING: column suggestion skipped ({exc})", err=True)
+
+
 @app.command()
 def ingest(
     path: str = typer.Argument(..., help="Path to log file or directory to ingest."),
@@ -221,6 +265,7 @@ def ingest(
                 "via": "cli",
             },
         )
+        await _suggest_columns(store, case_obj.id, source_id, resolved_user)
 
         if result.errors:
             for error in result.errors:

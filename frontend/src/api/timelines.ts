@@ -71,6 +71,18 @@ export const timelinesApi = {
       `/cases/${caseId}/timelines/${timelineId}/sources/${sourceId}`,
     ),
 
+  /**
+   * Re-derive the timeline's suggested grid columns (issue #213).
+   *
+   * `job_id` is null when a recommendation is already running for this
+   * timeline, or when suggestions are switched off instance-wide (`enabled`
+   * distinguishes the two).
+   */
+  recommendColumns: (caseId: string, timelineId: string) =>
+    post<{ job_id: string | null; enabled: boolean }>(
+      `/cases/${caseId}/timelines/${timelineId}/recommend-columns`,
+    ),
+
   /** Fetch per-artifact field recommendations for the timeline's embedding wizard. */
   embeddingFields: (caseId: string, timelineId: string) =>
     get<EmbeddingFieldsResponse>(

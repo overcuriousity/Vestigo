@@ -17,6 +17,7 @@ const KIND_LABELS: Record<string, string> = {
   sigma_run: "Sigma scan",
   case_export: "Case export",
   case_import: "Case import",
+  column_recommend: "Column suggestion",
 };
 
 interface Props {

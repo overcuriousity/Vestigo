@@ -4,12 +4,19 @@
  * Fetches the timeline's field list from /fields (top-level + dynamic
  * attributes) and renders a searchable checkbox list.  Selection is persisted
  * to the UI store (localStorage) via setVisibleColumns.
+ *
+ * Columns the backend suggested for this timeline (issue #213) are marked, and
+ * carry the evidence behind the suggestion in a tooltip — a default an analyst
+ * cannot interrogate is a default they have to take on faith.  The footer is
+ * where the suggestion is adopted, rejected, or recomputed.
  */
 import { useState, useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search, Sparkles } from "lucide-react";
 import { eventsApi } from "@/api/events";
+import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { useJobsStore } from "@/stores/jobs";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -19,11 +26,22 @@ import {
   PopoverContent,
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
+import {
+  hasSuggestion,
+  isSuggesting,
+  resolveVisibleColumns,
+  suggestedColumns,
+} from "@/lib/columns";
 import { splitDerivedKey } from "@/lib/enrichment";
+import type { RecommendedColumns } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
+  /** The timeline's stored suggestion, or null/undefined when it has none. */
+  recommended?: RecommendedColumns | null;
+  /** Whether this analyst may recompute the shared suggestion. */
+  canRecommend?: boolean;
 }
 
 /** Human-readable labels for the built-in top-level columns. */
@@ -42,11 +60,14 @@ function ColumnRow({
   label,
   checked,
   onChange,
+  suggestedReason,
 }: {
   id: string;
   label: string;
   checked: boolean;
   onChange: (id: string, checked: boolean) => void;
+  /** Present when this column is part of the timeline's suggestion. */
+  suggestedReason?: string;
 }) {
   return (
     <label
@@ -64,6 +85,17 @@ function ColumnRow({
       <span className={cn("flex-1 truncate", checked && "text-[var(--color-fg-primary)]")}>
         {label}
       </span>
+      {suggestedReason !== undefined && (
+        <span
+          title={suggestedReason ? `Suggested — ${suggestedReason}` : "Suggested"}
+          aria-label={
+            suggestedReason ? `Suggested column: ${suggestedReason}` : "Suggested column"
+          }
+          className="shrink-0 text-[var(--color-accent)]"
+        >
+          <Sparkles size={11} />
+        </span>
+      )}
     </label>
   );
 }
@@ -110,12 +142,37 @@ function DerivedGroup({
   );
 }
 
-export function ColumnPicker({ caseId, timelineId }: Props) {
+export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: Props) {
   const [search, setSearch] = useState("");
   const tlKey = `${caseId}/${timelineId}`;
-  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
   const setVisibleColumnsStore = useUiStore((s) => s.setVisibleColumns);
   const setVisibleColumns = (cols: string[]) => setVisibleColumnsStore(tlKey, cols);
+  const suggestion = suggestedColumns(recommended);
+  // Through the shared resolver, not a local copy of the same three-way
+  // precedence — the ticks here must match what the grid is rendering.
+  const visibleColumns = resolveVisibleColumns(storedColumns, recommended);
+  const suggestedReasons = hasSuggestion(recommended) ? recommended.reasons : {};
+  const suggestedSet = new Set(suggestion ?? []);
+
+  const queryClient = useQueryClient();
+  const addJob = useJobsStore((s) => s.addJob);
+  const recommendMutation = useMutation({
+    mutationFn: () => timelinesApi.recommendColumns(caseId, timelineId),
+    onSuccess: (result) => {
+      // A null job id means one was already running (or suggestions are off
+      // instance-wide) — refetching the timeline is still the right move, since
+      // that in-flight job is what the status line is waiting on.
+      if (result.job_id) {
+        addJob(result.job_id, "Suggesting columns", [
+          ["timeline", caseId, timelineId],
+          ["fields", caseId, timelineId],
+        ]);
+      }
+      queryClient.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+    },
+  });
+  const recommendRunning = recommendMutation.isPending || isSuggesting(recommended);
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],
@@ -243,6 +300,9 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                       label={c.label}
                       checked={visibleSet.has(c.id)}
                       onChange={toggle}
+                      suggestedReason={
+                        suggestedSet.has(c.id) ? (suggestedReasons[c.id] ?? "") : undefined
+                      }
                     />
                   ))}
                 </div>
@@ -260,6 +320,9 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                         label={id}
                         checked={visibleSet.has(id)}
                         onChange={toggle}
+                        suggestedReason={
+                          suggestedSet.has(id) ? (suggestedReasons[id] ?? "") : undefined
+                        }
                       />
                       {children.length > 0 && (
                         <DerivedGroup
@@ -303,14 +366,38 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
           )}
         </div>
 
-        {/* Reset footer */}
-        <div className="border-t border-[var(--color-border)] p-2">
+        {/* Reset / suggestion footer */}
+        <div className="flex flex-wrap items-center gap-1 border-t border-[var(--color-border)] p-2">
           <button
             className="flex items-center gap-1.5 text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-base"
             onClick={() => setVisibleColumns(DEFAULT_COLUMNS)}
           >
             <RotateCcw size={10} /> Reset to defaults
           </button>
+          {suggestion && (
+            <Button
+              variant="ghost"
+              size="sm"
+              // Clearing the local override is what makes the suggestion take
+              // effect, rather than copying it in — so a later recomputation
+              // still reaches this analyst.
+              onClick={() => setVisibleColumnsStore(tlKey, undefined)}
+              disabled={!storedColumns}
+            >
+              <Sparkles size={11} /> Use suggested
+            </Button>
+          )}
+          {canRecommend && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => recommendMutation.mutate()}
+              disabled={recommendRunning}
+            >
+              {recommendRunning ? <Spinner size={11} /> : <RotateCcw size={11} />}
+              {recommendRunning ? "Suggesting…" : "Re-suggest columns"}
+            </Button>
+          )}
         </div>
       </PopoverContent>
     </Popover>
