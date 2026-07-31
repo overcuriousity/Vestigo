@@ -238,17 +238,21 @@ def test_admin_listing_hides_other_users_demo_cases(client, admin_bootstrap, sto
     _create_user(client, "alice3")
     client.post("/api/cases/", json={"name": "real-case"})
 
-    alice_client = client.__class__(client.app)
-    login(alice_client, "alice3", "abcdefgh12")  # seeds alice's demo case
-    _wait_for_seeds(builds, 2)
+    # Alice's client holds its portal open for the whole block. A bare
+    # TestClient starts and stops one per request, and the seed her login
+    # dispatches is a background task on that loop — it dies with the portal
+    # unless it happens to finish inside the request that started it.
+    with client.__class__(client.app) as alice_client:
+        login(alice_client, "alice3", "abcdefgh12")  # seeds alice's demo case
+        _wait_for_seeds(builds, 2)
 
-    cases = client.get("/api/cases/").json()["cases"]
-    demos = [c for c in cases if c["is_demo"]]
-    assert {c["name"] for c in cases} >= {"real-case"}
-    assert [c["owner_id"] for c in demos] == [admin["id"]], (
-        "an admin must see their own demo case and no one else's"
-    )
+        cases = client.get("/api/cases/").json()["cases"]
+        demos = [c for c in cases if c["is_demo"]]
+        assert {c["name"] for c in cases} >= {"real-case"}
+        assert [c["owner_id"] for c in demos] == [admin["id"]], (
+            "an admin must see their own demo case and no one else's"
+        )
 
-    # Alice still has hers, and it is the only case she can see.
-    alice_cases = alice_client.get("/api/cases/").json()["cases"]
-    assert [c["is_demo"] for c in alice_cases] == [True]
+        # Alice still has hers, and it is the only case she can see.
+        alice_cases = alice_client.get("/api/cases/").json()["cases"]
+        assert [c["is_demo"] for c in alice_cases] == [True]

@@ -166,9 +166,17 @@ def builds(monkeypatch, seeds_on_login):
     the call: the flag is what the case list filters on and what the restore
     endpoint refuses against, so a fake that skips it would leave both
     untested.
+
+    Raises the concurrency cap off its default of 1. A refused seed is dropped,
+    not queued, so at the default a test that seeds two users races: if the
+    first build is still in flight when the second logs in, the second never
+    happens. Tests that are about the cap set their own value.
     """
     from vestigo.core import demo_case as demo_mod
     from vestigo.demo.build import DemoBuildResult
+
+    monkeypatch.setenv("VESTIGO_DEMO_MAX_CONCURRENT", "8")
+    get_settings.cache_clear()
 
     calls = []
 
