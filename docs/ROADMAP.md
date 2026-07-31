@@ -57,6 +57,13 @@ round — **standing rule: when either resumes, both are designed together in on
 
 ## Milestone 3 — polish
 
+- [ ] **Show env-pinned settings as pinned in the admin console.** A field the operator
+  set in the environment silently wins over the stored override (`core/config.py::
+  env_pinned`), so an admin can flip a toggle, get a 200, and see nothing change —
+  `VESTIGO_OIDC_ENABLED=false` left in a `.env` is the case that actually bit someone
+  (session 138). `runtime_settings._usable_overrides` already logs the drop; surface it:
+  serve the pinned-field set from the settings API and render those inputs disabled with
+  a "pinned by VESTIGO_*" hint.
 - [ ] **Generate frontend API types from OpenAPI** (`openapi-typescript` over
   `/openapi.json`) to replace the hand-mirrored types in `frontend/src/api/types.ts`.
   The duplication is compounding: 1240 lines when this was filed (PR109 review), 1549

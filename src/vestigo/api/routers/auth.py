@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import logging
 import math
 from collections.abc import Generator
 from typing import Any
@@ -27,6 +28,8 @@ from vestigo.core.security import (
     verify_password,
 )
 from vestigo.db.postgres import User, generate_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -297,10 +300,26 @@ async def get_my_audit(
 
 
 async def _oidc_metadata(issuer: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(issuer.rstrip("/") + "/.well-known/openid-configuration")
-        resp.raise_for_status()
-        return resp.json()
+    """Fetch the provider's discovery document.
+
+    Redirects are followed: several IdPs publish the well-known path only
+    behind one (Nextcloud 301s ``/.well-known/openid-configuration`` to
+    ``/index.php/.well-known/openid-configuration``), and refusing to follow
+    turns a working provider into an opaque 500.
+    """
+    url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        # The operator needs the failing URL and reason; the browser must not
+        # get a traceback for a misconfigured or unreachable IdP.
+        logger.warning("OIDC discovery failed for %s: %s", url, exc)
+        raise HTTPException(
+            status_code=502, detail=f"Could not fetch OIDC discovery document from {url}"
+        ) from exc
 
 
 def _require_oidc_configured() -> None:

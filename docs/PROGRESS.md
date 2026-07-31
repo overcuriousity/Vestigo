@@ -1,9 +1,32 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 137 — README reorder).
+Last updated: 2026-07-31 (session 138 — OIDC discovery redirects).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 138 — 2026-07-31: OIDC discovery followed a redirect it should have followed
+
+**Why.** A live deployment against a Nextcloud IdP got a 500 on every SSO click.
+Nextcloud 301s `/.well-known/openid-configuration` to
+`/index.php/.well-known/openid-configuration`; `_oidc_metadata` used a default
+`httpx.AsyncClient` (`follow_redirects=False`), so `raise_for_status()` raised on the
+301 and nothing caught it.
+
+- **Follow redirects on discovery** (`api/routers/auth.py`). Every mainstream OIDC
+  client does — pinning the issuer to `/index.php` would also have worked but leaves the
+  issuer string disagreeing with the endpoints the document advertises.
+- **Discovery failures are now 502 with the attempted URL**, plus a `WARNING` log, rather
+  than an unhandled exception and a traceback per click. That half was not doc-fixable:
+  it applied to any unreachable or misconfigured IdP, not just Nextcloud.
+- **Documented the issuer**, which was the actual gap — `docs/DEPLOYMENT.md` gained an
+  "OIDC single sign-on" section with per-IdP issuer forms (Authentik, Nextcloud,
+  Keycloak, Okta, Google), a `curl` verification one-liner, and the redirect-URL rules.
+  `.env.example` carries the short version.
+- **Noted the env-pin footgun** in `.env.example`: `VESTIGO_OIDC_ENABLED=false` left in a
+  `.env` pins the field, so the admin console's SSO toggle silently does nothing (the
+  override is dropped with an INFO log). Surfacing env-pinned fields in the settings UI
+  is still open — filed in `ROADMAP.md`.
 
 ## Session 137 — 2026-07-30: README reordered, and a count that did not add up
 

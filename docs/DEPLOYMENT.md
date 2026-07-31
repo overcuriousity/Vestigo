@@ -79,6 +79,64 @@ refused with 503, but an archive an earlier export already produced can still be
 downloaded — it is single-use and swept from disk shortly after, so refusing it would
 only strand a legitimate export.
 
+## OIDC single sign-on (optional)
+
+Off by default. Enabling it adds an SSO button to the login page next to local
+username/password login — it does not replace local accounts, and the bootstrap admin
+stays a local account so a broken IdP can never lock you out of the instance.
+
+```bash
+VESTIGO_OIDC_ENABLED=true
+VESTIGO_OIDC_ISSUER=https://idp.example.org/application/o/vestigo/
+VESTIGO_OIDC_CLIENT_ID=...
+VESTIGO_OIDC_CLIENT_SECRET=...
+VESTIGO_OIDC_REDIRECT_URL=https://vestigo.example.org/api/auth/oidc/callback
+VESTIGO_OIDC_SCOPES="openid email profile"   # default; rarely needs changing
+```
+
+This is the one optional subsystem deliberately independent of
+`VESTIGO_ALLOW_ONLINE` — see [TECH_STACK.md](TECH_STACK.md) §6. An airgapped
+instance with an IdP on the same isolated network can use SSO without opening
+general outbound access.
+
+### Getting the issuer right
+
+`VESTIGO_OIDC_ISSUER` is the base URL Vestigo appends
+`/.well-known/openid-configuration` to. Everything else (authorization, token and
+userinfo endpoints) is read from that discovery document, so the issuer is the only
+IdP URL you configure. Vestigo follows redirects on that fetch, so the tidy form
+works even where the provider serves the document elsewhere.
+
+| IdP | Issuer |
+|---|---|
+| Authentik | `https://auth.example.org/application/o/<app-slug>/` |
+| Nextcloud | `https://cloud.example.org` (301s to `/index.php/.well-known/...`; followed automatically) |
+| Keycloak | `https://sso.example.org/realms/<realm>` |
+| Okta | `https://<tenant>.okta.com/oauth2/default` |
+| Google | `https://accounts.google.com` |
+
+Verify before touching Vestigo — this is the exact request the app makes:
+
+```bash
+curl -sL https://idp.example.org/application/o/vestigo/.well-known/openid-configuration | jq .authorization_endpoint
+```
+
+If that returns JSON, the issuer is correct. If it 404s, you have the wrong base URL;
+if it needs `-L` to succeed, that is fine — Vestigo follows the same redirect. A
+discovery fetch that fails at runtime surfaces as `502` with the attempted URL in the
+response and a `WARNING` in the log, not as a generic 500.
+
+### Redirect URL and the IdP side
+
+`VESTIGO_OIDC_REDIRECT_URL` must match a redirect URI registered with the IdP
+*character for character*, and must be the URL the browser reaches — behind the TLS
+proxy that is the `https://` form, not `http://localhost:8080` (see
+[Required Vestigo-side settings](#3-required-vestigo-side-settings)).
+
+New subjects are auto-provisioned into a team-less "default pool": they can log in
+and see only their own work until an admin assigns them a team in the admin console.
+No case access is granted implicitly.
+
 ## Reference compose stack
 
 `docker-compose.yml` starts the three backing services for local/dev use:

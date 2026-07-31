@@ -221,3 +221,66 @@ def test_user_directory_requires_auth_and_maps_ids(client, admin_bootstrap):
     assert admin_row["id"].startswith("user_")
     assert admin_row["display_name"] == "Root Admin"
     assert set(admin_row) == {"id", "username", "display_name"}
+
+
+@pytest.mark.asyncio
+async def test_oidc_discovery_follows_redirects():
+    """Nextcloud 301s /.well-known/openid-configuration to /index.php/...
+
+    Refusing to follow it turned a perfectly working IdP into an unhandled
+    HTTPStatusError and a 500 on /api/auth/oidc/login.
+    """
+    import httpx
+
+    from vestigo.api.routers.auth import _oidc_metadata
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/.well-known/openid-configuration":
+            return httpx.Response(
+                301, headers={"Location": "/index.php/.well-known/openid-configuration"}
+            )
+        return httpx.Response(200, json={"authorization_endpoint": "https://idp.example/auth"})
+
+    transport = httpx.MockTransport(handler)
+    original = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original(*args, **kwargs)
+
+    httpx.AsyncClient = patched  # type: ignore[misc]
+    try:
+        metadata = await _oidc_metadata("https://cloud.example.org")
+    finally:
+        httpx.AsyncClient = original  # type: ignore[misc]
+
+    assert metadata["authorization_endpoint"] == "https://idp.example/auth"
+    assert seen[-1].endswith("/index.php/.well-known/openid-configuration")
+
+
+@pytest.mark.asyncio
+async def test_oidc_discovery_failure_is_a_502_not_a_traceback():
+    import httpx
+    from fastapi import HTTPException
+
+    from vestigo.api.routers.auth import _oidc_metadata
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(404))
+    original = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original(*args, **kwargs)
+
+    httpx.AsyncClient = patched  # type: ignore[misc]
+    try:
+        with pytest.raises(HTTPException) as excinfo:
+            await _oidc_metadata("https://cloud.example.org")
+    finally:
+        httpx.AsyncClient = original  # type: ignore[misc]
+
+    assert excinfo.value.status_code == 502
+    assert "cloud.example.org" in excinfo.value.detail
