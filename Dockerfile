@@ -12,7 +12,7 @@
 # builds the dist on the connected side.
 ARG FRONTEND_STAGE=frontend-build
 
-FROM node:22-alpine AS frontend-build
+FROM node:25-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
