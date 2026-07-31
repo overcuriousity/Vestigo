@@ -7,17 +7,18 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -262,16 +263,25 @@ export function ValueNoveltyView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {selectedFields !== null && selectedFields.length === 0
-              ? "No fields selected to scan. Pick fields above, or reset to auto."
+        <AnalysisEmptyState
+          hint={
+            selectedFields !== null && selectedFields.length === 0
+              ? "Pick fields above, or reset to auto to let the detector choose."
               : data?.status === "no_data"
-                ? "No rare values detected. No events ingested yet."
-                : "No rare values detected. All field values appear frequently."}
-          </span>
-        </div>
+                ? "Check the frame above — the scanned windows may not cover any events."
+                : data?.status === "insufficient_data"
+                  ? "A field needs enough distinct values for rarity to mean anything. Pick fields explicitly above."
+                  : "Every value seen here occurs often enough to look routine. Adding fields widens what counts as rare."
+          }
+        >
+          {selectedFields !== null && selectedFields.length === 0
+            ? "No fields selected to scan."
+            : data?.status === "no_data"
+              ? "The scan matched no events."
+              : data?.status === "insufficient_data"
+                ? "Not enough distinct values to judge rarity."
+                : "No rare values."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

@@ -12,7 +12,7 @@
  */
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { type UseMutationResult } from "@tanstack/react-query";
-import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, EyeOff, Pin, RefreshCw, Tag } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, EyeOff, Info, Pin, RefreshCw, Tag } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useDisposition } from "@/hooks/useDisposition";
@@ -21,6 +21,37 @@ import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
 import { InfoHint } from "@/components/ui/InfoHint";
 import { GLOSSARY } from "@/lib/glossary";
+
+/**
+ * Shown in place of a detector's findings when there are none.
+ *
+ * Same contract as `viz/primitives/ChartEmptyState`: the primary line says what
+ * happened, the optional `hint` gives the likely cause and what to try next, and
+ * both stay at the call site because only the detector knows why it came back
+ * empty. Only the markup is shared — until now this one block was hand-rolled
+ * identically in thirteen views, which is how they drifted into stating absence
+ * twice ("No drift findings. No events ingested yet.").
+ *
+ * Layout is inline rather than that component's centered fixed-height box: these
+ * sit in a scrolling panel between the field picker and the findings list.
+ */
+export function AnalysisEmptyState({
+  children,
+  hint,
+}: {
+  children: React.ReactNode;
+  hint?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
+      <Info size={13} className="mt-0.5 shrink-0" />
+      <div className="space-y-1">
+        <p className="text-[var(--color-fg-secondary)]">{children}</p>
+        {hint && <p>{hint}</p>}
+      </div>
+    </div>
+  );
+}
 
 /**
  * Shown in place of a detector's findings when the global frame is `baseline`
@@ -271,7 +302,7 @@ export function FindingShell({
             ? "border-[var(--color-anomaly,var(--color-warning))]/50 hover:border-[var(--color-anomaly,var(--color-warning))]"
             : highlight && !dismissed
               ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-dim)]"
-              : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+              : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]",
         dismissed && "opacity-60",
       )}
       title={title}
@@ -354,7 +385,7 @@ export function TagFindingsBar({
           {tagResultLabel(mutation.data)}
         </span>
       )}
-      {mutation.isError && <span className="text-xs text-[var(--color-error)]">Failed</span>}
+      {mutation.isError && <span className="text-xs text-[var(--color-danger)]">Failed</span>}
     </div>
   );
 }

@@ -138,7 +138,7 @@ export function DateTimeField({ value, onChange, placeholder = "—", className,
           type="button"
           aria-label={ariaLabel}
           className={cn(
-            "flex h-8 w-full items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 text-left text-xs transition-colors hover:border-[var(--color-border-focus)] focus:outline-none focus:ring-1 focus:ring-[var(--color-accent)]",
+            "flex h-8 w-full items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 text-left text-xs transition-colors hover:border-[var(--color-border-strong)] focus:outline-none focus:ring-1 focus:ring-[var(--color-accent)]",
             className,
           )}
         >
@@ -156,7 +156,7 @@ export function DateTimeField({ value, onChange, placeholder = "—", className,
               role="button"
               tabIndex={-1}
               aria-label="Clear"
-              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
               onClick={(e) => {
                 e.stopPropagation();
                 onChange(undefined);
@@ -236,7 +236,7 @@ export function DateTimeField({ value, onChange, placeholder = "—", className,
                   selected
                     ? "bg-[var(--color-accent)] text-white"
                     : "text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)]",
-                  isToday && !selected && "ring-1 ring-inset ring-[var(--color-border-focus)]",
+                  isToday && !selected && "ring-1 ring-inset ring-[var(--color-border-strong)]",
                 )}
               >
                 {day}

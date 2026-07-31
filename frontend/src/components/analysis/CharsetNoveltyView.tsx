@@ -10,16 +10,17 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -155,7 +156,7 @@ function CharsetRow({
           <span
             key={`${c}:${i}`}
             title={codepointLabel(c)}
-            className="inline-block rounded border border-[var(--color-error)]/40 bg-[var(--color-bg-elevated)] px-1 py-0.5 font-mono text-xs text-[var(--color-error)]"
+            className="inline-block rounded border border-[var(--color-danger)]/40 bg-[var(--color-bg-elevated)] px-1 py-0.5 font-mono text-xs text-[var(--color-danger)]"
           >
             {charLabel(c)}
           </span>
@@ -339,18 +340,25 @@ export function CharsetNoveltyView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No charset novelties. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "No fields with enough distinct baseline values (or the alphabet is too large). Pick fields explicitly above."
+                ? "A learned alphabet needs enough distinct baseline values, and stays useful only while the alphabet is small. Pick fields explicitly above."
                 : isTemporal
-                  ? "No values with characters absent from the baseline window."
-                  : "No values with rare characters."}
-          </span>
-        </div>
+                  ? "Every suspect-window value used characters the baseline had already seen."
+                  : "Every value stayed inside the alphabet the corpus already uses."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "No field had a learnable alphabet."
+              : isTemporal
+                ? "No values with characters new to the baseline."
+                : "No values with rare characters."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

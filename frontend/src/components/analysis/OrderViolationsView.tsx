@@ -8,10 +8,11 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, Rewind } from "lucide-react";
+import { AlertTriangle, Rewind } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   DismissedToggle,
   FindingRowActions,
@@ -94,8 +95,8 @@ function ViolationRow({
     >
       {/* Skew headline */}
       <div className="flex flex-wrap items-center gap-1.5">
-        <Rewind size={12} className="shrink-0 text-[var(--color-error)]" />
-        <span className="font-mono text-xs font-medium text-[var(--color-error)]">
+        <Rewind size={12} className="shrink-0 text-[var(--color-danger)]" />
+        <span className="font-mono text-xs font-medium text-[var(--color-danger)]">
           −{fmtSkew(finding.skew_seconds)}
         </span>
         <span className="text-xs text-[var(--color-fg-muted)]">backwards</span>
@@ -231,14 +232,21 @@ export function OrderViolationsView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No events with timestamps ingested yet."
-              : "No out-of-order timestamps. Records are chronological in file order."}
-          </span>
-        </div>
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "This detector reads timestamps in file order, so events whose timestamp could not be parsed are invisible to it."
+              : data?.status === "insufficient_data"
+                ? "A source needs at least two timestamped records in file order before they can be out of order."
+                : "Records appear in chronological order within each source, which is what an untampered log looks like."
+          }
+        >
+          {data?.status === "no_data"
+            ? "No events carry a usable timestamp."
+            : data?.status === "insufficient_data"
+              ? "Not enough timestamped records to compare."
+              : "No out-of-order timestamps."}
+        </AnalysisEmptyState>
       )}
 
       {/* Server-side truncation notice — the per-source "showing" counters

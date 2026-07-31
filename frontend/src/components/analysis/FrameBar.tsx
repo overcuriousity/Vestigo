@@ -52,7 +52,7 @@ export function FrameBar({ caseId, timelineId }: Props) {
         {frame === "baseline" && (
           <button
             onClick={() => setBaselineBuilderOpen(true)}
-            className="flex shrink-0 items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-focus)] hover:text-[var(--color-fg-primary)]"
+            className="flex shrink-0 items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-fg-primary)]"
             title="Open the baseline builder — pick, edit or create baseline definitions and suspect windows"
           >
             <SlidersHorizontal size={11} />

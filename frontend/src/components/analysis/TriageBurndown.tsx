@@ -11,6 +11,7 @@ import { Info } from "lucide-react";
 import { dispositionsApi } from "@/api/dispositions";
 import { LineChart } from "@/components/viz/charts/LineChart";
 import { Spinner } from "@/components/ui/Spinner";
+import { AnalysisEmptyState } from "./detector-shared";
 import { useTriageCoverage } from "@/hooks/useTriageCoverage";
 import { dispositionStatsToTimeseries } from "@/lib/triage-coverage";
 
@@ -38,10 +39,9 @@ export function TriageBurndown({ caseId, timelineId }: Props) {
   }
   if (!data || data.totals.total === 0) {
     return (
-      <p className="flex items-center gap-1.5 py-2 text-xs text-[var(--color-fg-muted)]">
-        <Info size={12} />
+      <AnalysisEmptyState hint="Disposition a finding as Normal, Dismiss or Confirm and your triage progress appears here.">
         No verdicts recorded yet.
-      </p>
+      </AnalysisEmptyState>
     );
   }
 
