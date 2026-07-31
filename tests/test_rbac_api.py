@@ -7,11 +7,19 @@ import time
 from tests.conftest import as_admin, login
 
 
-def _wait_for_seeds(builds, expected, timeout=5.0):
-    """Demo seeds are dispatched into the app's loop after the login returns."""
+def _wait_for_seeds(builds, expected, timeout=15.0):
+    """Demo seeds are dispatched into the app's loop after the login returns.
+
+    Fails on timeout rather than returning: a caller that proceeds on a seed
+    that never landed asserts against an empty list, which reads as a product
+    bug rather than the wait giving up.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and len(builds) < expected:
         time.sleep(0.02)
+    assert len(builds) >= expected, (
+        f"only {len(builds)}/{expected} demo seeds ran within {timeout}s"
+    )
 
 
 def _create_user(client, username: str, password: str = "abcdefgh12") -> dict:

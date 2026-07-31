@@ -87,7 +87,9 @@ def test_restore_endpoint_503_when_disabled(client, admin_bootstrap, monkeypatch
     get_settings.cache_clear()
 
 
-def test_restore_endpoint_429_when_too_many_seeds_are_running(client, admin_bootstrap, monkeypatch):
+def test_restore_endpoint_429_when_too_many_seeds_are_running(
+    client, admin_bootstrap, monkeypatch, seeds_on_login
+):
     """The build is CPU-heavy, so the cap is a real limit with its own code.
 
     The fake build never finishes, which is the only way to hold jobs in a

@@ -115,13 +115,52 @@ def as_admin(client: TestClient, admin_bootstrap: dict) -> dict:
     return resp.json()["user"]
 
 
+@pytest.fixture(autouse=True)
+def no_demo_seed(monkeypatch):
+    """Don't seed a demo case for tests that aren't about demo seeding.
+
+    Every login dispatches a background build of a 251k-event case against a
+    real ClickHouse. For the ~700 tests that only need *a* logged-in session
+    that is minutes of generation per run and an unrelated task competing for
+    the app's loop, which is exactly the kind of load that turns a seeding race
+    into an intermittent failure elsewhere.
+
+    Patched at the call site in ``routers.auth``, which imports the name
+    directly. Tests that *are* about seeding take ``builds``, which puts the
+    real dispatch path back.
+    """
+    from vestigo.api.routers import auth as auth_mod
+
+    async def _no_seed(user):
+        return None
+
+    monkeypatch.setattr(auth_mod, "maybe_seed_demo_case", _no_seed)
+    yield
+
+
 @pytest.fixture()
-def builds(monkeypatch):
+def seeds_on_login(monkeypatch, no_demo_seed):
+    """Put the real login-time seeder back for tests that are about seeding.
+
+    Take this (directly, or via ``builds``) whenever the dispatch that a login
+    triggers is part of what's under test — including tests that only need the
+    slot it occupies. Fake the build underneath it, or the case is generated
+    for real.
+    """
+    from vestigo.api.routers import auth as auth_mod
+    from vestigo.core import demo_case as demo_mod
+
+    monkeypatch.setattr(auth_mod, "maybe_seed_demo_case", demo_mod.maybe_seed_demo_case)
+
+
+@pytest.fixture()
+def builds(monkeypatch, seeds_on_login):
     """Record demo builds instead of generating and ingesting a real case.
 
     The build itself is exercised against live services in
     ``tests/test_demo_build_clickhouse.py``; everything here is about the
-    dispatch path around it.
+    dispatch path around it, so this fakes only the expensive build underneath
+    the real seeder.
 
     Creates a real (empty) case flagged ``is_demo`` rather than only recording
     the call: the flag is what the case list filters on and what the restore
@@ -134,7 +173,9 @@ def builds(monkeypatch):
     calls = []
 
     async def _fake_build(store, clickhouse, owner_id, progress=None):
-        case_id = f"case_demo{len(calls) + 1}"
+        # Keyed by owner, not by call count: seeds for two users can overlap,
+        # and a count read before either appends gives both the same id.
+        case_id = f"case_demo_{owner_id}"
         await store.create_case(
             case_id=case_id, name="Demo (test)", owner_id=owner_id, is_demo=True
         )
