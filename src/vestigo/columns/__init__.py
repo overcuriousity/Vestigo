@@ -16,7 +16,10 @@ parts stay optional:
 * :mod:`~vestigo.columns.advisor` — one typed LLM call that *reorders and
   selects from* the candidates the scorer already produced. It cannot
   introduce a field the scorer did not surface, and any failure falls back to
-  the heuristic ranking.
+  the heuristic ranking. Reached only when a caller passes ``use_llm=True``,
+  which one analyst action does and no automatic trigger does: the request
+  carries real sample values, so it is opted into per timeline after a
+  disclosure naming the endpoint and the model.
 * :mod:`~vestigo.columns.jobs` — the background job that loads the stats,
   runs the two above, validates, persists to ``Timeline.recommended_columns``
   and records the audit row.

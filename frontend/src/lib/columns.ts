@@ -72,6 +72,26 @@ export function suggestedColumns(
   return sanitized.length > 0 ? sanitized : null;
 }
 
+/**
+ * Preference key holding `{ [timelineId]: true }` for the timelines this user
+ * has opted in to AI column suggestions on (issue #213).
+ *
+ * Per timeline, because that is the granularity at which evidence is actually
+ * sent: the request carries sample values from *this* timeline's events, so
+ * consenting to it says nothing about the next one.
+ */
+export const COLUMN_ADVISOR_OPTIN = "column_advisor_optin";
+
+/** Whether *timelineId* has already been opted in by this user. */
+export function hasColumnAdvisorOptIn(
+  preferences: Record<string, unknown> | null | undefined,
+  timelineId: string,
+): boolean {
+  const optIn = preferences?.[COLUMN_ADVISOR_OPTIN];
+  if (!optIn || typeof optIn !== "object") return false;
+  return (optIn as Record<string, unknown>)[timelineId] === true;
+}
+
 /** Resolve the columns to render, applying the precedence above. */
 export function resolveVisibleColumns(
   stored: string[] | undefined,

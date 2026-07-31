@@ -20,8 +20,10 @@ Every agent invariant that can apply here does (`docs/AGENT.md`):
   carry it, its fill rate, its distinct count, and up to three **real sample
   values from the case's events**, each truncated to 40 characters. Those
   samples are evidence — usernames, hostnames, addresses, paths — so this is
-  egress, and the operator opts into it (``column_recommend_mode=auto``; the
-  default is ``heuristic``, which never calls this module). No event row, no
+  egress, and an analyst opts into it per timeline: nothing reaches this
+  module unless someone pressed "Suggest with AI" on that timeline, having
+  read the disclosure naming this endpoint and model. Ingest, timeline
+  creation, the CLI and the demo build never call it. No event row, no
   case/source/timeline id, no API key and no analyst identity are sent.
 * **Sandboxed.** The result is a *default*, not a mutation: it lands in
   ``Timeline.recommended_columns`` and any analyst's own column choice

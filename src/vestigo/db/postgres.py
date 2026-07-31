@@ -2846,10 +2846,16 @@ class PostgresStore:
     ) -> Timeline | None:
         """Replace a timeline's recommended event-grid columns (issue #213).
 
-        Written only by the recommendation job (``vestigo/columns/jobs.py``),
-        which owns the payload shape. Returns the updated timeline with sources
-        eagerly loaded, or None if it doesn't exist — a timeline deleted while
-        its job was running is an ordinary outcome, not an error.
+        Written only by the recommendation job (``vestigo/columns/jobs.py``) and
+        the read-path settler in ``api/routers/cases.py``, which share the
+        payload shape. Returns the updated timeline, or None if it doesn't
+        exist — a timeline deleted while its job was running is an ordinary
+        outcome, not an error.
+
+        ``sources`` is deliberately *not* eager-loaded on the way out: no
+        caller serializes this return value (the job discards it), and the
+        payload is written twice per run, so the extra round trip would be pure
+        cost. Callers that need ``to_dict()`` re-read through ``get_timeline``.
         """
         from sqlalchemy import select
 
@@ -2866,7 +2872,6 @@ class PostgresStore:
             timeline.recommended_columns = recommended_columns or None
             await session.commit()
             await session.refresh(timeline)
-            await session.refresh(timeline, attribute_names=["sources"])
             return timeline
 
     async def clear_stale_running_recommendations(self) -> int:
@@ -2874,11 +2879,10 @@ class PostgresStore:
 
         ``JobStore`` is in-memory, so a process that dies mid-recommendation
         leaves a Postgres payload claiming a job is in flight that no longer
-        exists — the explorer would poll for it forever. The job carries the
-        previous answer forward into its placeholder, so settling it is just a
-        relabel: ``ok`` when there are columns to show, ``insufficient``
-        otherwise. Nothing is recomputed here; the next ingest or a manual
-        re-suggest does that.
+        exists — the explorer would poll for it forever. The relabel itself
+        lives in ``columns/jobs.settle_running_payload``, shared with the
+        read-path settler so the two can never drift. Nothing is recomputed
+        here; the next ingest or a manual re-suggest does that.
 
         Filtering happens in Python rather than with a JSON path predicate:
         the same code runs against SQLite in the test suite, and the number of
@@ -2886,6 +2890,8 @@ class PostgresStore:
         timelines. Returns the number of rows settled.
         """
         from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
 
         async with self.session_factory() as session:
             result = await session.execute(
@@ -2896,10 +2902,7 @@ class PostgresStore:
                 payload = timeline.recommended_columns
                 if not isinstance(payload, dict) or payload.get("status") != "running":
                     continue
-                updated = dict(payload)
-                updated["status"] = "ok" if updated.get("columns") else "insufficient"
-                updated["job_id"] = None
-                timeline.recommended_columns = updated
+                timeline.recommended_columns = settle_running_payload(payload)
                 settled += 1
             if settled:
                 await session.commit()

@@ -98,7 +98,6 @@ GROUPS: tuple[SettingGroup, ...] = (
     SettingGroup("stories", "Stories", "Report export and block size ceilings."),
     SettingGroup("transfer", "Case transfer", "Export/import archive limits."),
     SettingGroup("agent", "AI agent", "LLM endpoint and tool policy."),
-    SettingGroup("explorer", "Explorer", "Event grid defaults."),
     SettingGroup("onboarding", "Onboarding", "What new users find the first time they log in."),
 )
 
@@ -658,21 +657,6 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Export/import jobs allowed at once across the instance. 0 removes the cap — it "
         "does not disable the feature (use the switch above for that).",
         subsystem="transfer",
-    ),
-    # ── Explorer ─────────────────────────────────────────────────────────
-    SettingSpec(
-        "column_recommend_mode",
-        "explorer",
-        "Suggest event-grid columns",
-        "Derives the columns a timeline opens on from its own data instead of the fixed "
-        "timestamp/artifact/message default. 'heuristic' (the default) scores the fields "
-        "statistically on this machine and sends nothing anywhere. 'auto' additionally lets "
-        "the configured LLM pick from those candidates — that sends each candidate field's "
-        "name, coverage statistics and up to three real sample values from this instance's "
-        "events (at most 20 fields, 40 characters per value) to the agent endpoint; no event "
-        "rows, case identifiers or credentials are included. 'off' keeps the built-in "
-        "defaults. Analysts can always override the suggestion from the Columns picker.",
-        choices=("auto", "heuristic", "off"),
     ),
     # ── AI agent ─────────────────────────────────────────────────────────
     SettingSpec(

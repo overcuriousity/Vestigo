@@ -1,17 +1,12 @@
 /**
- * The column-suggestion disclosure (issue #213): shown once per user, names
- * what leaves the machine, and is the only place the LLM path gets enabled.
+ * The column-suggestion disclosure (issue #213): opened by "Suggest with AI",
+ * names what leaves the machine, and sends nothing until it is confirmed.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
-import { useAuthStore } from "@/stores/auth";
-import type { User } from "@/api/types";
-
-const updatePreferences = vi.fn();
-const updateSettings = vi.fn();
-const getSettings = vi.fn();
+import { hasColumnAdvisorOptIn } from "@/lib/columns";
 
 vi.mock("@/api/agent", () => ({
   agentApi: {
@@ -26,144 +21,87 @@ vi.mock("@/api/agent", () => ({
   },
 }));
 
-vi.mock("@/api/auth", () => ({
-  authApi: { updatePreferences: (patch: Record<string, unknown>) => updatePreferences(patch) },
-}));
-
-vi.mock("@/api/settings", () => ({
-  settingsApi: {
-    get: () => getSettings(),
-    update: (values: Record<string, unknown>) => updateSettings(values),
-  },
-}));
-
-function user(over: Partial<User> = {}): User {
-  return {
-    id: "u1",
-    username: "alice",
-    display_name: null,
-    email: null,
-    is_admin: true,
-    is_active: true,
-    must_change_password: false,
-    auth_provider: "local",
-    onboarding_completed: true,
-    created_at: "2026-07-01T00:00:00Z",
-    updated_at: "2026-07-01T00:00:00Z",
-    last_login_at: null,
-    preferences: null,
-    ...over,
-  };
-}
-
-function settingsPayload(source: "env" | "db" | "default", editable: boolean) {
-  return {
-    groups: [],
-    secrets_mode: "db" as const,
-    settings: [
-      {
-        field: "column_recommend_mode",
-        group: "explorer",
-        label: "Suggest event-grid columns",
-        help: "",
-        kind: "choice" as const,
-        nullable: false,
-        constraints: {},
-        choices: ["auto", "heuristic", "off"],
-        default: "heuristic",
-        source,
-        env_var: "VESTIGO_COLUMN_RECOMMEND_MODE",
-        env_only: false,
-        restart_required: false,
-        subsystem: null,
-        managed_by: null,
-        editable,
-        value: "heuristic",
-      },
-    ],
-  };
-}
-
-function renderNotice(mode: "auto" | "heuristic" | "off" = "heuristic") {
+function renderNotice(props: Partial<React.ComponentProps<typeof ColumnAdvisorNotice>> = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const onConfirm = vi.fn();
+  const onOpenChange = vi.fn();
+  const view = render(
     <QueryClientProvider client={qc}>
-      <ColumnAdvisorNotice mode={mode} />
+      <ColumnAdvisorNotice
+        open
+        onOpenChange={onOpenChange}
+        onConfirm={onConfirm}
+        {...props}
+      />
     </QueryClientProvider>,
   );
+  return { ...view, onConfirm, onOpenChange };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
-  updatePreferences.mockResolvedValue(user({ preferences: { column_advisor_notice_ack: true } }));
-  updateSettings.mockResolvedValue(settingsPayload("db", true));
-  getSettings.mockResolvedValue(settingsPayload("default", true));
-  useAuthStore.setState({ user: user() });
 });
 
 describe("ColumnAdvisorNotice", () => {
   it("names what is sent, where, and to which model", async () => {
     renderNotice();
 
-    expect(await screen.findByText("AI column suggestions")).toBeInTheDocument();
+    expect(await screen.findByText("Suggest columns with AI")).toBeInTheDocument();
     expect(screen.getByText(/three real sample values per field/i)).toBeInTheDocument();
     expect(await screen.findByText("http://10.0.0.4:8000/v1")).toBeInTheDocument();
     expect(screen.getByText(/qwen3-coder/)).toBeInTheDocument();
   });
 
-  it("lets an admin enable the LLM path, and records the acknowledgement", async () => {
+  it("says the result is shared and audited, and that the opt-in is per timeline", async () => {
     renderNotice();
 
-    fireEvent.click(await screen.findByRole("button", { name: /enable/i }));
-
-    await waitFor(() =>
-      expect(updateSettings).toHaveBeenCalledWith({ column_recommend_mode: "auto" }),
-    );
-    expect(updatePreferences).toHaveBeenCalledWith({ column_advisor_notice_ack: true });
+    expect(await screen.findByText(/shared with everyone who can see this timeline/i))
+      .toBeInTheDocument();
+    expect(screen.getByText(/asked again on the next one/i)).toBeInTheDocument();
   });
 
-  it("acknowledges without changing the setting when statistics-only is kept", async () => {
-    renderNotice();
+  it("sends nothing when it is cancelled", async () => {
+    const { onConfirm, onOpenChange } = renderNotice();
 
-    fireEvent.click(await screen.findByRole("button", { name: /keep statistics-only/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /cancel/i }));
 
-    await waitFor(() =>
-      expect(updatePreferences).toHaveBeenCalledWith({ column_advisor_notice_ack: true }),
-    );
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("offers a non-admin no way to change the instance setting", async () => {
-    useAuthStore.setState({ user: user({ is_admin: false }) });
-    renderNotice();
+  it("confirms only on the explicit send action", async () => {
+    const { onConfirm } = renderNotice();
 
-    expect(await screen.findByRole("button", { name: /got it/i })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^enable$/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/an administrator controls this/i)).toBeInTheDocument();
-    expect(getSettings).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: /send and suggest/i }));
+
+    expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 
-  it("explains a pinned setting instead of offering to change it", async () => {
-    getSettings.mockResolvedValue(settingsPayload("env", false));
-    renderNotice();
+  it("reports a failed opt-in as nothing having been sent", async () => {
+    renderNotice({ error: true });
 
-    expect(await screen.findByText(/VESTIGO_COLUMN_RECOMMEND_MODE/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^enable$/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /got it/i })).toBeInTheDocument();
+    expect(await screen.findByText(/nothing was sent/i)).toBeInTheDocument();
   });
 
-  it("stays closed for a user who has already seen it", () => {
-    useAuthStore.setState({
-      user: user({ preferences: { column_advisor_notice_ack: true } }),
-    });
-    renderNotice();
+  it("is not rendered at all when closed", () => {
+    renderNotice({ open: false });
 
-    expect(screen.queryByText("AI column suggestions")).not.toBeInTheDocument();
+    expect(screen.queryByText("Suggest columns with AI")).not.toBeInTheDocument();
+  });
+});
+
+describe("hasColumnAdvisorOptIn", () => {
+  it("is per timeline, not per user", () => {
+    const prefs = { column_advisor_optin: { "tl-1": true } };
+
+    expect(hasColumnAdvisorOptIn(prefs, "tl-1")).toBe(true);
+    expect(hasColumnAdvisorOptIn(prefs, "tl-2")).toBe(false);
   });
 
-  it("says nothing when suggestions are switched off entirely", () => {
-    renderNotice("off");
-
-    expect(screen.queryByText("AI column suggestions")).not.toBeInTheDocument();
+  it("treats a missing, malformed or falsy entry as not opted in", () => {
+    expect(hasColumnAdvisorOptIn(null, "tl-1")).toBe(false);
+    expect(hasColumnAdvisorOptIn({}, "tl-1")).toBe(false);
+    expect(hasColumnAdvisorOptIn({ column_advisor_optin: "yes" }, "tl-1")).toBe(false);
+    expect(hasColumnAdvisorOptIn({ column_advisor_optin: { "tl-1": false } }, "tl-1")).toBe(false);
   });
 });

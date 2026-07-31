@@ -187,18 +187,37 @@ def test_update_me_onboarding_flag(client, admin_bootstrap):
 
 
 def test_update_my_preferences_merges_a_whitelisted_key(client, admin_bootstrap):
-    """Acknowledging the column-suggestion disclosure has to outlive one browser."""
+    """Opting in to AI column suggestions has to outlive one browser."""
     as_admin(client, admin_bootstrap)
     assert (client.get("/api/auth/me").json()["user"]["preferences"] or {}) == {}
 
     resp = client.put(
         "/api/auth/me/preferences",
-        json={"preferences": {"column_advisor_notice_ack": True}},
+        json={"preferences": {"column_advisor_optin": {"tl-1": True}}},
     )
     assert resp.status_code == 200
-    assert resp.json()["user"]["preferences"]["column_advisor_notice_ack"] is True
+    assert resp.json()["user"]["preferences"]["column_advisor_optin"] == {"tl-1": True}
     assert client.get("/api/auth/me").json()["user"]["preferences"] == {
-        "column_advisor_notice_ack": True
+        "column_advisor_optin": {"tl-1": True}
+    }
+
+
+def test_update_my_preferences_merges_dict_values_one_level_down(client, admin_bootstrap):
+    """A second tab adding its own timeline must not drop the first one's."""
+    as_admin(client, admin_bootstrap)
+    client.put(
+        "/api/auth/me/preferences",
+        json={"preferences": {"column_advisor_optin": {"tl-1": True}}},
+    )
+
+    resp = client.put(
+        "/api/auth/me/preferences",
+        json={"preferences": {"column_advisor_optin": {"tl-2": True}}},
+    )
+
+    assert resp.json()["user"]["preferences"]["column_advisor_optin"] == {
+        "tl-1": True,
+        "tl-2": True,
     }
 
 
@@ -215,7 +234,23 @@ def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bo
     assert (
         client.put(
             "/api/auth/me/preferences",
-            json={"preferences": {"column_advisor_notice_ack": "yes"}},
+            json={"preferences": {"column_advisor_optin": "yes"}},
+        ).status_code
+        == 422
+    )
+    # The whitelist has to reach inside a dict value too, or it is exactly the
+    # arbitrary key/value store it exists to prevent.
+    assert (
+        client.put(
+            "/api/auth/me/preferences",
+            json={"preferences": {"column_advisor_optin": {"tl-1": "sure"}}},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/auth/me/preferences",
+            json={"preferences": {"column_advisor_optin": {str(i): True for i in range(501)}}},
         ).status_code
         == 422
     )

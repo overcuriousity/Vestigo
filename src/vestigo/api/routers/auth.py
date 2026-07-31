@@ -65,10 +65,17 @@ class UpdateMeRequest(BaseModel):
 #: storage sink nobody asked for. Agent tool preferences keep their own
 #: endpoint (`/api/agent/preferences`), which validates against the registry.
 _ALLOWED_PREFERENCE_KEYS: dict[str, type] = {
-    # Set once the analyst has seen the column-suggestion disclosure dialog
-    # (issue #213) — what the LLM path sends, where, and to which model.
-    "column_advisor_notice_ack": bool,
+    # `{timeline_id: true}` — the timelines this analyst has opted in to
+    # "Suggest with AI" on (issue #213), having read the disclosure naming the
+    # endpoint, the model and what the request carries. The opt-in is per
+    # timeline because that is the granularity at which evidence is sent.
+    "column_advisor_optin": dict,
 }
+
+#: Ceiling on entries in a dict-valued preference. High enough that no real
+#: analyst reaches it (one entry per timeline they opted in on), low enough
+#: that the blob cannot be grown into storage by a scripted client.
+_MAX_PREFERENCE_ENTRIES = 500
 
 
 class UpdatePreferencesRequest(BaseModel):
@@ -85,6 +92,20 @@ class UpdatePreferencesRequest(BaseModel):
                 raise ValueError(f"Unknown preference: {key}")
             if not isinstance(entry, expected):
                 raise ValueError(f"Preference {key} must be a {expected.__name__}")
+            if expected is dict:
+                # A dict-valued preference is still a whitelist, one level
+                # down: string keys, boolean values, bounded size. Without
+                # this it would be the arbitrary key/value store the
+                # top-level whitelist exists to prevent.
+                if len(entry) > _MAX_PREFERENCE_ENTRIES:
+                    raise ValueError(
+                        f"Preference {key} may hold at most {_MAX_PREFERENCE_ENTRIES} entries"
+                    )
+                for inner_key, inner in entry.items():
+                    if not isinstance(inner_key, str) or not inner_key:
+                        raise ValueError(f"Preference {key} keys must be non-empty strings")
+                    if not isinstance(inner, bool):
+                        raise ValueError(f"Preference {key} values must be booleans")
         return value
 
 
@@ -250,15 +271,28 @@ async def update_my_preferences(
 ) -> dict[str, Any]:
     """Merge whitelisted keys into the current user's own preferences.
 
-    Per-user UI state that has to outlive one browser — acknowledging the
-    column-suggestion disclosure is the first of them, because a notice that
-    reappears on every machine is a notice people learn to dismiss unread.
-    Not audited: these are display preferences about the reader, not actions
-    on evidence.
+    Per-user UI state that has to outlive one browser — which timelines the
+    analyst has opted in to AI column suggestions on is the first of them,
+    because a disclosure that reappears on every machine is one people learn
+    to dismiss unread. Not audited: these are display preferences about the
+    reader, not actions on evidence.
+
+    Dict-valued keys merge one level down rather than replacing, so a second
+    tab or a second machine adding its own entry cannot drop the entries this
+    one already had. The store's own merge is top-level only, and it is shared
+    with callers that want replace semantics — hence doing it here.
     """
     if not payload.preferences:
         return {"user": _user_response(user, await _teams_for_user(user))}
-    updated = await get_store().update_user_preferences(user.id, payload.preferences)
+    existing = user.preferences or {}
+    patch: dict[str, Any] = {}
+    for key, value in payload.preferences.items():
+        if isinstance(value, dict):
+            current = existing.get(key)
+            patch[key] = {**current, **value} if isinstance(current, dict) else dict(value)
+        else:
+            patch[key] = value
+    updated = await get_store().update_user_preferences(user.id, patch)
     if updated is None:
         raise HTTPException(status_code=404, detail="User not found")
     return {"user": _user_response(updated, await _teams_for_user(updated))}

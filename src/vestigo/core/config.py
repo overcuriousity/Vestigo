@@ -262,17 +262,6 @@ class Settings(BaseSettings):
     # cores to spare.
     demo_max_concurrent: int = Field(default=1, ge=0)
 
-    # Recommended event-grid columns (issue #213; see `vestigo/columns/`).
-    # "heuristic" (the default) scores the timeline's own fields locally and
-    # never leaves the machine; "auto" additionally lets a configured LLM pick
-    # from those candidates, which sends field names and up to three real
-    # sample values per field to that endpoint — opt-in, via the disclosure
-    # dialog in the Explorer or Settings → Explorer; "off" recommends nothing
-    # and the explorer keeps its built-in timestamp/artifact/message defaults.
-    # The model call is advisory only — it can reorder and drop candidates,
-    # never introduce a field the scorer did not surface.
-    column_recommend_mode: str = Field(default="heuristic", pattern="^(auto|heuristic|off)$")
-
     # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
     # directory scanned for *.yml/*.yaml at run time — an offline file drop
     # (e.g. a vendored SigmaHQ clone); empty string disables the global set.

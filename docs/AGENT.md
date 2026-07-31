@@ -378,8 +378,8 @@ sources carry it, fill rate, distinct count, three sample values — and returns
 
 | Invariant | How it holds here |
 |---|---|
-| Invisible unless configured | Gated on the same cached `agent_available()` probe `/api/health` uses. Unconfigured or unreachable ⇒ never called, and the deterministic answer ships instead. |
-| Scope safety | The model is given no case, timeline, source or event id, and no event row. It *is* given up to three real sample values per candidate field (40 characters each, ≤20 fields) — evidence-derived strings, which is why the path is opt-in rather than on by default. |
+| Invisible unless configured | Gated on the same cached `agent_available()` probe `/api/health` uses. Unconfigured or unreachable ⇒ never called, and the deterministic answer ships instead. The "Suggest with AI" button is gated on the same `capabilities.agent`, so an instance with no model configured renders no entry point either. |
+| Scope safety | The model is given no case, timeline, source or event id, and no event row. It *is* given up to three real sample values per candidate field (40 characters each, ≤20 fields) — evidence-derived strings, which is why the path is opt-in rather than on by default. `tests/test_columns_api.py` asserts the rendered prompt against that promise. |
 | Sandbox + apply | The result is a *default*, not a mutation. It lands in `Timeline.recommended_columns`; any analyst's own column choice outranks it, and "Reset to defaults" is one click. |
 | Forensic reproducibility | Every run writes a `timeline.recommend_columns` audit row with the method, the model id, the chosen columns and the full candidate set. The heuristic half is deterministic and unit-tested; the LLM half is recorded as `method: "llm"` so a suggestion is never mistaken for a computation. |
 | Bounded trust | Every returned token is intersected with the candidate set — the model cannot introduce a field. A response that falls below the minimum after filtering is rejected whole rather than padded. Malformed, timed out (45 s ceiling), or errored is indistinguishable from "not configured". |
@@ -391,19 +391,32 @@ already holds exactly; the tools are also timeline-scoped where the evidence
 here is per-source. The tool-deny layers are not bypassed by this, because no
 tool is called.
 
-**Opt-in, with the disclosure attached to the opting.**
-`VESTIGO_COLUMN_RECOMMEND_MODE` defaults to `heuristic`: the scorer runs, the
-model is never called, and nothing leaves the machine. `auto` adds the model
-call; `off` disables suggestions entirely. Because `auto` sends evidence-derived
-sample values, the first analyst to open an Explorer on an instance with an
-agent configured gets a one-time dialog
+**Opt-in per analyst, per timeline — with the disclosure attached to the
+opting.** There is no instance-wide setting for this, deliberately: whether the
+model half is *available* is already answered by whether an agent endpoint is
+configured, and a second tri-state on top of it only made the disclosure
+incoherent (a dialog explaining egress that was not happening, offering an
+action most users could not take).
+
+The job takes `use_llm`, and it defaults to False. Every automatic trigger —
+post-ingest, timeline creation, the CLI, the demo build — leaves it there, so
+the scorer runs locally and **egress is never a side effect of uploading a
+file**. Exactly one caller sets it: `POST
+/api/cases/{id}/timelines/{id}/recommend-columns` with `{"use_ai": true}`,
+behind the "Suggest with AI" button in the Columns picker. The first press on a
+given timeline opens the disclosure
 (`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`) naming exactly what
-would be sent, the endpoint URL and the model — an admin can switch the instance
-to `auto` from there, everyone else reads it and it is recorded per user
-(`preferences.column_advisor_notice_ack`, via `PUT /api/auth/me/preferences`).
-`/api/health` carries `column_recommend_mode` so that dialog can say which state
-the instance is in without an admin-only request. The demo build always passes
-`allow_llm=False` — seeded content never triggers egress. See
+would be sent, the endpoint URL and the model; confirming records the opt-in for
+that timeline (`preferences.column_advisor_optin`, a `{timeline_id: true}` map
+written through `PUT /api/auth/me/preferences`) and only then runs. Cancelling
+sends nothing. The next timeline asks again, because the sample values sent are
+that timeline's evidence.
+
+The contribute-access check on the endpoint is the authorization; the stored
+opt-in is the UI's memory of having shown the disclosure, not a second gate. The
+resulting suggestion is shared with everyone who can see the timeline — the
+opt-in governs who *causes* egress, not who may read the result afterwards, and
+the audit row names the analyst who triggered it. See
 `vestigo/columns/__init__.py` for the layering.
 
 ## Configuration

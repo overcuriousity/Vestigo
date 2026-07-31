@@ -74,13 +74,16 @@ export const timelinesApi = {
   /**
    * Re-derive the timeline's suggested grid columns (issue #213).
    *
+   * `useAi` is the analyst's per-timeline opt-in to the LLM reranker, which
+   * sends candidate field names and sample values to the configured model
+   * endpoint; without it the scoring is local and nothing leaves the machine.
    * `job_id` is null when a recommendation is already running for this
-   * timeline, or when suggestions are switched off instance-wide (`enabled`
-   * distinguishes the two).
+   * timeline.
    */
-  recommendColumns: (caseId: string, timelineId: string) =>
-    post<{ job_id: string | null; enabled: boolean }>(
+  recommendColumns: (caseId: string, timelineId: string, useAi = false) =>
+    post<{ job_id: string | null; use_ai: boolean }>(
       `/cases/${caseId}/timelines/${timelineId}/recommend-columns`,
+      { use_ai: useAi },
     ),
 
   /** Fetch per-artifact field recommendations for the timeline's embedding wizard. */

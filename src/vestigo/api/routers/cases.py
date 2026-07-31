@@ -25,7 +25,12 @@ from vestigo.api.deps import (
     resolve_case_access,
 )
 from vestigo.api.uploads import receive_upload_to_tmp
-from vestigo.columns.jobs import schedule_for_source, start_column_recommendation
+from vestigo.columns.jobs import (
+    get_active_recommendation,
+    schedule_for_source,
+    settle_running_payload,
+    start_column_recommendation,
+)
 from vestigo.core.config import get_settings
 from vestigo.core.eta import ThroughputMeter
 from vestigo.core.events_bus import publish_annotation_change
@@ -40,7 +45,7 @@ from vestigo.db.field_stats import (
     merged_list_fields,
     refresh_source_field_stats,
 )
-from vestigo.db.postgres import Case, PostgresStore, User, generate_id
+from vestigo.db.postgres import Case, PostgresStore, Timeline, User, generate_id
 from vestigo.db.qdrant import QdrantStore
 from vestigo.ingestion.parser import detect_format
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -941,6 +946,34 @@ async def list_timelines(case: Case = Depends(require_case_read)) -> dict[str, A
     return {"timelines": [t.to_dict() for t in timelines]}
 
 
+async def _settle_dead_recommendation(
+    store: PostgresStore, case_id: str, timeline: Timeline
+) -> None:
+    """Relabel a ``running`` column suggestion whose job no longer exists (#213).
+
+    The explorer polls on the word ``running``, and ``JobStore`` is in-memory:
+    a job killed as a cancelled task (rather than with the whole process) is
+    never settled by the boot-time sweep, and the timeline would claim to be
+    thinking forever. Settling needs both checks — ``_ACTIVE`` covers a job
+    that is genuinely mid-flight, and the job store covers one that finished
+    without writing (which the placeholder rollback normally handles).
+
+    Mutates ``timeline`` in place so the caller serializes the settled payload
+    without a second read.
+    """
+    payload = timeline.recommended_columns
+    if not isinstance(payload, dict) or payload.get("status") != "running":
+        return
+    if get_active_recommendation(timeline.id) is not None:
+        return
+    job_id = payload.get("job_id")
+    if job_id and get_job_store().get(job_id) is not None:
+        return
+    settled = settle_running_payload(payload)
+    await store.update_timeline_recommended_columns(case_id, timeline.id, settled)
+    timeline.recommended_columns = settled
+
+
 @router.get("/{case_id}/timelines/{timeline_id}")
 async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)) -> dict[str, Any]:
     """Get a single timeline by ID."""
@@ -948,6 +981,7 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     timeline = await store.get_timeline(case.id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+    await _settle_dead_recommendation(store, case.id, timeline)
     return {"timeline": timeline.to_dict()}
 
 
@@ -1049,9 +1083,16 @@ async def create_timeline(
     return {"timeline": timeline.to_dict()}
 
 
+class RecommendColumnsRequest(BaseModel):
+    """Whether this run may consult the LLM (issue #213)."""
+
+    use_ai: bool = False
+
+
 @router.post("/{case_id}/timelines/{timeline_id}/recommend-columns")
 async def recommend_timeline_columns(
     timeline_id: str,
+    payload: RecommendColumnsRequest | None = None,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
@@ -1061,14 +1102,22 @@ async def recommend_timeline_columns(
     picker. Contribute access, because the result is shared with everyone who
     can see the timeline — a read-only member changing what the timeline opens
     on for the whole case would be a surprise. Returns ``job_id: null`` when a
-    job for this timeline is already in flight or recommendation is switched
-    off instance-wide, so the caller can say so rather than showing a job that
-    never appears.
+    job for this timeline is already in flight, so the caller can say so rather
+    than showing a job that never appears.
+
+    ``use_ai`` is the analyst's per-timeline opt-in to the advisor
+    (``columns/advisor.py``), which sends candidate field names and up to three
+    real sample values per field to the configured model endpoint. This
+    authenticated, explicit request *is* the authorization — the acknowledgement
+    stored in the caller's preferences is the UI's memory of having shown the
+    disclosure, not a second gate. Every other trigger for this job leaves it
+    False and stays local.
     """
     store = get_store()
     timeline = await store.get_timeline(case.id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+    use_ai = bool(payload and payload.use_ai)
     job_id = start_column_recommendation(
         case_id=case.id,
         timeline_id=timeline_id,
@@ -1076,11 +1125,9 @@ async def recommend_timeline_columns(
         store=store,
         actor_id=user.id,
         actor_username=user.username,
+        use_llm=use_ai,
     )
-    return {
-        "job_id": job_id,
-        "enabled": get_settings().column_recommend_mode != "off",
-    }
+    return {"job_id": job_id, "use_ai": use_ai}
 
 
 @router.patch("/{case_id}/timelines/{timeline_id}/field-mappings")

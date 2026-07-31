@@ -151,7 +151,9 @@ instead of rebuilding.
   the `db/field_stats.py` cache, an optional one-shot typed LLM call that only reorders the
   scorer's candidates (`docs/AGENT.md` §"Outside the agent loop"), and the job that persists
   the result to `Timeline.recommended_columns`. Display metadata — a per-user column choice
-  in the browser always outranks it.
+  in the browser always outranks it. The job's `use_llm` defaults to False and only the
+  "Suggest with AI" endpoint sets it, so every automatic trigger scores locally; the analyst
+  opts in per timeline after a disclosure naming what is sent.
 - `sigma/` — Sigma rule loader/compiler/router (`docs/ANOMALY_DETECTION.md` §13).
 - `stories/` — the Stories subsystem (blocks, snapshots, export). See `docs/STORIES.md`.
 - `transfer/` — case export/import (`.vestigo` archive).

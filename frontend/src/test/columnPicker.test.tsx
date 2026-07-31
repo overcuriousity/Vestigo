@@ -8,12 +8,54 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { useUiStore } from "@/stores/ui";
-import type { RecommendedColumns } from "@/api/types";
+import { useAuthStore } from "@/stores/auth";
+import type { RecommendedColumns, User } from "@/api/types";
+
+function testUser(over: Partial<User> = {}): User {
+  return {
+    id: "u1",
+    username: "alice",
+    display_name: null,
+    email: null,
+    is_admin: false,
+    is_active: true,
+    must_change_password: false,
+    auth_provider: "local",
+    onboarding_completed: true,
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+    last_login_at: null,
+    preferences: null,
+    ...over,
+  };
+}
 
 vi.mock("@/api/timelines", () => ({
   timelinesApi: {
-    recommendColumns: vi.fn().mockResolvedValue({ job_id: "job-1", enabled: true }),
+    recommendColumns: vi.fn().mockResolvedValue({ job_id: "job-1", use_ai: false }),
   },
+}));
+
+vi.mock("@/api/auth", () => ({
+  authApi: { updatePreferences: vi.fn() },
+}));
+
+vi.mock("@/api/agent", () => ({
+  agentApi: {
+    getInfo: vi.fn().mockResolvedValue({
+      model: "qwen3-coder",
+      provider: "openai",
+      api_base_url: "http://10.0.0.4:8000/v1",
+      context_window: null,
+      tools: [],
+      user_disabled_tools: [],
+    }),
+  },
+}));
+
+const capabilities = { agent: false };
+vi.mock("@/api/health", () => ({
+  useCapabilities: () => capabilities,
 }));
 
 vi.mock("@/api/events", () => ({
@@ -46,6 +88,7 @@ async function renderOpenPicker() {
 
 beforeEach(() => {
   useUiStore.setState({ visibleColumnsByTimeline: {} });
+  capabilities.agent = false;
 });
 
 describe("ColumnPicker derived-key grouping", () => {
@@ -127,8 +170,9 @@ describe("ColumnPicker derived-key grouping", () => {
 
 /**
  * The suggestion surface (issue #213): a suggested column is marked with its
- * evidence, adopting the suggestion clears the local override rather than
- * copying it in, and recomputing is contribute-gated.
+ * evidence, resetting clears the local override rather than writing one, and
+ * recomputing is contribute-gated. The AI path additionally needs a configured
+ * agent and this analyst's per-timeline opt-in.
  */
 const SUGGESTION: RecommendedColumns = {
   status: "ok",
@@ -171,21 +215,20 @@ describe("ColumnPicker suggestions", () => {
     expect(row.querySelector("input")!).toBeChecked();
   });
 
-  it("adopting the suggestion clears the local override", async () => {
+  it("resetting clears the local override rather than writing one", async () => {
     useUiStore.setState({ visibleColumnsByTimeline: { "c1/t1": ["message"] } });
     await renderWithSuggestion({ recommended: SUGGESTION });
 
-    fireEvent.click(screen.getByRole("button", { name: /use suggested/i }));
+    fireEvent.click(screen.getByRole("button", { name: /reset to defaults/i }));
 
-    // Absent, not equal-to-the-suggestion: a later recomputation must still
-    // reach this browser.
+    // Absent, not equal-to-the-suggestion or to DEFAULT_COLUMNS: writing
+    // either would opt this browser out of every later recomputation.
     expect(useUiStore.getState().visibleColumnsByTimeline).not.toHaveProperty("c1/t1");
   });
 
-  it("offers no suggestion actions when the timeline has none", async () => {
+  it("still offers re-suggesting when the timeline has no suggestion yet", async () => {
     await renderWithSuggestion({ recommended: null, canRecommend: true });
 
-    expect(screen.queryByRole("button", { name: /use suggested/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /re-suggest columns/i })).toBeInTheDocument();
   });
 
@@ -197,7 +240,7 @@ describe("ColumnPicker suggestions", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("re-suggesting starts a job and tracks it in the tray", async () => {
+  it("re-suggesting starts a local job and tracks it in the tray", async () => {
     const { timelinesApi } = await import("@/api/timelines");
     const { useJobsStore } = await import("@/stores/jobs");
     useJobsStore.setState({ jobs: {} });
@@ -206,6 +249,76 @@ describe("ColumnPicker suggestions", () => {
     fireEvent.click(screen.getByRole("button", { name: /re-suggest columns/i }));
 
     await waitFor(() => expect(useJobsStore.getState().jobs).toHaveProperty("job-1"));
-    expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1");
+    // `false`, explicitly: the plain button must never opt anyone into egress.
+    expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1", false);
+  });
+
+  it("offers no AI path when no agent endpoint is configured", async () => {
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    expect(screen.queryByRole("button", { name: /suggest with ai/i })).not.toBeInTheDocument();
+  });
+
+  it("discloses before sending anything the first time on a timeline", async () => {
+    const { timelinesApi } = await import("@/api/timelines");
+    capabilities.agent = true;
+    useAuthStore.setState({ user: testUser() });
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+
+    expect(await screen.findByText("Suggest columns with AI")).toBeInTheDocument();
+    expect(vi.mocked(timelinesApi.recommendColumns)).not.toHaveBeenCalledWith("c1", "t1", true);
+  });
+
+  it("records the opt-in and runs with AI once the disclosure is confirmed", async () => {
+    const { timelinesApi } = await import("@/api/timelines");
+    const { authApi } = await import("@/api/auth");
+    capabilities.agent = true;
+    useAuthStore.setState({ user: testUser() });
+    vi.mocked(authApi.updatePreferences).mockResolvedValue(
+      testUser({ preferences: { column_advisor_optin: { t1: true } } }),
+    );
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /send and suggest/i }));
+
+    await waitFor(() =>
+      expect(vi.mocked(authApi.updatePreferences)).toHaveBeenCalledWith({
+        column_advisor_optin: { t1: true },
+      }),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1", true),
+    );
+  });
+
+  it("skips the disclosure on a timeline this analyst already opted in to", async () => {
+    const { timelinesApi } = await import("@/api/timelines");
+    capabilities.agent = true;
+    useAuthStore.setState({
+      user: testUser({ preferences: { column_advisor_optin: { t1: true } } }),
+    });
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+
+    await waitFor(() =>
+      expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1", true),
+    );
+    expect(screen.queryByText("Suggest columns with AI")).not.toBeInTheDocument();
+  });
+
+  it("asks again on a timeline the analyst has not opted in to", async () => {
+    capabilities.agent = true;
+    useAuthStore.setState({
+      user: testUser({ preferences: { column_advisor_optin: { "some-other-timeline": true } } }),
+    });
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+
+    expect(await screen.findByText("Suggest columns with AI")).toBeInTheDocument();
   });
 });

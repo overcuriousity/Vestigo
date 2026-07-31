@@ -144,31 +144,30 @@ async def _suggest_columns(store: PostgresStore, clickhouse: ClickHouseStore, ca
     router, so it would otherwise miss both scheduling hooks — and the very
     first timeline a new user opens is exactly the one the suggestion exists
     for. Awaited rather than spawned, so the case is complete when the seed
-    job reports done. Best-effort: a failure leaves the built-in defaults,
-    which is what the demo shipped with before.
+    job reports done. Best-effort — including the two calls outside the job
+    itself, since a failure here must leave the seeded case usable rather than
+    fail a first login over its column layout.
 
-    ``allow_llm=False``: this runs inline in first-login seeding, once per
-    timeline, and the advisor is allowed 45 seconds each. The demo corpus is
-    fabricated and fixed, so the deterministic scorer already knows the right
-    answer — paying a model round trip for it would buy nothing and would make
-    a new user's first minute depend on an endpoint being fast. It also keeps
-    seeded content free of any egress the user has not opted into.
+    The scorer runs locally (``use_llm`` defaults to False), so seeding never
+    waits on a model endpoint and seeds no content the user has not opted into.
     """
     from vestigo.columns.jobs import JOB_KIND, run_column_recommendation_job
     from vestigo.core.jobs import JobStore
 
-    job_store = JobStore()
-    for timeline in await store.list_timelines(case_id):
-        job = job_store.create(kind=JOB_KIND, case_id=case_id)
-        await run_column_recommendation_job(
-            job_id=job.id,
-            case_id=case_id,
-            timeline_id=timeline.id,
-            job_store=job_store,
-            store=store,
-            ch_store=clickhouse,
-            allow_llm=False,
-        )
+    try:
+        job_store = JobStore()
+        for timeline in await store.list_timelines(case_id):
+            job = job_store.create(kind=JOB_KIND, case_id=case_id)
+            await run_column_recommendation_job(
+                job_id=job.id,
+                case_id=case_id,
+                timeline_id=timeline.id,
+                job_store=job_store,
+                store=store,
+                ch_store=clickhouse,
+            )
+    except Exception:  # noqa: BLE001 — advisory step, never fails the seed
+        logger.exception("Column suggestion skipped for demo case %s", case_id)
 
 
 async def _artifacts(

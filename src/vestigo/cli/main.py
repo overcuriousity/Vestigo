@@ -129,17 +129,14 @@ async def _suggest_columns(store: PostgresStore, case_id: str, source_id: str, a
     exit and the case would open on the built-in defaults for an operator who
     only ever ingests from the command line. Best-effort — a suggestion is
     never worth failing an ingest that already succeeded.
+
+    Local scoring only: ``run_column_recommendation_job`` defaults
+    ``use_llm=False``, so a CLI ingest never contacts a model endpoint.
     """
-    from vestigo.columns.jobs import (
-        JOB_KIND,
-        recommendation_enabled,
-        run_column_recommendation_job,
-    )
+    from vestigo.columns.jobs import JOB_KIND, run_column_recommendation_job
     from vestigo.core.jobs import JobStore
     from vestigo.db.clickhouse import ClickHouseStore
 
-    if not recommendation_enabled():
-        return
     try:
         job_store = JobStore()
         # One client for every timeline this source belongs to, rather than

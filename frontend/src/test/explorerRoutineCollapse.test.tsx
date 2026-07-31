@@ -101,6 +101,8 @@ vi.mock("@/api/baselines", async () => {
 // agent-apply seed-parity test); the panel itself is stubbed below.
 vi.mock("@/api/health", () => ({
   useHealth: () => ({ data: { agent_available: true } }),
+  // ColumnPicker gates its "Suggest with AI" button on this.
+  useCapabilities: () => ({ agent: false }),
 }));
 vi.mock("@/hooks/useCaseStream", () => ({
   useCaseStream: () => undefined,

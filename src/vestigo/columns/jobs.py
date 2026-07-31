@@ -9,9 +9,14 @@ Triggered from everywhere a timeline's source set becomes knowable: a source
 finishing ingestion, an explicitly created timeline, the analyst pressing
 "Re-suggest columns", the CLI ingest, and the demo build. The API path goes
 through :func:`start_column_recommendation`; the CLI and the demo await
-:func:`run_column_recommendation_job` directly, which is why the
-``column_recommend_mode`` check lives in the job itself rather than only at
-the scheduling sites.
+:func:`run_column_recommendation_job` directly.
+
+**Every one of those triggers is local-only.** ``use_llm`` defaults to False,
+so a job scheduled by an ingest, a timeline creation, the CLI or the demo
+scores the field-stats cache on this machine and sends nothing anywhere. The
+advisor is reached from exactly one place: an analyst pressing "Suggest with
+AI" for one timeline, after the disclosure dialog told them what that sends.
+Egress is never a side effect of uploading a file.
 
 Failure is always survivable — the explorer keeps its built-in defaults — so
 every trigger site isolates this from the work that actually matters.
@@ -25,7 +30,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from vestigo.columns.recommend import finalize_columns, pick_columns, score_columns
-from vestigo.core.config import get_settings
 from vestigo.core.jobs import JobStore
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_stats import ensure_source_field_stats
@@ -59,14 +63,24 @@ def spawn_tracked_column_task(coro: Any) -> asyncio.Task:
     return task
 
 
-def recommendation_enabled() -> bool:
-    """Whether column recommendation runs at all on this instance."""
-    return get_settings().column_recommend_mode != "off"
+def settle_running_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Relabel a ``running`` payload whose job is gone.
 
+    ``JobStore`` is in-memory, so a job that dies — with the process, or as a
+    cancelled task — leaves a Postgres payload claiming to be in flight, and
+    the explorer polls on exactly that word. The job carries its previous
+    answer forward into the placeholder (see :func:`_carry_forward`), so
+    settling is only a relabel: ``ok`` when there are columns to show,
+    ``insufficient`` otherwise. Nothing is recomputed.
 
-def _llm_allowed() -> bool:
-    """Whether the advisor may be consulted (``auto`` mode only)."""
-    return get_settings().column_recommend_mode == "auto"
+    Shared by the boot-time sweep (``PostgresStore.clear_stale_running_recommendations``)
+    and the read path (``GET /cases/{id}/timelines/{id}``) so the two can never
+    disagree about what "settled" means.
+    """
+    settled = dict(payload)
+    settled["status"] = "ok" if settled.get("columns") else "insufficient"
+    settled["job_id"] = None
+    return settled
 
 
 def _carry_forward(previous: dict[str, Any] | None) -> dict[str, Any]:
@@ -155,7 +169,7 @@ async def run_column_recommendation_job(
     ch_store: ClickHouseStore | None = None,
     actor_id: str | None = None,
     actor_username: str | None = None,
-    allow_llm: bool = True,
+    use_llm: bool = False,
 ) -> None:
     """Compute, validate and persist one timeline's recommended columns.
 
@@ -164,22 +178,21 @@ async def run_column_recommendation_job(
     this job — which nothing depends on — rather than the HTTP request or the
     ingest that scheduled it.
 
-    ``allow_llm=False`` keeps the advisor out of this run whatever the
-    instance-wide mode says — the demo build uses it so seeding a fabricated
-    case never waits on a model endpoint.
+    ``use_llm`` defaults to False and is the *only* thing that lets this job
+    reach the advisor. It comes from one place — an analyst pressing "Suggest
+    with AI" for this timeline, having read the disclosure — so an ingest, a
+    timeline creation, the CLI and the demo build all score locally and send
+    nothing anywhere. The advisor still applies its own
+    ``agent_available()`` gate on top, so asking for it on an instance with no
+    model configured simply keeps the heuristic answer.
 
-    The ``column_recommend_mode`` check lives here rather than only in
-    :func:`start_column_recommendation`, because the demo build and the CLI
-    call this coroutine directly and an operator who switched suggestions off
-    means it everywhere.
+    ``_ACTIVE`` is claimed inside the ``try`` so the ``finally`` releases it on
+    every exit path, including any guard clause added later.
     """
-    if not recommendation_enabled():
-        job_store.update(job_id, status="completed", result={"skipped": True})
-        return
-    _ACTIVE[timeline_id] = job_id
     job_store.update(job_id, status="running", progress={"phase": "fields"})
     previous: dict[str, Any] | None = None
     try:
+        _ACTIVE[timeline_id] = job_id
         timeline = await store.get_timeline(case_id, timeline_id)
         if timeline is None:
             job_store.update(job_id, status="failed", error="Timeline not found")
@@ -232,7 +245,7 @@ async def run_column_recommendation_job(
         model: str | None = None
         llm_reasons: dict[str, str] = {}
 
-        if tokens and allow_llm and _llm_allowed():
+        if tokens and use_llm:
             job_store.update(job_id, progress={"phase": "model"})
             from vestigo.columns.advisor import rank_columns_with_llm
 
@@ -312,19 +325,21 @@ def start_column_recommendation(
     ch_store: ClickHouseStore | None = None,
     actor_id: str | None = None,
     actor_username: str | None = None,
+    use_llm: bool = False,
 ) -> str | None:
     """Create and spawn a recommendation job for one timeline.
 
-    Returns the job id, or ``None`` when recommendation is switched off or a
-    job for this timeline is already in flight. The active check happens
-    before the job is created, so a skip leaves no orphan job in the tray —
-    the same ordering ``_trigger_automatic_enrichments`` uses.
+    Returns the job id, or ``None`` when a job for this timeline is already in
+    flight. The active check happens before the job is created, so a skip
+    leaves no orphan job in the tray — the same ordering
+    ``_trigger_automatic_enrichments`` uses.
 
     Pass ``ch_store`` when the caller already holds one (the ingest hook
     does); otherwise the job opens its own, off the request path.
+
+    ``use_llm`` is passed straight through and defaults to False; only the
+    "Suggest with AI" endpoint sets it.
     """
-    if not recommendation_enabled():
-        return None
     active = get_active_recommendation(timeline_id)
     if active is not None:
         logger.info(
@@ -350,6 +365,7 @@ def start_column_recommendation(
             ch_store=ch_store,
             actor_id=actor_id,
             actor_username=actor_username,
+            use_llm=use_llm,
         )
     )
     return job.id
@@ -368,10 +384,8 @@ async def schedule_for_source(
     — the one place that knows a source just became queryable. A per-user
     column choice lives in the browser and always outranks the stored
     recommendation, so replacing it here never moves anyone's columns out from
-    under them.
+    under them. Local scoring only — an ingest never reaches the advisor.
     """
-    if not recommendation_enabled():
-        return
     timelines = await store.list_timelines_for_source(case_id, source_id)
     for timeline in timelines:
         start_column_recommendation(

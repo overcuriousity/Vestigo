@@ -4,18 +4,21 @@ The field-stats cache is seeded directly in Postgres so the job's read path
 (``ensure_source_field_stats``) is a pure cache hit — no ClickHouse needed.
 The LLM advisor is monkeypatched at the job's call site; the real one is
 gated on ``agent_available()`` and never runs in the suite.
+
+There is no instance-wide mode to pin: the advisor is reached only when a
+caller passes ``use_llm=True``, which is the analyst's per-timeline opt-in and
+nothing else.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Any
 
 import pytest
 
 from tests.conftest import as_admin
+from vestigo.api.routers.cases import _settle_dead_recommendation
 from vestigo.columns import jobs as columns_jobs
-from vestigo.core.config import get_settings
 from vestigo.core.jobs import JobStore
 from vestigo.db.field_stats import EFFECTIVE_STATS_VERSION
 
@@ -30,22 +33,6 @@ def _attr(coverage: int, distinct: int, samples: list[str]) -> dict[str, Any]:
 
 #: Stand-in for a ClickHouseStore the cache-hit path never dereferences.
 _NEVER_USED = object()
-
-
-@contextmanager
-def _mode(monkeypatch, value: str):
-    """Run a block with ``column_recommend_mode`` pinned to *value*.
-
-    The shipped default is ``heuristic`` — the LLM path is opt-in — so any
-    test about the advisor has to ask for ``auto`` explicitly.
-    """
-    monkeypatch.setenv("VESTIGO_COLUMN_RECOMMEND_MODE", value)
-    get_settings.cache_clear()
-    try:
-        yield
-    finally:
-        monkeypatch.delenv("VESTIGO_COLUMN_RECOMMEND_MODE", raising=False)
-        get_settings.cache_clear()
 
 
 RICH_ATTRIBUTES = {
@@ -262,30 +249,34 @@ async def test_a_failure_after_the_payload_write_keeps_the_new_answer(store, mon
 
 
 @pytest.mark.asyncio
-async def test_the_job_itself_refuses_when_recommendation_is_off(store, monkeypatch):
-    """The demo build and the CLI await the job directly, bypassing the scheduler."""
-    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+async def test_the_job_releases_its_active_slot_on_every_exit(store):
+    """A leaked `_ACTIVE` entry wedges the timeline: no job can ever start again.
 
-    with _mode(monkeypatch, "off"):
-        job_store = await _run(store, case_id, timeline_id)
+    The missing timeline is the cheapest early return the job has; it must
+    still go through the `finally` that releases the slot.
+    """
+    case_id, _, _ = await _seed_case_with_stats(store)
 
-    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns is None
-    job = job_store.list_by_case(case_id)[0]
-    assert job.status == "completed"
-    assert job.result == {"skipped": True}
+    job_store = await _run(store, case_id, "no-such-timeline")
+
+    assert columns_jobs.get_active_recommendation("no-such-timeline") is None
+    assert job_store.list_by_case(case_id)[0].status == "failed"
 
 
 @pytest.mark.asyncio
-async def test_allow_llm_false_keeps_the_advisor_out_of_an_auto_instance(store, monkeypatch):
-    """What the demo build relies on: no model round trip during first-login seeding."""
+async def test_the_default_run_never_reaches_the_advisor(store, monkeypatch):
+    """Ingest, timeline creation, the CLI and the demo all rely on this default.
+
+    Egress is never a side effect of uploading a file: only an explicit
+    ``use_llm=True`` — the analyst's per-timeline opt-in — consults the model.
+    """
     case_id, timeline_id, _ = await _seed_case_with_stats(store)
 
     async def _never(candidates, **kwargs):
         raise AssertionError("the advisor must not be consulted")
 
     monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _never)
-    with _mode(monkeypatch, "auto"):
-        await _run(store, case_id, timeline_id, allow_llm=False)
+    await _run(store, case_id, timeline_id)
 
     recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
     assert recommended["status"] == "ok"
@@ -338,6 +329,72 @@ async def test_a_restart_leaves_settled_recommendations_alone(store):
     assert (await store.get_timeline(case_id, timeline_id)).recommended_columns == good
 
 
+@pytest.mark.asyncio
+async def test_reading_a_timeline_settles_a_recommendation_whose_job_is_gone(store):
+    """A cancelled task leaves `running` behind without restarting the process.
+
+    The boot sweep never sees that one, and the explorer polls on the word
+    `running` — so the read path has to settle it or the timeline claims to be
+    thinking forever.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    await store.update_timeline_recommended_columns(
+        case_id, timeline_id, dict(good, status="running", job_id="job-that-died")
+    )
+
+    timeline = await store.get_timeline(case_id, timeline_id)
+    await _settle_dead_recommendation(store, case_id, timeline)
+
+    assert timeline.recommended_columns["status"] == "ok"
+    assert timeline.recommended_columns["job_id"] is None
+    # Persisted, not only patched in memory — the next reader must agree.
+    stored = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert stored["status"] == "ok"
+    assert stored["columns"] == good["columns"]
+
+
+@pytest.mark.asyncio
+async def test_reading_a_timeline_leaves_a_live_recommendation_running(store):
+    """A job genuinely in flight must not be settled out from under itself."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    await store.update_timeline_recommended_columns(
+        case_id, timeline_id, dict(good, status="running", job_id="job-in-flight")
+    )
+
+    columns_jobs._ACTIVE[timeline_id] = "job-in-flight"
+    try:
+        timeline = await store.get_timeline(case_id, timeline_id)
+        await _settle_dead_recommendation(store, case_id, timeline)
+    finally:
+        columns_jobs._ACTIVE.pop(timeline_id, None)
+
+    assert timeline.recommended_columns["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_reading_a_timeline_respects_a_job_the_store_still_knows(store, monkeypatch):
+    """`_ACTIVE` is cleared before the job's last write lands; the tray is the backstop."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    job_store = JobStore()
+    job = job_store.create(kind=columns_jobs.JOB_KIND, case_id=case_id)
+    await store.update_timeline_recommended_columns(
+        case_id, timeline_id, dict(good, status="running", job_id=job.id)
+    )
+    monkeypatch.setattr("vestigo.api.routers.cases.get_job_store", lambda: job_store)
+
+    timeline = await store.get_timeline(case_id, timeline_id)
+    await _settle_dead_recommendation(store, case_id, timeline)
+
+    assert timeline.recommended_columns["status"] == "running"
+
+
 # ── The advisor hand-off ────────────────────────────────────────────────────
 
 
@@ -355,8 +412,7 @@ async def test_advisor_result_wins_when_it_validates(store, monkeypatch):
         )
 
     monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _advise)
-    with _mode(monkeypatch, "auto"):
-        await _run(store, case_id, timeline_id)
+    await _run(store, case_id, timeline_id, use_llm=True)
 
     recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
     assert recommended["method"] == "llm"
@@ -375,35 +431,48 @@ async def test_advisor_declining_leaves_the_heuristic_answer(store, monkeypatch)
         return None
 
     monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _decline)
-    with _mode(monkeypatch, "auto"):
-        await _run(store, case_id, timeline_id)
+    await _run(store, case_id, timeline_id, use_llm=True)
 
     recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
     assert recommended["method"] == "heuristic"
     assert recommended["status"] == "ok"
 
 
+# ── What actually crosses the wire ──────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_advisor_is_not_consulted_in_heuristic_mode(store, monkeypatch):
-    case_id, timeline_id, _ = await _seed_case_with_stats(store)
-    monkeypatch.setenv("VESTIGO_COLUMN_RECOMMEND_MODE", "heuristic")
-    get_settings.cache_clear()
+async def test_the_prompt_carries_the_candidate_table_and_nothing_else(store):
+    """Every privacy claim the disclosure dialog makes rests on this function.
 
-    called = False
+    The dialog tells an analyst that the request carries field names, coverage
+    statistics and up to three truncated sample values — and no event rows, no
+    case/source/timeline identifiers and no credentials. That promise is only
+    as good as `_format_candidates`, so assert it directly against candidates
+    scored from a real seeded case.
+    """
+    from vestigo.columns.advisor import MAX_CANDIDATES_IN_PROMPT, _format_candidates
+    from vestigo.columns.recommend import score_columns
+    from vestigo.db.field_stats import ensure_source_field_stats
 
-    async def _advise(candidates, **kwargs):
-        nonlocal called
-        called = True
-        return None
+    long_value = "x" * 200
+    case_id, timeline_id, source_id = await _seed_case_with_stats(
+        store, attributes=dict(RICH_ATTRIBUTES, note=_attr(1000, 9, [long_value, "b", "c"]))
+    )
+    stats = await ensure_source_field_stats(store, _NEVER_USED, case_id, [source_id])
+    candidates = score_columns(stats)
 
-    monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _advise)
-    try:
-        await _run(store, case_id, timeline_id)
-    finally:
-        get_settings.cache_clear()
+    rendered = _format_candidates(candidates[:MAX_CANDIDATES_IN_PROMPT])
 
-    assert called is False
-    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns["status"] == "ok"
+    assert "user" in rendered
+    assert "alice" in rendered
+    for identifier in (case_id, timeline_id, source_id):
+        assert identifier not in rendered
+    # Samples are truncated at 40 characters, so the oversized value can only
+    # appear as a prefix of itself — never whole.
+    assert long_value not in rendered
+    assert "x" * 40 in rendered
+    assert "x" * 41 not in rendered
 
 
 # ── The advisor's own validation ────────────────────────────────────────────
@@ -466,7 +535,8 @@ def test_advisor_validation_keeps_reasons_only_for_chosen_columns():
 # ── The endpoint ────────────────────────────────────────────────────────────
 
 
-def test_recommend_endpoint_starts_a_job(client, admin_bootstrap, monkeypatch):
+def test_recommend_endpoint_starts_a_local_job_by_default(client, admin_bootstrap):
+    """No body means no AI: the plain "Re-suggest" button must not send anything."""
     as_admin(client, admin_bootstrap)
     case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
     timeline_id = client.get(f"/api/cases/{case_id}/timelines").json()["timelines"][0]["id"]
@@ -475,8 +545,31 @@ def test_recommend_endpoint_starts_a_job(client, admin_bootstrap, monkeypatch):
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["enabled"] is True
+    assert body["use_ai"] is False
     assert body["job_id"]
+
+
+def test_recommend_endpoint_passes_the_opt_in_through(client, admin_bootstrap, monkeypatch):
+    """`use_ai` is the whole opt-in; it has to reach the job, not stop at the router."""
+    seen: dict[str, Any] = {}
+
+    def _capture(**kwargs):
+        seen.update(kwargs)
+        return "job-1"
+
+    monkeypatch.setattr("vestigo.api.routers.cases.start_column_recommendation", _capture)
+    as_admin(client, admin_bootstrap)
+    case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
+    timeline_id = client.get(f"/api/cases/{case_id}/timelines").json()["timelines"][0]["id"]
+
+    resp = client.post(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/recommend-columns",
+        json={"use_ai": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["use_ai"] is True
+    assert seen["use_llm"] is True
 
 
 def test_recommend_endpoint_404s_on_an_unknown_timeline(client, admin_bootstrap):
@@ -486,22 +579,6 @@ def test_recommend_endpoint_404s_on_an_unknown_timeline(client, admin_bootstrap)
     resp = client.post(f"/api/cases/{case_id}/timelines/nope/recommend-columns")
 
     assert resp.status_code == 404
-
-
-def test_recommend_endpoint_is_off_when_the_setting_is_off(client, admin_bootstrap, monkeypatch):
-    as_admin(client, admin_bootstrap)
-    case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
-    timeline_id = client.get(f"/api/cases/{case_id}/timelines").json()["timelines"][0]["id"]
-    monkeypatch.setenv("VESTIGO_COLUMN_RECOMMEND_MODE", "off")
-    get_settings.cache_clear()
-
-    try:
-        body = client.post(f"/api/cases/{case_id}/timelines/{timeline_id}/recommend-columns").json()
-    finally:
-        get_settings.cache_clear()
-
-    assert body["enabled"] is False
-    assert body["job_id"] is None
 
 
 def test_recommend_endpoint_needs_contribute_access(client, admin_bootstrap, store):
@@ -548,22 +625,17 @@ async def test_scheduling_is_skipped_while_one_is_already_running(store, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_scheduling_is_skipped_when_the_setting_is_off(store, monkeypatch):
-    case_id, timeline_id, _ = await _seed_case_with_stats(store)
-    monkeypatch.setenv("VESTIGO_COLUMN_RECOMMEND_MODE", "off")
-    get_settings.cache_clear()
-    job_store = JobStore()
+async def test_scheduling_defaults_to_a_local_run(store, monkeypatch):
+    """`schedule_for_source` is the post-ingest path — it must never opt in for anyone."""
+    case_id, timeline_id, source_id = await _seed_case_with_stats(store)
+    seen: dict[str, Any] = {}
 
-    try:
-        job_id = columns_jobs.start_column_recommendation(
-            case_id=case_id,
-            timeline_id=timeline_id,
-            job_store=job_store,
-            store=store,
-            ch_store=None,
-        )
-    finally:
-        get_settings.cache_clear()
+    def _capture(**kwargs):
+        seen.update(kwargs)
+        return "job-1"
 
-    assert job_id is None
-    assert job_store.list_by_case(case_id) == []
+    monkeypatch.setattr(columns_jobs, "start_column_recommendation", _capture)
+    await columns_jobs.schedule_for_source(store, _NEVER_USED, JobStore(), case_id, source_id)
+
+    assert seen["timeline_id"] == timeline_id
+    assert seen.get("use_llm", False) is False

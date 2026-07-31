@@ -1,9 +1,50 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 139 — suggested event-grid columns).
+Last updated: 2026-07-31 (session 140 — column-suggestion review pass).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 140 — 2026-07-31: the column-suggestion review, and one setting fewer (PR #214)
+
+**Why.** A review of #213 turned up five findings. Fixing the disclosure one exposed a
+design problem underneath it: `VESTIGO_COLUMN_RECOMMEND_MODE` was a second, admin-only
+tri-state layered on top of a question the codebase already answered — is an agent
+endpoint configured and reachable (`agent_available()`). It forced the disclosure into
+an incoherent shape: on a default (`heuristic`) instance a non-admin got a blocking
+modal disclosing egress that was not happening and offering an action they could not
+take. The setting was the cause, not the gate.
+
+- **The setting is gone** — from `core/config.py`, `settings_registry.py` (with its
+  one-member "Explorer" group), `.env.example`, `/api/health` and the frontend types.
+  Suggestions always run; the scorer is local and reads a cache that already exists.
+- **The LLM half is now an explicit per-(user, timeline) opt-in.** The job takes
+  `use_llm`, defaulting to **False**, and every automatic trigger leaves it there — so
+  ingest, timeline creation, the CLI and the demo build score locally and **egress is
+  never a side effect of uploading a file**, which is a stronger posture than the
+  merged branch had. One caller sets it: `POST .../recommend-columns` with
+  `{"use_ai": true}`, behind "Suggest with AI" in the Columns picker. The first press
+  on a timeline opens the disclosure (endpoint, model, exactly what is sent);
+  confirming records `preferences.column_advisor_optin[timeline_id]` and only then
+  runs. Cancelling sends nothing; the next timeline asks again. The result stays shared
+  — the opt-in governs who *causes* egress, not who may read it, and the audit row
+  names the actor. This supersedes `column_advisor_notice_ack` from session 139.
+- **`_ACTIVE` could wedge a timeline permanently** (finding #1): the job claimed the
+  slot before its `try`, so an early return leaked it and no further job for that
+  timeline could ever start. Claimed inside the `try` now, covered by the `finally` on
+  every path, with a regression test.
+- **A `running` payload now settles on read** (finding #3), not only on the next boot: a
+  cancelled task never restarts the process, and the explorer polls on that word.
+  `settle_running_payload` is shared by the boot sweep and the read path so they cannot
+  drift.
+- **"Reset to defaults" clears the local override** instead of writing one (finding #5).
+  Writing `DEFAULT_COLUMNS` quietly opted that browser out of every future
+  recomputation; "Use suggested" is redundant now and is gone.
+- **Demo seeding is genuinely best-effort** (finding #2) — the two calls outside the job
+  were unguarded and could fail a first login over a column layout.
+- **The privacy claim is now tested.** `_format_candidates` renders every promise the
+  disclosure makes and had no coverage; a test asserts the prompt carries the candidate
+  table and no case, source or timeline id, with samples truncated at 40 characters.
 
 ## Session 139 — 2026-07-31: the grid opens on columns the corpus actually has (issue #213)
 
@@ -62,16 +103,17 @@ on its least informative view, every time.
 - **Precedence is one function** (`lib/columns.ts`): the analyst's own choice, then the
   suggestion, then `DEFAULT_COLUMNS`. Read by both `ExplorerPage` and `ColumnPicker` so
   the ticks always match the grid. "Use suggested" *clears* the local override rather
-  than copying it in, so a later recomputation still reaches that browser.
+  than copying it in, so a later recomputation still reaches that browser. (Session 140
+  folded this into "Reset to defaults" and dropped the separate button.)
 - **Scheduled from every path that creates a knowable source set**: post-ingest (beside
   `refresh_source_field_stats`, isolated so a failure never reaches the ingest
   rollback), timeline creation, the CLI, the demo build, and a contribute-gated
   `POST .../recommend-columns` behind "Re-suggest columns" in the picker.
 - **`VESTIGO_COLUMN_RECOMMEND_MODE`** (`heuristic` by default, or `auto` / `off`) in a
   new "Explorer" settings group; the job itself enforces it, so the CLI and the demo
-  build honour `off` without their own check. Every run writes a
-  `timeline.recommend_columns` audit row naming the method, the model, the chosen
-  columns and the full candidate set.
+  build honour `off` without their own check. **Removed in session 140** — replaced by
+  a per-(user, timeline) opt-in. Every run writes a `timeline.recommend_columns` audit
+  row naming the method, the model, the chosen columns and the full candidate set.
 - **Known gap, filed in `ROADMAP.md`:** timelines with `field_mappings` get no
   suggestion for the mapped fields. The grid reads `attributes[colId]` directly, so
   neither the canonical name nor one raw spelling renders correctly — recommending

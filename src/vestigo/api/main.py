@@ -578,11 +578,6 @@ def create_app() -> FastAPI:
         body["embeddings_available"] = caps["embeddings"]
         body["agent_available"] = caps["agent"]
         body["mcp_enabled"] = caps["mcp"]
-        # Not a capability (the subsystem is always present, only its method
-        # varies), but every analyst needs it: the Explorer's column-suggestion
-        # disclosure has to say whether this instance is scoring locally or
-        # also asking the model, and only admins may read /api/admin/settings.
-        body["column_recommend_mode"] = get_settings().column_recommend_mode
         return body
 
     app.include_router(auth.router)
