@@ -11,7 +11,16 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, MoveUp, MoveDown } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
-import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
+import {
+  AnalysisEmptyState,
+  DetectorStatusLine,
+  FindingRowActions,
+  FindingShell,
+  NeedsBaselinePrompt,
+  RefreshButton,
+  ResultsBar,
+  TagFindingsBar,
+} from "./detector-shared";
 import {
   useCappedFindings,
   useFindingsLimit,

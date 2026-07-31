@@ -75,6 +75,41 @@ interface Props {
   onTagFilter?: (tag: string) => void;
 }
 
+/**
+ * The one place that says "there is nothing here yet", for whichever analysis tab
+ * is open. Every tab in this panel reads the same timeline, so the answer never
+ * differs between them — saying it per tab was how thirteen detector views ended
+ * up each asserting it separately, in wording that drifted.
+ *
+ * The two arms are genuinely different situations: mid-ingest resolves itself and
+ * needs only somewhere to watch, while an empty case needs an action and a link
+ * to perform it.
+ */
+function NoEventsState({ caseId, stillIngesting }: { caseId: string; stillIngesting: boolean }) {
+  return (
+    <AnalysisEmptyState
+      hint={
+        stillIngesting ? (
+          "The job tray in the top bar shows progress. Events become searchable as they land."
+        ) : (
+          <>
+            Upload a log file on the{" "}
+            <Link to={`/cases/${caseId}`} className="text-[var(--color-accent)] hover:underline">
+              case overview
+            </Link>{" "}
+            to begin — every tab here works over a timeline's events, and this one has none
+            yet.
+          </>
+        )
+      }
+    >
+      {stillIngesting
+        ? "This timeline's sources are still ingesting."
+        : "No events in this timeline yet."}
+    </AnalysisEmptyState>
+  );
+}
+
 export function InvestigatePanel({
   caseId,
   timelineId,
@@ -140,6 +175,12 @@ export function InvestigatePanel({
   const { data: sources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
     queryFn: () => timelinesApi.listSources(caseId, timelineId),
+    // The "still ingesting" empty state below promises events appear as they
+    // land, so it has to notice when they do. ExplorerPage polls this same key
+    // on the same terms; stating it here too means the promise does not quietly
+    // depend on the panel's host still doing it.
+    refetchInterval: (query) =>
+      query.state.data?.some((s) => s.status !== "ready") ? 4000 : false,
   });
 
   // Verdict counts for the Dispositions header — the persistent "my triage
@@ -259,29 +300,7 @@ export function InvestigatePanel({
             </div>
 
             {nothingToAnalyse ? (
-              <AnalysisEmptyState
-                hint={
-                  stillIngesting ? (
-                    "The job tray in the top bar shows progress. Events become searchable as they land."
-                  ) : (
-                    <>
-                      Upload a log file on the{" "}
-                      <Link
-                        to={`/cases/${caseId}`}
-                        className="text-[var(--color-accent)] hover:underline"
-                      >
-                        case overview
-                      </Link>{" "}
-                      to begin — detectors run over a timeline's events, and this one has none
-                      yet.
-                    </>
-                  )
-                }
-              >
-                {stillIngesting
-                  ? "This timeline's sources are still ingesting."
-                  : "No events in this timeline yet."}
-              </AnalysisEmptyState>
+              <NoEventsState caseId={caseId} stillIngesting={stillIngesting} />
             ) : (
               <>
                 {/* 1. Scope */}
@@ -354,33 +373,17 @@ export function InvestigatePanel({
 
         {/* Guidance still renders on an empty timeline: "what would this tab do
             for me" is most worth answering before there is data, and the
-            Anomalies tab above keeps its explainer for the same reason. */}
+            Anomalies tab above keeps its explainer for the same reason.
+            `PatternsView`/`TemplatesView` normally each render their own, but
+            neither mounts here — and with no events the sub-tab choice is not
+            offered either, so the sequences explainer stands for the tab. */}
         {activeTab === "patterns" && nothingToAnalyse && (
-          <div className="mb-3">
-            <GuidancePanel id="investigate-patterns" />
-          </div>
-        )}
-
-        {activeTab === "patterns" && nothingToAnalyse && (
-          <AnalysisEmptyState
-            hint={
-              stillIngesting ? (
-                "The job tray in the top bar shows progress."
-              ) : (
-                <>
-                  Upload a log file on the{" "}
-                  <Link to={`/cases/${caseId}`} className="text-[var(--color-accent)] hover:underline">
-                    case overview
-                  </Link>{" "}
-                  to begin.
-                </>
-              )
-            }
-          >
-            {stillIngesting
-              ? "This timeline's sources are still ingesting."
-              : "No events in this timeline yet."}
-          </AnalysisEmptyState>
+          <>
+            <div className="mb-3">
+              <GuidancePanel id="investigate-patterns" />
+            </div>
+            <NoEventsState caseId={caseId} stillIngesting={stillIngesting} />
+          </>
         )}
 
         {activeTab === "patterns" && !nothingToAnalyse && (
@@ -421,7 +424,20 @@ export function InvestigatePanel({
           </div>
         )}
 
-        {activeTab === "sigma" && (
+        {/* Same treatment as Patterns, and for a sharper reason: SigmaPanel's
+            Run button would happily scan an empty timeline and report zero
+            matches, which reads as "these rules cleared you" rather than "there
+            was nothing to match against". */}
+        {activeTab === "sigma" && nothingToAnalyse && (
+          <>
+            <div className="mb-3">
+              <GuidancePanel id="investigate-sigma" />
+            </div>
+            <NoEventsState caseId={caseId} stillIngesting={stillIngesting} />
+          </>
+        )}
+
+        {activeTab === "sigma" && !nothingToAnalyse && (
           <SigmaPanel caseId={caseId} timelineId={timelineId} onTagFilter={onTagFilter} />
         )}
 

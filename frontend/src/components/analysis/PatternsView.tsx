@@ -18,7 +18,14 @@ import { jobsApi } from "@/api/jobs";
 import { useDisposition } from "@/hooks/useDisposition";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
-import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, FindingShell, RefreshButton, ResultsBar } from "./detector-shared";
+import {
+  AnalysisEmptyState,
+  DetectorStatusLine,
+  FindingRowActions,
+  FindingShell,
+  RefreshButton,
+  ResultsBar,
+} from "./detector-shared";
 import { useCappedFindings, useFindingsLimit, useOpenEvent } from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import type { Event, SequenceMotifFinding } from "@/api/types";

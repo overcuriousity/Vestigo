@@ -1,10 +1,57 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 133 — frontend design audit; ratchet, guidance registry,
-empty states).
+Last updated: 2026-07-31 (session 134 — PR #210 review pass).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 134 — 2026-07-31: PR #210 review pass — the ratchet's own blind spot
+
+**Why.** A review of the tier-1 design work before merge. Five findings, all fixed in the
+branch; nothing filed.
+
+- **The ratchet did not cover the file the same PR created.** `designSystem.test.ts` globbed
+  `components/**/*.tsx` and `pages/**/*.tsx` only, so `lib/`, `hooks/`, `stores/` and every
+  `.ts` file were unscanned — including `lib/guidance.tsx`, which the PR had just created to
+  hold JSX copy with token classes, and `components/viz/lib/colors.ts`, which returns
+  `var(--viz-*)` strings into the SVG export path where a dead token exports a blank fill
+  rather than a visibly wrong colour. Demonstrated by planting a bogus token in each and
+  watching all four assertions pass. The token check now scans every `.ts`/`.tsx` under
+  `src/` except `src/test/` (whose files quote token names in prose and fixtures); the two
+  budgeted checks stay on components and pages, since only JSX has `text-[Npx]` or
+  `<button>`. Widening it surfaced three false positives, both classes now handled: block
+  comments are stripped before the scan (`export.ts` documents `var(--x)` as a placeholder),
+  and `var(--viz-series-${slot})` is skipped as a computed name — `vizColors.test.ts` already
+  asserts that family literally.
+- **Both regexes were lowercase-only.** `--colorError` would have been invisible to the
+  definition scan and the reference scan alike, and so silently exempt. Both now take the
+  full custom-property character set.
+- **The legacy-key adoption could never run for the browsers that needed it most.** It sat in
+  `migrate`, which zustand calls only when the store already has persisted state at an older
+  version. A browser that dismissed guidance but never wrote a UI preference has
+  `vestigo-guidance-*` keys and no `vestigo-ui` entry: it lost the dismissal *and* kept the
+  keys forever, because its next preference write persists at v5 directly and `migrate` never
+  fires again. Moved to `onRehydrateStorage`, which runs on every load.
+  `guidanceLegacyAdoption.test.ts` covers all four paths and three of its cases fail against
+  the previous implementation.
+- **The Sigma tab had no empty state**, so its Run button would scan an empty timeline and
+  report zero matches — which reads as "these rules cleared you", the exact failure the PR
+  fixed in the detector views. It now gets the same guidance-plus-empty-state treatment as
+  Patterns. The duplicated hint JSX behind that (three near-identical copies) collapsed into
+  one local `NoEventsState`, and the two adjacent identical `activeTab === "patterns" &&
+  nothingToAnalyse` guards became one. `investigateEmptyTimeline.test.tsx` now covers the
+  gating with the tab bodies stubbed — the Sigma case fails against the pre-fix panel.
+- **The "events appear as they land" promise depended on the panel's host.** `InvestigatePanel`
+  set no `refetchInterval` on `["timeline-sources", …]`; it stayed fresh only because
+  `ExplorerPage` polls the same key at 4s while ingesting. Stated on both queries now, so the
+  copy does not silently rely on a caller.
+
+Also restored the multi-line `detector-shared` imports in thirteen views, which the tier-1
+commit had collapsed into ~200-character single lines directly above multi-line imports in
+the same files. `E501` is ignored by convention, but the diff was gratuitous.
+
+**Verified.** 689 frontend tests (680 + 9 new), typecheck, lint and a production build pass.
+Each fix was demonstrated failing against the pre-fix code before being trusted.
 
 ## Session 133 — 2026-07-30: frontend design audit; dead tokens and the brand mark
 

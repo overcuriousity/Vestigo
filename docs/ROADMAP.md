@@ -85,9 +85,12 @@ Seven dead-token references found and fixed the same day (`--color-error` in 12 
 of it compiled, typechecked, linted and passed tests, because nothing checked.
 
 **The ratchet now exists** — `frontend/src/test/designSystem.test.ts`, shipped with the
-tier-1 work. Undefined `var(--…)` is a hard check at zero; arbitrary `text-[Npx]` and raw
-`<button>` outside `components/ui/` are budgeted per file in `designSystemBudget.ts`,
-seeded at 119 and 119. The budget only falls: exceeding an entry fails, and so does
+tier-1 work. Undefined `var(--…)` is a hard check at zero, over every `.ts`/`.tsx` under
+`src/` outside `src/test/` — a dead token is not a JSX-only problem, since
+`viz/lib/colors.ts` builds `var(--viz-*)` strings for the chart export path. Arbitrary
+`text-[Npx]` and raw `<button>` outside `components/ui/` are budgeted per file in
+`designSystemBudget.ts`, seeded at 119 and 119, and stay scoped to components and pages
+because only JSX has them. The budget only falls: exceeding an entry fails, and so does
 *beating* one without lowering it, which is what keeps the list shrinking. **Every item
 below burns its numbers out of that file** — closing one means deleting its budget entries,
 and the migration is done when the file is `{}`.

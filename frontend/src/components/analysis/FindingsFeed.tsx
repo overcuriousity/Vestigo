@@ -14,7 +14,14 @@ import { Info } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
 import { DETECTORS, type DetectorId } from "./detector-registry";
 import { SWEEP_LIMIT, useAnomalyMarkers, useCappedFindings, useDetectorSweep, useOpenEvent } from "./detector-hooks";
-import { AnalysisEmptyState, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar } from "./detector-shared";
+import {
+  AnalysisEmptyState,
+  FindingRowActions,
+  FindingShell,
+  NeedsBaselinePrompt,
+  RefreshButton,
+  ResultsBar,
+} from "./detector-shared";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
 import { useTriageCoverage } from "@/hooks/useTriageCoverage";
 import { cn } from "@/lib/cn";

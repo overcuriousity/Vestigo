@@ -11,7 +11,16 @@ import { AlertTriangle } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
-import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
+import {
+  AnalysisEmptyState,
+  DetectorStatusLine,
+  FindingRowActions,
+  FindingShell,
+  NeedsBaselinePrompt,
+  RefreshButton,
+  ResultsBar,
+  TagFindingsBar,
+} from "./detector-shared";
 import {
   useBaselineRequest,
   useCappedFindings,

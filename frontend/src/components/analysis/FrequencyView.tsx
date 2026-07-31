@@ -20,7 +20,15 @@ import {
 import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
-import { AnalysisEmptyState, DetectorStatusLine, FindingRowActions, NeedsBaselinePrompt, RefreshButton, ResultsBar, TagFindingsBar } from "./detector-shared";
+import {
+  AnalysisEmptyState,
+  DetectorStatusLine,
+  FindingRowActions,
+  NeedsBaselinePrompt,
+  RefreshButton,
+  ResultsBar,
+  TagFindingsBar,
+} from "./detector-shared";
 import {
   useCappedFindings,
   useFindingsLimit,

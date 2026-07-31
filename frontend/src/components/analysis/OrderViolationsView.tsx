@@ -11,7 +11,15 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Rewind } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
-import { AnalysisEmptyState, DetectorStatusLine, DismissedToggle, FindingRowActions, FindingShell, RefreshButton, TagFindingsBar } from "./detector-shared";
+import {
+  AnalysisEmptyState,
+  DetectorStatusLine,
+  DismissedToggle,
+  FindingRowActions,
+  FindingShell,
+  RefreshButton,
+  TagFindingsBar,
+} from "./detector-shared";
 import {
   useAnomalyMarkers,
   useDetectorRunId,

@@ -66,6 +66,13 @@ const LEGACY_GUIDANCE_PREFIX = "vestigo-guidance-";
  * Adopt the pre-v5 `vestigo-guidance-<id>` localStorage keys so nobody's
  * dismissals resurface on upgrade, and clear them so the two stores cannot
  * disagree later.
+ *
+ * Called from `onRehydrateStorage`, not from `migrate`. `migrate` only runs when
+ * this store already has persisted state at an older version, so a browser that
+ * dismissed guidance without ever writing a UI preference would both lose the
+ * dismissal *and* keep its `vestigo-guidance-*` keys forever — the next write
+ * persists at v5 directly and `migrate` never fires again. Rehydration happens
+ * on every load, so the adoption lands and the cleanup completes either way.
  */
 function adoptLegacyGuidanceKeys(): Record<string, boolean> {
   const adopted: Record<string, boolean> = {};
@@ -183,16 +190,22 @@ export const useUiStore = create<UiState>()(
         }
         if (version < 5) {
           // Guidance dismissal moved out of its own `vestigo-guidance-*` keys.
-          // Only reached when this store has persisted state to migrate; a
-          // browser that dismissed guidance without ever writing a UI
-          // preference just sees the panels once more, which is the safe
-          // direction to fail in.
-          state.collapsedGuidance = {
-            ...adoptLegacyGuidanceKeys(),
-            ...(state.collapsedGuidance ?? {}),
-          };
+          // Adopting those keys is `onRehydrateStorage`'s job (see
+          // `adoptLegacyGuidanceKeys`); all this branch owes is the field.
+          state.collapsedGuidance = state.collapsedGuidance ?? {};
         }
         return state;
+      },
+      // Runs after migrate + merge, on every load rather than only on a version
+      // bump. Mutating `state` in place is safe here: with localStorage the
+      // hydration is synchronous, so this lands before the first render and
+      // there is nothing subscribed yet to miss a notification.
+      onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        const adopted = adoptLegacyGuidanceKeys();
+        if (Object.keys(adopted).length > 0) {
+          state.collapsedGuidance = { ...adopted, ...(state.collapsedGuidance ?? {}) };
+        }
       },
     },
   ),
