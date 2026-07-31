@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/test_demo_detector_coverage_clickhouse.py` asserts every shipped analysis tool
   still finds something in it, so retuning a detector cannot quietly hollow the demo out.
 
+- **A timeline opens on columns its own data justifies.** Every timeline used to open on
+  timestamp/artifact/message regardless of what it held; the fields that would say something
+  — `user`, `src_ip`, `event_id`, whatever this corpus has — were a popover away and only if
+  you knew to look. A pure scorer over the existing per-source field-stats cache now
+  recommends a column set per timeline (no new ClickHouse scans on the common path), stored
+  on `Timeline.recommended_columns` and shared by everyone with access. A per-user column
+  choice in the browser always outranks it, and the grid renders defaults immediately rather
+  than blocking on the job. "Suggest with AI" adds one typed LLM call that may only reorder
+  and select from the scorer's own candidates; it is an explicit per-(user, timeline) opt-in
+  behind a disclosure naming the endpoint, the model and what is sent, so no automatic
+  trigger — ingest, timeline creation, the CLI, the demo build — ever causes egress. Every
+  run writes a `timeline.recommend_columns` audit row.
+
 - **A derived `annotated` tag.** Any event carrying an annotation — a human tag or comment,
   an agent proposal, or a detector finding — also carries the tag `annotated`, filterable
   alongside parser tags and analyst tags in the same panel. It is computed at read time
@@ -37,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lowering it. Also lands a guidance registry and actionable empty states.
 
 - **README reordered** so the tool comes before the comparison to prior art.
+
+- **Dependencies updated.** FastAPI 0.139.2 → 0.140.13, pydantic-ai-slim 2.17 → 2.19, React
+  and React DOM 19.2.7 → 19.2.8, lucide-react 1.26 → 1.27, `@tanstack/react-virtual` 3.14.8,
+  six Radix primitives, the frontend build image to `node:25-alpine`, and the
+  `docker/login-action` / `github/codeql-action` workflow actions.
 
 ### Fixed
 
