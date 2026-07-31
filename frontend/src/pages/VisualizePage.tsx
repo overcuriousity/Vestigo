@@ -1426,7 +1426,7 @@ export function VisualizePage() {
             {chartType === "pie" && termsQuery.data && (
               <>
                 {pieWarning && (
-                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-subtle)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
+                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
                     <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
                     {pieWarning}{" "}
                     <button

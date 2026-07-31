@@ -68,7 +68,102 @@ round — **standing rule: when either resumes, both are designed together in on
   read/aggregate/export seams.
 - [ ] **Extract a `ui/Callout` primitive.** `analysis/EmbeddingStatusBanner`,
   `timelines/UploadDialog`'s duplicate warning and a handful of other sites hand-roll the
-  same border/dim-background/icon banner with per-site colour tokens.
+  same border/dim-background/icon banner with per-site colour tokens. Distinct from the
+  `Card` item below — a callout is a banner that interrupts, a card is a surface that
+  contains; they should not collapse into one primitive.
+
+### Frontend design-system consistency (audit 2026-07-30)
+
+Root cause, established by the audit: **the design system stops at colour.** Colour is
+tokenized and disciplined (tiered backgrounds, CVD-validated viz palette, documented
+diverging-ramp rationale); type, spacing, radius, icon size and surface treatment have no
+token layer and no primitive, so every author re-decides at the call site. Absent a token,
+`text-[10px]` is the *reasonable* thing to write — 118 reasonable moments is the drift.
+
+Seven dead-token references found and fixed the same day (`--color-error` in 12 files,
+`--color-border-focus` in 7, `--color-bg-subtle` in 2) plus the off-palette brand mark; all
+of it compiled, typechecked, linted and passed tests, because nothing checked.
+
+**The ratchet now exists** — `frontend/src/test/designSystem.test.ts`, shipped with the
+tier-1 work. Undefined `var(--…)` is a hard check at zero, over every `.ts`/`.tsx` under
+`src/` outside `src/test/` — a dead token is not a JSX-only problem, since
+`viz/lib/colors.ts` builds `var(--viz-*)` strings for the chart export path. Arbitrary
+`text-[Npx]` and raw `<button>` outside `components/ui/` are budgeted per file in
+`designSystemBudget.ts`, seeded at 119 and 119, and stay scoped to components and pages
+because only JSX has them. The budget only falls: exceeding an entry fails, and so does
+*beating* one without lowering it, which is what keeps the list shrinking. **Every item
+below burns its numbers out of that file** — closing one means deleting its budget entries,
+and the migration is done when the file is `{}`.
+
+- [ ] **Type scale in `@theme`, and burn down the 118 arbitrary font sizes.** Filed as a
+  correctness item, not an aesthetic one: `html[data-density="compact"]` (`index.css:205`)
+  rebases `font-size` to scale the whole UI, and every `text-[10px]`/`[11px]`/`[9px]`/`[8px]`
+  ignores it — **compact density does not do what it claims** on those 118 sites. Current
+  usage is `text-xs` ×565, `text-sm` ×107, arbitrary-px ×118, against `base`/`lg`/`xl` ×15
+  total: one size with ad-hoc escapes *downward*, so nothing has hierarchy and the smallest
+  text is below any legibility floor. Pick five named steps for *this* app — a dense grid
+  tool legitimately lives at 12–13px, so the scale is `micro / body / lead / section / page`,
+  not a generic 12/14/16/20/24. The point is five named decisions replacing ten anonymous
+  pixel values, not larger text. Related: 69 `uppercase` + 68 `tracking-wide/wider` + 232
+  `font-medium/semibold` are currently doing the job type size should, which is why every
+  section label reads as the same texture and the panel cannot be skimmed.
+
+- [ ] **`Card` and `SectionLabel` primitives.** 141 sites hand-roll
+  `border border-[var(--color-border)]` + `rounded` + padding as a surface; 69 hand-roll the
+  uppercase micro-label. That duplication is *why* radius is inconsistent (`rounded` ×267,
+  `-lg` ×22, `-md` ×12, `-sm` ×6, against three defined radius tokens that go largely
+  unused). Precondition for the type-scale and radius decisions landing consistently —
+  afterwards those live in one place instead of 141. Extraction is small; migration is a
+  ratcheted long tail, not a big-bang refactor. `SectionLabel` should render real heading
+  elements, which absorbs most of the heading-structure item below for free.
+
+- [ ] **Just-in-time guidance restructure (Investigate panel).** Needs its own design round;
+  the diagnosis is settled, the shape is not. The tier-1 work fixed the *plumbing* — copy is
+  now in `lib/guidance.tsx` and inlining it is a type error, dismissal is restorable — but
+  not the placement, which is the actual complaint. `guidance["investigate-anomalies"]` is
+  still ~120 words of three-step ordered list rendered in `text-xs`/`--color-fg-muted`, the
+  faintest text in the app, into a panel 320px wide by default: sized like documentation,
+  styled like a footnote, too long to skim and too faint to read. Worse, step 3 teaches
+  Normal/Dismiss/Confirm — the single most important concept in the product — at the one
+  moment nothing on screen demonstrates it, since finding cards have not rendered on first
+  run. Proposed inversion: guidance attaches to the control at the moment of use. Panel top
+  keeps one or two sentences of orientation (what this panel is *for*); scope guidance moves
+  onto `FrameBar` where the choice is made; disposition guidance moves onto the first finding
+  card, which is its referent. The registry makes this cheap to try — the copy is one file
+  and the panel is one component.
+
+- [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand store,
+  so it is per-browser: an analyst who folds a panel away at their desk meets it again on a
+  second machine, and vice versa. The backend half already exists — `User.preferences` (JSON,
+  `db/postgres.py:1515`) and `update_user_preferences` (`:4938`, where a `None` value deletes
+  the key, so reset comes free) — and `agent_disabled_tools` is the precedent for a namespaced
+  key. The work is a preferences passthrough (`PATCH /auth/me` takes only username, display
+  name and `onboarding_completed` today) plus deciding whether the frontend `User` type gains
+  `preferences` or the agent's derived-endpoint pattern is repeated. Deliberately deferred
+  from tier 1, which was scoped frontend-only.
+
+- [ ] **`IconButton` primitive / the 119 raw `<button>`s.** Across 46 files, against 57 that
+  import `Button` — roughly half the interactive surface skips the variant system, the focus
+  ring and the disabled treatment. Individually small, collectively wide. The ratchet has
+  stopped the bleeding; burn these down opportunistically rather than as one task, lowering
+  the `rawButton` budgets as files are cleaned.
+
+- [ ] **Icon size scale.** Ten distinct values in use (9, 10, 11, 12, 13, 14, 16, 18, 20,
+  24; `size={12}` ×110, `size={13}` ×102, `size={11}` ×75). 11 vs 12 vs 13 is not a decision
+  anyone can perceive — it is drift. Collapse to three (`inline` 12, `control` 16, `feature`
+  20). Nothing breaks today, so fold it into the `Card`/`SectionLabel` migration passes
+  rather than scheduling it separately.
+
+- [ ] **`aria-live` for background work.** 35 `aria-label` but exactly one `aria-live` in the
+  whole frontend: the job tray, toasts and streaming agent output announce nothing, so a
+  screen-reader user gets no signal that an ingest finished. Narrow audience, total failure
+  for that audience, small well-defined fix. The event grid's `aria-rowcount`/`aria-rowindex`
+  is the pattern to follow.
+
+- [ ] **Heading structure.** 39 heading elements (`h1` ×8, `h2` ×20, `h3` ×5, `h4` ×6)
+  across 211 component files; hierarchy is carried entirely by the uppercase micro-label
+  convention, so screen-reader navigation is effectively absent. Mostly resolved for free by
+  `SectionLabel` above — do not schedule separately, verify after that migration.
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 

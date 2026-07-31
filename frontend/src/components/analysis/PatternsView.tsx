@@ -19,6 +19,7 @@ import { useDisposition } from "@/hooks/useDisposition";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
@@ -365,20 +366,7 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
   return (
     <div className="space-y-3">
       {/* First-run explainer — folds away permanently once dismissed. */}
-      <GuidancePanel id="investigate-patterns" title="How pattern mining works">
-        <p>
-          This tab <strong>discovers repeating event sequences</strong> (motifs) —
-          it needs no baseline and detects nothing by itself; it shows the log's
-          routine structure so you can separate it from the interesting rest.
-        </p>
-        <p className="mt-1">
-          <strong>Mark routine</strong> when you recognize a sequence as expected
-          operations — cron jobs, heartbeats, poller loops, backup runs. Its
-          occurrences collapse in the event grid behind a visible "N routine
-          events" count, decluttering the timeline without hiding anything.
-          Routine patterns stay listed below and can be unmarked anytime.
-        </p>
-      </GuidancePanel>
+      <GuidancePanel id="investigate-patterns" />
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
@@ -463,14 +451,17 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No events ingested yet."
-              : `No sequence of ${ngramSize} repeats at least ${minSupport} times for this field — the log has no routine structure at these settings.`}
-          </span>
-        </div>
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Sequence mining reads events in time order, so events whose timestamp could not be parsed are invisible to it."
+              : `Try a shorter sequence than ${ngramSize}, or a support threshold below ${minSupport}. A log with no routine structure is itself worth knowing — it means there is nothing here to collapse away.`
+          }
+        >
+          {data?.status === "no_data"
+            ? "No events carry a usable timestamp."
+            : `No sequence of ${ngramSize} repeats at least ${minSupport} times for this field.`}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

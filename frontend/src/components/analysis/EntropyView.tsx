@@ -10,16 +10,17 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, MoveUp, MoveDown } from "lucide-react";
+import { AlertTriangle, MoveUp, MoveDown } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -98,7 +99,7 @@ function EntropyRow({
           {fieldLabel(finding.field)}
         </span>
         {above ? (
-          <MoveUp size={12} className="shrink-0 text-[var(--color-error)]" />
+          <MoveUp size={12} className="shrink-0 text-[var(--color-danger)]" />
         ) : (
           <MoveDown size={12} className="shrink-0 text-[var(--color-warning)]" />
         )}
@@ -240,18 +241,23 @@ export function EntropyView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No entropy outliers. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "No fields with enough distinct baseline values (min length 6 chars). Pick fields explicitly above."
-                : isTemporal
-                  ? "No suspect-window values outside the baseline entropy band."
-                  : "No values outside the corpus entropy band."}
-          </span>
-        </div>
+                ? "Entropy needs values of at least 6 characters, and enough distinct ones to fit a band. Pick fields explicitly above."
+                : "Character entropy alone misses a lowercase-only generated name — a value can look random and still score unremarkably."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "No field had enough distinct values to measure."
+              : isTemporal
+                ? "No suspect-window value fell outside the baseline entropy band."
+                : "No value fell outside the corpus entropy band."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}

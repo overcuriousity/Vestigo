@@ -10,15 +10,16 @@
  */
 import { Fragment, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, ArrowRight } from "lucide-react";
+import { AlertTriangle, ArrowRight } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import {
+  AnalysisEmptyState,
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
-  ResultsBar,
   RefreshButton,
+  ResultsBar,
   TagFindingsBar,
 } from "./detector-shared";
 import {
@@ -331,16 +332,21 @@ export function EventSequenceView({
       )}
 
       {!isLoading && findings.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
-          <Info size={13} />
-          <span>
-            {data?.status === "no_data"
-              ? "No event sequences. No events ingested yet."
+        <AnalysisEmptyState
+          hint={
+            data?.status === "no_data"
+              ? "Check the frame above — the scanned windows may not cover any events."
               : data?.status === "insufficient_data"
-                ? "Nothing to compare — the baseline window has no complete sequences of this length for the chosen field."
-                : "Every event ordering in the suspect windows also occurs in the baseline."}
-          </span>
-        </div>
+                ? "The baseline window holds no complete sequence of this length for the chosen field. Shorten the sequence, widen the baseline, or pick a field that changes more often."
+                : "The suspect windows repeat orderings the baseline already contains, so nothing here is new — not that nothing happened."
+          }
+        >
+          {data?.status === "no_data"
+            ? "The scan matched no events."
+            : data?.status === "insufficient_data"
+              ? "No baseline sequence to compare against."
+              : "Every event ordering also occurs in the baseline."}
+        </AnalysisEmptyState>
       )}
 
       {/* Findings list */}
