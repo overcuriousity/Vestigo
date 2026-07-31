@@ -185,12 +185,19 @@ export function VisualizePage() {
   // the notice below says why it is not the chart that was linked.
   const chartRefBroken =
     !!chartId && savedChartsQuery.isSuccess && (savedChart === undefined || storedConfig === null);
-  // Until the reference resolves, `config` below is the *default* chart, not
-  // the linked one. Anything that would write the config back to the URL has
-  // to wait: a defaulting effect firing in this window counts as the analyst
-  // taking the chart over, and would drop `c_chart` before the chart it names
-  // ever loaded.
-  const chartRefPending = !!chartId && !savedChartsQuery.isSuccess;
+  // While the URL names a chart, *nothing writes the URL automatically* — not
+  // while the reference is resolving (where `config` below is still the
+  // default chart) and not after it has, where the stored chart already
+  // answered every question the defaulting effects exist to answer. Both
+  // windows are the same rule, because both would end the same way: any
+  // automatic write goes through `takeOver`, which spells the chart out as
+  // `c_*` params and drops `c_chart` along with the three filter members
+  // params cannot carry. Only the analyst's own edit may do that.
+  //
+  // A *broken* reference is deliberately not live: a link to a deleted or
+  // unreadable chart falls through to the params, where the page is building
+  // a chart again and the defaults are wanted.
+  const chartRefLive = !!chartId && !chartRefBroken;
 
   const urlFilters = useMemo(
     () =>
@@ -343,11 +350,11 @@ export function VisualizePage() {
   // Default to the first field once the list loads — the backend sorts by
   // coverage descending, so this is the highest-coverage field.
   useEffect(() => {
-    if (chartRefPending) return;
+    if (chartRefLive) return;
     if (field == null && fieldsQuery.data?.fields.length) {
       updateConfig({ field: fieldsQuery.data.fields[0].token });
     }
-  }, [field, fieldsQuery.data, updateConfig, chartRefPending]);
+  }, [field, fieldsQuery.data, updateConfig, chartRefLive]);
 
   // Probe numeric-ness only when actually needed: once per field change (to
   // auto-suggest a scale) and while a numeric chart type is displayed (as its
@@ -385,14 +392,27 @@ export function VisualizePage() {
       !multiField &&
       !groupedOn &&
       (dataKind === "numeric" ||
-        (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
+        (!chartRefLive &&
+          !fieldFree &&
+          !requiresSecondField &&
+          field !== autoProbedField.current)),
   });
+
+  // A named chart's field arrives *after* mount, so it is never the field the
+  // ref was initialized with — without this, resolving the reference looks
+  // exactly like the analyst picking a new field and spends the one-shot
+  // suggestion on a chart that already has its own answer. Declared before the
+  // two suggestion effects below, which React therefore runs after it.
+  useEffect(() => {
+    if (chartRefLive && field) autoProbedField.current = field;
+  }, [chartRefLive, field]);
 
   // Scale suggestion for a virtual time field — the statically-known answer,
   // no round-trip. Must run before the numeric-probe effect below so the
   // shared `autoProbedField` ref is spent first; React runs effects in
   // declaration order.
   useEffect(() => {
+    if (chartRefLive) return;
     if (!field || !fieldIsTime || field === autoProbedField.current) return;
     // Advance the ref even when the early-return below fires: it means "this
     // field's one-shot suggestion is spent", not "we fetched something".
@@ -400,9 +420,10 @@ export function VisualizePage() {
     if (fieldFree || requiresSecondField || multiField) return;
     const scale = TIME_FIELDS[field].scale;
     updateConfig({ scale, chartType: defaultChartTypeForScale(scale, field) });
-  }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig]);
+  }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig, chartRefLive]);
 
   useEffect(() => {
+    if (chartRefLive) return;
     if (!field || field === autoProbedField.current) return;
     // Inert for time fields anyway (the query is disabled, so `data` stays
     // undefined) — stated explicitly so the intent survives a refactor.
@@ -425,6 +446,7 @@ export function VisualizePage() {
     requiresSecondField,
     multiField,
     updateConfig,
+    chartRefLive,
   ]);
 
   // Keep chartType valid when the analyst switches scale — clamped at event
@@ -453,9 +475,9 @@ export function VisualizePage() {
     [compareOn, dataKind],
   );
   useEffect(() => {
-    if (chartRefPending) return;
+    if (chartRefLive) return;
     if (!metricAvailable(metric)) updateConfig({ metric: "count" });
-  }, [metric, metricAvailable, updateConfig, chartRefPending]);
+  }, [metric, metricAvailable, updateConfig, chartRefLive]);
 
   const compareTermsOn = compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({

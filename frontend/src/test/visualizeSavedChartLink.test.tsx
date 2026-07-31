@@ -30,6 +30,11 @@ beforeAll(() => {
 
 const fieldsMock = vi.fn();
 const fieldTermsMock = vi.fn();
+// Mocked deliberately, even though a `c_chart` chart must never trigger it: the
+// scale probe is the one API call on this page that *writes back* to the URL,
+// so leaving it to reject (as an unmocked call does in jsdom) is exactly how a
+// takeover of the reference stays invisible to this file.
+const fieldNumericMock = vi.fn();
 const chartsListMock = vi.fn();
 const dispositionsListMock = vi.fn();
 
@@ -41,6 +46,7 @@ vi.mock("@/api/viz", async () => {
       ...actual.vizApi,
       fields: (...args: unknown[]) => fieldsMock(...args),
       fieldTerms: (...args: unknown[]) => fieldTermsMock(...args),
+      fieldNumeric: (...args: unknown[]) => fieldNumericMock(...args),
     },
     savedChartsApi: {
       ...actual.savedChartsApi,
@@ -124,6 +130,9 @@ beforeEach(() => {
   fieldTermsMock
     .mockReset()
     .mockResolvedValue({ field: "hostname", total: 10, distinct: 2, values: [], other_count: 0 });
+  fieldNumericMock
+    .mockReset()
+    .mockResolvedValue({ field: "hostname", count: 0, bins: [], points: [], min: null, max: null });
   chartsListMock.mockReset().mockResolvedValue({ charts: [SCOPED_CHART] });
   dispositionsListMock.mockReset().mockResolvedValue({ dispositions: [] });
 });
@@ -184,6 +193,36 @@ describe("VisualizePage ?c_chart=", () => {
     await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
     expect(lastSearch).toContain("c_chart=chart-1");
     expect(fieldTermsMock.mock.calls[0][2]).toBe("hostname");
+  });
+
+  it("keeps naming the chart once the page has settled", async () => {
+    // The page's own defaulting effects — field, scale, chart type, metric —
+    // exist for a chart the analyst is building. A stored chart already
+    // answered all four, and any one of them writing back would rewrite the
+    // URL as `c_*` params: `c_chart` gone, and with it the three filter
+    // members params cannot carry. Nothing may write the URL while it names a
+    // chart; only the analyst's own edit may.
+    renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1");
+
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(lastSearch).toBe("?c_chart=chart-1");
+    // The scale probe is what would have overwritten the stored nominal/bar
+    // pair with its own guess; a named chart must not even ask.
+    expect(fieldNumericMock).not.toHaveBeenCalled();
+  });
+
+  it("still defaults the chart when the reference is broken", async () => {
+    // The guard is on the *reference*, not on the presence of `c_chart`: a
+    // link to a deleted chart falls through to the params, where the page is
+    // building a chart again and the defaults are wanted.
+    chartsListMock.mockResolvedValue({ charts: [] });
+    renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1");
+
+    await waitFor(() => expect(new URLSearchParams(lastSearch).get("c_field")).toBe("artifact"));
   });
 
   it("says so when the chart is gone rather than drawing a default", async () => {

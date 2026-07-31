@@ -264,6 +264,30 @@ async def test_the_job_releases_its_active_slot_on_every_exit(store):
 
 
 @pytest.mark.asyncio
+async def test_a_second_job_on_the_same_timeline_stands_down(store, monkeypatch):
+    """The `_ACTIVE` claim is the guard for every caller, not only the API path.
+
+    The CLI and the demo build call the job directly, so a check that only
+    `start_column_recommendation` performed would leave those two able to run
+    two jobs over one timeline — trading writes, and each rolling back a
+    placeholder the other owns.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    monkeypatch.setitem(columns_jobs._ACTIVE, timeline_id, "job-already-running")
+    job_store = await _run(store, case_id, timeline_id)
+
+    # Neither the payload nor the other job's claim was touched.
+    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns == good
+    assert columns_jobs.get_active_recommendation(timeline_id) == "job-already-running"
+    job = job_store.list_by_case(case_id)[0]
+    assert job.status == "completed"
+    assert job.result == {"skipped": True, "running": "job-already-running"}
+
+
+@pytest.mark.asyncio
 async def test_the_default_run_never_reaches_the_advisor(store, monkeypatch):
     """Ingest, timeline creation, the CLI and the demo all rely on this default.
 
@@ -317,6 +341,74 @@ async def test_a_restart_settles_an_empty_running_recommendation_as_insufficient
     assert await store.clear_stale_running_recommendations() == 1
     settled = (await store.get_timeline(case_id, timeline_id)).recommended_columns
     assert settled["status"] == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_recommendation_carries_no_placeholder_timestamp(store):
+    """`columns_generated_at` exists for placeholders only — a finished answer
+    was derived at its own `generated_at`, and a second key would be a second
+    thing to keep true."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+
+    recommended = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert "columns_generated_at" not in recommended
+
+
+@pytest.mark.asyncio
+async def test_a_settled_recommendation_dates_its_columns_honestly(store):
+    """Settling relabels a placeholder; it must not re-date the columns in it.
+
+    The placeholder's `generated_at` is the *recompute's* start — the clock the
+    explorer measures its staleness floor against — while the columns it
+    carries are the previous run's. A settled payload that kept the recompute's
+    timestamp would claim an answer was derived by a run that never finished,
+    in the one record a case export and the audit trail carry forward.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    # The placeholder exactly as a recompute writes it, then killed mid-flight.
+    orphaned = columns_jobs._payload(
+        status="running",
+        source_ids=good["source_ids"],
+        job_id="job-that-died",
+        **columns_jobs._carry_forward(good),
+    )
+    assert orphaned["generated_at"] >= good["generated_at"]
+    await store.update_timeline_recommended_columns(case_id, timeline_id, orphaned)
+
+    assert await store.clear_stale_running_recommendations() == 1
+
+    settled = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert settled["status"] == "ok"
+    assert settled["columns"] == good["columns"]
+    assert settled["generated_at"] == good["generated_at"]
+    # Restored, not merely stored: the settled payload is a finished answer
+    # again and reads like one.
+    assert "columns_generated_at" not in settled
+
+
+@pytest.mark.asyncio
+async def test_two_crashes_in_a_row_do_not_walk_the_timestamp_forward(store):
+    """Each carry-forward reads the previous *columns* timestamp, not the last
+    placeholder's, so repeated failed recomputes cannot age an answer into
+    looking fresh."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+
+    payload = good
+    for job_id in ("died-once", "died-twice"):
+        payload = columns_jobs._payload(
+            status="running",
+            source_ids=good["source_ids"],
+            job_id=job_id,
+            **columns_jobs._carry_forward(payload),
+        )
+
+    assert columns_jobs.settle_running_payload(payload)["generated_at"] == good["generated_at"]
 
 
 @pytest.mark.asyncio

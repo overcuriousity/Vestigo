@@ -39,8 +39,8 @@ def test_prebuilt_frontend_stage_needs_no_base_image():
     """`frontend-prebuilt` is `FROM scratch`, so nothing is resolved for it.
 
     This is the whole airgap mechanism: BuildKit skips a stage no reachable
-    stage copies from, so selecting this one means `node:22-alpine` is never
-    looked up — the failure the operator hit on the isolated host.
+    stage copies from, so selecting this one means the node build image is
+    never looked up — the failure the operator hit on the isolated host.
     """
     text = DOCKERFILE.read_text()
     assert "ARG FRONTEND_STAGE=frontend-build" in text

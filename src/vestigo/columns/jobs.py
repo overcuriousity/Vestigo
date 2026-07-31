@@ -76,10 +76,19 @@ def settle_running_payload(payload: dict[str, Any]) -> dict[str, Any]:
     Shared by the boot-time sweep (``PostgresStore.clear_stale_running_recommendations``)
     and the read path (``GET /cases/{id}/timelines/{id}``) so the two can never
     disagree about what "settled" means.
+
+    ``generated_at`` on a placeholder is the *recompute's* start — that is what
+    the explorer measures its staleness floor against — but the columns being
+    settled are the previous run's. :func:`_carry_forward` parks their real
+    timestamp in ``columns_generated_at``, and settling puts it back, so a
+    payload never claims its columns were derived later than they were.
     """
     settled = dict(payload)
     settled["status"] = "ok" if settled.get("columns") else "insufficient"
     settled["job_id"] = None
+    carried = settled.pop("columns_generated_at", None)
+    if carried:
+        settled["generated_at"] = carried
     return settled
 
 
@@ -93,6 +102,13 @@ def _carry_forward(previous: dict[str, Any] | None) -> dict[str, Any]:
     answer forward means the worst a crash can do is mislabel a still-usable
     recommendation, which ``PostgresStore.clear_stale_running_recommendations``
     fixes on the next boot.
+
+    ``columns_generated_at`` carries when those columns were actually derived.
+    The placeholder's own ``generated_at`` has to be the recompute's start (the
+    explorer reads it as the job's clock), so without this the settled payload
+    would date a previous run's columns to a run that never finished. Read from
+    the previous ``columns_generated_at`` first, so two crashes in a row do not
+    walk the timestamp forward one recompute at a time.
     """
     if not isinstance(previous, dict):
         return {"columns": [], "reasons": {}, "method": "heuristic", "model": None}
@@ -101,6 +117,8 @@ def _carry_forward(previous: dict[str, Any] | None) -> dict[str, Any]:
         "reasons": dict(previous.get("reasons") or {}),
         "method": previous.get("method") or "heuristic",
         "model": previous.get("model"),
+        "columns_generated_at": previous.get("columns_generated_at")
+        or previous.get("generated_at"),
     }
 
 
@@ -113,6 +131,7 @@ def _payload(
     model: str | None,
     source_ids: list[str],
     job_id: str | None,
+    columns_generated_at: str | None = None,
 ) -> dict[str, Any]:
     """Build the stored ``Timeline.recommended_columns`` payload.
 
@@ -121,8 +140,14 @@ def _payload(
     when the corpus genuinely had nothing worth suggesting — recorded rather
     than left null so the explorer can stop waiting and the job does not get
     re-run in the hope of a different answer.
+
+    ``generated_at`` is always *now*: for a finished payload that is when its
+    columns were derived, and for a ``running`` placeholder it is the job's
+    clock, which the explorer measures its staleness floor against.
+    ``columns_generated_at`` is set on placeholders only — a carried-forward
+    answer's real timestamp, which :func:`settle_running_payload` restores.
     """
-    return {
+    payload = {
         "status": status,
         "columns": columns,
         "reasons": reasons,
@@ -132,6 +157,9 @@ def _payload(
         "generated_at": datetime.now(UTC).isoformat(),
         "job_id": job_id,
     }
+    if columns_generated_at:
+        payload["columns_generated_at"] = columns_generated_at
+    return payload
 
 
 async def _restore_previous(
@@ -186,16 +214,31 @@ async def run_column_recommendation_job(
     ``agent_available()`` gate on top, so asking for it on an instance with no
     model configured simply keeps the heuristic answer.
 
-    ``_ACTIVE`` is claimed *before* the ``try`` — and only when this job does
-    not already hold it, which is the API path, where
-    :func:`start_column_recommendation` claimed it before spawning the task so
-    no burst can slip a second job in between. The claim is outside the ``try``
-    only so the ``finally`` cannot release a slot this job never took; it
-    releases on every other exit path, including any guard clause added later.
+    ``_ACTIVE`` is claimed *before* the ``try``, and the claim is the guard:
+    a timeline already being recommended for belongs to that job, so this one
+    returns without touching the payload (whose ``running`` placeholder is the
+    other job's to roll back). The API path claims through
+    :func:`start_column_recommendation` before spawning the task — so no burst
+    can slip a second job in between — and re-claiming with the same id here is
+    a no-op. The CLI and the demo call this function directly and are covered by
+    the same check.
+
+    The claim is outside the ``try`` only so the ``finally`` cannot release a
+    slot this job never took; it releases on every other exit path, including
+    any guard clause added later.
     """
     job_store.update(job_id, status="running", progress={"phase": "fields"})
     previous: dict[str, Any] | None = None
-    _ACTIVE.setdefault(timeline_id, job_id)
+    holder = _ACTIVE.setdefault(timeline_id, job_id)
+    if holder != job_id:
+        logger.info(
+            "Column recommendation already running for timeline %s (job %s); skipping job %s",
+            timeline_id,
+            holder,
+            job_id,
+        )
+        job_store.update(job_id, status="completed", result={"skipped": True, "running": holder})
+        return
     try:
         timeline = await store.get_timeline(case_id, timeline_id)
         if timeline is None:

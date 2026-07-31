@@ -86,9 +86,19 @@ async function renderOpenPicker() {
   await waitFor(() => expect(screen.getByText("src_ip")).toBeInTheDocument());
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   useUiStore.setState({ visibleColumnsByTimeline: {} });
   capabilities.agent = false;
+  // Both are module-level mocks, so a rejection armed by one test would
+  // otherwise be the next test's default.
+  const { timelinesApi } = await import("@/api/timelines");
+  vi.mocked(timelinesApi.recommendColumns).mockReset();
+  vi.mocked(timelinesApi.recommendColumns).mockResolvedValue({
+    job_id: "job-1",
+    use_ai: false,
+  });
+  const { authApi } = await import("@/api/auth");
+  vi.mocked(authApi.updatePreferences).mockReset();
 });
 
 describe("ColumnPicker derived-key grouping", () => {
@@ -308,6 +318,48 @@ describe("ColumnPicker suggestions", () => {
       expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1", true),
     );
     expect(screen.queryByText("Suggest columns with AI")).not.toBeInTheDocument();
+  });
+
+  it("reports a lost opt-in as lost, even after an unrelated failed re-suggest", async () => {
+    // The two halves of the confirm are told apart by the confirm itself, not
+    // by whether *some* recommend call has ever failed. Getting this backwards
+    // tells the analyst their choice was saved when it was not, and the
+    // disclosure never comes back to ask again.
+    const { timelinesApi } = await import("@/api/timelines");
+    const { authApi } = await import("@/api/auth");
+    capabilities.agent = true;
+    useAuthStore.setState({ user: testUser() });
+    vi.mocked(timelinesApi.recommendColumns).mockRejectedValueOnce(new Error("boom"));
+    vi.mocked(authApi.updatePreferences).mockRejectedValue(new Error("nope"));
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    // The unrelated local run that fails first.
+    fireEvent.click(screen.getByRole("button", { name: /re-suggest columns/i }));
+    await waitFor(() =>
+      expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1", false),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /send and suggest/i }));
+
+    expect(await screen.findByText(/did not save/i)).toBeInTheDocument();
+  });
+
+  it("does not report a saved opt-in as lost when only the run failed", async () => {
+    const { timelinesApi } = await import("@/api/timelines");
+    const { authApi } = await import("@/api/auth");
+    capabilities.agent = true;
+    useAuthStore.setState({ user: testUser() });
+    vi.mocked(authApi.updatePreferences).mockResolvedValue(
+      testUser({ preferences: { column_advisor_optin: { t1: true } } }),
+    );
+    vi.mocked(timelinesApi.recommendColumns).mockRejectedValue(new Error("boom"));
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /send and suggest/i }));
+
+    expect(await screen.findByText(/did not start/i)).toBeInTheDocument();
   });
 
   it("asks again on a timeline the analyst has not opted in to", async () => {

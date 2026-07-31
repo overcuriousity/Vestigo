@@ -1,9 +1,73 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 144 — review of the 1.9.0 branch, fixed in place).
+Last updated: 2026-07-31 (session 145 — review of PR 230, the 1.9.0 release PR).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 145 — 2026-07-31: the chart link undid itself four seconds after opening
+
+**Why.** A review of PR 230 — the 1.9.0 release PR, `release/1.9.0` → `main`. One blocker,
+and it is the release's own headline fix defeating itself.
+
+- **`?c_chart=<id>` was dropped moments after the page loaded.** Session 142's whole argument
+  is that three filter members (`ids`, `anomalyRunId`, `collapseRoutine`) have no URL form, so
+  a chart must be addressed by id and read back out of storage. But `VisualizePage`'s scale
+  probe fires on *any* field change, and `autoProbedField` is initialized at mount — when the
+  URL holds only `c_chart` and `field` is still null. Resolving the reference therefore looked
+  exactly like the analyst picking a new field: the probe ran, its effect called
+  `updateConfig`, and `takeOver` rewrote the URL as `c_*` params with the reference and the
+  three narrowings gone. An agent chart scoped to one detector run's 47 events opened as the
+  whole timeline, drawn as if it had always been that shape. The same write also reverted a
+  scale the analyst had just chosen.
+
+  The tests missed it for a specific reason worth remembering: `vizApi.fieldNumeric` was
+  unmocked, so in jsdom it rejected and `numericQuery.data` stayed null — the probe's effect
+  never reached its `updateConfig`. The one API call on that page that *writes back to the
+  URL* was the one left to fail. It is mocked now, and two of the file's existing tests fail
+  without the fix.
+
+  The rule is now stated once and applied to all four defaulting effects (field default,
+  time-field scale, numeric probe, metric clamp): **while the URL names a saved chart,
+  nothing writes the URL automatically.** A stored chart already answered every question they
+  exist to answer. A *broken* reference is deliberately not "live" — a link to a deleted
+  chart falls through to the params, where the page is building a chart again and the
+  defaults are wanted.
+
+- **The AI opt-in reported the wrong half as failed.** `ColumnPicker` inferred "did the run
+  fail, or the save?" from `recommendMutation.isError`, which is sticky across mutations: an
+  unrelated local "Re-suggest columns" that had failed earlier made a failed *opt-in write*
+  report as "your choice was saved, the suggestion did not start". That is the one wrong
+  answer available — the analyst is never asked again for a consent that was never recorded.
+  The confirm now tracks its own stage.
+
+- **`_ACTIVE` was documented as a guard and used as a hint.** Only
+  `start_column_recommendation` claimed the slot, so the CLI and the demo build — which call
+  `run_column_recommendation_job` directly — could run two jobs over one timeline, trading
+  writes and each rolling back a placeholder the other owned. The claim is now the guard for
+  every caller: a job that finds the slot held by another stands down without touching the
+  payload.
+
+- **A settled recommendation misdated its own columns.** The `running` placeholder carries
+  the previous answer forward (so the grid holds still), and its `generated_at` has to be the
+  *recompute's* start, since that is the clock the explorer measures staleness against. When
+  a crash left that placeholder to be settled, the previous run's columns kept the dead run's
+  timestamp — in the one record a case export and the audit trail carry forward.
+  `columns_generated_at` parks the real timestamp on placeholders only, and settling puts it
+  back; carry-forward reads it first, so repeated failures cannot walk an answer's date
+  forward one recompute at a time.
+
+Also: the frontend build image goes to `node:24-alpine` rather than the bot's `node:25` (odd
+numbered, EOL mid-2026 — a poor floor for an image an operator installs on an isolated host
+and never updates), with `ci.yml`/`release.yml` moved from Node 22 to 24 so the runtime that
+tests the frontend is the one that builds it; and the two exact-patch action pins the bot
+introduced are back to majors, matching every other action in the repo.
+
+One review finding was withdrawn rather than fixed: unchecking every column stores `[]`,
+which `resolveVisibleColumns` treats as a deliberate choice. That is correct and tested —
+`migrateColumns` runs only in the `version < 1` persist branch, not on every rehydrate, so
+the empty selection does not decay into a permanent `DEFAULT_COLUMNS` override, and "Reset to
+defaults" stays enabled as the way back.
 
 ## Session 144 — 2026-07-31: reviewing the release branch against itself
 

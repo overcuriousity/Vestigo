@@ -190,29 +190,32 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
     },
   });
 
+  // Which half of the confirm this attempt reached. Tracked by the confirm
+  // itself rather than read off `recommendMutation.isError`, which is sticky:
+  // a plain "Re-suggest columns" that failed earlier would still be flagged as
+  // errored here, and a *save* failure would then be reported as "your choice
+  // was saved" — the one wrong answer, since the analyst would never be asked
+  // again for a consent that was never recorded.
+  const [optInStage, setOptInStage] = useState<"save" | "run">("save");
+
   // The opt-in is persisted *before* the run, and the run only happens if that
   // write succeeded: a request that sends evidence must never be one the user
   // will be asked to authorize again because the record of it was lost.
   const optInAndRecommend = useMutation({
     mutationFn: async () => {
+      setOptInStage("save");
       const updated = await authApi.updatePreferences({
         [COLUMN_ADVISOR_OPTIN]: { [timelineId]: true },
       });
       setUser(updated);
       queryClient.setQueryData(["auth", "me"], updated);
+      setOptInStage("run");
       return recommendMutation.mutateAsync(true);
     },
   });
 
   const recommendRunning = recommendMutation.isPending || isSuggesting(recommended);
-  // Which half failed: the opt-in write, or the run it gates. The run only
-  // ever executes once the write succeeded, so a failed run means the opt-in
-  // is on record and must not be reported as lost.
-  const optInError = optInAndRecommend.isError
-    ? recommendMutation.isError
-      ? "run"
-      : "save"
-    : null;
+  const optInError = optInAndRecommend.isError ? optInStage : null;
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],

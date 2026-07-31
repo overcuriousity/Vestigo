@@ -53,8 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Dependencies updated.** FastAPI 0.139.2 → 0.140.13, pydantic-ai-slim 2.17 → 2.19, React
   and React DOM 19.2.7 → 19.2.8, lucide-react 1.26 → 1.27, `@tanstack/react-virtual` 3.14.8,
-  six Radix primitives, the frontend build image to `node:25-alpine`, and the
+  six Radix primitives, the frontend build image to `node:24-alpine`, and the
   `docker/login-action` / `github/codeql-action` workflow actions.
+
+- **The frontend build image tracks Node LTS, and CI builds on the same major.** The bot's
+  bump landed on `node:25-alpine`, an odd-numbered release that goes end-of-life mid-2026 —
+  a poor floor for an image operators install and then never update on an isolated host.
+  Pinned to `node:24-alpine` instead, with `ci.yml` and `release.yml` moved from Node 22 to
+  24 so the runtime that tests the frontend is the one that builds the shipped image.
+  Workflow actions are pinned by major throughout again (`github/codeql-action@v4`,
+  `docker/login-action@v4`), so a patch-level fix no longer waits for a bot PR.
 
 ### Fixed
 
@@ -89,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   have no URL form at all and would otherwise have widened an agent-scoped chart to the
   whole timeline in silence. The rail's load button uses the same reference, and editing
   either half spells the chart out in full and drops it. A link to a deleted chart says so.
+  While the URL names a chart, none of the page's own defaulting effects may write it back:
+  the field default, the scale probe, the time-field suggestion and the metric clamp all
+  stand down. Any one of them firing would have counted as the analyst taking the chart
+  over — rewriting the URL as `c_*` params seconds after the link opened, and dropping the
+  three narrowings on the way out.
 
 - **`read_story` no longer cuts the analyst's report unmarked.** Markdown blocks were
   truncated at 1600 characters — 0.6% of what a write accepts — with no marker, so the agent
