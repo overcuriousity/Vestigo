@@ -1,9 +1,56 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 141 — a story's chart link opens that chart).
+Last updated: 2026-07-31 (session 142 — a saved chart keeps the filters it was built under).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 142 — 2026-07-31: a saved chart is the slice it was built over
+
+**Why.** Reported from use, and the deeper bug behind session 141: build a chart with
+Explorer filters active (exclude a few known-good accounts), add it to a story, and the
+story's bar chart lists the excluded accounts again. Session 141 saw the same fact from the
+other side — "no filters are attached, because a saved chart stores none" — and treated it
+as the correct state of the world. It wasn't.
+
+**What was wrong.** On the Visualize page the primary filters come from the URL, inherited
+from the Explorer and shown by `InheritedFiltersBar`. `ChartConfig` deliberately holds only
+chart *shape*, so `chartConfigToStored` persisted a `SavedChart.config` with no primary
+filters at all — only the comparison layer's custom filters survived. Every consumer then
+redrew the chart over the whole timeline: the story block (`ChartBlockCard` passed no
+`filters` to `ChartCanvas`), the **frozen export** (`_stored_chart_to_spec` built a
+`ChartSpec` with no filters, so `execute_chart_spec` ran unscoped), the block's "Open in
+Visualize" link, and the agent's `ChartProposalCard`, which rendered the filtered chart and
+then saved the shape alone. The backend half-knew: `spec_to_stored_chart_config` refused a
+spec with base filters and advised "save the chart from the filtered Explorer view instead"
+— which did not in fact capture them.
+
+**Shape of the fix.** The filters are stored as a sibling key of the chart keys —
+`{v: 1, …chartConfig, filters: <view payload>}` — not as a new `ChartConfig` field. On the
+live page the URL owns those filters and `filterParamsPreservingChartConfig` depends on the
+`c_*`/filter-param split; folding them into `ChartConfig` would create a second owner.
+Storage is the one place the chart and its scope legitimately travel together, which is
+exactly the relationship `View.view_filter` already has, so the payload format is the same
+one (`filtersToViewPayload`) and both sides reuse the existing translators
+(`_filter_payload_to_spec` / `_spec_filters_to_payload`).
+
+`v` stays `1`: the key is additive, absent on older charts, and absence means "whole
+timeline" — what those charts have always done. Nothing migrates, and nothing recovers the
+filters charts saved earlier never stored; re-save them from the filtered view.
+
+Loading a saved chart in the rail now restores both halves in one URL write, so the Visualize
+page, the story block and the export agree by construction rather than by coincidence. The
+agent's rejection path is gone: a `ChartSpec.filters` now has a home, so `propose_story_block`
+embeds the slice the agent proposed over. While making the two translators exact inverses
+again, `collapseRoutine`, `eventIds` and `runId` — `FilterSpec` members the Explorer can't
+produce but an agent chart can — were added to the stored payload, because dropping them
+silently *widens* a chart's scope.
+
+**Known limits, stated in `STORIES.md` rather than papered over.** `collapseRoutine` from the
+Visualize page is not frozen (it isn't URL-serialized and derives from live dispositions), and
+`qMode: "semantic"` survives the payload but has no server-side equivalent, so an export
+re-runs it as a keyword query — now a `ROADMAP.md` Milestone 3 item, since this change makes
+a pre-existing View-block gap reachable for charts too.
 
 ## Session 141 — 2026-07-31: a story's chart link opened Visualize, but not the chart
 

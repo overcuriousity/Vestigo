@@ -8,22 +8,37 @@ import { Input } from "@/components/ui/Input";
 import {
   chartConfigToStored,
   parseStoredChartConfig,
+  parseStoredChartFilters,
   type ChartConfig,
 } from "@/components/viz/lib/chartConfig";
+import type { EventFilters } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
   currentConfig: ChartConfig;
-  onLoad: (config: ChartConfig) => void;
+  /** The Explorer filters the chart is currently drawn under. Saved with the
+   * chart, so a story block, an export and a re-load all reproduce the slice
+   * the analyst was looking at rather than the whole timeline. Pass the raw
+   * URL filters, not a set augmented with `collapseRoutine` — that one is not
+   * URL-serialized and derives from live dispositions. */
+  currentFilters: EventFilters;
+  onLoad: (config: ChartConfig, filters: EventFilters) => void;
 }
 
 /**
- * Rail footer for saved charts: name-and-save the current ChartConfig, load
- * a saved one (with a graceful message when it was saved by an incompatible
- * config version), delete stale ones.
+ * Rail footer for saved charts: name-and-save the current ChartConfig plus the
+ * filters it is drawn under, load a saved one back (restoring both, with a
+ * graceful message when it was saved by an incompatible config version),
+ * delete stale ones.
  */
-export function SavedChartsRail({ caseId, timelineId, currentConfig, onLoad }: Props) {
+export function SavedChartsRail({
+  caseId,
+  timelineId,
+  currentConfig,
+  currentFilters,
+  onLoad,
+}: Props) {
   const [name, setName] = useState("");
   const [loadError, setLoadError] = useState<string | null>(null);
   const qc = useQueryClient();
@@ -36,7 +51,12 @@ export function SavedChartsRail({ caseId, timelineId, currentConfig, onLoad }: P
 
   const saveMutation = useMutation({
     mutationFn: () =>
-      savedChartsApi.create(caseId, timelineId, name.trim(), chartConfigToStored(currentConfig)),
+      savedChartsApi.create(
+        caseId,
+        timelineId,
+        name.trim(),
+        chartConfigToStored(currentConfig, currentFilters),
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey });
       setName("");
@@ -55,7 +75,7 @@ export function SavedChartsRail({ caseId, timelineId, currentConfig, onLoad }: P
       return;
     }
     setLoadError(null);
-    onLoad(config);
+    onLoad(config, parseStoredChartFilters(stored));
   };
 
   const charts = chartsQuery.data?.charts ?? [];

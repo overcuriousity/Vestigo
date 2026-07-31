@@ -1866,9 +1866,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                         check_field=_check_chart_field,
                     )
                     # Derive the stored ChartConfig now, not at confirm time:
-                    # a spec that can't be represented as one (chart-local
-                    # base filters) has to be an error the model can correct,
-                    # not a saved chart nothing can draw.
+                    # a spec that can't be represented as one has to be an
+                    # error the model can correct, not a saved chart nothing
+                    # can draw. The spec's filters are part of that config, so
+                    # the block resolves to the slice the chart was proposed
+                    # over rather than the whole timeline.
                     content = {
                         "chart_spec": spec.model_dump(mode="json", exclude_none=True),
                         "chart_config": spec_to_stored_chart_config(spec),

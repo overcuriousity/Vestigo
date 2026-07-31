@@ -17,7 +17,11 @@ import { savedChartsApi } from "@/api/viz";
 import { viewsApi } from "@/api/views";
 import type { Event, StoryBlockOf } from "@/api/types";
 import { ChartCanvas } from "@/components/viz/ChartCanvas";
-import { chartConfigToParams, parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
+import {
+  chartConfigToParams,
+  parseStoredChartConfig,
+  parseStoredChartFilters,
+} from "@/components/viz/lib/chartConfig";
 import { Spinner } from "@/components/ui/Spinner";
 import { filtersToParams, viewPayloadToFilters } from "@/lib/queryParams";
 import { fmtNum } from "@/lib/format";
@@ -282,6 +286,12 @@ export function ChartBlockCard({
     () => (chart ? parseStoredChartConfig(chart.config) : null),
     [chart],
   );
+  // The filters the chart was saved under. Memoized for the same reason as
+  // the config: `ChartCanvas` puts it in a query key.
+  const filters = useMemo(
+    () => (chart ? parseStoredChartFilters(chart.config) : {}),
+    [chart],
+  );
 
   if (chartsQuery.isLoading) return <Spinner size={14} />;
   if (chartsQuery.isError) {
@@ -305,11 +315,12 @@ export function ChartBlockCard({
         <OpenLink
           to={`/cases/${caseId}/timelines/${timelineId}/visualize?${chartConfigToParams(
             config,
+            filtersToParams(filters),
           ).toString()}`}
           label="Open in Visualize"
         />
       </div>
-      <ChartCanvas caseId={caseId} timelineId={timelineId} config={config} />
+      <ChartCanvas caseId={caseId} timelineId={timelineId} config={config} filters={filters} />
     </div>
   );
 }

@@ -6,6 +6,7 @@ import {
   filterParamsPreservingChartConfig,
   paramsToChartConfig,
   parseStoredChartConfig,
+  parseStoredChartFilters,
   type ChartConfig,
 } from "@/components/viz/lib/chartConfig";
 
@@ -148,6 +149,34 @@ describe("stored (saved chart) round-trip", () => {
     const stored = chartConfigToStored(fullConfig) as Record<string, unknown>;
     delete stored.fieldY;
     expect(parseStoredChartConfig(stored)).toEqual({ ...fullConfig, fieldY: null });
+  });
+
+  it("stores the filters the chart was drawn under, and reads them back", () => {
+    // A saved chart is the slice it was built over: drop the filters and the
+    // story block redraws the excluded data the analyst just filtered out.
+    const filters = {
+      q: "logon",
+      exclusions: { user: ["svc_backup"] },
+      tagsExclude: ["known-good"],
+      start: "2026-01-01T00:00:00Z",
+    };
+    const stored = chartConfigToStored(fullConfig, filters);
+    expect(parseStoredChartConfig(stored)).toEqual(fullConfig);
+    expect(parseStoredChartFilters(stored)).toEqual(filters);
+  });
+
+  it("omits the filters key entirely for an unfiltered chart", () => {
+    // "Unfiltered" and "saved before filters were captured" must be the same
+    // bytes, so neither reads as the other.
+    expect("filters" in chartConfigToStored(fullConfig, {})).toBe(false);
+    expect("filters" in chartConfigToStored(fullConfig)).toBe(false);
+    expect(parseStoredChartFilters(chartConfigToStored(fullConfig))).toEqual({});
+  });
+
+  it("reads no filters from a config saved before they were captured", () => {
+    expect(parseStoredChartFilters({ v: 1, chartType: "bar" })).toEqual({});
+    expect(parseStoredChartFilters(null)).toEqual({});
+    expect(parseStoredChartFilters({ v: 1, filters: "nope" })).toEqual({});
   });
 
   it("falls back to the default chart type for unknown stored types", () => {

@@ -59,6 +59,7 @@ describe("ChartBlockCard open link", () => {
             scale: "nominal",
             field: "hostname",
             metric: "count",
+            filters: { q: "logon", exclusions: { user: ["svc_backup"] } },
           },
           created_at: null,
           updated_at: null,
@@ -80,5 +81,16 @@ describe("ChartBlockCard open link", () => {
     expect(params.get("c_type")).toBe("bar");
     expect(params.get("c_scale")).toBe("nominal");
     expect(params.get("c_field")).toBe("hostname");
+  });
+
+  it("carries the chart's frozen filters into the Visualize URL too", async () => {
+    // The chart means the slice it was saved over. A link that restores the
+    // shape but not the filters opens a chart that shows more than the story
+    // block does.
+    renderCard();
+    const link = await screen.findByRole("link", { name: /Open in Visualize/ });
+    const params = new URLSearchParams(link.getAttribute("href")!.split("?")[1]);
+    expect(params.get("q")).toBe("logon");
+    expect(params.toString()).toContain("svc_backup");
   });
 });

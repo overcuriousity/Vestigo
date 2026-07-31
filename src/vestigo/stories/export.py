@@ -173,6 +173,13 @@ def _filter_payload_to_spec(payload: dict[str, Any]):
         tags_exclude=tags_exclude or None,
         annotated=_list("annotated"),
         annotation_tag_value=p.get("annotationTagValue") or None,
+        # Agent-only members of FilterSpec. The Explorer cannot produce them
+        # and no saved View carries them, but a chart saved from an agent
+        # proposal can — and dropping them here would silently widen the
+        # chart's scope. Absent everywhere else, so this is a no-op there.
+        collapse_routine=bool(p.get("collapseRoutine")),
+        event_ids=_list("eventIds"),
+        run_id=p.get("runId") or None,
     )
 
 
@@ -240,6 +247,14 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     if spec_options:
         spec["options"] = spec_options
 
+    # The primary filter layer — the Explorer filters the chart was saved
+    # under, stored beside the ChartConfig keys (the frontend's
+    # ``chartConfigToStored``). Absent on charts saved before filters were
+    # captured, which resolve over the whole timeline as they always did.
+    stored_filters = config.get("filters")
+    if stored_filters:
+        spec["filters"] = _filter_payload_to_spec(stored_filters)
+
     compare = config.get("compare") or {}
     mode = compare.get("mode", "off")
     if mode != "off":
@@ -270,11 +285,14 @@ def _spec_filters_to_payload(fspec: Any) -> dict[str, Any]:
         "tagsExclude": list(fspec.tags_exclude) if fspec.tags_exclude else None,
         "annotated": list(fspec.annotated) if fspec.annotated else None,
         "annotationTagValue": fspec.annotation_tag_value,
+        "collapseRoutine": fspec.collapse_routine or None,
+        "eventIds": list(fspec.event_ids) if fspec.event_ids else None,
+        "runId": fspec.run_id,
     }
     return {**payload, **{k: v for k, v in simple.items() if v is not None}}
 
 
-def spec_to_stored_chart_config(spec: Any, *, base_filters_allowed: bool = False) -> dict[str, Any]:
+def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
     """Translate an agent ``ChartSpec`` into a stored ``ChartConfig``.
 
     The exact inverse of ``_stored_chart_to_spec``. Needed because the agent
@@ -284,17 +302,17 @@ def spec_to_stored_chart_config(spec: Any, *, base_filters_allowed: bool = False
     export resolver, the story editor card and the Visualize rail all refuse
     to draw, with no error at write time.
 
-    ``spec.filters`` (a chart-local base filter set) has no representation in
-    ``ChartConfig`` — a saved chart takes its filters from the Explorer state
-    it was saved from. Rather than drop them silently, this raises unless the
-    caller opts in with ``base_filters_allowed``.
+    ``spec.filters`` — the primary filter layer — is stored beside the chart
+    keys rather than inside them, matching the frontend: on the live page the
+    URL owns those filters, and storage is the one place the chart and the
+    slice it describes travel together.
     """
-    if spec.filters is not None and not base_filters_allowed:
-        raise ValueError(
-            "a saved chart cannot carry chart-local base filters; "
-            "save the chart from the filtered Explorer view instead"
-        )
     config: dict[str, Any] = {"v": CHART_CONFIG_VERSION}
+    # An all-defaults FilterSpec narrows nothing, so it is stored as no key at
+    # all — the same bytes an unfiltered chart from the Visualize page writes.
+    stored_filters = _spec_filters_to_payload(spec.filters)
+    if stored_filters:
+        config["filters"] = stored_filters
     for stored_key, spec_key in _CHART_CONFIG_KEYS.items():
         value = getattr(spec, spec_key, None)
         if value is not None:

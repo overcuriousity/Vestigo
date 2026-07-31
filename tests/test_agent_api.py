@@ -2514,14 +2514,15 @@ def test_confirm_story_block_story_deleted(client, admin_bootstrap, agent_on, st
     assert body["proposal"]["status"] == "confirmed"
 
 
-def test_confirm_story_block_unrepresentable_legacy_spec_is_reported(
+def test_confirm_story_block_legacy_spec_keeps_its_base_filters(
     client, admin_bootstrap, agent_on, store
 ):
-    """A stored payload that no longer converts is `applied: false`, not a 500.
+    """A confirmed chart proposal is saved as the slice it was proposed over.
 
-    Proposals now carry ``chart_config`` from propose time, but ones written
-    before that fall back to converting the spec at confirm — and a spec with
-    chart-local base filters has no ``ChartConfig`` representation.
+    Proposals now carry ``chart_config`` from propose time; ones written
+    before that fall back to converting the spec at confirm. Either way the
+    spec's ``filters`` have to reach the stored config, or the block redraws
+    over the whole timeline and shows what the agent had filtered out.
     """
     owner = as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)
@@ -2554,9 +2555,15 @@ def test_confirm_story_block_unrepresentable_legacy_spec_is_reported(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["applied"] is False
-    assert "base filters" in body["reason"]
-    assert asyncio.run(store.list_story_blocks("s1")) == []
+    assert body["applied"] is True, body
+
+    blocks = asyncio.run(store.list_story_blocks("s1"))
+    assert len(blocks) == 1
+    chart = asyncio.run(
+        store.get_saved_chart(case_id, timeline_id, blocks[0].content["chart_id"])
+    )
+    assert chart is not None
+    assert chart.config["filters"] == {"q": "ssh"}
 
 
 def test_confirm_story_block_rechecks_referent_scope(client, admin_bootstrap, agent_on, store):

@@ -191,6 +191,27 @@ describe("ChartProposalCard", () => {
     expect(config).toMatchObject({ v: 1, chartType: "bar", field: "artifact" });
   });
 
+  it("Save stores the spec's own filters alongside the config", async () => {
+    // The card draws the *filtered* chart, so saving the shape alone would
+    // hand the analyst a saved chart that answers a different question.
+    renderCard({
+      chart_type: "bar",
+      field: "artifact",
+      filters: { q: "logon", exclusions: { user: ["svc_backup"] } },
+    } as AgentChartSpec);
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+    fireEvent.change(screen.getByPlaceholderText("Save as…"), {
+      target: { value: "filtered chart" },
+    });
+    fireEvent.click(screen.getByLabelText("Save chart"));
+    await waitFor(() => expect(savedChartsCreateMock).toHaveBeenCalled());
+    const config = savedChartsCreateMock.mock.calls[0][3] as Record<string, unknown>;
+    expect(config.filters).toMatchObject({
+      q: "logon",
+      exclusions: { user: ["svc_backup"] },
+    });
+  });
+
   it("Open in Visualize link carries the mapped chart-config params", async () => {
     renderCard({ kind: "numeric", field: "attr:bytes" });
     await waitFor(() => expect(fieldNumericMock).toHaveBeenCalled());

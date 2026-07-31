@@ -1133,8 +1133,7 @@ async def _apply_story_block_proposal(
         # Everything that can fail on a *stored* payload is inside one try:
         # a decided proposal must report an honest ``applied: false`` with a
         # reason, never a 500. That includes the legacy chart conversion —
-        # a spec carrying chart-local base filters has no ChartConfig
-        # representation and raises.
+        # a stored spec that no longer validates raises.
         try:
             if block_kind == "chart_ref" and "chart_spec" in content:
                 from pydantic import ValidationError

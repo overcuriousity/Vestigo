@@ -10,6 +10,7 @@
  */
 import type { CompareTimeResponse, EventFilters, HistogramResponse } from "@/api/types";
 import { filtersToParams, filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
+import { hasActiveFilters } from "@/lib/fieldFilters";
 import type { Metric } from "./transforms";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
@@ -275,13 +276,44 @@ export function histogramToCompare(h: HistogramResponse): CompareTimeResponse {
 }
 
 /** Shape a ChartConfig for storage (saved charts): compare filters go
- * through the same View payload normalization the Views feature uses. */
-export function chartConfigToStored(config: ChartConfig): Record<string, unknown> {
+ * through the same View payload normalization the Views feature uses.
+ *
+ * *filters* is the primary layer — the Explorer filters the chart was built
+ * under. They are stored as a sibling key rather than inside `ChartConfig`
+ * because on the live page the URL owns them (see `parseStoredChartFilters`),
+ * and are omitted entirely when empty so an unfiltered chart stores exactly
+ * what it stored before this key existed. */
+export function chartConfigToStored(
+  config: ChartConfig,
+  filters?: EventFilters,
+): Record<string, unknown> {
   return {
     ...config,
     compare:
       config.compare.mode === "custom"
         ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
         : config.compare,
+    ...(filters && hasActiveFilters(filters)
+      ? { filters: filtersToViewPayload(filters) }
+      : {}),
   };
+}
+
+/**
+ * Read a saved chart's frozen primary filters back out of its stored config.
+ *
+ * Separate from `parseStoredChartConfig` because the two answer different
+ * questions: the chart *shape* is `ChartConfig` (also URL state, where the
+ * Explorer filter params live beside it under their own keys), while these
+ * filters exist only in storage — the one place the two travel together, the
+ * same way `View.view_filter` does.
+ *
+ * Returns `{}` for a chart saved before filters were captured, which is what
+ * makes those charts keep rendering exactly as they do today.
+ */
+export function parseStoredChartFilters(stored: unknown): EventFilters {
+  if (!stored || typeof stored !== "object") return {};
+  const raw = (stored as Record<string, unknown>).filters;
+  if (!raw || typeof raw !== "object") return {};
+  return viewPayloadToFilters(raw as Record<string, unknown>);
 }

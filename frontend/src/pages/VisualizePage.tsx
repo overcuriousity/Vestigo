@@ -211,6 +211,21 @@ export function VisualizePage() {
     [setSearchParams],
   );
 
+  // Loading a saved chart restores both halves of what was saved: the `c_*`
+  // chart state and the filters it was drawn under. One write, because the
+  // chart and its scope are one thing — restoring the shape but keeping the
+  // filters you happened to be browsing with would show a different chart
+  // here than the story block and the export show.
+  const loadSavedChart = useCallback(
+    (loaded: ChartConfig, savedFilters: EventFilters) => {
+      setSearchParams(
+        (prev) => chartConfigToParams(loaded, filterParamsPreservingChartConfig(savedFilters, prev)),
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
   // Round trip back to the grid these filters came from. Only the filter params
   // travel — the `c_*` chart config means nothing to the Explorer.
   const explorerHref = useMemo(
@@ -1270,7 +1285,8 @@ export function VisualizePage() {
               caseId={caseId}
               timelineId={timelineId}
               currentConfig={config}
-              onLoad={(loaded) => updateConfig(loaded)}
+              currentFilters={urlFilters}
+              onLoad={loadSavedChart}
             />
           )}
           <ExportControls
