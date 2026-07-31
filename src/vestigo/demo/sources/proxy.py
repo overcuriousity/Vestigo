@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from vestigo.demo import scenario
@@ -185,7 +185,8 @@ def proxy_rows() -> Iterator[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for builder in (_baseline, _beacon, _exfil):
         rows.extend(builder())
-    rows.sort(key=lambda r: r["datetime"])
+    # On the parsed instant, not the ISO string — see ``linux.linux_rows``.
+    rows.sort(key=lambda r: datetime.fromisoformat(r["datetime"]))
     return iter(rows)
 
 

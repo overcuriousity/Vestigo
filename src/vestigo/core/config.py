@@ -254,6 +254,13 @@ class Settings(BaseSettings):
     # restore it explicitly). Off for deployments where fabricated data in a
     # case list is a policy problem.
     demo_case_enabled: bool = True
+    # Concurrent demo-case builds across the instance; 0 disables the cap.
+    # Generating and ingesting a quarter of a million events is CPU-bound
+    # Python, so it holds the GIL and every concurrent build contends with the
+    # API's own event loop. One at a time keeps a post-upgrade burst of first
+    # logins from making the whole instance feel slow; raise it on a box with
+    # cores to spare.
+    demo_max_concurrent: int = Field(default=1, ge=0)
 
     # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
     # directory scanned for *.yml/*.yaml at run time — an offline file drop

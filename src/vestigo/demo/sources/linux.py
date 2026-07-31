@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from vestigo.demo import scenario
@@ -226,7 +226,11 @@ def linux_rows() -> Iterator[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for builder in (_baseline, _clock_skew, _backup_job, _intrusion):
         rows.extend(builder())
-    rows.sort(key=lambda r: r.get("_arrival") or r["timestamp"])
+    # Sorted on the parsed instant, not the ISO string: string order only
+    # happens to agree with time order while every stamp carries the same UTC
+    # offset and the same microsecond padding, which is not a property worth
+    # relying on.
+    rows.sort(key=lambda r: datetime.fromisoformat(r.get("_arrival") or r["timestamp"]))
     for row in rows:
         row.pop("_arrival", None)
         yield row

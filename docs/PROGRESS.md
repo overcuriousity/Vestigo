@@ -1,9 +1,57 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-30 (session 133 — the demo case).
+Last updated: 2026-07-31 (session 134 — PR #211 review pass).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 134 — 2026-07-31: the demo case, reviewed
+
+**Why.** A review of PR #211 before merge. One bug could take a user's demo case away
+permanently, one endpoint was an authenticated storage-amplification primitive, and the
+rest were smaller correctness and honesty problems.
+
+- **A claim that never dispatched is now released.** `maybe_seed_demo_case` stamped
+  `demo_case_seeded_at` and *then* dispatched; when dispatch hit the concurrency cap the
+  `RuntimeError` was swallowed by the never-fail-a-login handler and the stamp stayed. That
+  is precisely the post-upgrade backfill case — fifty users stamped, one seeded, and no way
+  back for anyone whose case list wasn't empty. `PostgresStore.release_demo_seed` gives an
+  unspent claim back, so the next login retries.
+- **One demo case per account.** `POST /api/demo/seed` had no per-user guard: a loop over it
+  wrote a quarter of a million ClickHouse rows per call. Cases now carry `is_demo`
+  (migration 0023) and the endpoint answers 409 while the caller still has theirs. The same
+  flag keeps other users' copies out of an admin's case list, which would otherwise show one
+  per account, and drives the restore offer's visibility in the UI.
+- **Seeds are cancelled at shutdown.** Nothing cancelled the background tasks, and
+  `build_demo_case`'s teardown caught `Exception` — which `CancelledError` is not — so a
+  shutdown mid-ingest left a half-populated case in someone's list. The lifespan now calls
+  `cancel_pending_seeds()`, and the build tears down on `BaseException`.
+- **The cap is a setting, and it is 1.** The build is CPU-bound Python holding the GIL, so
+  each concurrent seed contends with the API's own loop. `demo_max_concurrent` replaces the
+  hardcoded 2, following `transfer_max_concurrent`. `DEPLOYMENT.md` said the overflow
+  "queues"; it does not.
+- **The full sweep, finally run.** It had never been: 2113 tests, one failure, and it was
+  session 133's own. `test_enrichers.py` carries a second copy of the pre-Alembic column
+  list that `test_postgres_store.py` has, and only the latter was updated for 0022 — so the
+  adoption path tried to add `demo_case_seeded_at` to a column that `create_all` had already
+  made. Both copies now drop both columns. Two copies of that list is the actual defect;
+  the next migration will trip over it again.
+- **The job store is per-test now.** `get_job_store()` is a process-wide singleton, so a
+  test leaving a job queued held an admission slot for every test after it. Invisible while
+  the demo cap was 2 and immediately fatal at 1: a seed that silently never dispatched.
+  An autouse fixture gives each test its own store, which also retires the never-finishing
+  tasks the 429 test used to leak.
+- **A flake worth naming, not fixed.** `find_value_combos` in auto mode picks its two
+  fields from `recommend_novelty_fields`, which ranks on ClickHouse's *approximate*
+  `uniq()`. The demo coverage test caught it going quiet once and never again across
+  repeated runs. The detector is fine; a canary test that can flip is not, and pinning the
+  fields there would trade the auto path — the one the UI actually uses — for a green run.
+  Left as-is deliberately, recorded here so the next flake is not mistaken for a new bug.
+- **Smaller.** Row ordering in the generators sorted ISO *strings* — correct only by
+  accident of a fixed UTC offset, now sorted on the parsed instant. Dead `noqa: BLE001`s
+  (`BLE` is not in the ruff select list) removed. Restore requests are audited at dispatch,
+  not only on success, so an abusive loop is visible. Frontend comments claiming the
+  capability meant "the archive is packaged" outlived the archive by a whole architecture.
 
 ## Session 133 — 2026-07-30: a demo case for every new user
 

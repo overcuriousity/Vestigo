@@ -48,6 +48,21 @@ def transfer_temp(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def fresh_job_store(monkeypatch):
+    """Give every test its own job store.
+
+    ``get_job_store()`` is a process-wide singleton, so without this a test
+    that leaves a job queued or running holds an admission slot for every test
+    after it — the demo seeder's cap is one, which makes that immediately
+    visible as a seed that silently never dispatches.
+    """
+    from vestigo.core import jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod, "_default_store", None)
+    yield
+
+
 @pytest.fixture()
 def admin_bootstrap(monkeypatch):
     """Seed VESTIGO_ADMIN_* env vars and clear the settings cache so the app
@@ -107,6 +122,11 @@ def builds(monkeypatch):
     The build itself is exercised against live services in
     ``tests/test_demo_build_clickhouse.py``; everything here is about the
     dispatch path around it.
+
+    Creates a real (empty) case flagged ``is_demo`` rather than only recording
+    the call: the flag is what the case list filters on and what the restore
+    endpoint refuses against, so a fake that skips it would leave both
+    untested.
     """
     from vestigo.core import demo_case as demo_mod
     from vestigo.demo.build import DemoBuildResult
@@ -114,10 +134,14 @@ def builds(monkeypatch):
     calls = []
 
     async def _fake_build(store, clickhouse, owner_id, progress=None):
-        calls.append({"owner": owner_id})
-        return DemoBuildResult(
-            case_id=f"case_demo{len(calls)}", events=3, sources=4, annotations=25
+        case_id = f"case_demo{len(calls) + 1}"
+        await store.create_case(
+            case_id=case_id, name="Demo (test)", owner_id=owner_id, is_demo=True
         )
+        # Recorded only once the case exists, so a test that waits on the call
+        # count can then query for the case without racing it.
+        calls.append({"owner": owner_id})
+        return DemoBuildResult(case_id=case_id, events=3, sources=4, annotations=25)
 
     monkeypatch.setattr(demo_mod, "build_demo_case", _fake_build)
     return calls

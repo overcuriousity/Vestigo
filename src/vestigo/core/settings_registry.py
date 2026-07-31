@@ -788,6 +788,16 @@ _SPECS: tuple[SettingSpec, ...] = (
         "explicitly. Turning this off stops future seeding and leaves existing copies alone.",
         subsystem="demo_case",
     ),
+    SettingSpec(
+        "demo_max_concurrent",
+        "onboarding",
+        "Concurrent demo-case builds",
+        "Demo cases prepared at once across the instance. The build is CPU-bound, so each "
+        "one competes with the rest of the app; a burst of first logins queues behind this "
+        "and retries at the next login. 0 removes the cap — it does not disable seeding "
+        "(use the switch above for that).",
+        subsystem="demo_case",
+    ),
 )
 
 SPECS_BY_FIELD: dict[str, SettingSpec] = {s.field: s for s in _SPECS}

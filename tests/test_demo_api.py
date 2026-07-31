@@ -52,18 +52,26 @@ def test_login_still_works_when_seeding_is_off(client, admin_bootstrap, builds, 
     assert builds == []
 
 
-def test_restore_endpoint_seeds_again(client, admin_bootstrap, builds):
+def test_restore_endpoint_seeds_again_after_deletion(client, admin_bootstrap, builds):
+    """Deleting the demo case is what makes a restore available again.
+
+    The once-only claim does not apply to an explicit restore — but the
+    one-per-account guard does, so the deletion is the precondition.
+    """
     # as_admin also rotates the bootstrap password, which every mutating
     # endpoint requires before it will answer.
     as_admin(client, admin_bootstrap)
     _wait_for_builds(builds, 1)
     assert len(builds) == 1
 
+    demo = next(c for c in client.get("/api/cases/").json()["cases"] if c["is_demo"])
+    assert client.delete(f"/api/cases/{demo['id']}").status_code == 200
+
     resp = client.post("/api/demo/seed")
     assert resp.status_code == 200, resp.text
     assert resp.json()["job_id"]
     _wait_for_builds(builds, 2)
-    assert len(builds) == 2, "restore is explicit, so the once-only claim does not apply"
+    assert len(builds) == 2
 
 
 def test_restore_endpoint_requires_auth(client):
@@ -84,7 +92,8 @@ def test_restore_endpoint_429_when_too_many_seeds_are_running(client, admin_boot
 
     The fake build never finishes, which is the only way to hold jobs in a
     running state long enough for the cap to be observable from a synchronous
-    client.
+    client. Those tasks are cancelled by the app's lifespan shutdown when the
+    client fixture exits, so they don't hold slots into the next test.
     """
     import asyncio
 
@@ -94,8 +103,29 @@ def test_restore_endpoint_429_when_too_many_seeds_are_running(client, admin_boot
         await asyncio.Event().wait()
 
     monkeypatch.setattr(demo_mod, "build_demo_case", _never_finishes)
-    as_admin(client, admin_bootstrap)  # consumes one slot via the first-login seed
+    # Two slots: one is spent by the first-login seed, leaving exactly one
+    # restore that can succeed before the cap answers.
+    monkeypatch.setenv("VESTIGO_DEMO_MAX_CONCURRENT", "2")
+    get_settings.cache_clear()
+    as_admin(client, admin_bootstrap)
 
     responses = [client.post("/api/demo/seed").status_code for _ in range(3)]
-    assert 429 in responses, responses
-    assert responses.count(200) <= demo_mod.MAX_CONCURRENT_SEEDS
+    assert responses.count(200) == 1, responses
+    assert responses.count(429) == 2, responses
+    monkeypatch.delenv("VESTIGO_DEMO_MAX_CONCURRENT")
+    get_settings.cache_clear()
+
+
+def test_restore_endpoint_409_when_the_user_still_has_one(client, admin_bootstrap, builds):
+    """One demo case per account: a fresh copy costs a deliberate deletion.
+
+    Without this an authenticated user can loop the endpoint and write a
+    quarter of a million ClickHouse rows per call.
+    """
+    as_admin(client, admin_bootstrap)  # the first session seeds one
+    _wait_for_builds(builds, 1)
+
+    resp = client.post("/api/demo/seed")
+    assert resp.status_code == 409, resp.text
+    assert "already have a demo case" in resp.json()["detail"]
+    assert len(builds) == 1, "the refused restore must not have dispatched a build"

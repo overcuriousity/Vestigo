@@ -4,14 +4,17 @@ The case is *generated and ingested* per user (``vestigo.demo.build``) rather
 than restored from a shipped archive: the generator is deterministic, so every
 copy is identical anyway, and the repository carries a few hundred lines of
 code instead of a 146 MiB binary that would need regenerating on every schema
-change. Once seeded it is an ordinary case — annotate it, export it, delete it;
-nothing here treats it specially afterwards.
+change. Once seeded it is an ordinary case — annotate it, export it, delete it —
+except that it is flagged ``is_demo``, which keeps other users' copies out of an
+administrator's case list and bounds the restore endpoint to one per account.
 
 Seeding is claimed atomically per user (``PostgresStore.claim_demo_seed``) and
 runs as a background job, so a login never waits on it and never fails because
 of it. The claim is stamped before the build starts: a user whose build fails
 sees a failed job and can restore explicitly, which beats rebuilding on every
-subsequent login.
+subsequent login. A claim that never became a running build is given back
+(``release_demo_seed``), so a full concurrency cap costs a user nothing but a
+wait until their next login.
 """
 
 from __future__ import annotations
@@ -30,14 +33,13 @@ logger = logging.getLogger(__name__)
 
 JOB_KIND = "demo_seed"
 
-#: Concurrent seeds allowed instance-wide. Each one ingests a quarter of a
-#: million events, so a burst of first logins after an upgrade should queue
-#: behind itself rather than compete for the whole box.
-MAX_CONCURRENT_SEEDS = 2
-
 #: Background seed tasks, kept referenced so the event loop cannot collect a
 #: running task mid-import (asyncio holds only weak references to tasks).
 _pending: set[asyncio.Task] = set()
+
+
+class DemoCaseExists(Exception):
+    """The caller already has a demo case, so there is nothing to restore."""
 
 
 async def maybe_seed_demo_case(user: User) -> str | None:
@@ -57,16 +59,26 @@ async def maybe_seed_demo_case(user: User) -> str | None:
     try:
         from vestigo.api.deps import get_store
 
-        if not await get_store().claim_demo_seed(user.id):
+        store = get_store()
+        if not await store.claim_demo_seed(user.id):
             return None
-        return _dispatch(user)
-    except Exception:  # noqa: BLE001 — seeding must never break a login
+        try:
+            return _dispatch(user)
+        except Exception:
+            # The claim is spent only once a build is actually running. A
+            # dispatch that never got that far — the concurrency cap is full
+            # during a post-upgrade burst of logins, say — must give the stamp
+            # back, or this user is marked seeded and never offered the case
+            # again. Their next login retries.
+            await store.release_demo_seed(user.id)
+            raise
+    except Exception:  # seeding must never break a login
         logger.exception("demo seeding failed to start for user %s", user.id)
         return None
 
 
 async def seed_demo_case(user: User) -> str:
-    """Seed unconditionally — the explicit "restore demo case" action.
+    """Seed on request — the explicit "restore demo case" action.
 
     Args:
         user: The account asking for a fresh copy.
@@ -75,13 +87,20 @@ async def seed_demo_case(user: User) -> str:
         The background job's id.
 
     Raises:
+        DemoCaseExists: When the caller still has the one they were given.
         RuntimeError: When too many seeds are already running.
     """
     from vestigo.api.deps import get_store
 
+    store = get_store()
+    # One demo case per account at a time. Without this an authenticated user
+    # can loop this endpoint and write a quarter of a million ClickHouse rows
+    # per call; with it, a fresh copy costs a deliberate deletion first.
+    if await store.find_demo_case_for_owner(user.id) is not None:
+        raise DemoCaseExists("this user already has a demo case")
     # Best-effort stamp so a restore also closes out a never-seeded account;
     # already-claimed is the normal case here and is not an error.
-    await get_store().claim_demo_seed(user.id)
+    await store.claim_demo_seed(user.id)
     return _dispatch(user)
 
 
@@ -89,11 +108,11 @@ def _dispatch(user: User) -> str:
     """Create the job row and start its background task.
 
     Raises:
-        RuntimeError: When ``MAX_CONCURRENT_SEEDS`` builds are already running.
+        RuntimeError: When ``demo_max_concurrent`` builds are already running.
     """
     job = get_job_store().create_if_under(
         kinds=(JOB_KIND,),
-        limit=MAX_CONCURRENT_SEEDS,
+        limit=get_settings().demo_max_concurrent,
         kind=JOB_KIND,
         progress={"phase": "queued", "processed": 0, "total": None},
         created_by=user.id,
@@ -138,9 +157,29 @@ async def _run_seed_job(job_id: str, user: User) -> None:
             status="completed",
             result={"case_id": result.case_id, "counts": counts},
         )
-    except Exception as exc:  # noqa: BLE001 — job error surface
+    except asyncio.CancelledError:
+        # Shutdown. ``build_demo_case`` has already torn its partial case down
+        # by the time this arrives; the job store is in-memory and dies with
+        # the process, so there is nothing further to record.
+        jobs.update(job_id, status="failed", error="cancelled at shutdown")
+        raise
+    except Exception as exc:  # job error surface
         logger.exception("demo seed job %s failed", job_id)
         jobs.update(job_id, status="failed", error=str(exc))
+
+
+async def cancel_pending_seeds() -> None:
+    """Cancel in-flight seed tasks and wait for their cleanup to finish.
+
+    Called from the app's lifespan shutdown. Without it a seed interrupted
+    mid-ingest leaves a half-populated case sitting in someone's list: the
+    process exits while the build is between sources, and nothing ever runs
+    the teardown that a failed build does.
+    """
+    for task in tuple(_pending):
+        task.cancel()
+    while _pending:
+        await asyncio.gather(*tuple(_pending), return_exceptions=True)
 
 
 async def _await_pending_seeds() -> None:

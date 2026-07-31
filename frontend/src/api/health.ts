@@ -34,8 +34,8 @@ const ASSUME_AVAILABLE: Capabilities = {
   enrichers: true,
   sigma: true,
   transfer: true,
-  // Like the agent: stays hidden until probed. The restore offer is only
-  // honest once health confirms the archive is actually packaged.
+  // Like the agent: stays hidden until probed. Offering to load a demo case
+  // is only honest once health confirms the instance will actually seed one.
   demo_case: false,
 };
 

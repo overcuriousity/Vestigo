@@ -258,6 +258,7 @@ async def build_demo_case(
             name=CASE_NAME,
             description=CASE_DESCRIPTION,
             owner_id=owner_id,
+            is_demo=True,
         )
         _phase("ingest", len(SOURCES))
         ingested = await _ingest(store, clickhouse, case_id, owner_id, paths, progress)
@@ -272,15 +273,18 @@ async def build_demo_case(
             sources=len(ingested),
             annotations=annotations,
         )
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a seed cancelled at shutdown raises
+        # CancelledError, and that is exactly the case where a half-populated
+        # case would otherwise survive into the next boot.
         for source_id in ingested.values():
             try:
                 clickhouse.delete_source_events(case_id, source_id)
-            except Exception:  # noqa: BLE001 — cleanup must not mask the real error
+            except Exception:  # cleanup must not mask the real error
                 logger.exception("demo cleanup: could not drop events for %s", source_id)
         try:
             await store.delete_case(case_id)
-        except Exception:  # noqa: BLE001 — same
+        except Exception:  # same
             logger.exception("demo cleanup: could not delete case %s", case_id)
         raise
     finally:

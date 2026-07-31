@@ -430,6 +430,10 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         )
         # 0012 adds the per-user preferences blob.
         await conn.execute(text("ALTER TABLE users DROP COLUMN preferences"))
+        # 0022 adds the demo-case seed stamp.
+        await conn.execute(text("ALTER TABLE users DROP COLUMN demo_case_seeded_at"))
+        # 0023 marks seeded demo cases.
+        await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(

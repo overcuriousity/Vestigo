@@ -165,7 +165,8 @@ def netflow_rows() -> Iterator[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for builder in (_baseline, _beacon_mirror, _exfil_sessions, _lateral_scan):
         rows.extend(builder())
-    rows.sort(key=lambda r: r["datetime"])
+    # On the parsed instant, not the ISO string — see ``linux.linux_rows``.
+    rows.sort(key=lambda r: datetime.fromisoformat(r["datetime"]))
     return iter(rows)
 
 
