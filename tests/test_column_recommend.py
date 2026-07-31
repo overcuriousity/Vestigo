@@ -68,6 +68,30 @@ def test_per_row_unique_field_is_rejected():
     assert "row_seq" not in _tokens(stats)
 
 
+def test_per_row_unique_field_is_rejected_across_several_sources():
+    """The uniqueness test is per source: summing coverage would hide this.
+
+    ``distinct`` is max-across-sources while ``coverage`` sums, so four
+    1000-event sources carrying a per-row-unique value read as a 0.25
+    aggregate ratio — full grouping credit for the emptiest column on the
+    grid, and boosted by breadth on top.
+    """
+    stats = {
+        f"s{i}": _source(1000, {"session_ref": _attr(1000, 1000, ["ref-9182", "ref-3341"])})
+        for i in range(4)
+    }
+    assert "session_ref" not in _tokens(stats)
+
+
+def test_a_grouping_field_survives_across_several_sources():
+    """The per-source gate must not take real columns down with it."""
+    stats = {
+        f"s{i}": _source(1000, {"user": _attr(1000, 20, ["alice", "bob", "carol"])})
+        for i in range(4)
+    }
+    assert "user" in _tokens(stats)
+
+
 def test_uniqueness_gate_does_not_fire_on_a_tiny_source():
     """With 12 events, "12 distinct" says nothing — the gate must not reject."""
     stats = {"s1": _source(12, {"user": _attr(12, 12, ["alice", "bob", "carol"])})}

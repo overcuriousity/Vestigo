@@ -226,20 +226,47 @@ def _name_affinity(token: str) -> float:
     return min(1.0, 0.7 + 0.3 * (hits - 1))
 
 
-def _cardinality_score(distinct: int, coverage: int) -> float | None:
+def _uniqueness_ratio(per_source: list[tuple[int, int]]) -> float | None:
+    """Highest per-source ``distinct / coverage``, or None on too little evidence.
+
+    Measured **per source, never on the aggregate**: ``distinct`` is
+    max-across-sources while ``coverage`` sums across them, so an aggregate
+    ratio is divided by the number of sources. A field that is unique on every
+    row of four 1000-event sources would read as 1000/4000 = 0.25 — full
+    grouping credit for the emptiest column on the grid, and worst exactly
+    where breadth (the heaviest weight) is highest.
+
+    Sources below :data:`_MIN_COVERAGE_FOR_UNIQUENESS` are ignored: with 12
+    values, "12 distinct" says nothing. None means no source carried enough
+    values to judge.
+    """
+    rated = [
+        min(1.0, distinct / coverage)
+        for distinct, coverage in per_source
+        if coverage >= _MIN_COVERAGE_FOR_UNIQUENESS
+    ]
+    return max(rated) if rated else None
+
+
+def _cardinality_score(
+    distinct: int, coverage: int, per_source: list[tuple[int, int]]
+) -> float | None:
     """Score how well a field *groups*, or None when it should be rejected.
 
     Rejects a constant (nothing to read) and a per-row-unique value (nothing
     to compare). ``distinct`` is max-across-sources — a documented
     approximation of the union in ``db/field_stats.py`` — so the uniqueness
-    test only applies once a field has enough values for the approximation to
-    mean anything.
+    test runs off :func:`_uniqueness_ratio` and only applies once some source
+    has enough values for the approximation to mean anything. Below that, the
+    aggregate ratio still tapers the score; it just cannot reject.
     """
     if distinct <= 1:
         return None
-    ratio = min(1.0, distinct / coverage) if coverage > 0 else 1.0
-    if coverage >= _MIN_COVERAGE_FOR_UNIQUENESS and ratio >= 0.95:
+    ratio = _uniqueness_ratio(per_source)
+    if ratio is not None and ratio >= 0.95:
         return None
+    if ratio is None:
+        ratio = min(1.0, distinct / coverage) if coverage > 0 else 1.0
     # log10-scaled: 10 distinct -> 0.5, 100+ -> 1.0. More values means more to
     # tell apart, with diminishing returns.
     diversity = min(1.0, math.log10(distinct) / 2.0)
@@ -372,12 +399,17 @@ def score_columns(
                         "coverage": 0,
                         "distinct": 0,
                         "sources": 0,
+                        "per_source": [],
                         "samples": [],
                         "top_level": section == "top_level",
                     },
                 )
+                entry_distinct = int(entry.get("distinct", 0))
                 acc["coverage"] += coverage
-                acc["distinct"] = max(acc["distinct"], int(entry.get("distinct", 0)))
+                acc["distinct"] = max(acc["distinct"], entry_distinct)
+                # Kept unaggregated: the uniqueness test is only meaningful
+                # within one source (see _uniqueness_ratio).
+                acc["per_source"].append((entry_distinct, coverage))
                 acc["sources"] += 1
                 acc["samples"].extend(_entry_samples(entry)[:5])
 
@@ -385,7 +417,7 @@ def score_columns(
     for token, acc in merged.items():
         coverage = int(acc["coverage"])
         distinct = int(acc["distinct"])
-        cardinality = _cardinality_score(distinct, coverage)
+        cardinality = _cardinality_score(distinct, coverage, acc["per_source"])
         if cardinality is None:
             continue
         shape = _shape_factor(acc["samples"])

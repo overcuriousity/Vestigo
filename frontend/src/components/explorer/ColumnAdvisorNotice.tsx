@@ -34,8 +34,15 @@ interface Props {
   onConfirm: () => void;
   /** True while the opt-in write or the job request is in flight. */
   pending?: boolean;
-  /** Shown when the opt-in could not be saved — the run is not started. */
-  error?: boolean;
+  /**
+   * Which half of the confirm failed, if either. `"save"` is the opt-in write,
+   * after which the run is never attempted; `"run"` is the request to start
+   * the job, which the saved opt-in outlived. Nothing has left the machine in
+   * either case — the advisor only runs server-side, once the job starts — but
+   * telling an analyst their opt-in "did not save" when it did is how they end
+   * up re-authorizing something they already authorized.
+   */
+  error?: "save" | "run" | null;
 }
 
 export function ColumnAdvisorNotice({ open, onOpenChange, onConfirm, pending, error }: Props) {
@@ -94,7 +101,9 @@ export function ColumnAdvisorNotice({ open, onOpenChange, onConfirm, pending, er
 
         {error && (
           <p className="mt-3 text-xs text-[var(--color-danger)]">
-            That did not save — nothing was sent. Try again.
+            {error === "save"
+              ? "That did not save — nothing was sent. Try again."
+              : "Your choice was saved, but the suggestion did not start — nothing was sent. Try again."}
           </p>
         )}
 

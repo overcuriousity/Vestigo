@@ -1,9 +1,47 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 140 — column-suggestion review pass).
+Last updated: 2026-07-31 (session 141 — second column-suggestion review pass).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 141 — 2026-07-31: the scorer's uniqueness test was per-timeline, not per-source (PR #214)
+
+**Why.** A second review of #214 found the endpoint tests never ran the endpoint, and
+one scoring bug that got *worse* the more sources a timeline held — the shape the
+feature exists for.
+
+- **Per-row-unique fields ranked first on multi-source timelines.** `distinct` is
+  max-across-sources while `coverage` sums across them, so the uniqueness ratio was
+  divided by the source count: four 1000-event sources carrying a unique-per-row value
+  read as 1000/4000 = 0.25, inside the full-grouping-credit band, then boosted by
+  breadth (the heaviest weight). Measured `1.06` — top of the list — for the emptiest
+  possible column, while identical single-source data was correctly rejected.
+  `score_columns` now keeps the per-source `(distinct, coverage)` pairs and
+  `_uniqueness_ratio` takes the max ratio over sources that clear
+  `_MIN_COVERAGE_FOR_UNIQUENESS`, falling back to the aggregate (taper only, no
+  rejection) when no source has enough values to judge — which is what preserves the
+  tiny-source behaviour.
+- **Four endpoint tests posted to `/api/cases` instead of `/api/cases/`** and died on
+  405 before reaching the assertion. The contribute gate on
+  `POST .../recommend-columns` and the `use_ai` passthrough — the two guards on shared
+  state and on egress — were untested in practice. Both now genuinely run.
+- **`_MAX_PREFERENCE_ENTRIES` is enforced on the merged blob**, not only on the request.
+  The endpoint merges one level down, so 500 fresh keys per call grew the row without
+  bound — exactly what the limit exists to stop. Over the ceiling is a 400, never a
+  silent truncation: dropping an opt-in the caller believes it recorded is how a
+  disclosure gets skipped. Inner keys are also length-bounded (128).
+- **A dead `running` payload now settles on the timeline *list* too**, not only the
+  single read. The two endpoints reporting different states for the same timeline was
+  the bug; a caller that only ever lists never saw it resolve.
+- **The disclosure no longer claims a saved opt-in was lost.** The confirm is two steps
+  (persist the opt-in, then start the job) and both fed one boolean, so a failed job
+  request read as "that did not save". Errors are now `"save"` / `"run"`, with copy per
+  case. Nothing leaves the machine either way.
+- **`_ACTIVE` is claimed with `setdefault` before the `try`**, so the job never stomps a
+  slot another job holds and the `finally` never releases one it did not take. The API
+  path claims it in `start_column_recommendation` before spawning; the CLI path claims
+  it here.
 
 ## Session 140 — 2026-07-31: the column-suggestion review, and one setting fewer (PR #214)
 

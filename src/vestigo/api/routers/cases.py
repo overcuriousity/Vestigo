@@ -943,6 +943,12 @@ async def list_timelines(case: Case = Depends(require_case_read)) -> dict[str, A
     """List timelines within a case."""
     store = get_store()
     timelines = await store.list_timelines(case.id)
+    # Same settling as the single-timeline read (#213): a list that keeps
+    # reporting `running` for a job that died would have the two endpoints
+    # disagreeing about the same timeline, and callers that only ever list
+    # (the timelines page) would never see it resolve.
+    for timeline in timelines:
+        await _settle_dead_recommendation(store, case.id, timeline)
     return {"timelines": [t.to_dict() for t in timelines]}
 
 
@@ -959,7 +965,9 @@ async def _settle_dead_recommendation(
     without writing (which the placeholder rollback normally handles).
 
     Mutates ``timeline`` in place so the caller serializes the settled payload
-    without a second read.
+    without a second read. Called from both the single read and the list, and
+    a no-op for every timeline that is not mid-recommendation — which is all
+    of them, almost always.
     """
     payload = timeline.recommended_columns
     if not isinstance(payload, dict) or payload.get("status") != "running":

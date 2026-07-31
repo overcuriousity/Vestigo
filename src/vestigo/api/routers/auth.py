@@ -74,8 +74,16 @@ _ALLOWED_PREFERENCE_KEYS: dict[str, type] = {
 
 #: Ceiling on entries in a dict-valued preference. High enough that no real
 #: analyst reaches it (one entry per timeline they opted in on), low enough
-#: that the blob cannot be grown into storage by a scripted client.
+#: that the blob cannot be grown into storage by a scripted client. Enforced
+#: on the *merged* result too (see :func:`update_my_preferences`) — checking
+#: only the request would let repeated calls of 500 fresh keys grow the row
+#: without bound, which is the thing this limit exists to stop.
 _MAX_PREFERENCE_ENTRIES = 500
+
+#: Ceiling on one key inside a dict-valued preference. The real keys are ids
+#: (a timeline id is 32 characters); this only has to stop a megabyte of
+#: string from being stored as a key.
+_MAX_PREFERENCE_KEY_LENGTH = 128
 
 
 class UpdatePreferencesRequest(BaseModel):
@@ -104,6 +112,11 @@ class UpdatePreferencesRequest(BaseModel):
                 for inner_key, inner in entry.items():
                     if not isinstance(inner_key, str) or not inner_key:
                         raise ValueError(f"Preference {key} keys must be non-empty strings")
+                    if len(inner_key) > _MAX_PREFERENCE_KEY_LENGTH:
+                        raise ValueError(
+                            f"Preference {key} keys may be at most "
+                            f"{_MAX_PREFERENCE_KEY_LENGTH} characters"
+                        )
                     if not isinstance(inner, bool):
                         raise ValueError(f"Preference {key} values must be booleans")
         return value
@@ -281,6 +294,12 @@ async def update_my_preferences(
     tab or a second machine adding its own entry cannot drop the entries this
     one already had. The store's own merge is top-level only, and it is shared
     with callers that want replace semantics — hence doing it here.
+
+    The merge is where :data:`_MAX_PREFERENCE_ENTRIES` actually has to hold:
+    the request validator only sees one request, and a client sending 500
+    fresh keys per call would otherwise grow the row for as long as it kept
+    calling. Over the limit is a 400, not a silent truncation — dropping an
+    opt-in the caller believes it recorded is how a disclosure gets skipped.
     """
     if not payload.preferences:
         return {"user": _user_response(user, await _teams_for_user(user))}
@@ -289,7 +308,13 @@ async def update_my_preferences(
     for key, value in payload.preferences.items():
         if isinstance(value, dict):
             current = existing.get(key)
-            patch[key] = {**current, **value} if isinstance(current, dict) else dict(value)
+            merged = {**current, **value} if isinstance(current, dict) else dict(value)
+            if len(merged) > _MAX_PREFERENCE_ENTRIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"Preference {key} may hold at most {_MAX_PREFERENCE_ENTRIES} entries"),
+                )
+            patch[key] = merged
         else:
             patch[key] = value
     updated = await get_store().update_user_preferences(user.id, patch)

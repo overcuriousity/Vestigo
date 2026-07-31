@@ -254,7 +254,37 @@ def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bo
         ).status_code
         == 422
     )
+    assert (
+        client.put(
+            "/api/auth/me/preferences",
+            json={"preferences": {"column_advisor_optin": {"t" * 129: True}}},
+        ).status_code
+        == 422
+    )
     assert (client.get("/api/auth/me").json()["user"]["preferences"] or {}) == {}
+
+
+def test_update_my_preferences_bounds_the_merged_blob(client, admin_bootstrap):
+    """The cap has to survive the merge, or repeated calls grow the row forever."""
+    as_admin(client, admin_bootstrap)
+
+    for batch in range(2):
+        resp = client.put(
+            "/api/auth/me/preferences",
+            json={
+                "preferences": {
+                    "column_advisor_optin": {f"tl-{batch}-{i}": True for i in range(300)}
+                }
+            },
+        )
+        if batch == 0:
+            assert resp.status_code == 200, resp.text
+        else:
+            # 300 already stored + 300 fresh = 600, over the ceiling.
+            assert resp.status_code == 400, resp.text
+
+    stored = client.get("/api/auth/me").json()["user"]["preferences"]
+    assert len(stored["column_advisor_optin"]) == 300
 
 
 def test_update_own_profile_rejects_duplicate_username(client, admin_bootstrap, store):

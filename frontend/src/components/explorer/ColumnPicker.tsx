@@ -205,6 +205,14 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
   });
 
   const recommendRunning = recommendMutation.isPending || isSuggesting(recommended);
+  // Which half failed: the opt-in write, or the run it gates. The run only
+  // ever executes once the write succeeded, so a failed run means the opt-in
+  // is on record and must not be reported as lost.
+  const optInError = optInAndRecommend.isError
+    ? recommendMutation.isError
+      ? "run"
+      : "save"
+    : null;
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],
@@ -447,7 +455,7 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
         onOpenChange={setNoticeOpen}
         onConfirm={() => optInAndRecommend.mutate()}
         pending={optInAndRecommend.isPending}
-        error={optInAndRecommend.isError}
+        error={optInError}
       />
     </Popover>
   );

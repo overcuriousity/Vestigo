@@ -78,9 +78,16 @@ describe("ColumnAdvisorNotice", () => {
   });
 
   it("reports a failed opt-in as nothing having been sent", async () => {
-    renderNotice({ error: true });
+    renderNotice({ error: "save" });
 
-    expect(await screen.findByText(/nothing was sent/i)).toBeInTheDocument();
+    expect(await screen.findByText(/did not save — nothing was sent/i)).toBeInTheDocument();
+  });
+
+  it("does not claim a saved opt-in was lost when the run is what failed", async () => {
+    renderNotice({ error: "run" });
+
+    expect(await screen.findByText(/was saved, but the suggestion did not start/i)).toBeInTheDocument();
+    expect(screen.getByText(/nothing was sent/i)).toBeInTheDocument();
   });
 
   it("is not rendered at all when closed", () => {

@@ -186,13 +186,17 @@ async def run_column_recommendation_job(
     ``agent_available()`` gate on top, so asking for it on an instance with no
     model configured simply keeps the heuristic answer.
 
-    ``_ACTIVE`` is claimed inside the ``try`` so the ``finally`` releases it on
-    every exit path, including any guard clause added later.
+    ``_ACTIVE`` is claimed *before* the ``try`` — and only when this job does
+    not already hold it, which is the API path, where
+    :func:`start_column_recommendation` claimed it before spawning the task so
+    no burst can slip a second job in between. The claim is outside the ``try``
+    only so the ``finally`` cannot release a slot this job never took; it
+    releases on every other exit path, including any guard clause added later.
     """
     job_store.update(job_id, status="running", progress={"phase": "fields"})
     previous: dict[str, Any] | None = None
+    _ACTIVE.setdefault(timeline_id, job_id)
     try:
-        _ACTIVE[timeline_id] = job_id
         timeline = await store.get_timeline(case_id, timeline_id)
         if timeline is None:
             job_store.update(job_id, status="failed", error="Timeline not found")

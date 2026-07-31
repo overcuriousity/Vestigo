@@ -395,6 +395,28 @@ async def test_reading_a_timeline_respects_a_job_the_store_still_knows(store, mo
     assert timeline.recommended_columns["status"] == "running"
 
 
+@pytest.mark.asyncio
+async def test_listing_timelines_settles_a_recommendation_whose_job_is_gone(store):
+    """The list has to agree with the single read, or a lister never sees it resolve."""
+    from vestigo.api.routers.cases import list_timelines
+
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    await store.update_timeline_recommended_columns(
+        case_id, timeline_id, dict(good, status="running", job_id="job-that-died")
+    )
+
+    case = await store.get_case(case_id)
+    listed = await list_timelines(case=case)
+
+    payload = next(t["recommended_columns"] for t in listed["timelines"] if t["id"] == timeline_id)
+    assert payload["status"] == "ok"
+    assert payload["job_id"] is None
+    stored = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert stored["status"] == "ok"
+
+
 # ── The advisor hand-off ────────────────────────────────────────────────────
 
 
@@ -538,7 +560,7 @@ def test_advisor_validation_keeps_reasons_only_for_chosen_columns():
 def test_recommend_endpoint_starts_a_local_job_by_default(client, admin_bootstrap):
     """No body means no AI: the plain "Re-suggest" button must not send anything."""
     as_admin(client, admin_bootstrap)
-    case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
+    case_id = client.post("/api/cases/", json={"name": "Columns"}).json()["case"]["id"]
     timeline_id = client.get(f"/api/cases/{case_id}/timelines").json()["timelines"][0]["id"]
 
     resp = client.post(f"/api/cases/{case_id}/timelines/{timeline_id}/recommend-columns")
@@ -559,7 +581,7 @@ def test_recommend_endpoint_passes_the_opt_in_through(client, admin_bootstrap, m
 
     monkeypatch.setattr("vestigo.api.routers.cases.start_column_recommendation", _capture)
     as_admin(client, admin_bootstrap)
-    case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
+    case_id = client.post("/api/cases/", json={"name": "Columns"}).json()["case"]["id"]
     timeline_id = client.get(f"/api/cases/{case_id}/timelines").json()["timelines"][0]["id"]
 
     resp = client.post(
@@ -574,7 +596,7 @@ def test_recommend_endpoint_passes_the_opt_in_through(client, admin_bootstrap, m
 
 def test_recommend_endpoint_404s_on_an_unknown_timeline(client, admin_bootstrap):
     as_admin(client, admin_bootstrap)
-    case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
+    case_id = client.post("/api/cases/", json={"name": "Columns"}).json()["case"]["id"]
 
     resp = client.post(f"/api/cases/{case_id}/timelines/nope/recommend-columns")
 
@@ -584,7 +606,7 @@ def test_recommend_endpoint_404s_on_an_unknown_timeline(client, admin_bootstrap)
 def test_recommend_endpoint_needs_contribute_access(client, admin_bootstrap, store):
     """A read-only member must not change what the timeline opens on for everyone."""
     as_admin(client, admin_bootstrap)
-    case_id = client.post("/api/cases", json={"name": "Columns"}).json()["case"]["id"]
+    case_id = client.post("/api/cases/", json={"name": "Columns"}).json()["case"]["id"]
     timeline_id = client.get(f"/api/cases/{case_id}/timelines").json()["timelines"][0]["id"]
     client.post(
         "/api/admin/users",
