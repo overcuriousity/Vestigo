@@ -44,6 +44,14 @@ export interface User {
   last_login_at: string | null;
   /** Only present on /auth/me and /auth/me/password responses. */
   teams?: TeamMembershipSummary[];
+  /**
+   * Per-user UI state that has to outlive one browser — currently the agent's
+   * `agent_disabled_tools` and `column_advisor_optin` (issue #213), a
+   * `{ [timelineId]: true }` map of the timelines this user has opted in to AI
+   * column suggestions on. Written through the whitelisted
+   * `PUT /auth/me/preferences`.
+   */
+  preferences?: Record<string, unknown> | null;
 }
 
 export interface Team {
@@ -132,8 +140,33 @@ export interface Timeline {
   embedded_at: string | null;
   /** Canonical field name -> ordered raw attribute keys (query-time merge). */
   field_mappings: Record<string, string[]> | null;
+  /** Data-derived default grid columns, shared by everyone with access. */
+  recommended_columns: RecommendedColumns | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * A timeline's suggested event-grid columns (issue #213), derived from its own
+ * field statistics rather than a fixed default.
+ *
+ * `status` is the whole contract: `running` while a job is in flight,
+ * `ok` when `columns` should be applied, and `insufficient` when the backend
+ * looked and found nothing worth suggesting — in which case the grid keeps
+ * `DEFAULT_COLUMNS`. A per-user column choice always outranks this.
+ */
+export interface RecommendedColumns {
+  status: "ok" | "insufficient" | "running";
+  /** Grid column ids, `timestamp` first. Empty unless `status === "ok"`. */
+  columns: string[];
+  /** Column id -> why it was chosen; shown as a tooltip in the picker. */
+  reasons: Record<string, string>;
+  /** Which path produced this — the deterministic scorer, or the LLM on top. */
+  method: "heuristic" | "llm";
+  model: string | null;
+  source_ids: string[];
+  generated_at: string;
+  job_id: string | null;
 }
 
 /** Per-source presence of one raw attribute key (timeline wizard). */

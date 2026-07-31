@@ -4,12 +4,24 @@
  * Fetches the timeline's field list from /fields (top-level + dynamic
  * attributes) and renders a searchable checkbox list.  Selection is persisted
  * to the UI store (localStorage) via setVisibleColumns.
+ *
+ * Columns the backend suggested for this timeline (issue #213) are marked, and
+ * carry the evidence behind the suggestion in a tooltip — a default an analyst
+ * cannot interrogate is a default they have to take on faith.  The footer is
+ * where the suggestion is recomputed, locally or — after the disclosure in
+ * `ColumnAdvisorNotice` — with the configured model.
  */
 import { useState, useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search, Sparkles } from "lucide-react";
+import { authApi } from "@/api/auth";
 import { eventsApi } from "@/api/events";
+import { useCapabilities } from "@/api/health";
+import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { useAuthStore } from "@/stores/auth";
+import { useJobsStore } from "@/stores/jobs";
+import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -19,11 +31,24 @@ import {
   PopoverContent,
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
+import {
+  COLUMN_ADVISOR_OPTIN,
+  hasColumnAdvisorOptIn,
+  hasSuggestion,
+  isSuggesting,
+  resolveVisibleColumns,
+  suggestedColumns,
+} from "@/lib/columns";
 import { splitDerivedKey } from "@/lib/enrichment";
+import type { RecommendedColumns } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
+  /** The timeline's stored suggestion, or null/undefined when it has none. */
+  recommended?: RecommendedColumns | null;
+  /** Whether this analyst may recompute the shared suggestion. */
+  canRecommend?: boolean;
 }
 
 /** Human-readable labels for the built-in top-level columns. */
@@ -42,11 +67,14 @@ function ColumnRow({
   label,
   checked,
   onChange,
+  suggestedReason,
 }: {
   id: string;
   label: string;
   checked: boolean;
   onChange: (id: string, checked: boolean) => void;
+  /** Present when this column is part of the timeline's suggestion. */
+  suggestedReason?: string;
 }) {
   return (
     <label
@@ -64,6 +92,17 @@ function ColumnRow({
       <span className={cn("flex-1 truncate", checked && "text-[var(--color-fg-primary)]")}>
         {label}
       </span>
+      {suggestedReason !== undefined && (
+        <span
+          title={suggestedReason ? `Suggested — ${suggestedReason}` : "Suggested"}
+          aria-label={
+            suggestedReason ? `Suggested column: ${suggestedReason}` : "Suggested column"
+          }
+          className="shrink-0 text-[var(--color-accent)]"
+        >
+          <Sparkles size={11} />
+        </span>
+      )}
     </label>
   );
 }
@@ -110,12 +149,70 @@ function DerivedGroup({
   );
 }
 
-export function ColumnPicker({ caseId, timelineId }: Props) {
+export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: Props) {
   const [search, setSearch] = useState("");
   const tlKey = `${caseId}/${timelineId}`;
-  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
   const setVisibleColumnsStore = useUiStore((s) => s.setVisibleColumns);
   const setVisibleColumns = (cols: string[]) => setVisibleColumnsStore(tlKey, cols);
+  const suggestion = useMemo(() => suggestedColumns(recommended), [recommended]);
+  // Through the shared resolver, not a local copy of the same three-way
+  // precedence — the ticks here must match what the grid is rendering.
+  const visibleColumns = useMemo(
+    () => resolveVisibleColumns(storedColumns, recommended),
+    [storedColumns, recommended],
+  );
+  const suggestedReasons = hasSuggestion(recommended) ? recommended.reasons : {};
+  const suggestedSet = useMemo(() => new Set(suggestion ?? []), [suggestion]);
+
+  const queryClient = useQueryClient();
+  const addJob = useJobsStore((s) => s.addJob);
+  const user = useAuthStore((s) => s.user);
+  const setUser = useAuthStore((s) => s.setUser);
+  const agentAvailable = useCapabilities().agent;
+  const [noticeOpen, setNoticeOpen] = useState(false);
+  const optedIn = hasColumnAdvisorOptIn(user?.preferences, timelineId);
+
+  const recommendMutation = useMutation({
+    mutationFn: (useAi: boolean) => timelinesApi.recommendColumns(caseId, timelineId, useAi),
+    onSuccess: (result) => {
+      // A null job id means one was already running — refetching the timeline
+      // is still the right move, since that in-flight job is what the status
+      // line is waiting on.
+      if (result.job_id) {
+        addJob(result.job_id, "Suggesting columns", [
+          ["timeline", caseId, timelineId],
+          ["fields", caseId, timelineId],
+        ]);
+      }
+      queryClient.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      setNoticeOpen(false);
+    },
+  });
+
+  // The opt-in is persisted *before* the run, and the run only happens if that
+  // write succeeded: a request that sends evidence must never be one the user
+  // will be asked to authorize again because the record of it was lost.
+  const optInAndRecommend = useMutation({
+    mutationFn: async () => {
+      const updated = await authApi.updatePreferences({
+        [COLUMN_ADVISOR_OPTIN]: { [timelineId]: true },
+      });
+      setUser(updated);
+      queryClient.setQueryData(["auth", "me"], updated);
+      return recommendMutation.mutateAsync(true);
+    },
+  });
+
+  const recommendRunning = recommendMutation.isPending || isSuggesting(recommended);
+  // Which half failed: the opt-in write, or the run it gates. The run only
+  // ever executes once the write succeeded, so a failed run means the opt-in
+  // is on record and must not be reported as lost.
+  const optInError = optInAndRecommend.isError
+    ? recommendMutation.isError
+      ? "run"
+      : "save"
+    : null;
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],
@@ -243,6 +340,9 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                       label={c.label}
                       checked={visibleSet.has(c.id)}
                       onChange={toggle}
+                      suggestedReason={
+                        suggestedSet.has(c.id) ? (suggestedReasons[c.id] ?? "") : undefined
+                      }
                     />
                   ))}
                 </div>
@@ -260,6 +360,9 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                         label={id}
                         checked={visibleSet.has(id)}
                         onChange={toggle}
+                        suggestedReason={
+                          suggestedSet.has(id) ? (suggestedReasons[id] ?? "") : undefined
+                        }
                       />
                       {children.length > 0 && (
                         <DerivedGroup
@@ -303,16 +406,57 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
           )}
         </div>
 
-        {/* Reset footer */}
-        <div className="border-t border-[var(--color-border)] p-2">
+        {/* Reset / suggestion footer */}
+        <div className="flex flex-wrap items-center gap-1 border-t border-[var(--color-border)] p-2">
           <button
             className="flex items-center gap-1.5 text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-base"
-            onClick={() => setVisibleColumns(DEFAULT_COLUMNS)}
+            // Clears this browser's override rather than writing one. That is
+            // what lets the timeline's suggestion — including a later
+            // recomputation — reach this analyst again; writing
+            // DEFAULT_COLUMNS here would quietly opt them out of it forever.
+            onClick={() => setVisibleColumnsStore(tlKey, undefined)}
+            disabled={!storedColumns}
+            title={
+              suggestion
+                ? "Show the columns suggested for this timeline"
+                : "Show the built-in default columns"
+            }
           >
             <RotateCcw size={10} /> Reset to defaults
           </button>
+          {canRecommend && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => recommendMutation.mutate(false)}
+              disabled={recommendRunning || optInAndRecommend.isPending}
+            >
+              {recommendRunning ? <Spinner size={11} /> : <RotateCcw size={11} />}
+              {recommendRunning ? "Suggesting…" : "Re-suggest columns"}
+            </Button>
+          )}
+          {canRecommend && agentAvailable && (
+            <Button
+              variant="ghost"
+              size="sm"
+              // Opted in on this timeline already: no dialog, the analyst has
+              // read what it sends. Otherwise the disclosure comes first and
+              // nothing is sent until they confirm it.
+              onClick={() => (optedIn ? recommendMutation.mutate(true) : setNoticeOpen(true))}
+              disabled={recommendRunning || optInAndRecommend.isPending}
+            >
+              <Sparkles size={11} /> Suggest with AI
+            </Button>
+          )}
         </div>
       </PopoverContent>
+      <ColumnAdvisorNotice
+        open={noticeOpen}
+        onOpenChange={setNoticeOpen}
+        onConfirm={() => optInAndRecommend.mutate()}
+        pending={optInAndRecommend.isPending}
+        error={optInError}
+      />
     </Popover>
   );
 }

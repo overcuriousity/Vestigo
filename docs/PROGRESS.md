@@ -201,6 +201,158 @@ the app does *around* a correct response.
   handler and an embedding process may replace it. The audit trail was already clean —
   it records `request.url.path`, never the query.
 
+## Session 141 — 2026-07-31: the scorer's uniqueness test was per-timeline, not per-source (PR #214)
+
+**Why.** A second review of #214 found the endpoint tests never ran the endpoint, and
+one scoring bug that got *worse* the more sources a timeline held — the shape the
+feature exists for.
+
+- **Per-row-unique fields ranked first on multi-source timelines.** `distinct` is
+  max-across-sources while `coverage` sums across them, so the uniqueness ratio was
+  divided by the source count: four 1000-event sources carrying a unique-per-row value
+  read as 1000/4000 = 0.25, inside the full-grouping-credit band, then boosted by
+  breadth (the heaviest weight). Measured `1.06` — top of the list — for the emptiest
+  possible column, while identical single-source data was correctly rejected.
+  `score_columns` now keeps the per-source `(distinct, coverage)` pairs and
+  `_uniqueness_ratio` takes the max ratio over sources that clear
+  `_MIN_COVERAGE_FOR_UNIQUENESS`, falling back to the aggregate (taper only, no
+  rejection) when no source has enough values to judge — which is what preserves the
+  tiny-source behaviour.
+- **Four endpoint tests posted to `/api/cases` instead of `/api/cases/`** and died on
+  405 before reaching the assertion. The contribute gate on
+  `POST .../recommend-columns` and the `use_ai` passthrough — the two guards on shared
+  state and on egress — were untested in practice. Both now genuinely run.
+- **`_MAX_PREFERENCE_ENTRIES` is enforced on the merged blob**, not only on the request.
+  The endpoint merges one level down, so 500 fresh keys per call grew the row without
+  bound — exactly what the limit exists to stop. Over the ceiling is a 400, never a
+  silent truncation: dropping an opt-in the caller believes it recorded is how a
+  disclosure gets skipped. Inner keys are also length-bounded (128).
+- **A dead `running` payload now settles on the timeline *list* too**, not only the
+  single read. The two endpoints reporting different states for the same timeline was
+  the bug; a caller that only ever lists never saw it resolve.
+- **The disclosure no longer claims a saved opt-in was lost.** The confirm is two steps
+  (persist the opt-in, then start the job) and both fed one boolean, so a failed job
+  request read as "that did not save". Errors are now `"save"` / `"run"`, with copy per
+  case. Nothing leaves the machine either way.
+- **`_ACTIVE` is claimed with `setdefault` before the `try`**, so the job never stomps a
+  slot another job holds and the `finally` never releases one it did not take. The API
+  path claims it in `start_column_recommendation` before spawning; the CLI path claims
+  it here.
+
+## Session 140 — 2026-07-31: the column-suggestion review, and one setting fewer (PR #214)
+
+**Why.** A review of #213 turned up five findings. Fixing the disclosure one exposed a
+design problem underneath it: `VESTIGO_COLUMN_RECOMMEND_MODE` was a second, admin-only
+tri-state layered on top of a question the codebase already answered — is an agent
+endpoint configured and reachable (`agent_available()`). It forced the disclosure into
+an incoherent shape: on a default (`heuristic`) instance a non-admin got a blocking
+modal disclosing egress that was not happening and offering an action they could not
+take. The setting was the cause, not the gate.
+
+- **The setting is gone** — from `core/config.py`, `settings_registry.py` (with its
+  one-member "Explorer" group), `.env.example`, `/api/health` and the frontend types.
+  Suggestions always run; the scorer is local and reads a cache that already exists.
+- **The LLM half is now an explicit per-(user, timeline) opt-in.** The job takes
+  `use_llm`, defaulting to **False**, and every automatic trigger leaves it there — so
+  ingest, timeline creation, the CLI and the demo build score locally and **egress is
+  never a side effect of uploading a file**, which is a stronger posture than the
+  merged branch had. One caller sets it: `POST .../recommend-columns` with
+  `{"use_ai": true}`, behind "Suggest with AI" in the Columns picker. The first press
+  on a timeline opens the disclosure (endpoint, model, exactly what is sent);
+  confirming records `preferences.column_advisor_optin[timeline_id]` and only then
+  runs. Cancelling sends nothing; the next timeline asks again. The result stays shared
+  — the opt-in governs who *causes* egress, not who may read it, and the audit row
+  names the actor. This supersedes `column_advisor_notice_ack` from session 139.
+- **`_ACTIVE` could wedge a timeline permanently** (finding #1): the job claimed the
+  slot before its `try`, so an early return leaked it and no further job for that
+  timeline could ever start. Claimed inside the `try` now, covered by the `finally` on
+  every path, with a regression test.
+- **A `running` payload now settles on read** (finding #3), not only on the next boot: a
+  cancelled task never restarts the process, and the explorer polls on that word.
+  `settle_running_payload` is shared by the boot sweep and the read path so they cannot
+  drift.
+- **"Reset to defaults" clears the local override** instead of writing one (finding #5).
+  Writing `DEFAULT_COLUMNS` quietly opted that browser out of every future
+  recomputation; "Use suggested" is redundant now and is gone.
+- **Demo seeding is genuinely best-effort** (finding #2) — the two calls outside the job
+  were unguarded and could fail a first login over a column layout.
+- **The privacy claim is now tested.** `_format_candidates` renders every promise the
+  disclosure makes and had no coverage; a test asserts the prompt carries the candidate
+  table and no case, source or timeline id, with samples truncated at 40 characters.
+
+## Session 139 — 2026-07-31: the grid opens on columns the corpus actually has (issue #213)
+
+**Why.** Every timeline opened on `timestamp / artifact / message`. One of those three
+earns its place: `artifact` usually restates a filter the analyst already set, and
+`message` truncates to nothing in a 160px cell. The fields that would tell them
+something — `user`, `src_ip`, `event_id`, whatever this corpus has — were a popover
+away and only if you knew to look. So the most important screen in the product opened
+on its least informative view, every time.
+
+- **`Timeline.recommended_columns`** (migration `0024`, one nullable JSON column on the
+  `field_mappings` precedent). Derived per timeline, shared by everyone with access,
+  carrying the columns, a per-column reason, which method produced them, and the source
+  set it was computed over. `status` is the contract with the frontend: `running` while
+  a job is in flight, `ok` to apply, `insufficient` for "we looked and found nothing" —
+  recorded rather than left null, so the explorer stops waiting and the job is not
+  re-run hoping for a different answer.
+- **`src/vestigo/columns/`**, three layers so the expensive part stays optional.
+  `recommend.py` scores candidates off the existing per-source field-stats cache
+  (`db/field_stats.py`) — **zero new ClickHouse scans on the common path** — weighting
+  breadth across sources highest, then fill rate, then a cardinality band that rejects
+  both the constant and the per-row-unique, with hashes/GUIDs/paragraph-length values
+  gated out and a small name vocabulary as the tie-breaker. Pure, deterministic, 24 unit
+  tests. `advisor.py` is one typed LLM call that **reorders and selects from** those
+  candidates; `jobs.py` orchestrates and persists.
+- **Not a different recommender by accident.** `db/field_recommend.py` answers "what is
+  worth vectorizing" and therefore rejects precisely the fields an analyst wants on
+  screen — ports, status codes, IPs. Only its value-shape regexes are shared.
+- **The AI half is bounded by code, not by prompt.** Gated on the same cached
+  `agent_available()` probe `/api/health` uses; the model sees a candidate table and
+  nothing else — no ids, no events; every token it returns is intersected with that
+  table; a malformed, short, timed-out or unreachable response is indistinguishable from
+  "no LLM configured" and the deterministic ranking stands. The stored `method` says
+  which one won. Documented in `AGENT.md` §"Outside the agent loop".
+- **The AI half is also opt-in, and says why.** The candidate table carries up to three
+  real sample values per field — evidence-derived strings — so `auto` is egress and the
+  default is `heuristic`: scorer only, nothing leaves the machine. The first Explorer
+  visit on an instance with an agent configured shows a one-time dialog
+  (`ColumnAdvisorNotice`) naming what would be sent, the endpoint and the model; an
+  admin can enable `auto` from it, everyone else reads it, and the acknowledgement is
+  per user (`preferences.column_advisor_notice_ack`, `PUT /api/auth/me/preferences`).
+  The demo build passes `allow_llm=False`, so seeded content never triggers a model call
+  and first-login seeding never waits on one.
+- **A `running` payload can no longer wedge a timeline.** `JobStore` is in-memory, so a
+  restart mid-job used to leave `status: "running"` in Postgres forever with the
+  explorer polling it every 3s. The placeholder now carries the previous answer forward
+  (the grid holds still during a recompute instead of flapping to the defaults), a
+  startup sweep relabels whatever a dead job left behind
+  (`clear_stale_running_recommendations`, in the lifespan rather than `_startup_recovery`
+  so a ClickHouse outage cannot skip it), and the client stops believing a `running`
+  claim older than ten minutes.
+- **Soft, never blocking.** The issue asked for the timeline to be disabled until the
+  process finished; a hung LLM endpoint making a timeline unbrowsable is the wrong
+  trade, so the grid renders the built-in defaults immediately and re-lays out when the
+  job lands, behind a `role="status" aria-live="polite"` line.
+- **Precedence is one function** (`lib/columns.ts`): the analyst's own choice, then the
+  suggestion, then `DEFAULT_COLUMNS`. Read by both `ExplorerPage` and `ColumnPicker` so
+  the ticks always match the grid. "Use suggested" *clears* the local override rather
+  than copying it in, so a later recomputation still reaches that browser. (Session 140
+  folded this into "Reset to defaults" and dropped the separate button.)
+- **Scheduled from every path that creates a knowable source set**: post-ingest (beside
+  `refresh_source_field_stats`, isolated so a failure never reaches the ingest
+  rollback), timeline creation, the CLI, the demo build, and a contribute-gated
+  `POST .../recommend-columns` behind "Re-suggest columns" in the picker.
+- **`VESTIGO_COLUMN_RECOMMEND_MODE`** (`heuristic` by default, or `auto` / `off`) in a
+  new "Explorer" settings group; the job itself enforces it, so the CLI and the demo
+  build honour `off` without their own check. **Removed in session 140** — replaced by
+  a per-(user, timeline) opt-in. Every run writes a `timeline.recommend_columns` audit
+  row naming the method, the model, the chosen columns and the full candidate set.
+- **Known gap, filed in `ROADMAP.md`:** timelines with `field_mappings` get no
+  suggestion for the mapped fields. The grid reads `attributes[colId]` directly, so
+  neither the canonical name nor one raw spelling renders correctly — recommending
+  either would recommend a column that looks broken.
+
 ## Session 138 — 2026-07-31: OIDC discovery followed a redirect it should have followed
 
 **Why.** A live deployment against a Nextcloud IdP got a 500 on every SSO click.

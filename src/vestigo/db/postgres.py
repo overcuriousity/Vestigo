@@ -219,6 +219,13 @@ class Timeline(Base):
     # ingested events are never rewritten; None/empty means no mapping.
     field_mappings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Recommended event-grid columns (issue #213): the derived-from-the-data
+    # answer to "what should this timeline open on", shared by every user with
+    # access. Display metadata only — a per-user column choice in the browser
+    # always outranks it, and the events are never touched. See
+    # ``vestigo/columns/`` for the payload shape and how it is produced.
+    recommended_columns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # --- Embedding state (all nullable; None → not yet embedded) -------------
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -245,6 +252,7 @@ class Timeline(Base):
             "is_default": self.is_default,
             "source_ids": [s.id for s in self.sources],
             "field_mappings": self.field_mappings,
+            "recommended_columns": self.recommended_columns,
             "is_embedded": is_embedded,
             "is_stale": is_stale,
             "embedding_model": self.embedding_model,
@@ -2829,6 +2837,76 @@ class PostgresStore:
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
+
+    async def update_timeline_recommended_columns(
+        self,
+        case_id: str,
+        timeline_id: str,
+        recommended_columns: dict[str, Any] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's recommended event-grid columns (issue #213).
+
+        Written only by the recommendation job (``vestigo/columns/jobs.py``) and
+        the read-path settler in ``api/routers/cases.py``, which share the
+        payload shape. Returns the updated timeline, or None if it doesn't
+        exist — a timeline deleted while its job was running is an ordinary
+        outcome, not an error.
+
+        ``sources`` is deliberately *not* eager-loaded on the way out: no
+        caller serializes this return value (the job discards it), and the
+        payload is written twice per run, so the extra round trip would be pure
+        cost. Callers that need ``to_dict()`` re-read through ``get_timeline``.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.recommended_columns = recommended_columns or None
+            await session.commit()
+            await session.refresh(timeline)
+            return timeline
+
+    async def clear_stale_running_recommendations(self) -> int:
+        """Settle column recommendations left ``running`` by a restart (#213).
+
+        ``JobStore`` is in-memory, so a process that dies mid-recommendation
+        leaves a Postgres payload claiming a job is in flight that no longer
+        exists — the explorer would poll for it forever. The relabel itself
+        lives in ``columns/jobs.settle_running_payload``, shared with the
+        read-path settler so the two can never drift. Nothing is recomputed
+        here; the next ingest or a manual re-suggest does that.
+
+        Filtering happens in Python rather than with a JSON path predicate:
+        the same code runs against SQLite in the test suite, and the number of
+        timelines with a stored recommendation is bounded by the number of
+        timelines. Returns the number of rows settled.
+        """
+        from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(Timeline.recommended_columns.is_not(None))
+            )
+            settled = 0
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                timeline.recommended_columns = settle_running_payload(payload)
+                settled += 1
+            if settled:
+                await session.commit()
+            return settled
 
     async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
         """Delete a timeline row.

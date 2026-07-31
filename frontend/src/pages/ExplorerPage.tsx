@@ -18,6 +18,7 @@ import {
   PanelLeftOpen,
   BarChart2,
   AreaChart,
+  Columns3,
   Repeat,
   Sparkles,
 } from "lucide-react";
@@ -28,7 +29,10 @@ import { dispositionsApi } from "@/api/dispositions";
 import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
-import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { casesApi } from "@/api/cases";
+import { canContributeToCase } from "@/lib/caseAccess";
+import { useUiStore } from "@/stores/ui";
+import { hasSuggestion, isSuggesting, resolveVisibleColumns } from "@/lib/columns";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { useBaselineStore } from "@/stores/baseline";
@@ -403,7 +407,7 @@ export function ExplorerPage() {
   const jumpSeqRef = useRef(0);
   const seededSeqRef = useRef(0);
   const tlKey = `${caseId}/${timelineId}`;
-  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
   const setHistogramOpen = useUiStore((s) => s.setHistogramOpen);
   const setSortDir = useUiStore((s) => s.setSortDir);
@@ -419,7 +423,34 @@ export function ExplorerPage() {
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
+    // A column suggestion runs as a background job (issue #213) — poll while
+    // one is in flight so the grid re-lays out on its own. The timeline is
+    // never blocked on it: until it lands, the built-in defaults render.
+    refetchInterval: (query) =>
+      isSuggesting(query.state.data?.recommended_columns) ? 3000 : false,
   });
+
+  // Precedence: the analyst's own choice, then the timeline's suggestion, then
+  // the built-in defaults. See lib/columns.ts.
+  const visibleColumns = useMemo(
+    () => resolveVisibleColumns(storedColumns, timeline?.recommended_columns),
+    [storedColumns, timeline?.recommended_columns],
+  );
+  const suggestionRunning = isSuggesting(timeline?.recommended_columns);
+  // "Your grid is showing suggested columns" is only true while the analyst
+  // hasn't overridden them — once they pick their own, the notice is noise.
+  const showingSuggestion =
+    !storedColumns && hasSuggestion(timeline?.recommended_columns);
+
+  // Only needed for the access level: recomputing the column suggestion
+  // changes what the timeline opens on for everyone, so it is a contribute
+  // action, not a read one.
+  const { data: case_ } = useQuery({
+    queryKey: ["case", caseId],
+    queryFn: () => casesApi.get(caseId!),
+    enabled: !!caseId,
+  });
+  const canRecommendColumns = case_ ? canContributeToCase(case_) : false;
 
   const { data: timelineSources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
@@ -565,6 +596,12 @@ export function ExplorerPage() {
     if (prevIngestingCount.current > 0 && ingestingCount === 0) {
       queryClient.invalidateQueries({ queryKey: ["events", caseId, timelineId] });
       queryClient.invalidateQueries({ queryKey: ["histogram", caseId, timelineId] });
+      // The same moment schedules a fresh column suggestion server-side
+      // (issue #213). Refetch the timeline to pick up its `running` status —
+      // otherwise nothing is polling and the new suggestion only appears on
+      // the next navigation.
+      queryClient.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      queryClient.invalidateQueries({ queryKey: ["fields", caseId, timelineId] });
     }
     prevIngestingCount.current = ingestingCount;
   }, [ingestingCount, caseId, timelineId, queryClient]);
@@ -1161,7 +1198,12 @@ export function ExplorerPage() {
               total={total}
             />
 
-            <ColumnPicker caseId={caseId!} timelineId={timelineId!} />
+            <ColumnPicker
+              caseId={caseId!}
+              timelineId={timelineId!}
+              recommended={timeline?.recommended_columns}
+              canRecommend={canRecommendColumns}
+            />
 
             <Tooltip content="Open the full visualization page">
               <Button variant="outline" size="sm" asChild data-tour="visualize-link">
@@ -1241,6 +1283,32 @@ export function ExplorerPage() {
                 : `${ingestingSources.length} sources are still ingesting`}{" "}
               — excluded from results until complete.
             </span>
+          </div>
+        )}
+
+        {/* Column suggestion (issue #213) — never blocks the grid; the built-in
+            defaults render until the job lands. aria-live so the swap is
+            announced rather than silently re-laying out the table. */}
+        {(suggestionRunning || showingSuggestion) && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border-subtle)] px-3 py-1 text-xs text-[var(--color-fg-muted)]"
+          >
+            {suggestionRunning ? (
+              <>
+                <Spinner size={11} />
+                <span>Suggesting columns from this timeline&rsquo;s data&hellip;</span>
+              </>
+            ) : (
+              <>
+                <Columns3 size={11} />
+                <span>
+                  Showing columns suggested from this timeline&rsquo;s data — change them
+                  from the Columns menu.
+                </span>
+              </>
+            )}
           </div>
         )}
 
