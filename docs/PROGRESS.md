@@ -1,9 +1,26 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 140 — the derived `annotated` tag).
+Last updated: 2026-07-31 (session 141 — a story's chart link opens that chart).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 141 — 2026-07-31: a story's chart link opened Visualize, but not the chart
+
+**Why.** Reported from use: "Open in Visualize" on a story's chart block navigated to the
+right case and timeline and then drew nothing recognisable — the preset picker, on a default
+chart.
+
+The Visualize page holds its entire chart state in `c_*` URL params (`paramsToChartConfig`),
+which is what makes a chart shareable as a link at all. `ChartBlockCard` linked to the bare
+`…/visualize` path, so every one of those params was absent and the page did exactly what an
+empty URL asks for. The agent's `ChartProposalCard` had always built its link through
+`chartConfigToParams`; the story card was the one place that didn't.
+
+The block resolves the saved chart already, in order to draw it — so the fix is to run that
+same config through `chartConfigToParams` for the href. No filters are attached, because a
+saved chart stores none and the story's own canvas draws it unfiltered: the link now lands on
+the chart the reader was looking at, not a differently-filtered relative of it.
 
 ## Session 140 — 2026-07-31: every annotated event says so, without a row saying it
 

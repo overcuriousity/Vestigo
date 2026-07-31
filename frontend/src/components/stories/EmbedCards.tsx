@@ -17,7 +17,7 @@ import { savedChartsApi } from "@/api/viz";
 import { viewsApi } from "@/api/views";
 import type { Event, StoryBlockOf } from "@/api/types";
 import { ChartCanvas } from "@/components/viz/ChartCanvas";
-import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
+import { chartConfigToParams, parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
 import { Spinner } from "@/components/ui/Spinner";
 import { filtersToParams, viewPayloadToFilters } from "@/lib/queryParams";
 import { fmtNum } from "@/lib/format";
@@ -303,7 +303,9 @@ export function ChartBlockCard({
           {chart.name}
         </span>
         <OpenLink
-          to={`/cases/${caseId}/timelines/${timelineId}/visualize`}
+          to={`/cases/${caseId}/timelines/${timelineId}/visualize?${chartConfigToParams(
+            config,
+          ).toString()}`}
           label="Open in Visualize"
         />
       </div>
