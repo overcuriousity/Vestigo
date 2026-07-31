@@ -2874,6 +2874,51 @@ class PostgresStore:
             await session.refresh(timeline)
             return timeline
 
+    async def settle_running_recommendations(
+        self, case_id: str, timeline_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Relabel the named timelines' ``running`` recommendations in one pass.
+
+        The read-path counterpart to
+        :py:meth:`clear_stale_running_recommendations`, sharing the same
+        relabel (``columns/jobs.settle_running_payload``). One session and one
+        commit for the whole set: the timelines list settles every stale row it
+        finds, and a restart that orphaned a dozen recommendations would
+        otherwise cost a dozen sequential round trips on a page an analyst
+        opens constantly.
+
+        Re-checks ``status == "running"`` under this session rather than
+        trusting the caller's snapshot — a job may have written its real answer
+        between the read and this call, and overwriting that with a settled
+        placeholder would age a fresh recommendation backwards.
+
+        Returns ``{timeline_id: settled_payload}`` for the rows actually
+        changed, so the caller can serialize them without a second read.
+        """
+        from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
+
+        if not timeline_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id.in_(timeline_ids),
+                )
+            )
+            settled: dict[str, dict[str, Any]] = {}
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                timeline.recommended_columns = settle_running_payload(payload)
+                settled[timeline.id] = timeline.recommended_columns
+            if settled:
+                await session.commit()
+            return settled
+
     async def clear_stale_running_recommendations(self) -> int:
         """Settle column recommendations left ``running`` by a restart (#213).
 

@@ -78,6 +78,13 @@ _ALLOWED_PREFERENCE_KEYS: dict[str, type] = {
 #: on the *merged* result too (see :func:`update_my_preferences`) — checking
 #: only the request would let repeated calls of 500 fresh keys grow the row
 #: without bound, which is the thing this limit exists to stop.
+#:
+#: Over the limit, the *oldest* entries are dropped rather than the write being
+#: refused. A hard wall would mean an analyst on their 501st timeline can never
+#: record an opt-in again — and a consent that cannot be recorded is a
+#: disclosure dialog that reappears forever, which is how people learn to click
+#: through it unread. Eviction only costs them one extra dialog on a timeline
+#: they last opted in on hundreds of timelines ago.
 _MAX_PREFERENCE_ENTRIES = 500
 
 #: Ceiling on one key inside a dict-valued preference. The real keys are ids
@@ -120,6 +127,31 @@ class UpdatePreferencesRequest(BaseModel):
                     if not isinstance(inner, bool):
                         raise ValueError(f"Preference {key} values must be booleans")
         return value
+
+
+def _merge_bounded(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge *incoming* over *current*, capped at :data:`_MAX_PREFERENCE_ENTRIES`.
+
+    Eviction is FIFO on the pre-existing entries. JSON objects preserve
+    insertion order through both Python and Postgres' ``json`` column, and this
+    merge only ever appends new keys, so the surviving order *is* the order the
+    analyst opted in — oldest first. That is the closest thing to a timestamp
+    available without changing the stored value type, which is a bare ``true``
+    and is what :func:`hasColumnAdvisorOptIn` in the frontend reads.
+
+    Nothing from *incoming* is ever evicted: this request is the consent being
+    recorded, and an analyst asked to re-authorize something they just
+    authorized stops reading the dialog. A request larger than the cap on its
+    own is rejected upstream by ``UpdatePreferencesRequest``.
+    """
+    merged = {**current, **incoming}
+    overflow = len(merged) - _MAX_PREFERENCE_ENTRIES
+    if overflow <= 0:
+        return merged
+    evictable = [key for key in merged if key not in incoming]
+    for key in evictable[:overflow]:
+        del merged[key]
+    return merged
 
 
 def _user_response(user: User, teams: list[dict[str, Any]]) -> dict[str, Any]:
@@ -298,8 +330,10 @@ async def update_my_preferences(
     The merge is where :data:`_MAX_PREFERENCE_ENTRIES` actually has to hold:
     the request validator only sees one request, and a client sending 500
     fresh keys per call would otherwise grow the row for as long as it kept
-    calling. Over the limit is a 400, not a silent truncation — dropping an
-    opt-in the caller believes it recorded is how a disclosure gets skipped.
+    calling. Over the limit, the oldest entries are evicted (see
+    :func:`_merge_bounded`) — never the ones this request is recording, since
+    dropping an opt-in the caller believes it stored is how a disclosure gets
+    skipped.
     """
     if not payload.preferences:
         return {"user": _user_response(user, await _teams_for_user(user))}
@@ -308,13 +342,7 @@ async def update_my_preferences(
     for key, value in payload.preferences.items():
         if isinstance(value, dict):
             current = existing.get(key)
-            merged = {**current, **value} if isinstance(current, dict) else dict(value)
-            if len(merged) > _MAX_PREFERENCE_ENTRIES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(f"Preference {key} may hold at most {_MAX_PREFERENCE_ENTRIES} entries"),
-                )
-            patch[key] = merged
+            patch[key] = _merge_bounded(current if isinstance(current, dict) else {}, value)
         else:
             patch[key] = value
     updated = await get_store().update_user_preferences(user.id, patch)

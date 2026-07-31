@@ -16,11 +16,15 @@ interface Props {
   caseId: string;
   timelineId: string;
   currentConfig: ChartConfig;
-  /** The Explorer filters the chart is currently drawn under. Saved with the
-   * chart, so a story block, an export and a re-load all reproduce the slice
-   * the analyst was looking at rather than the whole timeline. Pass the raw
-   * URL filters, not a set augmented with `collapseRoutine` — that one is not
-   * URL-serialized and derives from live dispositions. */
+  /** The filters the chart is currently drawn under. Saved with the chart, so
+   * a story block, an export and a re-load all reproduce the slice the analyst
+   * was looking at rather than the whole timeline.
+   *
+   * Pass the *resolved* set, `collapseRoutine` included. It has no URL form
+   * and the Visualize page re-derives it from live dispositions, but nothing
+   * else does: `ChartBlockCard` and the export resolver draw a saved chart's
+   * stored filters verbatim, so omitting it would freeze the uncollapsed
+   * superset of the chart the analyst pressed Save on. */
   currentFilters: EventFilters;
   /** Load a saved chart by *id*, not by value. The page addresses it as
    * `?c_chart=<id>` and reads both halves — shape and filters — back out of

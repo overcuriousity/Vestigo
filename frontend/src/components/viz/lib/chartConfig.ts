@@ -329,14 +329,45 @@ export function chartConfigToStored(
   filters?: EventFilters,
 ): Record<string, unknown> {
   const storedFilters = filters ? chartFiltersToStored(filters) : null;
-  return {
+  const stored: Record<string, unknown> = {
     ...config,
     compare:
       config.compare.mode === "custom"
         ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
         : config.compare,
-    ...(storedFilters ? { filters: storedFilters } : {}),
   };
+  // `filters` is *this function's* key, never `ChartConfig`'s. Cleared before
+  // writing rather than merely overwritten: a future `ChartConfig.filters`
+  // would otherwise ride the spread above into storage on every save that
+  // passes no filters, and `parseStoredChartFilters` would read it back as a
+  // slice the analyst never chose.
+  delete stored.filters;
+  if (storedFilters) stored.filters = storedFilters;
+  return stored;
+}
+
+/**
+ * Filter members that survive storage but have no `c_*`/filter-param form.
+ *
+ * `filtersToParams` cannot express any of them, so writing a chart out as URL
+ * params drops them — which silently *widens* the chart, since each one only
+ * ever narrows. The Visualize page uses this to say so out loud when the
+ * analyst's own edit takes a saved chart over (see `takeOver` there), rather
+ * than leaving a chart scoped to 40 events looking like one that was always
+ * drawn over the whole timeline.
+ */
+const URL_UNREPRESENTABLE_FILTERS: { key: keyof EventFilters; label: string }[] = [
+  { key: "ids", label: "a fixed event set" },
+  { key: "anomalyRunId", label: "a detector run" },
+  { key: "collapseRoutine", label: "routine collapse" },
+];
+
+/** Human-readable labels for the narrowings *filters* would lose in the URL. */
+export function unrepresentableFilterMembers(filters: EventFilters): string[] {
+  return URL_UNREPRESENTABLE_FILTERS.filter(({ key }) => {
+    const value = filters[key];
+    return Array.isArray(value) ? value.length > 0 : !!value;
+  }).map(({ label }) => label);
 }
 
 /**

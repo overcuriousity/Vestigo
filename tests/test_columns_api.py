@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from tests.conftest import as_admin
-from vestigo.api.routers.cases import _settle_dead_recommendation
+from vestigo.api.routers.cases import _settle_dead_recommendations
 from vestigo.columns import jobs as columns_jobs
 from vestigo.core.jobs import JobStore
 from vestigo.db.field_stats import EFFECTIVE_STATS_VERSION
@@ -437,7 +437,7 @@ async def test_reading_a_timeline_settles_a_recommendation_whose_job_is_gone(sto
     )
 
     timeline = await store.get_timeline(case_id, timeline_id)
-    await _settle_dead_recommendation(store, case_id, timeline)
+    await _settle_dead_recommendations(store, case_id, [timeline])
 
     assert timeline.recommended_columns["status"] == "ok"
     assert timeline.recommended_columns["job_id"] is None
@@ -460,7 +460,7 @@ async def test_reading_a_timeline_leaves_a_live_recommendation_running(store):
     columns_jobs._ACTIVE[timeline_id] = "job-in-flight"
     try:
         timeline = await store.get_timeline(case_id, timeline_id)
-        await _settle_dead_recommendation(store, case_id, timeline)
+        await _settle_dead_recommendations(store, case_id, [timeline])
     finally:
         columns_jobs._ACTIVE.pop(timeline_id, None)
 
@@ -482,7 +482,7 @@ async def test_reading_a_timeline_respects_a_job_the_store_still_knows(store, mo
     monkeypatch.setattr("vestigo.api.routers.cases.get_job_store", lambda: job_store)
 
     timeline = await store.get_timeline(case_id, timeline_id)
-    await _settle_dead_recommendation(store, case_id, timeline)
+    await _settle_dead_recommendations(store, case_id, [timeline])
 
     assert timeline.recommended_columns["status"] == "running"
 

@@ -265,7 +265,13 @@ def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bo
 
 
 def test_update_my_preferences_bounds_the_merged_blob(client, admin_bootstrap):
-    """The cap has to survive the merge, or repeated calls grow the row forever."""
+    """The cap has to survive the merge, or repeated calls grow the row forever.
+
+    Over the cap the *oldest* entries go, and the write still succeeds: a hard
+    refusal would mean an analyst past the ceiling can never record a consent
+    again, and a consent that cannot be recorded is a disclosure dialog that
+    reappears forever.
+    """
     as_admin(client, admin_bootstrap)
 
     for batch in range(2):
@@ -277,14 +283,16 @@ def test_update_my_preferences_bounds_the_merged_blob(client, admin_bootstrap):
                 }
             },
         )
-        if batch == 0:
-            assert resp.status_code == 200, resp.text
-        else:
-            # 300 already stored + 300 fresh = 600, over the ceiling.
-            assert resp.status_code == 400, resp.text
+        # 300 already stored + 300 fresh = 600, over the ceiling — accepted, trimmed.
+        assert resp.status_code == 200, resp.text
 
-    stored = client.get("/api/auth/me").json()["user"]["preferences"]
-    assert len(stored["column_advisor_optin"]) == 300
+    stored = client.get("/api/auth/me").json()["user"]["preferences"]["column_advisor_optin"]
+    assert len(stored) == 500
+    # Everything this request recorded survived — it is the consent being given.
+    assert all(f"tl-1-{i}" in stored for i in range(300))
+    # The 100 oldest went, in insertion order.
+    assert not any(f"tl-0-{i}" in stored for i in range(100))
+    assert all(f"tl-0-{i}" in stored for i in range(100, 300))
 
 
 def test_update_own_profile_rejects_duplicate_username(client, admin_bootstrap, store):
@@ -417,6 +425,65 @@ def test_access_log_redacts_the_oidc_authorization_code():
     # a callback happened and that it carried a code.
     assert "/api/auth/oidc/callback" in record.args[2]
     assert "BKnwFkdaDaZxDQ" not in record.args[2]
+
+
+def test_access_log_redactor_survives_uvicorn_logging_config():
+    """The filter must outlive uvicorn configuring its own loggers.
+
+    `create_app()` attaches the redactor at import time; uvicorn calls
+    `dictConfig(LOGGING_CONFIG)` afterwards, when the server starts. That
+    ordering only holds because `dictConfig` clears a configured logger's
+    *handlers* and not its *filters* — a CPython implementation detail, not a
+    documented contract, and the difference between "OIDC codes are redacted"
+    and "they are silently back in the journal after a dependency bump".
+    """
+    import logging
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    from vestigo.api.main import AccessLogRedactor, create_app
+
+    access_logger = logging.getLogger("uvicorn.access")
+    for existing in [f for f in access_logger.filters if isinstance(f, AccessLogRedactor)]:
+        access_logger.removeFilter(existing)
+
+    create_app()
+    assert any(isinstance(f, AccessLogRedactor) for f in access_logger.filters)
+
+    # Exactly what `uvicorn.Config.configure_logging()` does.
+    logging.config.dictConfig(LOGGING_CONFIG)
+    assert any(isinstance(f, AccessLogRedactor) for f in access_logger.filters), (
+        "uvicorn's logging config dropped the access-log redactor — "
+        "OIDC authorization codes would reach the journal in the clear"
+    )
+
+    # And it still redacts once uvicorn owns the handler.
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("10.0.13.1:0", "GET", "/api/auth/oidc/callback?code=BKnwFkdaDaZxDQ", "1.1", 307),
+        exc_info=None,
+    )
+    for log_filter in access_logger.filters:
+        log_filter.filter(record)  # type: ignore[union-attr]
+    assert record.args is not None
+    assert "BKnwFkdaDaZxDQ" not in record.args[2]
+
+
+def test_access_log_redactor_is_attached_once():
+    """Repeated `create_app()` calls must not stack filters on the shared logger."""
+    import logging
+
+    from vestigo.api.main import AccessLogRedactor, create_app
+
+    create_app()
+    create_app()
+    access_logger = logging.getLogger("uvicorn.access")
+    attached = [f for f in access_logger.filters if isinstance(f, AccessLogRedactor)]
+    assert len(attached) == 1
 
 
 def test_access_log_leaves_ordinary_query_strings_alone():

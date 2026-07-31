@@ -98,6 +98,35 @@ def test_uniqueness_gate_does_not_fire_on_a_tiny_source():
     assert "user" in _tokens(stats)
 
 
+def test_uniqueness_is_judged_on_the_largest_source_not_the_worst_one():
+    """One small outlier source must not veto a field that groups everywhere else.
+
+    ``user`` is unique on every row of a 60-event source (one day of one host)
+    and groups cleanly across three 5000-event ones. Reading the ratio off the
+    *worst* source rejects the field outright — and does so more often the more
+    sources a timeline merges, which is backwards for a scorer that weights
+    breadth highest. The largest source's ratio is the one least likely to be
+    an artifact of how little it holds.
+    """
+    stats = {
+        "small": _source(60, {"user": _attr(60, 60, ["alice", "bob", "carol"])}),
+        **{
+            f"big{i}": _source(5000, {"user": _attr(5000, 25, ["alice", "bob", "carol"])})
+            for i in range(3)
+        },
+    }
+    assert "user" in _tokens(stats)
+
+
+def test_a_field_unique_in_the_largest_source_is_still_rejected():
+    """The rule is "the best-evidenced source", not "whichever source acquits"."""
+    stats = {
+        "small": _source(60, {"trace_id": _attr(60, 4, ["t-1", "t-2"])}),
+        "big": _source(5000, {"trace_id": _attr(5000, 5000, ["t-1", "t-2"])}),
+    }
+    assert "trace_id" not in _tokens(stats)
+
+
 def test_hash_valued_field_is_rejected():
     stats = {
         "s1": _source(

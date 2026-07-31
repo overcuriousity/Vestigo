@@ -7,6 +7,7 @@ import {
   paramsToChartConfig,
   parseStoredChartConfig,
   parseStoredChartFilters,
+  unrepresentableFilterMembers,
   type ChartConfig,
 } from "@/components/viz/lib/chartConfig";
 
@@ -263,5 +264,41 @@ describe("multi-field serialization", () => {
   it("ignores a malformed field list instead of throwing", () => {
     const params = new URLSearchParams({ c_type: "corr", c_fields: "{not json" });
     expect(paramsToChartConfig(params).fields).toBeNull();
+  });
+});
+
+describe("unrepresentableFilterMembers", () => {
+  it("names every narrowing the URL would drop", () => {
+    expect(
+      unrepresentableFilterMembers({
+        ids: ["e1", "e2"],
+        anomalyRunId: "run-9",
+        collapseRoutine: true,
+      }),
+    ).toEqual(["a fixed event set", "a detector run", "routine collapse"]);
+  });
+
+  it("says nothing about filters the URL can carry", () => {
+    expect(unrepresentableFilterMembers({ q: "logon", artifacts: ["auth"] })).toEqual([]);
+    expect(unrepresentableFilterMembers({})).toEqual([]);
+  });
+
+  it("does not count an empty event set as a narrowing", () => {
+    expect(unrepresentableFilterMembers({ ids: [], collapseRoutine: false })).toEqual([]);
+  });
+});
+
+describe("chartConfigToStored filter-key hygiene", () => {
+  it("never lets a stray config `filters` key masquerade as stored filters", () => {
+    // Guards the day `ChartConfig` grows its own `filters`: the spread inside
+    // `chartConfigToStored` would otherwise carry it into storage, and
+    // `parseStoredChartFilters` would read it back as a slice nobody chose.
+    const polluted = { ...DEFAULT_CHART_CONFIG, filters: { q: "not-a-slice" } } as ChartConfig;
+    expect("filters" in chartConfigToStored(polluted)).toBe(false);
+    expect(parseStoredChartFilters(chartConfigToStored(polluted))).toEqual({});
+    // A real filter set still wins.
+    expect(parseStoredChartFilters(chartConfigToStored(polluted, { q: "logon" }))).toEqual({
+      q: "logon",
+    });
   });
 });

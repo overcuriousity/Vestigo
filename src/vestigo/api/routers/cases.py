@@ -28,7 +28,6 @@ from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.columns.jobs import (
     get_active_recommendation,
     schedule_for_source,
-    settle_running_payload,
     start_column_recommendation,
 )
 from vestigo.core.config import get_settings
@@ -944,40 +943,52 @@ async def list_timelines(case: Case = Depends(require_case_read)) -> dict[str, A
     # Same settling as the single-timeline read (#213): a list that keeps
     # reporting `running` for a job that died would have the two endpoints
     # disagreeing about the same timeline, and callers that only ever list
-    # (the timelines page) would never see it resolve.
-    for timeline in timelines:
-        await _settle_dead_recommendation(store, case.id, timeline)
+    # (the timelines page) would never see it resolve. Batched — a restart that
+    # orphaned several would otherwise cost one round trip each on a page that
+    # is opened constantly.
+    await _settle_dead_recommendations(store, case.id, timelines)
     return {"timelines": [t.to_dict() for t in timelines]}
 
 
-async def _settle_dead_recommendation(
-    store: PostgresStore, case_id: str, timeline: Timeline
-) -> None:
-    """Relabel a ``running`` column suggestion whose job no longer exists (#213).
+def _recommendation_is_dead(timeline: Timeline) -> bool:
+    """Whether this timeline claims a ``running`` job that no longer exists (#213).
 
     The explorer polls on the word ``running``, and ``JobStore`` is in-memory:
     a job killed as a cancelled task (rather than with the whole process) is
     never settled by the boot-time sweep, and the timeline would claim to be
-    thinking forever. Settling needs both checks — ``_ACTIVE`` covers a job
+    thinking forever. Answering it needs both checks — ``_ACTIVE`` covers a job
     that is genuinely mid-flight, and the job store covers one that finished
     without writing (which the placeholder rollback normally handles).
 
-    Mutates ``timeline`` in place so the caller serializes the settled payload
-    without a second read. Called from both the single read and the list, and
-    a no-op for every timeline that is not mid-recommendation — which is all
-    of them, almost always.
+    Pure and synchronous, so the list path can filter the whole page before
+    touching the database at all. False for every timeline that is not
+    mid-recommendation — which is all of them, almost always.
     """
     payload = timeline.recommended_columns
     if not isinstance(payload, dict) or payload.get("status") != "running":
-        return
+        return False
     if get_active_recommendation(timeline.id) is not None:
-        return
+        return False
     job_id = payload.get("job_id")
-    if job_id and get_job_store().get(job_id) is not None:
+    return not (job_id and get_job_store().get(job_id) is not None)
+
+
+async def _settle_dead_recommendations(
+    store: PostgresStore, case_id: str, timelines: list[Timeline]
+) -> None:
+    """Relabel every dead ``running`` suggestion in *timelines*, in one write.
+
+    Mutates the passed timelines in place so the caller serializes the settled
+    payloads without a second read. Returns without touching the database when
+    nothing is stale, which is the overwhelmingly common case.
+    """
+    stale = [t for t in timelines if _recommendation_is_dead(t)]
+    if not stale:
         return
-    settled = settle_running_payload(payload)
-    await store.update_timeline_recommended_columns(case_id, timeline.id, settled)
-    timeline.recommended_columns = settled
+    settled = await store.settle_running_recommendations(case_id, [t.id for t in stale])
+    for timeline in stale:
+        if timeline.id in settled:
+            timeline.recommended_columns = settled[timeline.id]
 
 
 @router.get("/{case_id}/timelines/{timeline_id}")
@@ -987,7 +998,7 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     timeline = await store.get_timeline(case.id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
-    await _settle_dead_recommendation(store, case.id, timeline)
+    await _settle_dead_recommendations(store, case.id, [timeline])
     return {"timeline": timeline.to_dict()}
 
 

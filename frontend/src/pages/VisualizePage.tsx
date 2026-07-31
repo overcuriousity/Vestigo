@@ -69,6 +69,7 @@ import {
   paramsToChartConfig,
   parseStoredChartConfig,
   parseStoredChartFilters,
+  unrepresentableFilterMembers,
   type ChartConfig,
   type ChartType,
   type Scale,
@@ -245,13 +246,28 @@ export function VisualizePage() {
     [urlFilters, collapseRoutine],
   );
 
+  // Narrowings the URL cannot carry that the analyst's last edit therefore
+  // dropped. Held in state rather than derived, because after `takeOver` the
+  // params are all that is left — the evidence of what was lost exists only at
+  // the moment it is lost.
+  const [droppedScope, setDroppedScope] = useState<string[] | null>(null);
+
   // Editing either half is the analyst taking the chart over: the URL stops
   // naming a saved chart and starts describing this one, spelled out in full.
   // Both halves are written every time, because after this the params are the
   // only record — `chartConfigToParams` drops `c_chart` along with the rest of
   // the `c_*` keys it rewrites, so there is no separate step to forget.
+  //
+  // Three filter members have no param form, so spelling the chart out *widens*
+  // it whenever they were set. That is unavoidable — the URL is the record now —
+  // but it must not be silent: a chart scoped to a fixed event set becoming a
+  // chart over the whole timeline is exactly the failure `?c_chart=` exists to
+  // prevent, and an analyst who is not told reads the wider chart as the one
+  // they opened.
   const takeOver = useCallback(
     (nextConfig: ChartConfig, nextFilters: EventFilters) => {
+      const dropped = unrepresentableFilterMembers(nextFilters);
+      setDroppedScope(dropped.length > 0 ? dropped : null);
       setSearchParams(() => chartConfigToParams(nextConfig, filtersToParams(nextFilters)), {
         replace: true,
       });
@@ -275,6 +291,9 @@ export function VisualizePage() {
   // lose exactly the members storage exists to carry.
   const loadSavedChart = useCallback(
     (loadedChartId: string) => {
+      // The URL names a chart again, so whatever a previous take-over dropped
+      // is no longer what is on screen.
+      setDroppedScope(null);
       setSearchParams(new URLSearchParams({ [CHART_ID_PARAM]: loadedChartId }), { replace: true });
     },
     [setSearchParams],
@@ -746,6 +765,17 @@ export function VisualizePage() {
             {savedChart
               ? "That chart was saved with an incompatible config version and cannot be loaded."
               : "That saved chart no longer exists."}
+          </p>
+        )}
+
+        {/* Editing a saved chart spells it into the URL, which cannot carry
+            these narrowings — so the chart on screen is now wider than the one
+            that was loaded. Said out loud, and repeated in the saved-chart rail
+            (re-saving from here would freeze the wider slice). */}
+        {droppedScope && (
+          <p role="status" className="text-xs text-[var(--color-warning)]">
+            Editing this chart dropped {droppedScope.join(" and ")} — it now covers the whole
+            timeline. Reload the saved chart to get that scope back.
           </p>
         )}
 
@@ -1371,7 +1401,12 @@ export function VisualizePage() {
               caseId={caseId}
               timelineId={timelineId}
               currentConfig={config}
-              currentFilters={urlFilters}
+              // The *resolved* filters, routine collapse included. Only this
+              // page re-derives collapse from live dispositions; the story
+              // card and the frozen export render a saved chart's stored
+              // filters verbatim, so leaving it out here is what would make
+              // those two show the uncollapsed superset of what was saved.
+              currentFilters={filters}
               onLoad={loadSavedChart}
             />
           )}

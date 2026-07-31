@@ -227,7 +227,7 @@ def _name_affinity(token: str) -> float:
 
 
 def _uniqueness_ratio(per_source: list[tuple[int, int]]) -> float | None:
-    """Highest per-source ``distinct / coverage``, or None on too little evidence.
+    """``distinct / coverage`` from the best-evidenced source, or None.
 
     Measured **per source, never on the aggregate**: ``distinct`` is
     max-across-sources while ``coverage`` sums across them, so an aggregate
@@ -236,16 +236,29 @@ def _uniqueness_ratio(per_source: list[tuple[int, int]]) -> float | None:
     grouping credit for the emptiest column on the grid, and worst exactly
     where breadth (the heaviest weight) is highest.
 
-    Sources below :data:`_MIN_COVERAGE_FOR_UNIQUENESS` are ignored: with 12
-    values, "12 distinct" says nothing. None means no source carried enough
-    values to judge.
+    Which source to read it off is a real choice, and it is the one with the
+    most values, not the highest ratio. ``max`` over the ratios lets a single
+    small source — 50 events, 50 distinct ``user`` values because it is one
+    day of one host — reject a field that groups cleanly across the other
+    three, and it does so *more* often the more sources a timeline merges,
+    which is backwards for a scorer that weights breadth highest. The
+    largest source is the one whose ratio is least likely to be an artifact of
+    how little it holds.
+
+    Sources below :data:`_MIN_COVERAGE_FOR_UNIQUENESS` are ignored entirely:
+    with 12 values, "12 distinct" says nothing. None means no source carried
+    enough values to judge.
     """
     rated = [
-        min(1.0, distinct / coverage)
+        (coverage, min(1.0, distinct / coverage))
         for distinct, coverage in per_source
         if coverage >= _MIN_COVERAGE_FOR_UNIQUENESS
     ]
-    return max(rated) if rated else None
+    if not rated:
+        return None
+    # Ties on coverage break towards the higher ratio, so the outcome does not
+    # depend on the order sources happened to merge in.
+    return max(rated)[1]
 
 
 def _cardinality_score(

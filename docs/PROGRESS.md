@@ -1,9 +1,71 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 145 — review of PR 230, the 1.9.0 release PR).
+Last updated: 2026-08-01 (session 146 — second review pass on PR 230).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 146 — 2026-08-01: the second review pass on PR 230
+
+**Why.** A fresh read of the 1.9.0 release PR after session 145's fixes. Nothing blocking;
+six real findings, one of them a correction to a claim this document makes.
+
+- **Editing a chart under `?c_chart=` widened it in silence.** Session 145 stopped the
+  *automatic* writes from dropping the reference, which was the blocker. But the analyst's own
+  edit still goes through `takeOver`, which spells the chart into `c_*` params — and those
+  cannot carry `ids`, `anomalyRunId` or `collapseRoutine`. Changing the metric on an
+  agent-scoped chart therefore still turns 47 events into the whole timeline. That is
+  unavoidable (the URL is the record now) but it must not be *silent*, which is the whole
+  argument of the feature. `unrepresentableFilterMembers` names what a write would lose, and
+  the page says so where it already reports a broken reference.
+
+- **`collapseRoutine` was captured for agent charts and dropped for analyst ones.** The rail
+  was passed the raw URL filters, on the reasoning that collapse derives from live
+  dispositions and the page re-derives it. Only the *page* re-derives it: `ChartBlockCard` and
+  the export resolver draw a saved chart's stored filters verbatim. So a chart saved with
+  routine collapse on was frozen as its uncollapsed superset — the release's own "a saved
+  chart is the slice it was built over" claim, missed for the one narrowing an analyst toggles
+  by hand. The rail now gets the resolved set.
+
+- **Uniqueness was judged on the worst source instead of the best-evidenced one.**
+  `_uniqueness_ratio` took `max()` over the per-source ratios, so a single 60-event source
+  where `user` happens to be per-row-unique vetoed a field that groups cleanly across three
+  5000-event ones — and did so *more* often the more sources a timeline merges, which is
+  backwards for a scorer that weights breadth highest. It now reads the ratio off the source
+  with the most values.
+
+- **The timelines list settled stale recommendations one round trip at a time.** Split into a
+  pure `_recommendation_is_dead` predicate and a batched
+  `PostgresStore.settle_running_recommendations`, so the common case (nothing stale) touches
+  the database not at all and a restart that orphaned a dozen costs one statement.
+
+- **The AI opt-in cap was a wall with no way past it.** At 500 opted-in timelines every
+  further opt-in 400'd, and a consent that cannot be recorded is a disclosure dialog that
+  reappears forever — which is how people learn to click through it unread. Over the cap the
+  oldest entries are now evicted (FIFO on JSON insertion order, which is the opt-in order);
+  nothing from the current request is ever the thing dropped.
+
+- **The access-log redactor's survival was untested.** It works only because `dictConfig`
+  clears a configured logger's *handlers* and not its *filters* — a CPython implementation
+  detail, not a contract, and the difference between "OIDC codes are redacted" and "they are
+  back in the journal after a dependency bump". A test now runs uvicorn's own `LOGGING_CONFIG`
+  and asserts the filter is still attached and still redacting.
+
+Also: `chartConfigToStored` clears `filters` before writing it, so a future `ChartConfig.filters`
+cannot ride the spread into storage and be read back as a slice nobody chose; and the PR
+description's "`node:25-alpine`" was corrected to the `node:24-alpine` the Dockerfile and
+CHANGELOG actually ship.
+
+**Session 145's withdrawn finding was withdrawn correctly.** This pass re-raised the empty
+column selection independently and was wrong for the same reason: `migrateColumns` runs only
+in the `version < 1` persist branch, so `[]` does not decay into a permanent `DEFAULT_COLUMNS`
+override. Verified in `stores/ui.ts` rather than argued — the change was written and then
+reverted.
+
+One flake seen and not fixed: `test_demo_detector_coverage_clickhouse.py::…[find_value_combos]`
+failed once in a full run and passes in isolation on both the clean and the modified tree, and
+the next full run was green at 2203. It shares a ClickHouse instance with the rest of the
+suite; worth a look if it recurs.
 
 ## Session 145 — 2026-07-31: the chart link undid itself four seconds after opening
 
