@@ -1,10 +1,37 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 136 — PR #211 review pass).
+Last updated: 2026-07-31 (session 137 — README reorder).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
 
+## Session 137 — 2026-07-30: README reordered, and a count that did not add up
+
+**Why.** The README read as a wall of text. The cause was ordering, not volume: the
+AMiner/Timesketch positioning occupied lines 28–55, so the screenshot (line 57) and Quick
+start (line 109) both sat below it — a visitor met the prior-art discussion before learning
+what the tool does or seeing it run.
+
+- **Reordered.** Pitch → screenshot → Quick start → Capabilities → Architecture → How it
+  compares → Documentation. The comparison keeps its substance but moves below
+  Architecture and condenses ~28 lines into ~14, with the full five-axis version left where
+  it belongs in `CONCEPT.md` §8. The two relationships stay distinct per the tone rule:
+  Timesketch as the invited comparison, AMiner explicitly labelled a method source.
+- **Tightened the Capabilities bullets** from up to nine lines each to at most five, bold
+  lead-in plus one or two sentences, long tails pushed to the doc links that already exist.
+  1099 → 1004 words while adding a bullet.
+- **Stories was missing entirely.** The living-report subsystem ships (`docs/STORIES.md`)
+  and `CONCEPT.md` §8 names it as a differentiator, but the README never mentioned
+  reporting. Added as a capability bullet and a documentation-list entry.
+- **The detector count was wrong.** The intro said "fourteen analysis tools" while
+  Capabilities said "twelve statistical detectors ... plus log-template clustering, a Sigma
+  rule runner, and semantic similarity" — fifteen. Per `ANOMALY_DETECTION.md` the split is
+  twelve statistical (log templates among them, and "value combinations" being a variant of
+  detector 1 rather than its own tool) plus Sigma plus semantic similarity. Also dropped
+  "every one of them explainable down to the SQL it ran", which is not true of the vector
+  search.
+- Fixed "throug" and "Aminer". Laid the screenshot out for a 2×2 grid with a placeholder
+  comment; the capture list is filed under Milestone 3.
 ## Session 136 — 2026-07-31: the demo case, reviewed
 
 **Why.** A review of PR #211 before merge. One bug could take a user's demo case away
