@@ -263,10 +263,21 @@ describe("ColumnPicker suggestions", () => {
     useUiStore.setState({ visibleColumnsByTimeline: { "c1/t1": ["message"] } });
     await renderWithSuggestion({ recommended: SUGGESTION });
 
-    fireEvent.click(screen.getByRole("button", { name: /reset to defaults/i }));
+    // Named for what it restores: with a suggestion stored, "defaults" *is*
+    // the suggestion, and the old label described a different button.
+    fireEvent.click(screen.getByRole("button", { name: /reset to suggested/i }));
 
     // Absent, not equal-to-the-suggestion or to DEFAULT_COLUMNS: writing
     // either would opt this browser out of every later recomputation.
+    expect(useUiStore.getState().visibleColumnsByTimeline).not.toHaveProperty("c1/t1");
+  });
+
+  it("offers the built-in defaults by name when there is no suggestion", async () => {
+    useUiStore.setState({ visibleColumnsByTimeline: { "c1/t1": ["message"] } });
+    await renderWithSuggestion({ recommended: null });
+
+    fireEvent.click(screen.getByRole("button", { name: /reset to defaults/i }));
+
     expect(useUiStore.getState().visibleColumnsByTimeline).not.toHaveProperty("c1/t1");
   });
 

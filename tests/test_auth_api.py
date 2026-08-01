@@ -551,6 +551,44 @@ def test_access_log_redaction_folds_case_and_covers_more_than_oidc():
     assert redact_query("/x?code") == "/x?code"
 
 
+def test_every_secret_bearing_query_parameter_is_on_the_redaction_list():
+    """The list is a name list, so the obligation to extend it needs a ratchet.
+
+    ``_SECRET_QUERY_PARAMS`` only redacts what it is told about, and until now
+    the only thing saying "add your new one here" was a comment. This walks the
+    app's own OpenAPI schema and fails when a route declares a query parameter
+    whose *name* reads like a credential and is not on the list — which is how
+    the OIDC code reached the journal in the first place, one subsystem at a
+    time.
+
+    Deliberately name-shaped rather than exhaustive: it cannot know that some
+    innocuously-named parameter carries a secret, but it does catch every
+    parameter a reviewer would have flagged by reading its name.
+    """
+    import re
+
+    from vestigo.api.main import _SECRET_QUERY_PARAMS, create_app
+
+    suspicious = re.compile(
+        r"(token|secret|password|passwd|credential|api_?key|signature|^code$|^state$)"
+    )
+    offenders = []
+    for path, operations in create_app().openapi()["paths"].items():
+        for method, operation in operations.items():
+            if not isinstance(operation, dict):
+                continue
+            for parameter in operation.get("parameters", []):
+                if parameter.get("in") != "query":
+                    continue
+                name = parameter["name"].lower()
+                if suspicious.search(name) and name not in _SECRET_QUERY_PARAMS:
+                    offenders.append(f"{method.upper()} {path} ?{parameter['name']}")
+    assert offenders == [], (
+        "these query parameters look like credentials but would be logged in full; "
+        "add them to _SECRET_QUERY_PARAMS in api/main.py: " + ", ".join(offenders)
+    )
+
+
 def test_listing_cases_does_not_run_migrations(client, admin_bootstrap, monkeypatch):
     """Schema upgrades belong to startup, not to the hottest endpoint.
 

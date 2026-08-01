@@ -811,6 +811,143 @@ async def test_a_failed_spawn_hands_the_active_slot_back(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_collapsed_trigger_marks_the_timeline_rather_than_vanishing(store, monkeypatch):
+    """A skipped trigger is not a duplicate — it may know about a newer source.
+
+    The running job read its source list before this call happened, so simply
+    dropping the trigger would leave the timeline recommended from a subset of
+    what it now holds until the next ingest or a manual re-suggest.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    monkeypatch.setitem(columns_jobs._ACTIVE, timeline_id, "already-running")
+    try:
+        assert (
+            columns_jobs.start_column_recommendation(
+                case_id=case_id,
+                timeline_id=timeline_id,
+                job_store=JobStore(),
+                store=store,
+                ch_store=_NEVER_USED,
+            )
+            is None
+        )
+        assert timeline_id in columns_jobs._DIRTY
+    finally:
+        columns_jobs._DIRTY.discard(timeline_id)
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_that_lands_mid_run_earns_exactly_one_re_run(store, monkeypatch):
+    """The holder re-runs once for whatever it was too early to see.
+
+    Three sources finishing ingestion at once collapse into one mark, so the
+    burst costs one extra job rather than one per source — and that job is
+    local, since the trigger is an ingest and not an analyst.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    job_store = JobStore()
+    spawned: list[dict[str, Any]] = []
+
+    real_score = columns_jobs.score_columns
+
+    def _score_and_trigger(*args, **kwargs):
+        # Two more sources finish while this job is scoring.
+        for _ in range(2):
+            columns_jobs.start_column_recommendation(
+                case_id=case_id,
+                timeline_id=timeline_id,
+                job_store=job_store,
+                store=store,
+                ch_store=_NEVER_USED,
+            )
+        return real_score(*args, **kwargs)
+
+    def _capture_spawn(coro):
+        spawned.append({"name": coro.cr_code.co_name})
+        coro.close()
+        return None
+
+    monkeypatch.setattr(columns_jobs, "score_columns", _score_and_trigger)
+    monkeypatch.setattr(columns_jobs, "spawn_tracked_column_task", _capture_spawn)
+
+    job = job_store.create(kind=columns_jobs.JOB_KIND, case_id=case_id)
+    try:
+        await columns_jobs.run_column_recommendation_job(
+            job_id=job.id,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            job_store=job_store,
+            store=store,
+            ch_store=_NEVER_USED,
+        )
+
+        # One re-run for the burst, not one per collapsed trigger.
+        assert [s["name"] for s in spawned] == ["run_column_recommendation_job"]
+        assert timeline_id not in columns_jobs._DIRTY
+        rerun = [j for j in job_store.list_by_case(case_id) if j.id != job.id]
+        assert len(rerun) == 1
+    finally:
+        # The re-run's claim is normally released by the job we never let run.
+        columns_jobs._ACTIVE.pop(timeline_id, None)
+        columns_jobs._DIRTY.discard(timeline_id)
+
+
+@pytest.mark.asyncio
+async def test_a_run_nothing_interrupted_does_not_re_run(store, monkeypatch):
+    """The mark is the whole trigger — an ordinary run schedules nothing."""
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    spawned: list[Any] = []
+    monkeypatch.setattr(columns_jobs, "spawn_tracked_column_task", spawned.append)
+
+    job_store = await _run(store, case_id, timeline_id)
+
+    assert spawned == []
+    assert timeline_id not in columns_jobs._DIRTY
+    assert len(job_store.list_by_case(case_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_re_run_never_carries_the_analyst_s_opt_in(store, monkeypatch):
+    """A burst must not turn one "Suggest with AI" into repeated egress.
+
+    The re-run answers an ingest, not a person, so it scores locally however
+    the run that scheduled it was started.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    job_store = JobStore()
+    started: list[dict[str, Any]] = []
+
+    async def _advise(candidates, **kwargs):
+        columns_jobs._DIRTY.add(timeline_id)
+        return None
+
+    monkeypatch.setattr("vestigo.columns.advisor.rank_columns_with_llm", _advise)
+
+    def _capture(**kwargs):
+        started.append(kwargs)
+        return "job-rerun"
+
+    monkeypatch.setattr(columns_jobs, "start_column_recommendation", _capture)
+
+    job = job_store.create(kind=columns_jobs.JOB_KIND, case_id=case_id)
+    try:
+        await columns_jobs.run_column_recommendation_job(
+            job_id=job.id,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            job_store=job_store,
+            store=store,
+            ch_store=_NEVER_USED,
+            use_llm=True,
+        )
+    finally:
+        columns_jobs._DIRTY.discard(timeline_id)
+
+    assert len(started) == 1
+    assert started[0].get("use_llm", False) is False
+
+
+@pytest.mark.asyncio
 async def test_scheduling_defaults_to_a_local_run(store, monkeypatch):
     """`schedule_for_source` is the post-ingest path — it must never opt in for anyone."""
     case_id, timeline_id, source_id = await _seed_case_with_stats(store)

@@ -431,6 +431,18 @@ offer below returns on every visit and people learn to dismiss it unread. The
 next timeline asks again, because the sample values sent are that timeline's
 evidence.
 
+The disclosure refuses to close while its confirm is in flight — Escape, the
+overlay and the X included. A close is recorded as "no thanks", so a dismissal
+landing between the opt-in write and its response would race a `false` against
+the `true` the analyst just gave, and the stored consent could end up
+contradicting the request that was actually sent.
+
+One derived run exists, and it is always local: when an ingest trigger is
+collapsed into an already-running job (`columns/jobs.py::_DIRTY`), that job
+re-runs itself once for the sources it read too early — with `use_llm` unset
+however the run that scheduled it was started, so a burst can never turn one
+opted-in "Suggest with AI" into repeated egress.
+
 Two surfaces open that disclosure, both through
 `frontend/src/hooks/useColumnRecommendation.ts` so neither can send anything the
 other would not:

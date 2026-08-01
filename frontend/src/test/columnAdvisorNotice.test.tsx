@@ -90,6 +90,21 @@ describe("ColumnAdvisorNotice", () => {
     expect(screen.getByText(/nothing was sent/i)).toBeInTheDocument();
   });
 
+  it("cannot be dismissed while the confirm is in flight", async () => {
+    // The opener records a dismissal as "no thanks". Between the opt-in write
+    // and its response that answer would race the "yes" the analyst just gave,
+    // and the stored consent could end up contradicting the request that was
+    // actually sent — so no close reaches the opener while pending, Escape and
+    // the overlay included, not only the disabled Cancel button.
+    const { onOpenChange } = renderNotice({ pending: true });
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.keyDown(dialog, { key: "Escape", code: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
   it("is not rendered at all when closed", () => {
     renderNotice({ open: false });
 

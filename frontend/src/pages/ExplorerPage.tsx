@@ -39,6 +39,7 @@ import {
   hasSuggestion,
   isSuggesting,
   resolveVisibleColumns,
+  suggestionPollInterval,
 } from "@/lib/columns";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
@@ -432,9 +433,12 @@ export function ExplorerPage() {
     enabled: !!(caseId && timelineId),
     // A column suggestion runs as a background job (issue #213) — poll while
     // one is in flight so the grid re-lays out on its own. The timeline is
-    // never blocked on it: until it lands, the built-in defaults render.
+    // never blocked on it: until it lands, the built-in defaults render. The
+    // interval widens with the job's age (see `suggestionPollInterval`), since
+    // a job still running after two minutes is not one a three-second poll
+    // catches any sooner.
     refetchInterval: (query) =>
-      isSuggesting(query.state.data?.recommended_columns) ? 3000 : false,
+      suggestionPollInterval(query.state.data?.recommended_columns),
   });
 
   // Precedence: the analyst's own choice, then the timeline's suggestion, then
@@ -497,8 +501,15 @@ export function ExplorerPage() {
 
   // Closing without confirming is an answer too, and recorded as one — an
   // offer that returns on every visit is one people learn to dismiss unread.
+  //
+  // Never while the opt-in is in flight, though: that write is recording
+  // "yes", and a "no" racing it could win and leave the consent record
+  // contradicting the request the analyst authorized. `ColumnAdvisorNotice`
+  // refuses to close at all while pending, so this is the second lock on the
+  // same door — and the one that survives a future dialog that does not.
   const closeAdvisorOffer = useCallback(
     (open: boolean) => {
+      if (!open && columnAdvisor.optInPending) return;
       setAdvisorOfferOpen(open);
       if (!open && timelineId && !hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)) {
         columnAdvisor.decline.mutate();

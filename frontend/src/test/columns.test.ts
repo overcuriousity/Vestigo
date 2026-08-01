@@ -9,6 +9,7 @@ import {
   isSuggesting,
   resolveVisibleColumns,
   suggestedColumns,
+  suggestionPollInterval,
   STALE_SUGGESTION_MS,
 } from "@/lib/columns";
 import { DEFAULT_COLUMNS } from "@/stores/ui";
@@ -128,5 +129,26 @@ describe("suggestion predicates", () => {
   it("suggestedColumns is null when there is nothing to apply", () => {
     expect(suggestedColumns(null)).toBeNull();
     expect(suggestedColumns(suggestion({ status: "insufficient", columns: [] }))).toBeNull();
+  });
+});
+
+describe("suggestionPollInterval", () => {
+  const running = (ageMs: number) =>
+    suggestion({ status: "running", generated_at: new Date(Date.now() - ageMs).toISOString() });
+
+  it("does not poll when nothing is running", () => {
+    expect(suggestionPollInterval(suggestion())).toBe(false);
+    expect(suggestionPollInterval(null)).toBe(false);
+    // A claim past the staleness floor is not a job worth waiting for.
+    expect(suggestionPollInterval(running(STALE_SUGGESTION_MS + 1000))).toBe(false);
+  });
+
+  it("widens with the job's age", () => {
+    // A local scoring pass answers in a second or two; a job still going after
+    // two minutes is waiting on a model or wedged, and polling it every three
+    // seconds for the rest of the staleness window buys nothing.
+    expect(suggestionPollInterval(running(1_000))).toBe(3_000);
+    expect(suggestionPollInterval(running(60_000))).toBe(10_000);
+    expect(suggestionPollInterval(running(180_000))).toBe(30_000);
   });
 });

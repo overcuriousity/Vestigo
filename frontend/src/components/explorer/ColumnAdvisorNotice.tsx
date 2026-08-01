@@ -65,8 +65,20 @@ export function ColumnAdvisorNotice({ open, onOpenChange, onConfirm, pending, er
   const endpoint = info?.api_base_url ?? "the configured endpoint";
   const model = info?.model ?? "the configured model";
 
+  // A close is refused while the confirm is in flight — Escape, the overlay
+  // and the X included, not only the disabled Cancel button. The opener treats
+  // a close as an answer ("no thanks", recorded), so a close landing between
+  // the opt-in write and its response would race a `false` against the `true`
+  // the analyst just chose, and the stored consent could end up contradicting
+  // the request that was actually sent. Nothing is lost by waiting: the
+  // pending write settles in one round trip and closes the dialog itself.
+  const guardedOpenChange = (next: boolean) => {
+    if (!next && pending) return;
+    onOpenChange(next);
+  };
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={guardedOpenChange}>
       <DialogContent
         title="Suggest columns with AI"
         description="This timeline's field statistics are shown to the configured language model, which picks the columns it opens on."
@@ -117,7 +129,12 @@ export function ColumnAdvisorNotice({ open, onOpenChange, onConfirm, pending, er
         )}
 
         <div className="mt-5 flex justify-end gap-2">
-          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)} disabled={pending}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => guardedOpenChange(false)}
+            disabled={pending}
+          >
             Cancel
           </Button>
           <Button size="sm" onClick={onConfirm} disabled={pending}>

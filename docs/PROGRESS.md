@@ -1,9 +1,50 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-01 (session 147 — third review pass on PR 230).
+Last updated: 2026-08-01 (session 148 — fifth review pass on PR 230).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 148 — 2026-08-01: the fifth review pass on PR 230
+
+**Why.** A fresh read of the 1.9.0 release PR, this time over the column-suggestion feature
+as a whole rather than the `?c_chart=` path the previous passes kept circling. Two real
+findings, both about *when* things run rather than what they compute, plus the minor cleanups.
+
+- **A dismissal could race the opt-in and record the opposite consent.** The Explorer treats
+  closing the AI disclosure as "no thanks" and writes `false`; Cancel was disabled while the
+  confirm was pending, but Escape, the overlay and the X were not, so a close landing between
+  the opt-in write and its response fired a second `PUT /auth/me/preferences` with the
+  opposite answer. Last write wins, and the stored consent could contradict the request that
+  had already gone out — on the one record whose whole job is saying what the analyst
+  authorized. `ColumnAdvisorNotice` now refuses every close while pending, and
+  `closeAdvisorOffer` refuses too: the same lock on both sides, so a future dialog that
+  forgets cannot reintroduce it.
+
+- **An ingest burst silently dropped every source but the first.** `_ACTIVE` collapsed
+  concurrent triggers for one timeline into the running job, and the docstring called them
+  "identical jobs" — they were not. The holder read its source list before those sources
+  became ready, so four files landing in parallel left the timeline recommended from one of
+  them until the next ingest or a manual re-suggest. Collapsed triggers now mark the timeline
+  in `_DIRTY` and the holder re-runs once for the whole burst, after releasing its claim. The
+  re-run never carries `use_llm`: it answers an ingest, not a person, and a burst must not
+  turn one opted-in "Suggest with AI" into repeated egress.
+
+- **A redaction list nothing enforced.** `_SECRET_QUERY_PARAMS` only scrubs the parameter
+  names it is told about, and the obligation to extend it lived in a comment. A test now walks
+  the app's own OpenAPI schema and fails when a route declares a query parameter whose name
+  reads like a credential and is not on the list — name-shaped, so it catches exactly what a
+  reviewer reading the name would have caught, which is how the OIDC code reached the journal
+  in the first place.
+
+- **Minor.** The suggestion poll widened from a flat 3 s to 3/10/30 s by job age (~200 requests
+  over the ten-minute staleness window was buying nothing); "Reset to defaults" now says
+  "Reset to suggested" when that is what it restores; a comment duplicated across an earlier
+  review pass in `ColumnPicker` was folded into one.
+
+**Verified.** `uv run pytest` — 2214 passed. Frontend: 781 tests across 91 files, `tsc -b
+--noEmit` clean, `oxlint src` clean. `ruff check .` clean. The disclosure test was confirmed to
+fail against the pre-fix component before being kept.
 
 ## Session 147 — 2026-08-01: the third review pass on PR 230
 

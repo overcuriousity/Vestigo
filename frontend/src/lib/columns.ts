@@ -59,6 +59,39 @@ export function isSuggesting(
 }
 
 /**
+ * How often to re-read a timeline while its suggestion is running, by how long
+ * the job has been going.
+ *
+ * A local scoring pass answers in a second or two, which is what the first step
+ * is sized for. Past that the job is either waiting on a model call or wedged,
+ * and neither is worth a request every three seconds for the ten minutes
+ * {@link STALE_SUGGESTION_MS} allows — that is ~200 requests to learn something
+ * a slower poll learns just as well.
+ */
+const POLL_STEPS: { after: number; interval: number }[] = [
+  { after: 0, interval: 3_000 },
+  { after: 30_000, interval: 10_000 },
+  { after: 120_000, interval: 30_000 },
+];
+
+/**
+ * The polling interval for a running suggestion, or `false` when there is
+ * nothing to wait for — the shape TanStack Query's `refetchInterval` wants.
+ */
+export function suggestionPollInterval(
+  recommended: RecommendedColumns | null | undefined,
+): number | false {
+  if (!isSuggesting(recommended)) return false;
+  // `isSuggesting` already rejected an unparseable timestamp.
+  const elapsed = Date.now() - Date.parse(recommended!.generated_at);
+  let interval = POLL_STEPS[0].interval;
+  for (const step of POLL_STEPS) {
+    if (elapsed >= step.after) interval = step.interval;
+  }
+  return interval;
+}
+
+/**
  * The suggested columns, run through the same sanitizer the stored selections
  * go through — a suggestion is server data and gets no more trust than a
  * persisted one. Null when nothing survives sanitization, so the caller falls

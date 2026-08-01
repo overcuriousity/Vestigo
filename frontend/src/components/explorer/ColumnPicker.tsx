@@ -407,7 +407,10 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
                 : "Show the built-in default columns"
             }
           >
-            <RotateCcw size={10} /> Reset to defaults
+            {/* Named for what it actually restores. With a suggestion stored,
+                "defaults" is the suggestion, and a label saying otherwise
+                describes a different button than the one that is there. */}
+            <RotateCcw size={10} /> {suggestion ? "Reset to suggested" : "Reset to defaults"}
           </button>
           {canRecommend && (
             <Button
@@ -425,10 +428,9 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
               variant="ghost"
               size="sm"
               // Opted in on this timeline already: no dialog, the analyst has
-              // read what it sends. Otherwise the disclosure comes first and
-              // nothing is sent until they confirm it.
-              // Opted in on this timeline already: no dialog, so the footer is
-              // the only place a failure can be said.
+              // read what it sends — which also makes the footer the only
+              // place a failure can be reported. Otherwise the disclosure comes
+              // first and nothing is sent until they confirm it.
               onClick={() => (optedIn ? advisor.recommend(true) : setNoticeOpen(true))}
               disabled={recommendRunning || advisor.optInPending}
             >

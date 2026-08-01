@@ -47,7 +47,8 @@ JOB_KIND = "column_recommend"
 background_column_tasks: set[asyncio.Task] = set()
 
 #: Timelines with a recommendation currently running, so an ingest burst does
-#: not stack four identical jobs on the same timeline.
+#: not stack four concurrent jobs on the same timeline. What the collapsed
+#: triggers would have seen is not lost — see :data:`_DIRTY`.
 #:
 #: In this process's memory, and only meaningful there — the same single-process
 #: assumption ``JobStore`` already makes. A second worker sees an empty dict and
@@ -55,6 +56,19 @@ background_column_tasks: set[asyncio.Task] = set()
 #: (``api/routers/cases.py::_recommendation_is_dead``). See ``docs/ROADMAP.md``
 #: §"Explicitly out of scope" → *Persistent job store*.
 _ACTIVE: dict[str, str] = {}
+
+#: Timelines a trigger arrived for while a recommendation was already running.
+#:
+#: The ``_ACTIVE`` guard exists so an ingest burst does not stack four jobs on
+#: one timeline — but those jobs are *not* identical: the running one read its
+#: source list before the later sources became ready, so dropping the later
+#: triggers outright would leave the timeline recommended from a subset of what
+#: it now holds, until the next ingest or a manual re-suggest. Marking it here
+#: instead makes the running job re-run itself once, after it releases the
+#: claim, however many triggers were collapsed into the mark.
+#:
+#: Same in-memory, single-process scope as ``_ACTIVE``.
+_DIRTY: set[str] = set()
 
 
 def get_active_recommendation(timeline_id: str) -> str | None:
@@ -224,7 +238,9 @@ async def run_column_recommendation_job(
     ``_ACTIVE`` is claimed *before* the ``try``, and the claim is the guard:
     a timeline already being recommended for belongs to that job, so this one
     returns without touching the payload (whose ``running`` placeholder is the
-    other job's to roll back). The API path claims through
+    other job's to roll back) — after marking the timeline in :data:`_DIRTY`,
+    which is what makes the holder re-run rather than the collapsed trigger
+    being lost. The API path claims through
     :func:`start_column_recommendation` before spawning the task — so no burst
     can slip a second job in between — and re-claiming with the same id here is
     a no-op. The CLI and the demo call this function directly and are covered by
@@ -244,6 +260,9 @@ async def run_column_recommendation_job(
             holder,
             job_id,
         )
+        # Not a duplicate of the running job — this trigger knows about state
+        # that job may have read too early. The holder re-runs for it.
+        _DIRTY.add(timeline_id)
         job_store.update(job_id, status="completed", result={"skipped": True, "running": holder})
         return
     try:
@@ -252,6 +271,10 @@ async def run_column_recommendation_job(
             job_store.update(job_id, status="failed", error="Timeline not found")
             return
 
+        # Everything from here on reads the current state, so whatever trigger
+        # set the mark is covered by this run. A trigger arriving *after* this
+        # line sets it again and earns the re-run in the `finally`.
+        _DIRTY.discard(timeline_id)
         sources = await store.list_timeline_sources(case_id, timeline_id)
         source_ids = sorted(s.id for s in sources if s.is_ready)
         if not source_ids:
@@ -368,6 +391,56 @@ async def run_column_recommendation_job(
     finally:
         if _ACTIVE.get(timeline_id) == job_id:
             del _ACTIVE[timeline_id]
+            _rerun_if_dirty(
+                case_id=case_id,
+                timeline_id=timeline_id,
+                job_store=job_store,
+                store=store,
+                ch_store=ch_store,
+            )
+
+
+def _rerun_if_dirty(
+    *,
+    case_id: str,
+    timeline_id: str,
+    job_store: JobStore,
+    store: PostgresStore,
+    ch_store: ClickHouseStore | None,
+) -> None:
+    """Start one more run when a trigger was collapsed into :data:`_DIRTY`.
+
+    Called from the job's ``finally``, *after* the claim is released, so the
+    new job is not turned away as a duplicate of the one that is finishing.
+
+    Bounded to one extra run per burst however many triggers were collapsed:
+    the mark is cleared here and again by the new job before it reads state, so
+    the only way to earn a third run is a trigger arriving after the second run
+    already started — which is a trigger that genuinely knows something newer.
+
+    **Always local.** The re-run answers an ingest, not an analyst, so it never
+    passes ``use_llm`` — a burst must not turn one opted-in "Suggest with AI"
+    into repeated egress. Never raises: a re-run that cannot be scheduled is a
+    slightly stale suggestion, and the caller is a ``finally`` on a job that has
+    already done its work.
+    """
+    if timeline_id not in _DIRTY:
+        return
+    _DIRTY.discard(timeline_id)
+    try:
+        start_column_recommendation(
+            case_id=case_id,
+            timeline_id=timeline_id,
+            job_store=job_store,
+            store=store,
+            ch_store=ch_store,
+        )
+    except Exception:  # noqa: BLE001 — housekeeping: the stale answer stands
+        logger.exception(
+            "Could not re-run the column recommendation for timeline %s (case %s)",
+            timeline_id,
+            case_id,
+        )
 
 
 def start_column_recommendation(
@@ -401,6 +474,10 @@ def start_column_recommendation(
             timeline_id,
             active,
         )
+        # Marked rather than dropped: the running job may have read this
+        # timeline's source list before whatever prompted this call happened,
+        # so it re-runs once for it (see :data:`_DIRTY`).
+        _DIRTY.add(timeline_id)
         return None
     job = job_store.create(
         kind=JOB_KIND,
@@ -457,6 +534,12 @@ async def schedule_for_source(
     column choice lives in the browser and always outranks the stored
     recommendation, so replacing it here never moves anyone's columns out from
     under them. Local scoring only — an ingest never reaches the advisor.
+
+    A parallel ingest into one timeline lands here several times over: the
+    later calls are turned away by the ``_ACTIVE`` claim and mark the timeline
+    in :data:`_DIRTY` instead, so the running job re-runs once and the
+    recommendation ends up derived from every source, not just the ones that
+    were ready when the first job read the list.
     """
     timelines = await store.list_timelines_for_source(case_id, source_id)
     for timeline in timelines:
