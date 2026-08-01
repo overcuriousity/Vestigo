@@ -31,8 +31,15 @@ import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { casesApi } from "@/api/cases";
 import { canContributeToCase } from "@/lib/caseAccess";
+import { useColumnRecommendation } from "@/hooks/useColumnRecommendation";
+import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
 import { useUiStore } from "@/stores/ui";
-import { hasSuggestion, isSuggesting, resolveVisibleColumns } from "@/lib/columns";
+import {
+  hasAnsweredColumnAdvisor,
+  hasSuggestion,
+  isSuggesting,
+  resolveVisibleColumns,
+} from "@/lib/columns";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { useBaselineStore } from "@/stores/baseline";
@@ -451,6 +458,57 @@ export function ExplorerPage() {
     enabled: !!caseId,
   });
   const canRecommendColumns = case_ ? canContributeToCase(case_) : false;
+
+  // ── The one-time AI column offer (issue #213) ──────────────────────────
+  // A timeline opens on locally-scored columns, always — that is the part
+  // that never sends anything. Whether the model gets to re-rank them is a
+  // question only the analyst can answer, and it was previously buried in the
+  // Columns popover: the common path (create a timeline, open it) landed on
+  // the heuristic answer with nothing saying a better one was available.
+  //
+  // So it is asked once per timeline, on first open, by whoever can act on it
+  // — and the answer is recorded either way, so "no" is as final as "yes".
+  // Deliberately not at creation time: a timeline built by an ingest never
+  // passes that dialog, and those are the ones an analyst opens first.
+  const columnAdvisor = useColumnRecommendation(caseId!, timelineId!);
+  const [advisorOfferOpen, setAdvisorOfferOpen] = useState(false);
+  const offeredFor = useRef<string | null>(null);
+  const recommendation = timeline?.recommended_columns;
+  useEffect(() => {
+    if (!timelineId || offeredFor.current === timelineId) return;
+    // Every condition has to hold before the question is worth asking: the
+    // model has to exist, the analyst has to be able to act on the answer,
+    // there has to be a local suggestion for it to re-rank, and nobody may
+    // have answered already. A run in flight waits — its result may make the
+    // offer moot.
+    if (!agentAvailable || !canRecommendColumns) return;
+    if (!recommendation || recommendation.status !== "ok") return;
+    if (recommendation.method !== "heuristic") return;
+    if (hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)) return;
+    offeredFor.current = timelineId;
+    setAdvisorOfferOpen(true);
+  }, [
+    timelineId,
+    agentAvailable,
+    canRecommendColumns,
+    recommendation,
+    columnAdvisor.preferences,
+  ]);
+
+  // Closing without confirming is an answer too, and recorded as one — an
+  // offer that returns on every visit is one people learn to dismiss unread.
+  const closeAdvisorOffer = useCallback(
+    (open: boolean) => {
+      setAdvisorOfferOpen(open);
+      if (!open && timelineId && !hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)) {
+        columnAdvisor.decline.mutate();
+      }
+    },
+    [timelineId, columnAdvisor],
+  );
+  useEffect(() => {
+    if (columnAdvisor.optInAndRecommend.isSuccess) setAdvisorOfferOpen(false);
+  }, [columnAdvisor.optInAndRecommend.isSuccess]);
 
   const { data: timelineSources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
@@ -1203,6 +1261,17 @@ export function ExplorerPage() {
               timelineId={timelineId!}
               recommended={timeline?.recommended_columns}
               canRecommend={canRecommendColumns}
+            />
+            {/* Asked once per timeline, on first open. Same dialog and same
+                consent record as the Columns popover's own button — the two
+                share `useColumnRecommendation`, so neither can send anything
+                the other would not have. */}
+            <ColumnAdvisorNotice
+              open={advisorOfferOpen}
+              onOpenChange={closeAdvisorOffer}
+              onConfirm={() => columnAdvisor.optInAndRecommend.mutate()}
+              pending={columnAdvisor.optInPending}
+              error={columnAdvisor.optInError}
             />
 
             <Tooltip content="Open the full visualization page">

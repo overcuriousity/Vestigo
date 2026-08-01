@@ -11,16 +11,13 @@
  * where the suggestion is recomputed, locally or — after the disclosure in
  * `ColumnAdvisorNotice` — with the configured model.
  */
-import { useState, useMemo } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search, Sparkles } from "lucide-react";
-import { authApi } from "@/api/auth";
 import { eventsApi } from "@/api/events";
 import { useCapabilities } from "@/api/health";
-import { timelinesApi } from "@/api/timelines";
+import { useColumnRecommendation } from "@/hooks/useColumnRecommendation";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
-import { useAuthStore } from "@/stores/auth";
-import { useJobsStore } from "@/stores/jobs";
 import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -32,7 +29,6 @@ import {
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
 import {
-  COLUMN_ADVISOR_OPTIN,
   hasColumnAdvisorOptIn,
   hasSuggestion,
   isSuggesting,
@@ -50,6 +46,9 @@ interface Props {
   /** Whether this analyst may recompute the shared suggestion. */
   canRecommend?: boolean;
 }
+
+/** How long the Columns button announces itself after a timeline is opened. */
+const FLASH_DURATION_MS = 10_000;
 
 /** Human-readable labels for the built-in top-level columns. */
 const TOP_LEVEL_LABELS: Record<string, string> = {
@@ -165,57 +164,35 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
   const suggestedReasons = hasSuggestion(recommended) ? recommended.reasons : {};
   const suggestedSet = useMemo(() => new Set(suggestion ?? []), [suggestion]);
 
-  const queryClient = useQueryClient();
-  const addJob = useJobsStore((s) => s.addJob);
-  const user = useAuthStore((s) => s.user);
-  const setUser = useAuthStore((s) => s.setUser);
+  // This button governs what the whole grid shows, and it is the one control
+  // an analyst who has never opened it does not know is there — it sits in a
+  // row of same-shaped buttons and says nothing about itself. So it announces
+  // itself for a few seconds whenever a timeline is opened, and stops the
+  // moment it is used: the pulse means "you have not looked in here", and
+  // continuing after someone has is just noise. Unconditional, deliberately —
+  // gating it on whether a suggestion exists would hide it exactly on the
+  // corpora whose columns need the most attention.
+  const [flashing, setFlashing] = useState(true);
+  useEffect(() => {
+    setFlashing(true);
+    const timer = setTimeout(() => setFlashing(false), FLASH_DURATION_MS);
+    return () => clearTimeout(timer);
+  }, [timelineId]);
+
   const agentAvailable = useCapabilities().agent;
   const [noticeOpen, setNoticeOpen] = useState(false);
-  const optedIn = hasColumnAdvisorOptIn(user?.preferences, timelineId);
+  // Shared with the Explorer's one-time offer (`useColumnRecommendation`), so
+  // the two surfaces record the same consent and start the same job. Every run
+  // it starts also clears this browser's column override — the analyst asked
+  // for the new answer, so it has to be allowed to reach them.
+  const advisor = useColumnRecommendation(caseId, timelineId);
+  const optedIn = hasColumnAdvisorOptIn(advisor.preferences, timelineId);
 
-  const recommendMutation = useMutation({
-    mutationFn: (useAi: boolean) => timelinesApi.recommendColumns(caseId, timelineId, useAi),
-    onSuccess: (result) => {
-      // A null job id means one was already running — refetching the timeline
-      // is still the right move, since that in-flight job is what the status
-      // line is waiting on.
-      if (result.job_id) {
-        addJob(result.job_id, "Suggesting columns", [
-          ["timeline", caseId, timelineId],
-          ["fields", caseId, timelineId],
-        ]);
-      }
-      queryClient.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
-      setNoticeOpen(false);
-    },
-  });
+  useEffect(() => {
+    if (advisor.optInAndRecommend.isSuccess) setNoticeOpen(false);
+  }, [advisor.optInAndRecommend.isSuccess]);
 
-  // Which half of the confirm this attempt reached. Tracked by the confirm
-  // itself rather than read off `recommendMutation.isError`, which is sticky:
-  // a plain "Re-suggest columns" that failed earlier would still be flagged as
-  // errored here, and a *save* failure would then be reported as "your choice
-  // was saved" — the one wrong answer, since the analyst would never be asked
-  // again for a consent that was never recorded.
-  const [optInStage, setOptInStage] = useState<"save" | "run">("save");
-
-  // The opt-in is persisted *before* the run, and the run only happens if that
-  // write succeeded: a request that sends evidence must never be one the user
-  // will be asked to authorize again because the record of it was lost.
-  const optInAndRecommend = useMutation({
-    mutationFn: async () => {
-      setOptInStage("save");
-      const updated = await authApi.updatePreferences({
-        [COLUMN_ADVISOR_OPTIN]: { [timelineId]: true },
-      });
-      setUser(updated);
-      queryClient.setQueryData(["auth", "me"], updated);
-      setOptInStage("run");
-      return recommendMutation.mutateAsync(true);
-    },
-  });
-
-  const recommendRunning = recommendMutation.isPending || isSuggesting(recommended);
-  const optInError = optInAndRecommend.isError ? optInStage : null;
+  const recommendRunning = advisor.pending || isSuggesting(recommended);
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],
@@ -293,9 +270,14 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
   const activeCount = visibleColumns.filter((c) => c !== "_select" && c !== "_expand").length;
 
   return (
-    <Popover>
+    <Popover onOpenChange={(open) => open && setFlashing(false)}>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm" data-tour="column-picker">
+        <Button
+          variant="outline"
+          size="sm"
+          data-tour="column-picker"
+          className={cn(flashing && "attention-pulse")}
+        >
           <Columns3 size={13} />
           Columns
           {activeCount > 0 && (
@@ -431,8 +413,8 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => recommendMutation.mutate(false)}
-              disabled={recommendRunning || optInAndRecommend.isPending}
+              onClick={() => advisor.recommend(false)}
+              disabled={recommendRunning || advisor.optInPending}
             >
               {recommendRunning ? <Spinner size={11} /> : <RotateCcw size={11} />}
               {recommendRunning ? "Suggesting…" : "Re-suggest columns"}
@@ -445,20 +427,27 @@ export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: 
               // Opted in on this timeline already: no dialog, the analyst has
               // read what it sends. Otherwise the disclosure comes first and
               // nothing is sent until they confirm it.
-              onClick={() => (optedIn ? recommendMutation.mutate(true) : setNoticeOpen(true))}
-              disabled={recommendRunning || optInAndRecommend.isPending}
+              // Opted in on this timeline already: no dialog, so the footer is
+              // the only place a failure can be said.
+              onClick={() => (optedIn ? advisor.recommend(true) : setNoticeOpen(true))}
+              disabled={recommendRunning || advisor.optInPending}
             >
               <Sparkles size={11} /> Suggest with AI
             </Button>
+          )}
+          {advisor.footerError && (
+            <p role="status" className="w-full text-xs text-[var(--color-danger)]">
+              Could not start the suggestion — the columns on screen are unchanged. Try again.
+            </p>
           )}
         </div>
       </PopoverContent>
       <ColumnAdvisorNotice
         open={noticeOpen}
         onOpenChange={setNoticeOpen}
-        onConfirm={() => optInAndRecommend.mutate()}
-        pending={optInAndRecommend.isPending}
-        error={optInError}
+        onConfirm={() => advisor.optInAndRecommend.mutate()}
+        pending={advisor.optInPending}
+        error={advisor.optInError}
       />
     </Popover>
   );

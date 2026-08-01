@@ -4,7 +4,7 @@
  * selection always uses the full raw key.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { useUiStore } from "@/stores/ui";
@@ -209,6 +209,40 @@ async function renderWithSuggestion(props: {
   await waitFor(() => expect(screen.getByText("src_ip")).toBeInTheDocument());
 }
 
+describe("ColumnPicker attention flash", () => {
+  it("announces itself when a timeline opens, and stops on its own", async () => {
+    vi.useFakeTimers();
+    try {
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <ColumnPicker caseId="c1" timelineId="t1" />
+        </QueryClientProvider>,
+      );
+
+      const button = screen.getByRole("button", { name: /columns/i });
+      expect(button.className).toContain("attention-pulse");
+
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(button.className).not.toContain("attention-pulse");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops as soon as the picker is opened", async () => {
+    // The pulse means "you have not looked in here". Once someone has, it is
+    // just a blinking button.
+    await renderOpenPicker();
+
+    expect(
+      screen.getByRole("button", { name: /columns/i }).className,
+    ).not.toContain("attention-pulse");
+  });
+});
+
 describe("ColumnPicker suggestions", () => {
   it("marks suggested columns with the evidence behind them", async () => {
     await renderWithSuggestion({ recommended: SUGGESTION });
@@ -360,6 +394,90 @@ describe("ColumnPicker suggestions", () => {
     fireEvent.click(await screen.findByRole("button", { name: /send and suggest/i }));
 
     expect(await screen.findByText(/did not start/i)).toBeInTheDocument();
+  });
+
+  it("adopts its own result: an explicit re-suggest clears the local override", async () => {
+    // The precedence rule ("your choice always wins") is about *automatic*
+    // recomputes — a colleague's ingest must not move anyone's columns. But
+    // ticking a single checkbox materializes the current suggestion into a
+    // stored override, so without this the button an analyst presses to get a
+    // new answer is the one thing guaranteed never to show it: the job runs,
+    // the suggestion changes, and the grid keeps the columns it had.
+    const { timelinesApi } = await import("@/api/timelines");
+    useUiStore.setState({ visibleColumnsByTimeline: { "c1/t1": ["message"] } });
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /re-suggest columns/i }));
+
+    await waitFor(() =>
+      expect(vi.mocked(timelinesApi.recommendColumns)).toHaveBeenCalledWith("c1", "t1", false),
+    );
+    await waitFor(() =>
+      expect(useUiStore.getState().visibleColumnsByTimeline["c1/t1"]).toBeUndefined(),
+    );
+  });
+
+  it("keeps the override when the run could not be started", async () => {
+    // Clearing on failure would drop the analyst's columns for nothing.
+    const { timelinesApi } = await import("@/api/timelines");
+    vi.mocked(timelinesApi.recommendColumns).mockRejectedValue(new Error("boom"));
+    useUiStore.setState({ visibleColumnsByTimeline: { "c1/t1": ["message"] } });
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /re-suggest columns/i }));
+
+    expect(await screen.findByText(/Could not start the suggestion/i)).toBeInTheDocument();
+    expect(useUiStore.getState().visibleColumnsByTimeline["c1/t1"]).toEqual(["message"]);
+  });
+
+  it("says so in the footer when a local re-suggest fails", async () => {
+    // The local path has no dialog to report into. Without this it failed
+    // silently: the button re-enabled and nothing else happened, which reads
+    // as "the suggestion is identical to what you already have".
+    const { timelinesApi } = await import("@/api/timelines");
+    vi.mocked(timelinesApi.recommendColumns).mockRejectedValue(new Error("boom"));
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /re-suggest columns/i }));
+
+    expect(await screen.findByText(/Could not start the suggestion/i)).toBeInTheDocument();
+  });
+
+  it("says so in the footer when the opted-in AI shortcut fails", async () => {
+    // Opted in already, so no disclosure opens — the footer is the only
+    // surface this failure has.
+    const { timelinesApi } = await import("@/api/timelines");
+    capabilities.agent = true;
+    useAuthStore.setState({
+      user: testUser({ preferences: { column_advisor_optin: { t1: true } } }),
+    });
+    vi.mocked(timelinesApi.recommendColumns).mockRejectedValue(new Error("boom"));
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+
+    expect(await screen.findByText(/Could not start the suggestion/i)).toBeInTheDocument();
+  });
+
+  it("leaves a dialog-owned failure to the dialog", async () => {
+    // `recommendMutation` is shared by all three buttons, so the footer has to
+    // know when something else is already saying it — in more precise words
+    // than the footer has ("your choice was saved", "nothing was sent").
+    const { timelinesApi } = await import("@/api/timelines");
+    const { authApi } = await import("@/api/auth");
+    capabilities.agent = true;
+    useAuthStore.setState({ user: testUser() });
+    vi.mocked(authApi.updatePreferences).mockResolvedValue(
+      testUser({ preferences: { column_advisor_optin: { t1: true } } }),
+    );
+    vi.mocked(timelinesApi.recommendColumns).mockRejectedValue(new Error("boom"));
+    await renderWithSuggestion({ recommended: SUGGESTION, canRecommend: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /suggest with ai/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /send and suggest/i }));
+
+    expect(await screen.findByText(/did not start/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Could not start the suggestion/i)).toBeNull();
   });
 
   it("asks again on a timeline the analyst has not opted in to", async () => {

@@ -420,14 +420,37 @@ post-ingest, timeline creation, the CLI, the demo build — leaves it there, so
 the scorer runs locally and **egress is never a side effect of uploading a
 file**. Exactly one caller sets it: `POST
 /api/cases/{id}/timelines/{id}/recommend-columns` with `{"use_ai": true}`,
-behind the "Suggest with AI" button in the Columns picker. The first press on a
-given timeline opens the disclosure
-(`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`) naming exactly what
-would be sent, the endpoint URL and the model; confirming records the opt-in for
-that timeline (`preferences.column_advisor_optin`, a `{timeline_id: true}` map
-written through `PUT /api/auth/me/preferences`) and only then runs. Cancelling
-sends nothing. The next timeline asks again, because the sample values sent are
-that timeline's evidence.
+behind the disclosure
+(`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`), which names
+exactly what would be sent, the endpoint URL and the model. Confirming records
+the answer for that timeline (`preferences.column_advisor_optin`, a
+`{timeline_id: bool}` map written through `PUT /api/auth/me/preferences`) and
+only then runs. Cancelling sends nothing and records `false` — a declined
+timeline has to be distinguishable from one nobody has been asked about, or the
+offer below returns on every visit and people learn to dismiss it unread. The
+next timeline asks again, because the sample values sent are that timeline's
+evidence.
+
+Two surfaces open that disclosure, both through
+`frontend/src/hooks/useColumnRecommendation.ts` so neither can send anything the
+other would not:
+
+- **The "Suggest with AI" button** in the Columns picker, at any time.
+- **A one-time offer** the first time someone with contribute access opens a
+  timeline that holds a `method: "heuristic"` suggestion they have not answered
+  for. The button alone was not enough: the common path (create a timeline, open
+  it) landed on the local answer with nothing on screen saying a better one
+  existed, and a disclosure nobody finds is not a choice anybody made. The offer
+  merely appearing sends nothing — it is the same dialog, gated on the same
+  `capabilities.agent`, and it never fires for a read-only member, a timeline
+  with no local suggestion yet, or one already ranked by the model.
+
+An explicit run from either surface also clears the requesting browser's stored
+column override. The per-user choice still outranks *automatic* recomputes (a
+colleague's ingest never moves anyone's columns), but pressing the button is
+asking for the new answer — leaving the override in place made the button look
+broken, since a single earlier checkbox click had already frozen the grid on the
+suggestion it was showing at the time.
 
 The contribute-access check on the endpoint is the authorization; the stored
 opt-in is the UI's memory of having shown the disclosure, not a second gate. The

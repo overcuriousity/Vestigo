@@ -10,11 +10,20 @@
  * authorized: it names what is sent, where it goes, and which model reads it,
  * before anything has left the machine.
  *
- * Opened by the "Suggest with AI" button in `ColumnPicker`, never on its own —
- * an analyst who has not asked for this is never interrupted by it. Confirming
- * records the opt-in per timeline (`preferences.column_advisor_optin`), which
- * is the granularity at which evidence is actually sent, so the button runs
- * straight through on that timeline afterwards and asks again on the next one.
+ * Two openers, both routed through `useColumnRecommendation` so neither can
+ * send anything the other would not: the "Suggest with AI" button in
+ * `ColumnPicker`, and `ExplorerPage`'s one-time offer the first time anyone who
+ * can act on it opens a timeline holding a locally-scored suggestion. The offer
+ * exists because the button alone was not enough — a timeline opens on the
+ * heuristic answer with nothing on screen saying a better one is available, and
+ * a disclosure nobody finds is not a choice anybody made.
+ *
+ * Either way the answer is recorded per timeline
+ * (`preferences.column_advisor_optin`), which is the granularity at which
+ * evidence is actually sent: `true` runs straight through on that timeline
+ * afterwards, `false` is as final as `true` and stops the offer coming back,
+ * and the next timeline asks again. Nothing is sent until Confirm — dismissing
+ * this dialog is a decision, not a deferral.
  *
  * The copy lives here rather than in `lib/guidance.tsx` because it interpolates
  * the resolved endpoint and model; the guidance registry is keyed by

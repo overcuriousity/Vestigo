@@ -286,6 +286,33 @@ body {
   }
 }
 
+/* ── Attention pulse ─────────────────────────────────────────────────────── */
+/* Points at a control that decides what the analyst sees but sits still and
+   silent while doing it — the Columns button, which governs the whole grid and
+   is otherwise indistinguishable from the buttons beside it. A ring drawn with
+   box-shadow rather than a border or an outline, so nothing reflows and the
+   button does not move under a cursor already travelling toward it. */
+@keyframes attention-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 0 3px var(--color-accent-dim);
+  }
+}
+.attention-pulse {
+  animation: attention-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* The point is "look here", not the motion — a steady ring says it without
+     anything blinking, which is what the preference is asking for. */
+  .attention-pulse {
+    animation: none;
+    box-shadow: 0 0 0 2px var(--color-accent-dim);
+  }
+}
+
 /* ── Onboarding tour ─────────────────────────────────────────────────────── */
 /* Forces hover-only controls visible while the tour spotlights them
    (overrides Tailwind's opacity-0 group-hover:opacity-100). */

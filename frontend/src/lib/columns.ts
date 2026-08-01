@@ -73,23 +73,49 @@ export function suggestedColumns(
 }
 
 /**
- * Preference key holding `{ [timelineId]: true }` for the timelines this user
- * has opted in to AI column suggestions on (issue #213).
+ * Preference key holding this user's answer per timeline for AI column
+ * suggestions (issue #213): `true` opted in, `false` declined, key absent
+ * never asked.
  *
  * Per timeline, because that is the granularity at which evidence is actually
  * sent: the request carries sample values from *this* timeline's events, so
  * consenting to it says nothing about the next one.
+ *
+ * A declined answer is stored rather than inferred from the absence of an
+ * opt-in, because the Explorer offers the suggestion once per timeline and
+ * has to tell "said no" apart from "not asked yet" — otherwise the offer
+ * comes back on every visit, which is how people learn to dismiss a consent
+ * dialog unread. Server-side for the same reason the opt-in is: the answer
+ * has to hold on the analyst's other machine too.
  */
 export const COLUMN_ADVISOR_OPTIN = "column_advisor_optin";
+
+function advisorAnswer(
+  preferences: Record<string, unknown> | null | undefined,
+  timelineId: string,
+): unknown {
+  const answers = preferences?.[COLUMN_ADVISOR_OPTIN];
+  if (!answers || typeof answers !== "object") return undefined;
+  return (answers as Record<string, unknown>)[timelineId];
+}
 
 /** Whether *timelineId* has already been opted in by this user. */
 export function hasColumnAdvisorOptIn(
   preferences: Record<string, unknown> | null | undefined,
   timelineId: string,
 ): boolean {
-  const optIn = preferences?.[COLUMN_ADVISOR_OPTIN];
-  if (!optIn || typeof optIn !== "object") return false;
-  return (optIn as Record<string, unknown>)[timelineId] === true;
+  return advisorAnswer(preferences, timelineId) === true;
+}
+
+/**
+ * Whether this user has answered the question for *timelineId* at all — yes
+ * or no. False only for a timeline nobody has been offered the suggestion on.
+ */
+export function hasAnsweredColumnAdvisor(
+  preferences: Record<string, unknown> | null | undefined,
+  timelineId: string,
+): boolean {
+  return typeof advisorAnswer(preferences, timelineId) === "boolean";
 }
 
 /** Resolve the columns to render, applying the precedence above. */

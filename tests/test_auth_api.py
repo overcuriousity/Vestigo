@@ -221,6 +221,32 @@ def test_update_my_preferences_merges_dict_values_one_level_down(client, admin_b
     }
 
 
+def test_update_my_preferences_records_a_declined_answer(client, admin_bootstrap):
+    """``false`` is an answer, not an absent one.
+
+    The Explorer offers the AI column suggestion once per timeline and has to
+    tell "said no" apart from "not asked yet" — otherwise the disclosure comes
+    back on every visit, which is how people learn to dismiss a consent dialog
+    unread. Same key as the opt-in, so one merge and one bound cover both.
+    """
+    as_admin(client, admin_bootstrap)
+    client.put(
+        "/api/auth/me/preferences",
+        json={"preferences": {"column_advisor_optin": {"tl-1": True}}},
+    )
+
+    resp = client.put(
+        "/api/auth/me/preferences",
+        json={"preferences": {"column_advisor_optin": {"tl-2": False}}},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["user"]["preferences"]["column_advisor_optin"] == {
+        "tl-1": True,
+        "tl-2": False,
+    }
+
+
 def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bootstrap):
     """The blob is feature state, not a key/value store every session can write."""
     as_admin(client, admin_bootstrap)
