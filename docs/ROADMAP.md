@@ -84,15 +84,6 @@ round — **standing rule: when either resumes, both are designed together in on
   run's findings and the Method panel open, a Story with a live view embed and a chart
   block, the Agent with an applied finding, and a re-shot Explorer to match. The
   placeholder comment in `README.md` marks where they go.
-- [ ] **Column suggestions skip mapped fields.** A timeline with `field_mappings` gets no
-  suggestion for the fields those mappings define (`columns/recommend.py` excludes both the
-  raw keys and the canonical name), because the event grid renders a dynamic column straight
-  out of `attributes[colId]` — the canonical name isn't in that map, and picking one raw
-  spelling shows blanks for every source using the other. On a badly-normalized corpus those
-  are exactly the fields worth suggesting. The fix is upstream of the suggestion: make the
-  event projection expose canonical mapped fields the way filters and aggregations already
-  see them (`db/field_mappings.py::mapping_coalesce_expr`), after which the exclusion in
-  `score_columns` just goes away.
 - [ ] **Extract a `ui/Callout` primitive.** `analysis/EmbeddingStatusBanner`,
   `timelines/UploadDialog`'s duplicate warning and a handful of other sites hand-roll the
   same border/dim-background/icon banner with per-site colour tokens. Distinct from the

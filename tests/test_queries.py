@@ -1179,6 +1179,41 @@ def test_cursor_predicate_is_sargable_plain_tuple(
     assert "p3" not in (params or {})
 
 
+def _row_with_attributes(event_id: str, attributes: dict[str, Any]) -> list[Any]:
+    row = _cursor_row(event_id, datetime(2026, 6, 25, 7, 30, 1))
+    row[18] = attributes
+    return row
+
+
+def test_page_carries_canonical_mapped_fields_in_attributes() -> None:
+    """The presented page resolves a timeline's canonical fields, using the
+    same coalesce the filter SQL applies — otherwise a canonical column the
+    picker offers renders empty on every row (see field_mappings.py)."""
+    rows = [
+        _row_with_attributes("evt-1", {"src_ip": "10.0.0.4"}),
+        _row_with_attributes("evt-2", {"ip_addr": "192.168.1.9"}),
+        _row_with_attributes("evt-3", {"src_ip": "", "status": "200"}),
+    ]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(case_id="case-1", field_mappings={"ip_address": ["src_ip", "ip_addr"]})
+    )
+    assert [e["attributes"].get("ip_address") for e in page.events] == [
+        "10.0.0.4",
+        "192.168.1.9",
+        None,
+    ]
+    # Raw keys stay exactly as ingested alongside the derived one.
+    assert page.events[0]["attributes"]["src_ip"] == "10.0.0.4"
+
+
+def test_page_without_mappings_leaves_attributes_untouched() -> None:
+    rows = [_row_with_attributes("evt-1", {"src_ip": "10.0.0.4"})]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(EventQuery(case_id="case-1"))
+    assert page.events[0]["attributes"] == {"src_ip": "10.0.0.4"}
+
+
 def test_two_phase_page_fetch_shapes() -> None:
     """Phase 1 must select only (event_id, timestamp); phase 2 must re-filter
     by the page's timestamp bounds plus an explicit event_id set, and return

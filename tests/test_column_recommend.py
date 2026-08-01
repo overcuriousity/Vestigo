@@ -192,8 +192,9 @@ def test_attribute_colliding_with_a_grid_column_id_is_dropped():
     assert "user" in tokens
 
 
-def test_mapping_consumed_keys_are_excluded():
-    """Neither the raw keys nor the canonical name renders in the grid today."""
+def test_mapping_consumed_keys_are_replaced_by_the_canonical_field():
+    """A raw spelling is blank for the sources using the other one; the
+    canonical field the grid actually renders is scored in its place."""
     stats = {
         "s1": _source(
             1000,
@@ -205,8 +206,69 @@ def test_mapping_consumed_keys_are_excluded():
     }
     tokens = [c.token for c in score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})]
     assert "src_ip" not in tokens
-    assert "ip_address" not in tokens
+    assert "ip_address" in tokens
     assert "user" in tokens
+
+
+def test_canonical_field_counts_both_spellings_toward_breadth():
+    """The point of the mapping: each raw key covers half the timeline, the
+    canonical field covers all of it and must outrank a single-source field."""
+    stats = {
+        "s1": _source(
+            1000,
+            {
+                "src_ip": _attr(1000, 40, ["10.0.0.1", "10.0.0.2", "8.8.8.8"]),
+                "only_here": _attr(1000, 40, ["a-value", "b-value", "c-value"]),
+            },
+        ),
+        "s2": _source(1000, {"ip_addr": _attr(1000, 40, ["192.168.1.9", "192.168.1.10"])}),
+    }
+    candidates = score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})
+    by_token = {c.token: c for c in candidates}
+    assert by_token["ip_address"].sources_present == 2
+    assert by_token["ip_address"].coverage == 2000
+    tokens = [c.token for c in candidates]
+    assert tokens.index("ip_address") < tokens.index("only_here")
+
+
+def test_canonical_coverage_is_capped_at_a_source_event_count():
+    """One source carrying both spellings must not double-count the events
+    that set both — the coalesce yields one value per event."""
+    stats = {
+        "s1": _source(
+            1000,
+            {
+                "src_ip": _attr(900, 40, ["10.0.0.1", "10.0.0.2"]),
+                "ip_addr": _attr(800, 40, ["192.168.1.9", "192.168.1.10"]),
+            },
+        )
+    }
+    candidate = next(
+        c
+        for c in score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})
+        if c.token == "ip_address"
+    )
+    assert candidate.coverage == 1000
+    assert candidate.fill == 1.0
+
+
+def test_canonical_name_shadowing_a_real_key_is_scored_as_neither():
+    """A source ingested after the mapping was saved can introduce the
+    canonical name as a real key. The projection then refuses to overwrite it,
+    so the column would mix stored and coalesced values across sources."""
+    stats = {
+        "s1": _source(1000, {"src_ip": _attr(1000, 40, ["10.0.0.1", "10.0.0.2"])}),
+        "s2": _source(1000, {"ip_address": _attr(1000, 40, ["192.168.1.9", "192.168.1.10"])}),
+    }
+    tokens = [c.token for c in score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})]
+    assert "ip_address" not in tokens
+    assert "src_ip" not in tokens
+
+
+def test_canonical_name_colliding_with_a_grid_column_id_is_dropped():
+    stats = {"s1": _source(1000, {"msg_text": _attr(1000, 300, ["one", "two", "three"])})}
+    tokens = [c.token for c in score_columns(stats, {"message": ["msg_text"]})]
+    assert tokens == []
 
 
 # ── Ranking ─────────────────────────────────────────────────────────────────

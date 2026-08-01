@@ -47,6 +47,7 @@ from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
+    project_mapped_fields,
     resolve_mapping,
 )
 from vestigo.db.field_recommend import (
@@ -1377,6 +1378,15 @@ class EventQueryService:
             _normalize_event_row(dict(zip(columns, row, strict=False)), query.source_offsets)
             for row in rows
         ]
+        # Canonical mapped fields are resolved for the *presented* page only —
+        # the same coalesce the filter SQL applies, so a rendered column and a
+        # filter on that column cannot disagree. Export (`iter_events`)
+        # deliberately does not do this; see project_mapped_fields.
+        if query.field_mappings:
+            for event in events:
+                event["attributes"] = project_mapped_fields(
+                    event.get("attributes"), query.field_mappings
+                )
         if query.before is not None:
             events.reverse()
 

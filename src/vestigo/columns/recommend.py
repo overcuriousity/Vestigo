@@ -38,12 +38,12 @@ Deliberate exclusions:
   columns already handled badly.
 * Ingestion metadata (``parser_name``, ``source_file``, hashes) is never a
   candidate. It describes how the evidence got here, not what happened.
-* Attribute keys consumed by a timeline's ``field_mappings`` are skipped. The
-  grid renders a dynamic column straight out of ``attributes[colId]``
-  (``EventGrid.tsx``), so neither the canonical name (absent from the map)
-  nor one arbitrary raw key (blank for the sources using the other spelling)
-  renders correctly — recommending either would be recommending a column that
-  looks broken. See ``docs/ROADMAP.md``.
+* Raw attribute keys consumed by a timeline's ``field_mappings`` are skipped —
+  one spelling is blank for every source using the other. The **canonical**
+  field is scored instead, merged from its raw keys: a source counts toward
+  breadth if it carries any of them, which is exactly the field an analyst
+  curated a mapping to get. It renders because the presented row carries the
+  coalesced value (``db/field_mappings.py::project_mapped_fields``).
 """
 
 from __future__ import annotations
@@ -369,8 +369,8 @@ def score_columns(
         stats: ``{source_id: (events_total, payload)}`` exactly as
             ``db/field_stats.ensure_source_field_stats`` returns it.
         field_mappings: The timeline's canonical field mappings, if any. Raw
-            keys consumed by a mapping are excluded (see the module
-            docstring).
+            keys consumed by a mapping are excluded and the canonical field is
+            scored in their place (see the module docstring).
         max_candidates: Cap on the returned list, highest score first.
 
     Returns:
@@ -383,7 +383,24 @@ def score_columns(
         return []
 
     mapped_raws = {raw for raws in (field_mappings or {}).values() for raw in raws}
-    excluded_attrs = reserved_column_ids() | mapped_raws | set(field_mappings or {})
+
+    # A canonical name that also exists as a raw key somewhere is scored as
+    # neither the mapping nor the attribute: `project_mapped_fields` refuses to
+    # overwrite a stored key, so the column would carry the ingested value on
+    # the sources that have that key and the coalesced value everywhere else —
+    # one column, two meanings, and statistics that describe neither.
+    # Validation rejects such a mapping when the inventory is known; this
+    # covers the source ingested after the mapping was saved.
+    all_attribute_keys = {
+        key for _, payload in stats.values() for key in (payload.get("attributes") or {})
+    }
+    shadowed = set(field_mappings or {}) & all_attribute_keys
+    excluded_attrs = reserved_column_ids() | mapped_raws | shadowed
+    canonicals = {
+        canonical: raws
+        for canonical, raws in (field_mappings or {}).items()
+        if canonical not in reserved_column_ids() and canonical not in shadowed
+    }
 
     # Merge per-source entries into one view per token. Coverage sums exactly;
     # distinct is max-across-sources (db/field_stats.py's documented
@@ -391,7 +408,7 @@ def score_columns(
     # rather than after merging, so an attribute that shares a name with a
     # top-level column can never contaminate that column's statistics.
     merged: dict[str, dict[str, Any]] = {}
-    for _events_total, payload in stats.values():
+    for events_total, payload in stats.values():
         sections: tuple[tuple[str, frozenset[str] | None], ...] = (
             ("top_level", frozenset(CANDIDATE_TOP_LEVEL)),
             ("attributes", None),
@@ -425,6 +442,43 @@ def score_columns(
                 acc["per_source"].append((entry_distinct, coverage))
                 acc["sources"] += 1
                 acc["samples"].extend(_entry_samples(entry)[:5])
+
+        # Canonical mapped fields are scored as one merged token, from the raw
+        # entries that make them up. A source counts once toward breadth if it
+        # carries *any* of the raws — which is the whole point: each raw alone
+        # looks partial on a merged timeline, while the canonical field the
+        # grid renders (db/field_mappings.py::project_mapped_fields) is
+        # present everywhere. Coverage is capped at the source's event count:
+        # a source carrying two of the raws would otherwise double-count the
+        # events that set both, where the coalesce yields one value.
+        attr_entries: dict[str, Any] = payload.get("attributes") or {}
+        for canonical, raw_keys in canonicals.items():
+            present = [attr_entries[raw] for raw in raw_keys if raw in attr_entries]
+            if not present:
+                continue
+            coverage = min(sum(int(e.get("coverage", 0)) for e in present), int(events_total))
+            if coverage <= 0:
+                continue
+            entry_distinct = max(int(e.get("distinct", 0)) for e in present)
+            acc = merged.setdefault(
+                canonical,
+                {
+                    "coverage": 0,
+                    "distinct": 0,
+                    "sources": 0,
+                    "per_source": [],
+                    "samples": [],
+                    "top_level": False,
+                },
+            )
+            acc["coverage"] += coverage
+            acc["distinct"] = max(acc["distinct"], entry_distinct)
+            acc["per_source"].append((entry_distinct, coverage))
+            acc["sources"] += 1
+            pooled: list[str] = []
+            for entry in present:
+                pooled.extend(_entry_samples(entry))
+            acc["samples"].extend(pooled[:5])
 
     candidates: list[ColumnCandidate] = []
     for token, acc in merged.items():

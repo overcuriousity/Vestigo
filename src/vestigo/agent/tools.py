@@ -1259,6 +1259,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         whole record either way. Iterate by refining `filters` rather than
         paging deeply — aggregations (field_terms, histogram) summarize better
         than paging.
+
+        Where the timeline defines canonical field mappings, each event's
+        attributes carry the canonical field alongside the raw keys it was
+        coalesced from — the same value a filter on that field matches.
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec, limit=limit, offset=offset, order=order)

@@ -85,6 +85,40 @@ def test_filter_on_canonical_field_matches_both_sources(ch_store):
     assert {e["source_id"] for e in page.events} == {SRC_A, SRC_B}
 
 
+def test_page_rows_carry_the_canonical_field_for_every_source(ch_store):
+    """The projection half of the mapping: a canonical column the picker
+    offers must render on rows from both spellings."""
+    service = EventQueryService(store=ch_store)
+    page = service.query(_query())
+    assert len(page.events) == 4
+    by_source: dict[str, set[str]] = {}
+    for event in page.events:
+        assert "ip_address" in event["attributes"], event["attributes"]
+        by_source.setdefault(event["source_id"], set()).add(event["attributes"]["ip_address"])
+    assert by_source == {SRC_A: {"10.0.0.1", "10.0.0.2"}, SRC_B: {"10.0.0.1", "10.0.0.3"}}
+
+
+def test_projected_value_agrees_with_a_filter_on_the_same_field(ch_store):
+    """Display and filter resolve the same canonical field through the same
+    coalesce rule — the one thing that must not drift."""
+    service = EventQueryService(store=ch_store)
+    filtered = service.query(_query(field_filters={"ip_address": ["10.0.0.1"]}))
+    assert {e["attributes"]["ip_address"] for e in filtered.events} == {"10.0.0.1"}
+    all_rows = service.query(_query())
+    matching = {
+        e["event_id"] for e in all_rows.events if e["attributes"].get("ip_address") == "10.0.0.1"
+    }
+    assert matching == {e["event_id"] for e in filtered.events}
+
+
+def test_export_rows_stay_raw(ch_store):
+    """Export carries what was ingested — the mapping is a query-time view."""
+    service = EventQueryService(store=ch_store)
+    rows = list(service.iter_events(_query()))
+    assert len(rows) == 4
+    assert all("ip_address" not in row["attributes"] for row in rows)
+
+
 def test_exclusion_on_canonical_field(ch_store):
     service = EventQueryService(store=ch_store)
     page = service.query(_query(field_exclusions={"ip_address": ["10.0.0.1"]}))

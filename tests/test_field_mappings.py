@@ -7,6 +7,7 @@ from vestigo.db.anomaly_stats import _col_expr
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
+    project_mapped_fields,
     resolve_mapping,
     validate_field_mappings,
 )
@@ -48,6 +49,54 @@ def test_resolve_mapping_hits_canonical_and_misses_others():
 def test_attr_prefix_bypasses_mapping():
     # attr: always addresses the raw key — the analyst's escape hatch.
     assert resolve_mapping("attr:ip_address", MAPPINGS) is None
+
+
+# ── project_mapped_fields ─────────────────────────────────────────────────────
+
+
+def test_projection_takes_the_first_raw_in_precedence_order():
+    attrs = {"src_ip": "10.0.0.4", "ip_addr": "192.168.1.9"}
+    assert project_mapped_fields(attrs, MAPPINGS)["ip_address"] == "10.0.0.4"
+
+
+def test_projection_falls_through_to_the_later_spelling():
+    # The source that uses the other spelling — the case the mapping exists for.
+    assert project_mapped_fields({"ip_addr": "192.168.1.9"}, MAPPINGS)["ip_address"] == (
+        "192.168.1.9"
+    )
+
+
+def test_projection_treats_empty_string_as_absent_like_nullif():
+    attrs = {"src_ip": "", "ip_addr": "192.168.1.9"}
+    assert project_mapped_fields(attrs, MAPPINGS)["ip_address"] == "192.168.1.9"
+
+
+def test_projection_omits_a_canonical_field_no_raw_carries():
+    # The SQL's trailing '' becomes an absent key here, so the grid renders its
+    # own em dash instead of an empty cell.
+    out = project_mapped_fields({"src_ip": "", "status": "200"}, MAPPINGS)
+    assert "ip_address" not in out
+    assert "user_name" not in out
+
+
+def test_projection_never_overwrites_a_stored_key():
+    # A source ingested after the mapping was saved can introduce the canonical
+    # name as a real key; the record outranks the derived value.
+    attrs = {"ip_address": "stored", "src_ip": "10.0.0.4"}
+    assert project_mapped_fields(attrs, MAPPINGS)["ip_address"] == "stored"
+
+
+def test_projection_without_mappings_returns_the_same_object():
+    attrs = {"src_ip": "10.0.0.4"}
+    assert project_mapped_fields(attrs, None) is attrs
+    assert project_mapped_fields(attrs, {}) is attrs
+
+
+def test_projection_does_not_mutate_the_source_map():
+    attrs = {"src_ip": "10.0.0.4"}
+    out = project_mapped_fields(attrs, MAPPINGS)
+    assert attrs == {"src_ip": "10.0.0.4"}
+    assert out["ip_address"] == "10.0.0.4"
 
 
 # ── validate_field_mappings ───────────────────────────────────────────────────
