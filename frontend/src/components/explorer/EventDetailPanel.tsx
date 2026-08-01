@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight, EyeOff } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -47,6 +47,9 @@ interface Props {
    * keys). The backend resolves them into every presented row's `attributes`
    * (db/field_mappings.py::project_mapped_fields), so without them here a
    * derived value would read as a key the source file carries — it does not.
+   * Used only to *name* the raw fields behind a badge; whether a given row's
+   * key is derived at all comes from that row's `mapped_fields`, since a
+   * source may store the canonical name itself and then outrank the mapping.
    */
   fieldMappings?: Record<string, string[]> | null;
   /** Existing annotation-tag labels for autocomplete. */
@@ -337,6 +340,16 @@ export function EventDetailPanel({
   });
   const toggleSection = (id: string) =>
     setCollapsedSections((s) => ({ ...s, [id]: !s[id] }));
+
+  // Which attribute keys the backend coalesced into this row (see the
+  // `fieldMappings` prop). Empty for an event that did not come from the paged
+  // query — the panel then badges nothing, which is the safe direction: a
+  // missing badge understates, a wrong one claims a provenance the source
+  // file contradicts.
+  const derivedFields = useMemo(
+    () => new Set(event.mapped_fields ?? []),
+    [event.mapped_fields],
+  );
 
   // Disposition = the analyst's verdict on a finding, shared with the
   // analysis finding rows via useDisposition (see docs/ANOMALY_DETECTION.md).
@@ -637,12 +650,16 @@ export function EventDetailPanel({
             onToggle={() => toggleSection("attributes")}
           >
             {Object.entries(event.attributes ?? {}).map(([k, v]) => {
-              // A canonical field is coalesced into the row by the query
-              // layer, not carried by the source file — say so, and address it
-              // by its canonical token rather than `attr:` (which bypasses
-              // mappings and would key an allowlist entry on a field no source
-              // has).
-              const mappedFrom = fieldMappings?.[k];
+              // A canonical field coalesced into the row by the query layer is
+              // not carried by the source file — say so, and address it by its
+              // canonical token rather than `attr:` (which bypasses mappings
+              // and would key an allowlist entry on a field no source has).
+              // The row itself declares which keys those are: a key that
+              // *does* exist in the source outranks the mapping and is absent
+              // from `mapped_fields`, so it must not be badged even though the
+              // timeline defines a mapping under that name.
+              const isDerived = derivedFields.has(k);
+              const mappedFrom = isDerived ? fieldMappings?.[k] : undefined;
               return (
                 <FieldRow
                   key={k}

@@ -40,10 +40,11 @@ Deliberate exclusions:
   candidate. It describes how the evidence got here, not what happened.
 * Raw attribute keys consumed by a timeline's ``field_mappings`` are skipped —
   one spelling is blank for every source using the other. The **canonical**
-  field is scored instead, merged from its raw keys: a source counts toward
-  breadth if it carries any of them, which is exactly the field an analyst
-  curated a mapping to get. It renders because the presented row carries the
-  coalesced value (``db/field_mappings.py::project_mapped_fields``).
+  field is scored instead, merged from every key the coalesce reads (the
+  canonical name itself first, then the raws): a source counts toward breadth
+  if it carries any of them, which is exactly the field an analyst curated a
+  mapping to get. It renders because the presented row carries the coalesced
+  value (``db/field_mappings.py::project_mapped_fields``).
 """
 
 from __future__ import annotations
@@ -384,22 +385,20 @@ def score_columns(
 
     mapped_raws = {raw for raws in (field_mappings or {}).values() for raw in raws}
 
-    # A canonical name that also exists as a raw key somewhere is scored as
-    # neither the mapping nor the attribute: `project_mapped_fields` refuses to
-    # overwrite a stored key, so the column would carry the ingested value on
-    # the sources that have that key and the coalesced value everywhere else —
-    # one column, two meanings, and statistics that describe neither.
-    # Validation rejects such a mapping when the inventory is known; this
-    # covers the source ingested after the mapping was saved.
-    all_attribute_keys = {
-        key for _, payload in stats.values() for key in (payload.get("attributes") or {})
-    }
-    shadowed = set(field_mappings or {}) & all_attribute_keys
-    excluded_attrs = reserved_column_ids() | mapped_raws | shadowed
+    # A canonical name is never scored as a plain attribute, even where a
+    # source stores that exact key: validation rejects such a mapping when the
+    # inventory is known, but a source ingested after the mapping was saved can
+    # introduce the key later, and resolution then reads the stored value first
+    # (`mapping_coalesce_expr` / `project_mapped_fields`). One token, one rule —
+    # so the stored key's statistics belong to the canonical field, not to a
+    # separate candidate that would collide with it in `merged`.
+    excluded_attrs = reserved_column_ids() | mapped_raws | set(field_mappings or {})
     canonicals = {
-        canonical: raws
+        # Precedence order, so the samples pooled below lead with the entry the
+        # coalesce actually reads first.
+        canonical: [canonical, *raws]
         for canonical, raws in (field_mappings or {}).items()
-        if canonical not in reserved_column_ids() and canonical not in shadowed
+        if canonical not in reserved_column_ids()
     }
 
     # Merge per-source entries into one view per token. Coverage sums exactly;
@@ -443,17 +442,25 @@ def score_columns(
                 acc["sources"] += 1
                 acc["samples"].extend(_entry_samples(entry)[:5])
 
-        # Canonical mapped fields are scored as one merged token, from the raw
-        # entries that make them up. A source counts once toward breadth if it
-        # carries *any* of the raws — which is the whole point: each raw alone
-        # looks partial on a merged timeline, while the canonical field the
-        # grid renders (db/field_mappings.py::project_mapped_fields) is
-        # present everywhere. Coverage is capped at the source's event count:
-        # a source carrying two of the raws would otherwise double-count the
-        # events that set both, where the coalesce yields one value.
+        # Canonical mapped fields are scored as one merged token, from the
+        # entries the coalesce reads (the canonical key itself, then the raws).
+        # A source counts once toward breadth if it carries *any* of them —
+        # which is the whole point: each spelling alone looks partial on a
+        # merged timeline, while the canonical field the grid renders
+        # (db/field_mappings.py::project_mapped_fields) is present everywhere.
+        #
+        # Coverage is the summed per-key coverage capped at the source's event
+        # count. That is an **upper bound, not a dedupe**: per-source stats
+        # carry no per-event overlap, so a source setting two spellings on the
+        # same events reads as up to twice the events the coalesce yields a
+        # value for. The cap keeps the resulting `fill` inside [0, 1] and makes
+        # it exact for the overwhelmingly common one-spelling-per-source case;
+        # for the rest, `fill` (and the "N% filled" reason) is the optimistic
+        # end of the range. Erring high here only ever promotes a field an
+        # analyst deliberately curated a mapping for.
         attr_entries: dict[str, Any] = payload.get("attributes") or {}
-        for canonical, raw_keys in canonicals.items():
-            present = [attr_entries[raw] for raw in raw_keys if raw in attr_entries]
+        for canonical, coalesce_keys in canonicals.items():
+            present = [attr_entries[key] for key in coalesce_keys if key in attr_entries]
             if not present:
                 continue
             coverage = min(sum(int(e.get("coverage", 0)) for e in present), int(events_total))
@@ -473,7 +480,13 @@ def score_columns(
             )
             acc["coverage"] += coverage
             acc["distinct"] = max(acc["distinct"], entry_distinct)
-            acc["per_source"].append((entry_distinct, coverage))
+            # The uniqueness ratio is distinct/coverage within one source, so
+            # both halves must come from the *same* entry: pairing the
+            # max-distinct spelling with the summed coverage above would deflate
+            # the ratio by however many spellings the source happens to carry,
+            # penalising exactly the merged field this branch exists to score.
+            best = max(present, key=lambda e: int(e.get("distinct", 0)))
+            acc["per_source"].append((entry_distinct, int(best.get("coverage", 0))))
             acc["sources"] += 1
             pooled: list[str] = []
             for entry in present:

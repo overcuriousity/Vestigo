@@ -48,9 +48,22 @@ const EVENT: Event = {
   display_name: "a.csv",
   tags: [],
   attributes: { src_ip: "10.0.0.4", ip_address: "10.0.0.4", status: "200" },
+  mapped_fields: ["ip_address"],
 } as unknown as Event;
 
-function renderPanel(fieldMappings: Record<string, string[]> | null) {
+/**
+ * Same row, but `ip_address` was carried by the source file — the query layer
+ * never overwrites a stored key, so it reports nothing as mapped.
+ */
+const EVENT_WITH_STORED_CANONICAL: Event = {
+  ...EVENT,
+  mapped_fields: undefined,
+} as unknown as Event;
+
+function renderPanel(
+  fieldMappings: Record<string, string[]> | null,
+  event: Event = EVENT,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -58,7 +71,7 @@ function renderPanel(fieldMappings: Record<string, string[]> | null) {
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <EventDetailPanel
-          event={EVENT}
+          event={event}
           annotations={[]}
           caseId="c1"
           timelineId="t1"
@@ -83,6 +96,13 @@ describe("EventDetailPanel mapped-field disclosure", () => {
 
   it("marks nothing when the timeline has no mappings", () => {
     renderPanel(null);
+    expect(screen.queryByText("mapped")).toBeNull();
+  });
+
+  it("marks nothing when the source file itself carried the canonical key", () => {
+    // The mapping exists, but this row's value is ingested — badging it would
+    // claim a provenance the source file contradicts.
+    renderPanel({ ip_address: ["src_ip", "ip_addr"] }, EVENT_WITH_STORED_CANONICAL);
     expect(screen.queryByText("mapped")).toBeNull();
   });
 });

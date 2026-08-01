@@ -653,7 +653,7 @@ def _field_column_expr(
         return time_spec.sql(effective_ts_sql(source_offsets))
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
-        return mapping_coalesce_expr(mapped_raws, parameters, param_name)
+        return mapping_coalesce_expr(field_token.strip(), mapped_raws, parameters, param_name)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         if cast_non_string and column in TOP_LEVEL_NON_STRING_COLUMNS:
@@ -1381,12 +1381,19 @@ class EventQueryService:
         # Canonical mapped fields are resolved for the *presented* page only —
         # the same coalesce the filter SQL applies, so a rendered column and a
         # filter on that column cannot disagree. Export (`iter_events`)
-        # deliberately does not do this; see project_mapped_fields.
+        # deliberately does not do this; see project_mapped_fields. Each row
+        # also declares which of its attribute keys it got from the mapping
+        # rather than from the source file, so the detail panel can say so
+        # without re-deriving it (and without mislabelling a stored key that
+        # happens to carry a canonical name).
         if query.field_mappings:
             for event in events:
-                event["attributes"] = project_mapped_fields(
+                attributes, derived_keys = project_mapped_fields(
                     event.get("attributes"), query.field_mappings
                 )
+                event["attributes"] = attributes
+                if derived_keys:
+                    event["mapped_fields"] = derived_keys
         if query.before is not None:
             events.reverse()
 
