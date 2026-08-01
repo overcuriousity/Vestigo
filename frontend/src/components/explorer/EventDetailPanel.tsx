@@ -42,6 +42,13 @@ interface Props {
   /** Pivots the explorer to a ±minutes window around this event's timestamp,
    * clearing all other filters (context query). */
   onContextQuery?: (ts: string, minutes: number) => void;
+  /**
+   * The timeline's canonical field mappings (canonical name → raw attribute
+   * keys). The backend resolves them into every presented row's `attributes`
+   * (db/field_mappings.py::project_mapped_fields), so without them here a
+   * derived value would read as a key the source file carries — it does not.
+   */
+  fieldMappings?: Record<string, string[]> | null;
   /** Existing annotation-tag labels for autocomplete. */
   tagSuggestions?: string[];
   /** Active, not-yet-tagged analysis findings that apply to this event. */
@@ -82,6 +89,7 @@ function FieldRow({
   onShowHistogram,
   onMarkNormal,
   flag,
+  labelNote,
   dataTour,
 }: {
   label: string;
@@ -100,6 +108,11 @@ function FieldRow({
    */
   onMarkNormal?: (value: string) => void;
   flag?: { flag: string; label: string } | null;
+  /**
+   * Marker rendered next to the label for a value the row did not get from the
+   * source file — today, a canonical field coalesced from a timeline mapping.
+   */
+  labelNote?: { text: string; title: string } | null;
   /** Onboarding-tour anchor on the action-buttons cluster. */
   dataTour?: string;
 }) {
@@ -122,6 +135,14 @@ function FieldRow({
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
       <span className="w-36 shrink-0 break-all text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
+        {labelNote && (
+          <span
+            className="ml-1 text-xs text-[var(--color-fg-muted)] italic"
+            title={labelNote.title}
+          >
+            {labelNote.text}
+          </span>
+        )}
       </span>
       {fullValue && fullValue !== value ? (
         <Tooltip content={fullValue} side="top">
@@ -302,6 +323,7 @@ export function EventDetailPanel({
   onShowFieldHistogram,
   onJumpToTime,
   onContextQuery,
+  fieldMappings,
   tagSuggestions = [],
   liveFindings = [],
 }: Props) {
@@ -614,19 +636,35 @@ export function EventDetailPanel({
             collapsed={!!collapsedSections.attributes}
             onToggle={() => toggleSection("attributes")}
           >
-            {Object.entries(event.attributes ?? {}).map(([k, v]) => (
-              <FieldRow
-                key={k}
-                label={k}
-                value={v}
-                mono
-                filterKey={k}
-                onAddFilter={onAddFilter}
-                onShowHistogram={onShowFieldHistogram}
-                onMarkNormal={(val) => markFieldNormal(`attr:${k}`, val)}
-                flag={getAttributeDecoration(event.attributes ?? {}, k)}
-              />
-            ))}
+            {Object.entries(event.attributes ?? {}).map(([k, v]) => {
+              // A canonical field is coalesced into the row by the query
+              // layer, not carried by the source file — say so, and address it
+              // by its canonical token rather than `attr:` (which bypasses
+              // mappings and would key an allowlist entry on a field no source
+              // has).
+              const mappedFrom = fieldMappings?.[k];
+              return (
+                <FieldRow
+                  key={k}
+                  label={k}
+                  value={v}
+                  mono
+                  filterKey={k}
+                  onAddFilter={onAddFilter}
+                  onShowHistogram={onShowFieldHistogram}
+                  onMarkNormal={(val) => markFieldNormal(mappedFrom ? k : `attr:${k}`, val)}
+                  flag={getAttributeDecoration(event.attributes ?? {}, k)}
+                  labelNote={
+                    mappedFrom
+                      ? {
+                          text: "mapped",
+                          title: `Canonical field from this timeline's mapping — first value present of: ${mappedFrom.join(", ")}`,
+                        }
+                      : null
+                  }
+                />
+              );
+            })}
           </Section>
         )}
 

@@ -1467,6 +1467,7 @@ export function ExplorerPage() {
                     onShowFieldHistogram={handleShowFieldHistogram}
                     onJumpToTime={handleJumpToTime}
                     onContextQuery={handleContextQuery}
+                    fieldMappings={timeline?.field_mappings}
                     tagSuggestions={tagSuggestions}
                   />
                 )}

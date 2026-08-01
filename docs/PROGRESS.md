@@ -1,9 +1,53 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-01 (session 148 — fifth review pass on PR 230).
+Last updated: 2026-08-02 (session 149 — canonical mapped fields in the event projection).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 149 — 2026-08-02: canonical mapped fields reach the event projection
+
+**Why.** The one known correctness hole in the release that ships the column recommender:
+`score_columns` excluded both the raw keys a timeline's `field_mappings` consume *and* the
+canonical names they define, on the grounds that neither renders. That was true, and it hid a
+live defect one layer up — the picker already lists canonical names (discovery substitutes
+them via `apply_mappings_to_attribute_keys`), so an analyst could select `ip_address` today
+and get a column of em dashes, frozen into story view blocks along with everything else.
+
+- **The root cause was the projection, not the recommender.** `mapping_coalesce_expr` had
+  exactly one call site — the field-expression resolver that serves WHERE clauses and every
+  aggregation. The grid's SELECT is a fixed column list ending in the whole `attributes` map,
+  so nothing ever resolved a mapping into a row. `project_mapped_fields` is the Python twin of
+  that SQL, applied to the presented page: first raw key in mapping order whose value is
+  neither absent nor `''`, which is what `coalesce(nullif(...), ...)` means. Computing it from
+  the same rule as the filter is the point — a live ClickHouse test asserts the rows whose
+  projected value equals `10.0.0.1` are exactly the rows a filter on that field returns.
+
+- **The derived value lands in `attributes`, and the detail panel says so.** Injecting it
+  there is why the grid, the story snapshot renderer and the embed cards needed no change at
+  all — but it also makes a synthesized key indistinguishable from an ingested one, and
+  `field_mappings.py` is explicit that a mapping is a per-timeline view. Storage stays
+  untouched; the *presented* row does not, so `EventDetailPanel` marks a canonical field as
+  mapped and names the raw fields behind it. The same branch fixes its allowlist token:
+  marking a canonical field's value normal used to write `attr:ip_address`, and `attr:`
+  bypasses mappings, so the entry keyed on a field no source has and could never match.
+
+- **Export deliberately stays raw.** `iter_events` does not project — a CSV/JSONL export
+  carries what was ingested. `event_ref` story blocks likewise: a frozen single event is
+  source-scoped and carries no timeline, so there is no mapping to apply.
+
+- **The recommender now scores the canonical field.** Merged from its raws: a source counts
+  once toward breadth if it carries *any* of them, which is the whole point — each spelling
+  alone looks partial on a merged timeline. Coverage is capped at the source's event count, so
+  a source carrying both spellings cannot double-count the events that set both. A canonical
+  name that also exists as a real attribute key somewhere is scored as neither the mapping nor
+  the attribute: the projection refuses to overwrite a stored key, so that column would carry
+  ingested values on some sources and coalesced ones on others.
+
+**Verified.** `uv run pytest` — 2231 passed. Frontend: 783 tests across 92 files, `tsc -b
+--noEmit` clean, `oxlint src` clean, `ruff check .` clean. The live-ClickHouse mapping tests
+ran against the dev stack. The new detail-panel test was confirmed to fail against the
+pre-fix component before being kept.
 
 ## Session 148 — 2026-08-01: the fifth review pass on PR 230
 

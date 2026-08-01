@@ -79,6 +79,34 @@ async def test_view_block_truncation_flagged(store):
     assert blk["ref"]["name"] == "SSH hits"
 
 
+async def test_view_block_query_carries_the_timeline_field_mappings(store):
+    """A frozen view resolves through the same canonical fields the analyst saw
+    on screen — both for filtering and for the values the rows carry
+    (db/field_mappings.py::project_mapped_fields runs off this)."""
+    case, story, blocks = await _case_with_story(
+        store,
+        [("view_ref", {"view_id": "v1", "timeline_id": "t1", "display": {"limit": 10}})],
+    )
+    await store.create_view(case.id, "v1", "IPs", query=None, view_filter={})
+    mappings = {"ip_address": ["src_ip", "ip_addr"]}
+    seen = {}
+
+    def fake_event_query(query):
+        seen["field_mappings"] = query.field_mappings
+        return EventPage(total=0, offset=0, limit=query.limit, events=[])
+
+    await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        run_event_query=fake_event_query,
+        resolve_scope=lambda case_id, timeline_id: (["src1"], mappings, None),
+        now=lambda: FROZEN_NOW,
+    )
+    assert seen["field_mappings"] == mappings
+
+
 async def test_chart_block_freezes_execution_result(store):
     case, story, blocks = await _case_with_story(
         store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]

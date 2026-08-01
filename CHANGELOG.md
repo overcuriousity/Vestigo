@@ -66,6 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A timeline's canonical mapped fields now render as columns.** Field mappings resolved in
+  filters, aggregations and detectors but never in the rows themselves, so a canonical field
+  like `ip_address` — offered by the column picker, since discovery already substitutes it —
+  drew an empty column on every row, and the column recommender excluded mapped fields
+  outright rather than suggest one that looks broken. The presented page now carries each
+  canonical field alongside the raw keys it was coalesced from, by the same rule the filter
+  SQL applies, so a rendered value and a filter on that field cannot disagree; the
+  recommender scores the canonical field in place of the raw spellings, counting a source
+  toward it whichever spelling that source uses. The event detail panel marks such a field
+  as mapped and names the raw fields behind it — the value is a timeline view, not something
+  the source file carried — and exports still carry raw attributes only.
+
 - **`GET /api/cases/` no longer runs `alembic upgrade head` on every request.** The endpoint
   the UI hits most re-ran the migration machinery per call — a connection, a version-table
   check and a migration lock on the hot path — where the startup lifespan already does it
