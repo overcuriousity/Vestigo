@@ -21,7 +21,7 @@ import { VisualizePage } from "@/pages/VisualizePage";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import { installFakeResizeObserver } from "./helpers/resizeObserver";
 import { installRadixJsdomStubs } from "./helpers/radix";
-import type { VizFieldsResponse } from "@/api/types";
+import type { Disposition, VizFieldsResponse } from "@/api/types";
 
 beforeAll(() => {
   installFakeResizeObserver();
@@ -97,6 +97,39 @@ const SCOPED_CHART = {
   created_at: null,
   updated_at: null,
 };
+
+/**
+ * A chart stored with routine collapse on, and *nothing else* the URL cannot
+ * carry — so anything this page says about dropped scope for it is wrong by
+ * construction.
+ */
+const COLLAPSED_CHART = {
+  ...SCOPED_CHART,
+  id: "chart-2",
+  name: "Logons, routine collapsed",
+  config: {
+    ...SCOPED_CHART.config,
+    filters: { q: "logon", collapseRoutine: true },
+  },
+};
+
+function routineDisposition(id: string): Disposition {
+  return {
+    id,
+    case_id: "c1",
+    timeline_id: "t1",
+    kind: "routine",
+    detector: "log_template",
+    field: "template_id",
+    value: "4736",
+    source_id: null,
+    event_id: null,
+    note: null,
+    details: null,
+    created_by: null,
+    created_at: null,
+  };
+}
 
 let lastSearch = "";
 
@@ -288,5 +321,49 @@ describe("VisualizePage ?c_chart=", () => {
     expect(params.get("c_field")).toBe("hostname");
     expect(params.get("q")).toBe("logon");
     expect(params.get("exclusions")).toContain("svc_backup");
+  });
+
+  it("lets the reveal toggle uncollapse a chart stored with routine collapse on", async () => {
+    // Routine collapse is the one stored member this page must *not* honour
+    // from storage: it is derived from the live disposition set (#147), and
+    // the resolved `filters` only ever adds the flag. A stored `true` reaching
+    // that spread would therefore survive the reveal — the toggle would redraw
+    // nothing and the analyst would have no way to see the muted events.
+    chartsListMock.mockResolvedValue({ charts: [COLLAPSED_CHART] });
+    dispositionsListMock.mockResolvedValue({ dispositions: [routineDisposition("d1")] });
+
+    renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-2");
+
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+    expect((fieldTermsMock.mock.calls[0][3] as Record<string, unknown>).collapseRoutine).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /Show routine events/i }));
+
+    await waitFor(() => {
+      const last = fieldTermsMock.mock.calls.at(-1)![3] as Record<string, unknown>;
+      expect(last.collapseRoutine).toBeUndefined();
+    });
+    // Revealing is not an edit: the URL still names the chart.
+    expect(lastSearch).toContain("c_chart=chart-2");
+  });
+
+  it("does not claim an edit dropped routine collapse, because it did not", async () => {
+    // The take-over warning exists so a chart that genuinely narrows cannot
+    // widen in silence. Collapse is re-derived from dispositions on every
+    // render, so it survives the take-over — reporting it would train the
+    // analyst to ignore the one banner that matters.
+    chartsListMock.mockResolvedValue({ charts: [COLLAPSED_CHART] });
+    dispositionsListMock.mockResolvedValue({ dispositions: [routineDisposition("d1")] });
+
+    renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-2");
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("radio", { name: /Ordinal/ }));
+
+    await waitFor(() => expect(lastSearch).not.toContain("c_chart"));
+    expect(screen.queryByText(/dropped/i)).toBeNull();
+    // And the collapse itself is still applied, from the live dispositions.
+    const last = fieldTermsMock.mock.calls.at(-1)![3] as Record<string, unknown>;
+    expect(last.collapseRoutine).toBe(true);
   });
 });

@@ -244,6 +244,29 @@ def test_meaningful_name_breaks_a_tie():
     assert tokens.index("username") < tokens.index("zzz_col")
 
 
+def test_a_corpus_of_unrecognizable_field_names_still_yields_columns():
+    """Name affinity re-ranks; it must never be the thing that lets a field in.
+
+    The module docstring's own promise: "a corpus whose fields are all named
+    ``f_17`` still gets a sensible answer". Every field here scores 0.0 on name
+    affinity (segments ``{"f", "17"}``, neither in the vocabulary), so the
+    statistical signals have to carry them over the floor on their own. If this
+    ever stops passing, the floor and the weights have drifted apart and every
+    vendor-numbered corpus quietly falls back to the built-in defaults.
+    """
+    values = ["alpha", "bravo", "charlie"]
+    stats = {
+        f"s{i}": _source(1000, {f"f_{n}": _attr(1000, 20, values) for n in range(17, 21)})
+        for i in range(2)
+    }
+    candidates = score_columns(stats)
+    assert [c.token for c in candidates] == ["f_17", "f_18", "f_19", "f_20"]
+    assert all(c.score >= SCORE_FLOOR for c in candidates)
+    # And they survive selection, rather than being scored well and then
+    # discarded as "insufficient".
+    assert pick_columns(candidates) == ["f_17", "f_18", "f_19", "f_20"]
+
+
 def test_scoring_is_deterministic_and_ties_break_by_name():
     values = ["alpha", "bravo", "charlie"]
     stats = {

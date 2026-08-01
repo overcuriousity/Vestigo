@@ -242,6 +242,12 @@ def _redact_url(url: str | None) -> str:
 # This is a *name list*, not a heuristic: a parameter whose name is not here is
 # logged in full. Anything added to the API that puts a secret in a query string
 # has to be added here too — lowercase, since matching folds case.
+#
+# Scope stops at this process. A fronting reverse proxy writes its own access
+# log from the request it received, unredacted — `nginx-tls.conf` ships in this
+# repo and `docs/DEPLOYMENT.md` §"TLS reverse proxy (nginx)" is the deployment
+# it describes. An operator terminating TLS upstream has to scrub or disable
+# that log separately; nothing here can reach it.
 _SECRET_QUERY_PARAMS = frozenset(
     {
         "code",

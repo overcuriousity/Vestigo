@@ -963,6 +963,15 @@ def _recommendation_is_dead(timeline: Timeline) -> bool:
     Pure and synchronous, so the list path can filter the whole page before
     touching the database at all. False for every timeline that is not
     mid-recommendation — which is all of them, almost always.
+
+    **Single-process, like everything it reads.** Both ``_ACTIVE`` and the job
+    store live in this process's memory, so under ``uvicorn --workers N`` a
+    second worker would read another worker's live job as dead and relabel the
+    payload; that job then writes its real answer anyway, so the visible damage
+    is a spinner ending early. Inherited from ``JobStore``, not introduced here
+    — ``docs/ROADMAP.md`` §"Explicitly out of scope" carries the standing
+    decision and names this as one more thing multi-process scale-out has to
+    move to a shared backend.
     """
     payload = timeline.recommended_columns
     if not isinstance(payload, dict) or payload.get("status") != "running":

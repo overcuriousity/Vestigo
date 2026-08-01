@@ -446,7 +446,9 @@ Decisions, not work items — each stays as decided unless its trigger fires.
 - **Persistent job store** — in-memory is a deliberate choice for the single-process
   deployment model ([Operational scale](./DEPLOYMENT.md#operational-scale)), not an
   oversight. Trigger: multi-process scale-out, which needs it moved to a shared backend
-  along with the event bus and login backoff.
+  along with the event bus, login backoff, and column-recommendation liveness
+  (`columns/jobs._ACTIVE` + `_recommendation_is_dead`, which read this store to decide
+  whether a `running` payload is still real).
 - **CSRF tokens** — SameSite=Lax cookies are adequate for a self-hosted instance on a
   trusted network. Trigger: exposing Vestigo to the open internet, or moving off a single
   trusted app process (see [Operational scale](./DEPLOYMENT.md#operational-scale)).

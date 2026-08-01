@@ -48,6 +48,12 @@ background_column_tasks: set[asyncio.Task] = set()
 
 #: Timelines with a recommendation currently running, so an ingest burst does
 #: not stack four identical jobs on the same timeline.
+#:
+#: In this process's memory, and only meaningful there — the same single-process
+#: assumption ``JobStore`` already makes. A second worker sees an empty dict and
+#: would both start a duplicate job and read this one as dead
+#: (``api/routers/cases.py::_recommendation_is_dead``). See ``docs/ROADMAP.md``
+#: §"Explicitly out of scope" → *Persistent job store*.
 _ACTIVE: dict[str, str] = {}
 
 

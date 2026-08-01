@@ -228,13 +228,19 @@ export function VisualizePage() {
     );
   }, [chartRefBroken, savedChartsQuery.isError, savedChart]);
 
-  const urlFilters = useMemo(
-    () =>
-      storedConfig && savedChart
-        ? parseStoredChartFilters(savedChart.config)
-        : paramsToFilters(searchParams),
-    [storedConfig, savedChart, searchParams],
-  );
+  const urlFilters = useMemo(() => {
+    if (!(storedConfig && savedChart)) return paramsToFilters(searchParams);
+    // Routine collapse is *live* state on this page, never stored state: the
+    // disposition set is the single source of truth (#147) and `filters` below
+    // re-derives it from scratch. A stored `true` riding along here would
+    // survive the reveal toggle — which only ever *adds* the flag, so it could
+    // never turn one off — and would be reported by `takeOver` as a narrowing
+    // the URL dropped, when the URL never carried it and the page re-derives
+    // it either way. The frozen renderers (`ChartBlockCard`, the export
+    // resolver) do read it, which is the whole reason it is stored.
+    const { collapseRoutine: _live, ...stored } = parseStoredChartFilters(savedChart.config);
+    return stored;
+  }, [storedConfig, savedChart, searchParams]);
   const config = useMemo(
     () => storedConfig ?? paramsToChartConfig(searchParams),
     [storedConfig, searchParams],
@@ -292,6 +298,12 @@ export function VisualizePage() {
   // chart over the whole timeline is exactly the failure `?c_chart=` exists to
   // prevent, and an analyst who is not told reads the wider chart as the one
   // they opened.
+  //
+  // In practice only two of the three ever reach here: `collapseRoutine` is
+  // stripped from `urlFilters` above because this page re-derives it from live
+  // dispositions, so a take-over does not lose it and must not claim to. The
+  // third stays in `unrepresentableFilterMembers` regardless — the rail saves
+  // the *resolved* filters, where the flag is real.
   //
   // `chartUrlParams` rewrites both namespaces and carries everything else in
   // the URL over untouched — this page owns `c_*` and the filter params, not

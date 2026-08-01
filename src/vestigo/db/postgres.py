@@ -1535,6 +1535,13 @@ class User(Base):
     # Namespaced per-user preference blob (e.g. "agent_disabled_tools").
     # A JSON column rather than a table: per-user singleton, never queried
     # by value. Nothing secret lives here.
+    #
+    # `JSON`, deliberately, not `JSONB`: Postgres' `json` stores the document
+    # verbatim and preserves key order, and `api/routers/auth.py::_merge_bounded`
+    # depends on that — it evicts the *oldest* entries of an over-large
+    # dict-valued preference, and insertion order is the only timestamp a bare
+    # `true` value carries. `JSONB` normalizes key order away, so switching this
+    # column would silently make that eviction arbitrary.
     preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
