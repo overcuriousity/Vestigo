@@ -2859,6 +2859,13 @@ class PostgresStore:
         exist — a timeline deleted while its job was running is an ordinary
         outcome, not an error.
 
+        ``None`` clears the column — "never recommended", which is what the
+        job's rollback path writes when its first run fails. An **empty dict
+        clears it too**: there is no payload without a ``status``, so a caller
+        passing ``{}`` means "nothing to record" rather than "recorded, empty",
+        and storing it would leave the explorer reading a payload it cannot
+        interpret.
+
         ``sources`` is deliberately *not* eager-loaded on the way out: no
         caller serializes this return value (the job discards it), and the
         payload is written twice per run, so the extra round trip would be pure

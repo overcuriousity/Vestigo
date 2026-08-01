@@ -138,11 +138,16 @@ async def _suggest_columns(store: PostgresStore, case_id: str, source_id: str, a
     from vestigo.db.clickhouse import ClickHouseStore
 
     try:
+        timelines = await store.list_timelines_for_source(case_id, source_id)
+        if not timelines:
+            return
         job_store = JobStore()
-        # One client for every timeline this source belongs to, rather than
-        # one connection per job.
+        # One client for every timeline this source belongs to, rather than one
+        # connection per job — and opened only once there is a timeline to
+        # score, so a source belonging to none never pays a ClickHouse
+        # connection (nor reports a blip as a skipped suggestion).
         ch_store = ClickHouseStore()
-        for timeline in await store.list_timelines_for_source(case_id, source_id):
+        for timeline in timelines:
             job = job_store.create(kind=JOB_KIND, case_id=case_id, created_by=actor.id)
             await run_column_recommendation_job(
                 job_id=job.id,

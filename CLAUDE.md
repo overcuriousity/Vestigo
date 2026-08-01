@@ -192,6 +192,12 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
 - Background jobs (`core/jobs.py::JobStore`) are intentionally ephemeral/in-memory — don't add
   persistence there without a deliberate design discussion; it changes the deployment model.
 - Forensic reproducibility/explainability is a hard requirement for basically any subsystem. 
+- A `require_case_read` endpoint does not write. One deliberate exception exists and is not a
+  precedent: `api/routers/cases.py::_settle_dead_recommendations` relabels a `running` column
+  recommendation whose job is provably gone, because a read-only member has no other way to
+  repair a timeline that reports "suggesting columns…" forever. It is bounded to display
+  metadata, recomputes nothing, touches no evidence and records no audit row. Anything else
+  that wants to write from a read endpoint needs its own argument, not this one.
 - Airgapped/offline-by-default is a design goal (`VESTIGO_ALLOW_ONLINE`, `docs/TECH_STACK.md` §6).
   Don't add code paths that reach the network unconditionally. Exception: optional OIDC SSO
   (`VESTIGO_OIDC_ENABLED`) is deliberately independent of `VESTIGO_ALLOW_ONLINE` — see `TECH_STACK.md` §6.

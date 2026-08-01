@@ -1,9 +1,44 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-02 (session 149 — canonical mapped fields in the event projection).
+Last updated: 2026-08-02 (session 150 — sixth review pass on PR 230, and the 1.9.0 cut).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 150 — 2026-08-02: sixth review pass on PR 230, and the 1.9.0 cut
+
+**Why.** A last read of the release PR as a whole — the column subsystem, the access-log
+redaction, the saved-chart filter persistence — rather than of the branch that had just landed.
+Four small things and two records to correct before tagging.
+
+- **A recompute with no ready sources no longer discards a good suggestion.**
+  `run_column_recommendation_job` wrote `insufficient` unconditionally when a timeline had no
+  ready source. But "no ready sources" is also what a re-ingest or a briefly detached source
+  looks like from inside the job, so a timeline that had a perfectly good recommendation
+  dropped the whole case's grid back to the built-in defaults until the next successful run.
+  A stored answer with columns is now left byte-for-byte alone — including its
+  `generated_at`, which is when those columns were actually derived — with one exception: a
+  `running` placeholder is settled, since this job holds the `_ACTIVE` claim and a stored
+  `running` can therefore only be a dead job's.
+
+- **The CLI opens its ClickHouse client only once there is a timeline to score.** A source
+  belonging to no timeline paid a connection, and a blip on it printed
+  `WARNING: column suggestion skipped` after an ingest that had entirely succeeded.
+
+- **`update_timeline_recommended_columns` says what an empty dict means.** It coerces falsy to
+  `NULL`, which is right — there is no payload without a `status` — but the coercion was
+  invisible at the call site.
+
+- **The one read-endpoint-that-writes is now a written-down exception.**
+  `_settle_dead_recommendations` relabels a dead `running` payload from a `require_case_read`
+  endpoint, which is correct (a read-only member has no other way to stop a timeline claiming
+  to be thinking forever) and is exactly the kind of thing that spreads by precedent.
+  `CLAUDE.md` now carries the rule and the exception together.
+
+- **1.9.0 is dated 2026-08-02**, the day it was cut, not the day the branch opened.
+
+**Verified.** `uv run pytest` — full suite green, `ruff check .` clean. Frontend unchanged this
+session; its suite and typecheck re-run before the merge.
 
 ## Session 149 — 2026-08-02: canonical mapped fields reach the event projection
 

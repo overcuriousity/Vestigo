@@ -278,8 +278,29 @@ async def run_column_recommendation_job(
         sources = await store.list_timeline_sources(case_id, timeline_id)
         source_ids = sorted(s.id for s in sources if s.is_ready)
         if not source_ids:
-            # Nothing ingested yet. Not a failure — the next source to finish
-            # ingesting schedules this again.
+            # Nothing queryable right now. Not a failure — the next source to
+            # finish ingesting schedules this again.
+            stored = timeline.recommended_columns
+            if isinstance(stored, dict) and stored.get("columns"):
+                # A timeline that already had an answer keeps it. "No ready
+                # sources" is also what a re-ingest looks like from here, and
+                # replacing a good suggestion with `insufficient` would drop
+                # the grid back to the built-in defaults for everyone until the
+                # next successful run — over a condition that is usually
+                # temporary. Left byte-for-byte alone, so the columns keep the
+                # timestamp they were actually derived at; the one exception is
+                # a `running` placeholder, which can only be a dead job's (this
+                # job holds the claim) and would otherwise poll forever.
+                if stored.get("status") == "running":
+                    await store.update_timeline_recommended_columns(
+                        case_id, timeline_id, settle_running_payload(stored)
+                    )
+                job_store.update(
+                    job_id,
+                    status="completed",
+                    result={"columns": list(stored["columns"]), "method": "kept"},
+                )
+                return
             await store.update_timeline_recommended_columns(
                 case_id,
                 timeline_id,

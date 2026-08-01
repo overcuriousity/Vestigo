@@ -168,6 +168,44 @@ async def test_job_with_no_ready_sources_is_not_a_failure(store):
 
 
 @pytest.mark.asyncio
+async def test_no_ready_sources_keeps_a_previous_recommendation(store):
+    """ "No ready sources" is also what a re-ingest looks like. Replacing a good
+    suggestion with `insufficient` would drop the whole case's grid back to the
+    built-in defaults over a condition that is usually temporary."""
+    case_id, timeline_id, source_id = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    before = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert before["status"] == "ok"
+
+    await store.remove_source_from_timeline(case_id, timeline_id, source_id)
+    await _run(store, case_id, timeline_id)
+
+    after = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    # Byte-for-byte: the columns keep the timestamp they were derived at.
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_no_ready_sources_settles_a_dead_running_placeholder(store):
+    """The one payload that cannot be left alone — this job holds the claim, so
+    a stored `running` is a dead job's and the explorer would poll forever."""
+    case_id, timeline_id, source_id = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    stored = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    await store.update_timeline_recommended_columns(
+        case_id, timeline_id, {**stored, "status": "running", "job_id": "dead-job"}
+    )
+
+    await store.remove_source_from_timeline(case_id, timeline_id, source_id)
+    await _run(store, case_id, timeline_id)
+
+    after = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    assert after["status"] == "ok"
+    assert after["job_id"] is None
+    assert after["columns"] == stored["columns"]
+
+
+@pytest.mark.asyncio
 async def test_job_failure_clears_the_running_placeholder(store, monkeypatch):
     """A stuck 'running' would leave the explorer polling forever."""
     case_id, timeline_id, _ = await _seed_case_with_stats(store)
