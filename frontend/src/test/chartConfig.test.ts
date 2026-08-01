@@ -3,6 +3,7 @@ import {
   CHART_ID_PARAM,
   chartConfigToParams,
   chartConfigToStored,
+  chartUrlParams,
   DEFAULT_CHART_CONFIG,
   paramsToChartConfig,
   parseStoredChartConfig,
@@ -300,5 +301,37 @@ describe("chartConfigToStored filter-key hygiene", () => {
     expect(parseStoredChartFilters(chartConfigToStored(polluted, { q: "logon" }))).toEqual({
       q: "logon",
     });
+  });
+});
+
+describe("chartUrlParams", () => {
+  const config: ChartConfig = { ...DEFAULT_CHART_CONFIG, field: "hostname", scale: "nominal" };
+
+  it("writes both namespaces this page owns", () => {
+    const params = chartUrlParams(config, { q: "logon" }, new URLSearchParams());
+    expect(params.get("c_field")).toBe("hostname");
+    expect(params.get("q")).toBe("logon");
+  });
+
+  it("drops the chart reference and stale chart keys", () => {
+    const prev = new URLSearchParams({ [CHART_ID_PARAM]: "chart-1", c_metric: "rate" });
+    const params = chartUrlParams(config, {}, prev);
+    expect(params.get(CHART_ID_PARAM)).toBeNull();
+    expect(params.get("c_metric")).toBeNull();
+  });
+
+  it("drops a filter the new set no longer carries", () => {
+    // A filter key absent from `filters` is a *cleared* filter, not a foreign
+    // key — carrying it over would resurrect a narrowing that was removed.
+    const prev = new URLSearchParams({ q: "logon", tagsInclude: "suspicious" });
+    const params = chartUrlParams(config, { q: "logon" }, prev);
+    expect(params.get("q")).toBe("logon");
+    expect(params.get("tagsInclude")).toBeNull();
+  });
+
+  it("carries over every key outside both namespaces", () => {
+    const prev = new URLSearchParams({ tour: "viz", c_field: "old", q: "old" });
+    const params = chartUrlParams(config, {}, prev);
+    expect(params.get("tour")).toBe("viz");
   });
 });

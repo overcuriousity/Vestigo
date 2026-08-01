@@ -981,6 +981,19 @@ async def _settle_dead_recommendations(
     Mutates the passed timelines in place so the caller serializes the settled
     payloads without a second read. Returns without touching the database when
     nothing is stale, which is the overwhelmingly common case.
+
+    **This writes from a ``require_case_read`` endpoint, deliberately.** A
+    read-only member is the one caller who can never repair the row any other
+    way — they cannot re-run the job, and the alternative is a timeline that
+    reports "suggesting columns…" at them forever. The write is bounded to what
+    that makes safe: it only ever relabels a ``running`` payload whose job is
+    provably gone, it never recomputes, it touches no evidence and no
+    analyst-authored content, the settled columns are the ones already stored,
+    and the endpoint's own access check still governs *which* case's rows are
+    even considered. It is housekeeping on display metadata, not a mutation the
+    caller authored, which is also why it records no audit row — an audit trail
+    that logged "read-only user changed a timeline" every time a process
+    restarted would be describing something that did not happen.
     """
     stale = [t for t in timelines if _recommendation_is_dead(t)]
     if not stale:

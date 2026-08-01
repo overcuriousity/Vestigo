@@ -9,7 +9,12 @@
  * and handle old versions explicitly instead of silently misreading them.
  */
 import type { CompareTimeResponse, EventFilters, HistogramResponse } from "@/api/types";
-import { filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
+import {
+  FILTER_PARAM_KEYS,
+  filtersToParams,
+  filtersToViewPayload,
+  viewPayloadToFilters,
+} from "@/lib/queryParams";
 import type { Metric } from "./transforms";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
@@ -157,6 +162,36 @@ export function chartConfigToParams(
   }
   if (Object.keys(config.options).length > 0) {
     params.set("c_opts", JSON.stringify(config.options));
+  }
+  return params;
+}
+
+/**
+ * Build the Visualize page's whole query string: this chart, these filters,
+ * and everything in *prev* that belongs to neither.
+ *
+ * Both halves are rewritten wholesale — that is the point, since after an
+ * analyst's edit the params are the only record of the chart and a
+ * half-updated URL would describe a chart nobody chose. But "wholesale" has to
+ * mean the two namespaces this function owns (`c_*` and `FILTER_PARAM_KEYS`)
+ * and not the whole query string: the previous implementation mutated a copy
+ * of the URL and so preserved unrelated keys by construction, and rebuilding
+ * from scratch silently dropped them instead. Nothing else writes this page's
+ * URL today, which is exactly why the loss would go unnoticed until something
+ * did.
+ */
+export function chartUrlParams(
+  config: ChartConfig,
+  filters: EventFilters,
+  prev: URLSearchParams,
+): URLSearchParams {
+  const params = chartConfigToParams(config, filtersToParams(filters));
+  for (const [key, value] of prev.entries()) {
+    // Ours, and already written above in their current form. A filter key
+    // absent from `filters` is a *cleared* filter, so carrying it over would
+    // resurrect a narrowing the analyst just removed.
+    if (key.startsWith("c_") || FILTER_PARAM_KEYS.has(key)) continue;
+    params.append(key, value);
   }
   return params;
 }

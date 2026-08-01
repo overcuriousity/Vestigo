@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
@@ -402,19 +403,37 @@ def start_column_recommendation(
         case_id=case_id,
     )
     _ACTIVE[timeline_id] = job.id
-    spawn_tracked_column_task(
-        run_column_recommendation_job(
-            job_id=job.id,
-            case_id=case_id,
-            timeline_id=timeline_id,
-            job_store=job_store,
-            store=store,
-            ch_store=ch_store,
-            actor_id=actor_id,
-            actor_username=actor_username,
-            use_llm=use_llm,
-        )
+    coro = run_column_recommendation_job(
+        job_id=job.id,
+        case_id=case_id,
+        timeline_id=timeline_id,
+        job_store=job_store,
+        store=store,
+        ch_store=ch_store,
+        actor_id=actor_id,
+        actor_username=actor_username,
+        use_llm=use_llm,
     )
+    try:
+        spawn_tracked_column_task(coro)
+    except BaseException:
+        # The claim is released only by the job's own `finally`, which a job
+        # that never started never reaches. A leaked claim is not a slow job:
+        # `_recommendation_is_dead` reads an active claim as proof the job is
+        # alive, so the timeline would report `running` for the rest of the
+        # process's life *and* every later recommendation for it would be
+        # skipped as a duplicate. Cheaper to hand the claim back here than to
+        # make the liveness check second-guess itself.
+        if _ACTIVE.get(timeline_id) == job.id:
+            del _ACTIVE[timeline_id]
+        # Suppressed because the failure may have come *after* `create_task`
+        # took the coroutine over, in which case closing it is both wrong and
+        # an error; a never-scheduled coroutine, meanwhile, warns at collection
+        # if nothing closes it. The claim above is the part that matters.
+        with suppress(RuntimeError):
+            coro.close()
+        job_store.update(job.id, status="failed", error="Could not schedule the recommendation")
+        raise
     return job.id
 
 

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  FILTER_PARAM_KEYS,
   filtersToParams,
   paramsToFilters,
   filtersToViewPayload,
@@ -265,5 +266,37 @@ describe("serializeEventFilterFields (C17 — shared by list/histogram/bulk-anno
     expect(serializeEventFilterFields({}).collapse_routine).toBeUndefined();
     expect(serializeEventFilterFields({ collapseRoutine: false }).collapse_routine).toBeUndefined();
     expect(serializeEventFilterParams({ collapseRoutine: true }).collapse_routine).toBe(true);
+  });
+});
+
+describe("FILTER_PARAM_KEYS", () => {
+  it("names exactly the keys filtersToParams can write", () => {
+    // The set exists so a caller rebuilding a URL can tell "this filter is
+    // cleared" from "this key was never ours" — `filtersToParams` writes only
+    // what is set, so its output cannot answer that. A new filter param that
+    // forgets to land in the set would be carried over as a foreign key and
+    // survive a rebuild meant to drop it.
+    const everything: EventFilters = {
+      q: "logon",
+      qMode: "semantic",
+      qRegex: true,
+      artifact: "apache:access",
+      artifacts: ["apache:access"],
+      sourceId: "s1",
+      tag: "suspicious",
+      excludeTag: "routine",
+      tagsInclude: ["a"],
+      tagsExclude: ["b"],
+      start: "2026-01-01T00:00:00Z",
+      end: "2026-01-02T00:00:00Z",
+      filters: { user: ["root"] },
+      exclusions: { user: ["svc"] },
+      filterModes: { user: "wildcard" },
+      exclusionModes: { user: "regex" },
+      annotated: ["tag"],
+      annotationTagValue: "keep",
+    };
+    const written = new Set(filtersToParams(everything).keys());
+    expect([...written].sort()).toEqual([...FILTER_PARAM_KEYS].sort());
   });
 });

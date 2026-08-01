@@ -1,9 +1,55 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-01 (session 146 — second review pass on PR 230).
+Last updated: 2026-08-01 (session 147 — third review pass on PR 230).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 147 — 2026-08-01: the third review pass on PR 230
+
+**Why.** A third read of the 1.9.0 release PR. Four findings, one of them a blocker that
+sessions 145 and 146 both walked past — each pass tightened `?c_chart=`'s *success* path and
+neither asked what the page does when the fetch behind it fails.
+
+- **A failed saved-charts fetch suspended the Visualize page indefinitely.** `chartRefBroken`
+  was gated on `isSuccess`, so an errored chart list left the reference neither live nor
+  broken: every defaulting effect stayed suppressed *and* `scopeReady` stayed false. No chart
+  drew, no notice appeared, and nothing on screen explained either — a blank page whose only
+  exit was editing the URL. A reference now settles on error too and falls through to the
+  params, which is the same graceful degradation a deleted chart already got.
+
+- **The broken-reference notice lasted about one frame.** Fixing the above exposed it: the
+  moment a reference settles as broken the defaulting effects write the default chart into the
+  URL, and `chartConfigToParams` drops `c_chart` with the rest of its namespace — so the
+  *derived* "this reference is broken" stopped being true one tick after it became true, and
+  the message blinked out with it. Both older notices (deleted chart, unreadable chart) had
+  the same hole and passed their tests only by racing them. Latched in state now, like
+  `droppedScope`, and cleared when the URL names a chart again.
+
+- **A take-over rebuilt the query string from scratch.** `takeOver` composed
+  `chartConfigToParams(config, filtersToParams(filters))`, which is a *fresh*
+  `URLSearchParams` — so the first config or filter edit silently dropped every param outside
+  the two namespaces this page owns. The helper it replaced preserved them by construction, by
+  mutating a copy. Nothing writes such a param today, which is exactly why the loss would have
+  gone unnoticed until something did. `chartUrlParams` rewrites `c_*` and the filter keys and
+  carries the rest through; `loadSavedChart` clears the same two namespaces and no more.
+  `FILTER_PARAM_KEYS` names the filter namespace explicitly, because `filtersToParams` writes
+  only what is set and so cannot tell "cleared filter" from "not ours" — with a test that
+  populates every member of `EventFilters` and asserts the set is exactly what gets written.
+
+- **A failed spawn wedged a timeline until the next restart.** `start_column_recommendation`
+  claims `_ACTIVE` before spawning, and the claim is released by the job's own `finally` —
+  which a coroutine that was never scheduled never reaches. `_recommendation_is_dead` reads an
+  active claim as proof the job is alive, so the leak is not a slow job: the timeline reports
+  `running` for the life of the process *and* every later recommendation for it is skipped as
+  a duplicate. The claim is handed back on a failed spawn, the job is marked failed rather
+  than left at `queued`, and the test proves the *next* attempt is not turned away.
+
+Also: `_settle_dead_recommendations` now states why it writes from a `require_case_read`
+endpoint, since a read-only member is the one caller who cannot repair the row any other way,
+and a test locks the bound that makes it safe — relabel only, same columns, no audit row.
+
+Backend 2205 passed, frontend 759 across 90 files, typecheck/lint/format clean.
 
 ## Session 146 — 2026-08-01: the second review pass on PR 230
 

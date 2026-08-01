@@ -24,7 +24,7 @@ import { savedChartsApi, vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
 import { dispositionsApi } from "@/api/dispositions";
-import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { FILTER_PARAM_KEYS, filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { InheritedFiltersBar } from "@/components/viz/InheritedFiltersBar";
 import {
   resolveCollapseRoutine,
@@ -64,7 +64,7 @@ import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { CorrMatrix, type CorrMethod } from "@/components/viz/charts/CorrMatrix";
 import {
   CHART_ID_PARAM,
-  chartConfigToParams,
+  chartUrlParams,
   histogramToCompare,
   paramsToChartConfig,
   parseStoredChartConfig,
@@ -181,11 +181,21 @@ export function VisualizePage() {
     () => (savedChart ? parseStoredChartConfig(savedChart.config) : null),
     [savedChart],
   );
-  // A `c_chart` that names a deleted chart, or one saved by an incompatible
-  // config version, falls through to the params — the page still works, and
-  // the notice below says why it is not the chart that was linked.
+  // Whether the reference has been resolved as far as it ever will be. An
+  // *error* settles it too: a chart list that could not be fetched is not a
+  // chart that is still arriving, and treating it as one would suspend the
+  // page indefinitely — every defaulting effect below suppressed and
+  // `scopeReady` false, so no chart renders, no notice appears, and there is
+  // nothing on screen to explain either. Falling through to the params draws
+  // the default chart, which is the same graceful degradation a deleted chart
+  // already got.
+  const chartRefSettled = savedChartsQuery.isSuccess || savedChartsQuery.isError;
+  // A `c_chart` that names a deleted chart, one saved by an incompatible
+  // config version, or one whose list could not be loaded at all falls through
+  // to the params — the page still works, and the notice below says why it is
+  // not the chart that was linked.
   const chartRefBroken =
-    !!chartId && savedChartsQuery.isSuccess && (savedChart === undefined || storedConfig === null);
+    !!chartId && chartRefSettled && (savedChart === undefined || storedConfig === null);
   // While the URL names a chart, *nothing writes the URL automatically* — not
   // while the reference is resolving (where `config` below is still the
   // default chart) and not after it has, where the stored chart already
@@ -199,6 +209,24 @@ export function VisualizePage() {
   // unreadable chart falls through to the params, where the page is building
   // a chart again and the defaults are wanted.
   const chartRefLive = !!chartId && !chartRefBroken;
+
+  // Why the last `c_chart` could not be honoured. Latched in state for the
+  // same reason `droppedScope` is: the moment the reference settles as broken
+  // the defaulting effects start writing the default chart into the URL, and
+  // `chartConfigToParams` drops `c_chart` along with the rest of the namespace
+  // — so the *derived* answer stops being true one tick after it becomes true,
+  // and the notice explaining the page would blink out with it. An analyst who
+  // clicked a link to a chart is owed the reason it is not on screen for
+  // longer than a frame.
+  const [brokenChartRef, setBrokenChartRef] = useState<
+    "unfetchable" | "unreadable" | "missing" | null
+  >(null);
+  useEffect(() => {
+    if (!chartRefBroken) return;
+    setBrokenChartRef(
+      savedChartsQuery.isError ? "unfetchable" : savedChart ? "unreadable" : "missing",
+    );
+  }, [chartRefBroken, savedChartsQuery.isError, savedChart]);
 
   const urlFilters = useMemo(
     () =>
@@ -237,10 +265,10 @@ export function VisualizePage() {
   // Postgres query before first paint, usually already warm from Explorer.
   // Same argument one step further for `c_chart`: fetching the default chart's
   // data and then the linked chart's would render the wrong chart first.
+  // Settled, not succeeded: a failed chart-list fetch has already fallen back
+  // to the params above, and there is nothing left to wait for.
   const scopeReady =
-    !!(caseId && timelineId) &&
-    dispositionsQuery.isSuccess &&
-    (!chartId || savedChartsQuery.isSuccess);
+    !!(caseId && timelineId) && dispositionsQuery.isSuccess && (!chartId || chartRefSettled);
   const filters = useMemo(
     () => (collapseRoutine ? { ...urlFilters, collapseRoutine: true } : urlFilters),
     [urlFilters, collapseRoutine],
@@ -264,11 +292,15 @@ export function VisualizePage() {
   // chart over the whole timeline is exactly the failure `?c_chart=` exists to
   // prevent, and an analyst who is not told reads the wider chart as the one
   // they opened.
+  //
+  // `chartUrlParams` rewrites both namespaces and carries everything else in
+  // the URL over untouched — this page owns `c_*` and the filter params, not
+  // the whole query string.
   const takeOver = useCallback(
     (nextConfig: ChartConfig, nextFilters: EventFilters) => {
       const dropped = unrepresentableFilterMembers(nextFilters);
       setDroppedScope(dropped.length > 0 ? dropped : null);
-      setSearchParams(() => chartConfigToParams(nextConfig, filtersToParams(nextFilters)), {
+      setSearchParams((prev) => chartUrlParams(nextConfig, nextFilters, prev), {
         replace: true,
       });
     },
@@ -292,9 +324,26 @@ export function VisualizePage() {
   const loadSavedChart = useCallback(
     (loadedChartId: string) => {
       // The URL names a chart again, so whatever a previous take-over dropped
-      // is no longer what is on screen.
+      // — and whatever a previous reference failed to resolve — is no longer
+      // what is on screen.
       setDroppedScope(null);
-      setSearchParams(new URLSearchParams({ [CHART_ID_PARAM]: loadedChartId }), { replace: true });
+      setBrokenChartRef(null);
+      // Clears both namespaces this page owns — the stored chart supplies the
+      // shape *and* the filters, so a leftover filter param would narrow it
+      // further than the analyst who saved it ever saw. Anything outside those
+      // two namespaces is not ours to drop.
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams();
+          for (const [key, value] of prev.entries()) {
+            if (key.startsWith("c_") || FILTER_PARAM_KEYS.has(key)) continue;
+            params.append(key, value);
+          }
+          params.set(CHART_ID_PARAM, loadedChartId);
+          return params;
+        },
+        { replace: true },
+      );
     },
     [setSearchParams],
   );
@@ -760,11 +809,13 @@ export function VisualizePage() {
             Said out loud rather than left to look like a chart that was
             always this shape — the page below is the default chart, not the
             one the link named. */}
-        {chartRefBroken && (
-          <p className="text-xs text-[var(--color-warning)]">
-            {savedChart
-              ? "That chart was saved with an incompatible config version and cannot be loaded."
-              : "That saved chart no longer exists."}
+        {brokenChartRef && (
+          <p role="status" className="text-xs text-[var(--color-warning)]">
+            {brokenChartRef === "unfetchable"
+              ? "That chart could not be loaded — the saved charts could not be fetched. Showing a default chart instead; reload to try again."
+              : brokenChartRef === "unreadable"
+                ? "That chart was saved with an incompatible config version and cannot be loaded."
+                : "That saved chart no longer exists."}
           </p>
         )}
 

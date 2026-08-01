@@ -716,6 +716,38 @@ def test_recommend_endpoint_needs_contribute_access(client, admin_bootstrap, sto
     assert resp.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_listing_settles_a_dead_recommendation_without_an_audit_row(store):
+    """The list endpoint writes from a `require_case_read` dependency, deliberately.
+
+    A read-only member cannot re-run the job, so without this they are the one
+    caller left watching "suggesting columns…" forever. What makes that safe is
+    how bounded the write is, and that is what this locks down: a `running`
+    payload whose job is provably gone is *relabelled* — same columns, no
+    recompute, no audit row. An audit trail that recorded "read-only user
+    changed a timeline" every time a process restarted would be describing
+    something that did not happen.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    await _run(store, case_id, timeline_id)
+    good = (await store.get_timeline(case_id, timeline_id)).recommended_columns
+    await store.update_timeline_recommended_columns(
+        case_id, timeline_id, dict(good, status="running", job_id="job-that-died")
+    )
+    audit_before = len(await store.query_audit(case_id=case_id))
+
+    timelines = await store.list_timelines(case_id)
+    await _settle_dead_recommendations(store, case_id, timelines)
+
+    # Serialized straight off the mutated objects — no second read needed.
+    settled = next(t for t in timelines if t.id == timeline_id).recommended_columns
+    assert settled["status"] == "ok"
+    assert settled["job_id"] is None
+    assert settled["columns"] == good["columns"]
+    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns == settled
+    assert len(await store.query_audit(case_id=case_id)) == audit_before
+
+
 # ── Scheduling ──────────────────────────────────────────────────────────────
 
 
@@ -736,6 +768,46 @@ async def test_scheduling_is_skipped_while_one_is_already_running(store, monkeyp
     assert job_id is None
     # No orphan job left in the tray for a run that never dispatched.
     assert job_store.list_by_case(case_id) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_spawn_hands_the_active_slot_back(store, monkeypatch):
+    """A claim taken for a job that never starts would wedge the timeline forever.
+
+    `start_column_recommendation` claims `_ACTIVE` *before* spawning, and the
+    claim is normally released by the job's own `finally` — which a coroutine
+    that was never scheduled never reaches. A leak here is not a slow job:
+    `_recommendation_is_dead` reads an active claim as proof the job is alive,
+    so the timeline would report `running` for the life of the process and
+    every later recommendation for it would be skipped as a duplicate.
+    """
+    case_id, timeline_id, _ = await _seed_case_with_stats(store)
+    job_store = JobStore()
+
+    def _boom(coro):
+        coro.close()
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(columns_jobs, "spawn_tracked_column_task", _boom)
+
+    with pytest.raises(RuntimeError):
+        columns_jobs.start_column_recommendation(
+            case_id=case_id,
+            timeline_id=timeline_id,
+            job_store=job_store,
+            store=store,
+            ch_store=_NEVER_USED,
+        )
+
+    assert columns_jobs.get_active_recommendation(timeline_id) is None
+    # And the tray says what happened rather than holding a job stuck at
+    # "queued" that nothing will ever advance.
+    assert job_store.list_by_case(case_id)[0].status == "failed"
+
+    # The real proof: the next attempt is not turned away as a duplicate.
+    monkeypatch.undo()
+    await _run(store, case_id, timeline_id)
+    assert (await store.get_timeline(case_id, timeline_id)).recommended_columns["status"] == "ok"
 
 
 @pytest.mark.asyncio

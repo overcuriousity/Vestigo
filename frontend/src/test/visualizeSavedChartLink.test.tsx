@@ -241,6 +241,37 @@ describe("VisualizePage ?c_chart=", () => {
     expect(await screen.findByText(/incompatible config version/i)).toBeTruthy();
   });
 
+  it("falls through to a default chart when the chart list cannot be fetched", async () => {
+    // A fetch that *failed* is not a chart that is still arriving. Waiting on
+    // one suspends the page with nothing drawn and nothing said, so the
+    // reference settles as broken and the params take over — the same
+    // degradation a deleted chart already got.
+    chartsListMock.mockRejectedValue(new Error("network"));
+    // `c_type=bar` only so the fallback chart is one whose data arrives
+    // through a mocked call — the point being asserted is that data arrives at
+    // all, which is what an unsettled reference prevented.
+    renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1&c_type=bar");
+
+    await waitFor(() => expect(new URLSearchParams(lastSearch).get("c_field")).toBe("artifact"));
+    expect(await screen.findByText(/could not be loaded/i)).toBeTruthy();
+    // The scope becomes ready rather than waiting forever on a fetch that
+    // already failed, so the fallback chart actually draws.
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+  });
+
+  it("carries unrelated query params through a takeover", async () => {
+    // This page owns `c_*` and the filter params. Rebuilding the URL from
+    // scratch would drop everything else in it, which nothing writes today —
+    // which is exactly why the loss would go unnoticed.
+    renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1&tour=viz");
+    await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("radio", { name: /Ordinal/ }));
+
+    await waitFor(() => expect(lastSearch).not.toContain("c_chart"));
+    expect(new URLSearchParams(lastSearch).get("tour")).toBe("viz");
+  });
+
   it("editing the chart drops the reference and spells the chart out", async () => {
     renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1");
     await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
