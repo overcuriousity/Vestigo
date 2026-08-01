@@ -206,6 +206,15 @@ export interface Event {
   /** Parser-derived tags (ClickHouse). Different from annotation tags. */
   tags: string[];
   attributes: Record<string, string>;
+  /**
+   * Attribute keys this row got from the timeline's `field_mappings` rather
+   * than from its source file (db/field_mappings.py::project_mapped_fields).
+   * Only present on the paged event query — absent on exports, on frozen
+   * `event_ref` story blocks, and whenever the timeline defines no mappings.
+   * A key stored under a canonical name is deliberately *not* listed: the
+   * source file did carry it.
+   */
+  mapped_fields?: string[];
   embedding_model: string | null;
   embedding_config_hash: string | null;
 }

@@ -23,12 +23,24 @@ and get a column of em dashes, frozen into story view blocks along with everythi
   the same rule as the filter is the point — a live ClickHouse test asserts the rows whose
   projected value equals `10.0.0.1` are exactly the rows a filter on that field returns.
 
+- **Precedence starts at the canonical name itself.** `validate_field_mappings` rejects a
+  canonical name that shadows a raw attribute key, but only when the inventory is known — a
+  source ingested after the mapping was saved introduces that key with nobody checking. The
+  projection never overwrites a stored key, so the filter had to agree: `mapping_coalesce_expr`
+  now reads `attributes[canonical]` as its first coalesce term. For every well-formed mapping
+  that term is always `''` and nothing changes; in the shadowed case it is the difference
+  between a filter that matches what the grid shows and one that ignores it.
+
 - **The derived value lands in `attributes`, and the detail panel says so.** Injecting it
   there is why the grid, the story snapshot renderer and the embed cards needed no change at
   all — but it also makes a synthesized key indistinguishable from an ingested one, and
   `field_mappings.py` is explicit that a mapping is a per-timeline view. Storage stays
   untouched; the *presented* row does not, so `EventDetailPanel` marks a canonical field as
-  mapped and names the raw fields behind it. The same branch fixes its allowlist token:
+  mapped and names the raw fields behind it. Which keys those are comes from the row itself —
+  each projected event carries `mapped_fields`, the canonical names *that row* got from the
+  mapping — not from the mapping dict alone, so a key the source file did carry under a
+  canonical name is never badged with a provenance it does not have. The same branch fixes
+  its allowlist token:
   marking a canonical field's value normal used to write `attr:ip_address`, and `attr:`
   bypasses mappings, so the entry keyed on a field no source has and could never match.
 
@@ -39,12 +51,16 @@ and get a column of em dashes, frozen into story view blocks along with everythi
 - **The recommender now scores the canonical field.** Merged from its raws: a source counts
   once toward breadth if it carries *any* of them, which is the whole point — each spelling
   alone looks partial on a merged timeline. Coverage is capped at the source's event count, so
-  a source carrying both spellings cannot double-count the events that set both. A canonical
-  name that also exists as a real attribute key somewhere is scored as neither the mapping nor
-  the attribute: the projection refuses to overwrite a stored key, so that column would carry
-  ingested values on some sources and coalesced ones on others.
+  a source carrying both spellings cannot double-count the events that set both — an upper
+  bound, not a dedupe, since per-source stats hold no per-event overlap; the cap keeps `fill`
+  inside [0, 1] and exact for the one-spelling-per-source case that is essentially all of
+  them. The uniqueness ratio is read off a single spelling's own coverage, since pairing the
+  max-distinct count with that summed coverage would halve the ratio and let a per-row-unique
+  column through. A canonical name that also exists as a real attribute key is folded into the
+  canonical field rather than scored separately: resolution reads that stored key first, so it
+  is one well-defined column and its statistics belong to it.
 
-**Verified.** `uv run pytest` — 2231 passed. Frontend: 783 tests across 92 files, `tsc -b
+**Verified.** `uv run pytest` — full suite green. Frontend: 783 tests across 92 files, `tsc -b
 --noEmit` clean, `oxlint src` clean, `ruff check .` clean. The live-ClickHouse mapping tests
 ran against the dev stack. The new detail-panel test was confirmed to fail against the
 pre-fix component before being kept.

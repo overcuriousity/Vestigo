@@ -1205,6 +1205,23 @@ def test_page_carries_canonical_mapped_fields_in_attributes() -> None:
     ]
     # Raw keys stay exactly as ingested alongside the derived one.
     assert page.events[0]["attributes"]["src_ip"] == "10.0.0.4"
+    # Every row declares which keys it got from the mapping, so the detail
+    # panel can badge them without guessing from the mapping alone.
+    assert page.events[0]["mapped_fields"] == ["ip_address"]
+    assert "mapped_fields" not in page.events[2]
+
+
+def test_a_stored_canonical_key_is_not_reported_as_mapped() -> None:
+    """A source ingested after the mapping was saved can carry the canonical
+    name itself. The stored value wins (and the coalesce SQL reads it first),
+    so the row must not claim the mapping produced it."""
+    rows = [_row_with_attributes("evt-1", {"ip_address": "10.0.0.9", "src_ip": "10.0.0.4"})]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(case_id="case-1", field_mappings={"ip_address": ["src_ip", "ip_addr"]})
+    )
+    assert page.events[0]["attributes"]["ip_address"] == "10.0.0.9"
+    assert "mapped_fields" not in page.events[0]
 
 
 def test_page_without_mappings_leaves_attributes_untouched() -> None:

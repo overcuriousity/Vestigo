@@ -232,8 +232,10 @@ def test_canonical_field_counts_both_spellings_toward_breadth():
 
 
 def test_canonical_coverage_is_capped_at_a_source_event_count():
-    """One source carrying both spellings must not double-count the events
-    that set both — the coalesce yields one value per event."""
+    """One source carrying both spellings must not double-count past its own
+    event count. Per-source stats hold no per-event overlap, so the summed
+    coverage is an upper bound, not a dedupe: the true fill here is anywhere in
+    900..1000 and the cap reports the optimistic end (see score_columns)."""
     stats = {
         "s1": _source(
             1000,
@@ -252,17 +254,41 @@ def test_canonical_coverage_is_capped_at_a_source_event_count():
     assert candidate.fill == 1.0
 
 
-def test_canonical_name_shadowing_a_real_key_is_scored_as_neither():
+def test_canonical_uniqueness_ratio_is_read_off_one_spelling():
+    """A per-row-unique field must stay rejected on a source carrying two
+    spellings. The ratio is distinct/coverage *within a source*, so pairing the
+    distinct count with the summed coverage would halve it and let a useless
+    column through."""
+    stats = {
+        "s1": _source(
+            1000,
+            {
+                "src_ip": _attr(500, 495, ["10.0.0.1", "10.0.0.2"]),
+                "ip_addr": _attr(500, 495, ["192.168.1.9", "192.168.1.10"]),
+            },
+        )
+    }
+    tokens = [c.token for c in score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})]
+    assert "ip_address" not in tokens
+
+
+def test_canonical_name_shadowing_a_real_key_is_scored_as_one_field():
     """A source ingested after the mapping was saved can introduce the
-    canonical name as a real key. The projection then refuses to overwrite it,
-    so the column would mix stored and coalesced values across sources."""
+    canonical name as a real key. Resolution reads that stored key first
+    (mapping_coalesce_expr / project_mapped_fields), so the column is one
+    well-defined field and its statistics must include the stored spelling —
+    never a second candidate under the same token."""
     stats = {
         "s1": _source(1000, {"src_ip": _attr(1000, 40, ["10.0.0.1", "10.0.0.2"])}),
         "s2": _source(1000, {"ip_address": _attr(1000, 40, ["192.168.1.9", "192.168.1.10"])}),
     }
-    tokens = [c.token for c in score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})]
-    assert "ip_address" not in tokens
+    candidates = score_columns(stats, {"ip_address": ["src_ip", "ip_addr"]})
+    tokens = [c.token for c in candidates]
+    assert tokens.count("ip_address") == 1
     assert "src_ip" not in tokens
+    canonical = next(c for c in candidates if c.token == "ip_address")
+    assert canonical.sources_present == 2
+    assert canonical.coverage == 2000
 
 
 def test_canonical_name_colliding_with_a_grid_column_id_is_dropped():

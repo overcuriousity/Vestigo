@@ -23,6 +23,9 @@ pytestmark = pytest.mark.clickhouse
 
 CASE_ID = f"tc-fieldmap-{uuid.uuid4().hex[:8]}"
 SRC_A, SRC_B = "src-a", "src-b"
+# Ingested *after* the mapping was saved, carrying the canonical name itself —
+# the one case validate_field_mappings cannot catch (issue #10).
+SRC_C = "src-c"
 MAPPINGS = {"ip_address": ["src_ip", "ip_addr"]}
 
 
@@ -62,10 +65,12 @@ def ch_store():
         # Source B uses ip_addr for the same kind of data.
         _event(SRC_B, 3, {"ip_addr": "10.0.0.1", "proto": "tcp"}),
         _event(SRC_B, 4, {"ip_addr": "10.0.0.3", "proto": "udp"}),
+        # Source C stores the canonical name as a real key.
+        _event(SRC_C, 5, {"ip_address": "10.0.0.7", "proto": "tcp"}),
     ]
     store.insert_events(events)
     yield store
-    for sid in (SRC_A, SRC_B):
+    for sid in (SRC_A, SRC_B, SRC_C):
         store.delete_source_events(CASE_ID, sid)
 
 
@@ -76,6 +81,26 @@ def _query(**kw) -> EventQuery:
         field_mappings=MAPPINGS,
         **kw,
     )
+
+
+def _shadow_query(**kw) -> EventQuery:
+    return EventQuery(
+        case_id=CASE_ID,
+        source_ids=[SRC_C],
+        field_mappings=MAPPINGS,
+        **kw,
+    )
+
+
+def test_a_stored_canonical_key_filters_and_renders_the_same_value(ch_store):
+    """The mapping reads the canonical name itself first, so a source that
+    stores that key is filterable by it and shows the stored value — display
+    and filter agree here too, and the row does not claim the mapping made it."""
+    service = EventQueryService(store=ch_store)
+    page = service.query(_shadow_query(field_filters={"ip_address": ["10.0.0.7"]}))
+    assert page.total == 1
+    assert page.events[0]["attributes"]["ip_address"] == "10.0.0.7"
+    assert "mapped_fields" not in page.events[0]
 
 
 def test_filter_on_canonical_field_matches_both_sources(ch_store):

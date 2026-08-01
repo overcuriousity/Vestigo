@@ -74,9 +74,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical field alongside the raw keys it was coalesced from, by the same rule the filter
   SQL applies, so a rendered value and a filter on that field cannot disagree; the
   recommender scores the canonical field in place of the raw spellings, counting a source
-  toward it whichever spelling that source uses. The event detail panel marks such a field
-  as mapped and names the raw fields behind it — the value is a timeline view, not something
-  the source file carried — and exports still carry raw attributes only.
+  toward it whichever spelling that source uses. Resolution reads a key stored under the
+  canonical name itself first — validation rejects such a mapping, but only against a known
+  inventory, and a source ingested afterwards can introduce that key — so an ingested value
+  is what both the filter and the row carry rather than data the filter silently ignores.
+  Each row declares which of its attributes came from the mapping, and the event detail
+  panel marks exactly those as mapped and names the raw fields behind them — the value is a
+  timeline view, not something the source file carried. Exports still carry raw attributes
+  only.
 
 - **`GET /api/cases/` no longer runs `alembic upgrade head` on every request.** The endpoint
   the UI hits most re-ran the migration machinery per call — a connection, a version-table
