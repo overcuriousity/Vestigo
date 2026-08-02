@@ -15,7 +15,7 @@ import httpx
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from vestigo.api.deps import get_current_user, get_store
 from vestigo.core.config import get_settings
@@ -56,6 +56,102 @@ class UpdateMeRequest(BaseModel):
     username: str | None = Field(default=None, min_length=1, max_length=255)
     display_name: str | None = Field(default=None, max_length=255)
     onboarding_completed: bool | None = Field(default=None)
+
+
+#: Keys the current user may set in their own ``preferences`` blob, with the
+#: type each must have. A whitelist rather than a free-form merge: the blob is
+#: read by feature code that assumes its own shape, and it is written from the
+#: browser — an arbitrary key/value store reachable by every session is a
+#: storage sink nobody asked for. Agent tool preferences keep their own
+#: endpoint (`/api/agent/preferences`), which validates against the registry.
+_ALLOWED_PREFERENCE_KEYS: dict[str, type] = {
+    # `{timeline_id: true}` — the timelines this analyst has opted in to
+    # "Suggest with AI" on (issue #213), having read the disclosure naming the
+    # endpoint, the model and what the request carries. The opt-in is per
+    # timeline because that is the granularity at which evidence is sent.
+    "column_advisor_optin": dict,
+}
+
+#: Ceiling on entries in a dict-valued preference. High enough that no real
+#: analyst reaches it (one entry per timeline they opted in on), low enough
+#: that the blob cannot be grown into storage by a scripted client. Enforced
+#: on the *merged* result too (see :func:`update_my_preferences`) — checking
+#: only the request would let repeated calls of 500 fresh keys grow the row
+#: without bound, which is the thing this limit exists to stop.
+#:
+#: Over the limit, the *oldest* entries are dropped rather than the write being
+#: refused. A hard wall would mean an analyst on their 501st timeline can never
+#: record an opt-in again — and a consent that cannot be recorded is a
+#: disclosure dialog that reappears forever, which is how people learn to click
+#: through it unread. Eviction only costs them one extra dialog on a timeline
+#: they last opted in on hundreds of timelines ago.
+_MAX_PREFERENCE_ENTRIES = 500
+
+#: Ceiling on one key inside a dict-valued preference. The real keys are ids
+#: (a timeline id is 32 characters); this only has to stop a megabyte of
+#: string from being stored as a key.
+_MAX_PREFERENCE_KEY_LENGTH = 128
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """Payload to merge a few whitelisted keys into the user's preferences."""
+
+    preferences: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("preferences")
+    @classmethod
+    def _check_keys(cls, value: dict[str, Any]) -> dict[str, Any]:
+        for key, entry in value.items():
+            expected = _ALLOWED_PREFERENCE_KEYS.get(key)
+            if expected is None:
+                raise ValueError(f"Unknown preference: {key}")
+            if not isinstance(entry, expected):
+                raise ValueError(f"Preference {key} must be a {expected.__name__}")
+            if expected is dict:
+                # A dict-valued preference is still a whitelist, one level
+                # down: string keys, boolean values, bounded size. Without
+                # this it would be the arbitrary key/value store the
+                # top-level whitelist exists to prevent.
+                if len(entry) > _MAX_PREFERENCE_ENTRIES:
+                    raise ValueError(
+                        f"Preference {key} may hold at most {_MAX_PREFERENCE_ENTRIES} entries"
+                    )
+                for inner_key, inner in entry.items():
+                    if not isinstance(inner_key, str) or not inner_key:
+                        raise ValueError(f"Preference {key} keys must be non-empty strings")
+                    if len(inner_key) > _MAX_PREFERENCE_KEY_LENGTH:
+                        raise ValueError(
+                            f"Preference {key} keys may be at most "
+                            f"{_MAX_PREFERENCE_KEY_LENGTH} characters"
+                        )
+                    if not isinstance(inner, bool):
+                        raise ValueError(f"Preference {key} values must be booleans")
+        return value
+
+
+def _merge_bounded(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge *incoming* over *current*, capped at :data:`_MAX_PREFERENCE_ENTRIES`.
+
+    Eviction is FIFO on the pre-existing entries. JSON objects preserve
+    insertion order through both Python and Postgres' ``json`` column, and this
+    merge only ever appends new keys, so the surviving order *is* the order the
+    analyst opted in — oldest first. That is the closest thing to a timestamp
+    available without changing the stored value type, which is a bare ``true``
+    and is what :func:`hasColumnAdvisorOptIn` in the frontend reads.
+
+    Nothing from *incoming* is ever evicted: this request is the consent being
+    recorded, and an analyst asked to re-authorize something they just
+    authorized stops reading the dialog. A request larger than the cap on its
+    own is rejected upstream by ``UpdatePreferencesRequest``.
+    """
+    merged = {**current, **incoming}
+    overflow = len(merged) - _MAX_PREFERENCE_ENTRIES
+    if overflow <= 0:
+        return merged
+    evictable = [key for key in merged if key not in incoming]
+    for key in evictable[:overflow]:
+        del merged[key]
+    return merged
 
 
 def _user_response(user: User, teams: list[dict[str, Any]]) -> dict[str, Any]:
@@ -211,6 +307,47 @@ async def update_me(
         onboarding_completed=payload.onboarding_completed,
     )
     await store.record_audit(action="auth.update_profile", actor=user)
+    return {"user": _user_response(updated, await _teams_for_user(updated))}
+
+
+@router.put("/me/preferences")
+async def update_my_preferences(
+    payload: UpdatePreferencesRequest, user: User = Depends(get_current_user)
+) -> dict[str, Any]:
+    """Merge whitelisted keys into the current user's own preferences.
+
+    Per-user UI state that has to outlive one browser — which timelines the
+    analyst has opted in to AI column suggestions on is the first of them,
+    because a disclosure that reappears on every machine is one people learn
+    to dismiss unread. Not audited: these are display preferences about the
+    reader, not actions on evidence.
+
+    Dict-valued keys merge one level down rather than replacing, so a second
+    tab or a second machine adding its own entry cannot drop the entries this
+    one already had. The store's own merge is top-level only, and it is shared
+    with callers that want replace semantics — hence doing it here.
+
+    The merge is where :data:`_MAX_PREFERENCE_ENTRIES` actually has to hold:
+    the request validator only sees one request, and a client sending 500
+    fresh keys per call would otherwise grow the row for as long as it kept
+    calling. Over the limit, the oldest entries are evicted (see
+    :func:`_merge_bounded`) — never the ones this request is recording, since
+    dropping an opt-in the caller believes it stored is how a disclosure gets
+    skipped.
+    """
+    if not payload.preferences:
+        return {"user": _user_response(user, await _teams_for_user(user))}
+    existing = user.preferences or {}
+    patch: dict[str, Any] = {}
+    for key, value in payload.preferences.items():
+        if isinstance(value, dict):
+            current = existing.get(key)
+            patch[key] = _merge_bounded(current if isinstance(current, dict) else {}, value)
+        else:
+            patch[key] = value
+    updated = await get_store().update_user_preferences(user.id, patch)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="User not found")
     return {"user": _user_response(updated, await _teams_for_user(updated))}
 
 

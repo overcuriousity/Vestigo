@@ -5,7 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -233,6 +233,88 @@ def _redact_url(url: str | None) -> str:
     return url
 
 
+# Query parameters whose *value* is a credential. The OIDC redirect carries an
+# authorization code and its CSRF state in the URL — that is the protocol, not
+# a flaw — but uvicorn's access log writes the full query string, so without
+# this every login puts a live credential into the system journal, which is
+# routinely readable by more people than the session store is.
+#
+# This is a *name list*, not a heuristic: a parameter whose name is not here is
+# logged in full. Anything added to the API that puts a secret in a query string
+# has to be added here too — lowercase, since matching folds case.
+#
+# Scope stops at this process. A fronting reverse proxy writes its own access
+# log from the request it received, unredacted — `nginx-tls.conf` ships in this
+# repo and `docs/DEPLOYMENT.md` §"TLS reverse proxy (nginx)" is the deployment
+# it describes. An operator terminating TLS upstream has to scrub or disable
+# that log separately; nothing here can reach it.
+_SECRET_QUERY_PARAMS = frozenset(
+    {
+        "code",
+        "state",
+        "token",
+        "access_token",
+        "id_token",
+        "refresh_token",
+        "session_state",
+        "client_secret",
+        "agent_token",
+        "api_key",
+        "apikey",
+        "password",
+        "signature",
+    }
+)
+REDACTED = "***"
+
+
+def redact_query(target: str) -> str:
+    """Replace the value of every sensitive query parameter in ``target``.
+
+    Matching is on the whole parameter name, percent-decoded and folded to
+    lowercase — a sensitive name appearing as a *substring* of another
+    parameter is not a match, a provider that capitalizes ``Code`` does not
+    slip through, and neither does one that sends ``%63ode``. Only names in
+    ``_SECRET_QUERY_PARAMS`` are redacted; nothing is inferred from the value.
+
+    The name is *emitted* exactly as it arrived, decoded only to decide. An
+    operator reading the journal should see what the client actually sent.
+
+    Args:
+        target: A request target, with or without a query string.
+
+    Returns:
+        The same target with sensitive values replaced by ``***``. Parameter
+        names, order and the path are preserved, so the log stays readable and
+        an operator can still see *that* a callback carried a code.
+    """
+    path, sep, query = target.partition("?")
+    if not sep or not query:
+        return target
+    parts = []
+    for pair in query.split("&"):
+        name, eq, _value = pair.partition("=")
+        secret = bool(eq) and unquote_plus(name).lower() in _SECRET_QUERY_PARAMS
+        parts.append(f"{name}={REDACTED}" if secret else pair)
+    return f"{path}?{'&'.join(parts)}"
+
+
+class AccessLogRedactor(logging.Filter):
+    """Scrub credentials out of uvicorn's access log records.
+
+    Uvicorn formats access lines from the record's ``args``, where the third
+    item is the request target including its query string. Rewriting the tuple
+    here catches every route at once, which is what makes this hold for
+    whatever query parameter the next subsystem adds.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], redact_query(args[2]), *args[3:])
+        return True
+
+
 def _log_config_report() -> None:
     """One startup block stating the resolved deployment-critical config."""
     settings = get_settings()
@@ -274,6 +356,23 @@ async def _refresh_enricher_availability() -> None:
         await asyncio.to_thread(refresh_availability)
     except Exception:
         logger.exception("Could not determine enricher availability at startup.")
+
+
+async def _settle_orphaned_column_recommendations(store: PostgresStore) -> None:
+    """Relabel column recommendations a restart left mid-flight (issue #213).
+
+    Deliberately *not* part of ``_startup_recovery``, for the same reason as
+    ``_refresh_enricher_availability``: this is one fast Postgres statement
+    that touches no external service, and a ClickHouse-dependent step failing
+    above it must not leave a timeline polling forever for a job that died
+    with the previous process.
+    """
+    try:
+        settled = await store.clear_stale_running_recommendations()
+        if settled:
+            logger.info("Settled %d column recommendation(s) orphaned by a restart.", settled)
+    except Exception:
+        logger.exception("Could not settle orphaned column recommendations.")
 
 
 async def _startup_recovery(store: PostgresStore) -> None:
@@ -332,6 +431,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     _log_config_report()
     await _seed_admin()
     await _refresh_enricher_availability()
+    await _settle_orphaned_column_recommendations(store)
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
     try:
@@ -472,6 +572,11 @@ def create_app() -> FastAPI:
         level=get_settings().log_level.upper(),
         format="%(levelname)s:     %(name)s — %(message)s",
     )
+    # Attached to the logger rather than to a handler: uvicorn owns the
+    # handler, and an embedding process may replace it.
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, AccessLogRedactor) for f in access_logger.filters):
+        access_logger.addFilter(AccessLogRedactor())
     app = FastAPI(
         title="Vestigo",
         description="Local-first forensic log investigation platform.",
@@ -557,6 +662,11 @@ def create_app() -> FastAPI:
         # working.
         caps = await get_capabilities()
         body["capabilities"] = caps
+        # Served rather than mirrored: the tag is a filter token the resolver
+        # and the grid must name identically, and a copy hardcoded in the
+        # frontend would drift silently — a renamed tag stops matching without
+        # raising anything. Outside `capabilities`, which is bool-only.
+        body["annotated_tag"] = events.ANNOTATED_TAG
         body["embeddings_available"] = caps["embeddings"]
         body["agent_available"] = caps["agent"]
         body["mcp_enabled"] = caps["mcp"]

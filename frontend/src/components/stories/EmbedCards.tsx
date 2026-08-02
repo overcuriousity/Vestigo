@@ -17,7 +17,11 @@ import { savedChartsApi } from "@/api/viz";
 import { viewsApi } from "@/api/views";
 import type { Event, StoryBlockOf } from "@/api/types";
 import { ChartCanvas } from "@/components/viz/ChartCanvas";
-import { parseStoredChartConfig } from "@/components/viz/lib/chartConfig";
+import {
+  CHART_ID_PARAM,
+  parseStoredChartConfig,
+  parseStoredChartFilters,
+} from "@/components/viz/lib/chartConfig";
 import { Spinner } from "@/components/ui/Spinner";
 import { filtersToParams, viewPayloadToFilters } from "@/lib/queryParams";
 import { fmtNum } from "@/lib/format";
@@ -282,6 +286,12 @@ export function ChartBlockCard({
     () => (chart ? parseStoredChartConfig(chart.config) : null),
     [chart],
   );
+  // The filters the chart was saved under. Memoized for the same reason as
+  // the config: `ChartCanvas` puts it in a query key.
+  const filters = useMemo(
+    () => (chart ? parseStoredChartFilters(chart.config) : {}),
+    [chart],
+  );
 
   if (chartsQuery.isLoading) return <Spinner size={14} />;
   if (chartsQuery.isError) {
@@ -302,12 +312,18 @@ export function ChartBlockCard({
         <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-fg-secondary)]">
           {chart.name}
         </span>
+        {/* Addresses the chart by id rather than spelling its state into
+            `c_*` params: Visualize then reads the shape *and* the filters
+            back out of storage, so a chart the agent scoped to a fixed event
+            set opens as that chart instead of widening to the timeline. */}
         <OpenLink
-          to={`/cases/${caseId}/timelines/${timelineId}/visualize`}
+          to={`/cases/${caseId}/timelines/${timelineId}/visualize?${CHART_ID_PARAM}=${encodeURIComponent(
+            chart.id,
+          )}`}
           label="Open in Visualize"
         />
       </div>
-      <ChartCanvas caseId={caseId} timelineId={timelineId} config={config} />
+      <ChartCanvas caseId={caseId} timelineId={timelineId} config={config} filters={filters} />
     </div>
   );
 }

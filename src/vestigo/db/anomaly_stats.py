@@ -1118,7 +1118,7 @@ def _col_expr(
     """
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
-        return mapping_coalesce_expr(mapped_raws, params, prefix)
+        return mapping_coalesce_expr(field_token.strip(), mapped_raws, params, prefix)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         return column
@@ -1744,8 +1744,8 @@ class StatisticalAnomalyService:
         m_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         m_parts = []
         canonicals = list(field_mappings.items())
-        for i, (_, raws) in enumerate(canonicals):
-            expr = mapping_coalesce_expr(raws, m_params, f"inv{i}")
+        for i, (canonical, raws) in enumerate(canonicals):
+            expr = mapping_coalesce_expr(canonical, raws, m_params, f"inv{i}")
             m_parts.append(f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}")
         m_sql = (
             f"SELECT {', '.join(m_parts)}"

@@ -219,6 +219,13 @@ class Timeline(Base):
     # ingested events are never rewritten; None/empty means no mapping.
     field_mappings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Recommended event-grid columns (issue #213): the derived-from-the-data
+    # answer to "what should this timeline open on", shared by every user with
+    # access. Display metadata only — a per-user column choice in the browser
+    # always outranks it, and the events are never touched. See
+    # ``vestigo/columns/`` for the payload shape and how it is produced.
+    recommended_columns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # --- Embedding state (all nullable; None → not yet embedded) -------------
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -245,6 +252,7 @@ class Timeline(Base):
             "is_default": self.is_default,
             "source_ids": [s.id for s in self.sources],
             "field_mappings": self.field_mappings,
+            "recommended_columns": self.recommended_columns,
             "is_embedded": is_embedded,
             "is_stale": is_stale,
             "embedding_model": self.embedding_model,
@@ -1527,6 +1535,13 @@ class User(Base):
     # Namespaced per-user preference blob (e.g. "agent_disabled_tools").
     # A JSON column rather than a table: per-user singleton, never queried
     # by value. Nothing secret lives here.
+    #
+    # `JSON`, deliberately, not `JSONB`: Postgres' `json` stores the document
+    # verbatim and preserves key order, and `api/routers/auth.py::_merge_bounded`
+    # depends on that — it evicts the *oldest* entries of an over-large
+    # dict-valued preference, and insertion order is the only timestamp a bare
+    # `true` value carries. `JSONB` normalizes key order away, so switching this
+    # column would silently make that eviction arbitrary.
     preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -2829,6 +2844,128 @@ class PostgresStore:
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
+
+    async def update_timeline_recommended_columns(
+        self,
+        case_id: str,
+        timeline_id: str,
+        recommended_columns: dict[str, Any] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's recommended event-grid columns (issue #213).
+
+        Written only by the recommendation job (``vestigo/columns/jobs.py``) and
+        the read-path settler in ``api/routers/cases.py``, which share the
+        payload shape. Returns the updated timeline, or None if it doesn't
+        exist — a timeline deleted while its job was running is an ordinary
+        outcome, not an error.
+
+        ``None`` clears the column — "never recommended", which is what the
+        job's rollback path writes when its first run fails. An **empty dict
+        clears it too**: there is no payload without a ``status``, so a caller
+        passing ``{}`` means "nothing to record" rather than "recorded, empty",
+        and storing it would leave the explorer reading a payload it cannot
+        interpret.
+
+        ``sources`` is deliberately *not* eager-loaded on the way out: no
+        caller serializes this return value (the job discards it), and the
+        payload is written twice per run, so the extra round trip would be pure
+        cost. Callers that need ``to_dict()`` re-read through ``get_timeline``.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.recommended_columns = recommended_columns or None
+            await session.commit()
+            await session.refresh(timeline)
+            return timeline
+
+    async def settle_running_recommendations(
+        self, case_id: str, timeline_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Relabel the named timelines' ``running`` recommendations in one pass.
+
+        The read-path counterpart to
+        :py:meth:`clear_stale_running_recommendations`, sharing the same
+        relabel (``columns/jobs.settle_running_payload``). One session and one
+        commit for the whole set: the timelines list settles every stale row it
+        finds, and a restart that orphaned a dozen recommendations would
+        otherwise cost a dozen sequential round trips on a page an analyst
+        opens constantly.
+
+        Re-checks ``status == "running"`` under this session rather than
+        trusting the caller's snapshot — a job may have written its real answer
+        between the read and this call, and overwriting that with a settled
+        placeholder would age a fresh recommendation backwards.
+
+        Returns ``{timeline_id: settled_payload}`` for the rows actually
+        changed, so the caller can serialize them without a second read.
+        """
+        from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
+
+        if not timeline_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id.in_(timeline_ids),
+                )
+            )
+            settled: dict[str, dict[str, Any]] = {}
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                timeline.recommended_columns = settle_running_payload(payload)
+                settled[timeline.id] = timeline.recommended_columns
+            if settled:
+                await session.commit()
+            return settled
+
+    async def clear_stale_running_recommendations(self) -> int:
+        """Settle column recommendations left ``running`` by a restart (#213).
+
+        ``JobStore`` is in-memory, so a process that dies mid-recommendation
+        leaves a Postgres payload claiming a job is in flight that no longer
+        exists — the explorer would poll for it forever. The relabel itself
+        lives in ``columns/jobs.settle_running_payload``, shared with the
+        read-path settler so the two can never drift. Nothing is recomputed
+        here; the next ingest or a manual re-suggest does that.
+
+        Filtering happens in Python rather than with a JSON path predicate:
+        the same code runs against SQLite in the test suite, and the number of
+        timelines with a stored recommendation is bounded by the number of
+        timelines. Returns the number of rows settled.
+        """
+        from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(Timeline.recommended_columns.is_not(None))
+            )
+            settled = 0
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                timeline.recommended_columns = settle_running_payload(payload)
+                settled += 1
+            if settled:
+                await session.commit()
+            return settled
 
     async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
         """Delete a timeline row.
@@ -4865,6 +5002,52 @@ class PostgresStore:
                 select(Annotation.event_id).where(*conditions).distinct()
             )
             return [row[0] for row in result.all()]
+
+    async def list_event_ids_with_any_annotation(
+        self, case_id: str, source_ids: list[str]
+    ) -> list[str]:
+        """Return the event_ids carrying at least one annotation of any kind.
+
+        Deliberately unfiltered by type or origin: this backs the derived
+        ``annotated`` tag, which means "somebody or something has touched this
+        event" — a human tag, a comment, an agent proposal or a detector
+        finding all count.
+
+        Uncapped, like its typed siblings above. The result feeds
+        ``TagFilter.postgres_event_ids`` and reaches ClickHouse through the
+        external-table path, whose breadth is a decision already taken and
+        argued — see ``EXTERNAL_LIST_THRESHOLD`` in ``vestigo/db/queries.py``,
+        whose comment names this very filter as the case it was sized for.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.event_id)
+                .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
+                .distinct()
+            )
+            return [row[0] for row in result.all()]
+
+    async def has_any_annotation(self, case_id: str, source_ids: list[str]) -> bool:
+        """Whether anything in this scope carries an annotation at all.
+
+        Same unfiltered-by-type-or-origin question as
+        :py:meth:`list_event_ids_with_any_annotation`, asked where only the
+        answer matters — the merged-tags facet, which offers the derived
+        ``annotated`` tag once the timeline has earned it. Materializing every
+        annotated event_id to test a list for emptiness costs the whole
+        annotation table on an endpoint the filter panel hits constantly.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.id)
+                .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
+                .limit(1)
+            )
+            return result.first() is not None
 
     # ------------------------------------------------------------------
     # Users

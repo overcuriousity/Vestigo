@@ -1,9 +1,665 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-31 (session 138 — OIDC discovery redirects).
+Last updated: 2026-08-02 (session 150 — sixth review pass on PR 230, and the 1.9.0 cut).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 150 — 2026-08-02: sixth review pass on PR 230, and the 1.9.0 cut
+
+**Why.** A last read of the release PR as a whole — the column subsystem, the access-log
+redaction, the saved-chart filter persistence — rather than of the branch that had just landed.
+Four small things and two records to correct before tagging.
+
+- **A recompute with no ready sources no longer discards a good suggestion.**
+  `run_column_recommendation_job` wrote `insufficient` unconditionally when a timeline had no
+  ready source. But "no ready sources" is also what a re-ingest or a briefly detached source
+  looks like from inside the job, so a timeline that had a perfectly good recommendation
+  dropped the whole case's grid back to the built-in defaults until the next successful run.
+  A stored answer with columns is now left byte-for-byte alone — including its
+  `generated_at`, which is when those columns were actually derived — with one exception: a
+  `running` placeholder is settled, since this job holds the `_ACTIVE` claim and a stored
+  `running` can therefore only be a dead job's.
+
+- **The CLI opens its ClickHouse client only once there is a timeline to score.** A source
+  belonging to no timeline paid a connection, and a blip on it printed
+  `WARNING: column suggestion skipped` after an ingest that had entirely succeeded.
+
+- **`update_timeline_recommended_columns` says what an empty dict means.** It coerces falsy to
+  `NULL`, which is right — there is no payload without a `status` — but the coercion was
+  invisible at the call site.
+
+- **The one read-endpoint-that-writes is now a written-down exception.**
+  `_settle_dead_recommendations` relabels a dead `running` payload from a `require_case_read`
+  endpoint, which is correct (a read-only member has no other way to stop a timeline claiming
+  to be thinking forever) and is exactly the kind of thing that spreads by precedent.
+  `CLAUDE.md` now carries the rule and the exception together.
+
+- **1.9.0 is dated 2026-08-02**, the day it was cut, not the day the branch opened.
+
+**Verified.** `uv run pytest` — full suite green, `ruff check .` clean. Frontend unchanged this
+session; its suite and typecheck re-run before the merge.
+
+## Session 149 — 2026-08-02: canonical mapped fields reach the event projection
+
+**Why.** The one known correctness hole in the release that ships the column recommender:
+`score_columns` excluded both the raw keys a timeline's `field_mappings` consume *and* the
+canonical names they define, on the grounds that neither renders. That was true, and it hid a
+live defect one layer up — the picker already lists canonical names (discovery substitutes
+them via `apply_mappings_to_attribute_keys`), so an analyst could select `ip_address` today
+and get a column of em dashes, frozen into story view blocks along with everything else.
+
+- **The root cause was the projection, not the recommender.** `mapping_coalesce_expr` had
+  exactly one call site — the field-expression resolver that serves WHERE clauses and every
+  aggregation. The grid's SELECT is a fixed column list ending in the whole `attributes` map,
+  so nothing ever resolved a mapping into a row. `project_mapped_fields` is the Python twin of
+  that SQL, applied to the presented page: first raw key in mapping order whose value is
+  neither absent nor `''`, which is what `coalesce(nullif(...), ...)` means. Computing it from
+  the same rule as the filter is the point — a live ClickHouse test asserts the rows whose
+  projected value equals `10.0.0.1` are exactly the rows a filter on that field returns.
+
+- **Precedence starts at the canonical name itself.** `validate_field_mappings` rejects a
+  canonical name that shadows a raw attribute key, but only when the inventory is known — a
+  source ingested after the mapping was saved introduces that key with nobody checking. The
+  projection never overwrites a stored key, so the filter had to agree: `mapping_coalesce_expr`
+  now reads `attributes[canonical]` as its first coalesce term. For every well-formed mapping
+  that term is always `''` and nothing changes; in the shadowed case it is the difference
+  between a filter that matches what the grid shows and one that ignores it.
+
+- **The derived value lands in `attributes`, and the detail panel says so.** Injecting it
+  there is why the grid, the story snapshot renderer and the embed cards needed no change at
+  all — but it also makes a synthesized key indistinguishable from an ingested one, and
+  `field_mappings.py` is explicit that a mapping is a per-timeline view. Storage stays
+  untouched; the *presented* row does not, so `EventDetailPanel` marks a canonical field as
+  mapped and names the raw fields behind it. Which keys those are comes from the row itself —
+  each projected event carries `mapped_fields`, the canonical names *that row* got from the
+  mapping — not from the mapping dict alone, so a key the source file did carry under a
+  canonical name is never badged with a provenance it does not have. The same branch fixes
+  its allowlist token:
+  marking a canonical field's value normal used to write `attr:ip_address`, and `attr:`
+  bypasses mappings, so the entry keyed on a field no source has and could never match.
+
+- **Export deliberately stays raw.** `iter_events` does not project — a CSV/JSONL export
+  carries what was ingested. `event_ref` story blocks likewise: a frozen single event is
+  source-scoped and carries no timeline, so there is no mapping to apply.
+
+- **The recommender now scores the canonical field.** Merged from its raws: a source counts
+  once toward breadth if it carries *any* of them, which is the whole point — each spelling
+  alone looks partial on a merged timeline. Coverage is capped at the source's event count, so
+  a source carrying both spellings cannot double-count the events that set both — an upper
+  bound, not a dedupe, since per-source stats hold no per-event overlap; the cap keeps `fill`
+  inside [0, 1] and exact for the one-spelling-per-source case that is essentially all of
+  them. The uniqueness ratio is read off a single spelling's own coverage, since pairing the
+  max-distinct count with that summed coverage would halve the ratio and let a per-row-unique
+  column through. A canonical name that also exists as a real attribute key is folded into the
+  canonical field rather than scored separately: resolution reads that stored key first, so it
+  is one well-defined column and its statistics belong to it.
+
+**Verified.** `uv run pytest` — full suite green. Frontend: 783 tests across 92 files, `tsc -b
+--noEmit` clean, `oxlint src` clean, `ruff check .` clean. The live-ClickHouse mapping tests
+ran against the dev stack. The new detail-panel test was confirmed to fail against the
+pre-fix component before being kept.
+
+## Session 148 — 2026-08-01: the fifth review pass on PR 230
+
+**Why.** A fresh read of the 1.9.0 release PR, this time over the column-suggestion feature
+as a whole rather than the `?c_chart=` path the previous passes kept circling. Two real
+findings, both about *when* things run rather than what they compute, plus the minor cleanups.
+
+- **A dismissal could race the opt-in and record the opposite consent.** The Explorer treats
+  closing the AI disclosure as "no thanks" and writes `false`; Cancel was disabled while the
+  confirm was pending, but Escape, the overlay and the X were not, so a close landing between
+  the opt-in write and its response fired a second `PUT /auth/me/preferences` with the
+  opposite answer. Last write wins, and the stored consent could contradict the request that
+  had already gone out — on the one record whose whole job is saying what the analyst
+  authorized. `ColumnAdvisorNotice` now refuses every close while pending, and
+  `closeAdvisorOffer` refuses too: the same lock on both sides, so a future dialog that
+  forgets cannot reintroduce it.
+
+- **An ingest burst silently dropped every source but the first.** `_ACTIVE` collapsed
+  concurrent triggers for one timeline into the running job, and the docstring called them
+  "identical jobs" — they were not. The holder read its source list before those sources
+  became ready, so four files landing in parallel left the timeline recommended from one of
+  them until the next ingest or a manual re-suggest. Collapsed triggers now mark the timeline
+  in `_DIRTY` and the holder re-runs once for the whole burst, after releasing its claim. The
+  re-run never carries `use_llm`: it answers an ingest, not a person, and a burst must not
+  turn one opted-in "Suggest with AI" into repeated egress.
+
+- **A redaction list nothing enforced.** `_SECRET_QUERY_PARAMS` only scrubs the parameter
+  names it is told about, and the obligation to extend it lived in a comment. A test now walks
+  the app's own OpenAPI schema and fails when a route declares a query parameter whose name
+  reads like a credential and is not on the list — name-shaped, so it catches exactly what a
+  reviewer reading the name would have caught, which is how the OIDC code reached the journal
+  in the first place.
+
+- **Minor.** The suggestion poll widened from a flat 3 s to 3/10/30 s by job age (~200 requests
+  over the ten-minute staleness window was buying nothing); "Reset to defaults" now says
+  "Reset to suggested" when that is what it restores; a comment duplicated across an earlier
+  review pass in `ColumnPicker` was folded into one.
+
+**Verified.** `uv run pytest` — 2214 passed. Frontend: 781 tests across 91 files, `tsc -b
+--noEmit` clean, `oxlint src` clean. `ruff check .` clean. The disclosure test was confirmed to
+fail against the pre-fix component before being kept.
+
+## Session 147 — 2026-08-01: the third review pass on PR 230
+
+**Why.** A third read of the 1.9.0 release PR. Four findings, one of them a blocker that
+sessions 145 and 146 both walked past — each pass tightened `?c_chart=`'s *success* path and
+neither asked what the page does when the fetch behind it fails.
+
+- **A failed saved-charts fetch suspended the Visualize page indefinitely.** `chartRefBroken`
+  was gated on `isSuccess`, so an errored chart list left the reference neither live nor
+  broken: every defaulting effect stayed suppressed *and* `scopeReady` stayed false. No chart
+  drew, no notice appeared, and nothing on screen explained either — a blank page whose only
+  exit was editing the URL. A reference now settles on error too and falls through to the
+  params, which is the same graceful degradation a deleted chart already got.
+
+- **The broken-reference notice lasted about one frame.** Fixing the above exposed it: the
+  moment a reference settles as broken the defaulting effects write the default chart into the
+  URL, and `chartConfigToParams` drops `c_chart` with the rest of its namespace — so the
+  *derived* "this reference is broken" stopped being true one tick after it became true, and
+  the message blinked out with it. Both older notices (deleted chart, unreadable chart) had
+  the same hole and passed their tests only by racing them. Latched in state now, like
+  `droppedScope`, and cleared when the URL names a chart again.
+
+- **A take-over rebuilt the query string from scratch.** `takeOver` composed
+  `chartConfigToParams(config, filtersToParams(filters))`, which is a *fresh*
+  `URLSearchParams` — so the first config or filter edit silently dropped every param outside
+  the two namespaces this page owns. The helper it replaced preserved them by construction, by
+  mutating a copy. Nothing writes such a param today, which is exactly why the loss would have
+  gone unnoticed until something did. `chartUrlParams` rewrites `c_*` and the filter keys and
+  carries the rest through; `loadSavedChart` clears the same two namespaces and no more.
+  `FILTER_PARAM_KEYS` names the filter namespace explicitly, because `filtersToParams` writes
+  only what is set and so cannot tell "cleared filter" from "not ours" — with a test that
+  populates every member of `EventFilters` and asserts the set is exactly what gets written.
+
+- **A failed spawn wedged a timeline until the next restart.** `start_column_recommendation`
+  claims `_ACTIVE` before spawning, and the claim is released by the job's own `finally` —
+  which a coroutine that was never scheduled never reaches. `_recommendation_is_dead` reads an
+  active claim as proof the job is alive, so the leak is not a slow job: the timeline reports
+  `running` for the life of the process *and* every later recommendation for it is skipped as
+  a duplicate. The claim is handed back on a failed spawn, the job is marked failed rather
+  than left at `queued`, and the test proves the *next* attempt is not turned away.
+
+Also: `_settle_dead_recommendations` now states why it writes from a `require_case_read`
+endpoint, since a read-only member is the one caller who cannot repair the row any other way,
+and a test locks the bound that makes it safe — relabel only, same columns, no audit row.
+
+Backend 2205 passed, frontend 759 across 90 files, typecheck/lint/format clean.
+
+## Session 146 — 2026-08-01: the second review pass on PR 230
+
+**Why.** A fresh read of the 1.9.0 release PR after session 145's fixes. Nothing blocking;
+six real findings, one of them a correction to a claim this document makes.
+
+- **Editing a chart under `?c_chart=` widened it in silence.** Session 145 stopped the
+  *automatic* writes from dropping the reference, which was the blocker. But the analyst's own
+  edit still goes through `takeOver`, which spells the chart into `c_*` params — and those
+  cannot carry `ids`, `anomalyRunId` or `collapseRoutine`. Changing the metric on an
+  agent-scoped chart therefore still turns 47 events into the whole timeline. That is
+  unavoidable (the URL is the record now) but it must not be *silent*, which is the whole
+  argument of the feature. `unrepresentableFilterMembers` names what a write would lose, and
+  the page says so where it already reports a broken reference.
+
+- **`collapseRoutine` was captured for agent charts and dropped for analyst ones.** The rail
+  was passed the raw URL filters, on the reasoning that collapse derives from live
+  dispositions and the page re-derives it. Only the *page* re-derives it: `ChartBlockCard` and
+  the export resolver draw a saved chart's stored filters verbatim. So a chart saved with
+  routine collapse on was frozen as its uncollapsed superset — the release's own "a saved
+  chart is the slice it was built over" claim, missed for the one narrowing an analyst toggles
+  by hand. The rail now gets the resolved set.
+
+- **Uniqueness was judged on the worst source instead of the best-evidenced one.**
+  `_uniqueness_ratio` took `max()` over the per-source ratios, so a single 60-event source
+  where `user` happens to be per-row-unique vetoed a field that groups cleanly across three
+  5000-event ones — and did so *more* often the more sources a timeline merges, which is
+  backwards for a scorer that weights breadth highest. It now reads the ratio off the source
+  with the most values.
+
+- **The timelines list settled stale recommendations one round trip at a time.** Split into a
+  pure `_recommendation_is_dead` predicate and a batched
+  `PostgresStore.settle_running_recommendations`, so the common case (nothing stale) touches
+  the database not at all and a restart that orphaned a dozen costs one statement.
+
+- **The AI opt-in cap was a wall with no way past it.** At 500 opted-in timelines every
+  further opt-in 400'd, and a consent that cannot be recorded is a disclosure dialog that
+  reappears forever — which is how people learn to click through it unread. Over the cap the
+  oldest entries are now evicted (FIFO on JSON insertion order, which is the opt-in order);
+  nothing from the current request is ever the thing dropped.
+
+- **The access-log redactor's survival was untested.** It works only because `dictConfig`
+  clears a configured logger's *handlers* and not its *filters* — a CPython implementation
+  detail, not a contract, and the difference between "OIDC codes are redacted" and "they are
+  back in the journal after a dependency bump". A test now runs uvicorn's own `LOGGING_CONFIG`
+  and asserts the filter is still attached and still redacting.
+
+Also: `chartConfigToStored` clears `filters` before writing it, so a future `ChartConfig.filters`
+cannot ride the spread into storage and be read back as a slice nobody chose; and the PR
+description's "`node:25-alpine`" was corrected to the `node:24-alpine` the Dockerfile and
+CHANGELOG actually ship.
+
+**Session 145's withdrawn finding was withdrawn correctly.** This pass re-raised the empty
+column selection independently and was wrong for the same reason: `migrateColumns` runs only
+in the `version < 1` persist branch, so `[]` does not decay into a permanent `DEFAULT_COLUMNS`
+override. Verified in `stores/ui.ts` rather than argued — the change was written and then
+reverted.
+
+One flake seen and not fixed: `test_demo_detector_coverage_clickhouse.py::…[find_value_combos]`
+failed once in a full run and passes in isolation on both the clean and the modified tree, and
+the next full run was green at 2203. It shares a ClickHouse instance with the rest of the
+suite; worth a look if it recurs.
+
+## Session 145 — 2026-07-31: the chart link undid itself four seconds after opening
+
+**Why.** A review of PR 230 — the 1.9.0 release PR, `release/1.9.0` → `main`. One blocker,
+and it is the release's own headline fix defeating itself.
+
+- **`?c_chart=<id>` was dropped moments after the page loaded.** Session 142's whole argument
+  is that three filter members (`ids`, `anomalyRunId`, `collapseRoutine`) have no URL form, so
+  a chart must be addressed by id and read back out of storage. But `VisualizePage`'s scale
+  probe fires on *any* field change, and `autoProbedField` is initialized at mount — when the
+  URL holds only `c_chart` and `field` is still null. Resolving the reference therefore looked
+  exactly like the analyst picking a new field: the probe ran, its effect called
+  `updateConfig`, and `takeOver` rewrote the URL as `c_*` params with the reference and the
+  three narrowings gone. An agent chart scoped to one detector run's 47 events opened as the
+  whole timeline, drawn as if it had always been that shape. The same write also reverted a
+  scale the analyst had just chosen.
+
+  The tests missed it for a specific reason worth remembering: `vizApi.fieldNumeric` was
+  unmocked, so in jsdom it rejected and `numericQuery.data` stayed null — the probe's effect
+  never reached its `updateConfig`. The one API call on that page that *writes back to the
+  URL* was the one left to fail. It is mocked now, and two of the file's existing tests fail
+  without the fix.
+
+  The rule is now stated once and applied to all four defaulting effects (field default,
+  time-field scale, numeric probe, metric clamp): **while the URL names a saved chart,
+  nothing writes the URL automatically.** A stored chart already answered every question they
+  exist to answer. A *broken* reference is deliberately not "live" — a link to a deleted
+  chart falls through to the params, where the page is building a chart again and the
+  defaults are wanted.
+
+- **The AI opt-in reported the wrong half as failed.** `ColumnPicker` inferred "did the run
+  fail, or the save?" from `recommendMutation.isError`, which is sticky across mutations: an
+  unrelated local "Re-suggest columns" that had failed earlier made a failed *opt-in write*
+  report as "your choice was saved, the suggestion did not start". That is the one wrong
+  answer available — the analyst is never asked again for a consent that was never recorded.
+  The confirm now tracks its own stage.
+
+- **`_ACTIVE` was documented as a guard and used as a hint.** Only
+  `start_column_recommendation` claimed the slot, so the CLI and the demo build — which call
+  `run_column_recommendation_job` directly — could run two jobs over one timeline, trading
+  writes and each rolling back a placeholder the other owned. The claim is now the guard for
+  every caller: a job that finds the slot held by another stands down without touching the
+  payload.
+
+- **A settled recommendation misdated its own columns.** The `running` placeholder carries
+  the previous answer forward (so the grid holds still), and its `generated_at` has to be the
+  *recompute's* start, since that is the clock the explorer measures staleness against. When
+  a crash left that placeholder to be settled, the previous run's columns kept the dead run's
+  timestamp — in the one record a case export and the audit trail carry forward.
+  `columns_generated_at` parks the real timestamp on placeholders only, and settling puts it
+  back; carry-forward reads it first, so repeated failures cannot walk an answer's date
+  forward one recompute at a time.
+
+Also: the frontend build image goes to `node:24-alpine` rather than the bot's `node:25` (odd
+numbered, EOL mid-2026 — a poor floor for an image an operator installs on an isolated host
+and never updates), with `ci.yml`/`release.yml` moved from Node 22 to 24 so the runtime that
+tests the frontend is the one that builds it; and the two exact-patch action pins the bot
+introduced are back to majors, matching every other action in the repo.
+
+One review finding was withdrawn rather than fixed: unchecking every column stores `[]`,
+which `resolveVisibleColumns` treats as a deliberate choice. That is correct and tested —
+`migrateColumns` runs only in the `version < 1` persist branch, not on every rehydrate, so
+the empty selection does not decay into a permanent `DEFAULT_COLUMNS` override, and "Reset to
+defaults" stays enabled as the way back.
+
+## Session 144 — 2026-07-31: reviewing the release branch against itself
+
+**Why.** A read of PR 212 before cutting 1.9.0. Four of the findings were in code sessions
+139–143 had just written, which is the useful kind: each is a case where the reasoning was
+right and one line of the implementation did not follow it.
+
+- **`read_story` spent its budget on the cap, not the text.** `remaining` was decremented by
+  `min(STORY_TEXT_TRUNCATE, remaining)` rather than by the characters actually taken, so a
+  200-character paragraph cost 8000. Four short blocks exhausted a 24000 budget and the
+  fourth came back empty and `truncated` — the marker session 143 added precisely so the
+  model would treat a cut block as unread, now firing on a complete one. The three tests
+  written with it all used full-size blocks, where the two numbers are equal; a test with ten
+  short blocks pins it.
+
+- **The merged-tags facet materialized the whole annotation table to ask a yes/no question.**
+  `list_event_ids_with_any_annotation` was called for its truthiness on the endpoint the
+  filter panel hits constantly. `has_any_annotation` is the same question as a `LIMIT 1`. (The
+  *filter* path genuinely needs the ids and is unchanged — and is no worse than any other tag
+  filter, since `bulk_annotate_by_filter` is uncapped and a bulk-tagged value reaches the same
+  size.)
+
+- **A chart's stored filters had two writers and one format.** Session 142 taught the backend
+  to carry `collapseRoutine`/`eventIds`/`runId` — "dropping them silently *widens* a chart's
+  scope" — but the frontend's `filtersToViewPayload` neither writes nor reads them. So the
+  analyst's Save on an agent chart scoped to a detector run stored the whole timeline, and a
+  chart the backend wrote drew wider on screen than the same chart frozen into its export:
+  the screen-versus-report divergence session 142 existed to close, reappearing on the agent
+  path. Fixed in a chart-only layer (`chartFiltersToStored` / `parseStoredChartFilters`) so
+  saved Views, which deliberately never freeze `collapseRoutine`, are untouched. The
+  "Open in Visualize" link stays lossy for those three — they have no URL form by design —
+  and `STORIES.md` now says so.
+
+  The same change replaced `hasActiveFilters` as the persistence gate. It is a *chip* helper
+  and omits `excludeTag` and `annotationTagValue`, so a chart whose only narrowing was an
+  excluded tag stored no filters at all. The gate is now "did anything survive
+  normalization", which cannot drift from what is actually stored.
+
+- **`ANNOTATED_TAG` is served, not mirrored.** Session 140 left the string hardcoded on both
+  sides under a "keep in step" comment; a rename would have stopped the filter matching
+  without raising anything. `/api/health` now names it (`annotated_tag`, beside
+  `capabilities`, which is bool-only) and `useAnnotatedTag` reads it with **no fallback
+  literal** — a default would be the second copy this removes. The chip waits for health
+  rather than guessing.
+
+Also: the access-log redactor's name list is wider and folds case (an IdP that capitalizes
+`Code` would have slipped through a list built for one provider); the `annotated` tag value
+versus the `annotated` filter *field* — same word, different axis — is called out in
+`MODEL_REFINEMENT.md` and at the constant; and a router-level test pins that the resolved ids
+actually reach `EventQuery`, which every previous test stopped short of.
+
+## Session 143 — 2026-07-31: the agent read the report through a keyhole
+
+**Why.** Noticed while looking at the story tools: `read_story` truncated each markdown block
+at `ATTR_VALUE_TRUNCATE * 8` — 1600 characters, roughly 400 tokens — while
+`propose_story_block` accepts up to `VESTIGO_STORY_MAX_MARKDOWN_BYTES` (256 KiB). The read was
+capped at 0.6% of what the write allows, so ordinary prose (a few paragraphs) came back cut.
+
+**What made it a correctness bug, not a tuning one.** The cut was unmarked. `_truncate`
+appends "…" and nothing else, so the payload said nothing about a block being partial, and
+there is no `read_story_block` and no offset — the tail is unreachable through any agent
+surface. A model asked to summarize or continue the analyst's narrative therefore reasoned
+over half a paragraph believing it had read the block, which is precisely what the system
+prompt's evidence rule forbids elsewhere (the `_listing` tools have always reported `returned`
+alongside `total` for exactly this reason). The agent also could not read back what it had
+itself written.
+
+**Shape of the fix.** Markdown gets its own budget, because it is the document under
+discussion rather than incidental string data like an attribute value: capped per block
+(`STORY_TEXT_TRUNCATE = 8000`) and per response (`STORY_TEXT_BUDGET = 24000`), spent in
+document order. One enormous block can no longer eat the whole response, a long story degrades
+block by block instead of all at once, and every block still returns its id/kind/origin —
+structure the model can act on beats a list that stops early. Every cut now carries
+`truncated: true` and the real `text_length`, with `truncated_blocks` on the response, and the
+docstring tells the model to treat a cut block as unread rather than summarize it.
+
+Not done, deliberately: paginated block reads. The honest marker plus a cap that fits real
+prose covers the reported problem; a `read_story_block(block_id, offset)` is only worth adding
+if the agent is asked to revise long reports, and that is a design question about write
+parity, not a truncation fix.
+
+## Session 142 — 2026-07-31: a saved chart is the slice it was built over
+
+**Why.** Reported from use, and the deeper bug behind session 141: build a chart with
+Explorer filters active (exclude a few known-good accounts), add it to a story, and the
+story's bar chart lists the excluded accounts again. Session 141 saw the same fact from the
+other side — "no filters are attached, because a saved chart stores none" — and treated it
+as the correct state of the world. It wasn't.
+
+**What was wrong.** On the Visualize page the primary filters come from the URL, inherited
+from the Explorer and shown by `InheritedFiltersBar`. `ChartConfig` deliberately holds only
+chart *shape*, so `chartConfigToStored` persisted a `SavedChart.config` with no primary
+filters at all — only the comparison layer's custom filters survived. Every consumer then
+redrew the chart over the whole timeline: the story block (`ChartBlockCard` passed no
+`filters` to `ChartCanvas`), the **frozen export** (`_stored_chart_to_spec` built a
+`ChartSpec` with no filters, so `execute_chart_spec` ran unscoped), the block's "Open in
+Visualize" link, and the agent's `ChartProposalCard`, which rendered the filtered chart and
+then saved the shape alone. The backend half-knew: `spec_to_stored_chart_config` refused a
+spec with base filters and advised "save the chart from the filtered Explorer view instead"
+— which did not in fact capture them.
+
+**Shape of the fix.** The filters are stored as a sibling key of the chart keys —
+`{v: 1, …chartConfig, filters: <view payload>}` — not as a new `ChartConfig` field. On the
+live page the URL owns those filters and `filterParamsPreservingChartConfig` depends on the
+`c_*`/filter-param split; folding them into `ChartConfig` would create a second owner.
+Storage is the one place the chart and its scope legitimately travel together, which is
+exactly the relationship `View.view_filter` already has, so the payload format is the same
+one (`filtersToViewPayload`) and both sides reuse the existing translators
+(`_filter_payload_to_spec` / `_spec_filters_to_payload`).
+
+`v` stays `1`: the key is additive, absent on older charts, and absence means "whole
+timeline" — what those charts have always done. Nothing migrates, and nothing recovers the
+filters charts saved earlier never stored; re-save them from the filtered view.
+
+Loading a saved chart in the rail now restores both halves in one URL write, so the Visualize
+page, the story block and the export agree by construction rather than by coincidence. The
+agent's rejection path is gone: a `ChartSpec.filters` now has a home, so `propose_story_block`
+embeds the slice the agent proposed over. While making the two translators exact inverses
+again, `collapseRoutine`, `eventIds` and `runId` — `FilterSpec` members the Explorer can't
+produce but an agent chart can — were added to the stored payload, because dropping them
+silently *widens* a chart's scope.
+
+**Known limits, stated in `STORIES.md` rather than papered over.** `collapseRoutine` from the
+Visualize page is not frozen (it isn't URL-serialized and derives from live dispositions), and
+`qMode: "semantic"` survives the payload but has no server-side equivalent, so an export
+re-runs it as a keyword query — now a `ROADMAP.md` Milestone 3 item, since this change makes
+a pre-existing View-block gap reachable for charts too.
+
+## Session 141 — 2026-07-31: a story's chart link opened Visualize, but not the chart
+
+**Why.** Reported from use: "Open in Visualize" on a story's chart block navigated to the
+right case and timeline and then drew nothing recognisable — the preset picker, on a default
+chart.
+
+The Visualize page holds its entire chart state in `c_*` URL params (`paramsToChartConfig`),
+which is what makes a chart shareable as a link at all. `ChartBlockCard` linked to the bare
+`…/visualize` path, so every one of those params was absent and the page did exactly what an
+empty URL asks for. The agent's `ChartProposalCard` had always built its link through
+`chartConfigToParams`; the story card was the one place that didn't.
+
+The block resolves the saved chart already, in order to draw it — so the fix is to run that
+same config through `chartConfigToParams` for the href. No filters are attached, because a
+saved chart stores none and the story's own canvas draws it unfiltered: the link now lands on
+the chart the reader was looking at, not a differently-filtered relative of it.
+
+## Session 140 — 2026-07-31: every annotated event says so, without a row saying it
+
+**Why.** Asked for: an event that anyone or anything annotates should also carry a tag
+`annotated`. The interesting part was choosing *where* it lives.
+
+There are two independent tagging systems sharing one UI panel — `events.tags`, an
+`Array(String)` written once by the parser at ingest, and annotation rows in Postgres with
+`annotation_type="tag"`. The first was never an option: adding to it means an
+`ALTER TABLE … UPDATE` mutation over an already-ingested event, which rewrites whole parts
+and breaks the invariant that the ingested record is immutable and hash-identified.
+
+That left a stored tag row versus a derived one, and stored loses on every axis. The marker
+would itself be an annotation (recursion), would need an idempotency check, would need
+cleanup when the last real annotation is deleted or else it lies, and would add a row per
+event to every bulk detector write. Derived has none of that: `ANNOTATED_TAG` is resolved
+from "does this event have any annotation", so it is correct by construction and there is no
+write path to get wrong.
+
+- `list_event_ids_with_any_annotation` — deliberately unfiltered by type or origin. A
+  comment, an agent proposal and a detector finding all count, which is what makes the tag
+  mean what its name says rather than "has a tag".
+- `_resolve_tags_filter` unions those ids in as a fourth tag population, and only when the
+  filter actually names the tag — it costs a query.
+- The merged-tags facet offers it once the timeline has an annotation, following the same
+  rule as every other value there.
+- The grid renders the chip from the annotations it already holds, so no extra fetch.
+
+## Session 139 — 2026-07-31: two things a deployment's own log showed
+
+**Why.** Reading the journal of a live instance, not a test run. Both findings
+predate today's merges; neither would ever fail a test, because both are about what
+the app does *around* a correct response.
+
+- **`GET /api/cases/` ran `alembic upgrade head` on every request.** `list_cases` and
+  `create_case` each opened with `await store.init_schema()`, so the busiest endpoint in
+  the UI re-ran the migration machinery per call — a connection, a version-table check
+  and a migration lock, on the hot path. The startup lifespan already does this once,
+  which is the documented contract; the handler calls were redundant, and under
+  concurrency the lock is a contention point rather than just noise. Both removed. The
+  `Context impl PostgresqlImpl` / `Will assume transactional DDL` pair that bracketed
+  every case-list hit in the journal is gone with them.
+
+- **OIDC authorization codes were logged in the clear.** Uvicorn's access log writes the
+  full request target, and the callback carries `code` and `state` as query parameters —
+  that is the protocol working as designed, but it put a live credential into the system
+  journal on every SSO login. `AccessLogRedactor`, attached to the `uvicorn.access`
+  logger at app creation, replaces the value of every sensitive parameter name while
+  keeping the path and the parameter names, so an operator can still see that a callback
+  carried a code. Attached to the logger rather than a handler, since uvicorn owns the
+  handler and an embedding process may replace it. The audit trail was already clean —
+  it records `request.url.path`, never the query.
+
+## Session 141 — 2026-07-31: the scorer's uniqueness test was per-timeline, not per-source (PR #214)
+
+**Why.** A second review of #214 found the endpoint tests never ran the endpoint, and
+one scoring bug that got *worse* the more sources a timeline held — the shape the
+feature exists for.
+
+- **Per-row-unique fields ranked first on multi-source timelines.** `distinct` is
+  max-across-sources while `coverage` sums across them, so the uniqueness ratio was
+  divided by the source count: four 1000-event sources carrying a unique-per-row value
+  read as 1000/4000 = 0.25, inside the full-grouping-credit band, then boosted by
+  breadth (the heaviest weight). Measured `1.06` — top of the list — for the emptiest
+  possible column, while identical single-source data was correctly rejected.
+  `score_columns` now keeps the per-source `(distinct, coverage)` pairs and
+  `_uniqueness_ratio` takes the max ratio over sources that clear
+  `_MIN_COVERAGE_FOR_UNIQUENESS`, falling back to the aggregate (taper only, no
+  rejection) when no source has enough values to judge — which is what preserves the
+  tiny-source behaviour.
+- **Four endpoint tests posted to `/api/cases` instead of `/api/cases/`** and died on
+  405 before reaching the assertion. The contribute gate on
+  `POST .../recommend-columns` and the `use_ai` passthrough — the two guards on shared
+  state and on egress — were untested in practice. Both now genuinely run.
+- **`_MAX_PREFERENCE_ENTRIES` is enforced on the merged blob**, not only on the request.
+  The endpoint merges one level down, so 500 fresh keys per call grew the row without
+  bound — exactly what the limit exists to stop. Over the ceiling is a 400, never a
+  silent truncation: dropping an opt-in the caller believes it recorded is how a
+  disclosure gets skipped. Inner keys are also length-bounded (128).
+- **A dead `running` payload now settles on the timeline *list* too**, not only the
+  single read. The two endpoints reporting different states for the same timeline was
+  the bug; a caller that only ever lists never saw it resolve.
+- **The disclosure no longer claims a saved opt-in was lost.** The confirm is two steps
+  (persist the opt-in, then start the job) and both fed one boolean, so a failed job
+  request read as "that did not save". Errors are now `"save"` / `"run"`, with copy per
+  case. Nothing leaves the machine either way.
+- **`_ACTIVE` is claimed with `setdefault` before the `try`**, so the job never stomps a
+  slot another job holds and the `finally` never releases one it did not take. The API
+  path claims it in `start_column_recommendation` before spawning; the CLI path claims
+  it here.
+
+## Session 140 — 2026-07-31: the column-suggestion review, and one setting fewer (PR #214)
+
+**Why.** A review of #213 turned up five findings. Fixing the disclosure one exposed a
+design problem underneath it: `VESTIGO_COLUMN_RECOMMEND_MODE` was a second, admin-only
+tri-state layered on top of a question the codebase already answered — is an agent
+endpoint configured and reachable (`agent_available()`). It forced the disclosure into
+an incoherent shape: on a default (`heuristic`) instance a non-admin got a blocking
+modal disclosing egress that was not happening and offering an action they could not
+take. The setting was the cause, not the gate.
+
+- **The setting is gone** — from `core/config.py`, `settings_registry.py` (with its
+  one-member "Explorer" group), `.env.example`, `/api/health` and the frontend types.
+  Suggestions always run; the scorer is local and reads a cache that already exists.
+- **The LLM half is now an explicit per-(user, timeline) opt-in.** The job takes
+  `use_llm`, defaulting to **False**, and every automatic trigger leaves it there — so
+  ingest, timeline creation, the CLI and the demo build score locally and **egress is
+  never a side effect of uploading a file**, which is a stronger posture than the
+  merged branch had. One caller sets it: `POST .../recommend-columns` with
+  `{"use_ai": true}`, behind "Suggest with AI" in the Columns picker. The first press
+  on a timeline opens the disclosure (endpoint, model, exactly what is sent);
+  confirming records `preferences.column_advisor_optin[timeline_id]` and only then
+  runs. Cancelling sends nothing; the next timeline asks again. The result stays shared
+  — the opt-in governs who *causes* egress, not who may read it, and the audit row
+  names the actor. This supersedes `column_advisor_notice_ack` from session 139.
+- **`_ACTIVE` could wedge a timeline permanently** (finding #1): the job claimed the
+  slot before its `try`, so an early return leaked it and no further job for that
+  timeline could ever start. Claimed inside the `try` now, covered by the `finally` on
+  every path, with a regression test.
+- **A `running` payload now settles on read** (finding #3), not only on the next boot: a
+  cancelled task never restarts the process, and the explorer polls on that word.
+  `settle_running_payload` is shared by the boot sweep and the read path so they cannot
+  drift.
+- **"Reset to defaults" clears the local override** instead of writing one (finding #5).
+  Writing `DEFAULT_COLUMNS` quietly opted that browser out of every future
+  recomputation; "Use suggested" is redundant now and is gone.
+- **Demo seeding is genuinely best-effort** (finding #2) — the two calls outside the job
+  were unguarded and could fail a first login over a column layout.
+- **The privacy claim is now tested.** `_format_candidates` renders every promise the
+  disclosure makes and had no coverage; a test asserts the prompt carries the candidate
+  table and no case, source or timeline id, with samples truncated at 40 characters.
+
+## Session 139 — 2026-07-31: the grid opens on columns the corpus actually has (issue #213)
+
+**Why.** Every timeline opened on `timestamp / artifact / message`. One of those three
+earns its place: `artifact` usually restates a filter the analyst already set, and
+`message` truncates to nothing in a 160px cell. The fields that would tell them
+something — `user`, `src_ip`, `event_id`, whatever this corpus has — were a popover
+away and only if you knew to look. So the most important screen in the product opened
+on its least informative view, every time.
+
+- **`Timeline.recommended_columns`** (migration `0024`, one nullable JSON column on the
+  `field_mappings` precedent). Derived per timeline, shared by everyone with access,
+  carrying the columns, a per-column reason, which method produced them, and the source
+  set it was computed over. `status` is the contract with the frontend: `running` while
+  a job is in flight, `ok` to apply, `insufficient` for "we looked and found nothing" —
+  recorded rather than left null, so the explorer stops waiting and the job is not
+  re-run hoping for a different answer.
+- **`src/vestigo/columns/`**, three layers so the expensive part stays optional.
+  `recommend.py` scores candidates off the existing per-source field-stats cache
+  (`db/field_stats.py`) — **zero new ClickHouse scans on the common path** — weighting
+  breadth across sources highest, then fill rate, then a cardinality band that rejects
+  both the constant and the per-row-unique, with hashes/GUIDs/paragraph-length values
+  gated out and a small name vocabulary as the tie-breaker. Pure, deterministic, 24 unit
+  tests. `advisor.py` is one typed LLM call that **reorders and selects from** those
+  candidates; `jobs.py` orchestrates and persists.
+- **Not a different recommender by accident.** `db/field_recommend.py` answers "what is
+  worth vectorizing" and therefore rejects precisely the fields an analyst wants on
+  screen — ports, status codes, IPs. Only its value-shape regexes are shared.
+- **The AI half is bounded by code, not by prompt.** Gated on the same cached
+  `agent_available()` probe `/api/health` uses; the model sees a candidate table and
+  nothing else — no ids, no events; every token it returns is intersected with that
+  table; a malformed, short, timed-out or unreachable response is indistinguishable from
+  "no LLM configured" and the deterministic ranking stands. The stored `method` says
+  which one won. Documented in `AGENT.md` §"Outside the agent loop".
+- **The AI half is also opt-in, and says why.** The candidate table carries up to three
+  real sample values per field — evidence-derived strings — so `auto` is egress and the
+  default is `heuristic`: scorer only, nothing leaves the machine. The first Explorer
+  visit on an instance with an agent configured shows a one-time dialog
+  (`ColumnAdvisorNotice`) naming what would be sent, the endpoint and the model; an
+  admin can enable `auto` from it, everyone else reads it, and the acknowledgement is
+  per user (`preferences.column_advisor_notice_ack`, `PUT /api/auth/me/preferences`).
+  The demo build passes `allow_llm=False`, so seeded content never triggers a model call
+  and first-login seeding never waits on one.
+- **A `running` payload can no longer wedge a timeline.** `JobStore` is in-memory, so a
+  restart mid-job used to leave `status: "running"` in Postgres forever with the
+  explorer polling it every 3s. The placeholder now carries the previous answer forward
+  (the grid holds still during a recompute instead of flapping to the defaults), a
+  startup sweep relabels whatever a dead job left behind
+  (`clear_stale_running_recommendations`, in the lifespan rather than `_startup_recovery`
+  so a ClickHouse outage cannot skip it), and the client stops believing a `running`
+  claim older than ten minutes.
+- **Soft, never blocking.** The issue asked for the timeline to be disabled until the
+  process finished; a hung LLM endpoint making a timeline unbrowsable is the wrong
+  trade, so the grid renders the built-in defaults immediately and re-lays out when the
+  job lands, behind a `role="status" aria-live="polite"` line.
+- **Precedence is one function** (`lib/columns.ts`): the analyst's own choice, then the
+  suggestion, then `DEFAULT_COLUMNS`. Read by both `ExplorerPage` and `ColumnPicker` so
+  the ticks always match the grid. "Use suggested" *clears* the local override rather
+  than copying it in, so a later recomputation still reaches that browser. (Session 140
+  folded this into "Reset to defaults" and dropped the separate button.)
+- **Scheduled from every path that creates a knowable source set**: post-ingest (beside
+  `refresh_source_field_stats`, isolated so a failure never reaches the ingest
+  rollback), timeline creation, the CLI, the demo build, and a contribute-gated
+  `POST .../recommend-columns` behind "Re-suggest columns" in the picker.
+- **`VESTIGO_COLUMN_RECOMMEND_MODE`** (`heuristic` by default, or `auto` / `off`) in a
+  new "Explorer" settings group; the job itself enforces it, so the CLI and the demo
+  build honour `off` without their own check. **Removed in session 140** — replaced by
+  a per-(user, timeline) opt-in. Every run writes a `timeline.recommend_columns` audit
+  row naming the method, the model, the chosen columns and the full candidate set.
+- **Known gap, filed in `ROADMAP.md`:** timelines with `field_mappings` get no
+  suggestion for the mapped fields. The grid reads `attributes[colId]` directly, so
+  neither the canonical name nor one raw spelling renders correctly — recommending
+  either would recommend a column that looks broken.
 
 ## Session 138 — 2026-07-31: OIDC discovery followed a redirect it should have followed
 

@@ -64,6 +64,12 @@ round — **standing rule: when either resumes, both are designed together in on
   (session 138). `runtime_settings._usable_overrides` already logs the drop; surface it:
   serve the pinned-field set from the settings API and render those inputs disabled with
   a "pinned by VESTIGO_*" hint.
+- [ ] **Semantic search does not survive a server-side resolve.** A saved View's (and now a
+  saved chart's) filter payload carries `qMode: "semantic"`, but `stories/export.py::
+  _filter_payload_to_spec` drops it — `FilterSpec` has no semantic mode — so a story export
+  re-runs the query as a keyword search and freezes a *different* result set than the block
+  shows on screen. Either teach `FilterSpec`/`_build_query` the semantic path, or refuse the
+  export with a named reason; silently degrading the query is the one option that is wrong.
 - [ ] **Generate frontend API types from OpenAPI** (`openapi-typescript` over
   `/openapi.json`) to replace the hand-mirrored types in `frontend/src/api/types.ts`.
   The duplication is compounding: 1240 lines when this was filed (PR109 review), 1549
@@ -431,7 +437,9 @@ Decisions, not work items — each stays as decided unless its trigger fires.
 - **Persistent job store** — in-memory is a deliberate choice for the single-process
   deployment model ([Operational scale](./DEPLOYMENT.md#operational-scale)), not an
   oversight. Trigger: multi-process scale-out, which needs it moved to a shared backend
-  along with the event bus and login backoff.
+  along with the event bus, login backoff, and column-recommendation liveness
+  (`columns/jobs._ACTIVE` + `_recommendation_is_dead`, which read this store to decide
+  whether a `running` payload is still real).
 - **CSRF tokens** — SameSite=Lax cookies are adequate for a self-hosted instance on a
   trusted network. Trigger: exposing Vestigo to the open internet, or moving off a single
   trusted app process (see [Operational scale](./DEPLOYMENT.md#operational-scale)).

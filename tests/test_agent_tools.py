@@ -20,6 +20,8 @@ from pydantic import BaseModel, ValidationError
 from vestigo.agent.fidelity import Fidelity
 from vestigo.agent.schema_slim import SHARED_SPEC_NAMES
 from vestigo.agent.tools import (
+    STORY_TEXT_BUDGET,
+    STORY_TEXT_TRUNCATE,
     AgentScope,
     ChartSpec,
     FilterSpec,
@@ -2374,6 +2376,98 @@ async def test_read_story_returns_ordered_blocks(store):
     assert payload["blocks"][0]["content"]["text"] == "first"
     # Embed blocks carry their reference, not inline data.
     assert payload["blocks"][1]["content"]["view_id"] == "v1"
+
+
+async def test_read_story_returns_ordinary_prose_whole(store):
+    """A story block is the document the agent reasons about, not incidental
+    string data. The old cap (1600 chars) cut ordinary prose — a few
+    paragraphs of narrative — while a write accepts 256 KiB."""
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    prose = "The lateral movement began at 02:14. " * 150  # ~5.5k chars
+    await store.create_story_block(story.id, "b1", "markdown", {"text": prose}, user="alice")
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    block = payload["blocks"][0]
+    assert block["content"]["text"] == prose
+    assert "truncated" not in block["content"]
+    assert "truncated_blocks" not in payload
+
+
+async def test_read_story_charges_the_budget_only_for_text_taken(store):
+    """A short block costs its own length, not the per-block cap.
+
+    Charging every block ``STORY_TEXT_TRUNCATE`` regardless of how much it
+    actually holds exhausts the response budget after three paragraphs and
+    hands back later blocks as empty and ``truncated`` — the model is then told
+    to treat a complete block as unread, which is the exact failure the marker
+    exists to prevent.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    para = "The lateral movement began at 02:14. " * 5  # ~185 chars
+    for i in range(10):
+        await store.create_story_block(story.id, f"b{i}", "markdown", {"text": para}, user="alice")
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    assert len(payload["blocks"]) == 10
+    for block in payload["blocks"]:
+        assert block["content"]["text"] == para
+        assert "truncated" not in block["content"]
+    assert "truncated_blocks" not in payload
+
+
+async def test_read_story_stamps_every_cut(store):
+    """An unmarked cut is the failure that matters: the model summarizes half
+    a paragraph believing it read the block. Cuts carry `truncated` and the
+    real `text_length`, and the response says how many blocks were cut."""
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    huge = "x" * (STORY_TEXT_TRUNCATE + 500)
+    await store.create_story_block(story.id, "b1", "markdown", {"text": huge}, user="alice")
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    content = payload["blocks"][0]["content"]
+    assert len(content["text"]) == STORY_TEXT_TRUNCATE
+    assert content["truncated"] is True
+    assert content["text_length"] == len(huge)
+    assert payload["truncated_blocks"] == 1
+
+
+async def test_read_story_spends_one_budget_across_blocks(store):
+    """One enormous block cannot eat the whole response.
+
+    Text is spent in document order, so a long story degrades block by block;
+    every block still returns its id/kind/origin, because structure the model
+    can act on beats a list that stops early.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    block_count = (STORY_TEXT_BUDGET // STORY_TEXT_TRUNCATE) + 2
+    for i in range(block_count):
+        await store.create_story_block(
+            story.id, f"b{i}", "markdown", {"text": "y" * STORY_TEXT_TRUNCATE}, user="alice"
+        )
+
+    server = build_tool_server(_scope("c1", "t1"))
+    payload = await _call(server, "read_story", {"story_id": "s1"})
+    assert payload["returned"] == block_count
+    assert len(payload["blocks"]) == block_count
+    total_text = sum(len(b["content"]["text"]) for b in payload["blocks"])
+    assert total_text <= STORY_TEXT_BUDGET
+    # The block past the budget is returned empty *and* marked, never as an
+    # empty block that reads like an empty block.
+    last = payload["blocks"][-1]["content"]
+    assert last["text"] == ""
+    assert last["truncated"] is True
+    assert last["text_length"] == STORY_TEXT_TRUNCATE
 
 
 async def test_read_story_unknown_id(store):

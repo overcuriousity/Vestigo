@@ -9,7 +9,12 @@
  * and handle old versions explicitly instead of silently misreading them.
  */
 import type { CompareTimeResponse, EventFilters, HistogramResponse } from "@/api/types";
-import { filtersToParams, filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
+import {
+  FILTER_PARAM_KEYS,
+  filtersToParams,
+  filtersToViewPayload,
+  viewPayloadToFilters,
+} from "@/lib/queryParams";
 import type { Metric } from "./transforms";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
@@ -112,9 +117,29 @@ const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
 
 /**
+ * Names a *saved* chart in the URL instead of spelling its state out.
+ *
+ * The alternative — reconstructing `c_*` params from a saved chart's config —
+ * cannot carry the filter members that have no URL representation (`ids`,
+ * `anomalyRunId`, `collapseRoutine`), so a story block's link to an
+ * agent-scoped chart would silently open the whole timeline. Addressing the
+ * chart by id lets the page read both halves back out of storage, which is
+ * the one place a chart and the slice it describes travel together.
+ *
+ * Deliberately inside the `c_*` namespace: `chartConfigToParams` clears that
+ * namespace before writing, so every path that spells a chart out in full
+ * drops the reference by construction, and "this is saved chart X" cannot
+ * survive an edit that makes it untrue.
+ */
+export const CHART_ID_PARAM = "c_chart";
+
+/**
  * Write the chart-specific state into *params* under `c_*` keys, leaving the
  * Explorer filter params (q/filters/start/...) untouched — the two live side
  * by side in the Visualize page's URL.
+ *
+ * Clears every pre-existing `c_*` key first, :data:`CHART_ID_PARAM` included —
+ * see there for why that is the point rather than a side effect.
  */
 export function chartConfigToParams(
   config: ChartConfig,
@@ -137,6 +162,36 @@ export function chartConfigToParams(
   }
   if (Object.keys(config.options).length > 0) {
     params.set("c_opts", JSON.stringify(config.options));
+  }
+  return params;
+}
+
+/**
+ * Build the Visualize page's whole query string: this chart, these filters,
+ * and everything in *prev* that belongs to neither.
+ *
+ * Both halves are rewritten wholesale — that is the point, since after an
+ * analyst's edit the params are the only record of the chart and a
+ * half-updated URL would describe a chart nobody chose. But "wholesale" has to
+ * mean the two namespaces this function owns (`c_*` and `FILTER_PARAM_KEYS`)
+ * and not the whole query string: the previous implementation mutated a copy
+ * of the URL and so preserved unrelated keys by construction, and rebuilding
+ * from scratch silently dropped them instead. Nothing else writes this page's
+ * URL today, which is exactly why the loss would go unnoticed until something
+ * did.
+ */
+export function chartUrlParams(
+  config: ChartConfig,
+  filters: EventFilters,
+  prev: URLSearchParams,
+): URLSearchParams {
+  const params = chartConfigToParams(config, filtersToParams(filters));
+  for (const [key, value] of prev.entries()) {
+    // Ours, and already written above in their current form. A filter key
+    // absent from `filters` is a *cleared* filter, so carrying it over would
+    // resurrect a narrowing the analyst just removed.
+    if (key.startsWith("c_") || FILTER_PARAM_KEYS.has(key)) continue;
+    params.append(key, value);
   }
   return params;
 }
@@ -240,24 +295,6 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   return config;
 }
 
-/**
- * Rebuild the URL params for a new filter set while carrying over every
- * `c_*` chart-config key from *prev*. `filtersToParams` builds a FRESH
- * URLSearchParams, so any filter write on the Visualize page (click-to-
- * filter, brush-zoom, reset range) must go through this or it silently
- * wipes the chart config out of the URL.
- */
-export function filterParamsPreservingChartConfig(
-  next: EventFilters,
-  prev: URLSearchParams,
-): URLSearchParams {
-  const params = filtersToParams(next);
-  for (const [k, v] of prev.entries()) {
-    if (k.startsWith("c_")) params.set(k, v);
-  }
-  return params;
-}
-
 /** Adapt the single-layer histogram response to the compare shape so one
  * chart component (CompareHistogram) renders both the compare-off and
  * compare-on cases — shared by the Visualize page and `ChartProposalCard`
@@ -274,14 +311,131 @@ export function histogramToCompare(h: HistogramResponse): CompareTimeResponse {
   };
 }
 
+/**
+ * Serialize a chart's primary filter layer for storage.
+ *
+ * Built on `filtersToViewPayload` — the same normalization a saved View uses,
+ * which is what lets the backend read both with one translator
+ * (`stories/export.py::_filter_payload_to_spec`) — with two deliberate
+ * differences, both scoped to charts so saved Views keep behaving exactly as
+ * they do today:
+ *
+ * 1. **Defaults are dropped.** A View payload always writes every key, `null`
+ *    or `false` or empty. A chart writes only what narrows, so "unfiltered"
+ *    and "saved before filters were captured" are the same bytes (no `filters`
+ *    key at all) and neither can read as the other.
+ * 2. **Three agent-only members travel too.** `eventIds`, `runId` and
+ *    `collapseRoutine` have no URL representation — the Explorer cannot
+ *    produce them and a View deliberately does not freeze `collapseRoutine`,
+ *    since it derives from live dispositions. An agent's `ChartSpec` *can*
+ *    carry all three, and `_spec_filters_to_payload` writes them, so dropping
+ *    them here would silently widen a chart the agent had scoped: the saved
+ *    chart, the story card and the frozen export would each show more than the
+ *    card the analyst clicked Save on.
+ *
+ * Returns `null` when nothing narrows.
+ */
+function chartFiltersToStored(filters: EventFilters): Record<string, unknown> | null {
+  const payload = filtersToViewPayload(filters);
+  const stored: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === null || value === undefined || value === false) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    if (typeof value === "object" && Object.keys(value).length === 0) continue;
+    stored[key] = value;
+  }
+  // Deliberately not in `filtersToViewPayload`: see (2) above.
+  if (filters.ids?.length) stored.eventIds = [...filters.ids];
+  if (filters.anomalyRunId) stored.runId = filters.anomalyRunId;
+  if (filters.collapseRoutine) stored.collapseRoutine = true;
+  return Object.keys(stored).length > 0 ? stored : null;
+}
+
 /** Shape a ChartConfig for storage (saved charts): compare filters go
- * through the same View payload normalization the Views feature uses. */
-export function chartConfigToStored(config: ChartConfig): Record<string, unknown> {
-  return {
+ * through the same View payload normalization the Views feature uses.
+ *
+ * *filters* is the primary layer — the Explorer filters the chart was built
+ * under. They are stored as a sibling key rather than inside `ChartConfig`
+ * because on the live page the URL owns them (see `parseStoredChartFilters`),
+ * and are omitted entirely when nothing narrows so an unfiltered chart stores
+ * exactly what it stored before this key existed. */
+export function chartConfigToStored(
+  config: ChartConfig,
+  filters?: EventFilters,
+): Record<string, unknown> {
+  const storedFilters = filters ? chartFiltersToStored(filters) : null;
+  const stored: Record<string, unknown> = {
     ...config,
     compare:
       config.compare.mode === "custom"
         ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
         : config.compare,
   };
+  // `filters` is *this function's* key, never `ChartConfig`'s. Cleared before
+  // writing rather than merely overwritten: a future `ChartConfig.filters`
+  // would otherwise ride the spread above into storage on every save that
+  // passes no filters, and `parseStoredChartFilters` would read it back as a
+  // slice the analyst never chose.
+  delete stored.filters;
+  if (storedFilters) stored.filters = storedFilters;
+  return stored;
+}
+
+/**
+ * Filter members that survive storage but have no `c_*`/filter-param form.
+ *
+ * `filtersToParams` cannot express any of them, so writing a chart out as URL
+ * params drops them — which silently *widens* the chart, since each one only
+ * ever narrows. The Visualize page uses this to say so out loud when the
+ * analyst's own edit takes a saved chart over (see `takeOver` there), rather
+ * than leaving a chart scoped to 40 events looking like one that was always
+ * drawn over the whole timeline.
+ */
+const URL_UNREPRESENTABLE_FILTERS: { key: keyof EventFilters; label: string }[] = [
+  { key: "ids", label: "a fixed event set" },
+  { key: "anomalyRunId", label: "a detector run" },
+  { key: "collapseRoutine", label: "routine collapse" },
+];
+
+/** Human-readable labels for the narrowings *filters* would lose in the URL. */
+export function unrepresentableFilterMembers(filters: EventFilters): string[] {
+  return URL_UNREPRESENTABLE_FILTERS.filter(({ key }) => {
+    const value = filters[key];
+    return Array.isArray(value) ? value.length > 0 : !!value;
+  }).map(({ label }) => label);
+}
+
+/**
+ * Read a saved chart's frozen primary filters back out of its stored config.
+ *
+ * Separate from `parseStoredChartConfig` because the two answer different
+ * questions: the chart *shape* is `ChartConfig` (also URL state, where the
+ * Explorer filter params live beside it under their own keys), while these
+ * filters exist only in storage — the one place the two travel together, the
+ * same way `View.view_filter` does.
+ *
+ * The exact inverse of `chartFiltersToStored`, including the three members
+ * `viewPayloadToFilters` does not know about. Reading them back matters as
+ * much as writing them: `serializeEventFilterParams` does send all three to
+ * the API, so a chart block that dropped them would draw wider on screen than
+ * the same chart frozen into an export.
+ *
+ * Returns `{}` for a chart saved before filters were captured, which is what
+ * makes those charts keep rendering exactly as they do today.
+ */
+export function parseStoredChartFilters(stored: unknown): EventFilters {
+  if (!stored || typeof stored !== "object") return {};
+  const raw = (stored as Record<string, unknown>).filters;
+  if (!raw || typeof raw !== "object") return {};
+  const payload = raw as Record<string, unknown>;
+  const filters = viewPayloadToFilters(payload);
+  const eventIds = payload.eventIds;
+  if (Array.isArray(eventIds) && eventIds.length > 0) {
+    filters.ids = eventIds.map(String);
+  }
+  if (typeof payload.runId === "string" && payload.runId) {
+    filters.anomalyRunId = payload.runId;
+  }
+  if (payload.collapseRoutine === true) filters.collapseRoutine = true;
+  return filters;
 }

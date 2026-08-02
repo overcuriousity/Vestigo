@@ -140,6 +140,41 @@ export function serializeEventFilterParams(
   return out;
 }
 
+/**
+ * Every URL param key `filtersToParams` owns.
+ *
+ * `filtersToParams` builds a *fresh* `URLSearchParams` and writes only what is
+ * set, so "this filter is cleared" and "this key was never ours" look identical
+ * in its output. A caller rebuilding a URL around a new filter set therefore
+ * cannot tell which of the old keys to carry over by looking at the result —
+ * it has to know the namespace, which is this.
+ *
+ * Kept in step with `filtersToParams` by `queryParams.test.ts`, which populates
+ * every member of `EventFilters` and asserts the produced keys are exactly this
+ * set: a new filter param that forgets to land here would otherwise survive a
+ * rebuild that was supposed to drop it.
+ */
+export const FILTER_PARAM_KEYS: ReadonlySet<string> = new Set([
+  "q",
+  "qMode",
+  "qRegex",
+  "artifact",
+  "artifacts",
+  "sourceId",
+  "tag",
+  "excludeTag",
+  "tagsInclude",
+  "tagsExclude",
+  "start",
+  "end",
+  "filters",
+  "exclusions",
+  "filterModes",
+  "exclusionModes",
+  "annotated",
+  "annotationTagValue",
+]);
+
 export function filtersToParams(filters: EventFilters): URLSearchParams {
   const p = new URLSearchParams();
   if (filters.q) p.set("q", filters.q);

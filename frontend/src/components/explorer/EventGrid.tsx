@@ -21,6 +21,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
 import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
 import { isAnalystAnnotation } from "@/api/types";
+import { useAnnotatedTag } from "@/api/health";
 import { useUserNames } from "@/hooks/useUserNames";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
@@ -386,6 +387,11 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   const parentRef = useRef<HTMLDivElement>(null);
   const density = useUiStore((s) => s.density);
   const ROW_HEIGHT = ROW_HEIGHT_BY_DENSITY[density];
+  // The backend names this tag; the chip must read the same word the filter
+  // panel offers, so it is served rather than hardcoded here. Undefined until
+  // health answers, and the chip simply waits — a guessed default would be the
+  // duplication this avoids.
+  const annotatedTag = useAnnotatedTag();
 
   const columns = useMemo<ColumnDef<Event>[]>(() => {
     const cols: ColumnDef<Event>[] = [
@@ -546,6 +552,11 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                   {t}
                 </Badge>
               ))}
+              {anns.length > 0 && annotatedTag && (
+                <Badge variant="muted" className="text-xs py-0.5 px-1.5 shrink-0">
+                  {annotatedTag}
+                </Badge>
+              )}
               {userTags.map((t) => (
                 <Badge key={t.id} variant="accent" className="text-xs py-0.5 px-1.5 shrink-0">
                   {t.content}
@@ -631,7 +642,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, sortDir, onSortToggle, liveAnomalies, dispositions]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, sortDir, onSortToggle, liveAnomalies, dispositions, annotatedTag]);
 
   const columnWidths = useUiStore((s) => s.columnWidths);
   const setColumnWidth = useUiStore((s) => s.setColumnWidth);

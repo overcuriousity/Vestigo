@@ -117,7 +117,7 @@ for both the HTTP router and the agent's `propose_story_block`).
 | --- | --- |
 | `markdown` | `{text}`, capped at `VESTIGO_STORY_MAX_MARKDOWN_BYTES` (256 KiB) |
 | `view_ref` | `{view_id, timeline_id, display: {limit=200, columns?}}` |
-| `chart_ref` | `{chart_id, timeline_id}` |
+| `chart_ref` | `{chart_id, timeline_id}` — the chart carries its own filters, see below |
 | `event_ref` | `{event_id, source_id, caption?}` (caption ≤ 1000 chars) |
 
 A block's `timeline_id`, `view_id`, `chart_id` and `source_id` are additionally
@@ -126,6 +126,71 @@ validation alone let a foreign or mistyped id through, to surface much later as
 an undrawable card or a frozen `resolution.error`; an error at the point of the
 mistake is the better failure. (A ref that goes dangling *afterwards* is a
 different thing, and still degrades visibly.)
+
+### A `chart_ref` is a chart *and* the slice it was built over
+
+A `SavedChart.config` holds the frontend's `ChartConfig` (chart type, field,
+scale, metric, options, comparison layer) **plus a `filters` key**: the
+Explorer filter set the chart was drawn under, serialized in exactly the same
+payload shape as `View.view_filter` (`filtersToViewPayload`). On the Visualize
+page those filters come from the URL and are shown by `InheritedFiltersBar`, so
+storage is the one place the chart and its scope travel together.
+
+Every consumer reapplies them — the live block (`ChartBlockCard` →
+`ChartCanvas`), the export resolver (`_stored_chart_to_spec` → `ChartSpec.filters`
+→ `execute_chart_spec`), the block's "Open in Visualize" link, and loading the
+chart back into the Visualize rail. Without this a chart saved from a filtered
+view redrew over the whole timeline everywhere, showing precisely the data the
+analyst had excluded.
+
+The last two reach the filters by **naming the chart** rather than describing
+it: both navigate to `?c_chart=<id>` (`CHART_ID_PARAM`), and `VisualizePage`
+resolves the id against the saved-chart list and reads both halves out of
+storage. Describing the chart in `c_*` params instead would have to describe its
+filters too, and three of those have no URL form at all (below) — so a
+reconstructed link could restore an agent-scoped chart's shape while silently
+widening it to the whole timeline. The reference lives inside the `c_*`
+namespace that `chartConfigToParams` clears before writing, so editing the chart
+drops it by construction: `c_chart` can only ever claim "this is saved chart X"
+while that is still true. A reference to a deleted or unreadable chart says so
+and falls back to the params.
+
+The key is additive within `v: 1`: a chart saved before it existed has no
+`filters` key, and that absence means "whole timeline" — the behavior those
+charts have always had. There is no way to recover their lost filters; re-save
+them from the filtered view.
+
+The payload is a **superset** of a View's: on top of `filtersToViewPayload` it
+carries `eventIds`, `runId` and `collapseRoutine`, three narrowings the Explorer
+cannot produce and a View deliberately never freezes. An agent's `ChartSpec`
+can, so both sides write and read them (`chartFiltersToStored` /
+`parseStoredChartFilters` on the frontend, `_spec_filters_to_payload` /
+`_filter_payload_to_spec` on the backend) — dropping them anywhere would widen
+a chart the agent had scoped to, say, one detector run's events. A chart saved
+from the Visualize page never carries them: `collapseRoutine` is not
+URL-serialized (it derives from live dispositions) and the rail is passed the
+raw URL filters, so the analyst path is unchanged.
+
+Unlike a View, the chart payload also stores only what narrows — no
+`null`/`false`/empty defaults — so "unfiltered" and "saved before the key
+existed" are the same bytes.
+
+Three things still do **not** survive:
+
+- **`collapseRoutine`, once Visualize has the chart.** The page derives it from
+  the live disposition set rather than restoring the stored value, deliberately:
+  a mute is a filter, and a shared URL should show a teammate the charts their
+  *current* dispositions produce. So a chart whose stored `collapseRoutine`
+  disagrees with today's mutes renders per the live set on Visualize, and per
+  the frozen set in the story canvas and the export. `ids` and `anomalyRunId`
+  have no such live source and are restored as stored.
+- **An unsaved chart's link.** `ChartProposalCard` shows a chart that has not
+  been saved yet, so there is no id to name and its link falls back to `c_*`
+  params — lossy for the three members above. Saving the chart is what makes it
+  addressable; the link on the resulting saved chart is exact.
+- **Semantic-search mode.** `qMode: "semantic"` survives the payload but the
+  server-side `FilterSpec` has no semantic mode, so an export treats the query
+  as a keyword (`ROADMAP.md`, Milestone 3).
 
 Every write path runs both gates: the HTTP router (422), the agent's
 `propose_story_block` (a tool error the model can correct) **and** its confirm
@@ -332,7 +397,11 @@ The agent can do what an analyst can do: read directly, write through
 propose→confirm. See `docs/AGENT.md` for the tool registry and deny layers.
 
 - `list_stories` / `read_story` — read tools; also exposed on the external
-  `/mcp` endpoint.
+  `/mcp` endpoint. `read_story` returns markdown under a per-block and
+  per-response budget (`STORY_TEXT_TRUNCATE` / `STORY_TEXT_BUDGET`), and marks
+  every cut with `truncated`/`text_length` — the agent has no way to fetch a
+  cut block's tail, so a cut it cannot see is a cut it would summarize as the
+  whole block.
 - `propose_story_block(story_id, block_kind, content, after_block_id?,
   rationale)` — conversation-bound, records an `AgentProposal`
   (`kind="story_block"`, target in `payload`) and writes nothing. Confirming
@@ -347,9 +416,9 @@ propose→confirm. See `docs/AGENT.md` for the tool registry and deny layers.
   `_stored_chart_to_spec` the export resolver uses, tested as a round trip.
   Writing the agent's snake_case `ChartSpec` dump straight into that column
   produced a chart that the export, the story card and the Visualize rail all
-  refused to draw, with no error at write time. A spec carrying chart-local
-  `filters` has no representation in `ChartConfig`, so it is rejected at propose
-  time rather than silently losing them.
+  refused to draw, with no error at write time. A spec's `filters` travel with
+  it into the stored config's `filters` key (below), so a confirmed proposal
+  embeds the slice the agent proposed over, not the whole timeline.
 
 **Deliberate parity boundary:** block edit/move/delete and export stay
 analyst-only. Parity covers analytical contribution, not document arrangement

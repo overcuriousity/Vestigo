@@ -79,6 +79,34 @@ async def test_view_block_truncation_flagged(store):
     assert blk["ref"]["name"] == "SSH hits"
 
 
+async def test_view_block_query_carries_the_timeline_field_mappings(store):
+    """A frozen view resolves through the same canonical fields the analyst saw
+    on screen — both for filtering and for the values the rows carry
+    (db/field_mappings.py::project_mapped_fields runs off this)."""
+    case, story, blocks = await _case_with_story(
+        store,
+        [("view_ref", {"view_id": "v1", "timeline_id": "t1", "display": {"limit": 10}})],
+    )
+    await store.create_view(case.id, "v1", "IPs", query=None, view_filter={})
+    mappings = {"ip_address": ["src_ip", "ip_addr"]}
+    seen = {}
+
+    def fake_event_query(query):
+        seen["field_mappings"] = query.field_mappings
+        return EventPage(total=0, offset=0, limit=query.limit, events=[])
+
+    await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        run_event_query=fake_event_query,
+        resolve_scope=lambda case_id, timeline_id: (["src1"], mappings, None),
+        now=lambda: FROZEN_NOW,
+    )
+    assert seen["field_mappings"] == mappings
+
+
 async def test_chart_block_freezes_execution_result(store):
     case, story, blocks = await _case_with_story(
         store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]
@@ -342,6 +370,18 @@ def test_chart_spec_and_stored_config_round_trip():
             "metric": "count",
             "options": {"sample_limit": 900},
         },
+        # The primary filter layer: a chart is the slice it was built over.
+        {
+            "chart_type": "bar",
+            "field": "user",
+            "metric": "count",
+            "filters": {
+                "q": "logon",
+                "exclusions": {"user": ["svc_backup", "svc_scan"]},
+                "tags_exclude": ["known-good"],
+                "collapse_routine": True,
+            },
+        },
     ):
         spec = ChartSpec.model_validate(payload)
         config = spec_to_stored_chart_config(spec)
@@ -349,22 +389,60 @@ def test_chart_spec_and_stored_config_round_trip():
         assert _stored_chart_to_spec(config) == spec, config
 
 
-def test_spec_with_base_filters_is_refused_not_dropped():
-    """`ChartSpec.filters` has no home in a stored ChartConfig.
+def test_saved_chart_carries_its_filters_into_the_spec():
+    """A saved chart is the *slice* it was built over, not just its shape.
 
-    Dropping them silently would persist a chart that answers a different
-    question than the one the agent proposed.
+    The filters an analyst had active when they saved the chart are stored
+    beside the ChartConfig keys; resolving one back has to reapply them, or a
+    story block and its export redraw the chart over the whole timeline and
+    show exactly the data the analyst filtered out.
     """
-    import pytest as _pytest
+    from vestigo.stories.export import _stored_chart_to_spec
 
-    from vestigo.agent.tools import ChartSpec
-    from vestigo.stories.export import spec_to_stored_chart_config
-
-    spec = ChartSpec.model_validate(
-        {"chart_type": "bar", "field": "port", "metric": "count", "filters": {"q": "ssh"}}
+    spec = _stored_chart_to_spec(
+        {
+            "v": 1,
+            "chartType": "bar",
+            "scale": "nominal",
+            "field": "user",
+            "metric": "count",
+            "compare": {"mode": "off"},
+            "options": {},
+            "filters": {
+                "q": "logon",
+                "exclusions": {"user": ["svc_backup"]},
+                "tagsExclude": ["known-good"],
+                "start": "2026-01-01T00:00:00+00:00",
+            },
+        }
     )
-    with _pytest.raises(ValueError, match="base filters"):
-        spec_to_stored_chart_config(spec)
+    assert spec.filters is not None
+    assert spec.filters.q == "logon"
+    assert spec.filters.exclusions == {"user": ["svc_backup"]}
+    assert spec.filters.tags_exclude == ["known-good"]
+    assert spec.filters.start is not None
+
+
+def test_saved_chart_without_filters_key_resolves_unfiltered():
+    """Charts saved before filters were captured must keep drawing.
+
+    Their config has no ``filters`` key, and the absence has to mean "whole
+    timeline" — the behavior they have always had — not an error.
+    """
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    spec = _stored_chart_to_spec(
+        {
+            "v": 1,
+            "chartType": "bar",
+            "scale": "nominal",
+            "field": "user",
+            "metric": "count",
+            "compare": {"mode": "off"},
+            "options": {},
+        }
+    )
+    assert spec.filters is None
 
 
 def test_json_safe_coerces_non_finite_floats_and_sets():

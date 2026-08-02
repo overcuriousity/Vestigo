@@ -5,6 +5,127 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] — 2026-08-02
+
+### Added
+
+- **A worked demo case, seeded for every new user.** A new account's first screen used to
+  be an empty case list, which is the worst possible introduction to a tool whose whole
+  argument is detection-as-workflow. Every user now finds a fabricated investigation
+  waiting: 251k events across four sources over 30 days, with a quiet intrusion buried in
+  it, plus the analyst artifacts that show what working the case looks like — annotations,
+  saved views, a baseline definition, a Sigma rule and a story. It is *generated* per user
+  from code that ships with the app, not shipped as a data file, so it costs nothing in the
+  repo and nothing on an airgapped host. One per account: deleting it is final, and
+  `POST /api/demo/seed` is the way back. Off with `VESTIGO_DEMO_CASE_ENABLED=0`.
+  `tests/test_demo_detector_coverage_clickhouse.py` asserts every shipped analysis tool
+  still finds something in it, so retuning a detector cannot quietly hollow the demo out.
+
+- **A timeline opens on columns its own data justifies.** Every timeline used to open on
+  timestamp/artifact/message regardless of what it held; the fields that would say something
+  — `user`, `src_ip`, `event_id`, whatever this corpus has — were a popover away and only if
+  you knew to look. A pure scorer over the existing per-source field-stats cache now
+  recommends a column set per timeline (no new ClickHouse scans on the common path), stored
+  on `Timeline.recommended_columns` and shared by everyone with access. A per-user column
+  choice in the browser always outranks it, and the grid renders defaults immediately rather
+  than blocking on the job. "Suggest with AI" adds one typed LLM call that may only reorder
+  and select from the scorer's own candidates; it is an explicit per-(user, timeline) opt-in
+  behind a disclosure naming the endpoint, the model and what is sent, so no automatic
+  trigger — ingest, timeline creation, the CLI, the demo build — ever causes egress. Every
+  run writes a `timeline.recommend_columns` audit row.
+
+- **A derived `annotated` tag.** Any event carrying an annotation — a human tag or comment,
+  an agent proposal, or a detector finding — also carries the tag `annotated`, filterable
+  alongside parser tags and analyst tags in the same panel. It is computed at read time
+  rather than stored, so it cannot disagree with the annotations it describes: delete the
+  last annotation and the tag goes with it, with no write path to maintain.
+
+### Changed
+
+- **The frontend design system now has a ratchet.** Seven dead `var(--…)` references had
+  compiled, typechecked, linted and passed tests, because nothing checked. Undefined custom
+  properties are now a hard failure at zero across every `.ts`/`.tsx` under `src/`, and
+  arbitrary `text-[Npx]` plus raw `<button>` outside `components/ui/` are budgeted per file
+  in a list that only ever falls — exceeding an entry fails, and so does beating one without
+  lowering it. Also lands a guidance registry and actionable empty states.
+
+- **README reordered** so the tool comes before the comparison to prior art.
+
+- **Dependencies updated.** FastAPI 0.139.2 → 0.140.13, pydantic-ai-slim 2.17 → 2.19, React
+  and React DOM 19.2.7 → 19.2.8, lucide-react 1.26 → 1.27, `@tanstack/react-virtual` 3.14.8,
+  six Radix primitives, the frontend build image to `node:24-alpine`, and the
+  `docker/login-action` / `github/codeql-action` workflow actions.
+
+- **The frontend build image tracks Node LTS, and CI builds on the same major.** The bot's
+  bump landed on `node:25-alpine`, an odd-numbered release that goes end-of-life mid-2026 —
+  a poor floor for an image operators install and then never update on an isolated host.
+  Pinned to `node:24-alpine` instead, with `ci.yml` and `release.yml` moved from Node 22 to
+  24 so the runtime that tests the frontend is the one that builds the shipped image.
+  Workflow actions are pinned by major throughout again (`github/codeql-action@v4`,
+  `docker/login-action@v4`), so a patch-level fix no longer waits for a bot PR.
+
+### Fixed
+
+- **A timeline's canonical mapped fields now render as columns.** Field mappings resolved in
+  filters, aggregations and detectors but never in the rows themselves, so a canonical field
+  like `ip_address` — offered by the column picker, since discovery already substitutes it —
+  drew an empty column on every row, and the column recommender excluded mapped fields
+  outright rather than suggest one that looks broken. The presented page now carries each
+  canonical field alongside the raw keys it was coalesced from, by the same rule the filter
+  SQL applies, so a rendered value and a filter on that field cannot disagree; the
+  recommender scores the canonical field in place of the raw spellings, counting a source
+  toward it whichever spelling that source uses. Resolution reads a key stored under the
+  canonical name itself first — validation rejects such a mapping, but only against a known
+  inventory, and a source ingested afterwards can introduce that key — so an ingested value
+  is what both the filter and the row carry rather than data the filter silently ignores.
+  Each row declares which of its attributes came from the mapping, and the event detail
+  panel marks exactly those as mapped and names the raw fields behind them — the value is a
+  timeline view, not something the source file carried. Exports still carry raw attributes
+  only.
+
+- **`GET /api/cases/` no longer runs `alembic upgrade head` on every request.** The endpoint
+  the UI hits most re-ran the migration machinery per call — a connection, a version-table
+  check and a migration lock on the hot path — where the startup lifespan already does it
+  once.
+
+- **OIDC authorization codes no longer reach the system journal.** Uvicorn's access log
+  writes the full request target, and the callback carries `code` and `state` as query
+  parameters, so every SSO login logged a live credential in the clear. Sensitive parameter
+  *values* are now redacted while the path and parameter names survive, so an operator can
+  still see that a callback carried a code. The audit trail was already clean.
+
+- **OIDC discovery follows redirects**, which a Nextcloud IdP needs; it previously answered
+  every SSO click with a 500.
+
+- **A saved chart is now the slice it was built over.** `SavedChart.config` held chart shape
+  only, so a chart built with Explorer filters active redrew over the whole timeline
+  everywhere it was reused — the story block, the frozen export, the "Open in Visualize"
+  link — showing precisely the data the analyst had excluded. The filters travel with the
+  chart now, including the scopings only an agent's `ChartSpec` can carry (a detector run,
+  an explicit event set, routine collapse), so the card, the export and the rail agree by
+  construction. Charts saved before this have no filters to recover; re-save them from the
+  filtered view.
+
+- **A story's chart block opens *that* chart.** "Open in Visualize" navigated to the right
+  timeline and then drew a default chart with the preset picker open, because the Visualize
+  page reads its entire state from `c_*` URL params and the link carried none of them. It
+  now names the saved chart instead of describing it — `?c_chart=<id>`, resolved against
+  storage — so the shape *and* the filters come back, including the three narrowings that
+  have no URL form at all and would otherwise have widened an agent-scoped chart to the
+  whole timeline in silence. The rail's load button uses the same reference, and editing
+  either half spells the chart out in full and drops it. A link to a deleted chart says so.
+  While the URL names a chart, none of the page's own defaulting effects may write it back:
+  the field default, the scale probe, the time-field suggestion and the metric clamp all
+  stand down. Any one of them firing would have counted as the analyst taking the chart
+  over — rewriting the URL as `c_*` params seconds after the link opened, and dropping the
+  three narrowings on the way out.
+
+- **`read_story` no longer cuts the analyst's report unmarked.** Markdown blocks were
+  truncated at 1600 characters — 0.6% of what a write accepts — with no marker, so the agent
+  summarized half a paragraph believing it had read the block. Markdown now has its own
+  per-block and per-response budget, every cut carries `truncated` and the real
+  `text_length`, and short blocks are charged only what they hold.
+
 ## [1.8.6] — 2026-07-30
 
 ### Added

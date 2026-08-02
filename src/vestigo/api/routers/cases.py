@@ -25,6 +25,11 @@ from vestigo.api.deps import (
     resolve_case_access,
 )
 from vestigo.api.uploads import receive_upload_to_tmp
+from vestigo.columns.jobs import (
+    get_active_recommendation,
+    schedule_for_source,
+    start_column_recommendation,
+)
 from vestigo.core.config import get_settings
 from vestigo.core.eta import ThroughputMeter
 from vestigo.core.events_bus import publish_annotation_change
@@ -39,7 +44,7 @@ from vestigo.db.field_stats import (
     merged_list_fields,
     refresh_source_field_stats,
 )
-from vestigo.db.postgres import Case, PostgresStore, User, generate_id
+from vestigo.db.postgres import Case, PostgresStore, Timeline, User, generate_id
 from vestigo.db.qdrant import QdrantStore
 from vestigo.ingestion.parser import detect_format
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -163,7 +168,6 @@ async def list_cases(user: User = Depends(get_current_user)) -> dict[str, Any]:
     still cascades theirs.
     """
     store = get_store()
-    await store.init_schema()
     if user.is_admin:
         cases = [
             case
@@ -194,7 +198,6 @@ async def create_case(
     (or an admin); plain team members cannot create team cases.
     """
     store = get_store()
-    await store.init_schema()
     if payload.team_id:
         if not user.is_admin:
             membership = await store.get_membership(payload.team_id, user.id)
@@ -594,6 +597,21 @@ async def _run_ingestion_job(
                 case_id,
             )
         await _revalidate_stale_field_mappings(store, case_id, source_id)
+        # Recommended columns follow the field-stats precompute above, since
+        # that is what they read. Isolated for the same reason as the
+        # auto-enrichment trigger below: a failure here must never fall through
+        # to the ingest rollback, which would delete a fully-ingested source
+        # over a cosmetic suggestion. A missed run self-heals on the next
+        # ingest or a manual re-run from the Columns picker.
+        try:
+            await schedule_for_source(store, clickhouse, job_store, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Column recommendation scheduling failed for source %s (case %s); "
+                "the explorer falls back to its built-in default columns",
+                source_id,
+                case_id,
+            )
         # Auto-enrichment scheduling runs *after* the source is committed
         # "ready"; a failure here must never fall through to the ingest
         # rollback below (which would delete a fully-ingested source). Isolate
@@ -922,7 +940,77 @@ async def list_timelines(case: Case = Depends(require_case_read)) -> dict[str, A
     """List timelines within a case."""
     store = get_store()
     timelines = await store.list_timelines(case.id)
+    # Same settling as the single-timeline read (#213): a list that keeps
+    # reporting `running` for a job that died would have the two endpoints
+    # disagreeing about the same timeline, and callers that only ever list
+    # (the timelines page) would never see it resolve. Batched — a restart that
+    # orphaned several would otherwise cost one round trip each on a page that
+    # is opened constantly.
+    await _settle_dead_recommendations(store, case.id, timelines)
     return {"timelines": [t.to_dict() for t in timelines]}
+
+
+def _recommendation_is_dead(timeline: Timeline) -> bool:
+    """Whether this timeline claims a ``running`` job that no longer exists (#213).
+
+    The explorer polls on the word ``running``, and ``JobStore`` is in-memory:
+    a job killed as a cancelled task (rather than with the whole process) is
+    never settled by the boot-time sweep, and the timeline would claim to be
+    thinking forever. Answering it needs both checks — ``_ACTIVE`` covers a job
+    that is genuinely mid-flight, and the job store covers one that finished
+    without writing (which the placeholder rollback normally handles).
+
+    Pure and synchronous, so the list path can filter the whole page before
+    touching the database at all. False for every timeline that is not
+    mid-recommendation — which is all of them, almost always.
+
+    **Single-process, like everything it reads.** Both ``_ACTIVE`` and the job
+    store live in this process's memory, so under ``uvicorn --workers N`` a
+    second worker would read another worker's live job as dead and relabel the
+    payload; that job then writes its real answer anyway, so the visible damage
+    is a spinner ending early. Inherited from ``JobStore``, not introduced here
+    — ``docs/ROADMAP.md`` §"Explicitly out of scope" carries the standing
+    decision and names this as one more thing multi-process scale-out has to
+    move to a shared backend.
+    """
+    payload = timeline.recommended_columns
+    if not isinstance(payload, dict) or payload.get("status") != "running":
+        return False
+    if get_active_recommendation(timeline.id) is not None:
+        return False
+    job_id = payload.get("job_id")
+    return not (job_id and get_job_store().get(job_id) is not None)
+
+
+async def _settle_dead_recommendations(
+    store: PostgresStore, case_id: str, timelines: list[Timeline]
+) -> None:
+    """Relabel every dead ``running`` suggestion in *timelines*, in one write.
+
+    Mutates the passed timelines in place so the caller serializes the settled
+    payloads without a second read. Returns without touching the database when
+    nothing is stale, which is the overwhelmingly common case.
+
+    **This writes from a ``require_case_read`` endpoint, deliberately.** A
+    read-only member is the one caller who can never repair the row any other
+    way — they cannot re-run the job, and the alternative is a timeline that
+    reports "suggesting columns…" at them forever. The write is bounded to what
+    that makes safe: it only ever relabels a ``running`` payload whose job is
+    provably gone, it never recomputes, it touches no evidence and no
+    analyst-authored content, the settled columns are the ones already stored,
+    and the endpoint's own access check still governs *which* case's rows are
+    even considered. It is housekeeping on display metadata, not a mutation the
+    caller authored, which is also why it records no audit row — an audit trail
+    that logged "read-only user changed a timeline" every time a process
+    restarted would be describing something that did not happen.
+    """
+    stale = [t for t in timelines if _recommendation_is_dead(t)]
+    if not stale:
+        return
+    settled = await store.settle_running_recommendations(case_id, [t.id for t in stale])
+    for timeline in stale:
+        if timeline.id in settled:
+            timeline.recommended_columns = settled[timeline.id]
 
 
 @router.get("/{case_id}/timelines/{timeline_id}")
@@ -932,6 +1020,7 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     timeline = await store.get_timeline(case.id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+    await _settle_dead_recommendations(store, case.id, [timeline])
     return {"timeline": timeline.to_dict()}
 
 
@@ -1019,7 +1108,65 @@ async def create_timeline(
         target_id=timeline_id,
         detail={"field_mappings": payload.field_mappings} if payload.field_mappings else None,
     )
+    # A timeline built from already-ingested sources never passes the
+    # post-ingest hook, so it would otherwise open on the built-in defaults
+    # until someone asked for a suggestion by hand.
+    start_column_recommendation(
+        case_id=case.id,
+        timeline_id=timeline_id,
+        job_store=get_job_store(),
+        store=store,
+        actor_id=user.id,
+        actor_username=user.username,
+    )
     return {"timeline": timeline.to_dict()}
+
+
+class RecommendColumnsRequest(BaseModel):
+    """Whether this run may consult the LLM (issue #213)."""
+
+    use_ai: bool = False
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/recommend-columns")
+async def recommend_timeline_columns(
+    timeline_id: str,
+    payload: RecommendColumnsRequest | None = None,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Re-derive this timeline's recommended event-grid columns (issue #213).
+
+    The same job the post-ingest hook runs, started by hand from the Columns
+    picker. Contribute access, because the result is shared with everyone who
+    can see the timeline — a read-only member changing what the timeline opens
+    on for the whole case would be a surprise. Returns ``job_id: null`` when a
+    job for this timeline is already in flight, so the caller can say so rather
+    than showing a job that never appears.
+
+    ``use_ai`` is the analyst's per-timeline opt-in to the advisor
+    (``columns/advisor.py``), which sends candidate field names and up to three
+    real sample values per field to the configured model endpoint. This
+    authenticated, explicit request *is* the authorization — the acknowledgement
+    stored in the caller's preferences is the UI's memory of having shown the
+    disclosure, not a second gate. Every other trigger for this job leaves it
+    False and stays local.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    use_ai = bool(payload and payload.use_ai)
+    job_id = start_column_recommendation(
+        case_id=case.id,
+        timeline_id=timeline_id,
+        job_store=get_job_store(),
+        store=store,
+        actor_id=user.id,
+        actor_username=user.username,
+        use_llm=use_ai,
+    )
+    return {"job_id": job_id, "use_ai": use_ai}
 
 
 @router.patch("/{case_id}/timelines/{timeline_id}/field-mappings")

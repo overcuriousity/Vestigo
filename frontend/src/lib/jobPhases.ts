@@ -28,9 +28,17 @@ const IMPORT_PHASES: Record<string, string> = {
   stats: "Recomputing counts",
 };
 
+/** Source: `src/vestigo/columns/jobs.py`. */
+const COLUMN_RECOMMEND_PHASES: Record<string, string> = {
+  queued: "Queued",
+  fields: "Reading this timeline's fields",
+  model: "Asking the model to choose",
+};
+
 const PHASES_BY_KIND: Record<string, Record<string, string>> = {
   case_export: EXPORT_PHASES,
   case_import: IMPORT_PHASES,
+  column_recommend: COLUMN_RECOMMEND_PHASES,
 };
 
 /**

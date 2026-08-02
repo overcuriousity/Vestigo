@@ -18,6 +18,7 @@ import {
   PanelLeftOpen,
   BarChart2,
   AreaChart,
+  Columns3,
   Repeat,
   Sparkles,
 } from "lucide-react";
@@ -28,7 +29,18 @@ import { dispositionsApi } from "@/api/dispositions";
 import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
-import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { casesApi } from "@/api/cases";
+import { canContributeToCase } from "@/lib/caseAccess";
+import { useColumnRecommendation } from "@/hooks/useColumnRecommendation";
+import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
+import { useUiStore } from "@/stores/ui";
+import {
+  hasAnsweredColumnAdvisor,
+  hasSuggestion,
+  isSuggesting,
+  resolveVisibleColumns,
+  suggestionPollInterval,
+} from "@/lib/columns";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { useBaselineStore } from "@/stores/baseline";
@@ -403,7 +415,7 @@ export function ExplorerPage() {
   const jumpSeqRef = useRef(0);
   const seededSeqRef = useRef(0);
   const tlKey = `${caseId}/${timelineId}`;
-  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
   const setHistogramOpen = useUiStore((s) => s.setHistogramOpen);
   const setSortDir = useUiStore((s) => s.setSortDir);
@@ -419,7 +431,95 @@ export function ExplorerPage() {
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
+    // A column suggestion runs as a background job (issue #213) — poll while
+    // one is in flight so the grid re-lays out on its own. The timeline is
+    // never blocked on it: until it lands, the built-in defaults render. The
+    // interval widens with the job's age (see `suggestionPollInterval`), since
+    // a job still running after two minutes is not one a three-second poll
+    // catches any sooner.
+    refetchInterval: (query) =>
+      suggestionPollInterval(query.state.data?.recommended_columns),
   });
+
+  // Precedence: the analyst's own choice, then the timeline's suggestion, then
+  // the built-in defaults. See lib/columns.ts.
+  const visibleColumns = useMemo(
+    () => resolveVisibleColumns(storedColumns, timeline?.recommended_columns),
+    [storedColumns, timeline?.recommended_columns],
+  );
+  const suggestionRunning = isSuggesting(timeline?.recommended_columns);
+  // "Your grid is showing suggested columns" is only true while the analyst
+  // hasn't overridden them — once they pick their own, the notice is noise.
+  const showingSuggestion =
+    !storedColumns && hasSuggestion(timeline?.recommended_columns);
+
+  // Only needed for the access level: recomputing the column suggestion
+  // changes what the timeline opens on for everyone, so it is a contribute
+  // action, not a read one.
+  const { data: case_ } = useQuery({
+    queryKey: ["case", caseId],
+    queryFn: () => casesApi.get(caseId!),
+    enabled: !!caseId,
+  });
+  const canRecommendColumns = case_ ? canContributeToCase(case_) : false;
+
+  // ── The one-time AI column offer (issue #213) ──────────────────────────
+  // A timeline opens on locally-scored columns, always — that is the part
+  // that never sends anything. Whether the model gets to re-rank them is a
+  // question only the analyst can answer, and it was previously buried in the
+  // Columns popover: the common path (create a timeline, open it) landed on
+  // the heuristic answer with nothing saying a better one was available.
+  //
+  // So it is asked once per timeline, on first open, by whoever can act on it
+  // — and the answer is recorded either way, so "no" is as final as "yes".
+  // Deliberately not at creation time: a timeline built by an ingest never
+  // passes that dialog, and those are the ones an analyst opens first.
+  const columnAdvisor = useColumnRecommendation(caseId!, timelineId!);
+  const [advisorOfferOpen, setAdvisorOfferOpen] = useState(false);
+  const offeredFor = useRef<string | null>(null);
+  const recommendation = timeline?.recommended_columns;
+  useEffect(() => {
+    if (!timelineId || offeredFor.current === timelineId) return;
+    // Every condition has to hold before the question is worth asking: the
+    // model has to exist, the analyst has to be able to act on the answer,
+    // there has to be a local suggestion for it to re-rank, and nobody may
+    // have answered already. A run in flight waits — its result may make the
+    // offer moot.
+    if (!agentAvailable || !canRecommendColumns) return;
+    if (!recommendation || recommendation.status !== "ok") return;
+    if (recommendation.method !== "heuristic") return;
+    if (hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)) return;
+    offeredFor.current = timelineId;
+    setAdvisorOfferOpen(true);
+  }, [
+    timelineId,
+    agentAvailable,
+    canRecommendColumns,
+    recommendation,
+    columnAdvisor.preferences,
+  ]);
+
+  // Closing without confirming is an answer too, and recorded as one — an
+  // offer that returns on every visit is one people learn to dismiss unread.
+  //
+  // Never while the opt-in is in flight, though: that write is recording
+  // "yes", and a "no" racing it could win and leave the consent record
+  // contradicting the request the analyst authorized. `ColumnAdvisorNotice`
+  // refuses to close at all while pending, so this is the second lock on the
+  // same door — and the one that survives a future dialog that does not.
+  const closeAdvisorOffer = useCallback(
+    (open: boolean) => {
+      if (!open && columnAdvisor.optInPending) return;
+      setAdvisorOfferOpen(open);
+      if (!open && timelineId && !hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)) {
+        columnAdvisor.decline.mutate();
+      }
+    },
+    [timelineId, columnAdvisor],
+  );
+  useEffect(() => {
+    if (columnAdvisor.optInAndRecommend.isSuccess) setAdvisorOfferOpen(false);
+  }, [columnAdvisor.optInAndRecommend.isSuccess]);
 
   const { data: timelineSources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
@@ -565,6 +665,12 @@ export function ExplorerPage() {
     if (prevIngestingCount.current > 0 && ingestingCount === 0) {
       queryClient.invalidateQueries({ queryKey: ["events", caseId, timelineId] });
       queryClient.invalidateQueries({ queryKey: ["histogram", caseId, timelineId] });
+      // The same moment schedules a fresh column suggestion server-side
+      // (issue #213). Refetch the timeline to pick up its `running` status —
+      // otherwise nothing is polling and the new suggestion only appears on
+      // the next navigation.
+      queryClient.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      queryClient.invalidateQueries({ queryKey: ["fields", caseId, timelineId] });
     }
     prevIngestingCount.current = ingestingCount;
   }, [ingestingCount, caseId, timelineId, queryClient]);
@@ -1161,7 +1267,23 @@ export function ExplorerPage() {
               total={total}
             />
 
-            <ColumnPicker caseId={caseId!} timelineId={timelineId!} />
+            <ColumnPicker
+              caseId={caseId!}
+              timelineId={timelineId!}
+              recommended={timeline?.recommended_columns}
+              canRecommend={canRecommendColumns}
+            />
+            {/* Asked once per timeline, on first open. Same dialog and same
+                consent record as the Columns popover's own button — the two
+                share `useColumnRecommendation`, so neither can send anything
+                the other would not have. */}
+            <ColumnAdvisorNotice
+              open={advisorOfferOpen}
+              onOpenChange={closeAdvisorOffer}
+              onConfirm={() => columnAdvisor.optInAndRecommend.mutate()}
+              pending={columnAdvisor.optInPending}
+              error={columnAdvisor.optInError}
+            />
 
             <Tooltip content="Open the full visualization page">
               <Button variant="outline" size="sm" asChild data-tour="visualize-link">
@@ -1244,6 +1366,32 @@ export function ExplorerPage() {
           </div>
         )}
 
+        {/* Column suggestion (issue #213) — never blocks the grid; the built-in
+            defaults render until the job lands. aria-live so the swap is
+            announced rather than silently re-laying out the table. */}
+        {(suggestionRunning || showingSuggestion) && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border-subtle)] px-3 py-1 text-xs text-[var(--color-fg-muted)]"
+          >
+            {suggestionRunning ? (
+              <>
+                <Spinner size={11} />
+                <span>Suggesting columns from this timeline&rsquo;s data&hellip;</span>
+              </>
+            ) : (
+              <>
+                <Columns3 size={11} />
+                <span>
+                  Showing columns suggested from this timeline&rsquo;s data — change them
+                  from the Columns menu.
+                </span>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Main area */}
         <div className="flex flex-1 min-h-0 overflow-hidden">
           {eventsLoading && !eventsData ? (
@@ -1319,6 +1467,7 @@ export function ExplorerPage() {
                     onShowFieldHistogram={handleShowFieldHistogram}
                     onJumpToTime={handleJumpToTime}
                     onContextQuery={handleContextQuery}
+                    fieldMappings={timeline?.field_mappings}
                     tagSuggestions={tagSuggestions}
                   />
                 )}

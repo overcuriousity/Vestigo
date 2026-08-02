@@ -44,6 +44,14 @@ export interface User {
   last_login_at: string | null;
   /** Only present on /auth/me and /auth/me/password responses. */
   teams?: TeamMembershipSummary[];
+  /**
+   * Per-user UI state that has to outlive one browser — currently the agent's
+   * `agent_disabled_tools` and `column_advisor_optin` (issue #213), a
+   * `{ [timelineId]: true }` map of the timelines this user has opted in to AI
+   * column suggestions on. Written through the whitelisted
+   * `PUT /auth/me/preferences`.
+   */
+  preferences?: Record<string, unknown> | null;
 }
 
 export interface Team {
@@ -132,8 +140,33 @@ export interface Timeline {
   embedded_at: string | null;
   /** Canonical field name -> ordered raw attribute keys (query-time merge). */
   field_mappings: Record<string, string[]> | null;
+  /** Data-derived default grid columns, shared by everyone with access. */
+  recommended_columns: RecommendedColumns | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * A timeline's suggested event-grid columns (issue #213), derived from its own
+ * field statistics rather than a fixed default.
+ *
+ * `status` is the whole contract: `running` while a job is in flight,
+ * `ok` when `columns` should be applied, and `insufficient` when the backend
+ * looked and found nothing worth suggesting — in which case the grid keeps
+ * `DEFAULT_COLUMNS`. A per-user column choice always outranks this.
+ */
+export interface RecommendedColumns {
+  status: "ok" | "insufficient" | "running";
+  /** Grid column ids, `timestamp` first. Empty unless `status === "ok"`. */
+  columns: string[];
+  /** Column id -> why it was chosen; shown as a tooltip in the picker. */
+  reasons: Record<string, string>;
+  /** Which path produced this — the deterministic scorer, or the LLM on top. */
+  method: "heuristic" | "llm";
+  model: string | null;
+  source_ids: string[];
+  generated_at: string;
+  job_id: string | null;
 }
 
 /** Per-source presence of one raw attribute key (timeline wizard). */
@@ -173,6 +206,15 @@ export interface Event {
   /** Parser-derived tags (ClickHouse). Different from annotation tags. */
   tags: string[];
   attributes: Record<string, string>;
+  /**
+   * Attribute keys this row got from the timeline's `field_mappings` rather
+   * than from its source file (db/field_mappings.py::project_mapped_fields).
+   * Only present on the paged event query — absent on exports, on frozen
+   * `event_ref` story blocks, and whenever the timeline defines no mappings.
+   * A key stored under a canonical name is deliberately *not* listed: the
+   * source file did carry it.
+   */
+  mapped_fields?: string[];
   embedding_model: string | null;
   embedding_config_hash: string | null;
 }
@@ -941,6 +983,14 @@ export interface HealthResponse {
   agent_available?: boolean;
   /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
   mcp_enabled?: boolean;
+  /**
+   * The tag every annotated event carries, derived at read time rather than
+   * stored (`ANNOTATED_TAG` in `api/routers/events.py`). Served instead of
+   * mirrored so the resolver and the grid cannot end up naming different
+   * tags — a copy here would drift silently, since a renamed tag stops
+   * matching without raising anything.
+   */
+  annotated_tag?: string;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */

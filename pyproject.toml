@@ -1,6 +1,6 @@
 [project]
 name = "vestigo"
-version = "1.8.6"
+version = "1.9.0"
 description = "Local-first, forensic-grade log investigation platform with vector-backed anomaly detection."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "fastapi>=0.139.2",
+    "fastapi>=0.140.13",
     "uvicorn[standard]>=0.51.0",
     "typer>=0.27.0",
     "pydantic>=2.10.0",
@@ -39,7 +39,7 @@ dependencies = [
     "pyarrow>=25.0.0",
     "pysigma>=1.4.0,<2.0.0",
     "pyyaml>=6.0",
-    "pydantic-ai-slim[anthropic,mcp,openai]>=2.17.0",
+    "pydantic-ai-slim[anthropic,mcp,openai]>=2.19.0",
     "mcp>=1.28.1",
 ]
 

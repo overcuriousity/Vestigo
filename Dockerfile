@@ -6,13 +6,18 @@
 # Where the built frontend comes from. Two stages provide it:
 #   frontend-build     (default) builds it here, needs the node base image.
 #   frontend-prebuilt  takes `frontend/dist` from the build context, so an
-#                      offline host never resolves node:22-alpine at all —
+#                      offline host never resolves the node image at all —
 #                      BuildKit skips a stage no reachable stage copies from.
 # `docs/DEPLOYMENT.md` §Airgapped drives this; `scripts/airgap-bundle.sh`
 # builds the dist on the connected side.
 ARG FRONTEND_STAGE=frontend-build
 
-FROM node:22-alpine AS frontend-build
+# Pinned to an LTS line, and deliberately so: this image builds the frontend an
+# operator installs, including on hosts that never see an update again. Keep it
+# on the even-numbered releases — a dependabot bump onto an odd-numbered (non-LTS)
+# line is a bump to review, not to take. `.github/workflows/{ci,release}.yml`
+# build the same frontend on the same major.
+FROM node:24-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci

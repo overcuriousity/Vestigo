@@ -44,7 +44,17 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const [name, setName] = useState("");
   const saveMutation = useMutation({
     mutationFn: () =>
-      savedChartsApi.create(caseId, timelineId, name.trim(), chartConfigToStored(config)),
+      savedChartsApi.create(
+        caseId,
+        timelineId,
+        name.trim(),
+        // The spec's own filters travel with the chart: the card renders the
+        // filtered chart, so saving the shape alone would hand the analyst a
+        // saved chart that draws something else. That includes the agent-only
+        // members (`ids`, `anomalyRunId`, `collapseRoutine`) — a chart scoped
+        // to one detector run must not widen to the whole timeline on Save.
+        chartConfigToStored(config, filters),
+      ),
     onSuccess: () => {
       setName("");
       // Same key SavedChartsRail reads, so an open Visualize page picks the

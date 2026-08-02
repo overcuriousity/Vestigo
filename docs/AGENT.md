@@ -193,6 +193,15 @@ which caps at `MAX_LIST_ROWS` and reports **`returned` alongside `total`** —
 a silently partial set the model reasons over as whole is exactly what the
 system prompt's evidence rule forbids.
 
+`read_story` is the one read whose payload is prose rather than records, and
+it is budgeted differently for that reason: markdown is capped per block
+(`STORY_TEXT_TRUNCATE`) *and* per response (`STORY_TEXT_BUDGET`), spent in
+document order so a long story degrades block by block while every block still
+returns its id/kind/origin. Any cut carries `truncated: true` and the real
+`text_length`, with `truncated_blocks` on the response. The earlier cap
+(`ATTR_VALUE_TRUNCATE * 8`, 1600 chars) treated a report the analyst may write
+up to 256 KiB of as if it were an attribute value, and cut it unmarked.
+
 `propose_finding`'s `FilterSpec` uses the exact Explorer filter shape
 (including `annotated`, `annotation_tag_value`, `run_id`, `event_ids`,
 `collapse_routine`); the backend echoes the current hit count and the
@@ -310,6 +319,14 @@ a categorical grouping variable producing one distribution per group;
   translation for persisted old-shape `tool_args`. Virtual `time:` fields are
   analyst-facing too (`viz/lib/fieldDisplay.ts` labels tokens and values;
   canonical values, not labels, round-trip into filters/URLs/saved charts).
+- **Save** stores `spec.filters` with the chart, `event_ids`/`run_id`/
+  `collapse_routine` included — a chart the agent scoped to one detector run
+  must not widen to the whole timeline on the analyst's click. **Open in
+  Visualize** on this card cannot carry those three: the chart is not saved
+  yet, so there is no id to name, and it falls back to describing the chart in
+  `c_*` params where they have no representation. Saving first is what makes
+  the chart addressable (`?c_chart=<id>`, `docs/STORIES.md`) and its link
+  exact.
 
 ### Per-tool enable/disable (three layers)
 
@@ -357,6 +374,102 @@ the conversation row (incl. `model_id`, `disabled_tools`), every message row
 (user/assistant/tool/thinking/window, with tool args/results and measured
 token usage), the proposals, and `raw_history` — the provider-wire
 pydantic-ai history blob (the only place thinking signatures live).
+
+## Outside the agent loop: the column advisor
+
+One feature reaches the configured LLM endpoint without being an agent turn:
+the event-grid column suggestion (`src/vestigo/columns/advisor.py`, issue
+#213). It is documented here because it shares this subsystem's configuration
+and its availability gate — not because it shares its machinery. It has no
+conversation, no tool server, no history, no proposals, and writes nothing an
+analyst has to decide on.
+
+**What it does.** A deterministic sweep over the per-source field-statistics
+cache (`db/field_stats.py`) has already scored every candidate column before
+the model is involved. The model receives a candidate table — token, how many
+sources carry it, fill rate, distinct count, three sample values — and returns
+3–5 of those tokens in a useful order, as a pydantic `output_type`
+(`ColumnChoice`). That is the whole interaction: one request, no tools.
+
+**How the invariants apply.**
+
+| Invariant | How it holds here |
+|---|---|
+| Invisible unless configured | Gated on the same cached `agent_available()` probe `/api/health` uses. Unconfigured or unreachable ⇒ never called, and the deterministic answer ships instead. The "Suggest with AI" button is gated on the same `capabilities.agent`, so an instance with no model configured renders no entry point either. |
+| Scope safety | The model is given no case, timeline, source or event id, and no event row. It *is* given up to three real sample values per candidate field (40 characters each, ≤20 fields) — evidence-derived strings, which is why the path is opt-in rather than on by default. `tests/test_columns_api.py` asserts the rendered prompt against that promise. |
+| Sandbox + apply | The result is a *default*, not a mutation. It lands in `Timeline.recommended_columns`; any analyst's own column choice outranks it, and "Reset to defaults" is one click. |
+| Forensic reproducibility | Every run writes a `timeline.recommend_columns` audit row with the method, the model id, the chosen columns and the full candidate set. The heuristic half is deterministic and unit-tested; the LLM half is recorded as `method: "llm"` so a suggestion is never mistaken for a computation. |
+| Bounded trust | Every returned token is intersected with the candidate set — the model cannot introduce a field. A response that falls below the minimum after filtering is rejected whole rather than padded. Malformed, timed out (45 s ceiling), or errored is indistinguishable from "not configured". |
+
+**What it deliberately does not do.** It does not go through `build_tool_server`
+or `FastMCPClient`. Driving the real tools would mean `describe_field`'s two
+live ClickHouse scans per field across ~50 candidates, for data the stats cache
+already holds exactly; the tools are also timeline-scoped where the evidence
+here is per-source. The tool-deny layers are not bypassed by this, because no
+tool is called.
+
+**Opt-in per analyst, per timeline — with the disclosure attached to the
+opting.** There is no instance-wide setting for this, deliberately: whether the
+model half is *available* is already answered by whether an agent endpoint is
+configured, and a second tri-state on top of it only made the disclosure
+incoherent (a dialog explaining egress that was not happening, offering an
+action most users could not take).
+
+The job takes `use_llm`, and it defaults to False. Every automatic trigger —
+post-ingest, timeline creation, the CLI, the demo build — leaves it there, so
+the scorer runs locally and **egress is never a side effect of uploading a
+file**. Exactly one caller sets it: `POST
+/api/cases/{id}/timelines/{id}/recommend-columns` with `{"use_ai": true}`,
+behind the disclosure
+(`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`), which names
+exactly what would be sent, the endpoint URL and the model. Confirming records
+the answer for that timeline (`preferences.column_advisor_optin`, a
+`{timeline_id: bool}` map written through `PUT /api/auth/me/preferences`) and
+only then runs. Cancelling sends nothing and records `false` — a declined
+timeline has to be distinguishable from one nobody has been asked about, or the
+offer below returns on every visit and people learn to dismiss it unread. The
+next timeline asks again, because the sample values sent are that timeline's
+evidence.
+
+The disclosure refuses to close while its confirm is in flight — Escape, the
+overlay and the X included. A close is recorded as "no thanks", so a dismissal
+landing between the opt-in write and its response would race a `false` against
+the `true` the analyst just gave, and the stored consent could end up
+contradicting the request that was actually sent.
+
+One derived run exists, and it is always local: when an ingest trigger is
+collapsed into an already-running job (`columns/jobs.py::_DIRTY`), that job
+re-runs itself once for the sources it read too early — with `use_llm` unset
+however the run that scheduled it was started, so a burst can never turn one
+opted-in "Suggest with AI" into repeated egress.
+
+Two surfaces open that disclosure, both through
+`frontend/src/hooks/useColumnRecommendation.ts` so neither can send anything the
+other would not:
+
+- **The "Suggest with AI" button** in the Columns picker, at any time.
+- **A one-time offer** the first time someone with contribute access opens a
+  timeline that holds a `method: "heuristic"` suggestion they have not answered
+  for. The button alone was not enough: the common path (create a timeline, open
+  it) landed on the local answer with nothing on screen saying a better one
+  existed, and a disclosure nobody finds is not a choice anybody made. The offer
+  merely appearing sends nothing — it is the same dialog, gated on the same
+  `capabilities.agent`, and it never fires for a read-only member, a timeline
+  with no local suggestion yet, or one already ranked by the model.
+
+An explicit run from either surface also clears the requesting browser's stored
+column override. The per-user choice still outranks *automatic* recomputes (a
+colleague's ingest never moves anyone's columns), but pressing the button is
+asking for the new answer — leaving the override in place made the button look
+broken, since a single earlier checkbox click had already frozen the grid on the
+suggestion it was showing at the time.
+
+The contribute-access check on the endpoint is the authorization; the stored
+opt-in is the UI's memory of having shown the disclosure, not a second gate. The
+resulting suggestion is shared with everyone who can see the timeline — the
+opt-in governs who *causes* egress, not who may read the result afterwards, and
+the audit row names the analyst who triggered it. See
+`vestigo/columns/__init__.py` for the layering.
 
 ## Configuration
 

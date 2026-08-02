@@ -7,6 +7,7 @@ from vestigo.db.anomaly_stats import _col_expr
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
+    project_mapped_fields,
     resolve_mapping,
     validate_field_mappings,
 )
@@ -18,22 +19,26 @@ MAPPINGS = {"ip_address": ["src_ip", "ip_addr"], "user_name": ["user", "username
 
 
 def test_coalesce_expr_binds_keys_in_precedence_order():
+    # The canonical name is read first: a source ingested after the mapping was
+    # saved can store that exact key, and the filter must see the same value
+    # the projected row shows (project_mapped_fields never overwrites it).
     params: dict = {}
-    expr = mapping_coalesce_expr(["src_ip", "ip_addr"], params, "fk")
+    expr = mapping_coalesce_expr("ip_address", ["src_ip", "ip_addr"], params, "fk")
     assert expr == (
         "coalesce(nullif(attributes[{fk_m0:String}], ''), "
-        "nullif(attributes[{fk_m1:String}], ''), '')"
+        "nullif(attributes[{fk_m1:String}], ''), "
+        "nullif(attributes[{fk_m2:String}], ''), '')"
     )
-    assert params == {"fk_m0": "src_ip", "fk_m1": "ip_addr"}
+    assert params == {"fk_m0": "ip_address", "fk_m1": "src_ip", "fk_m2": "ip_addr"}
 
 
 def test_coalesce_expr_with_callable_param_minting():
     params: dict = {}
     counter = iter(range(10))
-    expr = mapping_coalesce_expr(["a", "b"], params, lambda: f"p{next(counter)}")
+    expr = mapping_coalesce_expr("canon", ["a", "b"], params, lambda: f"p{next(counter)}")
     assert "attributes[{p0:String}]" in expr
-    assert "attributes[{p1:String}]" in expr
-    assert params == {"p0": "a", "p1": "b"}
+    assert "attributes[{p2:String}]" in expr
+    assert params == {"p0": "canon", "p1": "a", "p2": "b"}
 
 
 # ── resolve_mapping ───────────────────────────────────────────────────────────
@@ -48,6 +53,68 @@ def test_resolve_mapping_hits_canonical_and_misses_others():
 def test_attr_prefix_bypasses_mapping():
     # attr: always addresses the raw key — the analyst's escape hatch.
     assert resolve_mapping("attr:ip_address", MAPPINGS) is None
+
+
+# ── project_mapped_fields ─────────────────────────────────────────────────────
+
+
+def test_projection_takes_the_first_raw_in_precedence_order():
+    attrs = {"src_ip": "10.0.0.4", "ip_addr": "192.168.1.9"}
+    projected, derived = project_mapped_fields(attrs, MAPPINGS)
+    assert projected["ip_address"] == "10.0.0.4"
+    assert derived == ["ip_address"]
+
+
+def test_projection_falls_through_to_the_later_spelling():
+    # The source that uses the other spelling — the case the mapping exists for.
+    projected, _ = project_mapped_fields({"ip_addr": "192.168.1.9"}, MAPPINGS)
+    assert projected["ip_address"] == "192.168.1.9"
+
+
+def test_projection_treats_empty_string_as_absent_like_nullif():
+    attrs = {"src_ip": "", "ip_addr": "192.168.1.9"}
+    assert project_mapped_fields(attrs, MAPPINGS)[0]["ip_address"] == "192.168.1.9"
+
+
+def test_projection_omits_a_canonical_field_no_raw_carries():
+    # The SQL's trailing '' becomes an absent key here, so the grid renders its
+    # own em dash instead of an empty cell.
+    out, derived = project_mapped_fields({"src_ip": "", "status": "200"}, MAPPINGS)
+    assert "ip_address" not in out
+    assert "user_name" not in out
+    assert derived == []
+
+
+def test_projection_never_overwrites_a_stored_key():
+    # A source ingested after the mapping was saved can introduce the canonical
+    # name as a real key; the record outranks the derived value, and the SQL
+    # reads that key first for exactly this reason.
+    attrs = {"ip_address": "stored", "src_ip": "10.0.0.4"}
+    projected, derived = project_mapped_fields(attrs, MAPPINGS)
+    assert projected["ip_address"] == "stored"
+    # Not reported as derived: the source file carried it, and the detail
+    # panel must not badge it as coming from the mapping.
+    assert derived == []
+
+
+def test_projection_reports_only_the_canonical_names_it_added():
+    attrs = {"src_ip": "10.0.0.4", "user": "root", "status": "200"}
+    _, derived = project_mapped_fields(attrs, MAPPINGS)
+    assert derived == ["ip_address", "user_name"]
+
+
+def test_projection_without_mappings_returns_the_same_object():
+    attrs = {"src_ip": "10.0.0.4"}
+    assert project_mapped_fields(attrs, None) == (attrs, [])
+    assert project_mapped_fields(attrs, None)[0] is attrs
+    assert project_mapped_fields(attrs, {})[0] is attrs
+
+
+def test_projection_does_not_mutate_the_source_map():
+    attrs = {"src_ip": "10.0.0.4"}
+    out, _ = project_mapped_fields(attrs, MAPPINGS)
+    assert attrs == {"src_ip": "10.0.0.4"}
+    assert out["ip_address"] == "10.0.0.4"
 
 
 # ── validate_field_mappings ───────────────────────────────────────────────────
@@ -140,7 +207,7 @@ def test_anomaly_col_expr_resolves_canonical_to_coalesce():
     params: dict = {}
     expr = _col_expr("ip_address", params, MAPPINGS)
     assert expr.startswith("coalesce(")
-    assert params == {"fk_m0": "src_ip", "fk_m1": "ip_addr"}
+    assert params == {"fk_m0": "ip_address", "fk_m1": "src_ip", "fk_m2": "ip_addr"}
 
 
 def test_anomaly_col_expr_without_mappings_unchanged():
@@ -208,8 +275,9 @@ def test_field_terms_groups_by_coalesced_canonical():
     )
     sql, params = store.client.queries[0]
     assert "coalesce(nullif(attributes[{field_key_m0:String}]" in sql
-    assert params["field_key_m0"] == "src_ip"
-    assert params["field_key_m1"] == "ip_addr"
+    assert params["field_key_m0"] == "ip_address"
+    assert params["field_key_m1"] == "src_ip"
+    assert params["field_key_m2"] == "ip_addr"
 
 
 def test_list_fields_rewrites_inventory_with_provenance():

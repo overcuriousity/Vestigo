@@ -14,11 +14,11 @@ and derived, do amend ``events.attributes`` — see ``enrichers/jobs.py``).
 The ``attr:`` token prefix keeps addressing raw keys directly, bypassing any
 mapping.
 
-This module owns the three mapping concerns shared by the query layer
+This module owns the four mapping concerns shared by the query layer
 (`queries.py`), the statistical detectors (`anomaly_stats.py`), and the API
 validation (`routers/cases.py`): building the coalesce SQL expression,
-validating a mapping dict, and rewriting field inventories for discovery
-endpoints.
+applying that same coalesce to a presented event row, validating a mapping
+dict, and rewriting field inventories for discovery endpoints.
 """
 
 from __future__ import annotations
@@ -37,28 +37,85 @@ FieldMappings = dict[str, list[str]]
 
 
 def mapping_coalesce_expr(
+    canonical: str,
     raw_keys: list[str],
     parameters: dict[str, Any],
     param_name: str | Callable[[], str],
 ) -> str:
     """Return the ClickHouse expression for a canonical field.
 
-    Each raw attribute key becomes a bound parameter; empty string counts as
-    "absent" (ClickHouse Map lookups return ``''`` for missing keys), so the
-    first non-empty raw value in mapping order wins::
+    Each key becomes a bound parameter; empty string counts as "absent"
+    (ClickHouse Map lookups return ``''`` for missing keys), so the first
+    non-empty value in precedence order wins::
 
         coalesce(nullif(attributes[{m0:String}], ''), ..., '')
+
+    Precedence is **the canonical name itself first, then the raw keys in
+    mapping order**. ``validate_field_mappings`` rejects a canonical name that
+    shadows a raw attribute key, but only when the inventory was known — a
+    source ingested *after* the mapping was saved can introduce that key later.
+    Reading it first means an ingested value is what both the filter and the
+    projected row carry (:func:`project_mapped_fields` never overwrites a
+    stored key), instead of the filter silently ignoring data the grid shows.
+    For every well-formed mapping the extra term is always ``''`` and changes
+    nothing.
 
     ``param_name`` follows the `_field_column_expr` contract: a callable mints
     fresh names; a string seeds ``{name}_m{i}`` suffixed names (the viz callers
     pass one caller-chosen name and never more).
     """
     parts = []
-    for i, key in enumerate(raw_keys):
+    for i, key in enumerate([canonical, *raw_keys]):
         name = param_name() if callable(param_name) else f"{param_name}_m{i}"
         parameters[name] = key
         parts.append(f"nullif(attributes[{{{name}:String}}], '')")
     return f"coalesce({', '.join(parts)}, '')"
+
+
+def project_mapped_fields(
+    attributes: Any,
+    field_mappings: FieldMappings | None,
+) -> tuple[Any, list[str]]:
+    """Add each canonical field's coalesced value to a presented event row's attributes.
+
+    The Python twin of :func:`mapping_coalesce_expr`, applied to the rows the
+    Explorer grid renders, and following the same precedence: a stored key
+    under the canonical name wins (it is never overwritten), otherwise the
+    first raw key in mapping order whose value is neither ``None`` nor ``''``.
+    A canonical field nothing carries is left absent (the SQL's trailing ``''``
+    becomes a missing key here, so the grid renders its own em dash rather than
+    an empty cell). Computing it from the same rule as the filter SQL is the
+    point — a displayed value and a filter on the same canonical field cannot
+    disagree, including in the shadowed case the SQL reads first.
+
+    Returns ``(attributes, derived_keys)``: a new dict — the caller's map is
+    not mutated — plus the canonical names *this* row got from the mapping
+    rather than from its source file, or *attributes* unchanged and an empty
+    list when there is nothing to add, so the common no-mappings case stays
+    byte-identical on the wire.
+
+    Note the deliberate asymmetry: this runs for the presented page
+    (``EventQueryService.query``) but **not** for ``iter_events``, which backs
+    CSV/JSONL export. An export carries what was ingested. Because the value
+    lands in ``attributes`` indistinguishably from an ingested key, the row
+    carries ``mapped_fields`` and ``EventDetailPanel`` badges exactly those
+    keys — a key stored under a canonical name is *not* among them, so the
+    panel never claims a provenance the source file contradicts.
+    """
+    if not field_mappings or not isinstance(attributes, dict):
+        return attributes, []
+    derived: dict[str, Any] = {}
+    for canonical, raw_keys in field_mappings.items():
+        if canonical in attributes:
+            continue
+        for raw in raw_keys:
+            value = attributes.get(raw)
+            if value is not None and value != "":
+                derived[canonical] = value
+                break
+    if not derived:
+        return attributes, []
+    return {**attributes, **derived}, sorted(derived)
 
 
 def resolve_mapping(field_token: str, field_mappings: FieldMappings | None) -> list[str] | None:
@@ -92,7 +149,9 @@ def validate_field_mappings(
       whitespace-padded key would validate here but never match at query
       time, since resolution strips only the incoming field token), must not
       collide with core event columns or with a raw attribute key present in
-      the sources (that would silently shadow real data), and must not use
+      the sources (one column would then mix ingested and coalesced values
+      across sources — resolution defines which wins, but the mapping is
+      still almost certainly not what the analyst meant), and must not use
       the ``attr:`` or reserved ``time:`` prefixes — the latter resolves
       ahead of mappings, so such a name would be unreachable, not ambiguous;
     - each raw key may appear in at most one mapping (and once per mapping);

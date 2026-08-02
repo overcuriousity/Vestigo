@@ -147,6 +147,15 @@ instead of rebuilding.
   dataclasses as append-only where possible.
 - `agent/` — the optional AI investigation agent (pydantic-ai runtime, `tools.py` tool
   registry, MCP exposure). See `docs/AGENT.md`.
+- `columns/` — recommended event-grid columns per timeline (issue #213): a pure scorer over
+  the `db/field_stats.py` cache, an optional one-shot typed LLM call that only reorders the
+  scorer's candidates (`docs/AGENT.md` §"Outside the agent loop"), and the job that persists
+  the result to `Timeline.recommended_columns`. Display metadata — a per-user column choice
+  in the browser outranks it for every *automatic* recompute, but an explicit re-suggest
+  clears that override (the analyst asked for the new answer). The job's `use_llm` defaults
+  to False and only the "Suggest with AI" endpoint sets it, so every automatic trigger
+  scores locally; the analyst answers once per timeline — yes or no, both recorded — after a
+  disclosure naming what is sent.
 - `sigma/` — Sigma rule loader/compiler/router (`docs/ANOMALY_DETECTION.md` §13).
 - `stories/` — the Stories subsystem (blocks, snapshots, export). See `docs/STORIES.md`.
 - `transfer/` — case export/import (`.vestigo` archive).
@@ -183,6 +192,12 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
 - Background jobs (`core/jobs.py::JobStore`) are intentionally ephemeral/in-memory — don't add
   persistence there without a deliberate design discussion; it changes the deployment model.
 - Forensic reproducibility/explainability is a hard requirement for basically any subsystem. 
+- A `require_case_read` endpoint does not write. One deliberate exception exists and is not a
+  precedent: `api/routers/cases.py::_settle_dead_recommendations` relabels a `running` column
+  recommendation whose job is provably gone, because a read-only member has no other way to
+  repair a timeline that reports "suggesting columns…" forever. It is bounded to display
+  metadata, recomputes nothing, touches no evidence and records no audit row. Anything else
+  that wants to write from a read endpoint needs its own argument, not this one.
 - Airgapped/offline-by-default is a design goal (`VESTIGO_ALLOW_ONLINE`, `docs/TECH_STACK.md` §6).
   Don't add code paths that reach the network unconditionally. Exception: optional OIDC SSO
   (`VESTIGO_OIDC_ENABLED`) is deliberately independent of `VESTIGO_ALLOW_ONLINE` — see `TECH_STACK.md` §6.

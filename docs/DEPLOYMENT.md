@@ -206,7 +206,7 @@ scripts/airgap-bundle.sh --app-only         # app image only — see the caveat 
 
 It builds the frontend, builds the app image **from that prebuilt frontend** (the
 `frontend-prebuilt` Dockerfile stage, so the isolated host never resolves
-`node:22-alpine`), saves every image the stack runs, verifies the resulting archive
+the `node:24-alpine` build image), saves every image the stack runs, verifies the resulting archive
 really holds that many images, and packs everything with the compose file,
 `.env.example`, `nginx-tls.conf` and `install.sh`. The compose file travels as
 `compose.airgap.yml` — not one of the names `docker compose` auto-discovers — and only

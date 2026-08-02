@@ -434,6 +434,8 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.execute(text("ALTER TABLE users DROP COLUMN demo_case_seeded_at"))
         # 0023 marks seeded demo cases.
         await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
+        # 0024 adds the per-timeline recommended grid columns.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN recommended_columns"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(
