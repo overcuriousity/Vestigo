@@ -32,6 +32,8 @@ from vestigo.demo.sources import linux, netflow, proxy, windows
 from vestigo.ingestion.files import hash_file
 from vestigo.ingestion.pipeline import IngestionPipeline
 from vestigo.sigma.rules import parse_rule_yaml, rule_key_for
+from vestigo.stories.refs import validate_block_scope
+from vestigo.stories.schemas import validate_block_content
 
 logger = logging.getLogger(__name__)
 
@@ -185,14 +187,27 @@ async def _artifacts(
     rows = metadata.tag_annotation_rows(resolved, case_id, user_id)
     await store.bulk_create_annotations(rows)
 
+    view_ids: dict[str, str] = {}
     for view in metadata.VIEWS:
-        await store.create_view(
+        created = await store.create_view(
             case_id=case_id,
             view_id=generate_id(view.name),
             name=view.name,
             query=view.query,
             view_filter=view.payload,
         )
+        view_ids[view.name] = created.id
+
+    chart_ids: dict[str, str] = {}
+    for chart in metadata.CHARTS:
+        saved = await store.create_saved_chart(
+            case_id=case_id,
+            timeline_id=timeline_ids[chart.timeline],
+            chart_id=generate_id(f"demo-chart:{chart.name}"),
+            name=chart.name,
+            config=chart.config,
+        )
+        chart_ids[chart.name] = saved.id
 
     full_timeline = timeline_ids["Full incident"]
     await store.create_baseline_definition(
@@ -229,12 +244,26 @@ async def _artifacts(
         description="How the intrusion unfolded, and what is not part of it.",
         user=user_id,
     )
-    for index, (kind, text) in enumerate(metadata.STORY_BLOCKS):
+    story_blocks = await asyncio.to_thread(
+        metadata.resolve_story_blocks,
+        clickhouse,
+        case_id,
+        source_ids,
+        view_ids,
+        chart_ids,
+        timeline_ids,
+    )
+    for index, (kind, content) in enumerate(story_blocks):
+        # Same two gates every write path applies (shape, then referent scope),
+        # so a demo block that would render as "cannot be drawn" fails the
+        # seed here instead of shipping broken.
+        validated = validate_block_content(kind, content)
+        await validate_block_scope(case_id, kind, validated, store=store)
         await store.create_story_block(
             story_id=story.id,
             block_id=generate_id(f"demo-block-{index:03d}"),
             kind=kind,
-            content={"text": text},
+            content=validated,
             user=user_id,
         )
     return len(resolved)

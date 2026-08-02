@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] — 2026-08-02
+
+### Changed
+
+- **The demo case's story now demonstrates what a story can hold.** It shipped as fourteen
+  markdown blocks and nothing else — it reads well, but it is the only worked example most
+  users see, and it quietly taught that a Vestigo story is a text editor. The narrative now
+  uses all four block kinds: the spray's first failed logon, the encoded PowerShell, the
+  persistence service install and the first upload chunk are frozen `event_ref` blocks with
+  captions; the matching saved filter sets are embedded as `view_ref` blocks; and three
+  charts are embedded where the shape of the data carries the argument. The demo case also
+  now creates four saved charts of its own, so the Visualization page has content on a first
+  login instead of an empty canvas.
+
+  The seed runs every block through the same content and referent-scope validation the HTTP
+  router and the agent go through, and a new test resolves the seeded story into a real
+  export snapshot and asserts no block fails to resolve — a broken embed in the shipped
+  example would otherwise surface only as a frozen `resolution.error` in someone's first
+  report.
+
 ## [1.9.0] — 2026-08-02
 
 ### Added

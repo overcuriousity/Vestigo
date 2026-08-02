@@ -6,7 +6,7 @@ makes of them (that is ``tests/test_demo_detector_coverage_clickhouse.py``).
 
 from __future__ import annotations
 
-from vestigo.demo import metadata, scenario
+from vestigo.demo import build, metadata, scenario
 from vestigo.demo.sources import linux, netflow, proxy, windows
 
 
@@ -270,10 +270,39 @@ def test_views_carry_the_full_frontend_payload():
 def test_story_has_a_narrative_arc():
     from vestigo.stories.schemas import BLOCK_KINDS
 
-    kinds = {kind for kind, _ in metadata.STORY_BLOCKS}
+    kinds = {block.kind for block in metadata.STORY_BLOCKS}
     assert kinds <= set(BLOCK_KINDS), "story blocks must use real block kinds"
-    assert metadata.STORY_BLOCKS[0][1].startswith("## ")
+    assert kinds == set(BLOCK_KINDS), "the demo story must show every block kind"
+    assert (metadata.STORY_BLOCKS[0].text or "").startswith("## ")
     assert len(metadata.STORY_BLOCKS) >= 8
-    body = " ".join(text for _, text in metadata.STORY_BLOCKS).lower()
+    body = " ".join(block.text or "" for block in metadata.STORY_BLOCKS).lower()
     assert "recommend" in body
     assert "unrelated" in body, "the benign findings must be called out as benign"
+
+
+def test_story_embeds_name_referents_that_exist():
+    view_names = {view.name for view in metadata.VIEWS}
+    chart_names = {chart.name for chart in metadata.CHARTS}
+    timeline_names = {name for name, _description, _keys in build.TIMELINES}
+    for block in metadata.STORY_BLOCKS:
+        if block.kind == "view_ref":
+            assert block.view in view_names
+        if block.kind == "chart_ref":
+            assert block.chart in chart_names
+        if block.kind in ("view_ref", "chart_ref"):
+            assert block.timeline in timeline_names
+        if block.kind == "event_ref":
+            assert block.event is not None
+            assert block.event.source_key in {key for key, *_rest in build.SOURCES}
+            assert block.caption, "a frozen event needs a caption saying why it is there"
+
+
+def test_saved_chart_configs_parse_as_chart_specs():
+    """A config in the wrong shape draws nothing, silently, everywhere."""
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    assert metadata.CHARTS
+    for chart in metadata.CHARTS:
+        assert chart.config["v"] == 1
+        spec = _stored_chart_to_spec(chart.config)
+        assert spec.chart_type == chart.config["chartType"]

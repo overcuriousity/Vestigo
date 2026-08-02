@@ -96,6 +96,58 @@ async def test_notes_and_tags_land_on_real_events(built, store, ch_store):
 
 
 @pytest.mark.asyncio
+async def test_story_embeds_resolve_into_a_snapshot(built, store, ch_store):
+    """The demo story must export cleanly, every block kind included.
+
+    A ``chart_ref`` or ``view_ref`` whose referent is wrong does not fail the
+    seed loudly — it freezes as a ``resolution.error`` in the report. This is
+    the check that keeps the shipped example from teaching that failure.
+    """
+    from vestigo.db.queries import EventQueryService
+    from vestigo.stories.export import resolve_story_snapshot
+
+    case_id = built.case_id
+    story = (await store.list_stories(case_id))[0]
+    blocks = await store.list_story_blocks(story.id)
+    kinds = {block.kind for block in blocks}
+    assert kinds == {"markdown", "view_ref", "chart_ref", "event_ref"}
+
+    charts_by_timeline = {}
+    for timeline in await store.list_timelines(case_id):
+        charts_by_timeline[timeline.id] = await store.list_saved_charts(case_id, timeline.id)
+    assert sum(len(v) for v in charts_by_timeline.values()) == len(metadata.CHARTS)
+
+    sources_by_timeline = {
+        timeline.id: [s.id for s in await store.list_timeline_sources(case_id, timeline.id)]
+        for timeline in await store.list_timelines(case_id)
+    }
+    service = EventQueryService(store=ch_store)
+    user = await store.get_user("u_demo_build")
+    snapshot = await resolve_story_snapshot(
+        story,
+        blocks,
+        user=user,
+        store=store,
+        run_event_query=service.query,
+        resolve_scope=lambda cid, tid: (sources_by_timeline[tid], None, None),
+    )
+    errors = {
+        (b["kind"], b["resolution"]["error"])
+        for b in snapshot["blocks"]
+        if b["resolution"]["error"]
+    }
+    assert not errors
+    for block in snapshot["blocks"]:
+        if block["kind"] == "event_ref":
+            assert block["data"]["event"]
+            assert block["data"]["caption"]
+        if block["kind"] == "view_ref":
+            assert block["data"]["rows"]
+        if block["kind"] == "chart_ref":
+            assert block["data"]["chart"]
+
+
+@pytest.mark.asyncio
 async def test_two_seeds_do_not_collide(store, ch_store, built):
     """Every user gets their own copy, so ids must not be shared."""
     other = await store.create_user(user_id="u_demo_build2", username="demo-build-2")

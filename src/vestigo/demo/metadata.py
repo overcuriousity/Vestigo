@@ -347,6 +347,81 @@ VIEWS: tuple[DemoView, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class DemoChart:
+    """A saved Visualize-page chart, in the config shape the frontend writes.
+
+    ``config`` is a full versioned ``ChartConfig`` (camelCase, ``v: 1``) —
+    the backend round-trips it verbatim, so writing one here means writing
+    exactly what the Visualize page would have saved. ``tests/test_demo.py``
+    parses every one of these through the export path's
+    ``_stored_chart_to_spec``, because a config in the wrong shape is
+    silently undrawable rather than an error.
+    """
+
+    name: str
+    timeline: str
+    config: dict[str, Any]
+
+
+def _chart_config(
+    chart_type: str,
+    scale: str,
+    *,
+    field: str | None = None,
+    field_y: str | None = None,
+    metric: str = "count",
+    options: dict[str, Any] | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A stored ``ChartConfig``, every key the frontend writes present."""
+    return {
+        "v": 1,
+        "field": field,
+        "fieldY": field_y,
+        "fields": None,
+        "scale": scale,
+        "chartType": chart_type,
+        "metric": metric,
+        "compare": {"mode": "off"},
+        "options": options or {},
+        **({"filters": filters} if filters else {}),
+    }
+
+
+#: The charts the analyst saved while working the case. They exist so the
+#: Visualization page is populated on a first login, and so the story has
+#: something real to embed — a ``chart_ref`` block re-runs the saved config
+#: at export time, so these are live queries, not pictures.
+CHARTS: tuple[DemoChart, ...] = (
+    DemoChart(
+        "Failed logons over the month",
+        "Endpoint",
+        _chart_config(
+            "time",
+            "interval",
+            options={"buckets": 120},
+            filters=_view_payload(filters={"event_id": ["4625"]}),
+        ),
+    ),
+    DemoChart(
+        "Where the traffic goes",
+        "Network",
+        _chart_config("bar", "nominal", field="host", options={"topN": 12, "sort": "count"}),
+    ),
+    DemoChart(
+        "Upload sizes",
+        "Network",
+        _chart_config("histogram", "ratio", field="bytes_out", options={"bins": 40}),
+    ),
+    DemoChart(
+        "Activity by hour and weekday",
+        "Full incident",
+        _chart_config("punchcard", "nominal"),
+    ),
+)
+
+
 SIGMA_RULES: tuple[tuple[str, str], ...] = (
     (
         "Encoded PowerShell command line",
@@ -422,88 +497,234 @@ level: medium
 )
 
 
-#: The story, as (block kind, markdown) pairs. Headings are markdown ``##``
-#: lines rather than a block kind of their own — see stories/schemas.py.
+@dataclass(frozen=True)
+class DemoEventPick:
+    """How to find the one event a story block freezes.
+
+    Same selector vocabulary as ``DemoAnnotation`` and resolved by the same
+    query — an ``event_ref`` block that pointed at a row number nobody can
+    check would undercut the point of the block.
+    """
+
+    source_key: str
+    after: datetime
+    attribute: str | None = None
+    value: str | None = None
+    contains: str | None = None
+
+
+@dataclass(frozen=True)
+class DemoBlock:
+    """One story block, with its referents named rather than by id.
+
+    Ids for views, charts and timelines only exist once the case is built, so
+    a block names them and ``resolve_story_blocks`` swaps in the real ids.
+
+    Attributes:
+        kind: One of ``stories.schemas.BLOCK_KINDS``.
+        text: Markdown body, for ``kind="markdown"``.
+        view: A ``VIEWS`` entry's name, for ``kind="view_ref"``.
+        chart: A ``CHARTS`` entry's name, for ``kind="chart_ref"``.
+        event: The selector, for ``kind="event_ref"``.
+        caption: One-line label under a frozen event.
+        timeline: Which timeline the embed resolves against, by name.
+        limit: Row cap for a view block.
+    """
+
+    kind: str
+    text: str | None = None
+    view: str | None = None
+    chart: str | None = None
+    event: DemoEventPick | None = None
+    caption: str | None = None
+    timeline: str = "Full incident"
+    limit: int = 25
+
+
+#: The story. Headings are markdown ``##`` lines rather than a block kind of
+#: their own — see stories/schemas.py. The narrative deliberately uses all
+#: four block kinds: prose carries the argument, and each claim that rests on
+#: evidence is followed by the evidence itself — the event that shows it, the
+#: filter set that finds the rest, or the chart that shows its shape.
 STORY_TITLE = "Contractor account compromise — 24–30 May"
-STORY_BLOCKS: tuple[tuple[str, str], ...] = (
-    (
+STORY_BLOCKS: tuple[DemoBlock, ...] = (
+    DemoBlock(
         "markdown",
-        "## Contractor account compromise — 24–30 May",
+        text="## Contractor account compromise — 24–30 May",
     ),
-    (
+    DemoBlock(
         "markdown",
-        "A contractor account was compromised by password spraying, used to establish a "
+        text="A contractor account was compromised by password spraying, used to establish a "
         "foothold on the jump host, and then to stage and upload roughly 6 GB from the "
         "finance file share. Containment happened on the morning of the 30th.\n\n"
         "The first three weeks of May are included deliberately: nothing in them looks "
         "like this, and being able to say that with evidence is half the report.",
     ),
-    (
-        "markdown",
-        "## 24 May — credential spray",
+    DemoBlock(
+        "chart_ref",
+        chart="Failed logons over the month",
+        timeline="Endpoint",
     ),
-    (
+    DemoBlock(
         "markdown",
-        "Just after 02:00, DC-01 logs several thousand failed logons in under an hour, "
+        text="Three flat weeks and then a wall on the 24th. Everything below is an "
+        "attempt to account for that shape.",
+    ),
+    DemoBlock(
+        "markdown",
+        text="## 24 May — credential spray",
+    ),
+    DemoBlock(
+        "markdown",
+        text="Just after 02:00, DC-01 logs several thousand failed logons in under an hour, "
         "cycling every account in the directory from a workstation on the contractor "
         "VPN pool. One account succeeds: `m.okonkwo`.\n\n"
         "The account list argues for prior reconnaissance. The single success argues "
         "for a reused password rather than a guessed one.",
     ),
-    (
-        "markdown",
-        "## 25 May — foothold and persistence",
+    DemoBlock(
+        "event_ref",
+        event=DemoEventPick(
+            "windows",
+            _RECON.start,
+            attribute="event_id",
+            value="4625",
+        ),
+        caption="The first failed logon of the spray.",
     ),
-    (
+    DemoBlock(
+        "view_ref",
+        view="Failed logons, all hosts",
+        timeline="Endpoint",
+        limit=25,
+    ),
+    DemoBlock(
         "markdown",
-        "The account logs on interactively to JUMP-01, runs a base64-encoded PowerShell "
+        text="## 25 May — foothold and persistence",
+    ),
+    DemoBlock(
+        "markdown",
+        text="The account logs on interactively to JUMP-01, runs a base64-encoded PowerShell "
         "command, and three minutes later a service named `WinSysHealthSvc` is "
         "installed. That name appears nowhere else in the estate before this moment.\n\n"
         "From here on, JUMP-01 calls out to a sixteen-character hostname every five "
         "minutes, to the second.",
     ),
-    (
-        "markdown",
-        "## 27–28 May — lateral movement",
+    DemoBlock(
+        "event_ref",
+        event=DemoEventPick(
+            "windows",
+            _FOOTHOLD.start,
+            attribute="command_line",
+            contains="-enc ",
+        ),
+        caption="The encoded PowerShell command that preceded the service install.",
     ),
-    (
+    DemoBlock(
+        "event_ref",
+        event=DemoEventPick(
+            "windows",
+            _FOOTHOLD.start,
+            attribute="service_name",
+            value=windows.PERSISTENCE_SERVICE,
+        ),
+        caption="The persistence service, three minutes later.",
+    ),
+    DemoBlock(
+        "view_ref",
+        view="Service installs",
+        timeline="Endpoint",
+        limit=25,
+    ),
+    DemoBlock(
         "markdown",
-        "SMB enumeration from JUMP-01 against FILE-01 is mostly denied, but enough "
+        text="## 27–28 May — lateral movement",
+    ),
+    DemoBlock(
+        "markdown",
+        text="SMB enumeration from JUMP-01 against FILE-01 is mostly denied, but enough "
         "succeeds to locate the finance share. `wmic /node:` creates processes "
         "remotely, and the same persistence service is installed on FILE-01.\n\n"
         "The contractor account also appears on WKS-007 and WKS-009 — finance "
         "workstations it has no history with.",
     ),
-    (
-        "markdown",
-        "## 29–30 May — staging and exfiltration",
+    DemoBlock(
+        "view_ref",
+        view="Contractor account activity",
+        timeline="Full incident",
+        limit=50,
     ),
-    (
+    DemoBlock(
         "markdown",
-        "7-Zip archives the finance share into `Q4_repоrt_archive.7z` — note the "
+        text="## 29–30 May — staging and exfiltration",
+    ),
+    DemoBlock(
+        "markdown",
+        text="7-Zip archives the finance share into `Q4_repоrt_archive.7z` — note the "
         "Cyrillic character in the filename. The archive leaves in a few hundred "
         "chunked uploads to a file-sharing host overnight, paced to look unremarkable.",
     ),
-    (
-        "markdown",
-        "## What is not part of this",
+    DemoBlock(
+        "chart_ref",
+        chart="Where the traffic goes",
+        timeline="Network",
     ),
-    (
+    DemoBlock(
+        "chart_ref",
+        chart="Upload sizes",
+        timeline="Network",
+    ),
+    DemoBlock(
         "markdown",
-        "Two things in the same window are unrelated and worth stating so nobody "
+        text="Each upload is unremarkable on its own; the distribution is what gives the "
+        "transfer away, and the destination has no business relationship behind it.",
+    ),
+    DemoBlock(
+        "event_ref",
+        event=DemoEventPick(
+            "proxy",
+            _EXFIL.start,
+            attribute="host",
+            value=scenario.EXFIL_HOST,
+        ),
+        caption="The first upload chunk to the file-sharing host.",
+    ),
+    DemoBlock(
+        "view_ref",
+        view="Callbacks and uploads",
+        timeline="Network",
+        limit=50,
+    ),
+    DemoBlock(
+        "markdown",
+        text="## What is not part of this",
+    ),
+    DemoBlock(
+        "markdown",
+        text="Two things in the same window are unrelated and worth stating so nobody "
         "re-investigates them:\n\n"
         "- APP-01's clock drifts against NTP, so its records land slightly out of "
         "order. It has done this all month.\n"
         "- The nightly backup moved from 02:15 to 03:40 on the 25th, in an approved "
         "change window.",
     ),
-    (
-        "markdown",
-        "## Recommendations",
+    DemoBlock(
+        "chart_ref",
+        chart="Activity by hour and weekday",
+        timeline="Full incident",
     ),
-    (
+    DemoBlock(
         "markdown",
-        "1. Force a password reset for every contractor account and disable password "
+        text="Office hours dominate the whole estate, which is why the 02:00 and "
+        "overnight blocks above stand out at all.",
+    ),
+    DemoBlock(
+        "markdown",
+        text="## Recommendations",
+    ),
+    DemoBlock(
+        "markdown",
+        text="1. Force a password reset for every contractor account and disable password "
         "auth on FILE-01, which had drifted from the standard.\n"
         "2. Hunt estate-wide for `WinSysHealthSvc` and for the guillemet user agent — "
         "both are specific enough to be reliable pivots.\n"
@@ -531,38 +752,150 @@ def resolve_annotation_events(
         LookupError: If a selector matches nothing. A note hanging off no event
             is a broken demo, so the build fails rather than shipping it.
     """
-    database = clickhouse.database
     resolved: list[tuple[DemoAnnotation, str, str]] = []
     for annotation in ANNOTATIONS:
         source_id = source_ids[annotation.source_key]
-        conditions = [
-            "case_id = %(case_id)s",
-            "source_id = %(source_id)s",
-            "timestamp >= %(after)s",
-        ]
-        params: dict[str, Any] = {
-            "case_id": case_id,
-            "source_id": source_id,
-            "after": annotation.after.replace(tzinfo=None),
-        }
-        if annotation.attribute is not None:
-            params["attribute"] = annotation.attribute
-            if annotation.value is not None:
-                conditions.append("attributes[%(attribute)s] = %(value)s")
-                params["value"] = annotation.value
-        if annotation.contains is not None:
-            target = "attributes[%(attribute)s]" if annotation.attribute else "message"
-            conditions.append(f"position({target}, %(contains)s) > 0")
-            params["contains"] = annotation.contains
-        sql = (
-            f"SELECT toString(event_id) FROM {database}.events"
-            f" WHERE {' AND '.join(conditions)} ORDER BY timestamp ASC LIMIT 1"
+        event_id = first_event_id(
+            clickhouse,
+            case_id,
+            source_id,
+            annotation.after,
+            attribute=annotation.attribute,
+            value=annotation.value,
+            contains=annotation.contains,
         )
-        rows = clickhouse.client.query(sql, parameters=params).result_rows
-        if not rows:
+        if event_id is None:
             raise LookupError(f"demo annotation matched no event: {annotation.note[:60]}…")
-        resolved.append((annotation, source_id, rows[0][0]))
+        resolved.append((annotation, source_id, event_id))
     return resolved
+
+
+def first_event_id(
+    clickhouse: Any,
+    case_id: str,
+    source_id: str,
+    after: datetime,
+    *,
+    attribute: str | None = None,
+    value: str | None = None,
+    contains: str | None = None,
+) -> str | None:
+    """The earliest event in *source_id* at or after *after* matching the selector.
+
+    Shared by the annotations and the story's ``event_ref`` blocks so both
+    anchor the same way. Returns None when nothing matches; each caller
+    decides how loud that is.
+    """
+    conditions = [
+        "case_id = %(case_id)s",
+        "source_id = %(source_id)s",
+        "timestamp >= %(after)s",
+    ]
+    params: dict[str, Any] = {
+        "case_id": case_id,
+        "source_id": source_id,
+        "after": after.replace(tzinfo=None),
+    }
+    if attribute is not None:
+        params["attribute"] = attribute
+        if value is not None:
+            conditions.append("attributes[%(attribute)s] = %(value)s")
+            params["value"] = value
+    if contains is not None:
+        target = "attributes[%(attribute)s]" if attribute else "message"
+        conditions.append(f"position({target}, %(contains)s) > 0")
+        params["contains"] = contains
+    sql = (
+        f"SELECT toString(event_id) FROM {clickhouse.database}.events"
+        f" WHERE {' AND '.join(conditions)} ORDER BY timestamp ASC LIMIT 1"
+    )
+    rows = clickhouse.client.query(sql, parameters=params).result_rows
+    return rows[0][0] if rows else None
+
+
+def resolve_story_blocks(
+    clickhouse: Any,
+    case_id: str,
+    source_ids: dict[str, str],
+    view_ids: dict[str, str],
+    chart_ids: dict[str, str],
+    timeline_ids: dict[str, str],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Turn ``STORY_BLOCKS`` into ``(kind, content)`` pairs with real ids.
+
+    Args:
+        clickhouse: A live ``ClickHouseStore``.
+        case_id: The case being built.
+        source_ids: Source key to source id.
+        view_ids: View name to view id.
+        chart_ids: Chart name to saved-chart id.
+        timeline_ids: Timeline name to timeline id.
+
+    Returns:
+        One ``(kind, content)`` pair per block, content in the shape
+        ``stories.schemas.validate_block_content`` accepts.
+
+    Raises:
+        LookupError: If an ``event_ref`` selector matches nothing — a story
+            block pointing at no event is a broken demo, same rule as the
+            annotations.
+        KeyError: If a block names a view, chart or timeline that was not
+            created, which can only be a typo in this module.
+    """
+    blocks: list[tuple[str, dict[str, Any]]] = []
+    for block in STORY_BLOCKS:
+        if block.kind == "markdown":
+            blocks.append(("markdown", {"text": block.text or ""}))
+        elif block.kind == "view_ref":
+            blocks.append(
+                (
+                    "view_ref",
+                    {
+                        "view_id": view_ids[block.view or ""],
+                        "timeline_id": timeline_ids[block.timeline],
+                        "display": {"limit": block.limit, "columns": None},
+                    },
+                )
+            )
+        elif block.kind == "chart_ref":
+            blocks.append(
+                (
+                    "chart_ref",
+                    {
+                        "chart_id": chart_ids[block.chart or ""],
+                        "timeline_id": timeline_ids[block.timeline],
+                    },
+                )
+            )
+        elif block.kind == "event_ref":
+            pick = block.event
+            if pick is None:
+                raise ValueError("event_ref demo block carries no selector")
+            source_id = source_ids[pick.source_key]
+            event_id = first_event_id(
+                clickhouse,
+                case_id,
+                source_id,
+                pick.after,
+                attribute=pick.attribute,
+                value=pick.value,
+                contains=pick.contains,
+            )
+            if event_id is None:
+                raise LookupError(f"demo story block matched no event: {block.caption!r}")
+            blocks.append(
+                (
+                    "event_ref",
+                    {
+                        "event_id": event_id,
+                        "source_id": source_id,
+                        "caption": block.caption,
+                    },
+                )
+            )
+        else:
+            raise ValueError(f"unknown demo block kind {block.kind!r}")
+    return blocks
 
 
 def baseline_windows() -> list[dict[str, str]]:

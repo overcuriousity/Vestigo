@@ -1,9 +1,41 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-02 (session 150 — sixth review pass on PR 230, and the 1.9.0 cut).
+Last updated: 2026-08-02 (session 151 — the demo story now demonstrates a story).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 151 — 2026-08-02: the demo story now demonstrates a story
+
+**Why.** The seeded demo case shipped a story made of fourteen markdown blocks and nothing
+else. It reads well, but it is the only worked example most users ever see, and it silently
+taught that a Vestigo story is a text editor — no embedded view, no chart, no frozen event.
+The demo case also created no saved charts at all, so the Visualization page was empty on a
+first login.
+
+- **Four saved charts** (`demo/metadata.py::CHARTS`): failed logons over the month (time,
+  filtered to 4625), where the traffic goes (bar on `host`), upload sizes (histogram on
+  `bytes_out`), activity by hour and weekday (punchcard). Written as stored `ChartConfig`s —
+  the frontend's camelCase `v: 1` shape — and parsed through the export path's
+  `_stored_chart_to_spec` in a test, because a config in the wrong shape draws nothing,
+  silently, in every consumer.
+
+- **The story uses all four block kinds.** `STORY_BLOCKS` became a tuple of `DemoBlock`s that
+  name their referents by view/chart/timeline *name*; `resolve_story_blocks` swaps in the real
+  ids at seed time. Each claim that rests on evidence is now followed by the evidence: the
+  spray's first 4625 and the encoded PowerShell as `event_ref`s, the matching saved filter set
+  as a `view_ref`, the shape as a `chart_ref`.
+
+- **The seed applies the same two gates every other write path applies** —
+  `validate_block_content` then `validate_block_scope` — so a mistyped referent fails the
+  build instead of shipping as a frozen `resolution.error` in someone's first export.
+
+- **`first_event_id` is now shared** by the annotations and the story's event blocks; the
+  annotation resolver lost its inline copy of the query.
+
+- Tests: `test_story_embeds_resolve_into_a_snapshot` seeds the case and resolves the real
+  export snapshot against live ClickHouse, asserting every block resolves with data;
+  `test_story_has_a_narrative_arc` now requires the block-kind set to be complete.
 
 ## Session 150 — 2026-08-02: sixth review pass on PR 230, and the 1.9.0 cut
 

@@ -425,6 +425,33 @@ analyst-only. Parity covers analytical contribution, not document arrangement
 or the attestation act — an export is a human sign-off by design. Revisit
 trigger: a user asks the agent to restructure a story.
 
+## The demo case's story
+
+The seeded demo case (`src/vestigo/demo/`) ships one story, and it deliberately
+uses **all four block kinds** — it is the only worked example most users see
+before writing their own, and a story made of nothing but prose teaches that
+the subsystem is a text editor.
+
+- `demo/metadata.py::STORY_BLOCKS` is a tuple of `DemoBlock`s that name their
+  referents (`view="Service installs"`, `chart="Upload sizes"`,
+  `timeline="Network"`) rather than carrying ids, because ids only exist once
+  the case is built. `resolve_story_blocks` swaps in the real ids at seed time
+  and resolves each `event_ref` selector against ClickHouse with the same
+  `first_event_id` query the demo annotations use — an embed pointing at no
+  event fails the seed rather than shipping.
+- `demo/metadata.py::CHARTS` are saved `ChartConfig`s (stored camelCase shape,
+  `v: 1`) created on the demo's timelines, so the Visualization page is
+  populated on first login and the story's `chart_ref` blocks have something
+  real to re-run.
+- `demo/build.py` runs every block through `validate_block_content` and
+  `validate_block_scope` before writing it — the same two gates the HTTP router
+  and the agent go through. A wrong referent otherwise surfaces only much later,
+  as a frozen `resolution.error` in an export.
+- `tests/test_demo_build_clickhouse.py::test_story_embeds_resolve_into_a_snapshot`
+  exports the seeded story end to end and asserts no block resolves to an
+  error — keep it green when retuning demo sources, since a renamed field or a
+  moved phase boundary breaks an embed silently.
+
 ## Frontend map (`frontend/src/components/stories/`)
 
 - `StoriesPage` / `StoriesPanel` — list and case-overview entry point.
