@@ -16,18 +16,24 @@ queue is feature-shaped.
 1. **D11** entropy bigram variant — closes a capability gap the shipped docs
    used to overclaim; truth of what we ship outranks new surface. (D14, the other
    truth-of-claims item, shipped in 1.8.6.)
-2. **A12** local transform tools — no design round needed, no OPSEC gate.
-3. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
+2. **N1** ASN enricher — the cheapest item on this list and the only one that came from an
+   analyst rather than an audit; answers "who operates this IP" on every existing timeline,
+   not only pcap ones.
+3. **A12** local transform tools — no design round needed, no OPSEC gate.
+4. **D12** time-of-day habit, **D13** cross-field correlation, **D15** impossible-speed
    transitions — cheap detectors reusing existing SQL machinery, high forensic payoff.
-4. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
-5. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
-6. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
+5. **N2** pcap HTTP reassembly — analyst-reported too, but it is a real TCP reassembler, so
+   it lands behind the cheap detectors rather than beside N1.
+6. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
+7. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
+8. **D10** correlation rules, **D16** multivariate window profiles — heaviest lifts, last of
    the detector line.
 
-Milestone 2–3 items are polish, picked up opportunistically. Milestones 6 (streaming
-ingest) and 7 (forensic examination) are future phases gated on a joint S1+E1 design
-round — **standing rule: when either resumes, both are designed together in one
-`MODEL_REFINEMENT.md` round, so the data model migrates once, not twice.**
+Milestone 2–3 items are polish, picked up opportunistically. Milestone 9 is additive work on
+shipped subsystems and needs no design round. Milestones 6 (streaming ingest) and 7 (forensic
+examination) are future phases gated on a joint S1+E1 design round — **standing rule: when
+either resumes, both are designed together in one `MODEL_REFINEMENT.md` round, so the data
+model migrates once, not twice.**
 
 ## Milestone 2 — visualization gaps
 
@@ -382,7 +388,12 @@ Source (evidence unit, hashed)
   per artifact). Hierarchy via materialized `path` + `parent_artifact_id` — no graph store,
   no new backing services.
 - [ ] **E4 — Artifact detail UI.** Blob store (generalize the existing content-addressed
-  source retention) + viewers (hex/text/image).
+  source retention) + viewers (hex/text/image). Also the landing place for N3's extracted
+  HTTP payloads — inline image rendering and a per-file download link need somewhere to put
+  bytes, which is exactly what this item builds, so the converter side deliberately stops at
+  hashes plus local extraction until it exists. Threat model is shared and non-trivial:
+  RBAC on blob reads, quotas, inclusion in `transfer/` export, and a preview endpoint that
+  never serves stored bytes as `text/html`.
 - [ ] **E5 — Examination extras.** Hashsets (NSRL/known-bad join on `content_hash` via a
   ClickHouse dictionary), image gallery, content keyword search (extracted-text column +
   tokenbf index).
@@ -429,6 +440,112 @@ reworked in 1.5.0 — a sliding context window replaced compaction + fidelity la
     network tools and their endpoints.
   - **Doc.** Update `docs/AGENT.md`'s sandbox invariant ("the agent queries the backend in
     its own loop"), which external tools genuinely widen.
+
+## Milestone 9 — network evidence depth (analyst feedback 2026-08-05)
+
+Two requests from an analyst working a pcap-derived timeline: reassembled HTTP payload, and
+IP addresses enriched with the operating provider. Both are additive to shipped subsystems
+(the enricher framework, `pcap2vestigo`) and neither needs a design round. The half that
+*does* — rendering payloads and serving extracted files from the server — is not here; it is
+E4's blob store, and N3 says why.
+
+- [ ] **N1 — ASN / network-operator enricher.** A second enricher mirroring
+  `enrichers/geoip.py` over MaxMind's GeoLite2-ASN database, outputting the announcing AS
+  number and organization per IP-shaped attribute value (`src_ip:asn_org`, …). The framework
+  is already generic: the asset upload flow is driven off `Enricher.asset_spec`
+  (`api/routers/admin.py`), `derived_suffixes` is computed from the registry
+  (`api/routers/events.py`), and the per-`(case_id, source_id)` apply lock
+  (`enrichers/jobs.py`) exists precisely so two enrichers can write one source without their
+  `REPLACE PARTITION` swaps clobbering each other. `geoip2` is already a dependency and its
+  reader has `.asn()` — no new deps, no admin UI work.
+  - **Refactor, don't copy.** `spawn()`/`_pin()` (hash the same fd you read, `MODE_FD`,
+    `config_extras()` from the pinned identity) and the sidecar helpers in
+    `enrichers/geoip.py` are generic MaxMind mechanics, not geo mechanics. Extract a shared
+    `MaxMindEnricher` base; duplicating ~120 lines of provenance-critical code is where the
+    bug would live.
+  - **Call it ASN, never whois.** GeoLite2-ASN gives the announcing AS number and
+    organization — usually the hosting provider, which is what was actually asked for. It
+    carries no netname, registrant, abuse contact or allocation date. RIR whois needs the
+    network and is A8's job, not an enricher's; say so in `display_name` and the enricher
+    docs, or the gap comes back as a bug report.
+  - **Decide IPv6 in the same round.** `IPV4_REGEX` (`enrichers/geoip.py`) is the eligibility
+    gate and is IPv4-only — and pcap timelines are exactly where IPv6 turns up, so shipping
+    N1 for pcap users without it half-solves the request. The pattern is documented as an
+    eligibility gate rather than a validator (`enrich_value` validates via `ipaddress`), so a
+    loose re2-compatible alternation is acceptable. Cost: changing that regex changes GeoIP's
+    `config_hash()`, so already-enriched sources report a new hash. Do it deliberately in the
+    same commit or leave it out — not as a side effect.
+  - **Frontend:** `getAttributeDecoration` returns the *first* matching decorator
+    (`frontend/src/lib/enrichment.ts`), so with GeoIP and ASN both firing on `src_ip` only the
+    flag renders. Merge the operator name into the existing label instead of adding a second
+    decorator that never runs. Also revise the "today GeoIP is the only enricher, so suffixes
+    are unique" note in `db/clickhouse.py` — `asn_*` vs `geo_*` keeps it true, but it stops
+    being self-evident once there are two.
+
+- [ ] **N2 — `pcap2vestigo --reassemble http`.** TCP stream reassembly plus HTTP/1.x framing
+  in the converter, emitting one `network:http:transaction` row per request/response *in
+  addition to* the existing per-packet rows — packet rows are the forensic floor, the
+  transaction row is derived convenience. Stdlib-only (no dpkt/scapy, preserving the
+  converter's pyarrow-only dependency), so the work is a real reassembler: per-flow
+  sequence-ordered buffering, ISN tracking, retransmit/overlap handling, gap tolerance,
+  FIN/RST teardown, idle eviction, then chunked encoding, keep-alive pipelining,
+  `Content-Encoding` (stdlib zlib) and 100-continue. Roughly 400–600 lines; not a flag-sized
+  change.
+  - **Reuse the shipped HTTP field names.** `nginx2vestigo.py` already emits `http_method`,
+    `http_uri`, `http_protocol`, `http_request_full`. Same names here, so a pcap timeline and
+    a webserver-log timeline filter identically and saved Views port across sources. Field
+    names become an API the moment an analyst saves a View on them: cheap to get right at
+    design time, expensive afterwards.
+  - **Provenance needs a stated new convention.** The module docstring guarantees
+    `content_hash` covers a contiguous `byte_offset`-anchored span on disk; a reassembled
+    transaction spans N non-contiguous packet records, so that contract breaks. Decide and
+    document: `byte_offset` = the record carrying the request line; `content_hash` = sha256
+    over the concatenated contributing record spans in capture order (deterministic and
+    re-derivable, but explicitly *not* a contiguous span); plus an attribute listing those
+    offsets so an examiner can reconstruct the exact input. Record the flag in
+    `META_PARSE_DECISIONS`, which today carries only `since`/`until` — it changes which rows
+    exist.
+  - **Hostile input.** `_MAX_RECORD_BYTES` exists because pcap length fields are
+    attacker-controlled; reassembly needs the equivalent — caps on per-stream buffered bytes,
+    on concurrently tracked streams (LRU eviction), on decompressed body size (gzip bomb), and
+    on header count/size. A malicious capture is a routine input here: it is evidence from an
+    incident.
+  - **State the limits in `--help`:** no HTTPS (most real traffic), no HTTP/2 or /3 (binary
+    framing + HPACK), and nothing useful from a snaplen-truncated or single-direction capture.
+    Unstated, each of those arrives as a bug report.
+  - Parallelism is unaffected (workers are per file, TCP streams do not cross files), but rows
+    stop being strictly in file order — a transaction emits when it completes. Harmless, since
+    the server sorts on query, but the docstring claims otherwise and needs a sentence. Bump
+    `CONVERTER_VERSION` and regenerate `manifest.json` (`tests/test_converters_api.py` asserts
+    sha256 + size). Fixtures belong in `tests/data/gen_pcap_fixtures.py`: at minimum a chunked
+    body, a retransmit and an out-of-order segment. New fields go in `docs/INPUT_FORMATS.md`.
+
+- [ ] **N3 — HTTP payload: hashes in the timeline, bytes on the analyst's disk.** Ships with
+  or just after N2, in three deliberately separated tiers:
+  1. *Always:* the cheap metadata (`http_status`, `http_host`, `http_content_type`,
+     `http_content_length`, `http_user_agent`, `http_referer`) plus
+     `http_response_body_sha256`. The full-body hash is the forensically valuable part, costs
+     32 bytes, and lets an analyst pivot against known-file lists without the bytes ever
+     entering the database.
+  2. *Opt-in, capped:* `--max-body-bytes` (default off or small), text-ish media types only
+     (`text/*`, JSON, form-encoded), with an explicit truncation marker.
+  3. *Opt-in, local:* `--extract-files DIR` writes reassembled bodies to disk on the analyst's
+     machine, named by sha256, with the event carrying hash, filename and media type. No
+     server change, and it keeps malware samples out of ClickHouse and out of `.vestigo`
+     exports.
+  - **Why bodies never go in `attributes`:** `search_blob` is a MATERIALIZED lowercased concat
+    of `mapValues(attributes)` with an ngram bloom index over it (`db/clickhouse.py`). Base64
+    bodies would inflate that column and poison the index's selectivity for *every* query on
+    the timeline, not only the rows carrying bodies. That is the constraint deciding this
+    design, not a preference.
+  - **Policy, not only storage:** HTTP bodies carry credentials, session cookies, PII and
+    malware, and a `.vestigo` export is an archive an analyst carries off the box. Body
+    capture defaults off, and `--help` says what it captures.
+  - The server-side half — images rendered inline, a download link per extracted file — needs
+    somewhere to put bytes, and there is nowhere today: events are `Map(String, String)` and
+    `source_retention_path` retains the uploaded `.parquet`, not the pcap. That is E4's blob
+    store and viewers; it arrives with that milestone rather than riding in on a converter
+    flag.
 
 ## Explicitly out of scope & standing decisions (with revisit triggers)
 

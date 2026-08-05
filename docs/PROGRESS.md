@@ -1,9 +1,47 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-02 (session 151 — the demo story now demonstrates a story).
+Last updated: 2026-08-05 (session 152 — analyst feedback on a pcap timeline triaged into
+Milestone 9).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 152 — 2026-08-05: pcap-timeline feedback triaged into a network-evidence milestone
+
+**Why.** An analyst working a pcap-derived timeline asked for two things: reassembled HTTP
+payload from the capture, and IP addresses enriched with the operating provider. No code
+changed this session — the work was establishing what each request actually costs against the
+shipped code, and splitting the one that turned out to be two requests wearing one coat.
+
+- **Milestone 9 added to `ROADMAP.md`** with three items (`N` prefix, previously unused). N1 is
+  the ASN enricher, N2 the pcap HTTP reassembly, N3 the payload-handling tiers. N1 and N2 enter
+  the priority list at 2 and 5.
+
+- **The enricher framework needs no work to take a second enricher.** Verified: the asset
+  upload flow is generic over `Enricher.asset_spec`, `derived_suffixes` comes from the
+  registry, and the per-`(case_id, source_id)` apply lock in `enrichers/jobs.py` was written
+  precisely so two enrichers cannot clobber each other's `REPLACE PARTITION`. `geoip2` already
+  ships and its reader has `.asn()`. The one real change is extracting the MaxMind
+  pinning/sidecar mechanics out of `geoip.py` into a shared base rather than copying them.
+
+- **ASN is not whois, and the roadmap now says so at the item.** GeoLite2-ASN gives the
+  announcing AS number and organization; netname, registrant and abuse contact need RIR whois,
+  which needs the network, which is A8's external-MCP path. Recorded so the gap is not
+  rediscovered as a defect.
+
+- **Reassembly's real cost is provenance, not parsing.** The converter's docstring guarantees
+  `content_hash` covers a contiguous `byte_offset`-anchored span on disk; a reassembled HTTP
+  transaction spans N non-contiguous packet records, so N2 has to state a new convention rather
+  than inherit the old one. Filed with the shape of that convention.
+
+- **The payload request splits at the storage layer.** Metadata, body hashes and local file
+  extraction are converter work and land in N3. Rendering images inline and serving download
+  links needs a blob store, and there is none: events are `Map(String, String)` and
+  `source_retention_path` retains the uploaded `.parquet`, not the pcap. Base64 bodies in
+  `attributes` are additionally ruled out because `search_blob` concatenates every attribute
+  value under an ngram bloom index, so bodies would degrade query selectivity timeline-wide.
+  That half is now cross-referenced from E4, whose blob store plus hex/text/image viewers is
+  the same component.
 
 ## Session 151 — 2026-08-02: the demo story now demonstrates a story
 
