@@ -1,10 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-05 (session 152 — analyst feedback on a pcap timeline triaged into
-Milestone 9).
+Last updated: 2026-08-05 (session 153 — N1 ASN enricher shipped in 1.10.0).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 153 — 2026-08-05: N1 shipped — ASN enricher and IPv6 eligibility
+
+**Why.** First item off Milestone 9 (analyst feedback from a pcap timeline): "who operates
+this IP" on every timeline, not only pcap ones. The framework needed no work — upload flow,
+`derived_suffixes`, and the per-source apply lock were already generic — so the session was
+the enricher module itself plus two deliberate decisions the roadmap had flagged.
+
+- **`enrichers/asn.py`, self-contained by design.** The roadmap had advised extracting a
+  shared `MaxMindEnricher` base from `geoip.py`; that was deliberately declined at plan
+  review. Enrichers are modular reference plugins (like the ingestion converters) and are
+  meant to stay independent, so `asn.py` mirrors the MaxMind mechanics (spawn/pin with
+  `MODE_FD`, sidecar identity, flavor-checked install) instead of importing them.
+  `ROADMAP.md`'s Milestone 9 records the divergence so a future reader doesn't "fix" it.
+
+- **ASN, never whois.** Output is the announcing AS number and organization
+  (`<attr>:asn_number`, `<attr>:asn_org`) — usually the hosting provider, which is what the
+  analyst asked for. `display_name`, `description`, and the module docstring state what the
+  database does *not* carry (netname, registrant, abuse contact, allocation dates); RIR
+  whois remains A8's external-MCP path.
+
+- **IPv6 landed in the same commit, for both enrichers.** GeoLite2 City and ASN both carry
+  IPv6 networks, and pcap timelines are where IPv6 turns up, so the eligibility regex became
+  a combined IPv4+IPv6 re2 pattern (`IP_REGEX`; still a gate, `enrich_value` validates via
+  `ipaddress`). Accepted cost: GeoIP's `config_hash()` changed, so previously enriched
+  sources report a new hash and are offered re-enrichment. Recorded in `CHANGELOG.md`.
+
+- **Explorer merges both enrichers into one cell decoration.** `getAttributeDecoration`
+  returns the first matching decorator, so the GeoIP decorator now appends the operator to
+  its tooltip ("Frankfurt, Germany — AS12345 Example Hosting") and falls back to an "AS"
+  marker when only ASN output exists. No admin-UI work: the dialog and config page were
+  already registry-driven.
+
+- **Tests mirror the GeoIP suite for ASN** (`tests/test_enrichers.py`,
+  `tests/test_admin_enrichers_api.py`) using the same fake-`Reader` pattern; frontend label
+  merge covered in `enrichment.test.ts`. 61 backend + 13 frontend tests pass.
 
 ## Session 152 — 2026-08-05: pcap-timeline feedback triaged into a network-evidence milestone
 

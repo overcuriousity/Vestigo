@@ -755,8 +755,8 @@ class ClickHouseStore:
         (mapUpdate alone only overwrites keys that are re-emitted). Left None
         for callers that only add keys; then nothing is stripped. Note: if two
         enrichers ever shared an output-field suffix, one's apply would strip
-        the other's keys — today GeoIP is the only enricher, so suffixes are
-        unique.
+        the other's keys — suffixes must stay unique across enrichers (today
+        ``geo_*`` vs ``asn_*`` keeps that true).
 
         Transiently doubles the partition's disk footprint (scratch copy).
         Caller must serialize applies per ``(case_id, source_id)`` — two

@@ -214,3 +214,71 @@ def test_list_enrichers_reports_geoip_unavailable(client, admin_bootstrap, store
     geoip_entry = next((e for e in enrichers if e["key"] == "geoip"), None)
     assert geoip_entry is not None
     assert geoip_entry["available"] is False
+
+
+class _FakeASNReader(_FakeReader):
+    database_type = "GeoLite2-ASN"
+
+
+def test_city_database_rejected_for_asn_enricher(
+    client, admin_bootstrap, store, tmp_path, monkeypatch
+):
+    import geoip2.database
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)  # City-flavored
+    monkeypatch.setattr(
+        "vestigo.enrichers.asn.asn_database_path", lambda: tmp_path / "GeoLite2-ASN.mmdb"
+    )
+
+    as_admin(client, admin_bootstrap)
+    resp = client.post(
+        "/api/admin/enrichers/asn/asset",
+        files={
+            "file": (
+                "GeoLite2-City.mmdb",
+                io.BytesIO(b"city db bytes"),
+                "application/octet-stream",
+            )
+        },
+    )
+    assert resp.status_code == 400
+    assert "GeoLite2-City" in resp.json()["detail"]
+    assert "ASN database" in resp.json()["detail"]
+    # Nothing installed.
+    assert not (tmp_path / "GeoLite2-ASN.mmdb").exists()
+
+
+def test_asn_database_upload_installs_and_writes_sidecar(
+    client, admin_bootstrap, store, tmp_path, monkeypatch
+):
+    import hashlib
+
+    import geoip2.database
+
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.asn import ASNEnricher, read_asn_sidecar
+
+    target = tmp_path / "GeoLite2-ASN.mmdb"
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeASNReader)
+    monkeypatch.setattr("vestigo.enrichers.asn.asn_database_path", lambda: target)
+    # Other tests may have registered an ASN instance pinned to their own
+    # tmp path; pin a fresh default-path instance for this test only.
+    monkeypatch.setitem(registry._REGISTRY, "asn", ASNEnricher())
+
+    payload = b"asn db bytes"
+    as_admin(client, admin_bootstrap)
+    resp = client.post(
+        "/api/admin/enrichers/asn/asset",
+        files={"file": ("GeoLite2-ASN.mmdb", io.BytesIO(payload), "application/octet-stream")},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    assert body["detail"]["sha256"] == expected_sha
+    assert body["detail"]["build_epoch"] == 1700000000
+    assert body["detail"]["database_type"] == "GeoLite2-ASN"
+
+    assert target.read_bytes() == payload
+    sidecar = read_asn_sidecar(target)
+    assert sidecar["sha256"] == expected_sha
+    assert sidecar["database_type"] == "GeoLite2-ASN"
