@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.10.0] — 2026-08-05
+## [1.10.0] — 2026-08-06
 
 ### Added
 
@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both.
   - **A reassembled row's provenance is deliberately not a contiguous span.** It carries
     `byte_offset` = the record holding the request line, `content_hash` = sha256 over the
-    concatenated contributing records in capture order, and `packet_offsets` /
+    tag `vestigo:http-transaction:<index>` and then the concatenated contributing records in
+    capture order (the tag is what keeps a transaction carried by a single packet from
+    hashing that packet row's own bytes at that packet row's own offset), and
+    `packet_offsets` /
     `packet_count` so an examiner can reconstruct the exact input — plus `reassembled`,
     `byte_offset_basis` and `content_hash_basis` so the two conventions are never confused
     by inspection. The flag is recorded in `vestigo.parse_decisions`: it changes which rows
@@ -70,6 +73,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eligibility, one IPv6-shaped value would have failed the whole job for an operator whose
   uploaded `.mmdb` carries only IPv4. Both enrichers now check the database's address family
   first and treat such a lookup as an ordinary miss.
+
+### Fixed
+
+- **A single-packet HTTP transaction no longer collides with the packet row it came from.**
+  When a transaction's whole exchange fit in one record, its `content_hash` covered exactly
+  that record's bytes at exactly that record's `byte_offset` — the pair the server derives
+  `event_id` from — so two different events landed under one id, and an annotation keyed by
+  that id hit both. The hash now carries a transaction tag ahead of the records; it stays
+  re-derivable by hand, and the tests re-derive it.
+- **A body delimited only by connection close is bounded like every other body.** HTTP/1.0
+  (or `Connection: close` with no `Content-Length`) hit the one framing branch that checked
+  no cap, and the per-stream limit could not cover it, so a single large download grew the
+  converter's memory to the size of the response. It now takes the same verdict as an
+  over-long `Content-Length`: that flow dies, its packet rows survive, the run continues.
+- **Requests waiting for a response are capped.** A single-direction capture — the case
+  `--help` already warned yields flagged-or-nothing — queued one unanswered request per
+  request for the length of the run. The overflow is emitted as an `http_response_missing`
+  transaction rather than dropped: evidence that arrived should not vanish because its
+  answer did not.
+- **Pipelined responses are framed against their own request.** A `HEAD` and a `GET`
+  answered within one packet framed the second response with the first's method, reporting a
+  body of zero bytes and desyncing everything behind it.
+- **A transaction is stamped with the request's first captured byte**, as the format
+  documentation always said — not with whichever packet completed the header block, which
+  with an out-of-order start is a later packet and, when one arrival drives both directions,
+  could even be the peer's. `duration_ms` inherited the same skew.
+- **A non-first IPv6 fragment is no longer decoded as TCP.** IPv4 had the guard; IPv6 handed
+  the fragment's body bytes to the L4 decoder, inventing ports and a sequence number — and,
+  under `--reassemble`, a phantom flow built from payload. IPv6 packet rows now carry
+  `fragment_offset` as IPv4 rows already did.
+- **Records consumed before a skipped capture gap stay in the provenance.** They contributed
+  bytes to the message but were dropped from `packet_offsets` without a trace, which is
+  exactly the silent loss that list exists to prevent.
 
 ## [1.9.1] — 2026-08-02
 
