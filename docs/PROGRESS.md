@@ -1,9 +1,58 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-06 (session 155 — pcap2vestigo --reassemble http, Milestone 9 N2).
+Last updated: 2026-08-06 (session 156 — PR #238 review fixes on the pcap HTTP reassembler).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 156 — 2026-08-06: PR #238 review fixes (`pcap2vestigo` reassembler)
+
+**Why.** A review of session 155's work found seven defects, three of them reproduced by
+driving the reassembler directly. All are fixed here; nothing was deferred.
+
+- **Unbounded `until_close` bodies (memory).** `length` and chunked framing both checked
+  `_REASM_MAX_BODY_BYTES`; the connection-close-delimited branch checked nothing, and
+  `_REASM_MAX_STREAM_BYTES` could not save it — `_take` moves bytes *out* of the direction's
+  buffer and into the message, so `buffered` stays near zero while the body grows. One
+  HTTP/1.0 download was enough to grow the body and its retained record blobs to the size of
+  the response. It now takes the same verdict as an over-long `Content-Length`: the flow
+  dies, its packet rows survive.
+- **A transaction row could collide with a packet row's `event_id`.** With exactly one
+  contributing record, the transaction hashed that record's bytes at that record's offset —
+  the identical `(byte_offset, content_hash)` pair the packet row carries, and the server
+  derives `event_id` from those. Two different events landed under one id (the events table
+  is a plain `MergeTree`, so nothing deduplicated them), and any annotation keyed by id hit
+  both. Reproduced by the PR's own orphan-request test. `content_hash` now covers a
+  `vestigo:http-transaction:<index>\n` tag ahead of the records — still re-derivable by hand,
+  which the provenance test asserts, and `docs/INPUT_FORMATS.md` states the tag.
+- **Pipelined responses were framed against the wrong request.** `messages()` is a generator,
+  so its `peer_method` argument was frozen at generator-creation time; the caller's update
+  between responses was dead code. `HEAD /a` + `GET /b` answered in one packet framed the
+  `GET` response as bodyless and desynced the stream behind it. `peer_method` is now a
+  callable the framer asks at each message start, which is the only shape that is correct
+  for a generator resumed N times.
+- **The unanswered-request queue had no cap.** A single-direction capture — the exact case
+  `--help` says yields flagged-or-nothing — queued a request (with its records) per request,
+  forever. Capped at `_REASM_MAX_PENDING_REQUESTS`; the overflow is *emitted* as an
+  `http_response_missing` transaction rather than dropped, because evidence that arrived
+  should not vanish because its answer did not.
+- **`timestamp` was the packet that completed the header block**, not the request's first
+  captured byte as `INPUT_FORMATS.md` promised — off by a packet with an out-of-order start,
+  and worse across directions, since `_pump` drives both from one arrival and a server
+  message framed during a client packet inherited the client's clock. Each message now
+  carries the earliest capture time among the records attributed to it; `duration_ms`
+  inherited the same skew and is fixed with it.
+- **IPv6 had no first-fragment guard.** IPv4 refuses to decode L4 out of a non-first
+  fragment; IPv6 handed the fragment's body bytes straight to the TCP decoder, inventing
+  ports and a sequence number — and, under `--reassemble`, a phantom flow. Guarded, and
+  `fragment_offset` is now on IPv6 packet rows as it already was on IPv4 ones.
+- **Gap forwarding silently dropped provenance.** Records wholly inside a skipped span end at
+  or below the new base, so `_take` never attributed them and they left `packet_offsets`
+  without a trace — the comment claimed the opposite. They are credited at the jump.
+
+Each fix carries a regression test; all seven fail against the pre-fix converter. The
+`manifest.json` size/sha256 for the converter were refreshed. Version stays 1.4.0 — it has
+not shipped.
 
 ## Session 155 — 2026-08-06: `pcap2vestigo --reassemble http` (Milestone 9 N2)
 

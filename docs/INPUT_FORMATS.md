@@ -368,8 +368,9 @@ What is specific to it:
 
 `src/vestigo/assets/converters/pcap2vestigo.py` decodes pcap/pcapng captures to one row per
 packet (`network:packet:<protocol>`), down to the Ethernet/Linux-SLL/raw-IP, IPv4/IPv6 and
-TCP/UDP/ICMP/ARP headers. `byte_offset`/`content_hash` follow the normal contiguous-span
-convention: the classic-pcap record header plus captured data, or the whole pcapng block.
+TCP/UDP/ICMP/ARP headers. Only a first fragment carries an L4 header, so for IPv4 and IPv6
+alike a row with `fragment_offset` > 0 gets no port/sequence fields rather than invented
+ones. `byte_offset`/`content_hash` follow the normal contiguous-span convention: the classic-pcap record header plus captured data, or the whole pcapng block.
 
 `--reassemble http` adds a second row type. It is off by default.
 
@@ -377,7 +378,9 @@ convention: the classic-pcap record header plus captured data, or the whole pcap
   reassembled from the TCP streams — **in addition to** the packet rows, never instead of
   them. Packet rows are the forensic floor and are byte-identical whether or not the flag is
   used; the transaction row is derived convenience. `artifact_long` is `web:access:request`,
-  the same as an nginx access row, and `timestamp` is the request's first captured byte.
+  the same as an nginx access row, and `timestamp` is the request's first captured byte —
+  the earliest capture time among the records that carried it, which with an out-of-order
+  start is not the packet that completed the header block.
 - **Fields**, deliberately spelled as `nginx2vestigo` spells them so a pcap timeline and a
   webserver-log timeline filter identically and a saved View ports across both:
   `http_method`, `http_uri`, `http_protocol`, `http_request_full`, `status_code`. Plus, from
@@ -397,9 +400,13 @@ convention: the classic-pcap record header plus captured data, or the whole pcap
     the start of one packet, not of the transaction — and **not** necessarily the lowest
     contributing offset, since an out-of-order segment from later in the message can sit
     earlier in the file.
-  - `content_hash` = sha256 over the concatenation of every contributing record's raw span,
-    in capture order (ascending offset). Deterministic and re-derivable by hand, but not a
-    single `dd` span.
+  - `content_hash` = sha256 over the ASCII tag
+    `vestigo:http-transaction:<http_transaction_index>\n`, then the concatenation of every
+    contributing record's raw span, in capture order (ascending offset). Deterministic and
+    re-derivable by hand, but not a single `dd` span. The tag is not decoration: a
+    transaction carried by a single packet would otherwise hash exactly that packet row's
+    bytes at exactly that packet row's offset, and the server derives `event_id` from
+    `(…, byte_offset, content_hash, …)` — two different events under one id.
   - `packet_offsets` lists those offsets (`packet_count` holds the true count;
     `packet_offsets_truncated` marks a capped list), so an examiner can reconstruct the
     exact input.
@@ -417,8 +424,13 @@ convention: the classic-pcap record header plus captured data, or the whole pcap
   reassembled.
 - **Bounded against hostile captures** — the routine case, since this is incident evidence:
   per-stream buffered bytes, concurrently tracked flows (LRU eviction), header count and
-  size, framed and decompressed body size (compression bombs), and held out-of-order
-  segments. Breaching a cap kills that one flow, never the run, and its packet rows survive.
+  size, framed and decompressed body size (compression bombs), held out-of-order segments,
+  and framed requests still waiting for a response. Breaching a cap kills that one flow,
+  never the run, and its packet rows survive — except the request queue, whose overflow is
+  emitted as an `http_response_missing` transaction rather than discarded. A body delimited
+  only by connection close (HTTP/1.0, or `Connection: close` with no `Content-Length`) is
+  bounded by the same framed-body cap as a declared `Content-Length`, so a very large such
+  download is refused rather than buffered.
 
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 

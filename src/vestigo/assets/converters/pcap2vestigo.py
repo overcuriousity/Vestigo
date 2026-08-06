@@ -52,9 +52,13 @@ on disk (and may interleave with other connections' records):
   * ``byte_offset`` = the offset of the record carrying the request line — a
     real offset into the capture, but the start of one packet, not of the
     transaction,
-  * ``content_hash`` = sha256 over the concatenation of every contributing
-    record's raw span, taken in capture order (ascending ``byte_offset``).
-    Deterministic and re-derivable by hand, but **not** a single ``dd`` span,
+  * ``content_hash`` = sha256 over the ASCII prefix
+    ``vestigo:http-transaction:<http_transaction_index>\\n`` followed by the
+    concatenation of every contributing record's raw span, taken in capture
+    order (ascending ``byte_offset``). Deterministic and re-derivable by hand,
+    but **not** a single ``dd`` span. The prefix is what keeps a transaction
+    carried by a single packet from hashing that packet's own row bytes at that
+    packet's own offset — which the server would read as one and the same event,
   * ``packet_offsets`` lists those record offsets (``packet_count`` holds the
     true count; the list itself is capped, and ``packet_offsets_truncated``
     says so when it was), so an examiner can reconstruct the exact input.
@@ -91,7 +95,7 @@ import re
 import struct
 import sys
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -551,11 +555,15 @@ def _decode_ipv6(data: bytes) -> dict[str, Any] | None:
 
     remaining = data[40 : 40 + payload_length] if payload_length else data[40:]
 
+    fragment_offset = 0
     for _ in range(8):
         if next_header not in _IPV6_EXT_HEADERS or len(remaining) < 2:
             break
         if next_header == 44:  # Fragment header: fixed 8 bytes
             hdr_len_bytes = 8
+            if len(remaining) >= 4:
+                # Offset in 8-byte units, in the top 13 bits of the field.
+                fragment_offset = struct.unpack(">H", remaining[2:4])[0] >> 3
         else:
             hdr_ext_len = remaining[1]
             hdr_len_bytes = (hdr_ext_len + 1) * 8
@@ -566,6 +574,7 @@ def _decode_ipv6(data: bytes) -> dict[str, Any] | None:
 
     return {
         "hop_limit": hop_limit,
+        "fragment_offset": fragment_offset,
         "protocol_id": next_header,
         "protocol_name": _protocol_name(next_header),
         "src_ip": src_ip,
@@ -782,13 +791,18 @@ def build_row(
             raise _MalformedPacket("bad IPv6 header")
         attrs["ip_version"] = 6
         attrs["hop_limit"] = ip["hop_limit"]
+        attrs["fragment_offset"] = ip["fragment_offset"]
         attrs["protocol_id"] = ip["protocol_id"]
         src_ip, dst_ip = ip["src_ip"], ip["dst_ip"]
         protocol = ip["protocol_name"]
-        l4_segment = ip["payload"]
-        l4 = _decode_l4(protocol, l4_segment)
-        if l4:
-            attrs.update(l4)
+        # As for IPv4: only the first fragment carries the L4 header. A later
+        # fragment's payload is body bytes, and decoding it would invent ports
+        # and sequence numbers — and, with --reassemble, a phantom flow.
+        if ip["fragment_offset"] == 0:
+            l4_segment = ip["payload"]
+            l4 = _decode_l4(protocol, l4_segment)
+            if l4:
+                attrs.update(l4)
     else:
         attrs["ethertype"] = f"0x{ethertype:04x}"
 
@@ -840,6 +854,12 @@ _REASM_MAX_BODY_BYTES = 64 * 1024 * 1024
 _REASM_MAX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
 # Out-of-order segments held while waiting for the gap ahead of them to fill.
 _REASM_MAX_PENDING_SEGMENTS = 1024
+# Framed requests waiting to be paired with a response. Deep pipelining is rare;
+# an unbounded queue is really a single-direction capture (no response side ever
+# arrives), so the overflow is emitted as ``http_response_missing`` rather than
+# held forever. Not covered by _REASM_MAX_STREAM_BYTES: a consumed record's bytes
+# move out of the direction's buffer and into the message that carried them.
+_REASM_MAX_PENDING_REQUESTS = 256
 # Contributing record offsets listed on a transaction row before truncation.
 _REASM_MAX_LISTED_OFFSETS = 256
 # Idle sweep cadence, in packets fed to the reassembler.
@@ -849,6 +869,14 @@ _REASM_HTTP_PORTS = frozenset({80, 81, 591, 3128, 8000, 8008, 8080, 8081, 8088, 
 
 _RE_REQUEST_LINE = re.compile(rb"^([A-Z][A-Z_-]{1,19}) ([^ \r\n]{1,8192}) (HTTP/\d\.\d)\r?\n")
 _RE_STATUS_LINE = re.compile(rb"^(HTTP/\d\.\d) (\d{3})(?:[ \t]+([^\r\n]{0,256}))?\r?\n")
+
+# Hashed ahead of a transaction's contributing records, so a single-packet
+# transaction never produces the same content_hash as the packet row it derives
+# from (see ``_HttpReassembler._transaction``). ``%d`` is the transaction index.
+_REASM_HASH_PREFIX = b"vestigo:http-transaction:%d\n"
+
+# Requests are never framed against a peer method; see ``_HttpDirection.messages``.
+_NO_PEER_METHOD: Callable[[], str] = lambda: ""  # noqa: E731
 
 
 class _HttpMessage:
@@ -868,6 +896,7 @@ class _HttpMessage:
         "content_encoding",
         "records",
         "anchor_offset",
+        "first_ts",
         "start_ts",
         "end_ts",
         "complete",
@@ -889,6 +918,10 @@ class _HttpMessage:
         self.content_encoding = ""
         self.records: dict[int, bytes] = {}
         self.anchor_offset = -1
+        # Capture time of the earliest record that carried any byte of this
+        # message — its first captured byte, which is what the row is stamped
+        # with. -1 until a record is attributed.
+        self.first_ts = -1
         self.start_ts = start_ts
         self.end_ts = start_ts
         self.complete = False
@@ -971,8 +1004,8 @@ class _HttpDirection:
         self.base = 0
         self.data = bytearray()
         self.pending: dict[int, bytes] = {}
-        # (start, end, record_offset, record_bytes) in stream-offset space.
-        self.records: list[tuple[int, int, int, bytes]] = []
+        # (start, end, record_offset, record_bytes, ts) in stream-offset space.
+        self.records: list[tuple[int, int, int, bytes, int]] = []
         self.buffered = 0
         self.gap = False
         self.truncated = False
@@ -1018,7 +1051,7 @@ class _HttpDirection:
             payload = payload[contiguous_end - off :]
             off = contiguous_end
 
-        self.records.append((off, off + len(payload), record_offset, record_bytes))
+        self.records.append((off, off + len(payload), record_offset, record_bytes, ts))
         self.buffered += len(record_bytes) + len(payload)
 
         if off == contiguous_end:
@@ -1067,12 +1100,31 @@ class _HttpDirection:
         self.gap = True
         if self.msg is not None:
             self.msg.gap = True
-        # Records covering the skipped span still contributed to this message's
-        # provenance, so they stay in ``records`` and are attributed on consume.
         self.buffered -= len(self.data)
         self.data.clear()
         self.base = target
+        # Records that end at or before the new base can never be attributed by
+        # ``_take`` again (it only looks at records reaching past it), so credit
+        # their provenance here — they did carry bytes of this message — before
+        # dropping them.
+        keep: list[tuple[int, int, int, bytes, int]] = []
+        for record in self.records:
+            if record[1] > self.base:
+                keep.append(record)
+                continue
+            self._attribute(record)
+            self.buffered -= len(record[3])
+        self.records = keep
         self._drain()
+
+    def _attribute(self, record: tuple[int, int, int, bytes, int]) -> None:
+        """Credit one capture record to the message currently being framed."""
+        message = self.msg
+        if message is None:
+            return
+        message.records.setdefault(record[2], record[3])
+        if message.first_ts < 0 or record[4] < message.first_ts:
+            message.first_ts = record[4]
 
     def _release(self) -> None:
         self.data.clear()
@@ -1085,10 +1137,10 @@ class _HttpDirection:
         """Consume ``count`` bytes, attributing the records that carried them."""
         chunk = bytes(self.data[:count])
         start, end = self.base, self.base + count
-        keep: list[tuple[int, int, int, bytes]] = []
+        keep: list[tuple[int, int, int, bytes, int]] = []
         for record in self.records:
-            if record[1] > start and record[0] < end and self.msg is not None:
-                self.msg.records.setdefault(record[2], record[3])
+            if record[1] > start and record[0] < end:
+                self._attribute(record)
             if record[1] > end:
                 keep.append(record)
             else:
@@ -1103,12 +1155,17 @@ class _HttpDirection:
 
     # -- HTTP framing ------------------------------------------------------
 
-    def messages(self, ts: int, peer_method: str, at_close: bool) -> Iterator[_HttpMessage]:
+    def messages(
+        self, ts: int, peer_method: Callable[[], str], at_close: bool
+    ) -> Iterator[_HttpMessage]:
         """Yield every message the buffered bytes now complete.
 
-        ``peer_method`` is the method of the request this response answers (a
-        response to HEAD has no body whatever its ``Content-Length`` says);
-        empty on the request side.
+        ``peer_method`` returns the method of the request the *next* response
+        answers (a response to HEAD has no body whatever its ``Content-Length``
+        says); it returns ``""`` on the request side. It is a callable, not a
+        value, because this is a generator: several pipelined responses can be
+        framed within one resumption, and each must be framed against its own
+        request, which the caller only dequeues as responses are yielded.
         """
         while not self.dead:
             if self.phase == "start":
@@ -1133,7 +1190,7 @@ class _HttpDirection:
         idx = self.data.find(b"\n\n")  # tolerate LF-only framing
         return idx + 2 if idx >= 0 else None
 
-    def _begin_message(self, header_end: int, ts: int, peer_method: str) -> bool:
+    def _begin_message(self, header_end: int, ts: int, peer_method: Callable[[], str]) -> bool:
         """Parse one start line + header block. False kills or stalls the direction."""
         head = bytes(self.data[:header_end])
         if self.is_request_side:
@@ -1173,7 +1230,7 @@ class _HttpDirection:
                 break
 
         self._take(header_end)
-        self._start_body(message, headers, peer_method)
+        self._start_body(message, headers, peer_method())
         return True
 
     def _start_body(self, message: _HttpMessage, headers: dict[str, str], peer_method: str) -> None:
@@ -1229,6 +1286,14 @@ class _HttpDirection:
 
         if self.body_mode == "until_close":
             if self.data:
+                # Nothing on the wire declares where this body ends, so the cap
+                # is the only bound there is. Same verdict as an over-long
+                # Content-Length or chunk size: the flow dies, its packet rows
+                # survive.
+                if len(self.body) + len(self.data) > _REASM_MAX_BODY_BYTES:
+                    self.dead = True
+                    self._release()
+                    return None
                 self.body += self._take(len(self.data))
             if not at_close:
                 return None
@@ -1303,6 +1368,12 @@ class _HttpDirection:
             return None
         message.body_bytes = len(self.body)
         message.complete = not partial
+        # Stamp the message with its own first captured byte, not with whichever
+        # packet happened to complete the framing — that packet can belong to
+        # the other direction (``_pump`` drives both from one arrival) or, with
+        # an out-of-order start, arrive after bytes that came earlier.
+        if message.first_ts >= 0:
+            message.start_ts = message.first_ts
         message.end_ts = max(self.last_ts, message.start_ts)
         message.gap = message.gap or self.gap
         message.truncated = message.truncated or self.truncated
@@ -1469,9 +1540,17 @@ class _HttpReassembler:
         self, flow: _HttpFlow, ts: int, at_close: bool
     ) -> list[tuple[int, bytes, dict[str, Any]]]:
         rows: list[tuple[int, bytes, dict[str, Any]]] = []
-        for request in flow.client.messages(ts, "", at_close):
+        for request in flow.client.messages(ts, _NO_PEER_METHOD, at_close):
             flow.requests.append(request)
-        peer_method = flow.requests[0].method if flow.requests else ""
+            # A queue this deep is a capture with no response side, not real
+            # pipelining: retire the oldest unanswered request instead of
+            # holding its records for the rest of the run.
+            while len(flow.requests) > _REASM_MAX_PENDING_REQUESTS:
+                rows.append(self._transaction(flow, flow.requests.popleft(), None))
+
+        def peer_method() -> str:
+            return flow.requests[0].method if flow.requests else ""
+
         for response in flow.server.messages(ts, peer_method, at_close):
             if 100 <= response.status < 200 and response.status != 101:
                 continue  # interim (100-continue): the real response still follows
@@ -1487,7 +1566,6 @@ class _HttpReassembler:
                 flow.client._release()
                 flow.server._release()
                 break
-            peer_method = flow.requests[0].method if flow.requests else ""
         return rows
 
     def _finalize(self, flow: _HttpFlow) -> list[tuple[int, bytes, dict[str, Any]]]:
@@ -1568,7 +1646,15 @@ class _HttpReassembler:
             attrs["reassembly_truncated_capture"] = "true"
 
         offsets = sorted(records)
-        content_bytes = b"".join(records[offset] for offset in offsets)
+        # Domain separation. A transaction carried by a single packet would
+        # otherwise hash the exact bytes of that packet's own row, at the same
+        # byte_offset — and the server derives event_id from
+        # (…, byte_offset, content_hash, …), so the two rows would collide on
+        # one id. The prefix is fixed text plus the transaction's position in
+        # its connection, so the hash stays re-derivable by hand.
+        content_bytes = _REASM_HASH_PREFIX % flow.index + b"".join(
+            records[offset] for offset in offsets
+        )
         anchor = source.anchor_offset
         if anchor < 0:
             anchor = offsets[0] if offsets else 0
@@ -2214,8 +2300,9 @@ def main() -> int:
         "(binary framing + HPACK/QPACK), and a capture taken with a snaplen "
         "shorter than the frame or recording only one direction cannot be "
         "reassembled — such transactions come out flagged incomplete or not at "
-        "all. A reassembled row's content_hash covers the concatenated "
-        "contributing packet records, not a contiguous span on disk.",
+        "all. A reassembled row's content_hash covers a fixed transaction tag "
+        "plus the concatenated contributing packet records, not a contiguous "
+        "span on disk.",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="progress on stderr")
     args = parser.parse_args()
