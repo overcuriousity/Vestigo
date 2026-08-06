@@ -364,6 +364,74 @@ What is specific to it:
 - **Not resolved:** `%%1833`-style message-table references stay as-is (rendering them needs
   the originating host's WEVT templates), and `.evtx.gz` is not accepted.
 
+### `pcap2vestigo.py`: packet captures, optionally with HTTP reassembly
+
+`src/vestigo/assets/converters/pcap2vestigo.py` decodes pcap/pcapng captures to one row per
+packet (`network:packet:<protocol>`), down to the Ethernet/Linux-SLL/raw-IP, IPv4/IPv6 and
+TCP/UDP/ICMP/ARP headers. Only a first fragment carries an L4 header, so for IPv4 and IPv6
+alike a row with `fragment_offset` > 0 gets no port/sequence fields rather than invented
+ones. `byte_offset`/`content_hash` follow the normal contiguous-span convention: the classic-pcap record header plus captured data, or the whole pcapng block.
+
+`--reassemble http` adds a second row type. It is off by default.
+
+- **What it adds.** One `network:http:transaction` row per HTTP/1.x request/response,
+  reassembled from the TCP streams — **in addition to** the packet rows, never instead of
+  them. Packet rows are the forensic floor and are byte-identical whether or not the flag is
+  used; the transaction row is derived convenience. `artifact_long` is `web:access:request`,
+  the same as an nginx access row, and `timestamp` is the request's first captured byte —
+  the earliest capture time among the records that carried it, which with an out-of-order
+  start is not the packet that completed the header block.
+- **Fields**, deliberately spelled as `nginx2vestigo` spells them so a pcap timeline and a
+  webserver-log timeline filter identically and a saved View ports across both:
+  `http_method`, `http_uri`, `http_protocol`, `http_request_full`, `status_code`. Plus, from
+  the reassembly itself: `http_status_reason`, `http_transaction_index` (position within the
+  connection, for keep-alive pipelining), `http_request_bytes` / `http_response_bytes` (wire
+  bytes), `http_request_body_bytes` / `http_response_body_bytes` (framed body, chunk framing
+  excluded), `http_content_encoding` with `http_response_body_decoded_bytes` (or
+  `http_response_body_decode_failed`), and `duration_ms`. Response *bodies* are never emitted
+  — see `ROADMAP.md` N3 for why they cannot live in `attributes`.
+- **Honest gaps.** `http_incomplete`, `http_request_missing`, `http_response_missing`,
+  `reassembly_gap` (a hole the capture never recorded — the halves are never silently
+  spliced) and `reassembly_truncated_capture` (a snaplen shorter than the frame). A
+  transaction still open when the capture ends is emitted flagged rather than dropped.
+- **Provenance is a different, explicitly non-contiguous convention**, because a transaction
+  spans N packet records that are not adjacent on disk:
+  - `byte_offset` = the offset of the record carrying the *request line*. A real offset, but
+    the start of one packet, not of the transaction — and **not** necessarily the lowest
+    contributing offset, since an out-of-order segment from later in the message can sit
+    earlier in the file.
+  - `content_hash` = sha256 over the ASCII tag
+    `vestigo:http-transaction:<http_transaction_index>\n`, then the concatenation of every
+    contributing record's raw span, in capture order (ascending offset). Deterministic and
+    re-derivable by hand, but not a single `dd` span. The tag is not decoration: a
+    transaction carried by a single packet would otherwise hash exactly that packet row's
+    bytes at exactly that packet row's offset, and the server derives `event_id` from
+    `(…, byte_offset, content_hash, …)` — two different events under one id.
+  - `packet_offsets` lists those offsets (`packet_count` holds the true count;
+    `packet_offsets_truncated` marks a capped list), so an examiner can reconstruct the
+    exact input.
+  - Every such row carries `reassembled=true`, `byte_offset_basis=request_line_record` and
+    `content_hash_basis=reassembled_records`, so the two conventions are never confused by
+    inspection. The footer's `vestigo.parse_decisions.reassemble` records the flag — it
+    changes which rows exist — and `vestigo.row_counts` splits `packets` from
+    `http_transactions`.
+  - Row order: a transaction is written when its response completes, so with this flag the
+    file is no longer sorted by `byte_offset`. Harmless (the server sorts on query), but a
+    reader walking the file must not assume monotone offsets.
+- **Limits, stated in `--help` too.** Cleartext HTTP/1.0 and 1.1 only. HTTPS is not
+  decrypted, so most real traffic yields nothing; HTTP/2 and HTTP/3 are not parsed (binary
+  framing plus HPACK/QPACK); a snaplen-truncated or single-direction capture cannot be
+  reassembled.
+- **Bounded against hostile captures** — the routine case, since this is incident evidence:
+  per-stream buffered bytes, concurrently tracked flows (LRU eviction), header count and
+  size, framed and decompressed body size (compression bombs), held out-of-order segments,
+  and framed requests still waiting for a response. Breaching a cap kills that one flow,
+  never the run, and its packet rows survive — except the request queue, whose overflow is
+  emitted as an `http_response_missing` transaction rather than discarded. A body delimited
+  only by connection close (HTTP/1.0, or `Connection: close` with no `Content-Length`) is
+  bounded by the same framed-body cap as a declared `Content-Length`, so a very large such
+  download is refused rather than buffered.
+
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
 If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write a converter —

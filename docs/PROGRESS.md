@@ -1,9 +1,134 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-06 (session 154 — PR #237 review fixes on the IPv6 eligibility widening).
+Last updated: 2026-08-06 (session 156 — PR #238 review fixes on the pcap HTTP reassembler).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 156 — 2026-08-06: PR #238 review fixes (`pcap2vestigo` reassembler)
+
+**Why.** A review of session 155's work found seven defects, three of them reproduced by
+driving the reassembler directly. All are fixed here; nothing was deferred.
+
+- **Unbounded `until_close` bodies (memory).** `length` and chunked framing both checked
+  `_REASM_MAX_BODY_BYTES`; the connection-close-delimited branch checked nothing, and
+  `_REASM_MAX_STREAM_BYTES` could not save it — `_take` moves bytes *out* of the direction's
+  buffer and into the message, so `buffered` stays near zero while the body grows. One
+  HTTP/1.0 download was enough to grow the body and its retained record blobs to the size of
+  the response. It now takes the same verdict as an over-long `Content-Length`: the flow
+  dies, its packet rows survive.
+- **A transaction row could collide with a packet row's `event_id`.** With exactly one
+  contributing record, the transaction hashed that record's bytes at that record's offset —
+  the identical `(byte_offset, content_hash)` pair the packet row carries, and the server
+  derives `event_id` from those. Two different events landed under one id (the events table
+  is a plain `MergeTree`, so nothing deduplicated them), and any annotation keyed by id hit
+  both. Reproduced by the PR's own orphan-request test. `content_hash` now covers a
+  `vestigo:http-transaction:<index>\n` tag ahead of the records — still re-derivable by hand,
+  which the provenance test asserts, and `docs/INPUT_FORMATS.md` states the tag.
+- **Pipelined responses were framed against the wrong request.** `messages()` is a generator,
+  so its `peer_method` argument was frozen at generator-creation time; the caller's update
+  between responses was dead code. `HEAD /a` + `GET /b` answered in one packet framed the
+  `GET` response as bodyless and desynced the stream behind it. `peer_method` is now a
+  callable the framer asks at each message start, which is the only shape that is correct
+  for a generator resumed N times.
+- **The unanswered-request queue had no cap.** A single-direction capture — the exact case
+  `--help` says yields flagged-or-nothing — queued a request (with its records) per request,
+  forever. Capped at `_REASM_MAX_PENDING_REQUESTS`; the overflow is *emitted* as an
+  `http_response_missing` transaction rather than dropped, because evidence that arrived
+  should not vanish because its answer did not.
+- **`timestamp` was the packet that completed the header block**, not the request's first
+  captured byte as `INPUT_FORMATS.md` promised — off by a packet with an out-of-order start,
+  and worse across directions, since `_pump` drives both from one arrival and a server
+  message framed during a client packet inherited the client's clock. Each message now
+  carries the earliest capture time among the records attributed to it; `duration_ms`
+  inherited the same skew and is fixed with it.
+- **IPv6 had no first-fragment guard.** IPv4 refuses to decode L4 out of a non-first
+  fragment; IPv6 handed the fragment's body bytes straight to the TCP decoder, inventing
+  ports and a sequence number — and, under `--reassemble`, a phantom flow. Guarded, and
+  `fragment_offset` is now on IPv6 packet rows as it already was on IPv4 ones.
+- **Gap forwarding silently dropped provenance.** Records wholly inside a skipped span end at
+  or below the new base, so `_take` never attributed them and they left `packet_offsets`
+  without a trace — the comment claimed the opposite. They are credited at the jump.
+
+Each fix carries a regression test; all seven fail against the pre-fix converter. The
+`manifest.json` size/sha256 for the converter were refreshed. Version stays 1.4.0 — it has
+not shipped.
+
+## Session 155 — 2026-08-06: `pcap2vestigo --reassemble http` (Milestone 9 N2)
+
+**Why.** Second half of the analyst feedback that opened Milestone 9: a pcap timeline shows
+packets, and an analyst working an intrusion wants the HTTP transaction — "what did this
+host request, and what came back". Reconstructing that by hand from packet rows is exactly
+the work a converter should do once.
+
+**What shipped** (`assets/converters/pcap2vestigo.py`, 1.3.0 → 1.4.0):
+
+- **A real reassembler, stdlib-only.** No dpkt/scapy — pyarrow stays the converter's single
+  dependency, so it remains a standalone download. `_HttpDirection` does ISN tracking,
+  sequence-ordered buffering with 32-bit wrap handling, retransmit drop and overlap trim
+  (first writer wins, matching what the receiver saw), out-of-order hold-and-drain, and
+  gap forwarding; `_HttpFlow` pairs the directions and queues requests against responses;
+  `_HttpReassembler` owns the flow table, teardown (FIN/RST), LRU and idle eviction.
+  On top: HTTP/1.x framing with chunked encoding, keep-alive pipelining, `Expect:
+  100-continue` (an interim 1xx does not close a transaction), HEAD (no body whatever
+  `Content-Length` claims), 101/CONNECT upgrades (stop parsing — the rest is not HTTP), and
+  `Content-Encoding` via stdlib zlib.
+- **Additive, never substitutive.** Transaction rows join the per-packet rows; a test asserts
+  the packet rows are byte-identical with and without the flag. Packet rows are the forensic
+  floor — the derived row is convenience, and convenience must not be able to delete
+  evidence.
+- **Field names are an API.** `http_method`, `http_uri`, `http_protocol`,
+  `http_request_full` and `status_code` are spelled exactly as `nginx2vestigo` spells them,
+  so a pcap timeline and a webserver-log timeline filter identically and a saved View ports
+  across both. This is why the row is `artifact_long: web:access:request` too.
+- **A stated new provenance convention.** The module's guarantee that `content_hash` covers
+  a contiguous `byte_offset`-anchored span cannot hold for a transaction spanning N
+  non-adjacent records, so the convention is documented rather than quietly broken:
+  `byte_offset` = the record carrying the request line, `content_hash` = sha256 over the
+  concatenated contributing records in capture order, `packet_offsets`/`packet_count` to
+  reconstruct the input, and `reassembled` / `byte_offset_basis` / `content_hash_basis` on
+  every such row so the two conventions are never confused by inspection. The flag is in
+  `vestigo.parse_decisions` because it changes *which rows exist*, and `vestigo.row_counts`
+  now splits `packets` from `http_transactions`. A test re-derives the hash from the listed
+  offsets against the raw capture, which is the only proof that "re-derivable by hand" is
+  true. Note the anchor is not the lowest contributing offset: the fixture sends the
+  request's tail first, so an out-of-order segment sits earlier in the file.
+- **Hostile input is the routine case** — this is incident evidence. Caps on per-stream
+  buffered bytes (payload *and* the retained record bytes, which are the dominant cost since
+  a request's records are held until its response completes), concurrent flows (LRU),
+  header count/size, framed and decompressed body size, and held out-of-order segments.
+  Breaching a cap kills one flow; its packet rows survive and the run continues.
+- **Limits stated in `--help`**, because unstated each arrives as a bug report: no HTTPS
+  (so most real traffic yields nothing), no HTTP/2 or /3, nothing useful from a
+  snaplen-truncated or single-direction capture. Incomplete transactions come out flagged
+  (`http_incomplete`, `reassembly_gap`, `reassembly_truncated_capture`) rather than dropped
+  or silently spliced.
+
+**Decisions worth recording.**
+
+- `status_code`, not the roadmap's provisional `http_status` — nginx parity was the stated
+  rationale for reusing field names, and it beats internal consistency with a not-yet-built
+  N3. N3's tier 1 was edited accordingly.
+- N2 emits the status but stops short of the rest of N3's tier-1 metadata (host,
+  content-type, user-agent, referer, body sha256). Status is not optional scope creep: a
+  request-only row is not a *transaction*.
+- Row order is no longer file order under the flag (a transaction is written when its
+  response completes). Harmless — the server sorts on query — but the docstring claimed
+  otherwise, so it now says so.
+- One packet record straddling a message boundary is attributed to *both* messages. It
+  genuinely contributed to both, and dropping either attribution would make a
+  `content_hash` non-re-derivable.
+
+**Tests.** `sample_http.pcap` joins the committed fixtures — a keep-alive connection whose
+request line arrives in the *second* segment sent, with a retransmitted body segment and a
+chunked response, plus a pipelined second transaction. The edge cases (gzip, HEAD,
+100-continue, orphan request, non-HTTP traffic, a capture gap, header flood, absurd
+`Content-Length`, compression bomb, flow-table bound, parallel parity, `--help` limits)
+build their own captures from the same builders instead of committing a fixture each.
+`gen_pcap_fixtures.py` no longer writes on import for that reason.
+
+`CONVERTER_VERSION` bumped and `manifest.json` regenerated (`test_converters_api.py` asserts
+its sha256 and size).
 
 ## Session 154 — 2026-08-06: two review findings on the IPv6 eligibility widening
 

@@ -164,7 +164,7 @@
     {
       "name": "pcap2vestigo",
       "filename": "pcap2vestigo.py",
-      "description": "Packet captures (pcap/pcapng, file or directory) to a Vestigo Parquet file for direct upload, decoded to Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers. Requires pyarrow.",
+      "description": "Packet captures (pcap/pcapng, file or directory) to a Vestigo Parquet file for direct upload, decoded to Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers, with optional TCP reassembly of HTTP/1.x transactions (--reassemble http). Requires pyarrow.",
       "inputs": [
         "*.pcap",
         "*.pcapng"
@@ -173,8 +173,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 47624,
-      "sha256": "ddacb95975868fb8ac9462cb9509f1bf15ddf5809d33a5f2088410061579ace9"
+      "size_bytes": 90963,
+      "sha256": "c371a145ea39103f8e60633e04e2054fc099f87c6720bcb06d0c41980ad46f48"
     },
     {
       "name": "suricata2timesketch",

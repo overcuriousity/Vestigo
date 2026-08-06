@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pcap2vestigo --reassemble http` — HTTP/1.x transactions from a packet capture.**
+  Off by default. With it, the converter reassembles TCP streams (ISN tracking,
+  sequence-ordered buffering, retransmit and overlap handling, gap tolerance, FIN/RST
+  teardown, LRU/idle eviction) and frames HTTP/1.0 and 1.1 on top — chunked encoding,
+  keep-alive pipelining, `Expect: 100-continue`, `Content-Encoding` (stdlib zlib) — emitting
+  one `network:http:transaction` row per request/response **in addition to** the per-packet
+  rows. Packet rows are the forensic floor and are byte-identical with and without the flag;
+  the transaction row is derived convenience. Still stdlib-only: pyarrow remains the
+  converter's single dependency. Transaction rows reuse `nginx2vestigo`'s field names
+  (`http_method`, `http_uri`, `http_protocol`, `http_request_full`, `status_code`), so a
+  pcap timeline and a webserver-log timeline filter identically and saved Views port across
+  both.
+  - **A reassembled row's provenance is deliberately not a contiguous span.** It carries
+    `byte_offset` = the record holding the request line, `content_hash` = sha256 over the
+    concatenated contributing records in capture order, and `packet_offsets` /
+    `packet_count` so an examiner can reconstruct the exact input — plus `reassembled`,
+    `byte_offset_basis` and `content_hash_basis` so the two conventions are never confused
+    by inspection. The flag is recorded in `vestigo.parse_decisions`: it changes which rows
+    exist. Rows are no longer strictly ordered by `byte_offset`, since a transaction is
+    written when its response completes.
+  - **Stated limits** (in `--help`): no HTTPS — nothing is decrypted, so most real traffic
+    yields nothing — no HTTP/2 or HTTP/3, and nothing useful from a snaplen-truncated or
+    single-direction capture; such transactions come out flagged `http_incomplete` /
+    `reassembly_gap` / `reassembly_truncated_capture`, or not at all.
+  - **Bounded against hostile captures**, which is the routine case for incident evidence:
+    caps on per-stream buffered bytes, concurrently tracked flows (LRU eviction), header
+    count and size, framed and decompressed body size, and held out-of-order segments.
+    Breaching a cap kills that one flow — its packet rows survive — never the run.
+
 - **ASN enricher — "who operates this IP" on every timeline.** A second enricher
   (`enrichers/asn.py`) resolves IP-shaped attribute values to the announcing AS number and
   organization via an admin-uploaded MaxMind GeoLite2-ASN database, writing
