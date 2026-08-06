@@ -452,47 +452,15 @@ shared base — enrichers stay self-contained modules by design, like the ingest
 converters — and IPv6 eligibility *was* added in the same commit, deliberately changing
 GeoIP's `config_hash`.)
 
-- [ ] **N2 — `pcap2vestigo --reassemble http`.** TCP stream reassembly plus HTTP/1.x framing
-  in the converter, emitting one `network:http:transaction` row per request/response *in
-  addition to* the existing per-packet rows — packet rows are the forensic floor, the
-  transaction row is derived convenience. Stdlib-only (no dpkt/scapy, preserving the
-  converter's pyarrow-only dependency), so the work is a real reassembler: per-flow
-  sequence-ordered buffering, ISN tracking, retransmit/overlap handling, gap tolerance,
-  FIN/RST teardown, idle eviction, then chunked encoding, keep-alive pipelining,
-  `Content-Encoding` (stdlib zlib) and 100-continue. Roughly 400–600 lines; not a flag-sized
-  change.
-  - **Reuse the shipped HTTP field names.** `nginx2vestigo.py` already emits `http_method`,
-    `http_uri`, `http_protocol`, `http_request_full`. Same names here, so a pcap timeline and
-    a webserver-log timeline filter identically and saved Views port across sources. Field
-    names become an API the moment an analyst saves a View on them: cheap to get right at
-    design time, expensive afterwards.
-  - **Provenance needs a stated new convention.** The module docstring guarantees
-    `content_hash` covers a contiguous `byte_offset`-anchored span on disk; a reassembled
-    transaction spans N non-contiguous packet records, so that contract breaks. Decide and
-    document: `byte_offset` = the record carrying the request line; `content_hash` = sha256
-    over the concatenated contributing record spans in capture order (deterministic and
-    re-derivable, but explicitly *not* a contiguous span); plus an attribute listing those
-    offsets so an examiner can reconstruct the exact input. Record the flag in
-    `META_PARSE_DECISIONS`, which today carries only `since`/`until` — it changes which rows
-    exist.
-  - **Hostile input.** `_MAX_RECORD_BYTES` exists because pcap length fields are
-    attacker-controlled; reassembly needs the equivalent — caps on per-stream buffered bytes,
-    on concurrently tracked streams (LRU eviction), on decompressed body size (gzip bomb), and
-    on header count/size. A malicious capture is a routine input here: it is evidence from an
-    incident.
-  - **State the limits in `--help`:** no HTTPS (most real traffic), no HTTP/2 or /3 (binary
-    framing + HPACK), and nothing useful from a snaplen-truncated or single-direction capture.
-    Unstated, each of those arrives as a bug report.
-  - Parallelism is unaffected (workers are per file, TCP streams do not cross files), but rows
-    stop being strictly in file order — a transaction emits when it completes. Harmless, since
-    the server sorts on query, but the docstring claims otherwise and needs a sentence. Bump
-    `CONVERTER_VERSION` and regenerate `manifest.json` (`tests/test_converters_api.py` asserts
-    sha256 + size). Fixtures belong in `tests/data/gen_pcap_fixtures.py`: at minimum a chunked
-    body, a retransmit and an out-of-order segment. New fields go in `docs/INPUT_FORMATS.md`.
+(N2, `pcap2vestigo --reassemble http`, also shipped in 1.10.0. One decision N3 inherits:
+the response status is spelled **`status_code`**, not `http_status` — that is what
+`nginx2vestigo` emits, and the whole point of the field-name bullet was that a pcap
+timeline and a webserver-log timeline filter identically. N2 stopped at the fields a
+*transaction* needs to be a transaction; the rest of N3's tier 1 is untouched.)
 
 - [ ] **N3 — HTTP payload: hashes in the timeline, bytes on the analyst's disk.** Ships with
   or just after N2, in three deliberately separated tiers:
-  1. *Always:* the cheap metadata (`http_status`, `http_host`, `http_content_type`,
+  1. *Always:* the cheap metadata (`http_host`, `http_content_type`,
      `http_content_length`, `http_user_agent`, `http_referer`) plus
      `http_response_body_sha256`. The full-body hash is the forensically valuable part, costs
      32 bytes, and lets an analyst pivot against known-file lists without the bytes ever
