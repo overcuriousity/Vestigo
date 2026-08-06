@@ -15,6 +15,7 @@ import pytest
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
     _CHARSET_GROUP_PROBE_LIMIT,
+    _ENTROPY_BIGRAM_PROB_THRESH,
     _MAX_CHARSET_GROUPED_ROWS,
     _MAX_CHARSET_SIZE,
     AnalysisWindows,
@@ -23,7 +24,10 @@ from vestigo.db.anomaly_stats import (
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
+    _ascii_lower_bigrams,
     _bh_qvalues,
+    _bigram_probability_table,
+    _bigram_score,
     _chi2_sf,
     _chi2_sf_df1,
     _classify_field,
@@ -5287,3 +5291,55 @@ def test_motif_max_gap_reaches_both_passes():
     joined = "\n".join(client.full_queries)
     assert "PARTITION BY source_id, w_idx, seg" in joined
     assert "if(gap_s > 300, 1, 0)" in joined
+
+
+# ---------------------------------------------------------------------------
+# D11 bigram helpers
+# ---------------------------------------------------------------------------
+
+
+def test_ascii_lower_bigrams_are_byte_pairs_of_the_ascii_lowercased_value():
+    assert _ascii_lower_bigrams("Host") == ["ho", "os", "st"]
+    assert _ascii_lower_bigrams("a") == []
+    assert _ascii_lower_bigrams("") == []
+
+
+def test_ascii_lower_bigrams_folds_ascii_only_like_clickhouse_lower():
+    """ClickHouse `lower()` leaves non-ASCII alone, and `ngrams` works on bytes
+    — the pairs of a two-byte character are its byte pair, not the character."""
+    pairs = _ascii_lower_bigrams("AБ")
+    # 'A' folds to 'a' (0x61); 'Б' stays as its two UTF-8 bytes 0xD0 0x91.
+    assert len(pairs) == 2
+    assert "".join(p[0] for p in pairs[:1]) == "a"
+
+
+def test_bigram_probability_table_divides_by_the_head_count():
+    table = _bigram_probability_table([("ab", 3, 4), ("ac", 1, 4), ("ba", 5, 5)])
+    assert table["ab"] == pytest.approx(0.75)
+    assert table["ac"] == pytest.approx(0.25)
+    assert table["ba"] == pytest.approx(1.0)
+
+
+def test_bigram_probability_table_skips_a_zero_head_count():
+    """A zero denominator cannot happen in a well-formed scan, but a division
+    error inside a detector is a worse outcome than a missing pair — which
+    scores as never-seen, the honest reading."""
+    assert _bigram_probability_table([("ab", 0, 0)]) == {}
+
+
+def test_bigram_score_is_normalized_distance_below_the_threshold():
+    assert _bigram_score(0.0, 0.05) == 1.0
+    assert _bigram_score(0.025, 0.05) == 0.5
+    # At or above the threshold nothing is flagged, but the formula must not go
+    # negative if it is ever called there.
+    assert _bigram_score(0.05, 0.05) == 0.0
+    assert _bigram_score(0.9, 0.05) == 0.0
+    assert _bigram_score(0.01, 0.0) == 0.0
+
+
+def test_entropy_bigram_prob_thresh_setting_matches_the_detector_fallback():
+    """The operator-facing setting and the module fallback are the same number
+    — a direct/CLI caller and the API must not disagree by default."""
+    from vestigo.core.config import Settings
+
+    assert Settings().stat_entropy_bigram_prob_thresh == _ENTROPY_BIGRAM_PROB_THRESH == 0.05

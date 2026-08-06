@@ -378,6 +378,12 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Distinct values a character may appear in before it stops counting as rare.",
     ),
     SettingSpec(
+        "stat_entropy_bigram_prob_thresh",
+        "detectors",
+        "Bigram entropy probability threshold",
+        "Mean character-pair probability below which the entropy detector's bigram method flags a value.",
+    ),
+    SettingSpec(
         "stat_z_threshold",
         "detectors",
         "Frequency z-score threshold",

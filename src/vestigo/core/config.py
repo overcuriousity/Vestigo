@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     # from stat_rarity_floor (which counts value *occurrences*, not chars) so the
     # two detectors can be tuned independently; defaults to the same value.
     stat_charset_rarity_floor: int = 3
+    # D11: mean character-pair probability below which the entropy detector's
+    # bigram method flags a value. AMiner's `EntropyDetector` default; lower =
+    # fewer, more extreme findings. Ignored by the default Shannon method.
+    stat_entropy_bigram_prob_thresh: float = 0.05
     # Z-score threshold for flagging a frequency window as anomalous.
     stat_z_threshold: float = 2.5
     # Number of time buckets for frequency analysis (same math as histogram).

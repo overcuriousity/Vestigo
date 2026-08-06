@@ -194,6 +194,7 @@ from __future__ import annotations
 import functools
 import math
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
@@ -340,6 +341,19 @@ _MIN_ENTROPY_BASELINE = 20
 # entirely (baseline and detect): character entropy of a 3-char string is
 # degenerate and would swamp the band with false lows.
 _MIN_ENTROPY_VALUE_LEN = 6
+
+# D11: ceiling on the learned character-pair transition table. A memory bound
+# on the query parameter, not an analyst-facing knob — the table is ordered by
+# frequency before truncation, so a hit drops the *rarest* pairs, whose
+# probability is nearest the zero a missing key already yields.
+_ENTROPY_BIGRAM_MAX_PAIRS = 20_000
+
+# D11: mean character-pair probability below which the bigram method flags a
+# value. AMiner's `EntropyDetector` default. The router passes the operator's
+# effective setting; this is the fallback for direct/CLI callers, which is why
+# it lives here rather than being read from Settings (no detector in this
+# module reads config directly).
+_ENTROPY_BIGRAM_PROB_THRESH = 0.05
 
 # Distribution-drift categorical branch: number of named categories in the
 # G-test vector (top by baseline count, deterministic tie-break on value);
@@ -1165,6 +1179,43 @@ def _split_novelty_fields(
         if column is None and attr_key:
             attr_keys[token] = attr_key
     return attr_keys
+
+
+def _ascii_lower_bigrams(value: str) -> list[str]:
+    """Return *value*'s consecutive byte pairs, ASCII-lowercased.
+
+    The Python mirror of ClickHouse's ``ngrams(lower(val), 2)``: ``lower()``
+    folds ASCII only (not ``lowerUTF8``), and ``ngrams`` operates on bytes, so
+    a multi-byte character contributes byte pairs. Pairs are decoded with
+    ``errors="replace"`` purely so they can be displayed on a finding — the
+    decoded form is only ever shown, never compared against the learned table.
+    """
+    raw = value.encode("utf-8", errors="replace")
+    folded = bytes(b + 32 if 65 <= b <= 90 else b for b in raw)
+    return [folded[i : i + 2].decode("utf-8", errors="replace") for i in range(len(folded) - 1)]
+
+
+def _bigram_probability_table(rows: Sequence[tuple[Any, Any, Any]]) -> dict[str, float]:
+    """Turn ``(pair, count, head_count)`` rows into ``P(c₂|c₁)``.
+
+    *head_count* is the total count of every pair sharing this pair's first
+    byte, computed by a window function in the learn query so the denominators
+    stay exact even when the returned rows hit their cap.
+    """
+    table: dict[str, float] = {}
+    for pair, cnt, head_cnt in rows:
+        head = int(head_cnt)
+        if head <= 0:
+            continue
+        table[str(pair)] = int(cnt) / head
+    return table
+
+
+def _bigram_score(mean_prob: float, prob_thresh: float) -> float:
+    """Normalized distance below the threshold: 0 at the threshold, 1 at zero probability."""
+    if prob_thresh <= 0:
+        return 0.0
+    return round(max(0.0, (prob_thresh - mean_prob) / prob_thresh), 4)
 
 
 def _apply_allowlist(findings: list[Any], allowlist: set[tuple[str, str]] | None) -> list[Any]:
