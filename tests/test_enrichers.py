@@ -59,6 +59,19 @@ def test_ip_regex_rejects_hostnames_and_partial_matches():
     assert ASN_IP_REGEX == IP_REGEX
 
 
+def test_ip_regex_does_not_match_mac_addresses_or_times():
+    # The pattern is pushed into ClickHouse by check_eligibility, so a match on
+    # these would report a pcap/DHCP/ARP/Windows-network timeline as eligible
+    # and auto-run a full-timeline scan that can only produce zero rows.
+    import re
+
+    for value in ("00:1a:2b:3c:4d:5e", "AA:BB:CC:DD:EE:FF", "13:45:02", "a:b:c", "1:2:3:4:5:6:7"):
+        assert re.match(IP_REGEX, value) is None, value
+    # ...while every real IPv6 form still matches.
+    for value in ("::", "::1", "fe80::", "2001:db8::1", "1:2:3:4:5:6:7:8", "::ffff:10.0.0.1"):
+        assert re.match(IP_REGEX, value), value
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1104,6 +1117,29 @@ def test_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_pa
         enricher.enrich_value("8.8.8.8")
 
 
+def test_geoip_enrich_value_skips_ipv6_on_ipv4_only_database(tmp_path):
+    # maxminddb raises a bare ValueError for an IPv6 lookup against an
+    # IPv4-only .mmdb; jobs.py re-raises anything but AddressNotFoundError, so
+    # without the guard one IPv6-shaped value would fail the whole run.
+    class _V4Meta:
+        ip_version = 4
+
+    class _V4Reader:
+        def metadata(self):
+            return _V4Meta()
+
+        def city(self, value):
+            raise ValueError("you attempted to look up an IPv6 address in an IPv4-only database.")
+
+    enricher = GeoIPEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _V4Reader()
+    assert enricher.enrich_value("2001:db8::1") is None
+    # The guard is scoped to IPv6: an IPv4 lookup still reaches the reader
+    # (this fake raises for every address, so the error must propagate).
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
 @pytest.mark.asyncio
 async def test_manual_run_skips_sources_already_enriched_at_current_config(store, monkeypatch):
     from fastapi import BackgroundTasks
@@ -1510,6 +1546,7 @@ async def test_eligibility_fanout_builds_one_clickhouse_store_per_check(store, m
 class _FakeASNMeta:
     build_epoch = 1700000000
     database_type = "GeoLite2-ASN"
+    ip_version = 6
 
 
 class _FakeASNResponse:
@@ -1539,6 +1576,9 @@ def test_asn_output_fields_contract_locked():
 
 def test_asn_enrich_value_maps_response(tmp_path):
     class _FakeReader:
+        def metadata(self):
+            return _FakeASNMeta()
+
         def asn(self, value):
             return _FakeASNResponse()
 
@@ -1584,6 +1624,29 @@ def test_asn_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tm
             raise ValueError("reader is closed or corrupt")
 
     enricher._reader = _BrokenReader()
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
+def test_asn_enrich_value_skips_ipv6_on_ipv4_only_database(tmp_path):
+    # maxminddb raises a bare ValueError for an IPv6 lookup against an
+    # IPv4-only .mmdb; jobs.py re-raises anything but AddressNotFoundError, so
+    # without the guard one IPv6-shaped value would fail the whole run.
+    class _V4Meta:
+        ip_version = 4
+
+    class _V4Reader:
+        def metadata(self):
+            return _V4Meta()
+
+        def asn(self, value):
+            raise ValueError("you attempted to look up an IPv6 address in an IPv4-only database.")
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _V4Reader()
+    assert enricher.enrich_value("2001:db8::1") is None
+    # The guard is scoped to IPv6: an IPv4 lookup still reaches the reader
+    # (this fake raises for every address, so the error must propagate).
     with pytest.raises(ValueError):
         enricher.enrich_value("8.8.8.8")
 

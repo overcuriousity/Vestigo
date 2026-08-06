@@ -46,11 +46,20 @@ logger = logging.getLogger(__name__)
 # ClickHouse match() by check_eligibility and reused as the cheap per-value
 # gate in is_field_eligible, so it must stay a ClickHouse-compatible re2
 # regex. Correctness validation happens via stdlib ipaddress in enrich_value.
-# The IPv6 arm is deliberately loose (re2 has no lookarounds/backrefs); it
-# covers full/compressed forms and IPv4-mapped tails like ::ffff:1.2.3.4.
+# The IPv6 arms are deliberately loose (re2 has no lookarounds/backrefs); they
+# cover full/compressed forms and IPv4-mapped tails like ::ffff:1.2.3.4.
+# They must NOT collide with the colon-separated non-addresses that show up all
+# over forensic data: a MAC address (00:1a:2b:3c:4d:5e) and a bare time-of-day
+# (13:45:02) would both match a plain "2..7 colon-separated hex groups" arm, and
+# check_eligibility runs in ClickHouse — a pcap/DHCP/ARP timeline would be
+# reported eligible and auto-run a full scan that yields nothing. So the
+# uncompressed arm requires the full eight groups and the compressed arm
+# requires a literal "::".
 IP_REGEX = (
     r"^(?:(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])"
-    r"|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}"
+    r"|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
+    r"|(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::"
+    r"(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?"
     r"|(?:[0-9a-fA-F]{0,4}:){1,6}(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}"
     r"(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9]))$"
 )
@@ -307,16 +316,24 @@ class ASNEnricher(Enricher):
     def enrich_value(self, raw_value: str) -> dict[str, str] | None:
         """Resolve one IP value, or None for invalid input / no ASN match.
 
-        Only an invalid address or a legitimate lookup miss maps to None —
-        reader failures (closed handle, corrupt database) propagate so the
-        job fails loudly instead of silently producing incomplete results.
+        Only an invalid address, an address family the installed database does
+        not carry, or a legitimate lookup miss maps to None — reader failures
+        (closed handle, corrupt database) propagate so the job fails loudly
+        instead of silently producing incomplete results.
         """
         try:
-            ipaddress.ip_address(raw_value)
+            address = ipaddress.ip_address(raw_value)
         except ValueError:
             return None
+        reader = self._get_reader()
+        # An IPv4-only .mmdb raises a bare ValueError (not AddressNotFoundError)
+        # for any IPv6 lookup, which enrichers/jobs.py re-raises — one IPv6-shaped
+        # value would fail the entire run. Such a database simply holds no answer
+        # for this address, so treat it as a miss.
+        if address.version == 6 and reader.metadata().ip_version == 4:
+            return None
         try:
-            response = self._get_reader().asn(raw_value)
+            response = reader.asn(raw_value)
         except geoip2.errors.AddressNotFoundError:
             return None
         number = response.autonomous_system_number

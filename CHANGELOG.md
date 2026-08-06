@@ -30,7 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ipaddress`) was widened from IPv4-only to IPv4+IPv6 — pcap timelines are exactly where
   IPv6 turns up. The pattern is an input to GeoIP's `config_hash()`, so sources enriched
   before this change report a new hash and are offered re-enrichment; re-running is safe
-  (the apply strips and rewrites the enricher's derived keys).
+  (the apply strips and rewrites the enricher's derived keys). The IPv6 arms deliberately
+  require either all eight groups or a literal `::`, so MAC addresses (`00:1a:2b:3c:4d:5e`)
+  and bare times (`13:45:02`) do not read as eligible — otherwise a pcap/DHCP/ARP timeline
+  containing neither an IPv4 nor an IPv6 field would be offered enrichment and auto-run a
+  full-timeline scan that can only produce zero rows.
+- **An IPv4-only MaxMind database no longer fails an enrichment run.** `maxminddb` raises a
+  bare `ValueError` (not `AddressNotFoundError`) for an IPv6 lookup against a database whose
+  metadata says `ip_version == 4`, and the job loop re-raises anything else — so with IPv6
+  eligibility, one IPv6-shaped value would have failed the whole job for an operator whose
+  uploaded `.mmdb` carries only IPv4. Both enrichers now check the database's address family
+  first and treat such a lookup as an ordinary miss.
 
 ## [1.9.1] — 2026-08-02
 

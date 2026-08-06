@@ -1,9 +1,40 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-05 (session 153 — N1 ASN enricher shipped in 1.10.0).
+Last updated: 2026-08-06 (session 154 — PR #237 review fixes on the IPv6 eligibility widening).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 154 — 2026-08-06: two review findings on the IPv6 eligibility widening
+
+**Why.** Review of PR #237 (session 153's work) found two real defects, both introduced by
+the IPv6 half rather than by the ASN enricher itself. Fixed in place on the branch — 1.10.0
+is not tagged yet, so the `CHANGELOG.md` entry absorbed them rather than getting a patch
+release.
+
+- **An IPv4-only `.mmdb` could fail an entire enrichment job.** `maxminddb` raises a plain
+  `ValueError` — not `AddressNotFoundError` — when asked for an IPv6 address in a database
+  whose metadata says `ip_version == 4`, and `enrichers/jobs.py::_build_rows` deliberately
+  re-raises everything else so partial results are never silently produced. Before the
+  widening no IPv6 value ever reached the reader; after it, the first IPv6-shaped attribute
+  value would kill the run for any operator on an IPv4-only database. Fixed at the lookup
+  rather than at install: rejecting such a database at upload would refuse a legitimate
+  install for an unrelated reason, whereas "this database has no answer for this address
+  family" is exactly a miss. Both enrichers now check `reader.metadata().ip_version` when
+  the parsed address is v6.
+
+- **The IPv6 arm matched MAC addresses and bare times.** `(?:[0-9a-fA-F]{0,4}:){2,7}...`
+  accepts `00:1a:2b:3c:4d:5e` and `13:45:02`. `enrich_value` rejected them via `ipaddress`
+  so no wrong data could be written — but `check_eligibility` pushes the pattern into
+  ClickHouse, so a pcap/DHCP/ARP/Windows-network timeline carrying MAC or time-of-day
+  fields and no IP field reported as *eligible*, and with `auto_run_default` both enrichers
+  auto-ran a full-timeline scan guaranteed to produce nothing. The arm is now split in two:
+  the uncompressed form requires all eight groups, the compressed form requires a literal
+  `::`. re2 has no lookarounds, so this is the tightening that fits. Regression test covers
+  both the rejected non-addresses and the IPv6 forms that must keep matching.
+
+- The third finding (a local `docker-compose.yml` edit in the working tree) was an obsolete
+  dev tweak, stashed rather than committed.
 
 ## Session 153 — 2026-08-05: N1 shipped — ASN enricher and IPv6 eligibility
 
