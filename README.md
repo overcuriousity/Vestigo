@@ -82,7 +82,7 @@ guarantees, see [Deployment](docs/DEPLOYMENT.md).
 - **Teams, access control, audit** — session-cookie auth with optional OIDC SSO, case-level
   RBAC with teams, an append-only audit trail over every mutating action, and live
   collaboration over Server-Sent Events.
-- **Enrichment** — post-ingest enrichers (currently GeoIP via a local MaxMind database)
+- **Enrichment** — post-ingest enrichers (GeoIP and ASN via local MaxMind databases)
   amend event attributes without touching the provenance columns.
 - **Forensic rigor by construction** — sources are SHA-256 hashed, immutable and retained
   content-addressed; every event carries a content hash and byte offset back into its raw

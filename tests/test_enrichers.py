@@ -1,4 +1,4 @@
-"""Tests for the enricher subsystem: registry, GeoIP plugin, and Postgres CRUD."""
+"""Tests for the enricher subsystem: registry, GeoIP/ASN plugins, and Postgres CRUD."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ import pytest
 import pytest_asyncio
 
 from vestigo.db.postgres import PostgresStore
+from vestigo.enrichers.asn import IP_REGEX as ASN_IP_REGEX
+from vestigo.enrichers.asn import ASNEnricher
 from vestigo.enrichers.base import AvailabilityResult
-from vestigo.enrichers.geoip import IPV4_REGEX, GeoIPEnricher
+from vestigo.enrichers.geoip import IP_REGEX, GeoIPEnricher
 
 
 @pytest_asyncio.fixture()
@@ -33,20 +35,41 @@ def test_geoip_unavailable_when_database_missing(tmp_path):
     assert result == AvailabilityResult(False, "GeoLite2 database not uploaded")
 
 
-def test_geoip_eligibility_regex_matches_ipv4():
+def test_geoip_eligibility_regex_matches_ip():
     enricher = GeoIPEnricher(db_path=None)
     assert enricher.is_field_eligible("8.8.8.8")
     assert enricher.is_field_eligible("192.168.1.1")
+    assert enricher.is_field_eligible("2001:db8::1")
+    assert enricher.is_field_eligible("::1")
     assert not enricher.is_field_eligible("not-an-ip")
     assert not enricher.is_field_eligible("999.999.999.999")
 
 
-def test_ipv4_regex_rejects_hostnames_and_partial_matches():
+def test_ip_regex_rejects_hostnames_and_partial_matches():
     import re
 
-    assert re.match(IPV4_REGEX, "10.0.0.1")
-    assert not re.match(IPV4_REGEX, "example.com")
-    assert not re.match(IPV4_REGEX, "10.0.0.1extra")
+    assert re.match(IP_REGEX, "10.0.0.1")
+    assert re.match(IP_REGEX, "2001:0db8:85a3:0000:0000:8a2e:0370:7334")
+    assert re.match(IP_REGEX, "fe80::1%eth0") is None  # zone ids are out of scope
+    assert re.match(IP_REGEX, "::ffff:10.0.0.1")
+    assert not re.match(IP_REGEX, "example.com")
+    assert not re.match(IP_REGEX, "10.0.0.1extra")
+    assert not re.match(IP_REGEX, "2001:db8::1extra")
+    # GeoIP and ASN deliberately share the same eligibility gate.
+    assert ASN_IP_REGEX == IP_REGEX
+
+
+def test_ip_regex_does_not_match_mac_addresses_or_times():
+    # The pattern is pushed into ClickHouse by check_eligibility, so a match on
+    # these would report a pcap/DHCP/ARP/Windows-network timeline as eligible
+    # and auto-run a full-timeline scan that can only produce zero rows.
+    import re
+
+    for value in ("00:1a:2b:3c:4d:5e", "AA:BB:CC:DD:EE:FF", "13:45:02", "a:b:c", "1:2:3:4:5:6:7"):
+        assert re.match(IP_REGEX, value) is None, value
+    # ...while every real IPv6 form still matches.
+    for value in ("::", "::1", "fe80::", "2001:db8::1", "1:2:3:4:5:6:7:8", "::ffff:10.0.0.1"):
+        assert re.match(IP_REGEX, value), value
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +90,9 @@ def test_registry_lists_geoip_and_caches_availability(tmp_path, monkeypatch):
     registry.register(GeoIPEnricher(db_path=tmp_path / "missing.mmdb"))
 
     assert registry.get_enricher("geoip") is not None
+    assert registry.get_enricher("asn") is not None
     assert any(e.key == "geoip" for e in registry.all_enrichers())
+    assert any(e.key == "asn" for e in registry.all_enrichers())
 
     availability = registry.refresh_availability()
     assert availability["geoip"].available is False
@@ -1092,6 +1117,29 @@ def test_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_pa
         enricher.enrich_value("8.8.8.8")
 
 
+def test_geoip_enrich_value_skips_ipv6_on_ipv4_only_database(tmp_path):
+    # maxminddb raises a bare ValueError for an IPv6 lookup against an
+    # IPv4-only .mmdb; jobs.py re-raises anything but AddressNotFoundError, so
+    # without the guard one IPv6-shaped value would fail the whole run.
+    class _V4Meta:
+        ip_version = 4
+
+    class _V4Reader:
+        def metadata(self):
+            return _V4Meta()
+
+        def city(self, value):
+            raise ValueError("you attempted to look up an IPv6 address in an IPv4-only database.")
+
+    enricher = GeoIPEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _V4Reader()
+    assert enricher.enrich_value("2001:db8::1") is None
+    # The guard is scoped to IPv6: an IPv4 lookup still reaches the reader
+    # (this fake raises for every address, so the error must propagate).
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
 @pytest.mark.asyncio
 async def test_manual_run_skips_sources_already_enriched_at_current_config(store, monkeypatch):
     from fastapi import BackgroundTasks
@@ -1488,3 +1536,295 @@ async def test_eligibility_fanout_builds_one_clickhouse_store_per_check(store, m
     assert created == 2
     assert len(seen_stores) == 2
     assert seen_stores[0] is not seen_stores[1]
+
+
+# ---------------------------------------------------------------------------
+# ASN enricher
+# ---------------------------------------------------------------------------
+
+
+class _FakeASNMeta:
+    build_epoch = 1700000000
+    database_type = "GeoLite2-ASN"
+    ip_version = 6
+
+
+class _FakeASNResponse:
+    def __init__(self, number=64512, org="Example Hosting GmbH"):
+        self.autonomous_system_number = number
+        self.autonomous_system_organization = org
+
+
+def test_asn_unavailable_when_database_missing(tmp_path):
+    enricher = ASNEnricher(db_path=tmp_path / "missing.mmdb")
+    result = enricher.check_availability()
+    assert result == AvailabilityResult(False, "GeoLite2-ASN database not uploaded")
+
+
+def test_asn_eligibility_regex_matches_ip():
+    enricher = ASNEnricher(db_path=None)
+    assert enricher.is_field_eligible("8.8.8.8")
+    assert enricher.is_field_eligible("2001:db8::1")
+    assert not enricher.is_field_eligible("not-an-ip")
+
+
+def test_asn_output_fields_contract_locked():
+    # Order is part of config_hash() — a reorder silently changes every
+    # enricher identity, so lock the exact tuple.
+    assert ASNEnricher(db_path=None).output_fields == ("asn_number", "asn_org")
+
+
+def test_asn_enrich_value_maps_response(tmp_path):
+    class _FakeReader:
+        def metadata(self):
+            return _FakeASNMeta()
+
+        def asn(self, value):
+            return _FakeASNResponse()
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _FakeReader()
+    # IPv4 and IPv6 both resolve through the same path.
+    assert enricher.enrich_value("8.8.8.8") == {
+        "asn_number": "64512",
+        "asn_org": "Example Hosting GmbH",
+    }
+    assert enricher.enrich_value("2001:db8::1") == {
+        "asn_number": "64512",
+        "asn_org": "Example Hosting GmbH",
+    }
+
+
+def test_asn_enrich_value_miss_and_empty_response_return_none(tmp_path):
+    import geoip2.errors
+
+    class _MissReader:
+        def asn(self, value):
+            raise geoip2.errors.AddressNotFoundError("nope")
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _MissReader()
+    assert enricher.enrich_value("8.8.8.8") is None
+
+    class _EmptyReader:
+        def asn(self, value):
+            return _FakeASNResponse(number=None, org=None)
+
+    enricher._reader = _EmptyReader()
+    assert enricher.enrich_value("8.8.8.8") is None
+
+
+def test_asn_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_path):
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    # Invalid input is a legitimate None — never touches the reader.
+    assert enricher.enrich_value("not-an-ip") is None
+
+    class _BrokenReader:
+        def asn(self, value):
+            raise ValueError("reader is closed or corrupt")
+
+    enricher._reader = _BrokenReader()
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
+def test_asn_enrich_value_skips_ipv6_on_ipv4_only_database(tmp_path):
+    # maxminddb raises a bare ValueError for an IPv6 lookup against an
+    # IPv4-only .mmdb; jobs.py re-raises anything but AddressNotFoundError, so
+    # without the guard one IPv6-shaped value would fail the whole run.
+    class _V4Meta:
+        ip_version = 4
+
+    class _V4Reader:
+        def metadata(self):
+            return _V4Meta()
+
+        def asn(self, value):
+            raise ValueError("you attempted to look up an IPv6 address in an IPv4-only database.")
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _V4Reader()
+    assert enricher.enrich_value("2001:db8::1") is None
+    # The guard is scoped to IPv6: an IPv4 lookup still reaches the reader
+    # (this fake raises for every address, so the error must propagate).
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
+def test_asn_spawn_pins_identity_against_mid_run_db_replacement(tmp_path, monkeypatch):
+    """spawn() captures the exact bytes it reads; a later on-disk swap can't change them."""
+    import hashlib
+
+    import geoip2.database
+    import maxminddb
+
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"v1-bytes")
+
+    captured: dict = {}
+
+    class _FakeReader:
+        def __init__(self, fileish, mode=0):
+            # Pinning must hand the Reader an open file object (MODE_FD), not a
+            # path — that's what makes the read immune to a later replacement.
+            captured["is_fileobj"] = hasattr(fileish, "read")
+            captured["mode"] = mode
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+
+    enricher = ASNEnricher(db_path=db_path).spawn()
+    pinned = enricher.config_extras()
+    assert captured["is_fileobj"] is True
+    assert captured["mode"] == maxminddb.MODE_FD
+    assert pinned["database_sha256"] == hashlib.sha256(b"v1-bytes").hexdigest()
+    assert pinned["database_type"] == "GeoLite2-ASN"
+
+    # Admin replaces the database on disk after the run has started.
+    db_path.write_bytes(b"v2-completely-different-bytes")
+
+    # Identity is unchanged — still the bytes pinned at spawn.
+    assert enricher.config_extras() == pinned
+    enricher.close()
+
+
+def test_asn_config_extras_reads_and_writes_sidecar(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from vestigo.enrichers.asn import read_asn_sidecar, write_asn_sidecar
+
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"fake-mmdb-content")
+
+    # Sidecar present: no Reader needed at all.
+    write_asn_sidecar(
+        db_path, {"sha256": "abc123", "build_epoch": 1700000000, "database_type": "GeoLite2-ASN"}
+    )
+    extras = ASNEnricher(db_path=db_path).config_extras()
+    assert extras == {
+        "database_sha256": "abc123",
+        "build_epoch": 1700000000,
+        "database_type": "GeoLite2-ASN",
+    }
+
+    # Missing sidecar: fallback hashes the file, reads metadata, persists sidecar.
+    (tmp_path / "GeoLite2-ASN.mmdb.meta.json").unlink()
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    extras = ASNEnricher(db_path=db_path).config_extras()
+    import hashlib
+
+    expected_sha = hashlib.sha256(b"fake-mmdb-content").hexdigest()
+    assert extras["database_sha256"] == expected_sha
+    assert extras["build_epoch"] == 1700000000
+    assert read_asn_sidecar(db_path)["sha256"] == expected_sha
+
+
+def test_asn_availability_uses_sidecar_without_opening_reader(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from vestigo.enrichers.asn import write_asn_sidecar
+
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"fake-mmdb-content")
+
+    def _boom(path):
+        raise AssertionError("Reader must not be opened when the sidecar has database_type")
+
+    monkeypatch.setattr(geoip2.database, "Reader", _boom)
+
+    # Sidecar with the right flavor: available, no Reader opened.
+    write_asn_sidecar(db_path, {"sha256": "a", "database_type": "GeoLite2-ASN"})
+    assert ASNEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
+
+    # Sidecar with the wrong flavor: unavailable with the flavor message.
+    write_asn_sidecar(db_path, {"sha256": "a", "database_type": "GeoLite2-City"})
+    result = ASNEnricher(db_path=db_path).check_availability()
+    assert result.available is False
+    assert "Wrong database flavor" in result.reason
+
+    # No sidecar (pre-sidecar install): falls back to opening a Reader.
+    (tmp_path / "GeoLite2-ASN.mmdb.meta.json").unlink()
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    assert ASNEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
+
+
+def test_asn_asset_status_and_install(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from vestigo.enrichers.asn import read_asn_sidecar
+    from vestigo.enrichers.base import AssetValidationError
+
+    db_path = tmp_path / "data" / "GeoLite2-ASN.mmdb"
+    enricher = ASNEnricher(db_path=db_path)
+
+    assert enricher.asset_status() == {"uploaded": False, "size_bytes": None, "detail": {}}
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    upload = tmp_path / "upload.mmdb"
+    upload.write_bytes(b"payload")
+    detail = enricher.install_asset(upload, "sha-abc")
+    assert detail["sha256"] == "sha-abc"
+    assert db_path.read_bytes() == b"payload"
+    assert read_asn_sidecar(db_path)["database_type"] == "GeoLite2-ASN"
+
+    status = enricher.asset_status()
+    assert status["uploaded"] is True
+    assert status["size_bytes"] == len(b"payload")
+    assert status["detail"]["sha256"] == "sha-abc"
+
+    # Wrong flavor raises AssetValidationError and installs nothing new.
+    class _CityMeta(_FakeASNMeta):
+        database_type = "GeoLite2-City"
+
+    monkeypatch.setattr(_FakeReader, "metadata", lambda self: _CityMeta())
+    upload2 = tmp_path / "upload2.mmdb"
+    upload2.write_bytes(b"city")
+    with pytest.raises(AssetValidationError, match="ASN database"):
+        enricher.install_asset(upload2, "sha-def")
+    assert db_path.read_bytes() == b"payload"

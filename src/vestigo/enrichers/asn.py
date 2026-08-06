@@ -1,4 +1,4 @@
-"""GeoIP enricher: resolves IP-address attribute values to country/city via MaxMind GeoLite2.
+"""ASN enricher: resolves IP-address attribute values to network operator via MaxMind GeoLite2-ASN.
 
 Availability requires an admin-uploaded ``.mmdb`` database file (see
 ``api/routers/admin.py``'s upload endpoint). Since arbitrary ingested data has
@@ -6,6 +6,16 @@ no canonical "ip" field name, this enricher scans every attribute value that
 matches the IP pattern rather than a single hardcoded field — the job loop
 (``enrichers/jobs.py``) is responsible for pairing each match back to the
 source attribute key it came from.
+
+Scope: GeoLite2-ASN yields the *announcing* AS number and organization —
+usually the hosting or connectivity provider operating the address. It is NOT
+whois: no netname, registrant, abuse contact, or allocation dates. RIR whois
+needs network access and is deliberately out of scope for an enricher.
+
+Self-contained by design: enrichers are modular demonstration/reference
+plugins (like the ingestion converters) and intentionally do not share code —
+the MaxMind mechanics below mirror ``enrichers/geoip.py`` rather than import
+from it.
 """
 
 from __future__ import annotations
@@ -45,10 +55,6 @@ logger = logging.getLogger(__name__)
 # reported eligible and auto-run a full scan that yields nothing. So the
 # uncompressed arm requires the full eight groups and the compressed arm
 # requires a literal "::".
-#
-# Note: this pattern is an input to config_hash() — changing it (as the IPv6
-# widening did) gives already-enriched sources a new hash, so they are
-# offered re-enrichment.
 IP_REGEX = (
     r"^(?:(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])"
     r"|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
@@ -61,56 +67,57 @@ IP_REGEX = (
 # Single source for the output-field names: the `output_fields` contract tuple
 # and enrich_value's return-dict keys must always agree. Order is part of
 # config_hash() — never reorder.
-_FIELD_COUNTRY = "geo_country"
-_FIELD_CITY = "geo_city"
-_FIELD_COUNTRY_CODE = "geo_country_code"
+_FIELD_NUMBER = "asn_number"
+_FIELD_ORG = "asn_org"
 
 
-def geoip_database_path() -> Path:
-    """Return the configured on-disk path for the GeoLite2 database file."""
-    return Path(get_settings().enricher_data_path) / "geoip" / "GeoLite2-City.mmdb"
+def asn_database_path() -> Path:
+    """Return the configured on-disk path for the GeoLite2-ASN database file."""
+    return Path(get_settings().enricher_data_path) / "asn" / "GeoLite2-ASN.mmdb"
 
 
-def geoip_sidecar_path(db_path: Path | None = None) -> Path:
+def asn_sidecar_path(db_path: Path | None = None) -> Path:
     """Return the metadata sidecar path recorded alongside the ``.mmdb`` at upload time."""
-    base = db_path or geoip_database_path()
+    base = db_path or asn_database_path()
     return base.with_name(base.name + ".meta.json")
 
 
-def write_geoip_sidecar(db_path: Path, metadata: dict[str, Any]) -> None:
+def write_asn_sidecar(db_path: Path, metadata: dict[str, Any]) -> None:
     """Atomically write the database-identity sidecar next to the ``.mmdb`` file."""
-    sidecar = geoip_sidecar_path(db_path)
+    sidecar = asn_sidecar_path(db_path)
     tmp = sidecar.with_suffix(".tmp")
     tmp.write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding="utf-8")
     os.replace(tmp, sidecar)
 
 
-def read_geoip_sidecar(db_path: Path) -> dict[str, Any] | None:
+def read_asn_sidecar(db_path: Path) -> dict[str, Any] | None:
     """Return the sidecar's metadata dict, or None if missing/unreadable."""
-    sidecar = geoip_sidecar_path(db_path)
+    sidecar = asn_sidecar_path(db_path)
     try:
         return json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 
 
-class GeoIPEnricher(Enricher):
-    """Resolves public IP addresses to country/city via a local MaxMind GeoLite2 database."""
+class ASNEnricher(Enricher):
+    """Resolves public IP addresses to AS number/organization via a local GeoLite2-ASN database."""
 
-    key = "geoip"
-    display_name = "GeoIP (MaxMind GeoLite2)"
+    key = "asn"
+    display_name = "ASN (MaxMind GeoLite2)"
     description = (
-        "Resolves IP address attribute values to country and city using a "
-        "locally uploaded MaxMind GeoLite2 City database."
+        "Resolves IP address attribute values to the announcing AS number and "
+        "organization — usually the hosting/connectivity provider — using a "
+        "locally uploaded MaxMind GeoLite2-ASN database. Not whois: no netname, "
+        "registrant, abuse contact, or allocation dates."
     )
     eligibility_regex = IP_REGEX
-    output_fields = (_FIELD_COUNTRY, _FIELD_CITY, _FIELD_COUNTRY_CODE)
+    output_fields = (_FIELD_NUMBER, _FIELD_ORG)
     asset_spec = AssetSpec(
-        name="GeoLite2 City database",
+        name="GeoLite2 ASN database",
         description=(
-            "MaxMind GeoLite2 City database (.mmdb). Download from maxmind.com "
-            "(free with a GeoLite2 account) and upload here; the City flavor is "
-            "required — Country/ASN databases are rejected."
+            "MaxMind GeoLite2-ASN database (.mmdb). Download from maxmind.com "
+            "(free with a GeoLite2 account) and upload here; the ASN flavor is "
+            "required — City/Country databases are rejected."
         ),
         file_extensions=(".mmdb",),
     )
@@ -130,10 +137,10 @@ class GeoIPEnricher(Enricher):
     def _db_path(self) -> Path:
         # Resolved lazily (not captured in __init__) so the long-lived
         # registry instance follows configuration/test changes to
-        # geoip_database_path() instead of freezing the import-time value.
-        return self._db_path_override or geoip_database_path()
+        # asn_database_path() instead of freezing the import-time value.
+        return self._db_path_override or asn_database_path()
 
-    def spawn(self) -> GeoIPEnricher:
+    def spawn(self) -> ASNEnricher:
         """Fresh per-run instance with its database bytes pinned at spawn time.
 
         Opens the ``.mmdb`` once and reads it fully into memory (``MODE_FD``),
@@ -146,7 +153,7 @@ class GeoIPEnricher(Enricher):
         be opened/read, the instance falls back to a lazy path-based reader and
         the sidecar-derived identity (prior behavior).
         """
-        inst = GeoIPEnricher(db_path=self._db_path_override)
+        inst = ASNEnricher(db_path=self._db_path_override)
         inst._pin()
         return inst
 
@@ -157,8 +164,7 @@ class GeoIPEnricher(Enricher):
             fh = path.open("rb")
         except OSError as exc:
             logger.warning(
-                "Could not open GeoIP database %s to pin it at spawn (%s); "
-                "falling back to lazy open",
+                "Could not open ASN database %s to pin it at spawn (%s); falling back to lazy open",
                 path,
                 exc,
             )
@@ -179,7 +185,7 @@ class GeoIPEnricher(Enricher):
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Could not pin GeoIP database %s at spawn (%s); falling back to lazy open",
+                "Could not pin ASN database %s at spawn (%s); falling back to lazy open",
                 path,
                 exc,
             )
@@ -190,12 +196,12 @@ class GeoIPEnricher(Enricher):
 
     def check_availability(self) -> AvailabilityResult:
         if not self._db_path.exists():
-            return AvailabilityResult(False, "GeoLite2 database not uploaded")
+            return AvailabilityResult(False, "GeoLite2-ASN database not uploaded")
         # Sidecar-first: the .meta.json is written atomically with the install
         # (upload endpoint), so its database_type is trustworthy — no need to
         # mmap the whole .mmdb just to read metadata. Opening a Reader is the
         # fallback for pre-sidecar (hand-copied) installs only.
-        meta = read_geoip_sidecar(self._db_path)
+        meta = read_asn_sidecar(self._db_path)
         if meta and meta.get("database_type"):
             database_type = str(meta["database_type"])
         else:
@@ -204,10 +210,10 @@ class GeoIPEnricher(Enricher):
                     database_type = reader.metadata().database_type
             except Exception as exc:  # noqa: BLE001
                 return AvailabilityResult(False, f"Database unreadable: {exc}")
-        if "City" not in database_type:
+        if "ASN" not in database_type:
             return AvailabilityResult(
                 False,
-                f"Wrong database flavor: {database_type!r}; a City database is required",
+                f"Wrong database flavor: {database_type!r}; an ASN database is required",
             )
         return AvailabilityResult(True)
 
@@ -218,14 +224,14 @@ class GeoIPEnricher(Enricher):
         return {
             "uploaded": True,
             "size_bytes": self._db_path.stat().st_size,
-            "detail": read_geoip_sidecar(self._db_path) or {},
+            "detail": read_asn_sidecar(self._db_path) or {},
         }
 
     def install_asset(self, tmp_path: Path, sha256: str) -> dict[str, Any]:
         """Validate an uploaded ``.mmdb`` and atomically install it.
 
         Confirms the file opens as a real GeoLite2 database *and* is
-        City-flavored (``enrich_value`` calls ``.city()``, which a Country/ASN
+        ASN-flavored (``enrich_value`` calls ``.asn()``, which a City/Country
         database would blow up on mid-job), then replaces any previous
         database and records its identity in the metadata sidecar (hash +
         build epoch, the inputs to ``config_hash()``).
@@ -237,10 +243,10 @@ class GeoIPEnricher(Enricher):
                 meta = reader.metadata()
         except Exception as exc:  # noqa: BLE001
             raise AssetValidationError(f"Invalid GeoLite2 database: {exc}") from exc
-        if "City" not in meta.database_type:
+        if "ASN" not in meta.database_type:
             raise AssetValidationError(
-                f"Wrong database flavor: {meta.database_type!r}; a City database is "
-                "required (the GeoIP enricher performs city lookups)"
+                f"Wrong database flavor: {meta.database_type!r}; an ASN database is "
+                "required (the ASN enricher performs asn lookups)"
             )
         sidecar = {
             "sha256": sha256,
@@ -257,7 +263,7 @@ class GeoIPEnricher(Enricher):
         shutil.move(str(tmp_path), str(self._db_path))
         # Sidecar must exist before availability is refreshed, so a job
         # triggered right after this upload hashes against the new metadata.
-        write_geoip_sidecar(self._db_path, sidecar)
+        write_asn_sidecar(self._db_path, sidecar)
         return sidecar
 
     def config_extras(self) -> dict[str, Any]:
@@ -277,7 +283,7 @@ class GeoIPEnricher(Enricher):
                 "build_epoch": self._pinned_meta.get("build_epoch", 0),
                 "database_type": self._pinned_meta.get("database_type", ""),
             }
-        meta = read_geoip_sidecar(self._db_path)
+        meta = read_asn_sidecar(self._db_path)
         if meta is None:
             with geoip2.database.Reader(str(self._db_path)) as reader:
                 reader_meta = reader.metadata()
@@ -287,9 +293,9 @@ class GeoIPEnricher(Enricher):
                     "database_type": reader_meta.database_type,
                 }
             try:
-                write_geoip_sidecar(self._db_path, meta)
+                write_asn_sidecar(self._db_path, meta)
             except OSError:
-                logger.warning("Could not persist GeoIP metadata sidecar next to %s", self._db_path)
+                logger.warning("Could not persist ASN metadata sidecar next to %s", self._db_path)
         return {
             "database_sha256": meta.get("sha256", ""),
             "build_epoch": meta.get("build_epoch", 0),
@@ -308,7 +314,7 @@ class GeoIPEnricher(Enricher):
             self._reader = None
 
     def enrich_value(self, raw_value: str) -> dict[str, str] | None:
-        """Resolve one IP value, or None for invalid input / no geolocation match.
+        """Resolve one IP value, or None for invalid input / no ASN match.
 
         Only an invalid address, an address family the installed database does
         not carry, or a legitimate lookup miss maps to None — reader failures
@@ -327,16 +333,14 @@ class GeoIPEnricher(Enricher):
         if address.version == 6 and reader.metadata().ip_version == 4:
             return None
         try:
-            response = reader.city(raw_value)
+            response = reader.asn(raw_value)
         except geoip2.errors.AddressNotFoundError:
             return None
-        country = response.country.name or ""
-        city = response.city.name or ""
-        country_code = response.country.iso_code or ""
-        if not country and not city:
+        number = response.autonomous_system_number
+        org = response.autonomous_system_organization or ""
+        if number is None and not org:
             return None
         return {
-            _FIELD_COUNTRY: country,
-            _FIELD_CITY: city,
-            _FIELD_COUNTRY_CODE: country_code,
+            _FIELD_NUMBER: str(number) if number is not None else "",
+            _FIELD_ORG: org,
         }

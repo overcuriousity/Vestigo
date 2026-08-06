@@ -8,6 +8,7 @@ uploads a required database file) via ``refresh_availability()``.
 
 from __future__ import annotations
 
+from vestigo.enrichers.asn import ASNEnricher
 from vestigo.enrichers.base import AvailabilityResult, Enricher
 from vestigo.enrichers.geoip import GeoIPEnricher
 
@@ -58,6 +59,7 @@ def get_cached_availability(key: str) -> AvailabilityResult | None:
 
 def _register_builtins() -> None:
     register(GeoIPEnricher())
+    register(ASNEnricher())
 
 
 _register_builtins()

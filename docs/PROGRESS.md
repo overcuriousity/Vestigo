@@ -1,10 +1,76 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-05 (session 152 — analyst feedback on a pcap timeline triaged into
-Milestone 9).
+Last updated: 2026-08-06 (session 154 — PR #237 review fixes on the IPv6 eligibility widening).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 154 — 2026-08-06: two review findings on the IPv6 eligibility widening
+
+**Why.** Review of PR #237 (session 153's work) found two real defects, both introduced by
+the IPv6 half rather than by the ASN enricher itself. Fixed in place on the branch — 1.10.0
+is not tagged yet, so the `CHANGELOG.md` entry absorbed them rather than getting a patch
+release.
+
+- **An IPv4-only `.mmdb` could fail an entire enrichment job.** `maxminddb` raises a plain
+  `ValueError` — not `AddressNotFoundError` — when asked for an IPv6 address in a database
+  whose metadata says `ip_version == 4`, and `enrichers/jobs.py::_build_rows` deliberately
+  re-raises everything else so partial results are never silently produced. Before the
+  widening no IPv6 value ever reached the reader; after it, the first IPv6-shaped attribute
+  value would kill the run for any operator on an IPv4-only database. Fixed at the lookup
+  rather than at install: rejecting such a database at upload would refuse a legitimate
+  install for an unrelated reason, whereas "this database has no answer for this address
+  family" is exactly a miss. Both enrichers now check `reader.metadata().ip_version` when
+  the parsed address is v6.
+
+- **The IPv6 arm matched MAC addresses and bare times.** `(?:[0-9a-fA-F]{0,4}:){2,7}...`
+  accepts `00:1a:2b:3c:4d:5e` and `13:45:02`. `enrich_value` rejected them via `ipaddress`
+  so no wrong data could be written — but `check_eligibility` pushes the pattern into
+  ClickHouse, so a pcap/DHCP/ARP/Windows-network timeline carrying MAC or time-of-day
+  fields and no IP field reported as *eligible*, and with `auto_run_default` both enrichers
+  auto-ran a full-timeline scan guaranteed to produce nothing. The arm is now split in two:
+  the uncompressed form requires all eight groups, the compressed form requires a literal
+  `::`. re2 has no lookarounds, so this is the tightening that fits. Regression test covers
+  both the rejected non-addresses and the IPv6 forms that must keep matching.
+
+- The third finding (a local `docker-compose.yml` edit in the working tree) was an obsolete
+  dev tweak, stashed rather than committed.
+
+## Session 153 — 2026-08-05: N1 shipped — ASN enricher and IPv6 eligibility
+
+**Why.** First item off Milestone 9 (analyst feedback from a pcap timeline): "who operates
+this IP" on every timeline, not only pcap ones. The framework needed no work — upload flow,
+`derived_suffixes`, and the per-source apply lock were already generic — so the session was
+the enricher module itself plus two deliberate decisions the roadmap had flagged.
+
+- **`enrichers/asn.py`, self-contained by design.** The roadmap had advised extracting a
+  shared `MaxMindEnricher` base from `geoip.py`; that was deliberately declined at plan
+  review. Enrichers are modular reference plugins (like the ingestion converters) and are
+  meant to stay independent, so `asn.py` mirrors the MaxMind mechanics (spawn/pin with
+  `MODE_FD`, sidecar identity, flavor-checked install) instead of importing them.
+  `ROADMAP.md`'s Milestone 9 records the divergence so a future reader doesn't "fix" it.
+
+- **ASN, never whois.** Output is the announcing AS number and organization
+  (`<attr>:asn_number`, `<attr>:asn_org`) — usually the hosting provider, which is what the
+  analyst asked for. `display_name`, `description`, and the module docstring state what the
+  database does *not* carry (netname, registrant, abuse contact, allocation dates); RIR
+  whois remains A8's external-MCP path.
+
+- **IPv6 landed in the same commit, for both enrichers.** GeoLite2 City and ASN both carry
+  IPv6 networks, and pcap timelines are where IPv6 turns up, so the eligibility regex became
+  a combined IPv4+IPv6 re2 pattern (`IP_REGEX`; still a gate, `enrich_value` validates via
+  `ipaddress`). Accepted cost: GeoIP's `config_hash()` changed, so previously enriched
+  sources report a new hash and are offered re-enrichment. Recorded in `CHANGELOG.md`.
+
+- **Explorer merges both enrichers into one cell decoration.** `getAttributeDecoration`
+  returns the first matching decorator, so the GeoIP decorator now appends the operator to
+  its tooltip ("Frankfurt, Germany — AS12345 Example Hosting") and falls back to an "AS"
+  marker when only ASN output exists. No admin-UI work: the dialog and config page were
+  already registry-driven.
+
+- **Tests mirror the GeoIP suite for ASN** (`tests/test_enrichers.py`,
+  `tests/test_admin_enrichers_api.py`) using the same fake-`Reader` pattern; frontend label
+  merge covered in `enrichment.test.ts`. 61 backend + 13 frontend tests pass.
 
 ## Session 152 — 2026-08-05: pcap-timeline feedback triaged into a network-evidence milestone
 
