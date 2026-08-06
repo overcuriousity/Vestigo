@@ -140,8 +140,18 @@ LIMIT {plim:UInt32}
 ```
 
 `rare_pairs` is the five distinct pairs with the lowest learned probability — the
-explanation, computed in the same pass rather than recomputed per finding. Python
-attaches each pair's probability from the map it already holds.
+explanation behind the score.
+
+**Two shapes revised at planning time**, for the same reason in both cases: the
+replacement uses a construct this codebase already relies on, and the original did
+not. The table travels as two parallel arrays turned into the map by
+`CAST((keys, values), 'Map(String, Float64)')` inside a `WITH`, rather than as a
+`Map`-typed query parameter (nothing here binds a dict to a `Map` today). And
+`rare_pairs` is computed in Python from the table already in memory, rather than by a
+lambda capturing that map inside `arraySort` — a higher-order lambda over a `WITH`
+alias is exactly the kind of construct that fails only at execution time. A helper
+(`_ascii_lower_bigrams`) mirrors ClickHouse's byte-level, ASCII-only-lowercase pair
+semantics exactly, and is unit-tested against them.
 
 **Map parameter size.** The cap is `_ENTROPY_BIGRAM_MAX_PAIRS = 20_000` (module
 constant, not a setting — it is a memory bound, not an analyst-facing knob). Worst
