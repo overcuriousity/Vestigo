@@ -15,9 +15,11 @@ import pytest
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
     _CHARSET_GROUP_PROBE_LIMIT,
+    _ENTROPY_BIGRAM_MAX_PAIRS,
     _ENTROPY_BIGRAM_PROB_THRESH,
     _MAX_CHARSET_GROUPED_ROWS,
     _MAX_CHARSET_SIZE,
+    _MIN_ENTROPY_BASELINE,
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
@@ -5343,3 +5345,161 @@ def test_entropy_bigram_prob_thresh_setting_matches_the_detector_fallback():
     from vestigo.core.config import Settings
 
     assert Settings().stat_entropy_bigram_prob_thresh == _ENTROPY_BIGRAM_PROB_THRESH == 0.05
+
+
+# ---------------------------------------------------------------------------
+# find_entropy_outliers — D11 bigram method
+# ---------------------------------------------------------------------------
+
+
+def test_entropy_rejects_an_unknown_method():
+    svc = _svc([])
+    with pytest.raises(ValueError):
+        svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], entropy_method="trigram")
+
+
+def test_entropy_bigram_learns_a_pair_table_then_scores_values():
+    """One count + one learn + one detect query per field, and the finding
+    carries the pairs that sank it."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(120,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(40,)], column_names=["n"]),
+            FakeQueryResult(
+                result_rows=[("ho", 30, 40), ("os", 25, 40), ("qx", 1, 40)],
+                column_names=["pair", "cnt", "head_cnt"],
+            ),
+            FakeQueryResult(
+                result_rows=[("qxvbnrtplkj", 0.0008, 3, fs, "evt-dga")],
+                column_names=["val", "mean_prob", "cnt", "first_seen", "evt_id"],
+            ),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], entropy_method="bigram")
+
+    assert result.status == "ok"
+    assert result.method == "bigram"
+    assert len(result.results) == 1
+    f = result.results[0]
+    assert f.mode == "bigram"
+    assert f.mean_prob == pytest.approx(0.0008)
+    assert f.prob_thresh == _ENTROPY_BIGRAM_PROB_THRESH
+    # The Shannon fields stay empty — bits and probabilities are not the same number.
+    assert f.entropy is None and f.lower is None and f.upper is None and f.direction is None
+    # score = (0.05 - 0.0008) / 0.05
+    assert f.score == pytest.approx(0.984, abs=1e-3)
+    # The explanation: the value's own rarest pairs. "qx" was learned at 1/40;
+    # "vb"/"nr" were never learned at all, so they score 0.0 and sort first.
+    assert len(f.rare_pairs) == 5
+    assert f.rare_pairs[0]["prob"] == 0.0
+    assert all(set(p) == {"pair", "prob"} for p in f.rare_pairs)
+    assert f.details["allowlist_field"] == "attr:host"
+    assert f.details["allowlist_value"] == "qxvbnrtplkj"
+    assert f.details["mode"] == "bigram"
+    assert f.details["table_pairs"] == 3
+    assert f.details["baseline_n"] == 40
+
+    joined = "\n".join(client.full_queries)
+    assert "ngrams(lower(" in joined
+    assert "Map(String, Float64)" in joined
+    assert "OVER (PARTITION BY substring(pair, 1, 1))" in joined
+
+
+def test_entropy_bigram_temporal_method_name_and_window_attribution():
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 5, tzinfo=UTC),
+        label="win",
+    )
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(120,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(40,)], column_names=["n"]),
+            FakeQueryResult(result_rows=[("ho", 30, 40)], column_names=["pair", "cnt", "head_cnt"]),
+            FakeQueryResult(
+                result_rows=[("qxvbnrtplkj", 0.001, 3, fs, "evt-1", 0)],
+                column_names=["val", "mean_prob", "cnt", "first_seen", "evt_id", "win_idx"],
+            ),
+        ]
+    )
+    result = svc.find_entropy_outliers(
+        "c1", ["s1"], fields=["attr:host"], entropy_method="bigram", windows=windows
+    )
+    assert result.method == "temporal-bigram"
+    assert result.results[0].details["window_label"] == "win"
+
+
+def test_entropy_bigram_warns_when_the_pair_table_is_capped():
+    rows = [(f"p{i}", 1, 10) for i in range(_ENTROPY_BIGRAM_MAX_PAIRS)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(120,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(40,)], column_names=["n"]),
+            FakeQueryResult(result_rows=rows, column_names=["pair", "cnt", "head_cnt"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], entropy_method="bigram")
+    assert any("ceiling" in w for w in result.warnings)
+
+
+def test_entropy_bigram_skips_a_field_under_the_baseline_floor():
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(120,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(_MIN_ENTROPY_BASELINE - 1,)], column_names=["n"]),
+        ]
+    )
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], entropy_method="bigram")
+    assert result.status == "insufficient_data"
+
+
+def test_entropy_bigram_threshold_is_overridable():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(120,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(40,)], column_names=["n"]),
+            FakeQueryResult(result_rows=[("ho", 30, 40)], column_names=["pair", "cnt", "head_cnt"]),
+            FakeQueryResult(
+                result_rows=[("qxvbn", 0.005, 3, fs, "evt-1")],
+                column_names=["val", "mean_prob", "cnt", "first_seen", "evt_id"],
+            ),
+        ]
+    )
+    result = svc.find_entropy_outliers(
+        "c1", ["s1"], fields=["attr:host"], entropy_method="bigram", prob_thresh=0.01
+    )
+    f = result.results[0]
+    assert f.prob_thresh == 0.01
+    # score = (0.01 - 0.005) / 0.01
+    assert f.score == pytest.approx(0.5)
+
+
+def test_entropy_shannon_findings_still_carry_their_own_fields():
+    """The default path is untouched: mode is stamped, nothing else moves."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[("aaaaaaaaaaaa", 0.1, 7, fs, "evt-pad")],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            ),
+        ]
+    )
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"])
+    f = result.results[0]
+    assert result.method == "iqr"
+    assert f.mode == "shannon"
+    assert f.entropy == 0.1 and f.direction == "below"
+    assert f.details["mode"] == "shannon"
+    assert f.mean_prob is None and f.rare_pairs is None and f.prob_thresh is None

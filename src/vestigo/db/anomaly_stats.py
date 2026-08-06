@@ -79,18 +79,23 @@ already-ingested data.
     (temporal: ``log(n_vals + 1)`` per char) — value_novelty's surprise family.
 
 **entropy** (``detector="entropy"``)
-    Per field, Shannon character entropy (bits) of each *distinct value*
+    Per field, two syntactic statistics over each *distinct value*, selected by
+    ``entropy_method``. **shannon** (default): character entropy (bits)
     compared against the field's baseline entropy distribution via a Tukey
-    fence — above-band values look random (DGA domains, encoded payloads),
-    below-band values look degenerate (padding, character stuffing). AMiner
-    ``EntropyDetector``, purely syntactic. Two modes: *self-baseline*
-    (``method="iqr"``, fence over the whole corpus — quantiles are not
-    degenerate over their own population, unlike min/max) and *temporal*
-    (``method="temporal-iqr"``, fence learned from the baseline window,
-    detection restricted to the detect window). Entropies are per distinct
-    value (frequency-independent); values shorter than
-    ``_MIN_ENTROPY_VALUE_LEN`` codepoints are excluded throughout. Score =
-    distance outside the band ÷ band width, like numeric_range.
+    fence — above-band values look random (base64 payloads, keys), below-band
+    values look degenerate (padding, character stuffing); score = distance
+    outside the band ÷ band width, like numeric_range. **bigram** (D11, AMiner
+    ``EntropyDetector``): a learned character-pair table ``P(c₂|c₁)`` over the
+    baseline's distinct values, flagging values whose mean pair probability
+    falls below ``prob_thresh`` — ordinary characters in an unusual *order*
+    (a lowercase DGA domain among English hostnames), which the character mix
+    alone cannot see; score = distance below the threshold ÷ threshold. Each
+    has a self-baseline and a temporal form (``iqr``/``temporal-iqr``,
+    ``bigram``/``temporal-bigram``): self-baseline learns from the whole
+    corpus, temporal from the baseline window with detection restricted to the
+    suspect windows. Both are per distinct value (frequency-independent);
+    values shorter than ``_MIN_ENTROPY_VALUE_LEN`` codepoints are excluded
+    throughout.
 
 **proportion_shift** (``detector="proportion_shift"``)
     Per (field, value), test whether the value's *share* of events differs
@@ -800,22 +805,40 @@ class CharsetFinding:
 
 @dataclass
 class EntropyFinding:
-    """One entropy-outlier value from the entropy detector."""
+    """One flagged value from the entropy detector.
+
+    Two methods share this shape. ``mode="shannon"`` carries the value's own
+    Shannon character entropy against a Tukey band (``entropy``/``lower``/
+    ``upper``/``direction``); ``mode="bigram"`` (D11) carries the mean learned
+    probability of its character pairs against a threshold (``mean_prob``/
+    ``prob_thresh``/``rare_pairs``). The other method's fields are ``None`` —
+    bits and probabilities are different quantities on different scales and
+    are never conflated into one field.
+    """
 
     field: str
     value: str
-    # Shannon character entropy of the value, in bits.
-    entropy: float
     count: int
-    # excess distance beyond the entropy band, normalized by band width.
+    # 0–1 severity; per-mode formula, documented on the fields below.
     score: float
-    direction: str  # "below" | "above"
-    lower: float
-    upper: float
     first_seen: str | None
     event_id: str | None
     event: dict[str, Any] | None
     details: dict[str, Any]
+    mode: str = "shannon"  # "shannon" | "bigram"
+    # --- shannon only ---
+    # Shannon character entropy of the value, in bits.
+    entropy: float | None = None
+    direction: str | None = None  # "below" | "above"
+    lower: float | None = None
+    upper: float | None = None
+    # --- bigram only (D11) ---
+    # Mean learned probability of the value's character pairs, 0–1.
+    mean_prob: float | None = None
+    prob_thresh: float | None = None
+    # The five lowest-probability pairs in the value:
+    # ``[{"pair": "qx", "prob": 0.0}, ...]`` — the explanation behind the score.
+    rare_pairs: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -3781,6 +3804,217 @@ class StatisticalAnomalyService:
     # Value entropy outliers
     # ------------------------------------------------------------------
 
+    def _entropy_bigram_field(
+        self,
+        field_token: str,
+        *,
+        case_id: str,
+        db: str,
+        base_params: dict[str, Any],
+        eff: str,
+        method: str,
+        thresh: float,
+        per_field_limit: int,
+        windows: AnalysisWindows | None,
+        field_mappings: dict[str, list[str]] | None,
+        source_offsets: dict[str, int] | None,
+    ) -> tuple[list[EntropyFinding] | None, str | None]:
+        """Score one field with the D11 bigram method.
+
+        Returns ``(findings, warning)``. *findings* is ``None`` when the field
+        was skipped (too few qualifying baseline values, or nothing learnable),
+        which the caller distinguishes from an empty list so ``evaluated_fields``
+        — and therefore the ``insufficient_data`` status — stays truthful.
+        """
+        # --- The qualifying baseline population, against the same floor the
+        # Shannon method applies over the same population. ---
+        cnt_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+        col = _col_expr(field_token, cnt_params, field_mappings)
+        baseline_clause = ""
+        if windows is not None:
+            base_pred, _ = _window_preds(windows, cnt_params, source_offsets)
+            # The baseline window is a bounded range, so the year-2299 sentinel
+            # can never fall inside it.
+            baseline_clause = f" AND {base_pred}"
+        cnt_sql = f"""
+            SELECT count() AS n
+            FROM (
+                SELECT DISTINCT {col} AS val
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {col} != ''
+                  AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
+            )
+            {HEAVY_SCAN_SETTINGS}
+        """
+        crows = self.ch.client.query(cnt_sql, parameters=cnt_params).result_rows
+        n = int(crows[0][0]) if crows and crows[0][0] is not None else 0
+        if n < _MIN_ENTROPY_BASELINE:
+            return None, None
+
+        # --- Learn P(c₂|c₁) over the baseline's distinct values. The window
+        # function totals each pair's head over the FULL pair set, so the
+        # denominators stay exact even when the returned rows hit the cap;
+        # ordering by count before the cap means a hit drops the rarest pairs,
+        # whose probability is nearest the zero a missing key already yields. ---
+        learn_params: dict[str, Any] = {
+            **base_params,
+            "minlen": _MIN_ENTROPY_VALUE_LEN,
+            "maxpairs": _ENTROPY_BIGRAM_MAX_PAIRS,
+        }
+        lcol = _col_expr(field_token, learn_params, field_mappings)
+        learn_baseline_clause = ""
+        if windows is not None:
+            lbase_pred, _ = _window_preds(windows, learn_params, source_offsets)
+            learn_baseline_clause = f" AND {lbase_pred}"
+        learn_sql = f"""
+            SELECT pair, cnt, sum(cnt) OVER (PARTITION BY substring(pair, 1, 1)) AS head_cnt
+            FROM (
+                SELECT arrayJoin(ngrams(lower(val), 2)) AS pair, count() AS cnt
+                FROM (
+                    SELECT DISTINCT {lcol} AS val
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {lcol} != ''
+                      AND lengthUTF8({lcol}) >= {{minlen:UInt32}}{learn_baseline_clause}
+                )
+                GROUP BY pair
+            )
+            ORDER BY cnt DESC
+            LIMIT {{maxpairs:UInt32}}
+            {HEAVY_SCAN_SETTINGS}
+        """
+        lrows = self.ch.client.query(learn_sql, parameters=learn_params).result_rows
+        table = _bigram_probability_table(lrows)
+        if not table:
+            return None, None
+        warning = None
+        if len(lrows) >= _ENTROPY_BIGRAM_MAX_PAIRS:
+            warning = (
+                f"{field_token}: the learned character-pair table hit its "
+                f"{_ENTROPY_BIGRAM_MAX_PAIRS}-pair ceiling — pairs beyond it score as never-seen."
+            )
+
+        # --- Score the detect population against the table. The table travels
+        # as two parallel arrays cast to a Map: a missing key yields 0.0, which
+        # is the honest score for a pair the baseline never contained. ---
+        viol_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+        bind_offset_params(source_offsets, viol_params)
+        vcol = _col_expr(field_token, viol_params, field_mappings)
+        viol_params["pairs"] = list(table.keys())
+        viol_params["probs"] = list(table.values())
+        viol_params["thresh"] = thresh
+        viol_params["plim"] = per_field_limit
+        win_idx_sel = ""
+        win_idx_group = ""
+        detect_clause = ""
+        if windows is not None:
+            _, viol_sps = _window_preds(windows, viol_params, source_offsets)
+            # Restrict the scan to the suspect-window union, tag each row with
+            # its window index for attribution, and exclude sentinel/undated
+            # rows (the year-2299 sentinel would land in any open range).
+            win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
+            win_idx_group = ", win_idx"
+            detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
+        viol_sql = f"""
+            WITH CAST(({{pairs:Array(String)}}, {{probs:Array(Float64)}}), 'Map(String, Float64)') AS tbl
+            SELECT val, mean_prob, cnt, first_seen, evt_id{win_idx_group}
+            FROM (
+                SELECT
+                    val,
+                    arrayAvg(arrayMap(p -> tbl[p], ngrams(lower(val), 2))) AS mean_prob,
+                    cnt, first_seen, evt_id{win_idx_group}
+                FROM (
+                    SELECT
+                        {vcol} AS val,
+                        count() AS cnt,
+                        min({eff}) AS first_seen,
+                        toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {vcol} != ''
+                      AND lengthUTF8({vcol}) >= {{minlen:UInt32}}{detect_clause}
+                    GROUP BY val{win_idx_group}
+                )
+            )
+            WHERE mean_prob < {{thresh:Float64}}
+            ORDER BY mean_prob ASC, first_seen ASC
+            LIMIT {{plim:UInt32}}
+            {HEAVY_SCAN_SETTINGS}
+        """
+        vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+
+        findings: list[EntropyFinding] = []
+        for vrow in vrows:
+            if windows is None:
+                val, mean_prob, cnt, first_seen, evt_id = vrow
+                window: TimeWindow | None = None
+            else:
+                val, mean_prob, cnt, first_seen, evt_id, win_idx = vrow
+                wi = int(win_idx)
+                window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
+            if not val or mean_prob is None:
+                continue
+            mp = float(mean_prob)
+            # The explanation, built from the table already in hand: the value's
+            # own lowest-probability pairs, in the same byte/casefold terms the
+            # query scored them by.
+            seen: list[str] = []
+            for pair in _ascii_lower_bigrams(str(val)):
+                if pair not in seen:
+                    seen.append(pair)
+            rare_pairs = [
+                {"pair": p, "prob": round(table.get(p, 0.0), 6)}
+                for p in sorted(seen, key=lambda p: table.get(p, 0.0))[:5]
+            ]
+            first_seen_str = _present_ts(first_seen)
+            evt_id_str = str(evt_id) if evt_id else None
+
+            details: dict[str, Any] = {
+                "detector": "entropy",
+                "method": method,
+                "mode": "bigram",
+                "field": field_token,
+                "value": str(val),
+                "mean_prob": round(mp, 6),
+                "prob_thresh": thresh,
+                "rare_pairs": rare_pairs,
+                "count": int(cnt),
+                "baseline_n": n,
+                "table_pairs": len(table),
+                "casefold": "ascii-lower",
+                "allowlist_field": field_token,
+                "allowlist_value": str(val),
+            }
+            if window is not None:
+                details.update(
+                    {
+                        "window_label": window.label,
+                        "window_start": ensure_utc(window.start).isoformat(),
+                        "window_end": ensure_utc(window.end).isoformat(),
+                    }
+                )
+            findings.append(
+                EntropyFinding(
+                    field=field_token,
+                    value=str(val),
+                    count=int(cnt),
+                    score=_bigram_score(mp, thresh),
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen_str),
+                    details=details,
+                    mode="bigram",
+                    mean_prob=round(mp, 6),
+                    prob_thresh=thresh,
+                    rare_pairs=rare_pairs,
+                )
+            )
+        return findings, warning
+
     @_gated_scan
     def find_entropy_outliers(
         self,
@@ -3796,42 +4030,72 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        entropy_method: str = "shannon",
+        prob_thresh: float | None = None,
     ) -> StatAnomalyResult:
-        """Return values whose Shannon character entropy falls outside a learned band.
+        """Return values whose character statistics are unlike the field's normal ones.
 
-        Per field, compute the character entropy (bits) of each *distinct
-        value* and compare it against the field's baseline entropy
-        distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
-        Values above the band look random (DGA domains, encoded payloads,
-        keys); values below it look degenerate (padding, repeated-character
-        stuffing). Entropy is a property of the characters, never of what the
-        value means.
+        Two methods, selected by *entropy_method*, sharing every other piece of
+        machinery — field selection, the length/baseline floors, window
+        handling, allowlists and the findings envelope.
 
-        Inspired by AMiner's ``EntropyDetector`` but **not the same statistic**:
-        AMiner scores values against a learned character-*bigram* transition
-        table, which catches ordinary-alphabet-unusual-order values (DGA
-        domains); per-value Shannon entropy does not. See
-        ``docs/ANOMALY_DETECTION.md`` §6 and roadmap D11.
+        **shannon** (default). Compute the Shannon character entropy (bits) of
+        each *distinct value* and compare it against the field's baseline
+        entropy distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
+        Values above the band look random (base64 payloads, keys); values below
+        it look degenerate (padding, repeated-character stuffing).
 
-        Two modes: *self-baseline* (``method="iqr"``) computes the fence over
-        the whole corpus's per-distinct-value entropies (unlike an exact
-        min/max, quartiles are not degenerate over their own population);
-        *temporal* (``method="temporal-iqr"``, *windows* provided) learns the
-        fence from the baseline window and flags only suspect-window values,
-        attributed to the window they appear in; events outside every window
-        are ignored.
+        **bigram** (D11, AMiner's ``EntropyDetector`` re-derived as batch SQL).
+        Learn a character-pair transition table ``P(c₂|c₁)`` over the baseline
+        population's distinct values, then flag detect values whose *mean pair
+        probability* falls below *prob_thresh*. This is what catches a value
+        built from perfectly ordinary characters in an unusual **order** — a
+        lowercase-latin DGA domain among English hostnames, whose Shannon
+        entropy is unremarkable. Pairs are ASCII-lowercased byte pairs
+        (ClickHouse ``lower()`` + ``ngrams``); a pair the baseline never
+        contained scores 0, unsmoothed. The table is capped at
+        ``_ENTROPY_BIGRAM_MAX_PAIRS`` most-frequent pairs, and a field that
+        hits the cap says so in ``warnings``.
 
-        Entropies are weighted per distinct value, not per row — one hot
-        value repeated millions of times cannot drag the band toward itself.
-        Values shorter than ``_MIN_ENTROPY_VALUE_LEN`` codepoints are excluded
-        from baseline and detection alike. A field with fewer than
+        Both methods have a self-baseline and a temporal form, giving four
+        ``method`` values: ``iqr`` / ``temporal-iqr`` and ``bigram`` /
+        ``temporal-bigram``. Self-baseline learns from the whole corpus (for
+        the fence, quartiles are not degenerate over their own population the
+        way an exact min/max is; for the table, a handful of generated values
+        contribute a negligible share of the pair mass); temporal learns from
+        the baseline window and flags only suspect-window values, attributed to
+        the window they appear in, with events outside every window ignored.
+
+        Both are weighted per distinct value, not per row — one hot value
+        repeated millions of times cannot train the band or the table toward
+        itself. Values shorter than ``_MIN_ENTROPY_VALUE_LEN`` codepoints are
+        excluded from baseline and detection alike. A field with fewer than
         ``_MIN_ENTROPY_BASELINE`` qualifying baseline values is skipped; when
         every scanned field skips the status is ``insufficient_data``.
+
+        Args:
+            entropy_method: ``"shannon"`` (default) or ``"bigram"``.
+            prob_thresh: bigram only — mean pair probability below which a
+                value is flagged. Defaults to ``_ENTROPY_BIGRAM_PROB_THRESH``;
+                the API passes the operator's effective setting.
+
+        Raises:
+            ValueError: if *entropy_method* is neither method.
         """
+        if entropy_method not in ("shannon", "bigram"):
+            raise ValueError(
+                f"Unknown entropy method: {entropy_method!r} (expected 'shannon' or 'bigram')"
+            )
+        bigram = entropy_method == "bigram"
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "iqr" if windows is None else "temporal-iqr"
+        if bigram:
+            method = "bigram" if windows is None else "temporal-bigram"
+        else:
+            method = "iqr" if windows is None else "temporal-iqr"
+        thresh = float(prob_thresh) if prob_thresh is not None else _ENTROPY_BIGRAM_PROB_THRESH
+        run_warnings: list[str] = []
         eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
@@ -3864,6 +4128,28 @@ class StatisticalAnomalyService:
         evaluated_fields = 0
 
         for field_token in scan_fields:
+            if bigram:
+                findings, warned = self._entropy_bigram_field(
+                    field_token,
+                    case_id=case_id,
+                    db=db,
+                    base_params=base_params,
+                    eff=eff,
+                    method=method,
+                    thresh=thresh,
+                    per_field_limit=per_field_limit,
+                    windows=windows,
+                    field_mappings=field_mappings,
+                    source_offsets=source_offsets,
+                )
+                if warned is not None:
+                    run_warnings.append(warned)
+                if findings is None:
+                    continue  # field skipped: under the baseline floor, or nothing learned
+                evaluated_fields += 1
+                all_findings.extend(findings)
+                continue
+
             # --- Learn the entropy band from the baseline. ---
             stat_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
             col = _col_expr(field_token, stat_params, field_mappings)
@@ -3970,6 +4256,7 @@ class StatisticalAnomalyService:
                 details: dict[str, Any] = {
                     "detector": "entropy",
                     "method": method,
+                    "mode": "shannon",
                     "field": field_token,
                     "value": str(val),
                     "entropy": round(ent_f, 4),
@@ -4007,6 +4294,7 @@ class StatisticalAnomalyService:
                         event_id=evt_id_str,
                         event=mini_event,
                         details=details,
+                        mode="shannon",
                     )
                 )
 
@@ -4017,6 +4305,7 @@ class StatisticalAnomalyService:
             total_events=total_events,
             evaluated_fields=evaluated_fields,
             allowlist=allowlist,
+            warnings=run_warnings,
             windows=windows,
             exclude_event_ids=exclude_event_ids,
             limit=limit,
