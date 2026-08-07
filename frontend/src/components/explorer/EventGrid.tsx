@@ -385,6 +385,22 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   locatedHiddenId,
 }, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  // Distance from the top of the scrolled content to the first row. The header
+  // is part of that content (so it can scroll horizontally with the columns),
+  // which shifts every vertical offset the virtualizer and the scroll handler
+  // reason about. Measured rather than hardcoded: the header's height follows
+  // the font and the density setting.
+  const [bodyOffset, setBodyOffset] = useState(0);
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const measure = () => setBodyOffset(el.offsetTop);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const density = useUiStore((s) => s.density);
   const ROW_HEIGHT = ROW_HEIGHT_BY_DENSITY[density];
   // The backend names this tag; the chip must read the same word the filter
@@ -682,6 +698,10 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     getScrollElement: () => parentRef.current,
     estimateSize: () => ROW_HEIGHT,
     overscan: OVERSCAN,
+    // The header occupies the top of the scrolled content; without this the
+    // virtualizer would believe row 0 starts at scrollTop 0 and render the
+    // wrong window by exactly the header's height.
+    scrollMargin: bodyOffset,
   });
 
   const virtualItems = rowVirtualizer.getVirtualItems();
@@ -707,14 +727,20 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     const el = parentRef.current;
     const ts =
       el && rows.length > 0
-        ? (rows[Math.min(rows.length - 1, Math.max(0, Math.floor(el.scrollTop / ROW_HEIGHT)))]
-            ?.original.timestamp ?? null)
+        ? (rows[
+            Math.min(
+              rows.length - 1,
+              // The header scrolls with the content, so the first bodyOffset
+              // pixels of scrollTop are header, not rows.
+              Math.max(0, Math.floor((el.scrollTop - bodyOffset) / ROW_HEIGHT)),
+            )
+          ]?.original.timestamp ?? null)
         : null;
     if (ts !== lastReportedTsRef.current) {
       lastReportedTsRef.current = ts;
       onVisibleTimestampChange(ts);
     }
-  }, [rows, onVisibleTimestampChange, ROW_HEIGHT]);
+  }, [rows, onVisibleTimestampChange, ROW_HEIGHT, bodyOffset]);
 
   useEffect(() => {
     reportVisibleTimestamp();
@@ -725,6 +751,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   // which would otherwise cause a visible jump. Capture an anchor right
   // before requesting the earlier page, then correct scrollTop once the new
   // rows land (row height is fixed, so this is exact, cheap arithmetic).
+  // Deliberately unaffected by the header's `bodyOffset`: both the captured
+  // and the restored scrollTop include it, so a constant offset cancels.
   const prependAnchorRef = useRef<{ scrollTop: number; firstEventId: string } | null>(null);
 
   const handleLoadEarlier = useCallback(() => {
@@ -810,8 +838,24 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
 
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">
-      {/* Header row */}
-      <div className="flex shrink-0 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]">
+      <div
+        ref={parentRef}
+        data-testid="grid-scroll"
+        data-tour="event-grid"
+        className="flex-1 overflow-auto"
+        onScroll={handleScroll}
+      >
+      {/* One wrapper at content width, so the header and every row span the
+        * same box. Without it the header could not scroll with the columns,
+        * and rows would be sized to the viewport — cutting their background,
+        * hover state and borders off at the right edge. */}
+      <div data-testid="grid-content" style={{ minWidth: table.getTotalSize() }}>
+      {/* Header row — inside the scroller so it tracks horizontal scroll,
+        * sticky so it still holds its place vertically. */}
+      <div
+        data-testid="grid-header"
+        className="sticky top-0 z-20 flex border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      >
         {table.getHeaderGroups().map((hg) =>
           hg.headers.map((h) => (
             <div
@@ -855,13 +899,11 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       </div>
 
       {/* Virtualized body */}
-      <div
-        ref={parentRef}
-        data-tour="event-grid"
-        className="flex-1 overflow-auto"
-        onScroll={handleScroll}
-      >
-        <div style={{ height: totalHeight, position: "relative" }}>
+        <div
+          ref={bodyRef}
+          data-testid="grid-body"
+          style={{ height: totalHeight, position: "relative" }}
+        >
           {virtualItems.map((vItem) => {
             const row = rows[vItem.index];
             const event = row.original;
@@ -895,7 +937,10 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                 key={vItem.key}
                 style={{
                   position: "absolute",
-                  top: vItem.start,
+                  // vItem.start is measured in scroll-element space once
+                  // scrollMargin is set; the row sits inside grid-body, so
+                  // this converts between the two.
+                  top: vItem.start - bodyOffset,
                   left: 0,
                   right: 0,
                   height: ROW_HEIGHT,
@@ -963,6 +1008,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             );
           })}
         </div>
+      </div>
       </div>
 
       {/* Footer */}
