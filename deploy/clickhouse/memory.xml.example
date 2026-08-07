@@ -1,0 +1,27 @@
+<!-- Server-side memory ceiling for ClickHouse. Copy to memory.xml, adjust the
+     value, and uncomment the corresponding mount in docker-compose.yml.
+
+     Why this exists as well as the container's mem_limit: ClickHouse derives
+     its own ceiling from max_server_memory_usage_to_ram_ratio (0.9) times what
+     it believes total RAM to be, and a containerized server can misdetect that
+     — 503 GiB has been observed on a 128 GiB VM. When it does, it never
+     self-throttles, grows past the cgroup limit, and the kernel SIGKILLs it:
+     `clickhouse-1 exited with code 137`, with no ClickHouse-side memory error
+     anywhere in its log. Pinning an absolute byte value removes the detection
+     step entirely; the cgroup limit then only ever has to catch the tail
+     (merges, caches, allocator slack) rather than the whole server.
+
+     Sizing: leave the server real headroom under the container limit. With
+     `mem_limit: 12g` in the reference stack, 10 GiB here is a reasonable start.
+     Also keep it consistent with the app's own scan budget — see
+     docs/DEPLOYMENT.md "Resource sizing"; VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES
+     is a *total across concurrent scans*, so it must sit below this number,
+     not above it. -->
+<clickhouse>
+  <!-- 10 GiB. -->
+  <max_server_memory_usage>10737418240</max_server_memory_usage>
+  <!-- Ignored once the absolute value above is set; spelled out so an operator
+       who clears max_server_memory_usage doesn't silently fall back to 0.9 of
+       a possibly-misdetected total. -->
+  <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+</clickhouse>

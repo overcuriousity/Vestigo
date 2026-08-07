@@ -98,6 +98,23 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   a correctly-pinned 8 GiB cap OOM-killed a 12 GiB host exactly this way.
   Nested helpers (`recommend_*`, `*_inventory`) are not gated — gated scans
   call them while holding the slot.
+  **The gate is not detector-only.** `ClickHouseStore.finalize_enrichment_apply`
+  takes a slot for the whole enrichment partition rewrite (scratch build,
+  `INSERT ... SELECT` over the source's partition, and the `REPLACE PARTITION`
+  swap — the swap included, because it queues merges on freshly written parts
+  and merge memory was never covered by the per-query cap). Ungated, that
+  rewrite stacked on top of a full set of admitted detector scans and
+  OOM-killed clickhouse-server on a 32 GiB full-docker host mid-apply. Its
+  write side is bounded separately (`VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS`,
+  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`), since the scan settings bound a
+  read and the rewrite also materializes a full copy of the partition.
+  Anything else that adds a whole-partition or whole-corpus query — read or
+  write — takes a slot too.
+- **Every `VESTIGO_STAT_SCAN_*` setting is restart-required.** The SETTINGS
+  clause is a module-level string built once at import, and the gate is
+  imported by value into each scan module, so an admin-console edit cannot
+  reach the running process. They are declared `restart_required` in the
+  settings registry rather than silently accepting an edit that does nothing.
 - **Window-function sorts cannot spill** (verified empirically on ClickHouse
   26.6: the `MergeSortingTransform` feeding a window function runs into
   `max_memory_usage` regardless of `max_bytes_before_external_sort`, code

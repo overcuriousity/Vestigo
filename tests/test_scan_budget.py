@@ -115,3 +115,50 @@ def test_every_detector_entry_point_is_gated():
     for name in detectors:
         fn = getattr(StatisticalAnomalyService, name)
         assert getattr(fn, "__wrapped__", None) is not None, f"{name} is not gated"
+
+
+def test_enrichment_partition_rewrite_takes_a_gate_slot():
+    """The enrichment apply is gated like a detector scan.
+
+    ``max_memory_usage`` is per *query*: an ungated whole-partition rewrite
+    stacked on top of a full set of admitted detector scans is how a 32 GiB
+    full-docker host OOM-killed clickhouse-server mid-apply (session-56).
+    """
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    seen: list[str] = []
+
+    class _Gate:
+        def __enter__(self):
+            seen.append("acquired")
+            return self
+
+        def __exit__(self, *exc):
+            seen.append("released")
+            return False
+
+    class _Client:
+        def command(self, sql):
+            # The swap must happen while the slot is still held: it queues
+            # merges on freshly written parts, which the per-query cap misses.
+            assert seen == ["acquired"], "rewrite ran outside the gate"
+
+        def query(self, sql, parameters=None):
+            assert seen == ["acquired"], "rewrite ran outside the gate"
+            assert "max_insert_threads" in sql
+            assert "min_insert_block_size_bytes" in sql
+
+    store = ClickHouseStore.__new__(ClickHouseStore)
+    store.client = _Client()
+    store.database = "testdb"
+
+    import vestigo.db.clickhouse as ch_mod
+
+    original = ch_mod.HEAVY_SCAN_GATE
+    ch_mod.HEAVY_SCAN_GATE = _Gate()
+    try:
+        store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
+    finally:
+        ch_mod.HEAVY_SCAN_GATE = original
+
+    assert seen == ["acquired", "released"]

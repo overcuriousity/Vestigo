@@ -33,7 +33,18 @@ cannot be relied on here: inside containers/VMs it may misdetect total memory
 The clause is a string constant, built once at import from the process
 settings, because it is interpolated into f-string SQL literals throughout the
 detectors — a live function call there would embed the function repr, not the
-clause.
+clause. :data:`HEAVY_SCAN_GATE` is likewise imported *by value* into every scan
+module, so rebinding it here would not reach those bindings. Both facts mean an
+admin console edit to a ``stat_scan_*`` setting cannot take effect in the
+running process, which is why every one of them is declared
+``restart_required`` in ``core/settings_registry.py`` — making the values live
+is a real refactor, and silently accepting an edit that does nothing is worse
+than telling the operator to restart.
+
+The gate is not detector-only: ``ClickHouseStore.finalize_enrichment_apply``
+takes a slot for the enrichment partition rewrite too. It is the same class of
+whole-partition query and, before it was gated, it stacked on top of a full set
+of admitted detector scans and OOM-killed a 32 GiB host mid-apply.
 """
 
 import os

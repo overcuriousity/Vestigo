@@ -194,6 +194,19 @@ class Settings(BaseSettings):
     # stack past the ClickHouse host's RAM — observed as a kernel OOM-kill
     # of clickhouse-server, not a clean query error.
     stat_scan_concurrency: int = Field(default=2, ge=1)
+    # Write-side guardrails for the enrichment partition rewrite
+    # (db/clickhouse.py::finalize_enrichment_apply). The stat_scan_* settings
+    # above bound a *scan*; the rewrite also INSERTs a full copy of the
+    # source's partition, and each insert thread holds its own block buffer.
+    # Threads are capped low deliberately: this path runs once per source at
+    # job end and is never latency-critical, but it is the query shape that
+    # OOM-killed a 32 GiB full-docker host (session-56 incident).
+    enrichment_apply_max_insert_threads: int = Field(default=2, ge=1)
+    # ClickHouse min_insert_block_size_bytes for that INSERT — the block is
+    # squashed to this size before a part is written, so it is roughly
+    # per-thread peak. The default matches ClickHouse's own; lower it to trade
+    # more (smaller) parts and more merge work for less insert-time memory.
+    enrichment_apply_insert_block_bytes: int = Field(default=268_435_456, ge=1_048_576)
     # Max entries in the process-local baseline-compare layer cache
     # (db/viz_cache.py, M24c) — memoizes the unfiltered baseline layer of
     # Visualize compare renders so it isn't a full-timeline re-scan on every
