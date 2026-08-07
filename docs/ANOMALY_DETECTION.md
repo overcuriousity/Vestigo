@@ -148,6 +148,109 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   column (a uniform per-source shift cancels within a source), and only the
   reported timestamps are shifted for display.
 
+### The analysis gate: which methods are offered up front
+
+The Investigate rail does not run every method on open. `db/analysis_plan.py`
+answers, per method and without scanning a single event, whether that method
+*can* produce a finding on this data; `GET .../analysis/plan` serves the
+verdicts. Inputs are the per-source `field_stats` cache and one
+timestamp-range probe, both already paid for elsewhere.
+
+**A method is `not_applicable` if and only if it structurally cannot produce a
+finding here** — never because it looks unpromising. The distinction is the
+whole contract: a zero from a method that ran means "checked, nothing"; a
+method that was skipped was not checked, and the UI must never present the two
+the same way.
+
+| Method | Precondition | Setting |
+|---|---|---|
+| `value_novelty`, `timestamp_order`, `log_template` | none — always offered | — |
+| `value_combo` | ≥2 categorical fields | — |
+| `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
+| `charset`, `entropy` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
+| `frequency` | span long enough to hold the bucket minimum | `analysis_gate_min_frequency_buckets` |
+| `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
+| `sequence_novelty` | series field with enough distinct values for n-grams to differ | `analysis_gate_min_series_distinct` |
+| `proportion_shift`, `value_distribution_drift` | a second window exists — i.e. the baseline frame with an active definition | — (reported as `needs_setup`) |
+
+`needs_setup` is a third status, not a weaker skip: an analyst action makes the
+method applicable, so the UI offers that action rather than a "run anyway" that
+could only produce a guaranteed-empty scan.
+
+Two properties are load-bearing and are enforced by tests:
+
+- **Nothing is ever locked.** A `not_applicable` method runs through
+  `GET .../analysis/findings` exactly as any other, returning what an
+  unconditional sweep would have returned.
+- **The gate never skips a method that works.** A wrong precondition fails
+  silently — a method that would have found something is simply not offered —
+  so `tests/test_demo_detector_coverage_clickhouse.py`, which already asserts
+  every analysis tool finds something in the demo case, also asserts the gate
+  offers every one of them there.
+
+Every verdict carries `reason_facts`, the arithmetic behind it, so the UI can
+state "no field parses as numeric (0 of 19 sampled ≥ 90 %)" rather than a bare
+"not applicable". The plan is also fail-open: if it errors, the client marks
+every method applicable and runs everything.
+
+### The analysis cache
+
+`GET .../analysis/findings` is memoized in `analysis_cache` (`db/analysis_cache.py`),
+keyed on a SHA-256 of everything that can change an answer: the timeline, the
+sorted set of source content hashes, the enrichment generation, the frame and
+baseline, the method, its canonical params, and `dispositions_hash`.
+
+Sources are immutable after ingestion (enrichment applies excepted, and those
+move the generation), so identical inputs cannot describe different data: **a
+hit is proof the answer still holds**, not a judgement that it is recent
+enough. There is deliberately no TTL — "is this recent?" is not the question,
+and adding one would reintroduce exactly the staleness guesswork the key
+removes.
+
+`dispositions_hash` is in the key because `normal` verdicts are
+detection-affecting: marking a value normal must invalidate cached findings
+that would otherwise keep showing it. That hash is timeline-wide rather than
+per-method, which over-invalidates slightly — the safe direction, costing a
+rescan rather than a wrong answer.
+
+Every row is derived data. Eviction is LRU per case
+(`analysis_cache_max_rows_per_case`) and costs a rescan and nothing else, which
+is why it needs no audit trail. `DetectorRun` is unchanged and keeps its
+separate role: the accumulating forensic diary of what an analyst ran.
+
+### Scope provenance
+
+A finding is meaningless without the comparison that produced it, so both
+sides now record it:
+
+- Every plan and findings response carries a `scope` object (frame, baseline id
+  and name, dispositions hash).
+- `finding_dispositions.analysis_scope` records the comparison a verdict was
+  reached under. Nullable — rows written before this existed read as "scope not
+  recorded", which is honest where a backfill would be invention. Named
+  `analysis_scope` because that model already uses "scope" for the
+  value-vs-event distinction.
+
+`analysis_scope` is deliberately **not** part of `dispositions_hash`: that
+hashes detection-affecting facts, and scope-at-verdict-time is provenance.
+Extending it would invalidate the reproducibility record of every existing
+`DetectorRun` for no detection benefit.
+
+It *does* join the dedupe identity for `confirmed` only. That verdict asserts
+something about a comparison — escalating a finding against the February
+baseline and again against the March one are two separate claims, and
+collapsing them would lose one. `normal`, `dismissed` and `routine` are
+standing declarations about a value under every frame; duplicating those per
+scope would inflate the dispositions hash and the triage burndown without
+expressing anything new. A consequence worth stating: a case can hold two
+`confirmed` verdicts on one finding, so coverage counters must count distinct
+findings rather than disposition rows.
+
+Changing scope re-runs every method and reframes every verdict already
+recorded, so the UI gates it behind a confirm that names both counts. Existing
+verdicts are never discarded or rewritten — they are kept and stay tagged with
+the scope they were reached under.
+
 ### Baseline definitions, suspect windows, and the normality model
 
 Every temporal detector (value novelty, value combos, frequency, numeric

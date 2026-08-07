@@ -1,10 +1,86 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 161 — the second PR #242 review pass: two ways two
-enrichment applies could still meet).
+Last updated: 2026-08-07 (session 162 — the Investigate panel redesign: a gate that
+decides what is worth running, a cache whose hits are proof, and one rail plus one
+overlay in place of five tabs).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 162 — 2026-08-07: the Investigate panel redesign
+
+**Why.** Three complaints, one structural. Opening Investigate fired all eleven
+detectors at once and showed a spinner until the slowest returned, with nothing
+cached server-side. Several of those detectors could not have found anything —
+`numeric_range` on a timeline with no numeric field, the two-window methods in
+the self frame, where they are empty by construction. And the panel was a
+`shrink-0` flex sibling next to the filter rail, the grid and the event detail
+panel, so on a laptop the sum of their minimum widths pushed it off screen.
+Underneath all three: five tabs that sorted fourteen tools by which subsystem
+built them, so the analyst had to guess where a thing would have been noticed
+before they could look for it.
+
+**The gate.** `db/analysis_plan.py` decides, per method and without scanning an
+event, whether that method *can* produce a finding on this data —
+`field_stats` plus one timestamp probe. The contract is narrow on purpose:
+`not_applicable` means structurally impossible, never unpromising, and nothing
+is ever withheld. Every verdict carries the arithmetic behind it, so the UI
+states "no field parses as numeric (0 of 19 sampled ≥ 90%)" rather than a
+shrug. The plan fails open — a broken gate may cost time, never hide a method.
+
+**The guard earned itself immediately.** Wiring
+`test_demo_detector_coverage_clickhouse.py` to assert the gate never skips a
+method that file proves works caught two real bugs on first run, both failing
+silently in the same direction. Series distinct came from `merged_inventory`,
+which merges `distinct` as max-across-sources: on a timeline whose sources each
+carry one artifact type that reports 1 however many the timeline holds, so the
+sequence methods were gated off. And the log-template precondition looked for
+`message` in the inventory, but `message` is deliberately absent from
+`_NOVELTY_CANDIDATE_TOP_LEVEL` — it matched nowhere, so templating was withheld
+from every timeline. Thresholds needed no tuning once both were fixed.
+
+**The cache.** `analysis_cache` keys on a hash of everything that can change an
+answer: source content hashes, enrichment generation, scope, method, params,
+dispositions hash. Sources are immutable, so a hit is *proof* the answer still
+holds rather than a guess that it is recent — which is why there is no TTL, and
+why the panel never has to ask an analyst to judge staleness. Verified live:
+plan ~19 ms, a cold method ~60 ms, every warm call a byte-identical hit at
+~18 ms, and each of scope, params and a `normal` verdict independently missing.
+
+**Scope provenance.** A verdict is an assertion about a comparison, and nothing
+recorded which comparison — `finding_dispositions` had no scope column at all,
+so "confirmed on 4 March" could not say what against. It does now, nullable so
+older rows read as "not recorded" rather than being backfilled with invention,
+and deliberately outside `dispositions_hash` (provenance, not a detection
+input). It joins the dedupe identity for `confirmed` only: escalating against
+two baselines is two claims, while `normal` is a standing declaration about a
+value under every frame.
+
+**The panel.** One rail holding findings grouped by evidence weight — named
+techniques, statistical outliers, exploration — with the group note ("odd, not
+necessarily bad") next to the rows it qualifies instead of in a methodology
+tab. Everything else is one overlay sheet in three modes, absolutely
+positioned, so Investigate spends exactly one fixed width and the overflow is
+structurally impossible rather than tuned away. `EventDetailPanel` and
+`AgentPanel` were also `shrink-0`, so they were made shrinkable too — fixing
+only Investigate would have left the same bug reachable with two panels open.
+Sixteen components deleted, ~5,900 lines net.
+
+**What the deletion nearly took with it.** Four affordances lived in the panel
+rather than in the things they served, and only surfaced as unused variables:
+histogram anomaly markers, the grid's "find similar" (which would have set an
+anchor nothing read — a dead button), the combo and frequency drills that a
+single field/value filter cannot express, and the first-run explainers. All
+rewired. The baseline gesture needed the same treatment: the brush still set a
+pending range, but the builder now mounts inside the Tools sheet, so nothing
+rendered it.
+
+**Verified end-to-end** against real Postgres and ClickHouse on isolated
+databases: migration 0026, the gate's reasoning on real data, the cache and
+every invalidation path, a gate-skipped method still running on request
+(returning `insufficient_data` — the detector agreeing with the gate), a typo'd
+knob rejected with the accepted names rather than silently defaulting, and
+`GET /anomalies` untouched for the agent.
 
 ## Session 161 — 2026-08-07: the second review pass on PR #242
 

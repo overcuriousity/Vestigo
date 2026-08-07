@@ -133,6 +133,15 @@ instead of rebuilding.
   same commit as any detector change. Read the module docstring before changing bucket math or
   scan-cost machinery (`HEAVY_SCAN_SETTINGS`, `HEAVY_SCAN_GATE`); it deliberately does **not**
   reuse the events-view filters that `QueryService.histogram` applies.
+- `db/analysis_plan.py` — the analysis gate: pure predicates deciding, per method and
+  without scanning an event, whether it *can* produce a finding on this data. A method is
+  gated off only when it structurally cannot, never when it looks unpromising, and a gated
+  method is still runnable on request — the plan is advice plus an audit record, never a
+  lock. See `docs/ANOMALY_DETECTION.md` §"The analysis gate".
+- `db/analysis_cache.py` — fingerprint-keyed memoization for `/analysis/findings`. The key
+  covers every input that can change an answer, and sources are immutable, so a hit is proof
+  the answer still holds. Deliberately no TTL. Distinct from `DetectorRun`, which stays the
+  forensic diary of what an analyst ran.
 - `db/similarity.py` / `db/field_recommend.py` — embedding-based nearest-neighbor search and
   field-selection heuristics for the embedding wizard.
 - `ingestion/parser.py` — format detection + streaming parsers (Plaso CSV/JSONL, generic
@@ -172,7 +181,11 @@ instead of rebuilding.
 - `api/` — one file per resource (`cases.ts`, `events.ts`, `anomalies.ts`, ...), thin fetch
   wrappers; `client.ts` holds the shared base client.
 - `components/` grouped by feature area: `explorer/` (event grid, filters, histogram),
-  `analysis/` (detector views, Sigma, templates, semantic search, similarity), `viz/`
+  `analysis/` (the Investigate surface: `InvestigateRail` holds findings grouped by evidence
+  weight and is the *only* fixed-width surface that flow spends; `InvestigateSheet` is one
+  absolutely-positioned overlay in three modes — finding, method, tools — so detail can be
+  wide without ever widening the row; `method-registry.ts` is the single description of all
+  twelve methods, including the prose that used to live in a Method tab), `viz/`
   (charts), `agent/`, `stories/`, `cases/`, `timelines/`, `sources/`, `auth/`, `jobs/`,
   `tour/`, `layout/` (app shell, top bar, job tray), `ui/` (design-system primitives on top
   of Radix).
@@ -193,6 +206,11 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
 - Background jobs (`core/jobs.py::JobStore`) are intentionally ephemeral/in-memory — don't add
   persistence there without a deliberate design discussion; it changes the deployment model.
 - Forensic reproducibility/explainability is a hard requirement for basically any subsystem. 
+- The analysis plan endpoint may never withhold a method. It reports what is worth running
+  first and explains what it did not run; every method it marks `not_applicable` still runs
+  through `/analysis/findings` and returns what an unconditional sweep would have. A wrong
+  precondition fails silently, so `tests/test_demo_detector_coverage_clickhouse.py` asserts
+  the gate offers every method that file proves finds something.
 - A `require_case_read` endpoint does not write. One deliberate exception exists and is not a
   precedent: `api/routers/cases.py::_settle_dead_recommendations` relabels a `running` column
   recommendation whose job is provably gone, because a read-only member has no other way to

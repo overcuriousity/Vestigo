@@ -160,11 +160,16 @@ and the migration is done when the file is `{}`.
   styled like a footnote, too long to skim and too faint to read. Worse, step 3 teaches
   Normal/Dismiss/Confirm — the single most important concept in the product — at the one
   moment nothing on screen demonstrates it, since finding cards have not rendered on first
-  run. Proposed inversion: guidance attaches to the control at the moment of use. Panel top
-  keeps one or two sentences of orientation (what this panel is *for*); scope guidance moves
-  onto `FrameBar` where the choice is made; disposition guidance moves onto the first finding
-  card, which is its referent. The registry makes this cheap to try — the copy is one file
-  and the panel is one component.
+  run. Proposed inversion: guidance attaches to the control at the moment of use. Rail top
+  keeps one or two sentences of orientation (what this surface is *for*); scope guidance moves
+  onto `ScopeStrip`/the Tools sheet's Scope section where the choice is made; disposition
+  guidance moves onto the first finding card, which is its referent. The registry makes this
+  cheap to try — the copy is one file and the panel is one component.
+
+  The 2026-08-07 Investigate redesign narrowed this but did not close it: the explainers now
+  sit beside the surfaces they describe (anomalies on the rail, Sigma and patterns in their
+  Tools sections) rather than one tab away, and evidence-class notes carry some of what step 2
+  used to. The placement complaint above still stands.
 
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand store,
   so it is per-browser: an analyst who folds a panel away at their desk meets it again on a
