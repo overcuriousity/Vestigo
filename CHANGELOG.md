@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header (which invented ports, a sequence number and a phantom flow). `pcap2vestigo` had
   both fixes already.
 
+- **`pcap2vestigo` 1.5.0: IPv6 `fragment_offset` is now reported in bytes**, as IPv4's always
+  was — the wire field counts 8-byte units, and reporting the raw unit count left one column
+  carrying two meanings depending on IP version. Only non-first fragments are affected
+  (internally the value is used as an `== 0` test, so no decoding behavior changes), and the
+  vendored `pcap2timesketch` was written this way from the start.
+
 ## [1.10.0] — 2026-08-06
 
 ### Added

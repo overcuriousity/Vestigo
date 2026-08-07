@@ -173,8 +173,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 90963,
-      "sha256": "c371a145ea39103f8e60633e04e2054fc099f87c6720bcb06d0c41980ad46f48"
+      "size_bytes": 91047,
+      "sha256": "96d4d26da3149b397638d78564d2c2792f10c2cd10ae3b86a3fe20a427e5fd5f"
     },
     {
       "name": "suricata2timesketch",

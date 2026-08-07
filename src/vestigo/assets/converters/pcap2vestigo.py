@@ -111,7 +111,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "pcap2vestigo"
-CONVERTER_VERSION = "1.4.0"
+CONVERTER_VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Vestigo Parquet interchange format v1 — embedded copy of the spec in
@@ -562,8 +562,9 @@ def _decode_ipv6(data: bytes) -> dict[str, Any] | None:
         if next_header == 44:  # Fragment header: fixed 8 bytes
             hdr_len_bytes = 8
             if len(remaining) >= 4:
-                # Offset in 8-byte units, in the top 13 bits of the field.
-                fragment_offset = struct.unpack(">H", remaining[2:4])[0] >> 3
+                # Offset in 8-byte units, in the top 13 bits of the field;
+                # reported in bytes, as for IPv4 — one column, one meaning.
+                fragment_offset = (struct.unpack(">H", remaining[2:4])[0] >> 3) * 8
         else:
             hdr_ext_len = remaining[1]
             hdr_len_bytes = (hdr_ext_len + 1) * 8

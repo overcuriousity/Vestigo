@@ -477,7 +477,8 @@ class TestHttpReassembly:
         assert len(rows) == 1
         attrs = dict(rows[0]["attributes"])
         assert attrs["ip_version"] == "6"
-        assert attrs["fragment_offset"] == "185"
+        # In bytes, as for IPv4 — the wire field counts 8-byte units.
+        assert attrs["fragment_offset"] == str(185 * 8)
         assert "src_port" not in attrs
         assert "tcp_sequence" not in attrs
         assert _transactions(pf) == []

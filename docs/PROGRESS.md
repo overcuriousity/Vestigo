@@ -38,7 +38,10 @@ top of the packet rows. Two decisions where the suites legitimately differ:
 Also fixed upstream because the reassembler depends on it: IPv6 fragments now report
 `fragment_offset` (in bytes, as for IPv4) and a non-first fragment's payload is no longer
 decoded as a transport header — doing so invented ports, a sequence number, and a phantom
-flow built from body bytes. `pcap2vestigo` fixed both in session 156.
+flow built from body bytes. `pcap2vestigo` fixed both in session 156 — and, aligned with the port, now reports IPv6
+`fragment_offset` in bytes rather than raw 8-byte units (`pcap2vestigo` 1.5.0): one column
+carrying two meanings depending on IP version was the kind of thing an analyst finds out
+the hard way.
 
 **Vestigo side.** Re-vendored the whole suite at `1bbe64f`
 (`scripts/vendor_converters.py`; every file's header and `__version__` move to
