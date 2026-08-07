@@ -19,6 +19,7 @@ from vestigo.api.routers import (
     admin,
     agent,
     agent_tokens,
+    analysis,
     auth,
     baselines,
     cases,
@@ -680,6 +681,7 @@ def create_app() -> FastAPI:
     app.include_router(dispositions.router)
     app.include_router(events.router)
     app.include_router(viz.router)
+    app.include_router(analysis.router)
     app.include_router(jobs.router)
     app.include_router(sigma.router)
     app.include_router(stories.router)
