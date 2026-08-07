@@ -1,9 +1,76 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 157 — HTTP reassembly back-ported to the vendored `pcap2timesketch`).
+Last updated: 2026-08-07 (session 158 — grid column reorder, the `empty` match mode, saved-view management).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 158 — 2026-08-07: grid column reorder, the `empty` match mode, saved-view management
+
+**Why.** Five small Explorer gaps an analyst hits in the first hour: columns could be chosen
+but not ordered, there was no way to ask "which rows have no value for this field", the grid
+header stayed put while its columns scrolled away, a saved view forgot the layout it was
+saved with, and the saved-views list could neither be searched nor pruned. Design round:
+`superpowers/specs/2026-08-07-grid-columns-and-empty-filter-design.md`; plan:
+`superpowers/plans/2026-08-07-grid-columns-and-empty-filter.md`.
+
+**The `empty` match mode.** A fourth mode beside exact/wildcard/regex, added to
+`VALID_MATCH_MODES` (`db/queries.py`) and `_VALID_FILTER_MODES` (`api/routers/events.py`).
+Include means "this field has no value", exclude means "it has one". The predicate is
+`ifNull(<col>, '') = ''`: an absent `attributes` Map key already reads as `''` in ClickHouse,
+so one comparison covers "key missing" and "key present but blank"; the cast handles
+non-String columns and the coalesce stops a NULL from evaluating the comparison to NULL and
+dropping the row from *both* sides. Whitespace-only values count as values — `' '` is what
+the source recorded, and folding it into "absent" would make the filter lie about the
+evidence. Riding the existing per-key mode maps meant URLs, saved views, export,
+bulk-annotate and the histogram all inherited it for free — except that
+`queryParams.ts::sanitizeModes` whitelists known modes and had not learned `empty`, so a
+shared URL silently downgraded the filter to an exact match against its placeholder value.
+Caught by a round-trip test, not by review.
+
+**Column reorder.** Visible columns were already an ordered array driving the render order,
+so a dnd-kit horizontal sortable over the header cells just rewrites it — the same
+per-timeline override a manual column choice writes, under the precedence rules in
+`lib/columns.ts`. The pinned checkbox/annotation/expand columns stay outside the sortable
+set. Two collisions handled: an 8px pointer activation distance so a click on the timestamp
+sort button still sorts, and the resize grip now stops `pointerdown` too, which is the event
+dnd-kit listens on.
+
+**The header scroll fix.** The header row was a *sibling* of the scroll container, so
+scrolling right moved the columns out from under it. It now sits inside the scroller under a
+shared content-width wrapper, sticky to the top — which also fixes rows having been sized to
+the viewport rather than the content, cutting their background, hover state and borders off
+at the right edge. The header being part of the scrolled content shifts every vertical
+offset, so the virtualizer takes a `scrollMargin` and the topmost-row computation behind the
+histogram position indicator subtracts the same measured offset. The prepend anchor needs no
+change and now says so: it restores a delta on the same `scrollTop` scale, so a constant
+offset cancels.
+
+**Saved views carry the layout.** The column list goes into the view's already-opaque JSON
+payload — no migration. Added at the `SaveViewDialog` call site rather than inside
+`filtersToViewPayload`, which the Visualize page shares for chart configs where columns mean
+nothing. Views saved before this carry no `columns` key and leave the current layout alone,
+which falls out of the `undefined` case rather than needing a version flag. Story pushes and
+the agent's finding cards omit the key too: neither speaks for a grid.
+
+**Deleting a view no longer guts a report.** A `view_ref` story block resolves its View live
+at render and export. Deleting a referenced View did not fail the export — `export.py`
+catches every resolution failure — it froze a `resolution.error` in place of the evidence
+that block was built on, which is the quieter and worse outcome for a forensic report. So
+deletion is now conditional (migration `0025`, `views.deleted_at`): an unreferenced View is
+removed, a referenced one is hidden, and `purge_orphaned_hidden_views(case_id)` — idempotent,
+swept after every block delete, block content update and story delete — finishes the job once
+the last reference is gone. `get_view` deliberately ignores `deleted_at` (resolving a hidden
+View is the point); `stories/refs.py` does not, so a hidden View cannot become a *new*
+block's referent. A View's lifetime is now "until deleted **and** unreferenced".
+Case transfer needed no change: the exporter selects views by case with no `deleted_at`
+filter and serializes by column introspection, and the importer coerces any datetime column
+generically — both verified rather than assumed.
+
+**Also.** The saved-views list gained case-insensitive substring search (shown once the list
+passes five entries) and per-row delete behind a confirmation, whose toast reports which of
+the two backend outcomes happened. The `DELETE` endpoint and its client method already
+existed and had simply never been called from the UI.
 
 ## Session 157 — 2026-08-07: `--reassemble http` back-ported upstream and re-vendored
 

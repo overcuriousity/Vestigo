@@ -205,6 +205,36 @@ twice with different presentation. `limit` is validated `1..VIEW_BLOCK_ROW_CAP`
 (1000). A `view_ref` carries `timeline_id` because a View is case-scoped while
 resolving its rows needs a source scope.
 
+### A View outlives its own deletion while a block embeds it
+
+A `view_ref` resolves its View **live**, at render and at export. Deleting a
+referenced View therefore used to leave the block dangling: the export still
+succeeded, but that block froze a `resolution.error` instead of the evidence
+it was built on — a report quietly losing its substance.
+
+So deleting a View is conditional (`PostgresStore.delete_view`, returning
+`"deleted"` / `"hidden"` / `None`):
+
+- No `view_ref` references it → the row is removed, as before.
+- Some `view_ref` references it → `views.deleted_at` is stamped instead. It
+  disappears from `list_views` and therefore from every list an analyst sees,
+  while `get_view` still resolves it — deliberately unfiltered, since that is
+  the whole point.
+- `PostgresStore.purge_orphaned_hidden_views(case_id)` hard-deletes hidden
+  Views nothing references any more. It is idempotent and runs after every
+  operation that can drop a reference: block delete, block content update,
+  story delete. Sweeping the case rather than tracking one View is what makes
+  it impossible to forget a path.
+
+A hidden View cannot become the referent of a *new* block —
+`stories/refs.py` rejects it — so the mechanism keeps existing reports whole
+without resurrecting a deleted artifact.
+
+A View's lifetime is therefore **until it is both deleted and unreferenced**,
+not until someone deletes it. The `resolution.error` path still exists and is
+still tested: a row can go missing out of band (a partial import, a manual
+repair), and that must degrade to a frozen error, never fail the export.
+
 ## API
 
 All routes are case-scoped, so `require_case_read` (view) and
