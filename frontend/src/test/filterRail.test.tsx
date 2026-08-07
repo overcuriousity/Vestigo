@@ -140,6 +140,43 @@ describe("FilterRail field match modes", () => {
     expect(screen.getByText(/matched literally in Exact mode/i)).toBeInTheDocument();
   });
 
+  it("adds an empty-mode include filter with no value typed", () => {
+    const { onChange } = renderRail();
+    // First `∅` segment button belongs to the Field=Value row.
+    fireEvent.click(screen.getAllByRole("button", { name: "∅" })[0]);
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[0], { target: { value: "user_agent" } });
+    fireEvent.click(screen.getByRole("button", { name: /add filter/i }));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filters: { user_agent: [""] },
+        filterModes: { user_agent: "empty" },
+      }),
+    );
+  });
+
+  it("adds an empty-mode exclusion, which is the 'has a value' filter", () => {
+    const { onChange } = renderRail();
+    fireEvent.click(screen.getAllByRole("button", { name: "∅" })[1]);
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[1], { target: { value: "user_agent" } });
+    fireEvent.click(screen.getByRole("button", { name: /add exclusion/i }));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        exclusions: { user_agent: [""] },
+        exclusionModes: { user_agent: "empty" },
+      }),
+    );
+  });
+
+  it("replaces the value input with a static label in empty mode", () => {
+    renderRail();
+    fireEvent.click(screen.getAllByRole("button", { name: "∅" })[0]);
+    // The exclude row still has its own value input, so one remains.
+    expect(screen.getAllByPlaceholderText("value")).toHaveLength(1);
+    expect(screen.getByText("(empty)")).toBeInTheDocument();
+  });
+
   it("shows a regex hint for an invalid field pattern", () => {
     renderRail();
     // First `.*` segment button = Field=Value row's regex mode.

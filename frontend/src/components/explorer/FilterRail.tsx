@@ -51,12 +51,18 @@ const MATCH_MODE_OPTIONS: { mode: RowMatchMode; label: string; tooltip: string }
     label: ".*",
     tooltip: "RE2 regular expression — case-sensitive, prefix (?i) for case-insensitive",
   },
+  {
+    mode: "empty",
+    label: "∅",
+    tooltip: "No value — field is absent or blank",
+  },
 ];
 
 const MODE_PLACEHOLDER: Record<RowMatchMode, string> = {
   exact: "value",
   wildcard: "e.g. 10.0.*",
   regex: "RE2 pattern — (?i) for case-insensitive",
+  empty: "(empty)",
 };
 
 /** 3-state exact/wildcard/regex selector for one field-filter entry row. */
@@ -197,9 +203,12 @@ export function FilterRail({
   }, [semanticMode, filters.qRegex, searchInput]);
 
   const addFilter = (value?: string) => {
-    const v = (value ?? fieldVal).trim();
     const key = fieldKey.trim();
-    if (!key || !v) return;
+    if (!key) return;
+    // Empty mode is a presence predicate — there is no value to type, and the
+    // one that goes on the wire is a placeholder the backend ignores.
+    const v = fieldMode === "empty" ? "" : (value ?? fieldVal).trim();
+    if (fieldMode !== "empty" && !v) return;
     // "exact" is never stored — absence means exact (legacy compatibility).
     const modes = { ...(filters.filterModes ?? {}) };
     if (fieldMode === "exact") delete modes[key];
@@ -220,9 +229,10 @@ export function FilterRail({
   };
 
   const addExclusion = (value?: string) => {
-    const v = (value ?? excludeVal).trim();
     const key = excludeKey.trim();
-    if (!key || !v) return;
+    if (!key) return;
+    const v = excludeMode === "empty" ? "" : (value ?? excludeVal).trim();
+    if (excludeMode !== "empty" && !v) return;
     // Mode-per-key: the mode chosen here becomes the key's mode for ALL its
     // excluded values — every chip of the key shows the (updated) badge, so
     // a semantics change is visible, never silent.
@@ -563,17 +573,31 @@ export function FilterRail({
               suggestions={fieldSuggestions}
               className="w-24"
             />
-            <TagInput
-              placeholder={MODE_PLACEHOLDER[fieldMode]}
-              openOnFocus
-              value={fieldVal}
-              onChange={setFieldVal}
-              onSubmit={addFilter}
-              onCancel={() => setFieldVal("")}
-              suggestions={fieldValueSuggestions}
-              className="flex-1"
-            />
-            <Button size="icon" variant="outline" onClick={() => addFilter()}>
+            {fieldMode === "empty" ? (
+              /* Nothing to type: the value is a placeholder the backend
+               * ignores, so offering an input would invite a value that
+               * silently does nothing. */
+              <span className="flex flex-1 items-center rounded border border-dashed border-[var(--color-border-strong)] px-2 text-xs text-[var(--color-fg-muted)] select-none">
+                (empty)
+              </span>
+            ) : (
+              <TagInput
+                placeholder={MODE_PLACEHOLDER[fieldMode]}
+                openOnFocus
+                value={fieldVal}
+                onChange={setFieldVal}
+                onSubmit={addFilter}
+                onCancel={() => setFieldVal("")}
+                suggestions={fieldValueSuggestions}
+                className="flex-1"
+              />
+            )}
+            <Button
+              size="icon"
+              variant="outline"
+              aria-label="Add filter"
+              onClick={() => addFilter()}
+            >
               <PlusCircle size={13} />
             </Button>
           </div>
@@ -603,17 +627,28 @@ export function FilterRail({
               suggestions={fieldSuggestions}
               className="w-24"
             />
-            <TagInput
-              placeholder={MODE_PLACEHOLDER[excludeMode]}
-              openOnFocus
-              value={excludeVal}
-              onChange={setExcludeVal}
-              onSubmit={addExclusion}
-              onCancel={() => setExcludeVal("")}
-              suggestions={excludeValueSuggestions}
-              className="flex-1"
-            />
-            <Button size="icon" variant="outline" onClick={() => addExclusion()}>
+            {excludeMode === "empty" ? (
+              <span className="flex flex-1 items-center rounded border border-dashed border-[var(--color-border-strong)] px-2 text-xs text-[var(--color-fg-muted)] select-none">
+                (empty)
+              </span>
+            ) : (
+              <TagInput
+                placeholder={MODE_PLACEHOLDER[excludeMode]}
+                openOnFocus
+                value={excludeVal}
+                onChange={setExcludeVal}
+                onSubmit={addExclusion}
+                onCancel={() => setExcludeVal("")}
+                suggestions={excludeValueSuggestions}
+                className="flex-1"
+              />
+            )}
+            <Button
+              size="icon"
+              variant="outline"
+              aria-label="Add exclusion"
+              onClick={() => addExclusion()}
+            >
               <MinusCircle size={13} />
             </Button>
           </div>

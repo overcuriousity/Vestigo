@@ -993,8 +993,12 @@ export interface HealthResponse {
   annotated_tag?: string;
 }
 
-/** Non-default field-filter match modes; "exact" is implied by absence. */
-export type FieldMatchMode = "wildcard" | "regex";
+/**
+ * Non-default field-filter match modes; "exact" is implied by absence.
+ * "empty" is a presence predicate rather than a comparison: it carries no
+ * value, and its value list is a `[""]` placeholder on the wire.
+ */
+export type FieldMatchMode = "wildcard" | "regex" | "empty";
 
 /** Filter params for the events query */
 export interface EventFilters {

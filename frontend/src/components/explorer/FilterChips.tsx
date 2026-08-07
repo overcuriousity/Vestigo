@@ -21,6 +21,10 @@ interface Chip {
 const MODE_BADGE: Record<FieldMatchMode, { label: string; tooltip: string }> = {
   wildcard: { label: "*", tooltip: "Wildcard match: * = any run, ? = one char (case-insensitive)" },
   regex: { label: ".*", tooltip: "RE2 regular expression (case-sensitive)" },
+  // Never rendered: an empty-mode chip states its meaning in words instead,
+  // because there is no value for a badge to qualify. Present so the record
+  // stays exhaustive over FieldMatchMode.
+  empty: { label: "∅", tooltip: "Presence filter — no value at all" },
 };
 
 export function FilterChips({ filters, onRemove }: Props) {
@@ -106,6 +110,17 @@ export function FilterChips({ filters, onRemove }: Props) {
     });
 
   for (const [k, vs] of Object.entries(filters.filters ?? {})) {
+    // A presence filter has no value to show — its wire value is a placeholder
+    // — so the chip says what it does instead of rendering an empty string.
+    if (filters.filterModes?.[k] === "empty") {
+      chips.push({
+        label: k,
+        value: "is empty",
+        onRemove: remove("filters", k, vs[0] ?? ""),
+        variant: "include",
+      });
+      continue;
+    }
     for (const v of vs) {
       chips.push({
         label: k,
@@ -117,6 +132,17 @@ export function FilterChips({ filters, onRemove }: Props) {
     }
   }
   for (const [k, vs] of Object.entries(filters.exclusions ?? {})) {
+    if (filters.exclusionModes?.[k] === "empty") {
+      // No `!` prefix here: "!user_agent has a value" would read as the
+      // opposite of what this filter does.
+      chips.push({
+        label: k,
+        value: "has a value",
+        onRemove: remove("exclusions", k, vs[0] ?? ""),
+        variant: "exclude",
+      });
+      continue;
+    }
     for (const v of vs) {
       chips.push({
         label: `!${k}`,
