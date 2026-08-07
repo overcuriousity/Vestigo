@@ -4,7 +4,7 @@
 input that can change an answer — dropping the whole table costs a rescan and
 nothing else, which is why it carries no TTL and no audit trail.
 
-``finding_dispositions.scope`` closes a real gap: a confirmed verdict recorded
+``finding_dispositions.analysis_scope`` closes a real gap: a confirmed verdict recorded
 nothing about the comparison it was reached under, so "which scope produced
 this finding" was unanswerable from the database. Nullable, so every
 pre-existing row reads as "scope not recorded" rather than being backfilled
@@ -42,11 +42,11 @@ def upgrade() -> None:
     op.create_index(
         "ix_analysis_cache_case_key", "analysis_cache", ["case_id", "cache_key"], unique=True
     )
-    op.add_column("finding_dispositions", sa.Column("scope", sa.JSON(), nullable=True))
+    op.add_column("finding_dispositions", sa.Column("analysis_scope", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column("finding_dispositions", "scope")
+    op.drop_column("finding_dispositions", "analysis_scope")
     op.drop_index("ix_analysis_cache_case_key", table_name="analysis_cache")
     op.drop_index("ix_analysis_cache_computed_at", table_name="analysis_cache")
     op.drop_index("ix_analysis_cache_case_id", table_name="analysis_cache")

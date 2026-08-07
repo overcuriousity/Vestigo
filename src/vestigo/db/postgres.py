@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import Collection, Iterable
@@ -1030,7 +1031,10 @@ class FindingDisposition(Base):
     # recorded", which is honest where a backfill would be invention.
     # Deliberately NOT part of :func:`dispositions_hash` — that hashes
     # detection-affecting facts, and scope-at-verdict-time is provenance.
-    scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Named `analysis_scope`, not `scope`: this class already uses "scope" for
+    # the value-vs-event distinction (see the class docstring), and one word
+    # meaning two things in one model is how the wrong one gets read.
+    analysis_scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1052,7 +1056,7 @@ class FindingDisposition(Base):
             "event_id": self.event_id,
             "note": self.note,
             "details": self.details,
-            "scope": self.scope,
+            "analysis_scope": self.analysis_scope,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -4270,6 +4274,7 @@ class PostgresStore:
         event_id: str | None = None,
         note: str | None = None,
         details: dict | None = None,
+        analysis_scope: dict | None = None,
         created_by: str | None = None,
     ) -> FindingDisposition:
         """Create a disposition row, or return the existing identical one.
@@ -4279,21 +4284,33 @@ class PostgresStore:
         case/timeline — so repeating the same verdict is a no-op rather than
         an error and the UI action stays idempotent. Scope validation (exactly
         one of value/event scope) lives in the API layer.
+
+        ``analysis_scope`` joins that key for ``confirmed`` only, because the
+        two verdict families mean different things. A ``confirmed`` verdict is
+        an assertion *about a comparison* — escalating a finding against the
+        February baseline and escalating it again against the March one are two
+        separate claims, and collapsing them would lose one. ``normal`` (and
+        ``dismissed``/``routine``) are standing declarations about a value,
+        effective under every frame; duplicating those per scope would inflate
+        :func:`dispositions_hash`'s input and the triage burndown without
+        expressing anything new.
         """
+        scope_in_identity = kind == "confirmed"
         async with self.session_factory() as session:
+            conditions = [
+                FindingDisposition.case_id == case_id,
+                FindingDisposition.timeline_id == timeline_id,
+                FindingDisposition.kind == kind,
+                FindingDisposition.detector == detector,
+                FindingDisposition.field == field,
+                FindingDisposition.value == value,
+                FindingDisposition.source_id == source_id,
+                FindingDisposition.event_id == event_id,
+            ]
+            if scope_in_identity:
+                conditions.append(FindingDisposition.analysis_scope == analysis_scope)
             existing = (
-                await session.execute(
-                    select(FindingDisposition).where(
-                        FindingDisposition.case_id == case_id,
-                        FindingDisposition.timeline_id == timeline_id,
-                        FindingDisposition.kind == kind,
-                        FindingDisposition.detector == detector,
-                        FindingDisposition.field == field,
-                        FindingDisposition.value == value,
-                        FindingDisposition.source_id == source_id,
-                        FindingDisposition.event_id == event_id,
-                    )
-                )
+                await session.execute(select(FindingDisposition).where(*conditions))
             ).scalar_one_or_none()
             if existing is not None:
                 return existing
@@ -4309,6 +4326,7 @@ class PostgresStore:
                 event_id=event_id,
                 note=note,
                 details=details,
+                analysis_scope=analysis_scope,
                 created_by=created_by,
             )
             session.add(row)
@@ -4344,8 +4362,13 @@ class PostgresStore:
             value: Any,
             source_id: Any,
             event_id: Any,
+            analysis_scope: Any = None,
         ) -> tuple:
-            return (timeline_id, kind, detector, field, value, source_id, event_id)
+            # analysis_scope joins the key for `confirmed` only — see
+            # :meth:`create_disposition` for why the two verdict families
+            # differ. Serialized because a dict is unhashable.
+            scope_part = json.dumps(analysis_scope, sort_keys=True) if kind == "confirmed" else None
+            return (timeline_id, kind, detector, field, value, source_id, event_id, scope_part)
 
         async with self.session_factory() as session:
             # One prefetch covering every row a batch item could collide with.
@@ -4369,7 +4392,14 @@ class PostgresStore:
             )
             by_key: dict[tuple, FindingDisposition] = {
                 _scope_key(
-                    r.timeline_id, r.kind, r.detector, r.field, r.value, r.source_id, r.event_id
+                    r.timeline_id,
+                    r.kind,
+                    r.detector,
+                    r.field,
+                    r.value,
+                    r.source_id,
+                    r.event_id,
+                    r.analysis_scope,
                 ): r
                 for r in existing_rows
             }
@@ -4383,6 +4413,7 @@ class PostgresStore:
                     it.get("value"),
                     it.get("source_id"),
                     it.get("event_id"),
+                    it.get("analysis_scope"),
                 )
                 existing = by_key.get(key)
                 if existing is not None:
@@ -4400,6 +4431,7 @@ class PostgresStore:
                     event_id=it.get("event_id"),
                     note=it.get("note"),
                     details=it.get("details"),
+                    analysis_scope=it.get("analysis_scope"),
                     created_by=it.get("created_by"),
                 )
                 session.add(row)
