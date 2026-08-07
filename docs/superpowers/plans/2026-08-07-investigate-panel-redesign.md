@@ -812,7 +812,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from vestigo.api.deps import get_store, require_case_read
-from vestigo.api.routers.events import _get_query_service, _resolve_timeline_sources
+from vestigo.api.routers.events import _get_query_service, _resolve_timeline_scope
 from vestigo.core.config import get_settings
 from vestigo.db._buckets import query_timestamp_range
 from vestigo.db.analysis_plan import (
@@ -902,7 +902,9 @@ async def get_analysis_plan(
     still runnable through the findings endpoint, and the UI keeps that one
     click away with ``reason_facts`` on screen.
     """
-    source_ids = await _resolve_timeline_sources(case_id, timeline_id)
+    source_ids, _field_mappings, _source_offsets = await _resolve_timeline_scope(
+        case_id, timeline_id
+    )
     inputs = await _collect_plan_inputs(case_id, timeline_id, source_ids, frame, baseline_id)
     plans = build_plan(inputs, get_settings())
     return {
@@ -1628,7 +1630,9 @@ async def get_analysis_findings(
 
     cfg = get_settings()
     store = get_store()
-    source_ids = await _resolve_timeline_sources(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(
+        case_id, timeline_id
+    )
     scope = await _scope_object(case_id, frame, baseline_id)
 
     sources = await store.list_sources_by_ids(source_ids)
@@ -1663,6 +1667,11 @@ async def get_analysis_findings(
         ngram_size=kwargs.get("ngram_size"),
         group_field=kwargs.get("group_field"),
         max_gap_seconds=kwargs.get("max_gap_seconds"),
+        # Both come from _resolve_timeline_scope and are not optional niceties:
+        # without field_mappings a canonical field alias is ignored, and without
+        # source_offsets a per-source clock-skew correction is silently dropped.
+        field_mappings=field_mappings,
+        source_offsets=source_offsets,
     )
     payload = {
         **_serialize_stat_result(result),
@@ -1864,23 +1873,54 @@ Append to `tests/test_demo_detector_coverage_clickhouse.py`:
 
 ```python
 @pytest.mark.asyncio
-async def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(
-    demo_case_built,
-):
+async def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(demo, ch_store):
     """The gate's thresholds must be satisfied by data we know produces findings.
 
     This file already asserts every analysis tool finds something in the demo
     case. That makes it the natural guard for the gate: if a precondition
     would skip a method here, the precondition is wrong — the method
     demonstrably works on this data.
-    """
-    from vestigo.api.routers.analysis import _collect_plan_inputs
-    from vestigo.core.config import get_settings
-    from vestigo.db.analysis_plan import build_plan
 
-    case_id, timeline_id, source_ids = demo_case_built
-    inputs = await _collect_plan_inputs(case_id, timeline_id, source_ids, "self", None)
-    plans = {p.method: p for p in build_plan(inputs, get_settings())}
+    Builds PlanInputs directly from the demo's sources rather than through
+    ``_collect_plan_inputs``: this module has no timeline and does not
+    monkeypatch ``deps.get_store``, and the gate's inputs are what is under
+    test, not the router's plumbing around them.
+    """
+    from vestigo.core.config import get_settings
+    from vestigo.db._buckets import query_timestamp_range
+    from vestigo.db.analysis_plan import (
+        PlanInputs,
+        build_plan,
+        message_tokens_from_inventory,
+        numeric_tokens_from_stats,
+    )
+    from vestigo.db.field_stats import compute_source_field_stats, merged_inventory
+
+    case_id, source_ids, _windows = demo
+    cfg = get_settings()
+
+    stats = {
+        source_id: compute_source_field_stats(ch_store, case_id, source_id)
+        for source_id in source_ids
+    }
+    inventory, events_total = merged_inventory(stats)
+    min_ts, max_ts = query_timestamp_range(
+        ch_store.client,
+        ch_store.database,
+        "case_id = {case_id:String} AND source_id IN {source_ids:Array(String)}",
+        {"case_id": case_id, "source_ids": source_ids},
+    )
+    inputs = PlanInputs(
+        inventory=inventory,
+        numeric_tokens=numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio),
+        message_tokens=message_tokens_from_inventory(inventory),
+        series_distinct=next((d for t, d, _c in inventory if t == "artifact"), 0),
+        events_total=events_total,
+        span_seconds=(max_ts - min_ts).total_seconds() if min_ts and max_ts else 0.0,
+        frame="self",
+        has_active_baseline=False,
+    )
+    plans = {p.method: p for p in build_plan(inputs, cfg)}
 
     # Two-window methods legitimately need setup in the self frame; everything
     # else must be offered on data this file proves they find things in.
@@ -1894,7 +1934,7 @@ async def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(
         )
 ```
 
-Use the existing fixture in that file that builds the demo case; if it exposes different names than `demo_case_built` / `(case_id, timeline_id, source_ids)`, adapt to what is there rather than adding a fixture.
+`compute_source_field_stats` is the synchronous computer behind `ensure_source_field_stats`; verify its exact signature in `db/field_stats.py` before use and match it.
 
 - [ ] **Step 2: Run the test**
 
