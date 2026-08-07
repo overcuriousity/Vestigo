@@ -7,36 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Auto field selection is reproducible.** The novelty-field recommender ranked
-  recommended-first, then by coverage — and stopped there. Coverage ties are the normal
-  case (every field of one source covers that source's events), so the tie order came
-  from a ClickHouse `GROUP BY` that does not promise a stable row order. The detectors
-  that auto-pick fields take the top 1 (`value_novelty`) or top 2 (`value_combo`) of
-  that list, so the same timeline could be scanned on different fields each time it was
-  opened. The ranking now breaks ties on the field token, and the inventory query orders
-  its `LIMIT` by `cov_count DESC, key ASC` so truncation is stable too.
-- **The enrichment partition rewrite no longer raises insert parallelism.**
-  `VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS` was removed rather than re-defaulted:
-  ClickHouse's default of 0 means a single-threaded `INSERT SELECT`, so shipping 2 gave
-  each thread its own squashing buffer on the exact query that OOM-killed a host — more
-  write-side memory, presented as a guardrail.
-  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` now defaults to 64 MiB (it previously
-  shipped ClickHouse's own 256 MiB default, so it bounded nothing) and is no longer
-  marked restart-required, because the apply reads it per call.
-- **The enrichers dialog clears its own interrupted-run banner.** A resume's partition
-  rewrite runs after the request returns, so the marker was still present at the only
-  refetch the dialog did — leaving "an earlier run was interrupted" on screen, with Run
-  now disabled, until the dialog was closed and reopened. The tracked job now invalidates
-  the enrichers list on completion, and Resume stays disabled until that job is terminal
-  instead of re-arming into a 409 against the analyst's own resume.
-- **One interrupted run, one job id.** The dialog surfaced the oldest stale marker while
-  the run route's 409 named the newest, so with more than one marker an analyst could
-  resume the job they were shown and be blocked again by a job nobody mentioned. Oldest
-  wins everywhere now. The auto-trigger's skip log also no longer reports a healthy
-  in-flight run as needing a resume.
-
 ## [1.11.0] — 2026-08-07
 
 ### Added
@@ -79,6 +49,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two enrichment applies could still meet over one source.** The run route read its
+  conflict check ~65 lines above the claim it belonged to, with three awaits in between,
+  and discarded the claim's return value — so the loser of a race spawned its job anyway,
+  and, holding no run slot, its *live* marker read as dead to the enrichers dialog, which
+  then offered Resume on a running job. Separately, startup reconciliation (which runs
+  after the app is serving) never claimed a slot at all, so the dialog offered Resume for
+  a marker it was in the middle of applying. Because the ClickHouse scratch tables are
+  keyed on the job id alone while the apply lock is per source, the two applies could
+  finalize one source's partition from another's rows — a `mapUpdate` matching nothing
+  plus stale-key stripping that removes derived keys that were there. The claim is now
+  the authoritative check everywhere, and reconciliation holds the slot for the duration
+  of its apply.
+- **The interrupted-run banner tells the truth after a half-finished resume.** Its
+  partial-coverage caveat compared the durable "sources fully staged" count against the
+  count of sources *still* staged — and a resume deletes staged rows as it applies them,
+  so the comparison inverted exactly when the caveat applied. The API now reports
+  `partial_sources` as a set difference. A marker with nothing left staged also no longer
+  claims "0 events across 0 sources were enriched but never written"; it says the run
+  left nothing pending and that resuming clears the record.
+- **The enrichers dialog admits when a run is in flight.** A live run's marker is hidden
+  on purpose, which left "Run now" enabled during any run in progress — including a
+  startup recovery still applying — with a 409 as the only feedback. The listing now
+  reports the running job and the buttons disable on it, server-derived so it survives a
+  page reload.
+- **Auto field selection is reproducible.** The novelty-field recommender ranked
+  recommended-first, then by coverage — and stopped there. Coverage ties are the normal
+  case (every field of one source covers that source's events), so the tie order came
+  from a ClickHouse `GROUP BY` that does not promise a stable row order. The detectors
+  that auto-pick fields take the top 1 (`value_novelty`) or top 2 (`value_combo`) of
+  that list, so the same timeline could be scanned on different fields each time it was
+  opened. The ranking now breaks ties on the field token, and the inventory query orders
+  its `LIMIT` by `cov_count DESC, key ASC` so truncation is stable too.
+- **The enrichment partition rewrite no longer raises insert parallelism.**
+  `VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS` was removed rather than re-defaulted:
+  ClickHouse's default of 0 means a single-threaded `INSERT SELECT`, so shipping 2 gave
+  each thread its own squashing buffer on the exact query that OOM-killed a host — more
+  write-side memory, presented as a guardrail.
+  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` now defaults to 64 MiB (it previously
+  shipped ClickHouse's own 256 MiB default, so it bounded nothing) and is no longer
+  marked restart-required, because the apply reads it per call.
+- **The enrichers dialog clears its own interrupted-run banner.** A resume's partition
+  rewrite runs after the request returns, so the marker was still present at the only
+  refetch the dialog did — leaving "an earlier run was interrupted" on screen, with Run
+  now disabled, until the dialog was closed and reopened. The tracked job now invalidates
+  the enrichers list on completion, and Resume stays disabled until that job is terminal
+  instead of re-arming into a 409 against the analyst's own resume.
+- **One interrupted run, one job id.** The dialog surfaced the oldest stale marker while
+  the run route's 409 named the newest, so with more than one marker an analyst could
+  resume the job they were shown and be blocked again by a job nobody mentioned. Oldest
+  wins everywhere now. The auto-trigger's skip log also no longer reports a healthy
+  in-flight run as needing a resume.
 - **A ClickHouse OOM-kill during enrichment (`exited with code 137`).** The enrichment
   partition rewrite carried the heavy-scan memory settings but never took a slot in the
   admission gate that every detector scan takes, so it stacked on top of a full set of
