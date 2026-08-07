@@ -1023,6 +1023,14 @@ class FindingDisposition(Base):
     note: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # confirmed: the finding's structured details snapshot at confirm time.
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The comparison this verdict was reached under — frame, baseline id and
+    # name. A verdict is an assertion about a *comparison*, so without this
+    # "confirmed on 4 March" cannot say what the finding was compared against.
+    # Nullable: rows written before scope provenance existed read as "not
+    # recorded", which is honest where a backfill would be invention.
+    # Deliberately NOT part of :func:`dispositions_hash` — that hashes
+    # detection-affecting facts, and scope-at-verdict-time is provenance.
+    scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1044,6 +1052,7 @@ class FindingDisposition(Base):
             "event_id": self.event_id,
             "note": self.note,
             "details": self.details,
+            "scope": self.scope,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -1120,6 +1129,38 @@ class DetectorRun(Base):
             "result": self.result,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class AnalysisCache(Base):
+    """Memoized analysis results, keyed on a fingerprint of everything that can change them.
+
+    Distinct in kind from :class:`DetectorRun`, which is the accumulating
+    forensic diary of what an analyst ran, with what parameters, and when. This
+    table answers a different question: "for exactly this data and exactly these
+    settings, what is the answer?" Because sources are immutable after ingestion
+    (enrichment applies excepted, and those move the fingerprint), a hit is
+    *proof* the answer still holds rather than a guess that it is recent enough
+    — which is why nothing here has a TTL and no caller ever has to judge
+    staleness.
+
+    Every row is derived data. Evicting one costs a rescan and nothing else,
+    which is why eviction needs no policy discussion, no audit trail and no
+    analyst-visible consequence.
+    """
+
+    __tablename__ = "analysis_cache"
+    __table_args__ = (Index("ix_analysis_cache_case_key", "case_id", "cache_key", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    cache_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        index=True,
+    )
 
 
 # Origin of an agent-confirmed annotation (A1): distinguishes it from
