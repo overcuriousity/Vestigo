@@ -1,9 +1,107 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 158 — grid column reorder, the `empty` match mode, saved-view management).
+Last updated: 2026-08-07 (session 159 — the enrichment OOM-kill and resuming an interrupted run).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 159 — 2026-08-07: the enrichment OOM-kill, and resuming an interrupted run
+
+**Why.** A production full-docker deployment (32 GiB host, default config) reported
+`clickhouse-1 exited with code 137 (restarting)` during an enrichment job, and — worse
+operationally — no way to recover the run afterwards without restarting the app. Both
+turned out to be real defects with independent causes; this session fixes both. Released
+as 1.11.0 together with the merged session-158 Explorer work.
+
+**Reading the log.** The traceback bottomed out at `db/clickhouse.py::finalize_enrichment_apply`
+on the `ALTER TABLE ... REPLACE PARTITION`, meaning the preceding whole-partition
+`INSERT ... SELECT` had already written a full duplicate copy. Exit 137 is SIGKILL from
+outside — a kernel/cgroup OOM kill, *not* a ClickHouse `MEMORY_LIMIT_EXCEEDED`, which is
+why the server's own log said nothing. Everything downstream in the log (connection
+refused, the failed job, the frontend's "Enrich failed · 100%") is consequence.
+
+**Cause 1: the rewrite was never admission-controlled.** `finalize_enrichment_apply`
+interpolated `HEAVY_SCAN_SETTINGS` and its docstring claimed "the same memory guardrails as
+the detector scans", but it never acquired `HEAVY_SCAN_GATE`. `max_memory_usage` is per
+*query*, so the rewrite stacked on top of `VESTIGO_STAT_SCAN_CONCURRENCY` already-admitted
+detector scans, each carrying a full cap — the session-52 failure mode reached from the
+enrichment side. It now holds a slot for the whole rewrite, **including the REPLACE**: the
+swap queues merges on freshly written parts, and merge memory was never covered by the
+per-query cap. The write side is bounded separately
+(`VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS`, `..._INSERT_BLOCK_BYTES`) because the scan
+settings bound a read while this also materializes a full copy of the partition.
+
+**Cause 2: the auto-detected budget assumes ClickHouse owns the box.** `db/_scan.py`
+detects from the *app* process's cgroup, or the host's `MemTotal` when there is none. The
+reference compose file sets no limits, so on a 32 GiB host the app computed
+32 × 0.8 ÷ 2 = 12.8 GiB per query and handed it to a ClickHouse sharing that RAM with
+Postgres, Qdrant and itself. Deliberately **not** fixed by shipping limits: the operator
+asked for commented examples they opt into, so `docker-compose.yml` gains commented
+`mem_limit` values sized for 32 GiB, `deploy/clickhouse/memory.xml.example` gains a
+`config.d` drop-in pinning `max_server_memory_usage` (a cgroup limit alone is not enough —
+a containerized server misdetects total RAM when deriving its own 90% ceiling), and
+`DEPLOYMENT.md` gains a "Resource sizing" section with a worked example. Nothing changes on
+upgrade.
+
+**A third thing fell out.** `HEAVY_SCAN_SETTINGS` is a module-level string built once at
+import, and `HEAVY_SCAN_GATE` is imported *by value* into each scan module — so no
+`stat_scan_*` edit made in the admin console could ever reach the running process, and none
+of the specs was marked `restart_required`. An operator tuning the budget in response to
+exactly this incident would have seen it save and do nothing. All six (plus the two new
+ones) are now restart-required. Making them live is a real refactor — rebinding the module
+global would not reach the by-value imports — and is on the roadmap; silently accepting a
+no-op edit was the worse option.
+
+**The operational half: nothing could finish the run.** After the crash the state was
+marker present, staged rows present and complete, no provenance, run slot released. The
+staged work was one `REPLACE PARTITION` from landing, and
+`reconcile_orphaned_enrichment_jobs` runs at **startup only** — here only the ClickHouse
+container restarted. Worse, `run_timeline_enricher` consulted neither the marker nor the
+staged rows, so "Run now" would have minted a new job id, re-scanned everything, and
+orphaned the earlier output permanently.
+
+**Shape of the fix.** `resume_enrichment_run(store, ch_store, run, *, trigger, actor_*)` is
+extracted as the single recover-forward primitive, shared by startup reconciliation and a
+new `POST .../enrichers/{key}/resume`. The design decisions worth keeping:
+
+- **Discovery rests on one invariant.** The run slot is claimed *before* the marker is
+  written and released *after* it would have been deleted, so "a marker exists and the slot
+  is not held by that same job id" is exactly "this run is dead". That is what the enrichers
+  listing filters on, and it is correct both after a crash and under a live app.
+- **The resume claims the slot under the *marker's* job id**, not the new poll job's.
+  Otherwise the marker would be present while the slot held a different id, and discovery
+  would re-offer a resume that is already running. Mandatory, not defensive: `_APPLY_LOCKS`
+  only serializes per `(case_id, source_id)`, so a competing fresh run would race the
+  `SourceEnrichment` upsert and could leave a provenance row whose `enricher_config_hash`
+  is not the one that produced the fields on the partition — a silent reproducibility break.
+- **`complete_source_ids` stays the marker's list.** `list_staged_sources` cannot tell a
+  fully staged source from one cut off mid-scan, and provenance written off partial staging
+  blocks that source forever.
+- **A fresh run is refused (409) while a marker exists**, on the manual route and skipped on
+  the auto-trigger. Auto-resuming would make a partition rewrite an implicit side effect of
+  "Run now"; discarding the staged rows would destroy output that is not recomputable once
+  the enricher's data version has changed. Both conflict checks moved above the
+  "already enriched → skipped" short-circuit, which would otherwise answer "nothing to do"
+  about work that has not been applied.
+- **Manual only**, by explicit decision: no timer, no reconnect hook. Every partition
+  rewrite traces to a named actor. `enricher.resume_requested` is written before the job
+  spawns so the actor is on record even if the apply then fails.
+- **Resume is always terminal**, including for a marker with zero staged rows (a no-op
+  apply that clears it). Without that the 409 above could become permanent.
+
+**Also fixed in the dialog**, all found while tracing why the analyst was stuck: one failing
+eligibility check blanked the entire enrichers list (`asyncio.gather` without
+`return_exceptions`) — precisely when the resume banner is needed; "Force re-run" was gated
+on `useState` that reset on unmount, making the documented recovery path unreachable after a
+refresh; and "Run now" was disabled by a negative eligibility result, which is a heuristic
+sample scan and must never lock an analyst out.
+
+**Tests.** 23 new cases in `test_enrichers.py` (store filters and staged-row counts, the
+primitive's apply/preserve/partial-provenance behavior, the job wrapper's slot release and
+its refusal to reschedule, discovery including the live-run invariant, the route's
+409/404/unavailable-enricher/zero-rows paths, and the run route's refusal and its precedence
+over the skip), plus one in `test_scan_budget.py` asserting the rewrite runs inside the gate
+and carries the insert bounds.
 
 ## Session 158 — 2026-08-07: grid column reorder, the `empty` match mode, saved-view management
 
