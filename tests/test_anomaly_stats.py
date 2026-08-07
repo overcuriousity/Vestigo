@@ -1293,6 +1293,79 @@ def test_recommend_novelty_fields_ranking_is_total_order():
     assert reranked == ranked
 
 
+def test_merged_inventory_truncation_is_deterministic():
+    """The cached inventory's ``max_attr_keys`` cut must not depend on arrival order.
+
+    ``merged_inventory`` is what actually feeds auto field selection (the live
+    ``field_inventory`` scan is the fallback), so making
+    ``recommend_novelty_fields`` a total order is not enough on its own: if the
+    candidate set it ranks is itself truncated differently between runs, the
+    auto-picked field still moves. Coverage ties at the cutoff are the norm and
+    ``stats`` arrives in Postgres row order, which is not promised to be stable.
+    """
+    from vestigo.db.field_stats import merged_inventory
+
+    def _stats(keys: list[str]) -> dict[str, tuple[int, dict]]:
+        # One source, every attribute at identical coverage — all ties, so only
+        # the tie-break decides which two survive max_attr_keys=2.
+        return {
+            "s1": (
+                10,
+                {
+                    "top_level": {},
+                    "attributes": {k: {"distinct": 3, "coverage": 10} for k in keys},
+                },
+            )
+        }
+
+    keys = ["attr_d", "attr_a", "attr_c", "attr_b"]
+    inv, total = merged_inventory(_stats(keys), max_attr_keys=2)
+    assert total == 10
+    attrs = [tok for tok, _, _ in inv if tok.startswith("attr:")]
+    assert attrs == ["attr:attr_a", "attr:attr_b"]
+
+    reordered, _ = merged_inventory(_stats(list(reversed(keys))), max_attr_keys=2)
+    assert [tok for tok, _, _ in reordered if tok.startswith("attr:")] == attrs
+
+
+def test_recommend_numeric_fields_ranking_is_total_order(monkeypatch):
+    """Numeric-ratio ties must not reshuffle the fields the range scan picks.
+
+    ``find_range_violations`` takes the top ``_MAX_AUTO_SCAN_FIELDS`` of this
+    list when the caller names no fields, and a ratio of exactly 1.0 is the
+    common case (every value in the field parses), so without a final key the
+    same timeline can be scored on different fields between runs — the same
+    defect ``recommend_novelty_fields`` was fixed for.
+    """
+    inventory = [
+        ("attr:bytes_out", 40, 900),
+        ("attr:duration_ms", 30, 900),
+        ("attr:port", 20, 900),
+        ("attr:label", 5, 900),
+    ]
+    svc = _svc([])
+    # Ratios keyed by token so a reordered inventory gets the same answers a
+    # real probe would: 1.0 for the three numeric fields (the tie), 0.0 for the
+    # non-numeric one.
+    ratios = {"attr:bytes_out": 1.0, "attr:duration_ms": 1.0, "attr:port": 1.0, "attr:label": 0.0}
+    monkeypatch.setattr(
+        type(svc),
+        "_numeric_ratio_probe",
+        lambda self, case_id, source_ids, tokens, *a, **k: [ratios[t] for t in tokens],
+    )
+
+    ranked = [
+        f.token for f in svc.recommend_numeric_fields("c1", ["s1"], total=1000, inventory=inventory)
+    ]
+    assert ranked == ["attr:bytes_out", "attr:duration_ms", "attr:port", "attr:label"]
+
+    shuffled = [inventory[2], inventory[0], inventory[3], inventory[1]]
+    reranked = [
+        f.token for f in svc.recommend_numeric_fields("c1", ["s1"], total=1000, inventory=shuffled)
+    ]
+    assert reranked == ranked
+
+
 def test_field_inventory_empty_on_no_data():
     svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
     inventory, total = svc.field_inventory("c1", ["s1"])

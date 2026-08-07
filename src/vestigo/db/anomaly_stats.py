@@ -2673,7 +2673,13 @@ class StatisticalAnomalyService:
             )
             for (tok, dist, cov), ratio in zip(candidates, ratios, strict=True)
         ]
-        out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage))
+        # Token last, for the same reason as `recommend_numeric_fields`' sibling
+        # in `recommend_novelty_fields`: `find_range_violations` and the auto-scan
+        # path below take a top-N slice of this list, and numeric-ratio ties are
+        # the norm (every field whose values all parse scores exactly 1.0), so
+        # without a final key the same timeline can be scored on different fields
+        # between runs.
+        out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage, f.token))
         return out
 
     @_gated_scan

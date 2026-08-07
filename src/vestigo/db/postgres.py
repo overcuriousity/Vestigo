@@ -2497,16 +2497,24 @@ class PostgresStore:
             result = await session.execute(stmt.order_by(EnrichmentJobRun.created_at.desc()))
             return list(result.scalars().all())
 
-    async def count_staged_rows_by_job(
+    async def staged_summary_by_job(
         self, job_ids: Collection[str]
-    ) -> dict[str, tuple[int, int]]:
-        """Map ``job_id -> (staged_row_count, distinct_staged_source_count)``.
+    ) -> dict[str, tuple[int, set[str]]]:
+        """Map ``job_id -> (staged_row_count, set of source ids with staged rows)``.
 
         One GROUP BY for every marker on a timeline, so the enrichers dialog
         doesn't fan out a count query per enricher. Job ids with no staged rows
         are simply absent from the result — a marker can legitimately have
-        zero staged rows (the run died before its first batch), and that is
-        still a resumable marker.
+        zero staged rows (the run died before its first batch, or its apply got
+        far enough to drain them), and that is still a resumable marker.
+
+        The source *ids* rather than their count, because the dialog's
+        partial-coverage caveat is "some staged source was never staged fully",
+        which is the staged set minus ``EnrichmentJobRun.completed_source_ids``.
+        Comparing the two cardinalities instead gets this backwards after a
+        partially-applied resume, which deletes staged rows source by source and
+        so shrinks the staged count below the (durable) completed one.
+        Cardinality is per timeline, so materializing the ids is cheap.
         """
         if not job_ids:
             return {}
@@ -2514,13 +2522,18 @@ class PostgresStore:
             result = await session.execute(
                 select(
                     EnrichmentResultStaging.job_id,
+                    EnrichmentResultStaging.source_id,
                     func.count(),
-                    func.count(EnrichmentResultStaging.source_id.distinct()),
                 )
                 .where(EnrichmentResultStaging.job_id.in_(list(job_ids)))
-                .group_by(EnrichmentResultStaging.job_id)
+                .group_by(EnrichmentResultStaging.job_id, EnrichmentResultStaging.source_id)
             )
-            return {job_id: (int(rows), int(sources)) for job_id, rows, sources in result.all()}
+            summary: dict[str, tuple[int, set[str]]] = {}
+            for job_id, source_id, rows in result.all():
+                total, sources = summary.get(job_id, (0, set()))
+                sources.add(source_id)
+                summary[job_id] = (total + int(rows), sources)
+            return summary
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:
         """Delete a source row and its enrichment provenance/staging.

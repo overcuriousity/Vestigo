@@ -1,10 +1,70 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 160 — closing the PR #242 review, and a coin-flip in
-auto field selection).
+Last updated: 2026-08-07 (session 161 — the second PR #242 review pass: two ways two
+enrichment applies could still meet).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 161 — 2026-08-07: the second review pass on PR #242
+
+**Why.** Re-reviewing the branch after session 160's fixes turned up six more findings.
+Two were the same class of bug the branch exists to prevent — two enrichment applies
+running over one source — reached by routes nobody had lined up against each other.
+
+**The run route's conflict check had drifted away from its claim.** `run_timeline_
+enricher` read `get_active_enricher_run` near the top and claimed the slot ~65 lines
+later, with three awaits in between (the marker query, the `config_hash` thread hop, the
+provenance query) — while the comment above the claim still asserted the
+check/create/claim happened in one event-loop tick, which had been true when the check
+sat directly above it. `try_claim_enricher_run`'s return value was discarded, so the
+loser of a race spawned its job anyway. Worse than a duplicated run: the loser holds no
+slot, so `list_timeline_enrichers` classifies its *live* marker as dead and offers
+Resume on a running job. The claim's return is now the authoritative check (409, and the
+loser's job is marked failed rather than left pending); the early read is kept, and
+re-documented, as a cheap fast path. The resume route and the auto-trigger check their
+claims too — both are single-tick today, but that is an invariant a later edit breaks
+silently.
+
+**Startup reconciliation never took the slot at all.** `_startup_recovery` runs *after*
+the app is serving, by design, and `reconcile_orphaned_enrichment_jobs` applied each
+orphan without claiming anything. So while it worked, the enrichers dialog saw
+marker-present + slot-not-held, called the marker dead, and offered Resume — and the
+resume route's own check passed. The two applies would then share ClickHouse scratch
+tables, which are keyed on `job_id` alone (`create_enrichment_scratch` DROPs and
+re-CREATEs), while `_APPLY_LOCKS` only serializes per *source*: recovery stages source A
+into `tmp_enrich_rows_X`, resume reaches source B and recreates that table, and
+recovery's `finalize_enrichment_apply` then REPLACEs A's partition from a rows table
+holding B's event ids — a `mapUpdate` that matches nothing, plus `owned_suffixes`
+stripping that removes A's existing derived keys. Silent evidence loss. Reconciliation
+now claims each marker's slot for the duration of its apply and releases it after, the
+same contract `run_resume_job` already had.
+
+**Two more places where a tie decided an analyst's answer.** Session 160 made
+`recommend_novelty_fields` a total order, but the inventory that actually feeds auto
+field selection comes from the *cache*: `merged_inventory` truncated to `max_attr_keys`
+after sorting on coverage alone, so ties at the cutoff dropped different fields between
+runs — the fix one level up ranked a candidate set that was itself unstable.
+`recommend_numeric_fields` had the original defect verbatim, and a numeric ratio of
+exactly 1.0 is the common case, so `find_range_violations`' top-N slice moved run to
+run. Both now break ties on the field token.
+
+**The banner could contradict itself after a half-finished resume.** The dialog's
+"one source was only partly processed" caveat compared `completed_sources` against
+`staged_sources`, but those are not measured the same way: the first is durable, the
+second is what is *still* staged, and a resume deletes staged rows source by source as
+it applies them. A resume that died partway therefore drove the staged count below the
+completed one and the caveat vanished exactly when it was true. `staged_summary_by_job`
+now returns the staged source *ids* and the API reports `partial_sources` as a set
+difference. The all-applied-but-marker-survived case had been reading "0 events across 0
+sources were enriched … but never written", which is not what happened; it now says the
+run left nothing pending and that resuming clears the record.
+
+**And the dialog now admits when a run is in flight.** A live run's marker is hidden on
+purpose (the slot is held by it), which left "Run now" enabled during any live run —
+including a startup reconciliation still applying — with a 409 as the only feedback. The
+listing exposes `running_job_id` and the buttons disable on it. Server-derived, so it
+survives a page reload, unlike the client-side resume-in-flight flag.
 
 ## Session 160 — 2026-08-07: closing the PR #242 review
 

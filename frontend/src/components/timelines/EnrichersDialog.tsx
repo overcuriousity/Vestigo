@@ -168,7 +168,10 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
                 e.unfinished_run &&
                 resumeMutation.mutate({ key: e.key, jobId: e.unfinished_run.job_id })
               }
-              isRunning={runMutation.isPending && runMutation.variables?.key === e.key}
+              isRunning={
+                e.running_job_id !== null ||
+                (runMutation.isPending && runMutation.variables?.key === e.key)
+              }
               isResuming={isResumeInFlight(e.key)}
             />
           ))}
@@ -200,12 +203,19 @@ function EnricherRow({
   onModeChange: (mode: "automatic" | "manual") => void;
   onRun: (force: boolean) => void;
   onResume: () => void;
+  /** A run is in flight — either this dialog's POST or, from `running_job_id`,
+   * one the server already has (another analyst, an auto-run, startup
+   * reconciliation). Both disable running again, which would only 409. */
   isRunning: boolean;
   isResuming: boolean;
 }) {
   const unfinished = enricher.unfinished_run;
-  const partial =
-    unfinished !== null && unfinished.completed_sources < unfinished.staged_sources;
+  const partial = unfinished !== null && unfinished.partial_sources > 0;
+  // Nothing left staged: either the run died before its first batch or its
+  // apply finished and only the marker survived. Resuming is still the way
+  // out, but it clears a record rather than writing pending results, and
+  // saying "0 events were enriched but never written" would be a lie.
+  const nothingPending = unfinished !== null && unfinished.staged_rows === 0;
   return (
     <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-2">
       <div className="flex items-center justify-between gap-3">
@@ -220,17 +230,31 @@ function EnricherRow({
       {unfinished && (
         <div className="rounded-md border border-[var(--color-warning)] bg-[var(--color-warning-dim)] p-2 space-y-1.5">
           <p className="text-xs font-medium text-[var(--color-fg-primary)]">
-            An earlier run was interrupted before its results were saved
+            {nothingPending
+              ? "An earlier run was interrupted before it was recorded as finished"
+              : "An earlier run was interrupted before its results were saved"}
           </p>
           <p className="text-xs text-[var(--color-fg-muted)]">
-            {unfinished.staged_rows.toLocaleString()}{" "}
-            {unfinished.staged_rows === 1 ? "event" : "events"} across{" "}
-            {unfinished.staged_sources}{" "}
-            {unfinished.staged_sources === 1 ? "source" : "sources"} were enriched{" "}
-            {formatAge(unfinished.age_seconds)} ago but never written to the timeline.
-            Resuming applies them — no re-scan.
-            {partial &&
-              " One source was only partly processed; its values still apply, and it stays eligible for a later run."}
+            {nothingPending ? (
+              <>
+                It started {formatAge(unfinished.age_seconds)} ago and left nothing pending —
+                either it stopped before enriching anything, or its results were already
+                written. Resuming clears the record so this enricher can run again.
+              </>
+            ) : (
+              <>
+                {unfinished.staged_rows.toLocaleString()}{" "}
+                {unfinished.staged_rows === 1 ? "event" : "events"} across{" "}
+                {unfinished.staged_sources}{" "}
+                {unfinished.staged_sources === 1 ? "source" : "sources"} were enriched{" "}
+                {formatAge(unfinished.age_seconds)} ago but never written to the timeline.
+                Resuming applies them — no re-scan.
+                {partial &&
+                  (unfinished.partial_sources === 1
+                    ? " One source was only partly processed; its values still apply, and it stays eligible for a later run."
+                    : ` ${unfinished.partial_sources} sources were only partly processed; their values still apply, and they stay eligible for a later run.`)}
+              </>
+            )}
           </p>
           <div className="flex items-center gap-2">
             <Button
@@ -289,9 +313,11 @@ function EnricherRow({
             title={
               unfinished !== null
                 ? "Resume the interrupted run first — a new run would strand its results"
-                : enricher.eligible
-                  ? undefined
-                  : "No matching values were found, but you can still run it"
+                : isRunning
+                  ? "An enrichment run for this enricher is already in progress"
+                  : enricher.eligible
+                    ? undefined
+                    : "No matching values were found, but you can still run it"
             }
             onClick={() => onRun(false)}
           >

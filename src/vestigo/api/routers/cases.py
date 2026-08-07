@@ -543,7 +543,19 @@ async def _trigger_automatic_enrichments(
         job = job_store.create(
             kind="enrich", progress={"processed": 0, "total": 0}, created_by=None, case_id=case_id
         )
-        try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        # Checked, not discarded: the read above is only as authoritative as the
+        # absence of an await between it and here, and that is an invariant a
+        # later edit can break silently. The claim itself cannot be raced.
+        conflict = try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        if conflict is not None:
+            job_store.update(job.id, status="failed", error="Enrichment already running")
+            logger.info(
+                "Enrichment %s already running for timeline %s (job %s); skipping auto-trigger",
+                enricher_key,
+                timeline_id,
+                conflict,
+            )
+            continue
         # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
         # inside the background ingestion job, where no request scope exists.
         # spawn_tracked_enrichment_task keeps the strong reference that stops
@@ -1694,19 +1706,30 @@ class EnricherResumeRequest(BaseModel):
 
 
 def _unfinished_run_payload(
-    run: EnrichmentJobRun | None, staged_counts: dict[str, tuple[int, int]]
+    run: EnrichmentJobRun | None, staged: dict[str, tuple[int, set[str]]]
 ) -> dict[str, Any] | None:
     """Describe a dead enrichment run for the enrichers dialog, or None.
 
-    ``completed_sources`` below ``staged_sources`` is the partial-coverage
-    signal: those sources get their values applied but stay provenance-free
-    and re-runnable. A marker with zero staged rows is still reported — it is
-    still resumable (a no-op apply that clears the marker), which is how an
-    analyst lifts the "resume before running" conflict.
+    ``partial_sources`` is the partial-coverage signal: staged sources that the
+    run never finished staging, which get their values applied but stay
+    provenance-free and re-runnable. It is computed as a set difference rather
+    than by comparing ``staged_sources`` with ``completed_sources``, because
+    those two are not measured the same way — ``staged_sources`` is what is
+    *still* staged now, and a resume that dies partway through has already
+    deleted the staged rows of the sources it applied, driving that count below
+    the durable ``completed_sources`` and flipping a naive comparison to "not
+    partial" exactly when the caveat is true.
+
+    A marker with zero staged rows is still reported — it is still resumable (a
+    no-op apply that clears the marker), which is how an analyst lifts the
+    "resume before running" conflict. The dialog says something different for
+    that case, since "0 events were enriched but never written" is not what
+    happened.
     """
     if run is None:
         return None
-    rows, sources = staged_counts.get(run.job_id, (0, 0))
+    rows, staged_source_ids = staged.get(run.job_id, (0, set()))
+    completed = set(run.completed_source_ids or [])
     started = run.created_at
     if started.tzinfo is None:  # SQLite round-trips naive datetimes
         started = started.replace(tzinfo=UTC)
@@ -1715,8 +1738,9 @@ def _unfinished_run_payload(
         "started_at": started.isoformat(),
         "age_seconds": max(0, int((datetime.now(UTC) - started).total_seconds())),
         "staged_rows": rows,
-        "staged_sources": sources,
-        "completed_sources": len(run.completed_source_ids or []),
+        "staged_sources": len(staged_source_ids),
+        "completed_sources": len(completed),
+        "partial_sources": len(staged_source_ids - completed),
     }
 
 
@@ -1755,7 +1779,7 @@ async def list_timeline_enrichers(
     # invisible to startup reconciliation, so this is how an analyst finds it.
     markers = await store.list_enrichment_job_runs_for_timeline(case_id, timeline_id)
     stale = [m for m in markers if get_active_enricher_run(timeline_id, m.enricher_key) != m.job_id]
-    staged_counts = await store.count_staged_rows_by_job([m.job_id for m in stale])
+    staged_counts = await store.staged_summary_by_job([m.job_id for m in stale])
     # One marker per enricher, chosen by the shared oldest-first tie-break so the
     # banner names the same job as the run route's 409 and the auto-trigger's log.
     by_key: dict[str, list[EnrichmentJobRun]] = defaultdict(list)
@@ -1814,6 +1838,14 @@ async def list_timeline_enrichers(
                 "eligibility_error": str(eligibility) if failed else None,
                 "mode": mode,
                 "enabled": enabled,
+                # The job holding the run slot, or None. A run in flight is
+                # exactly the case where `unfinished_run` is None *and* a run
+                # would 409: its marker is filtered out of `stale` above because
+                # the slot is held by it. Without this the dialog offers "Run
+                # now" during a live run — including one startup reconciliation
+                # is still applying — and the click fails with an "already
+                # running" error the analyst had no way to anticipate.
+                "running_job_id": get_active_enricher_run(timeline_id, enricher.key),
                 # None unless this enricher has a dead run waiting to be resumed.
                 # Markers for a currently-*unavailable* enricher are not rendered
                 # (it is filtered out of `available` above) — that enricher cannot
@@ -1912,6 +1944,10 @@ async def run_timeline_enricher(
     # in flight or unfinished, "everything is already enriched, nothing to do"
     # would be a misleading answer — the staged rows of an unfinished run are
     # precisely the work that has not been applied yet.
+    #
+    # This read is for the *early* 409 only: several awaits separate it from the
+    # claim below, so it cannot be the authoritative check. The claim's own
+    # return value is (see there).
     active_job_id = get_active_enricher_run(timeline_id, enricher_key)
     if active_job_id is not None:
         raise HTTPException(
@@ -1977,7 +2013,23 @@ async def run_timeline_enricher(
     )
     # Claim now (before the response) so a double-click is rejected with 409
     # even though the job itself only starts after the response is sent.
-    try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    #
+    # The claim's return value is the authoritative conflict check, not the read
+    # near the top of this handler: three awaits sit between them (the marker
+    # query, the config_hash thread hop, the provenance query), so two "Run now"
+    # clicks — or one racing ``_trigger_automatic_enrichments`` from a concurrent
+    # ingest — can both pass that read. Losing the claim and spawning anyway
+    # would put two applies on the same source *and* leave the loser's live
+    # marker looking dead to the enrichers dialog (marker present, slot held by
+    # the winner), which offers Resume on a running job — exactly the concurrent
+    # partition rewrite ``enrichers/jobs.py`` exists to prevent.
+    conflict = try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    if conflict is not None:
+        job_store.update(job.id, status="failed", error="Enrichment already running")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {conflict})",
+        )
     background_tasks.add_task(
         run_enrichment_job,
         job_id=job.id,
@@ -2066,8 +2118,8 @@ async def resume_timeline_enricher(
         # that some other case's job id exists.
         raise HTTPException(status_code=404, detail="No unfinished enrichment run with that id")
 
-    counts = await store.count_staged_rows_by_job([run.job_id])
-    staged_rows, staged_sources = counts.get(run.job_id, (0, 0))
+    summary = await store.staged_summary_by_job([run.job_id])
+    staged_rows, staged_source_ids = summary.get(run.job_id, (0, set()))
 
     # From here to the claim there is no await: check-then-claim must happen in
     # one event-loop tick or two concurrent resumes both pass. Same
@@ -2093,7 +2145,15 @@ async def resume_timeline_enricher(
     # discovery invariant sound (marker present + slot held by it = live), so a
     # second analyst cannot fire a second resume over the same staged rows, and
     # it makes the run route's 409 name the run they already know about.
-    try_claim_enricher_run(timeline_id, enricher_key, run.job_id)
+    # Checked rather than discarded for the same reason as the run route: the
+    # read above is only authoritative while nothing awaits between it and here.
+    conflict = try_claim_enricher_run(timeline_id, enricher_key, run.job_id)
+    if conflict is not None:
+        job_store.update(job.id, status="failed", error="Enrichment already running")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {conflict})",
+        )
 
     # Recorded before spawning so the named actor is on file even if the apply
     # then fails.
@@ -2108,8 +2168,9 @@ async def resume_timeline_enricher(
             "job_id": run.job_id,
             "poll_job_id": job.id,
             "staged_rows": staged_rows,
-            "staged_sources": staged_sources,
+            "staged_sources": len(staged_source_ids),
             "completed_sources": len(run.completed_source_ids or []),
+            "partial_sources": len(staged_source_ids - set(run.completed_source_ids or [])),
         },
     )
     background_tasks.add_task(
@@ -2131,5 +2192,5 @@ async def resume_timeline_enricher(
         "resumed_job_id": run.job_id,
         "status": job.status,
         "staged_rows": staged_rows,
-        "staged_sources": staged_sources,
+        "staged_sources": len(staged_source_ids),
     }

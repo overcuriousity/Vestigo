@@ -12,9 +12,17 @@ export interface EnricherInfo {
 /** An enrichment run that died before its staged results were applied.
  *
  * The work is already computed and one partition rewrite away from landing;
- * resuming applies it without re-scanning. `completed_sources` below
- * `staged_sources` means some source's staging was cut short — its values
- * still apply, but it stays eligible for a later run. */
+ * resuming applies it without re-scanning. `partial_sources` counts staged
+ * sources the run never finished staging — their values still apply, but they
+ * stay eligible for a later run. Use it directly rather than comparing
+ * `staged_sources` with `completed_sources`: the former is what is *still*
+ * staged, which a half-finished resume has already drained for the sources it
+ * applied, so the comparison inverts exactly when the caveat is true.
+ *
+ * `staged_rows === 0` is a legitimate state (the run died before its first
+ * batch, or its apply drained everything and only the marker survived): the
+ * marker is still resumable, but nothing is pending, so the banner says so
+ * rather than reporting zero enriched events. */
 export interface UnfinishedEnrichmentRun {
   job_id: string;
   started_at: string;
@@ -22,6 +30,7 @@ export interface UnfinishedEnrichmentRun {
   staged_rows: number;
   staged_sources: number;
   completed_sources: number;
+  partial_sources: number;
 }
 
 export interface TimelineEnricherInfo {
@@ -37,6 +46,12 @@ export interface TimelineEnricherInfo {
   mode: "automatic" | "manual";
   enabled: boolean;
   unfinished_run: UnfinishedEnrichmentRun | null;
+  /** The job holding this enricher's run slot on the server, or null. Non-null
+   * and `unfinished_run === null` is a live run (its marker is hidden precisely
+   * because the slot is held); running again would 409, so the buttons say so
+   * instead of letting the analyst find out from an error. Server-derived on
+   * purpose: it survives a page reload, unlike any client-side in-flight flag. */
+  running_job_id: string | null;
 }
 
 export interface EnricherAssetInfo {

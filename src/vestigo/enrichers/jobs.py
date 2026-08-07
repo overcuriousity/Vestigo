@@ -739,6 +739,11 @@ async def reconcile_orphaned_enrichment_jobs(
     sources; the run/re-run overlap is safe because ``mapUpdate`` overwrites
     the same derived keys with recomputed values.
 
+    Each marker's run slot is claimed for the duration of its apply and released
+    after, so an analyst who reaches the enrichers dialog while this is still
+    running sees the marker as live rather than as a resumable orphan — see the
+    inline note for what two concurrent applies of one job id would do.
+
     If applying fails (e.g. ClickHouse unreachable), the marker and staged
     rows are left intact for the next restart.
 
@@ -749,6 +754,29 @@ async def reconcile_orphaned_enrichment_jobs(
     orphaned = await store.list_orphaned_enrichment_job_runs()
     recovered: list[EnrichmentJobRun] = []
     for run in orphaned:
+        # Hold the run slot for the duration of the apply, exactly as
+        # ``run_resume_job`` does. This runs *after* the app is serving
+        # (``api/main.py::_startup_recovery``), so without a claim the enrichers
+        # dialog sees marker-present + slot-not-held, calls the marker dead and
+        # offers Resume — and the resume route's own check would pass. Both
+        # applies share ClickHouse scratch tables keyed on ``job_id`` alone
+        # (``create_enrichment_scratch`` DROPs and re-CREATEs), while
+        # ``_APPLY_LOCKS`` only serializes per source, so the two would proceed
+        # on *different* sources and one would finalize a partition from the
+        # other's rows: a REPLACE whose mapUpdate matches nothing and whose
+        # owned-suffix stripping removes that source's existing derived keys.
+        # Silent evidence loss, so the claim is mandatory, not an optimization.
+        conflict = try_claim_enricher_run(run.timeline_id, run.enricher_key, run.job_id)
+        if conflict is not None:
+            logger.warning(
+                "Skipping recovery of orphaned enrichment job %s (enricher=%s, timeline=%s): "
+                "job %s already holds the run slot",
+                run.job_id,
+                run.enricher_key,
+                run.timeline_id,
+                conflict,
+            )
+            continue
         try:
             applied = await resume_enrichment_run(store, ch_store, run, trigger="startup")
         except Exception:  # noqa: BLE001
@@ -760,6 +788,8 @@ async def reconcile_orphaned_enrichment_jobs(
                 run.timeline_id,
             )
             continue
+        finally:
+            release_enricher_run(run.timeline_id, run.enricher_key, run.job_id)
         logger.warning(
             "Recovered orphaned enrichment job %s (enricher=%s, timeline=%s): "
             "applied %d staged enrichment fields, scheduling re-run",

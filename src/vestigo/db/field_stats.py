@@ -348,7 +348,13 @@ def merged_inventory(
                 max(dist, int(entry.get("distinct", 0))),
                 cov + int(entry.get("coverage", 0)),
             )
-    ranked = sorted(merged_attrs.items(), key=lambda kv: -kv[1][1])[:max_attr_keys]
+    # Key ascending is the tie-break that makes this cut deterministic. Coverage
+    # ties are the norm, and without it the survivors of the ``max_attr_keys``
+    # truncation are whatever order ``stats`` happened to arrive in (the row
+    # order of the Postgres field-stats query) — which would leave
+    # ``recommend_novelty_fields`` scoring a different candidate set run to run
+    # on unchanged data, the same defect its own sort was made total to close.
+    ranked = sorted(merged_attrs.items(), key=lambda kv: (-kv[1][1], kv[0]))[:max_attr_keys]
     inventory.extend((f"attr:{key}", dist, cov) for key, (dist, cov) in ranked)
     return inventory, total
 

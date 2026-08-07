@@ -634,6 +634,82 @@ async def test_reconcile_grants_provenance_to_marker_completed_sources(store):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_holds_the_run_slot_while_applying(store, monkeypatch):
+    """Recovery must look like a live run to every other surface while it applies.
+
+    ``_startup_recovery`` runs *after* the app is serving, so without a claim
+    the enrichers dialog sees marker-present + slot-not-held, calls the marker
+    dead and offers Resume — and the resume route's own check would pass. Two
+    applies of one job id share ClickHouse scratch tables keyed on the job id
+    alone while ``_APPLY_LOCKS`` only serializes per source, so they would
+    finalize partitions from each other's rows.
+    """
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    held: list[str | None] = []
+    real_resume = _jobs.resume_enrichment_run
+
+    async def _spy(store_, ch_, run, **kwargs):
+        held.append(_jobs.get_active_enricher_run(run.timeline_id, run.enricher_key))
+        return await real_resume(store_, ch_, run, **kwargs)
+
+    monkeypatch.setattr(_jobs, "resume_enrichment_run", _spy)
+    recovered = await _jobs.reconcile_orphaned_enrichment_jobs(store, _RecordingClickHouse())
+
+    assert [r.job_id for r in recovered] == ["job1"]
+    assert held == ["job1"]
+    # Released afterwards, or the re-run scheduled next would never get a slot.
+    assert _jobs.get_active_enricher_run("t1", "geoip") is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_releases_the_run_slot_when_the_apply_fails(store):
+    """A failed recovery must not wedge the (timeline, enricher) at 409 until restart."""
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    assert await _jobs.reconcile_orphaned_enrichment_jobs(store, _BrokenClickHouse()) == []
+    assert _jobs.get_active_enricher_run("t1", "geoip") is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_a_marker_whose_slot_is_already_held(store):
+    """A run live under this process is not an orphan, whatever the marker says."""
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    _jobs.try_claim_enricher_run("t1", "geoip", "someone-else")
+    try:
+        ch = _RecordingClickHouse()
+        assert await _jobs.reconcile_orphaned_enrichment_jobs(store, ch) == []
+        assert ch.applied == []
+        # Marker and staged rows untouched — the slot holder still owns them.
+        assert [o.job_id for o in await store.list_orphaned_enrichment_job_runs()] == ["job1"]
+        assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+    finally:
+        _jobs.release_enricher_run("t1", "geoip", "someone-else")
+
+
+@pytest.mark.asyncio
 async def test_reconcile_leaves_marker_and_rows_when_apply_fails(store):
     from vestigo.enrichers.jobs import reconcile_orphaned_enrichment_jobs
 
@@ -1254,6 +1330,55 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
     assert res["source_ids"] == ["sk"]
     assert res["skipped_source_ids"] == []
     _jobs.release_enricher_run(timeline.id, "stub-skip", res["job_id"])
+
+
+@pytest.mark.asyncio
+async def test_manual_run_409s_when_the_claim_loses_a_race(store, monkeypatch):
+    """The claim, not the early read, is what decides the conflict.
+
+    Several awaits separate the two (the marker query, the ``config_hash``
+    thread hop, the provenance query), so two "Run now" clicks — or one racing
+    ``_trigger_automatic_enrichments`` from a concurrent ingest — can both pass
+    the read. Spawning anyway would put two applies on one source *and* make the
+    loser's live marker look dead to the enrichers dialog, which would then
+    offer Resume on a running job. Simulated here by holding the slot while the
+    early read reports it free.
+    """
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import run_timeline_enricher
+    from vestigo.core.jobs import get_job_store
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-race")
+    await store.set_source_status("c1", "s1", "ready")
+
+    _jobs.try_claim_enricher_run(timeline.id, "stub-race", "winner-job")
+    monkeypatch.setattr(_jobs, "get_active_enricher_run", lambda *a, **k: None)
+    background_tasks = BackgroundTasks()
+    try:
+        with pytest.raises(HTTPException) as excinfo:
+            await run_timeline_enricher(
+                timeline_id=timeline.id,
+                enricher_key="stub-race",
+                background_tasks=background_tasks,
+                case=case,
+                user=User(id="u1", username="t", is_admin=True, is_active=True),
+            )
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-race", "winner-job")
+
+    assert excinfo.value.status_code == 409
+    assert "winner-job" in excinfo.value.detail
+    # No enrichment scheduled, and the loser's job is not left pending forever.
+    assert background_tasks.tasks == []
+    losers = [
+        j
+        for j in get_job_store().list_by_case(case.id)
+        if j.kind == "enrich" and j.status == "failed"
+    ]
+    assert losers and losers[-1].error == "Enrichment already running"
 
 
 @pytest.mark.asyncio
@@ -1899,7 +2024,7 @@ async def test_list_enrichment_job_runs_for_timeline_filters(store):
 
 
 @pytest.mark.asyncio
-async def test_count_staged_rows_by_job_returns_row_and_source_counts(store):
+async def test_staged_summary_by_job_returns_row_counts_and_source_ids(store):
     async def stage(job_id, source_id, event_id):
         await store.stage_enrichment_results(
             [
@@ -1922,11 +2047,11 @@ async def test_count_staged_rows_by_job_returns_row_and_source_counts(store):
     await stage("job1", "s2", "e3")
     await stage("job2", "s1", "e4")
 
-    counts = await store.count_staged_rows_by_job(["job1", "job2", "job-none"])
-    assert counts == {"job1": (3, 2), "job2": (1, 1)}
+    summary = await store.staged_summary_by_job(["job1", "job2", "job-none"])
+    assert summary == {"job1": (3, {"s1", "s2"}), "job2": (1, {"s1"})}
     # A job with no staged rows is simply absent, not zero-valued.
-    assert "job-none" not in counts
-    assert await store.count_staged_rows_by_job([]) == {}
+    assert "job-none" not in summary
+    assert await store.staged_summary_by_job([]) == {}
 
 
 @pytest.mark.asyncio
@@ -2190,6 +2315,69 @@ async def test_list_timeline_enrichers_reports_unfinished_run(store, monkeypatch
     assert unfinished["staged_sources"] == 1
     assert unfinished["completed_sources"] == 0
     assert isinstance(unfinished["age_seconds"], int)
+
+
+@pytest.mark.asyncio
+async def test_unfinished_run_payload_partial_survives_a_half_applied_resume(store):
+    """Partial coverage is a set difference, not a comparison of two counts.
+
+    ``staged_sources`` is what is *still* staged; ``completed_sources`` comes
+    from the durable marker. A resume that dies partway has already deleted the
+    staged rows of the sources it applied, so the counts cross over and the
+    "one source was only partly processed" caveat used to disappear exactly
+    when it was true.
+    """
+    from vestigo.api.routers.cases import _unfinished_run_payload
+    from vestigo.db.postgres import EnrichmentJobRun
+
+    run = EnrichmentJobRun(
+        job_id="job1",
+        timeline_id="t1",
+        case_id="c1",
+        enricher_key="geoip",
+        created_at=datetime.now(UTC),
+        # s4 was cut off mid-scan; s1..s3 were staged fully.
+        completed_source_ids=["s1", "s2", "s3"],
+    )
+    # A resume applied s1 and s2 before dying: fewer staged sources (2) than
+    # completed ones (3), yet s4 is still only partly processed.
+    payload = _unfinished_run_payload(run, {"job1": (120, {"s3", "s4"})})
+    assert payload["staged_sources"] == 2
+    assert payload["completed_sources"] == 3
+    assert payload["partial_sources"] == 1
+
+    # Every staged source fully staged -> no caveat.
+    clean = _unfinished_run_payload(run, {"job1": (120, {"s2", "s3"})})
+    assert clean["partial_sources"] == 0
+
+    # A marker with nothing staged is still reported (it is what blocks a fresh
+    # run), just with zero everything so the dialog can say so honestly.
+    empty = _unfinished_run_payload(run, {})
+    assert (empty["staged_rows"], empty["staged_sources"], empty["partial_sources"]) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_list_timeline_enrichers_reports_the_live_run_slot(store, monkeypatch):
+    """A live run is reported so the dialog disables running instead of 409ing.
+
+    Its marker is deliberately hidden (the slot is held by it), which used to
+    leave the dialog with nothing at all to show for work in flight — including
+    a startup reconciliation still applying.
+    """
+    from vestigo.api.routers.cases import list_timeline_enrichers
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-slot")
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    assert next(e for e in res["enrichers"] if e["key"] == "stub-slot")["running_job_id"] is None
+
+    _jobs.try_claim_enricher_run(timeline.id, "stub-slot", "job1")
+    try:
+        res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+        row = next(e for e in res["enrichers"] if e["key"] == "stub-slot")
+        assert row["running_job_id"] == "job1"
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-slot", "job1")
 
 
 @pytest.mark.asyncio
