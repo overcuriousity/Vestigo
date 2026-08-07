@@ -18,6 +18,29 @@
  * show ticks next to columns that are not on screen.
  */
 import type { RecommendedColumns } from "@/api/types";
+
+/**
+ * Move `activeId` to `overId`'s slot in a visible-column list — the reducer
+ * behind dragging a grid header.
+ *
+ * Returns the input array by identity when nothing moves: same id, or an id
+ * that is not a visible column. The grid-internal `_select`/`_annotations`/
+ * `_expand` headers are pinned and never enter the sortable set, but a stray
+ * drop id must not corrupt the list either.
+ */
+export function reorderColumns(
+  columns: string[],
+  activeId: string,
+  overId: string,
+): string[] {
+  if (activeId === overId) return columns;
+  const from = columns.indexOf(activeId);
+  const to = columns.indexOf(overId);
+  if (from === -1 || to === -1) return columns;
+  const next = [...columns];
+  next.splice(to, 0, next.splice(from, 1)[0]);
+  return next;
+}
 import { DEFAULT_COLUMNS, sanitizeColumns } from "@/stores/ui";
 
 /**

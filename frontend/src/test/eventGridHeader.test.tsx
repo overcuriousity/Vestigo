@@ -8,6 +8,7 @@ import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import { EventGrid } from "@/components/explorer/EventGrid";
+import { reorderColumns } from "@/lib/columns";
 import type { Event } from "@/api/types";
 
 function evt(i: number): Event {
@@ -78,5 +79,48 @@ describe("EventGrid scroll structure", () => {
     const wrapper = screen.getByTestId("grid-content");
     expect(wrapper).toContainElement(screen.getByTestId("grid-header"));
     expect(wrapper).toContainElement(screen.getByTestId("grid-body"));
+  });
+});
+
+describe("EventGrid column reorder", () => {
+  it("makes each visible column header a drag handle", () => {
+    renderGrid(["timestamp", "artifact", "message"]);
+    const header = screen.getByTestId("grid-header");
+    expect(header.querySelectorAll("[data-column-drag]")).toHaveLength(3);
+  });
+
+  it("does not make the grid-internal columns draggable", () => {
+    renderGrid(["timestamp", "artifact", "message"]);
+    const header = screen.getByTestId("grid-header");
+    const ids = [...header.querySelectorAll("[data-column-drag]")].map((el) =>
+      el.getAttribute("data-column-drag"),
+    );
+    expect(ids).toEqual(["timestamp", "artifact", "message"]);
+    expect(ids).not.toContain("_select");
+    expect(ids).not.toContain("_annotations");
+    expect(ids).not.toContain("_expand");
+  });
+});
+
+/**
+ * A jsdom test cannot faithfully simulate a dnd-kit pointer drag, so the
+ * ordering logic lives in a pure function and is tested here directly —
+ * asserting on a simulated drag would be testing dnd-kit, not this code.
+ */
+describe("reorderColumns", () => {
+  it("moves the dragged column to the target's position", () => {
+    expect(reorderColumns(["a", "b", "c"], "a", "c")).toEqual(["b", "c", "a"]);
+    expect(reorderColumns(["a", "b", "c"], "c", "a")).toEqual(["c", "a", "b"]);
+  });
+
+  it("returns the input unchanged when the ids are the same", () => {
+    const cols = ["a", "b", "c"];
+    expect(reorderColumns(cols, "b", "b")).toBe(cols);
+  });
+
+  it("returns the input unchanged when either id is not a visible column", () => {
+    const cols = ["a", "b", "c"];
+    expect(reorderColumns(cols, "a", "_expand")).toBe(cols);
+    expect(reorderColumns(cols, "zz", "b")).toBe(cols);
   });
 });

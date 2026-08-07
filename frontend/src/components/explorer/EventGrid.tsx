@@ -16,8 +16,25 @@ import {
   getCoreRowModel,
   flexRender,
   type ColumnDef,
+  type Header,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
 import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
 import { isAnalystAnnotation } from "@/api/types";
@@ -34,11 +51,77 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
+import { reorderColumns } from "@/lib/columns";
 import { getAttributeDecoration, hasEnrichmentSiblings } from "@/lib/enrichment";
 
 // Keep in sync with --grid-row-height in index.css.
 const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
 const OVERSCAN = 10;
+
+const HEADER_CELL_CLASS =
+  "relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none";
+
+/** Width/flex for a header cell — `message` is the one that absorbs slack. */
+function headerCellSize(h: Header<Event, unknown>) {
+  return {
+    width: h.column.id === "message" ? undefined : h.getSize(),
+    flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
+  };
+}
+
+/** A header cell's label and resize grip, shared by the sortable and the
+ *  pinned branch so the two can never drift apart visually. */
+function HeaderCellBody({ h }: { h: Header<Event, unknown> }) {
+  const raw = h.column.columnDef.header;
+  const label = typeof raw === "string" ? raw : undefined;
+  return (
+    <>
+      {/* Clip a too-narrow header at its START (rtl) so the meaningful tail
+        * stays visible, and surface the full label on hover. The inner ltr
+        * wrapper keeps the text itself readable. */}
+      <span className="block truncate" style={{ direction: "rtl" }} title={label}>
+        <span className="inline-block align-bottom" style={{ direction: "ltr" }}>
+          {flexRender(raw, h.getContext())}
+        </span>
+      </span>
+      {h.column.getCanResize() && (
+        <div
+          // pointerdown is what dnd-kit's PointerSensor listens on, so without
+          // stopping it here, grabbing the grip would start a column drag.
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+          onTouchStart={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute right-0 top-0 h-full w-1 cursor-col-resize select-none touch-none opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
+          style={{ marginRight: -2 }}
+        />
+      )}
+    </>
+  );
+}
+
+/** One draggable header cell. The pinned grid-internal columns render through
+ *  the plain branch in the header map instead of this. */
+function SortableHeaderCell({ h }: { h: Header<Event, unknown> }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: h.column.id });
+  return (
+    <div
+      ref={setNodeRef}
+      data-column-drag={h.column.id}
+      className={cn(HEADER_CELL_CLASS, "cursor-grab", isDragging && "opacity-50")}
+      style={{
+        ...headerCellSize(h),
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
+      {...attributes}
+      {...listeners}
+    >
+      <HeaderCellBody h={h} />
+    </div>
+  );
+}
 
 interface Props {
   events: Event[];
@@ -61,6 +144,9 @@ interface Props {
   hasNextPage: boolean;
   isFetching: boolean;
   visibleColumns: string[];
+  /** Called with the full reordered visible-column list after a header drag.
+   *  Omit to render a non-reorderable grid. */
+  onReorderColumns?: (next: string[]) => void;
   sortDir: "asc" | "desc";
   onSortToggle: () => void;
   /** Active (not-yet-tagged) analysis findings, keyed by event ID. */
@@ -376,6 +462,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   hasNextPage,
   isFetching,
   visibleColumns,
+  onReorderColumns,
   sortDir,
   onSortToggle,
   liveAnomalies,
@@ -691,6 +778,23 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     prevResizingColRef.current = resizingColumnId;
   }, [resizingColumnId, columnSizing, setColumnWidth]);
 
+  const sensors = useSensors(
+    // 8px, not the story editor's 4: this header also carries the timestamp
+    // sort button, and a plain click on it must never arm a drag.
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const handleColumnDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || !onReorderColumns) return;
+      const next = reorderColumns(visibleColumns, String(active.id), String(over.id));
+      if (next !== visibleColumns) onReorderColumns(next);
+    },
+    [visibleColumns, onReorderColumns],
+  );
+
   const rows = table.getRowModel().rows;
 
   const rowVirtualizer = useVirtualizer({
@@ -856,46 +960,25 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         data-testid="grid-header"
         className="sticky top-0 z-20 flex border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]"
       >
-        {table.getHeaderGroups().map((hg) =>
-          hg.headers.map((h) => (
-            <div
-              key={h.id}
-              className="relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
-              style={{
-                width: h.column.id === "message" ? undefined : h.getSize(),
-                flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
-              }}
-            >
-              {/* Clip a too-narrow header at its START (rtl) so the meaningful
-                * tail stays visible, and surface the full label on hover. The
-                * inner ltr wrapper keeps the text itself readable. */}
-              {(() => {
-                const raw = h.column.columnDef.header;
-                const label = typeof raw === "string" ? raw : undefined;
-                return (
-                  <span
-                    className="block truncate"
-                    style={{ direction: "rtl" }}
-                    title={label}
-                  >
-                    <span className="inline-block align-bottom" style={{ direction: "ltr" }}>
-                      {flexRender(raw, h.getContext())}
-                    </span>
-                  </span>
-                );
-              })()}
-              {h.column.getCanResize() && (
-                <div
-                  onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
-                  onTouchStart={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute right-0 top-0 h-full w-1 cursor-col-resize select-none touch-none opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
-                  style={{ marginRight: -2 }}
-                />
-              )}
-            </div>
-          )),
-        )}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleColumnDragEnd}
+        >
+          <SortableContext items={visibleColumns} strategy={horizontalListSortingStrategy}>
+            {table.getHeaderGroups().map((hg) =>
+              hg.headers.map((h) =>
+                visibleColumns.includes(h.column.id) ? (
+                  <SortableHeaderCell key={h.id} h={h} />
+                ) : (
+                  <div key={h.id} className={HEADER_CELL_CLASS} style={headerCellSize(h)}>
+                    <HeaderCellBody h={h} />
+                  </div>
+                ),
+              ),
+            )}
+          </SortableContext>
+        </DndContext>
       </div>
 
       {/* Virtualized body */}
