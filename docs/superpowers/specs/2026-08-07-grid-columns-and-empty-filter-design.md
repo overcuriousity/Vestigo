@@ -2,12 +2,14 @@
 
 Date: 2026-08-07
 
-Three small changes to the Explorer's event grid and filter rail, grouped because
-two of them touch the same header markup in `EventGrid.tsx`.
+Four small changes to the Explorer's event grid, filter rail and saved views,
+grouped because two of them touch the same header markup in `EventGrid.tsx` and
+a third is what makes a column layout worth persisting.
 
 1. Drag-and-drop reordering of grid columns.
 2. A filter that keeps or drops events by whether a field has a value at all.
 3. A fix for the header not following horizontal scroll.
+4. Saved views carry the column layout.
 
 ## 1. Column reorder by dragging the header
 
@@ -171,6 +173,54 @@ A `scrollMargin` regression here is silent — the grid still renders, it just
 pages or reports position wrongly. This is the risk in the change and gets
 explicit test coverage plus a manual pass.
 
+## 4. Saved views carry the column layout
+
+### Current state
+
+`View.view_filter` (`db/postgres.py:606`) is opaque JSON the backend only
+round-trips — it never interprets it. `SaveViewDialog` writes
+`filtersToViewPayload(filters)` into it; `FilterRail.tsx:642` reads it back
+through `viewPayloadToFilters` and hands the result to `onApplyView`. Columns
+are not filters and appear nowhere in that round trip.
+
+### Design
+
+Store the visible-column array under a `columns` key alongside the filter keys.
+No migration, no backend change — the JSON column already accepts it and
+`to_dict` already returns the whole object.
+
+**Save.** `SaveViewDialog` takes the current `visibleColumns` as a prop and
+writes `{ ...filtersToViewPayload(filters), columns }`, always. The `columns`
+key is added at the call site, deliberately **not** inside
+`filtersToViewPayload` — the Visualize page's chart config shares that helper
+(`viz/lib/chartConfig.ts:160`, `:339`) and a column layout is meaningless there.
+
+**Apply.** `viewPayloadToFilters` keeps its signature and its filters-only job.
+A separate exported helper, `viewPayloadColumns(payload): string[] | undefined`,
+reads and sanitizes the key: it must be an array of strings, run through the
+existing `sanitizeColumns` (retired-id remap, drop grid-internal ids, dedupe),
+and yield `undefined` when absent or when sanitizing empties it. `onApplyView`
+gains an optional second argument; `ExplorerPage` writes it through
+`setVisibleColumns(tlKey, columns)` when present and leaves the current layout
+alone when not.
+
+Views predating this change have no `columns` key, so applying one leaves the
+analyst's columns untouched. That falls out of the `undefined` case rather than
+needing a version flag.
+
+### Cross-timeline behavior
+
+Views are case-scoped; column layouts are per-timeline. Applying a view saved
+on a different timeline installs its columns as-is. Attribute columns that
+timeline does not have render `—`, the same as any column whose value is
+missing on a row. This is accepted rather than guarded: the analyst asked for
+that view by name, and a restore that silently does nothing is the worse
+surprise. Removing a stray column is one click in the picker.
+
+Restoring columns writes the same per-user, per-timeline override that a manual
+column choice or a reorder writes (§1), so it interacts with the server
+suggestion under rules that already exist.
+
 ## Testing
 
 Backend:
@@ -192,6 +242,10 @@ Frontend (vitest):
 - `empty` mode: selecting `∅` disables the value input; the emitted
   `EventFilters` matches the wire shape above; chips read "is empty" /
   "has a value".
+- Saved views: the create payload carries `columns`; applying a view restores
+  them into `visibleColumnsByTimeline`; a legacy payload with no `columns` key
+  leaves the current layout untouched; a payload whose `columns` sanitize to
+  nothing is treated as absent, not as "no columns".
 - Scroll: with the header inside the scroller, the virtualizer's row offsets
   account for `scrollMargin`, and the topmost-row callback reports the same
   index before and after the restructure for a given `scrollTop + headerHeight`.
