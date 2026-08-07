@@ -116,7 +116,10 @@ export function FilterChips({ filters, onRemove }: Props) {
       chips.push({
         label: k,
         value: "is empty",
-        onRemove: remove("filters", k, vs[0] ?? ""),
+        // Drops the key and its mode outright rather than one value: this one
+        // chip stands for the whole key, so removing it must clear the whole
+        // key even if an older payload left more than the placeholder behind.
+        onRemove: remove("filters", k),
         variant: "include",
       });
       continue;
@@ -138,7 +141,7 @@ export function FilterChips({ filters, onRemove }: Props) {
       chips.push({
         label: k,
         value: "has a value",
-        onRemove: remove("exclusions", k, vs[0] ?? ""),
+        onRemove: remove("exclusions", k),
         variant: "exclude",
       });
       continue;

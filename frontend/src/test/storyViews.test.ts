@@ -74,4 +74,16 @@ describe("viewMatchesFilters", () => {
   it("distinguishes a different query", () => {
     expect(viewMatchesFilters(view({ query: "sudo" }), FILTERS)).toBe(false);
   });
+
+  it("ignores a saved column layout", () => {
+    // A view saved from the explorer carries the analyst's columns, which say
+    // nothing about what it matches. Comparing them would make every such view
+    // unreusable and mint a duplicate on every push.
+    expect(
+      viewMatchesFilters(
+        view({ filter: { q: "ssh", artifacts: ["linux:syslog"], columns: ["timestamp"] } }),
+        FILTERS,
+      ),
+    ).toBe(true);
+  });
 });

@@ -42,11 +42,18 @@ function canonical(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
 }
 
-/** True when a saved View encodes exactly these filters. */
+/** True when a saved View encodes exactly these filters.
+ *
+ * `columns` is dropped before comparing: a view saved from the explorer carries
+ * the analyst's column layout, which `filtersToViewPayload` never emits and
+ * which says nothing about what the view *matches*. Comparing it would make
+ * every such view unreusable and mint the duplicates this module exists to
+ * avoid. */
 export function viewMatchesFilters(view: View, filters: EventFilters): boolean {
+  const { columns: _columns, ...viewFilter } = (view.filter ?? {}) as Record<string, unknown>;
   return (
     (view.query ?? "") === (filters.q ?? "") &&
-    canonical(view.filter) === canonical(filtersToViewPayload(filters))
+    canonical(viewFilter) === canonical(filtersToViewPayload(filters))
   );
 }
 

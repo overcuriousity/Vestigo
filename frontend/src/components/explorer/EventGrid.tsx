@@ -10,7 +10,7 @@
  * Parser tags and user annotation tags both appear as chips under the message.
  * The annotation column shows outlier/tag/comment icons that open edit popovers.
  */
-import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from "react";
+import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -105,6 +105,17 @@ function HeaderCellBody({ h }: { h: Header<Event, unknown> }) {
 function SortableHeaderCell({ h }: { h: Header<Event, unknown> }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: h.column.id });
+  // KeyboardSensor's activator is this cell's onKeyDown and it does not look at
+  // the event target, so Enter/Space on the timestamp sort button inside would
+  // start a keyboard drag and preventDefault the sort. Only a keypress on the
+  // cell itself starts a drag; anything focusable inside keeps its own keys.
+  const keyboardListeners = listeners && {
+    ...listeners,
+    onKeyDown: (e: ReactKeyboardEvent) => {
+      if (e.target !== e.currentTarget) return;
+      listeners.onKeyDown?.(e);
+    },
+  };
   return (
     <div
       ref={setNodeRef}
@@ -116,7 +127,7 @@ function SortableHeaderCell({ h }: { h: Header<Event, unknown> }) {
         transition,
       }}
       {...attributes}
-      {...listeners}
+      {...keyboardListeners}
     >
       <HeaderCellBody h={h} />
     </div>
@@ -478,6 +489,12 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   // which shifts every vertical offset the virtualizer and the scroll handler
   // reason about. Measured rather than hardcoded: the header's height follows
   // the font and the density setting.
+  //
+  // `offsetTop` is relative to the nearest *positioned* ancestor, so the
+  // grid-content wrapper carries `position: relative` — without it the offset
+  // would be the body's distance from the page top (top bar, toolbars,
+  // histogram) instead of the header's height, and the virtualizer would
+  // render its window hundreds of pixels off.
   const [bodyOffset, setBodyOffset] = useState(0);
   useLayoutEffect(() => {
     const el = bodyRef.current;
@@ -940,6 +957,18 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     [events, sortDir, rowVirtualizer],
   );
 
+  // The ids dnd-kit sorts, taken from the cells that actually register a
+  // sortable node rather than from `visibleColumns`. The two diverge: the
+  // grid-internal ids (`tags`, `_annotations`) survive `sanitizeColumns` and so
+  // can sit in a saved view's or localStorage's column list, but the column
+  // builder skips them. An id with no node throws off dnd-kit's index lookup
+  // for every column after it, landing drops in the wrong slot.
+  const sortableColumnIds = table
+    .getHeaderGroups()
+    .flatMap((hg) => hg.headers)
+    .filter((h) => visibleColumns.includes(h.column.id))
+    .map((h) => h.column.id);
+
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">
       <div
@@ -952,8 +981,15 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       {/* One wrapper at content width, so the header and every row span the
         * same box. Without it the header could not scroll with the columns,
         * and rows would be sized to the viewport — cutting their background,
-        * hover state and borders off at the right edge. */}
-      <div data-testid="grid-content" style={{ minWidth: table.getTotalSize() }}>
+        * hover state and borders off at the right edge.
+        * `relative` makes this the offset parent the body measures against
+        * (see `bodyOffset`); it does not affect the sticky header, which
+        * positions against the scroll container. */}
+      <div
+        data-testid="grid-content"
+        className="relative"
+        style={{ minWidth: table.getTotalSize() }}
+      >
       {/* Header row — inside the scroller so it tracks horizontal scroll,
         * sticky so it still holds its place vertically. */}
       <div
@@ -965,7 +1001,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           collisionDetection={closestCenter}
           onDragEnd={handleColumnDragEnd}
         >
-          <SortableContext items={visibleColumns} strategy={horizontalListSortingStrategy}>
+          <SortableContext items={sortableColumnIds} strategy={horizontalListSortingStrategy}>
             {table.getHeaderGroups().map((hg) =>
               hg.headers.map((h) =>
                 visibleColumns.includes(h.column.id) ? (

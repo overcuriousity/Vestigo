@@ -1344,13 +1344,19 @@ async def delete_view(
     removing one out from under a story would make that story's export fail.
     Such a view is hidden instead, and swept once the last block referencing it
     goes away; ``hidden`` in the response is what lets the UI say which of the
-    two happened.
+    two happened. ``deleted`` reports whether the row is actually gone — a
+    client that reads only that field must not be told the view no longer
+    exists when it does.
     """
     store = get_store()
     outcome = await store.delete_view(case.id, view_id)
     if outcome is None:
         raise HTTPException(status_code=404, detail="View not found")
-    return {"deleted": True, "view_id": view_id, "hidden": outcome == "hidden"}
+    return {
+        "deleted": outcome == "deleted",
+        "view_id": view_id,
+        "hidden": outcome == "hidden",
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════

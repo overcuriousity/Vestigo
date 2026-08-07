@@ -359,11 +359,18 @@ class FilterSpec(ObjectArgModel):
         description=(
             'Per-field match mode for filters: "exact" (default) | "wildcard" | '
             '"regex" | "empty". "empty" ignores the field\'s values and matches '
-            "rows where the field has no value at all (absent or blank)."
+            "rows where the field has no value at all (absent or blank) — name "
+            "the field here and leave it out of `filters` entirely."
         ),
     )
     exclusion_modes: dict[str, str] = Field(
-        default_factory=dict, description="Per-field match mode for exclusions."
+        default_factory=dict,
+        description=(
+            "Per-field match mode for exclusions, same values as filter_modes. "
+            '"empty" drops rows where the field has no value, i.e. keeps only '
+            "rows that have one; name the field here and leave it out of "
+            "`exclusions`."
+        ),
     )
     tags_include: list[str] | None = Field(
         default=None, description="Only events carrying any of these tags."
@@ -414,7 +421,23 @@ class FilterSpec(ObjectArgModel):
         answers the question actually being asked. This is the same contract as
         the chart-legality errors: an error the model is meant to act on, with
         ``retries=3`` (``agent/runtime.py``) giving it room to.
+
+        ``empty`` mode is the one legitimate valueless predicate, and it is
+        normalized here rather than rejected: the mode asks about the field's
+        presence, so there is no value to name. ``_build_where`` only visits
+        keys present in the filter map, so a mode with no key would otherwise
+        be silently dropped and answer with the whole timeline — the exact
+        failure this validator exists to prevent, arrived at from the other
+        side. The placeholder value the predicate ignores is injected instead.
         """
+        for mapping, modes in (
+            (self.filters, self.filter_modes),
+            (self.exclusions, self.exclusion_modes),
+        ):
+            for key, mode in modes.items():
+                if mode == "empty" and not mapping.get(key):
+                    mapping[key] = [""]
+
         empty_maps = [
             (name, key)
             for name, mapping in (("filters", self.filters), ("exclusions", self.exclusions))

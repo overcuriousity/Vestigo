@@ -155,6 +155,43 @@ describe("FilterRail field match modes", () => {
     );
   });
 
+  it("replaces a field's existing values when switching it to empty mode", () => {
+    // The mode covers the whole key, so appending the placeholder would leave
+    // "200" in the filter unmatched and unshown — one chip, two clicks to
+    // clear, and a value the analyst can no longer see.
+    const { onChange } = renderRail({ filters: { status: ["200"] } });
+    fireEvent.click(screen.getAllByRole("button", { name: "∅" })[0]);
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[0], { target: { value: "status" } });
+    fireEvent.click(screen.getByRole("button", { name: /add filter/i }));
+    expect(onChange.mock.calls[0][0].filters).toEqual({ status: [""] });
+  });
+
+  it("drops the empty-mode placeholder when a real value is added back", () => {
+    const { onChange } = renderRail({
+      filters: { status: [""] },
+      filterModes: { status: "empty" },
+    });
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[0], { target: { value: "status" } });
+    const valInput = screen.getAllByPlaceholderText("value")[0];
+    fireEvent.change(valInput, { target: { value: "200" } });
+    fireEvent.keyDown(valInput, { key: "Enter" });
+    const arg = onChange.mock.calls[0][0];
+    expect(arg.filters).toEqual({ status: ["200"] });
+    expect(arg.filterModes).toBeUndefined();
+  });
+
+  it("does not accumulate duplicate exclusion values", () => {
+    const { onChange } = renderRail({ exclusions: { status: ["404"] } });
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[1], { target: { value: "status" } });
+    const valInput = screen.getAllByPlaceholderText("value")[1];
+    fireEvent.change(valInput, { target: { value: "404" } });
+    fireEvent.keyDown(valInput, { key: "Enter" });
+    expect(onChange.mock.calls[0][0].exclusions).toEqual({ status: ["404"] });
+  });
+
   it("adds an empty-mode exclusion, which is the 'has a value' filter", () => {
     const { onChange } = renderRail();
     fireEvent.click(screen.getAllByRole("button", { name: "∅" })[1]);

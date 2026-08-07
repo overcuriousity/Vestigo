@@ -2085,6 +2085,29 @@ async def test_a_stringified_filter_spec_reaches_the_query_end_to_end(store, mon
     assert spec.artifacts == ["auth"]
 
 
+def test_empty_mode_needs_no_values_and_still_reaches_the_where_clause():
+    """"Events with no user agent" is a valueless question with a real answer.
+
+    ``_build_where`` only visits keys present in the filter map, so a mode
+    entry whose key is absent would be dropped and the tool would answer with
+    the whole timeline — while naming the key with an empty list trips
+    ``_reject_empty_selections``. Neither is a way for the model to ask, so
+    the placeholder the predicate ignores is injected for it.
+    """
+    spec = FilterSpec.model_validate({"filter_modes": {"attr:user_agent": "empty"}})
+    assert spec.filters == {"attr:user_agent": [""]}
+
+    exclusion = FilterSpec.model_validate({"exclusion_modes": {"attr:user_agent": "empty"}})
+    assert exclusion.exclusions == {"attr:user_agent": [""]}
+
+
+def test_an_empty_value_list_is_still_rejected_in_every_other_mode():
+    with pytest.raises(ValidationError, match="filters nothing"):
+        FilterSpec.model_validate(
+            {"filters": {"attr:status": []}, "filter_modes": {"attr:status": "wildcard"}}
+        )
+
+
 def test_a_stringified_spec_still_reaches_the_legacy_kind_translation():
     """Both before-validators run, in whichever order pydantic picks."""
     spec = ChartSpec.model_validate('{"kind": "terms", "field": "attr:status", "limit": 5}')

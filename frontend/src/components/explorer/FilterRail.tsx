@@ -68,6 +68,10 @@ const MODE_PLACEHOLDER: Record<RowMatchMode, string> = {
   empty: "(empty)",
 };
 
+/** Saved-view count above which the list gets a search box. Five rows are
+ *  faster to scan than to filter. */
+const VIEW_SEARCH_MIN = 5;
+
 /** 3-state exact/wildcard/regex selector for one field-filter entry row. */
 function MatchModeControl({
   mode,
@@ -194,10 +198,16 @@ export function FilterRail({
     onError: (err: Error) => toast.error("Could not delete view", err.message),
   });
 
-  /** Case-insensitive substring match on the view name. */
+  /** Case-insensitive substring match on the view name.
+   *
+   * Gated on the same threshold that renders the search box: deleting a view
+   * can take the list back under it, and a needle still filtering after its
+   * input has unmounted would strand the panel on "No views match" with no
+   * control left to clear it. */
+  const viewSearchShown = views.length > VIEW_SEARCH_MIN;
   const matchingViews = useMemo(() => {
     const needle = viewSearch.trim().toLowerCase();
-    if (!needle) return views;
+    if (!needle || views.length <= VIEW_SEARCH_MIN) return views;
     return views.filter((v) => v.name.toLowerCase().includes(needle));
   }, [views, viewSearch]);
 
@@ -248,8 +258,19 @@ export function FilterRail({
     // Append to the field's value list (src_port 22, then 23 → OR'd), skipping
     // duplicates — mirrors addExclusion. Mode-per-key: this mode applies to
     // ALL of the key's values.
-    const prevValues = filters.filters?.[key] ?? [];
-    const nextValues = prevValues.includes(v) ? prevValues : [...prevValues, v];
+    //
+    // Empty mode is the exception: the mode covers the whole key, so any value
+    // already listed would stop being matched while still sitting in the
+    // filter — invisible in the chips, and its removal handler would then take
+    // two clicks to clear one chip. The placeholder replaces the list, and
+    // switching the key back off empty drops the placeholder again.
+    const prevValues = (filters.filters?.[key] ?? []).filter((x) => x !== "");
+    const nextValues =
+      fieldMode === "empty"
+        ? [""]
+        : prevValues.includes(v)
+          ? prevValues
+          : [...prevValues, v];
     onChange({
       ...filters,
       filters: { ...(filters.filters ?? {}), [key]: nextValues },
@@ -271,11 +292,20 @@ export function FilterRail({
     const modes = { ...(filters.exclusionModes ?? {}) };
     if (excludeMode === "exact") delete modes[key];
     else modes[key] = excludeMode;
+    // Same placeholder rule as addFilter, and the same dedupe: without it a
+    // repeated add accumulates duplicate values the chips render twice.
+    const prevValues = (filters.exclusions?.[key] ?? []).filter((x) => x !== "");
+    const nextValues =
+      excludeMode === "empty"
+        ? [""]
+        : prevValues.includes(v)
+          ? prevValues
+          : [...prevValues, v];
     onChange({
       ...filters,
       exclusions: {
         ...(filters.exclusions ?? {}) as Record<string, string[]>,
-        [key]: [...(filters.exclusions?.[key] ?? []), v],
+        [key]: nextValues,
       },
       exclusionModes: Object.keys(modes).length > 0 ? modes : undefined,
     });
@@ -702,7 +732,7 @@ export function FilterRail({
             </label>
             {/* Search earns its space only once the list is long enough to
               * need it — five rows are faster to scan than to filter. */}
-            {views.length > 5 && (
+            {viewSearchShown && (
               <Input
                 className="mb-1.5"
                 placeholder="Search views"

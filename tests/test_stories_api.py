@@ -506,6 +506,9 @@ def test_export_flow(client, admin_bootstrap, store):
     deleted = client.delete(f"/api/cases/{case_id}/views/{view['id']}")
     assert deleted.status_code == 200
     assert deleted.json()["hidden"] is True
+    # The row is still there, so a client reading only `deleted` must not be
+    # told otherwise.
+    assert deleted.json()["deleted"] is False
 
     resp = client.post(f"{base}/exports")
     assert resp.status_code == 200, resp.text

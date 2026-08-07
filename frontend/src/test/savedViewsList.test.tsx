@@ -31,9 +31,10 @@ function view(id: string, name: string): View {
   };
 }
 
-function renderRail(views: View[]) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(
+const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+function rail(views: View[]) {
+  return (
     <MemoryRouter>
       <QueryClientProvider client={qc}>
         <TooltipProvider>
@@ -49,8 +50,12 @@ function renderRail(views: View[]) {
           />
         </TooltipProvider>
       </QueryClientProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderRail(views: View[]) {
+  return render(rail(views));
 }
 
 const many = [
@@ -90,6 +95,22 @@ describe("saved views list", () => {
       target: { value: "zzz" },
     });
     expect(screen.getByText("No views match")).toBeInTheDocument();
+  });
+
+  it("stops filtering once the list shrinks below the search threshold", () => {
+    // Deleting a view can take the list back under the threshold, unmounting
+    // the search box. A needle still applying after that would strand the
+    // panel on "No views match" with no control left to clear it.
+    const { rerender } = renderRail(many);
+    fireEvent.change(screen.getByPlaceholderText("Search views"), {
+      target: { value: "zzz" },
+    });
+    expect(screen.getByText("No views match")).toBeInTheDocument();
+
+    rerender(rail(many.slice(0, 3)));
+    expect(screen.queryByPlaceholderText("Search views")).not.toBeInTheDocument();
+    expect(screen.queryByText("No views match")).not.toBeInTheDocument();
+    expect(screen.getByText("Failed logons")).toBeInTheDocument();
   });
 
   it("deletes a view after confirmation", async () => {

@@ -72,6 +72,31 @@ passes five entries) and per-row delete behind a confirmation, whose toast repor
 the two backend outcomes happened. The `DELETE` endpoint and its client method already
 existed and had simply never been called from the UI.
 
+**Review pass (PR #241).** Eight findings, all confirmed against the code and fixed here.
+The one that mattered: `bodyOffset` was measured with `offsetTop`, which is relative to the
+nearest *positioned* ancestor — and nothing between the grid body and `<body>` was positioned,
+so the virtualizer's `scrollMargin` was the body's distance from the page top (top bar,
+toolbars, histogram) rather than the header's height, leaving most of the viewport blank at
+`scrollTop = 0`. The grid-content wrapper is now `relative`. jsdom reports `offsetTop` as 0
+unconditionally, so no unit test could have caught it and none can guard it.
+Four more from the same round: `SortableContext` listed `visibleColumns`, which can carry the
+grid-internal ids (`tags`, `_annotations`) that survive `sanitizeColumns` but register no
+sortable node — one phantom id and every drop after it lands a slot off, so the item list is
+now derived from the cells actually rendered. `useSortable`'s keyboard activator sits on the
+header cell and ignores the event target, so Enter on the timestamp sort button started a
+drag and swallowed the sort; it is now gated on `target === currentTarget`. Switching a field
+that already had values to `empty` mode appended the placeholder instead of replacing the
+list, leaving values matched by nothing, shown by nothing, and removable only on the second
+click — the placeholder now replaces, leaving the mode drops it, and the "is empty" chip
+clears the whole key. `filter_modes: {f: "empty"}` was unusable from the agent: naming the key
+with an empty list trips `_reject_empty_selections`, omitting it drops the mode silently, so
+the validator now injects the placeholder the predicate ignores.
+Three cosmetic: `viewMatchesFilters` compared the new `columns` key that `filtersToViewPayload`
+never emits, so every explorer-saved view was unreusable and each story push minted a
+duplicate; the saved-views search needle kept filtering after its input unmounted below the
+five-view threshold, stranding the panel on "No views match"; and `DELETE /views/{id}`
+answered `deleted: true` for a view it had only hidden.
+
 ## Session 157 — 2026-08-07: `--reassemble http` back-ported upstream and re-vendored
 
 **Why.** Sessions 155–156 built HTTP/1.x reassembly in the native `pcap2vestigo` only. The
