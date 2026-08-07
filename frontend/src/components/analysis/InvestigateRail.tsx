@@ -15,15 +15,22 @@
  * The old five-tab split is gone. So is the Advanced accordion: per-method
  * controls live in the sheet, where there is room for them.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
 import { useStreamingSweep } from "@/hooks/useMethodFindings";
 import { ScopeStrip } from "./ScopeStrip";
 import { FindingGroup } from "./FindingGroup";
 import { AnalysisEmptyState } from "./detector-shared";
+import { GuidancePanel } from "@/components/ui/GuidancePanel";
+import { DETECTORS } from "./detector-registry";
+import { normalizeFinding } from "@/lib/finding-normalize";
+import { isTemplateRow } from "@/api/analysis";
 import { cn } from "@/lib/cn";
-import type { Event } from "@/api/types";
+import type { AnomalyMarker, Event } from "@/api/types";
+
+/** See FindingGroup: method ids are API keys, detector-registry uses UI slugs. */
+const DETECTOR_BY_API_KEY = Object.fromEntries(DETECTORS.map((d) => [d.detector, d]));
 
 /**
  * The analyst questions from the design round, surviving as filters over one
@@ -57,6 +64,12 @@ interface Props {
   onOpenTools: (section?: "methods" | "signatures" | "explore" | "scope") => void;
   onSelectEvent: (event: Event) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
+  /** Drill a finding's field/value into the grid's filters. */
+  onDrillField?: (field: string, value: string) => void;
+  /** Publish every timestamped finding as a histogram/grid marker. */
+  onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
+  onComboDrill?: (pairs: [string, string][]) => void;
+  onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
 }
 
 export function InvestigateRail({
@@ -66,6 +79,10 @@ export function InvestigateRail({
   onOpenTools,
   onSelectEvent,
   onJumpToTime,
+  onDrillField,
+  onAnomalyMarkers,
+  onComboDrill,
+  onFrequencyDrill,
 }: Props) {
   const { byMethod, scope, done, total } = useStreamingSweep(caseId, timelineId);
   const [preset, setPreset] = useState("all");
@@ -79,12 +96,51 @@ export function InvestigateRail({
     [active, byMethod],
   );
 
+  // Publish findings onto the histogram and grid. Without this the marks the
+  // old panel put there simply vanish, and the timeline stops showing where
+  // the findings are — which is most of how an analyst navigates to them.
+  const markers = useMemo(() => {
+    const out: AnomalyMarker[] = [];
+    for (const meta of METHODS) {
+      const state = byMethod[meta.id];
+      if (!state) continue;
+      const detectorMeta = DETECTOR_BY_API_KEY[meta.id];
+      if (!detectorMeta) continue;
+      for (const raw of state.findings) {
+        if (isTemplateRow(raw)) continue;
+        const item = normalizeFinding(detectorMeta, raw, 0);
+        if (!item.ts) continue;
+        out.push({
+          ts: item.ts,
+          label: item.title,
+          detail: `${item.detectorLabel}: ${item.title} — ${item.subtitle}`,
+          eventId: item.eventId,
+          sourceId: item.sourceId,
+          detector: item.detector as AnomalyMarker["detector"],
+          rawDetails: item.raw.details,
+          windowEnd: item.raw.type === "frequency" ? item.raw.window_end : undefined,
+        });
+      }
+    }
+    return out;
+  }, [byMethod]);
+
+  useEffect(() => {
+    if (!onAnomalyMarkers) return;
+    onAnomalyMarkers(markers);
+    return () => onAnomalyMarkers([]);
+  }, [markers, onAnomalyMarkers]);
+
   const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);
   const anyFindings = visible.some((m) => byMethod[m.id].findings.length > 0);
 
   return (
     <div className="space-y-2">
+      {/* First-run explainer, collapsible and restorable from Settings. It
+          moved here with the findings it explains rather than being dropped
+          along with the tab that used to host it. */}
+      <GuidancePanel id="investigate-anomalies" />
       <ScopeStrip scope={scope} onOpen={() => onOpenTools("scope")} />
 
       <div className="flex flex-wrap gap-1">
@@ -147,6 +203,9 @@ export function InvestigateRail({
           onSelectFinding={onSelectFinding}
           onSelectEvent={onSelectEvent}
           onJumpToTime={onJumpToTime}
+          onDrillField={onDrillField}
+          onComboDrill={onComboDrill}
+          onFrequencyDrill={onFrequencyDrill}
         />
       ))}
 

@@ -21,9 +21,12 @@ import { useStreamingSweep } from "@/hooks/useMethodFindings";
 import { SigmaPanel } from "./SigmaPanel";
 import { PatternsView } from "./PatternsView";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
+import { SimilarEvents } from "./SimilarEvents";
+import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 import type { AnalysisScope } from "@/api/analysis";
+import type { Event } from "@/api/types";
 
 export type ToolsSection = "methods" | "signatures" | "explore" | "scope";
 
@@ -37,6 +40,12 @@ interface Props {
    * method at once and reframes every verdict already recorded, so the host
    * routes it through a confirm. */
   onRequestScopeChange: (next: { frame: "self" | "baseline"; baselineId?: string }) => void;
+  /** Sigma hits filter the grid by their "sigma: <title>" tag. */
+  onTagFilter?: (tag: string) => void;
+  /** The event the analyst anchored from the grid, if any. */
+  similarAnchor?: Event | null;
+  onSimilarClose?: () => void;
+  onSelectEvent?: (event: Event) => void;
 }
 
 function Section({
@@ -65,6 +74,10 @@ export function ToolsSheet({
   onRunMethod,
   onOpenMethod,
   onRequestScopeChange,
+  onTagFilter,
+  similarAnchor,
+  onSimilarClose,
+  onSelectEvent,
 }: Props) {
   const { byMethod, scope } = useStreamingSweep(caseId, timelineId);
   const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
@@ -111,14 +124,35 @@ export function ToolsSheet({
       </Section>
 
       <Section id="signatures" title="Signatures">
-        <SigmaPanel caseId={caseId} timelineId={timelineId} />
+        <GuidancePanel id="investigate-sigma" />
+        <SigmaPanel caseId={caseId} timelineId={timelineId} onTagFilter={onTagFilter} />
       </Section>
 
       <Section id="explore" title="Explore">
+        {/* Similarity is anchor-driven: it cannot join an unprompted sweep, so
+            it lives here and appears once the analyst anchors an event from a
+            grid row. Without this the grid's "find similar" action would set
+            an anchor nothing ever reads — a dead button. */}
+        {similarAnchor && onSelectEvent ? (
+          <div className="mb-3">
+            <SimilarEvents
+              caseId={caseId}
+              timelineId={timelineId}
+              anchorEvent={similarAnchor}
+              onClose={onSimilarClose ?? (() => {})}
+              onSelectEvent={onSelectEvent}
+            />
+          </div>
+        ) : (
+          <p className="mb-3 text-[11px] text-[var(--color-fg-muted)]">
+            Click the search icon on any event row to find events like it.
+          </p>
+        )}
         <p className="mb-2 text-[11px] text-[var(--color-fg-muted)]">
           Motif mining answers &ldquo;what is routine here?&rdquo; — its results{" "}
           <strong className="font-medium">suppress</strong> findings rather than raising them.
         </p>
+        <GuidancePanel id="investigate-patterns" />
         <PatternsView caseId={caseId} timelineId={timelineId} onSelectEvent={() => {}} />
       </Section>
 

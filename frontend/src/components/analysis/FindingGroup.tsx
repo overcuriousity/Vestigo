@@ -11,6 +11,7 @@
  * useDisposition, and a second implementation would fork the verdict
  * semantics — the one thing in this subsystem that must stay single-sourced.
  */
+import { Filter } from "lucide-react";
 import { DETECTORS } from "./detector-registry";
 import { FindingRowActions, FindingShell } from "./detector-shared";
 import type { EvidenceClass, MethodId, MethodMeta } from "./method-registry";
@@ -38,6 +39,11 @@ interface Props {
   onSelectFinding: (method: MethodId, rank: number) => void;
   onSelectEvent: (event: Event) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
+  onDrillField?: (field: string, value: string) => void;
+  /** Combo findings drill every pair at once — one value alone is not the finding. */
+  onComboDrill?: (pairs: [string, string][]) => void;
+  /** Frequency findings drill the anomalous window *and* the series value. */
+  onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
 }
 
 function TemplateRows({
@@ -72,14 +78,45 @@ function ScoredRow({
   timelineId,
   onSelect,
   onJumpToTime,
+  onDrillField,
+  onComboDrill,
+  onFrequencyDrill,
 }: {
   item: FeedItem;
   caseId: string;
   timelineId: string;
   onSelect: () => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
+  onDrillField?: (field: string, value: string) => void;
+  onComboDrill?: (pairs: [string, string][]) => void;
+  onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
 }) {
   const Icon = item.icon;
+
+  /**
+   * Combo and frequency findings are not a single field/value pair, so the
+   * shared row drill cannot express them: a combo IS the co-occurrence, and a
+   * frequency finding is a value within a window. Give each its own drill
+   * rather than dropping to a lossy single-field filter.
+   */
+  const raw = item.raw;
+  const wideDrill =
+    raw.type === "value_combo" && onComboDrill
+      ? () =>
+          onComboDrill(
+            raw.fields.map(
+              (f, i) => [f, String(raw.values[i] ?? "")] as [string, string],
+            ),
+          )
+      : raw.type === "frequency" && onFrequencyDrill
+        ? () =>
+            onFrequencyDrill(
+              raw.series_field,
+              String(raw.series_value),
+              raw.window_start,
+              raw.window_end,
+            )
+        : null;
   return (
     <FindingShell
       dismissed={item.raw.dismissed}
@@ -87,9 +124,29 @@ function ScoredRow({
       details={item.raw.details}
       onClick={onSelect}
       actions={
+        <>
+          {wideDrill && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                wideDrill();
+              }}
+              title={
+                item.raw.type === "value_combo"
+                  ? "Filter the grid to this combination"
+                  : "Filter the grid to this value within its window"
+              }
+              className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
+            >
+              <Filter size={11} />
+            </button>
+          )}
         <FindingRowActions
           ts={item.ts}
           eventId={item.eventId}
+          field={item.raw.type === "value_novelty" ? item.raw.field : undefined}
+          value={item.raw.type === "value_novelty" ? String(item.raw.value) : undefined}
+          onDrillField={onDrillField}
           onJumpToTime={
             onJumpToTime
               ? (ts, eventId) =>
@@ -108,6 +165,7 @@ function ScoredRow({
             sourceId: item.sourceId,
           }}
         />
+        </>
       }
     >
       <div className="flex flex-wrap items-center gap-1.5">
@@ -142,6 +200,9 @@ export function FindingGroup({
   timelineId,
   onSelectFinding,
   onJumpToTime,
+  onDrillField,
+  onComboDrill,
+  onFrequencyDrill,
 }: Props) {
   const scored = methods.filter((m) => m.id !== "log_template");
   const templates = methods.find((m) => m.id === "log_template");
@@ -188,6 +249,9 @@ export function FindingGroup({
             // `detectorId` is the older UI slug and would not resolve.
             onSelect={() => onSelectFinding(item.detector as MethodId, item.rank)}
             onJumpToTime={onJumpToTime}
+            onDrillField={onDrillField}
+            onComboDrill={onComboDrill}
+            onFrequencyDrill={onFrequencyDrill}
           />
         ))}
         {templates && (

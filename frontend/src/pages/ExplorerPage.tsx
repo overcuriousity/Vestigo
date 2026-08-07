@@ -21,6 +21,7 @@ import {
   Columns3,
   Repeat,
   Sparkles,
+  X,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -69,7 +70,9 @@ import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
-import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
+import { InvestigateRail } from "@/components/analysis/InvestigateRail";
+import { InvestigateSheetHost } from "@/components/analysis/InvestigateSheetHost";
+import type { MethodId } from "@/components/analysis/method-registry";
 import { AgentPanel } from "@/components/agent/AgentPanel";
 import { useAgentStore } from "@/stores/agent";
 import { useHealth } from "@/api/health";
@@ -334,6 +337,7 @@ export function ExplorerPage() {
   );
 
   // ── Panel visibility state ────────────────────────────────────────────
+  const investigatePanelWidth = useUiStore((s) => s.investigatePanelWidth);
   const filterRailOpen = useUiStore((s) => s.filterRailOpen);
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
   const investigatePanelOpen = useUiStore((s) => s.investigatePanelOpen);
@@ -350,6 +354,13 @@ export function ExplorerPage() {
   }, []);
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
+  /** What the Investigate overlay is showing, if anything. */
+  const [sheet, setSheet] = useState<
+    | { kind: "finding"; method: MethodId; rank: number }
+    | { kind: "method"; method: MethodId }
+    | { kind: "tools"; section?: "methods" | "signatures" | "explore" | "scope" }
+    | null
+  >(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
   // Agent-applied event_id allowlist (a finding's `event_ids`). Session
@@ -893,6 +904,10 @@ export function ExplorerPage() {
 
   const handleFindSimilar = useCallback((event: Event) => {
     setSimilarAnchor(event);
+    // Similarity lives in the Tools sheet's Explore section — open it there,
+    // or this anchor would be set and never shown.
+    setInvestigatePanelOpen(true);
+    setSheet({ kind: "tools", section: "explore" });
     setInvestigatePanelOpen(true);
   }, [setInvestigatePanelOpen]);
 
@@ -1494,27 +1509,68 @@ export function ExplorerPage() {
                   />
                 )}
 
-                {/* Investigate panel (frame + detectors + windows & normality) */}
+                {/* Investigate: the rail is the ONLY fixed-width surface this
+                    flow spends. Its detail views render into the overlay sheet
+                    below, which is absolutely positioned and therefore cannot
+                    contribute to this row's minimum width. */}
                 {investigatePanelOpen && timeline && (
-                  <InvestigatePanel
+                  <div
+                    className="relative flex h-full min-w-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+                    style={{
+                      width: investigatePanelWidth,
+                      flex: `0 1 ${investigatePanelWidth}px`,
+                    }}
+                  >
+                    <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2.5">
+                      <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
+                        Investigate
+                      </h3>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => {
+                          setInvestigatePanelOpen(false);
+                          setSimilarAnchor(null);
+                          setBaselineMarkMode(false);
+                          setSheet(null);
+                        }}
+                        title="Close Investigate"
+                      >
+                        <X size={14} />
+                      </Button>
+                    </div>
+                    <div className="min-h-0 flex-1 overflow-y-auto p-3">
+                      <InvestigateRail
+                        caseId={caseId!}
+                        timelineId={timelineId!}
+                        onSelectFinding={(method, rank) => setSheet({ kind: "finding", method, rank })}
+                        onOpenTools={(section) => setSheet({ kind: "tools", section })}
+                        onSelectEvent={(ev) => handleExpandEvent(ev)}
+                        onJumpToTime={handleJumpToTime}
+                        onDrillField={handleDrillField}
+                        onAnomalyMarkers={setAnomalyMarkers}
+                        onComboDrill={handleComboDrill}
+                        onFrequencyDrill={handleFrequencyDrill}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Investigate detail: one overlay, three modes. Absolutely
+                    positioned inside this stage, so it never joins the flex
+                    row and never widens it. */}
+                {investigatePanelOpen && timeline && sheet && (
+                  <InvestigateSheetHost
                     caseId={caseId!}
                     timelineId={timelineId!}
-                    hasVectors={hasVectors}
-                    similarAnchor={similarAnchor}
-                    onClose={() => {
-                      setInvestigatePanelOpen(false);
-                      setSimilarAnchor(null);
-                      setBaselineMarkMode(false);
-                    }}
-                    onSelectEvent={(ev) => handleExpandEvent(ev)}
-                    onSimilarClose={() => setSimilarAnchor(null)}
-                    onDrillField={handleDrillField}
-                    onComboDrill={handleComboDrill}
-                    onFrequencyDrill={handleFrequencyDrill}
-                    onAnomalyMarkers={setAnomalyMarkers}
-                    onAnomalyRunId={setAnomalyRunId}
-                    onJumpToTime={handleJumpToTime}
+                    railWidth={investigatePanelWidth}
+                    sheet={sheet}
+                    onClose={() => setSheet(null)}
+                    onOpenMethod={(method: MethodId) => setSheet({ kind: "method", method })}
                     onTagFilter={handleTagDrill}
+                    similarAnchor={similarAnchor}
+                    onSimilarClose={() => setSimilarAnchor(null)}
+                    onSelectEvent={(ev) => handleExpandEvent(ev)}
                   />
                 )}
 

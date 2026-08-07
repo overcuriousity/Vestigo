@@ -26,6 +26,7 @@ import { ToolsSheet } from "./ToolsSheet";
 import { Button } from "@/components/ui/Button";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 import type { AnalysisScope, MethodResult } from "@/api/analysis";
+import type { Event } from "@/api/types";
 import { isTemplateRow } from "@/api/analysis";
 
 export type SheetMode =
@@ -45,6 +46,12 @@ interface Props {
   onOpenMethod?: (method: MethodId) => void;
   /** Tools mode: hand a scope change to the host's confirm gate. */
   onRequestScopeChange?: (next: { frame: "self" | "baseline"; baselineId?: string }) => void;
+  /** Tools mode: Sigma hits filter the grid by tag. */
+  onTagFilter?: (tag: string) => void;
+  /** Tools mode: the event anchored from a grid row, for similarity. */
+  similarAnchor?: Event | null;
+  onSimilarClose?: () => void;
+  onSelectEvent?: (event: Event) => void;
 }
 
 function Subhead({ children }: { children: React.ReactNode }) {
@@ -148,6 +155,10 @@ export function InvestigateSheet({
   onRunMethod,
   onOpenMethod,
   onRequestScopeChange,
+  onTagFilter,
+  similarAnchor,
+  onSimilarClose,
+  onSelectEvent,
   ...rest
 }: Props & SheetMode) {
   // Escape returns to the grid. The sheet covers what the analyst is trying to
@@ -206,6 +217,10 @@ export function InvestigateSheet({
               onRunMethod={onRunMethod ?? (() => {})}
               onOpenMethod={onOpenMethod ?? (() => {})}
               onRequestScopeChange={onRequestScopeChange ?? (() => {})}
+              onTagFilter={onTagFilter}
+              similarAnchor={similarAnchor}
+              onSimilarClose={onSimilarClose}
+              onSelectEvent={onSelectEvent}
             />
           )}
         </div>
