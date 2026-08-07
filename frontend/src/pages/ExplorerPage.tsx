@@ -1353,10 +1353,22 @@ export function ExplorerPage() {
             highlightRange={rangeHighlight}
             baselineWindows={activeBaselineWindows}
             markMode={baselineMarkMode}
-            onMarkModeChange={setBaselineMarkMode}
+            onMarkModeChange={(next) => {
+              setBaselineMarkMode(next);
+              // Marking is only ever for building a baseline, so pull the
+              // analyst to where that happens. Deliberately not opening the
+              // sheet yet: it would cover the histogram they are about to
+              // drag on.
+              if (next) setInvestigatePanelOpen(true);
+            }}
             onMarkRange={(start, end) => {
               setBaselinePendingRange({ start, end });
+              // The brushed range has to land somewhere the analyst can see.
+              // BaselineBuilderDrawer mounts inside the Tools sheet, so open
+              // Investigate at Scope — otherwise marking on the histogram sets
+              // a pending range that nothing ever renders.
               setInvestigatePanelOpen(true);
+              setSheet({ kind: "tools", section: "scope" });
             }}
           />
         )}
