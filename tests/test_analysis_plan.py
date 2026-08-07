@@ -17,8 +17,8 @@ from vestigo.db.analysis_plan import (
     MethodPlan,
     PlanInputs,
     build_plan,
-    message_tokens_from_inventory,
     numeric_tokens_from_stats,
+    series_distinct_from_stats,
 )
 
 
@@ -33,7 +33,6 @@ def _inputs(**over) -> PlanInputs:
     base = {
         "inventory": [("artifact", 5, 1000), ("message", 900, 1000), ("attr:src_ip", 41, 1000)],
         "numeric_tokens": ["attr:bytes_out"],
-        "message_tokens": ["message"],
         "series_distinct": 8,
         "events_total": 1000,
         "span_seconds": 86_400.0,
@@ -79,7 +78,7 @@ def test_two_window_methods_applicable_once_a_baseline_is_active(cfg):
 
 def test_charset_and_entropy_gated_off_on_enum_only_fields(cfg):
     enum_only = [("artifact", 3, 1000), ("attr:level", 4, 1000)]
-    plans = _by_id(build_plan(_inputs(inventory=enum_only, message_tokens=[]), cfg))
+    plans = _by_id(build_plan(_inputs(inventory=enum_only), cfg))
     for method in ("charset", "entropy"):
         assert plans[method].status == "not_applicable"
         assert plans[method].reason_facts["max_distinct"] == 4
@@ -120,9 +119,15 @@ def test_sequence_gated_off_below_the_series_distinct_minimum(cfg):
     assert plans["sequence_novelty"].reason_facts == {"series_distinct": 2, "required": 3}
 
 
-def test_log_template_gated_off_without_a_message_field(cfg):
-    plans = _by_id(build_plan(_inputs(message_tokens=[]), cfg))
-    assert plans["log_template"].status == "not_applicable"
+def test_log_template_is_never_gated_off(cfg):
+    """Templating clusters the `message` schema column, which always exists.
+
+    An earlier inventory-based precondition here never matched anywhere:
+    `message` is deliberately absent from _NOVELTY_CANDIDATE_TOP_LEVEL, so the
+    gate silently withheld templating from every timeline.
+    """
+    plans = _by_id(build_plan(_inputs(inventory=[("artifact", 2, 10)]), cfg))
+    assert plans["log_template"].status == "applicable"
 
 
 def test_novelty_and_order_are_never_gated_off(cfg):
@@ -130,7 +135,6 @@ def test_novelty_and_order_are_never_gated_off(cfg):
     thin = _inputs(
         inventory=[("artifact", 2, 10)],
         numeric_tokens=[],
-        message_tokens=[],
         series_distinct=1,
         events_total=10,
         span_seconds=1.0,
@@ -205,6 +209,20 @@ def test_numeric_tokens_merge_the_ratio_across_sources():
     assert numeric_tokens_from_stats(stats, 0.9) == []
 
 
-def test_message_tokens_pick_the_free_text_columns():
-    inventory = [("artifact", 5, 100), ("message", 98, 100), ("attr:src_ip", 12, 100)]
-    assert message_tokens_from_inventory(inventory) == ["message"]
+def test_series_distinct_unions_sampled_values_across_sources():
+    """merged_inventory merges `distinct` as max-across-sources, which for the
+    series field is biased the harmful way: a timeline whose sources each carry
+    one artifact type reports distinct=1 however many the timeline holds, and
+    the gate would stop offering the sequence methods on data they work on."""
+    stats = {
+        "src-1": (50, {"top_level": {"artifact": {"distinct": 1, "values": [["web:access", 50]]}}}),
+        "src-2": (50, {"top_level": {"artifact": {"distinct": 1, "values": [["auth:log", 50]]}}}),
+        "src-3": (50, {"top_level": {"artifact": {"distinct": 1, "values": [["net:flow", 50]]}}}),
+    }
+    assert series_distinct_from_stats(stats, "artifact", 1) == 3
+
+
+def test_series_distinct_keeps_the_max_merged_value_as_a_floor():
+    """The sample can truncate on a wide field; the merged count still bounds it."""
+    stats = {"src-1": (50, {"top_level": {"artifact": {"distinct": 40, "values": [["a", 50]]}}})}
+    assert series_distinct_from_stats(stats, "artifact", 40) == 40

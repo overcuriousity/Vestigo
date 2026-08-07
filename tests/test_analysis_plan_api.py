@@ -34,7 +34,6 @@ def stub_inputs(monkeypatch):
         base = {
             "inventory": [("artifact", 5, 1000), ("message", 900, 1000)],
             "numeric_tokens": [],
-            "message_tokens": ["message"],
             "series_distinct": 5,
             "events_total": 1000,
             "span_seconds": 86_400.0,

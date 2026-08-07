@@ -38,8 +38,8 @@ from vestigo.db.analysis_cache import cache_get, cache_put, enrichment_generatio
 from vestigo.db.analysis_plan import (
     PlanInputs,
     build_plan,
-    message_tokens_from_inventory,
     numeric_tokens_from_stats,
+    series_distinct_from_stats,
 )
 from vestigo.db.field_stats import ensure_source_field_stats, merged_inventory
 from vestigo.db.postgres import Case, dispositions_hash
@@ -74,7 +74,6 @@ async def _collect_plan_inputs(
         return PlanInputs(
             inventory=[],
             numeric_tokens=[],
-            message_tokens=[],
             series_distinct=0,
             events_total=0,
             span_seconds=0.0,
@@ -96,8 +95,11 @@ async def _collect_plan_inputs(
     return PlanInputs(
         inventory=inventory,
         numeric_tokens=numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio),
-        message_tokens=message_tokens_from_inventory(inventory),
-        series_distinct=next((d for token, d, _c in inventory if token == DEFAULT_SERIES_FIELD), 0),
+        series_distinct=series_distinct_from_stats(
+            stats,
+            DEFAULT_SERIES_FIELD,
+            next((d for token, d, _c in inventory if token == DEFAULT_SERIES_FIELD), 0),
+        ),
         events_total=events_total,
         span_seconds=span_seconds,
         frame=frame,

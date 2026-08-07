@@ -70,10 +70,6 @@ COST_CLASS: dict[str, str] = {
     "log_template": "heavy",
 }
 
-#: Top-level columns whose content is free text rather than a category — what
-#: log templating clusters over.
-_MESSAGE_TOKENS: tuple[str, ...] = ("message", "display_name")
-
 
 @dataclass(frozen=True)
 class PlanInputs:
@@ -87,7 +83,6 @@ class PlanInputs:
 
     inventory: list[tuple[str, int, int]]
     numeric_tokens: list[str]
-    message_tokens: list[str]
     series_distinct: int
     events_total: int
     span_seconds: float
@@ -150,10 +145,33 @@ def numeric_tokens_from_stats(
     )
 
 
-def message_tokens_from_inventory(inventory: list[tuple[str, int, int]]) -> list[str]:
-    """Return the free-text tokens present in *inventory*, in _MESSAGE_TOKENS order."""
-    present = {token for token, _distinct, coverage in inventory if coverage > 0}
-    return [t for t in _MESSAGE_TOKENS if t in present]
+def series_distinct_from_stats(
+    stats: dict[str, tuple[int, dict[str, Any]]], token: str, inventory_distinct: int
+) -> int:
+    """Estimate a field's distinct count across sources, for the series-field gate.
+
+    ``merged_inventory`` merges ``distinct`` as **max-across-sources** — a
+    documented approximation, since union cardinality is not derivable from
+    per-source counts (see ``db/field_stats.py``). For the series field that
+    approximation is not merely imprecise, it is biased in the harmful
+    direction: a timeline whose sources each carry one artifact type reports
+    ``distinct = 1`` however many types the timeline holds in total, and the
+    gate would then stop offering the sequence methods on data they work on.
+
+    Unioning the per-source *sampled* top values recovers the common case
+    exactly (low-cardinality fields like ``artifact`` fit well inside the
+    sample), and the max-merged value is kept as a floor for the case where the
+    sample truncated. Both are lower bounds, so the result can still understate
+    a very wide field — which only matters against a threshold of a few values.
+    """
+    section = "attributes" if token.startswith("attr:") else "top_level"
+    lookup = token[len("attr:") :] if token.startswith("attr:") else token
+    seen: set[str] = set()
+    for _total, payload in stats.values():
+        entry = (payload.get(section) or {}).get(lookup) or {}
+        for raw, _count in entry.get("values") or []:
+            seen.add(str(raw))
+    return max(len(seen), inventory_distinct)
 
 
 def _categorical(inputs: PlanInputs) -> list[tuple[str, int, int]]:
@@ -193,8 +211,8 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
     per_series = inputs.events_total // max(inputs.series_distinct, 1)
     plans: dict[str, MethodPlan] = {}
 
-    # Always applicable: both work on any timeline that has events at all, so a
-    # precondition could only ever be wrong.
+    # Always applicable: these work on any timeline that has events at all, so
+    # a precondition could only ever be wrong.
     plans["value_novelty"] = _ok("value_novelty")
     plans["timestamp_order"] = _ok("timestamp_order")
 
@@ -290,14 +308,12 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         )
     )
 
-    plans["log_template"] = (
-        _ok("log_template")
-        if inputs.message_tokens
-        else _no(
-            "log_template",
-            "no free-text message field to cluster",
-            {"message_fields": 0},
-        )
-    )
+    # Log templating clusters the `message` materialized column, which is part
+    # of the events schema and therefore always present. There is no data shape
+    # that makes it structurally unable to produce a template, so gating it
+    # could only ever be wrong — as it was: `message` is deliberately absent
+    # from _NOVELTY_CANDIDATE_TOP_LEVEL (it is free text, a poor novelty
+    # candidate), so an inventory-based precondition never matched anywhere.
+    plans["log_template"] = _ok("log_template")
 
     return [plans[m] for m in METHOD_IDS]
