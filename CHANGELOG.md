@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Vendored `*2timesketch` converters re-synced to upstream 1.1.0 (`1bbe64f`).** The only
+  behavior change is in `pcap2timesketch.py`, which gains the `--reassemble http` flag
+  back-ported from `pcap2vestigo`: one `network:http:transaction` row per reassembled
+  HTTP/1.x request/response, emitted in addition to the packet rows, with the same field
+  names (`http_method`, `http_uri`, `status_code`, …), the same client/server orientation of
+  `src_ip`/`dst_ip`, and the same per-flow caps against hostile captures. Two deliberate
+  differences from the native converter, both following the vendored suite's own
+  conventions:
+  - **No per-row provenance.** No `*2timesketch` script emits `byte_offset`/`content_hash`
+    (those columns exist because the Vestigo Parquet schema requires them), so the
+    transaction-hash machinery is not ported — `--report`'s audit report remains that
+    suite's provenance layer. Rows keep `packet_count`, `reassembled`, `http_incomplete`,
+    `reassembly_gap` and `reassembly_truncated_capture`.
+  - **Output stays globally time-sorted.** A transaction row is stamped with its request's
+    first captured byte but produced when the response completes, which would break the
+    k-way merge's per-stream ordering invariant. Each capture file therefore contributes a
+    second, lazily evaluated stream that re-reads the file, keeps only the derived rows and
+    sorts them (spilling to temporary JSONL past 200k rows) before the merge. Cost: an
+    enabled capture is read twice.
+  Also fixed upstream, since the reassembler depends on it: IPv6 fragments now report
+  `fragment_offset`, and a non-first fragment's payload is no longer decoded as a transport
+  header (which invented ports, a sequence number and a phantom flow). `pcap2vestigo` had
+  both fixes already.
+
 ## [1.10.0] — 2026-08-06
 
 ### Added

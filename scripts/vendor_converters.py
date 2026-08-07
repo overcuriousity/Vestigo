@@ -82,7 +82,8 @@ CONVERTERS = {
         "pcap",
         "pcap2timesketch.py",
         "Packet captures (pcap/pcapng) to Timesketch timeline, decoded to "
-        "Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers.",
+        "Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers, with optional TCP "
+        "reassembly of HTTP/1.x transactions (--reassemble http).",
         ["*.pcap", "*.pcapng"],
     ),
     "syslog2timesketch": (

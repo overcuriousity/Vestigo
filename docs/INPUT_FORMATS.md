@@ -432,6 +432,11 @@ ones. `byte_offset`/`content_hash` follow the normal contiguous-span convention:
   bounded by the same framed-body cap as a declared `Content-Length`, so a very large such
   download is refused rather than buffered.
 
+The vendored `pcap2timesketch.py` carries the same flag (upstream 1.1.0), emitting the same
+transaction fields into CSV/JSONL. It has no per-row provenance — no `*2timesketch` script
+does; `--report` is that suite's provenance layer — and it keeps its globally time-sorted
+output by reading each capture file a second time to sort the derived rows before merging.
+
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
 If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write a converter —

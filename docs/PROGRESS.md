@@ -1,9 +1,56 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-06 (session 156 — PR #238 review fixes on the pcap HTTP reassembler).
+Last updated: 2026-08-07 (session 157 — HTTP reassembly back-ported to the vendored `pcap2timesketch`).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 157 — 2026-08-07: `--reassemble http` back-ported upstream and re-vendored
+
+**Why.** Sessions 155–156 built HTTP/1.x reassembly in the native `pcap2vestigo` only. The
+vendored `*2timesketch` suite is the permanent stdlib-only alternative
+(`ROADMAP.md` §"Vendored converter ports stay demand-driven"), and a capability gap this
+large between the two pcap converters is a reason to pick the native one for the wrong
+reason — pyarrow availability, not analysis need. Ported upstream, then re-vendored.
+
+**Upstream** (`github.com/overcuriousity/2timesketch`, commit `1bbe64f`, suite version
+1.0.0 → 1.1.0): `pcap2timesketch.py --reassemble http`, the same reassembler
+(ISN tracking, sequence-ordered buffering, retransmit/overlap/gap handling, chunked and
+`until_close` framing, pipelining, HEAD/204/304/1xx/101/CONNECT rules, LRU and idle flow
+eviction, per-flow caps) emitting one `network:http:transaction` row per request/response on
+top of the packet rows. Two decisions where the suites legitimately differ:
+
+- **No per-row provenance.** `byte_offset`/`content_hash` exist in the `*2vestigo` converters
+  because the Parquet interchange schema mandates them; no `*2timesketch` script emits any
+  per-row provenance, and `packet_offsets` would have been the only byte offset in the whole
+  suite — dangling, since its packet rows carry none to join against. `--report`'s
+  `AuditReport` (input paths + input sha256 + output sha256) stays that suite's provenance
+  layer. The transaction-tag hashing from session 156 is therefore not ported; `packet_count`
+  and the flags are.
+- **The globally time-sorted output guarantee is preserved.** That guarantee is what the
+  vendored converter has over the native one (which lets the server sort on query), and a
+  transaction row breaks it: stamped with the request's first captured byte, produced when
+  the response completes. So each file contributes a *second*, lazily evaluated stream —
+  re-read the file, keep only derived rows, sort them, spill to temporary JSONL past 200k
+  rows — which enters the existing k-way merge as an ordinary sorted stream. Cost, stated in
+  `--help`: an enabled capture file is read twice.
+
+Also fixed upstream because the reassembler depends on it: IPv6 fragments now report
+`fragment_offset` (in bytes, as for IPv4) and a non-first fragment's payload is no longer
+decoded as a transport header — doing so invented ports, a sequence number, and a phantom
+flow built from body bytes. `pcap2vestigo` fixed both in session 156.
+
+**Vestigo side.** Re-vendored the whole suite at `1bbe64f`
+(`scripts/vendor_converters.py`; every file's header and `__version__` move to
+`1.1.0+vendored.1bbe64fbcf04`, only `pcap2timesketch.py` changes behavior), and updated its
+`manifest.json` description to name the flag. Verified the vendored single-file script
+against `tests/data/sample_http.pcap`: same two transactions as `pcap2vestigo`, field for
+field, including `packet_count` (5 and 2) and timestamps; packet rows byte-identical with
+and without the flag; output time-sorted. Upstream has no test suite, so the behavioral
+checks (pipelined HEAD+GET framing, IPv6 fragment, single-direction incomplete, chunked +
+gzip, CSV column shape, non-HTTP capture unchanged) were run as a one-off script rather than
+committed — `tests/test_pcap_converter.py` continues to cover the same ground for the native
+converter, which is where the logic is maintained.
 
 ## Session 156 — 2026-08-06: PR #238 review fixes (`pcap2vestigo` reassembler)
 
