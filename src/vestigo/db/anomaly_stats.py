@@ -1706,7 +1706,12 @@ class StatisticalAnomalyService:
               AND has({{src:Array(String)}}, source_id)
               AND val != ''
             GROUP BY key
-            ORDER BY cov_count DESC
+            -- `key` is a tie-break, not cosmetics: coverage ties are common
+            -- (every field of one source covers the same event count), and
+            -- with only `cov_count DESC` the rows that survive LIMIT differ
+            -- between runs on the same data. A recommender whose candidate
+            -- set is a coin flip is not reproducible.
+            ORDER BY cov_count DESC, key ASC
             LIMIT {{max_keys:UInt32}}
             {HEAVY_SCAN_SETTINGS}
         """
@@ -1815,8 +1820,16 @@ class StatisticalAnomalyService:
                 )
             )
 
-        # Sort: recommended first, then by coverage descending.
-        findings.sort(key=lambda f: (not f.recommended, -f.coverage))
+        # Sort: recommended first, then by coverage descending, then by token.
+        # The token is what makes the order *total*. Coverage ties are the norm
+        # (fields of one source all cover that source's events), and without a
+        # final key the tie order is whatever the inventory happened to arrive
+        # in — which for a ClickHouse GROUP BY is not stable across runs. That
+        # is visible to analysts, since `find_value_novelty` and
+        # `find_value_combos` take the top 1 / top 2 of this list when the
+        # caller names no fields: the same timeline could be scored on
+        # different fields each time it is opened.
+        findings.sort(key=lambda f: (not f.recommended, -f.coverage, f.token))
         return findings
 
     # ------------------------------------------------------------------

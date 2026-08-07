@@ -1262,6 +1262,37 @@ def test_recommend_novelty_fields_recommended_first():
         assert last_rec_idx < first_not_rec_idx
 
 
+def test_recommend_novelty_fields_ranking_is_total_order():
+    """Equal-coverage fields rank in a fixed order, whatever order they arrive in.
+
+    Coverage ties are the norm, not an edge case: every field of one source
+    covers that source's events exactly. Without a final tie-break the order
+    came from the inventory, i.e. from a ClickHouse ``GROUP BY`` that does not
+    promise a stable row order — so ``find_value_novelty`` (top 1) and
+    ``find_value_combos`` (top 2) could score the same timeline on different
+    fields each time it was opened. Caught by the demo coverage suite, where
+    the auto-picked pair flipped between one that finds the fabricated lateral
+    movement and one that finds nothing.
+    """
+    inventory = [
+        ("attr:computer_name", 14, 371),
+        ("attr:event_id", 5, 371),
+        ("attr:user", 13, 879),
+        ("attr:logon_type", 4, 298),
+    ]
+    svc = _svc([])
+    ranked = [
+        f.token for f in svc.recommend_novelty_fields("c1", ["s1"], total=1000, inventory=inventory)
+    ]
+    assert ranked == ["attr:user", "attr:computer_name", "attr:event_id", "attr:logon_type"]
+
+    shuffled = [inventory[1], inventory[3], inventory[0], inventory[2]]
+    reranked = [
+        f.token for f in svc.recommend_novelty_fields("c1", ["s1"], total=1000, inventory=shuffled)
+    ]
+    assert reranked == ranked
+
+
 def test_field_inventory_empty_on_no_data():
     svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
     inventory, total = svc.field_inventory("c1", ["s1"])
