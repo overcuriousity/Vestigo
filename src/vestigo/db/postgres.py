@@ -799,6 +799,16 @@ class StaleBlockError(Exception):
         self.current = current
 
 
+class ReferentGoneError(ValueError):
+    """A block write's referent was deleted before the write could commit.
+
+    A ``ValueError`` subclass so every caller that already maps the pre-write
+    scope check (:mod:`vestigo.stories.refs`) to a 422 keeps doing so
+    unchanged; named so the agent's confirm handler can tell it apart from the
+    "anchor block vanished" ValueError, which it retries.
+    """
+
+
 class _Unset:
     """Sentinel for "caller did not supply this field" (distinct from ``None``)."""
 
@@ -3151,6 +3161,43 @@ class PostgresStore:
                 counts[view_id] = counts.get(view_id, 0) + 1
         return counts
 
+    async def _lock_live_view(self, session: Any, case_id: str, view_id: str) -> None:
+        """Take the view row's lock inside *session*; raise if it isn't live.
+
+        The counterpart to the same lock in :meth:`delete_view`, and what makes
+        "delete a view no block references" and "create a block referencing a
+        view" serialize against each other. Without it the two interleave:
+        ``delete_view`` counts zero references, a collaborator commits a
+        ``view_ref`` block, and the delete then removes the view out from under
+        it — leaving a dangling reference that surfaces as a frozen
+        ``resolution.error`` in a forensic export, which is precisely the
+        outcome the hide-instead-of-delete design exists to prevent.
+
+        A block write holds this lock until it commits, so ``delete_view``
+        either runs first (and the block write then finds the view gone) or
+        waits and counts the now-committed reference. Raises ValueError so
+        callers map it exactly like the pre-write scope check in
+        :mod:`vestigo.stories.refs`.
+        """
+        from sqlalchemy import select
+
+        view = (
+            await session.execute(
+                select(View).where(View.case_id == case_id, View.id == view_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if view is None or view.deleted_at is not None:
+            raise ReferentGoneError(f"view {view_id!r} is not in this case")
+
+    async def _lock_referenced_view(self, session: Any, story_id: str, kind: str, content: dict):
+        """Lock the view a ``view_ref`` block points at; no-op for other kinds."""
+        if kind != "view_ref":
+            return
+        case_id = await self._case_id_for_story(session, story_id)
+        if case_id is None:  # pragma: no cover - the story lock already proved it exists
+            return
+        await self._lock_live_view(session, case_id, str(content.get("view_id")))
+
     async def delete_view(self, case_id: str, view_id: str) -> str | None:
         """Delete a saved view, or hide it when a story block still needs it.
 
@@ -3164,8 +3211,11 @@ class PostgresStore:
         from sqlalchemy import select
 
         async with self.session_factory() as session:
+            # Locked before counting: a block write takes the same lock and
+            # holds it to commit, so the count below cannot miss a reference
+            # that lands between the count and the delete.
             result = await session.execute(
-                select(View).where(View.case_id == case_id, View.id == view_id)
+                select(View).where(View.case_id == case_id, View.id == view_id).with_for_update()
             )
             view = result.scalar_one_or_none()
             if view is None:
@@ -3631,6 +3681,11 @@ class PostgresStore:
                     position = self._story_position_for(order, after_block_id)
             if position is None:  # pragma: no cover - unreachable after a renumber
                 raise RuntimeError(f"no free position in story {story_id!r} even after renumbering")
+            # Re-checked under the view's row lock, held until this commit.
+            # `validate_block_scope` already ran, but in an earlier transaction
+            # — only the lock keeps a concurrent `delete_view` from hard-
+            # deleting the referent in between.
+            await self._lock_referenced_view(session, story_id, kind, content)
             block = StoryBlock(
                 id=block_id,
                 story_id=story_id,
@@ -3690,6 +3745,12 @@ class PostgresStore:
                 session.expunge(current)
                 raise StaleBlockError(current)
             block = await self._reload_block(session, block_id)
+            if block is not None:
+                # Repointing a view_ref makes this write a new reference, so it
+                # takes the referent's row lock exactly like a create does —
+                # see :meth:`_lock_live_view`. Raising here rolls the update
+                # back with the session close.
+                await self._lock_referenced_view(session, block.story_id, block.kind, content)
             await session.commit()
             if block is not None:
                 await session.refresh(block)

@@ -61,6 +61,15 @@ const OVERSCAN = 10;
 const HEADER_CELL_CLASS =
   "relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none";
 
+/**
+ * Grid-internal columns the analyst never reorders: they carry no label and
+ * `lib/columns.ts::reorderColumns` refuses them as a drag id. `sanitizeColumns`
+ * lets them through, so a saved view or a localStorage entry can legitimately
+ * list one — which is why membership in `visibleColumns` is not enough to
+ * decide whether a header is draggable.
+ */
+const PINNED_COLUMN_IDS = new Set(["_select", "_annotations", "_expand"]);
+
 /** Width/flex for a header cell — `message` is the one that absorbs slack. */
 function headerCellSize(h: Header<Event, unknown>) {
   return {
@@ -156,7 +165,9 @@ interface Props {
   isFetching: boolean;
   visibleColumns: string[];
   /** Called with the full reordered visible-column list after a header drag.
-   *  Omit to render a non-reorderable grid. */
+   *  Omit to render a non-reorderable grid — headers then register no sortable
+   *  node at all, so they carry neither the grab cursor nor a drag that would
+   *  quietly go nowhere. */
   onReorderColumns?: (next: string[]) => void;
   sortDir: "asc" | "desc";
   onSortToggle: () => void;
@@ -484,6 +495,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
 }, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  const headerRef = useRef<HTMLDivElement | null>(null);
   // Distance from the top of the scrolled content to the first row. The header
   // is part of that content (so it can scroll horizontally with the columns),
   // which shifts every vertical offset the virtualizer and the scroll handler
@@ -495,14 +507,21 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   // would be the body's distance from the page top (top bar, toolbars,
   // histogram) instead of the header's height, and the virtualizer would
   // render its window hundreds of pixels off.
+  //
+  // Observed on the *header*, not on the body: the offset is the header's
+  // height, and a header that grows without the body's box changing (a larger
+  // font, a column label wrapping to two lines) would otherwise leave the
+  // scroll margin, the row offsets and the histogram's position indicator
+  // stale by exactly that delta, with nothing on screen saying so.
   const [bodyOffset, setBodyOffset] = useState(0);
   useLayoutEffect(() => {
     const el = bodyRef.current;
-    if (!el) return;
+    const header = headerRef.current;
+    if (!el || !header) return;
     const measure = () => setBodyOffset(el.offsetTop);
     measure();
     const ro = new ResizeObserver(measure);
-    ro.observe(el);
+    ro.observe(header);
     return () => ro.disconnect();
   }, []);
   const density = useUiStore((s) => s.density);
@@ -959,14 +978,22 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
 
   // The ids dnd-kit sorts, taken from the cells that actually register a
   // sortable node rather than from `visibleColumns`. The two diverge: the
-  // grid-internal ids (`tags`, `_annotations`) survive `sanitizeColumns` and so
-  // can sit in a saved view's or localStorage's column list, but the column
-  // builder skips them. An id with no node throws off dnd-kit's index lookup
-  // for every column after it, landing drops in the wrong slot.
+  // grid-internal ids survive `sanitizeColumns` and so can sit in a saved
+  // view's or localStorage's column list, but the column builder skips them.
+  // An id with no node throws off dnd-kit's index lookup for every column
+  // after it, landing drops in the wrong slot.
+  //
+  // The pinned ids are excluded by name rather than by "absent from
+  // `visibleColumns`": `_annotations` *can* be in that list, and then the
+  // header the analyst cannot reorder (`reorderColumns` refuses a pinned id,
+  // and its header renders no label) would still pick up a grab cursor and a
+  // drag they get nothing back from.
+  const isSortableColumn = (id: string) =>
+    Boolean(onReorderColumns) && !PINNED_COLUMN_IDS.has(id) && visibleColumns.includes(id);
   const sortableColumnIds = table
     .getHeaderGroups()
     .flatMap((hg) => hg.headers)
-    .filter((h) => visibleColumns.includes(h.column.id))
+    .filter((h) => isSortableColumn(h.column.id))
     .map((h) => h.column.id);
 
   return (
@@ -993,6 +1020,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       {/* Header row — inside the scroller so it tracks horizontal scroll,
         * sticky so it still holds its place vertically. */}
       <div
+        ref={headerRef}
         data-testid="grid-header"
         className="sticky top-0 z-20 flex border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]"
       >
@@ -1004,7 +1032,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           <SortableContext items={sortableColumnIds} strategy={horizontalListSortingStrategy}>
             {table.getHeaderGroups().map((hg) =>
               hg.headers.map((h) =>
-                visibleColumns.includes(h.column.id) ? (
+                isSortableColumn(h.column.id) ? (
                   <SortableHeaderCell key={h.id} h={h} />
                 ) : (
                   <div key={h.id} className={HEADER_CELL_CLASS} style={headerCellSize(h)}>

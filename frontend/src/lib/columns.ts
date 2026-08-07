@@ -18,6 +18,7 @@
  * show ticks next to columns that are not on screen.
  */
 import type { RecommendedColumns } from "@/api/types";
+import { DEFAULT_COLUMNS, sanitizeColumns } from "@/stores/ui";
 
 /**
  * Move `activeId` to `overId`'s slot in a visible-column list — the reducer
@@ -41,7 +42,6 @@ export function reorderColumns(
   next.splice(to, 0, next.splice(from, 1)[0]);
   return next;
 }
-import { DEFAULT_COLUMNS, sanitizeColumns } from "@/stores/ui";
 
 /**
  * How long a `running` recommendation is believed before the explorer stops

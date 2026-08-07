@@ -242,6 +242,10 @@ async def update_block(
         block = await get_store().update_story_block(
             block_id, content, expected_version=body.version, user=user.username
         )
+    except ValueError as exc:
+        # The store re-checks a view_ref's referent under its row lock, so a
+        # view deleted between the scope check above and the write lands here.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except StaleBlockError as exc:
         raise HTTPException(
             status_code=409,

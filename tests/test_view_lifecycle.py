@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-from vestigo.db.postgres import PostgresStore
+from vestigo.db.postgres import PostgresStore, ReferentGoneError
 
 
 @pytest_asyncio.fixture()
@@ -113,9 +113,47 @@ async def test_purge_is_idempotent(store):
 
 @pytest.mark.asyncio
 async def test_hidden_view_is_scoped_to_its_own_case(store):
-    """A block in another case must not keep this case's view alive."""
+    """A block in another case must not keep this case's view alive.
+
+    The referent lock the insert takes is case-scoped like the reference count
+    is, so a foreign view is not a view this block can point at — it is refused
+    at the write rather than left to keep another case's view alive.
+    """
     await _case_with_view(store)
     await store.create_case("c2", "Case Two")
     story = await store.create_story("c2", "s2", "Other Story", None, "alice")
-    await store.create_story_block(story.id, "b2", "view_ref", {"view_id": "v1"}, "alice")
+    with pytest.raises(ReferentGoneError):
+        await store.create_story_block(story.id, "b2", "view_ref", {"view_id": "v1"}, "alice")
     assert await store.delete_view("c1", "v1") == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_block_cannot_be_created_against_an_already_hidden_view(store):
+    """The insert re-checks the referent under its row lock.
+
+    `validate_block_scope` runs in an earlier transaction, so this is the only
+    check a concurrent `delete_view` cannot slip past — without it the delete
+    could count zero references and hard-delete the view a block committed
+    against a moment later, leaving the frozen `resolution.error` in an export
+    that hiding exists to prevent.
+    """
+    await _case_with_view(store)
+    _story_id, _block_id = await _story_referencing(store, "v1")
+    assert await store.delete_view("c1", "v1") == "hidden"
+    story = await store.create_story("c1", "s2", "Second Story", None, "alice")
+    with pytest.raises(ReferentGoneError):
+        await store.create_story_block(story.id, "b2", "view_ref", {"view_id": "v1"}, "alice")
+
+
+@pytest.mark.asyncio
+async def test_repointing_a_block_onto_a_hidden_view_is_refused(store):
+    await _case_with_view(store)
+    await store.create_view("c1", "v2", "Other View", "", {})
+    _story_id, block_id = await _story_referencing(store, "v1")
+    story = await store.create_story("c1", "s2", "Second Story", None, "alice")
+    await store.create_story_block(story.id, "b2", "view_ref", {"view_id": "v2"}, "alice")
+    assert await store.delete_view("c1", "v2") == "hidden"
+    with pytest.raises(ReferentGoneError):
+        await store.update_story_block(block_id, {"view_id": "v2"}, 1, "alice")
+    # The refused update left the block pointing where it was.
+    assert await store.get_view("c1", "v1") is not None

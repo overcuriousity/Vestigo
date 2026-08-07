@@ -97,6 +97,39 @@ duplicate; the saved-views search needle kept filtering after its input unmounte
 five-view threshold, stranding the panel on "No views match"; and `DELETE /views/{id}`
 answered `deleted: true` for a view it had only hidden.
 
+**Second review pass (PR #241).** Two reviews of the same branch agreed on the substantive
+findings, all fixed here.
+The `empty` mode had a *third* whitelist nobody had updated: `api/agent.ts::specToEventFilters`,
+which converts a tool call's `FilterSpec` into the Explorer's filters behind a finding card's
+"open in Explorer". It dropped the mode but kept the `[""]` placeholder the validator injects,
+so the link ran an exact match on the literal empty string — which skips `ifNull(...)` and
+therefore excludes the NULL rows the agent had just counted, landing the analyst on evidence
+that does not match the finding they clicked.
+Same defect one layer down: `lib/fieldFilters.ts::applyFieldFilter` — the shared "click a value
+→ filter on it" reducer behind grid cells, the detail panel, anomaly drill-downs and Visualize —
+treated `""` as an ordinary stored value, so clicking `curl/7` on a key already filtered to
+"is empty" produced `user_agent IN ('', 'curl/7')` with the mode dropped: every blank row riding
+along silently. Both sides now strip the placeholder, as `FilterRail.addFilter` already did.
+Server-side, an `empty` mode naming a key absent from `filters` was accepted and then ignored by
+the query builder — a truncated shared URL answering with the whole timeline, the exact failure
+the agent's `FilterSpec` validator exists to prevent, arrived at from the HTTP side.
+`_validate_field_regexes` is now `_validate_field_modes` and rejects it at every call site
+(events, viz, export, agent, chart exec) rather than in one of them.
+The `delete_view` / `view_ref` race was real: `refs.py` validates in an earlier transaction, so
+a collaborator's block could commit between the reference count and the hard delete, recreating
+the frozen `resolution.error` the whole feature exists to prevent. Both sides now take the View
+row's lock — `delete_view` across count-and-delete, block insert and repoint before commit
+(`ReferentGoneError`, a `ValueError`, so existing 422 mappings hold). Consequence worth knowing:
+the store now refuses to create a `view_ref` against a missing view at all, so the export tests
+that need a dangling block set one up by removing the row directly.
+`bodyOffset` was re-measured on a `ResizeObserver` watching the *body*, but it is the *header's*
+height — a header growing without the body's box changing (larger font, a label wrapping) left
+the scroll margin and every row offset stale by that delta. It observes the header now.
+Two smaller ones: `_annotations` survives `sanitizeColumns`, so a saved view could put it in
+`visibleColumns` and make the label-less pinned header draggable into a drag `reorderColumns`
+refuses — pinned ids are excluded by name now, and omitting `onReorderColumns` registers no drag
+handles at all, which is what its prop doc already claimed.
+
 ## Session 157 — 2026-08-07: `--reassemble http` back-ported upstream and re-vendored
 
 **Why.** Sessions 155–156 built HTTP/1.x reassembly in the native `pcap2vestigo` only. The

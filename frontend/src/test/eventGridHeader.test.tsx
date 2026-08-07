@@ -27,7 +27,11 @@ function evt(i: number): Event {
   } as unknown as Event;
 }
 
-function renderGrid(visibleColumns: string[]) {
+/** `onReorderColumns: null` renders the non-reorderable grid (prop omitted). */
+function renderGrid(
+  visibleColumns: string[],
+  onReorderColumns: ((next: string[]) => void) | null = vi.fn(),
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -48,6 +52,7 @@ function renderGrid(visibleColumns: string[]) {
         hasNextPage={false}
         isFetching={false}
         visibleColumns={visibleColumns}
+        onReorderColumns={onReorderColumns ?? undefined}
         sortDir="desc"
         onSortToggle={vi.fn()}
       />
@@ -99,6 +104,24 @@ describe("EventGrid column reorder", () => {
     expect(ids).not.toContain("_select");
     expect(ids).not.toContain("_annotations");
     expect(ids).not.toContain("_expand");
+  });
+
+  it("keeps a pinned id out of the drag set even when it is a visible column", () => {
+    // `_annotations` survives `sanitizeColumns`, so a saved view or a
+    // localStorage entry can legitimately list it. It still carries no label
+    // and `reorderColumns` refuses it as a drag id, so a grab cursor on it
+    // would offer a drag that goes nowhere.
+    renderGrid(["timestamp", "_annotations", "message"]);
+    const ids = [...screen.getByTestId("grid-header").querySelectorAll("[data-column-drag]")].map(
+      (el) => el.getAttribute("data-column-drag"),
+    );
+    expect(ids).toEqual(["timestamp", "message"]);
+  });
+
+  it("registers no drag handles at all when the grid is not reorderable", () => {
+    renderGrid(["timestamp", "artifact", "message"], null);
+    const header = screen.getByTestId("grid-header");
+    expect(header.querySelectorAll("[data-column-drag]")).toHaveLength(0);
   });
 });
 

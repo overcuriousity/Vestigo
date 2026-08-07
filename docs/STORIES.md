@@ -230,6 +230,21 @@ A hidden View cannot become the referent of a *new* block —
 `stories/refs.py` rejects it — so the mechanism keeps existing reports whole
 without resurrecting a deleted artifact.
 
+`refs.py` runs in its own transaction, though, so on its own it cannot stop a
+delete that counts zero references from racing a block write that is about to
+add one. Both sides therefore take the View row's lock: `delete_view` holds it
+across count-and-delete, and a `view_ref` insert or repoint re-checks the
+referent under the same lock before it commits
+(`PostgresStore._lock_live_view`, raising `ReferentGoneError` — a `ValueError`,
+so every caller keeps mapping it to 422). The two orderings are the two honest
+outcomes: the delete wins and the block write is refused, or the block write
+wins and the delete hides instead of removing.
+
+`DELETE /api/cases/{case_id}/views/{view_id}` reports which branch ran:
+`{"deleted": bool, "hidden": bool, "view_id": …}`. `deleted` is false for a
+hidden View — the row is still there — so a client that reads only that field
+is never told the View is gone while a story still renders it.
+
 A View's lifetime is therefore **until it is both deleted and unreferenced**,
 not until someone deletes it. The `resolution.error` path still exists and is
 still tested: a row can go missing out of band (a partial import, a manual

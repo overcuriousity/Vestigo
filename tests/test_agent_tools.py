@@ -2086,7 +2086,7 @@ async def test_a_stringified_filter_spec_reaches_the_query_end_to_end(store, mon
 
 
 def test_empty_mode_needs_no_values_and_still_reaches_the_where_clause():
-    """"Events with no user agent" is a valueless question with a real answer.
+    """ "Events with no user agent" is a valueless question with a real answer.
 
     ``_build_where`` only visits keys present in the filter map, so a mode
     entry whose key is absent would be dropped and the tool would answer with
@@ -2382,6 +2382,9 @@ async def test_read_story_returns_ordered_blocks(store):
     await store.init_schema()
     await store.create_case("c1", "Case One")
     story = await store.create_story("c1", "s1", "Report", None, user="alice")
+    # The view_ref block below is created under the referent's row lock, so the
+    # view it points at has to exist first.
+    await store.create_view("c1", "v1", "My View", "", {})
     await store.create_story_block(story.id, "b1", "markdown", {"text": "first"}, user="alice")
     await store.create_story_block(
         story.id,

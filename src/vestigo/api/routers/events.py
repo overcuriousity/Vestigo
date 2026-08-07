@@ -257,16 +257,32 @@ def _parse_modes_object(value: str | None) -> dict[str, str]:
     return parsed
 
 
-def _validate_field_regexes(
+def _validate_field_modes(
     field_map: dict[str, str] | dict[str, list[str]], modes: dict[str, str]
 ) -> None:
-    """Pre-check every regex-mode field pattern with ``re.compile`` → 400.
+    """Check a match-mode map against the field map it applies to → 400.
 
-    Same non-authoritative cheap check as :func:`_validate_regex` — RE2
-    inside ClickHouse is the final arbiter, guarded by
-    :func:`_run_regex_guarded`.
+    Two checks, both cheap and both about a mode that cannot mean what it
+    says:
+
+    * Every ``regex``-mode pattern is pre-compiled with ``re.compile``. Same
+      non-authoritative check as :func:`_validate_regex` — RE2 inside
+      ClickHouse is the final arbiter, guarded by
+      :func:`_run_regex_guarded`.
+    * Every ``empty``-mode key must actually appear in *field_map*. The query
+      builder only ever visits keys that are present there, so a lone
+      ``{"user_agent": "empty"}`` would be silently dropped and answer with
+      the whole timeline instead of the blank rows the caller asked for —
+      reachable from a hand-edited or truncated shared URL. This mirrors the
+      contract the agent's ``FilterSpec`` validator enforces by injecting the
+      ``[""]`` placeholder.
     """
     for key, mode in modes.items():
+        if mode == "empty" and key not in field_map:
+            raise HTTPException(
+                status_code=400,
+                detail=f"match mode 'empty' for field {key!r} has no matching filter entry",
+            )
         if mode != "regex":
             continue
         raw = field_map.get(key)
@@ -700,8 +716,8 @@ async def list_events(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
 
     after_cursor = _parse_cursor(after, param_name="after")
     before_cursor = _parse_cursor(before, param_name="before")
@@ -882,8 +898,8 @@ async def bulk_annotate_by_filter(
     parsed_exclusions = _parse_multivalue_object(body.exclusions)
     parsed_filter_modes = _parse_modes_object(body.filter_modes)
     parsed_exclusion_modes = _parse_modes_object(body.exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
 
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
@@ -1130,8 +1146,8 @@ async def count_events(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -1225,8 +1241,8 @@ async def get_histogram(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -1500,8 +1516,8 @@ async def export_events(
                 raise HTTPException(
                     status_code=400, detail=f"invalid match mode {v!r} for field {k!r}"
                 )
-    _validate_field_regexes(body.filter.fields, body.filter.field_modes)
-    _validate_field_regexes(body.filter.exclude, body.filter.exclude_modes)
+    _validate_field_modes(body.filter.fields, body.filter.field_modes)
+    _validate_field_modes(body.filter.exclude, body.filter.exclude_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,

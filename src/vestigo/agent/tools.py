@@ -1168,7 +1168,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         _persist_detector_run,
         _run_stat_detector,
         _serialize_stat_result,
-        _validate_field_regexes,
+        _validate_field_modes,
         _validate_regex,
     )
 
@@ -1196,8 +1196,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     def _validated(spec: FilterSpec | None) -> FilterSpec:
         spec = spec or FilterSpec()
         _validate_regex(spec.q, spec.q_regex)
-        _validate_field_regexes(spec.filters, spec.filter_modes)
-        _validate_field_regexes(spec.exclusions, spec.exclusion_modes)
+        _validate_field_modes(spec.filters, spec.filter_modes)
+        _validate_field_modes(spec.exclusions, spec.exclusion_modes)
         return spec
 
     # Field vocabulary for chart validation, resolved once per tool server
