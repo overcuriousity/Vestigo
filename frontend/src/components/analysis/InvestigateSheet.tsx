@@ -22,6 +22,7 @@ import { useEffect } from "react";
 import { X } from "lucide-react";
 import { METHODS_BY_ID, type MethodId } from "./method-registry";
 import { EVIDENCE_CLASSES } from "./method-registry";
+import { ToolsSheet } from "./ToolsSheet";
 import { Button } from "@/components/ui/Button";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 import type { AnalysisScope, MethodResult } from "@/api/analysis";
@@ -38,6 +39,12 @@ interface Props {
   /** Width of the rail this sheet sits beside, so it never overlaps it. */
   railWidth: number;
   onClose: () => void;
+  /** Tools mode: run a method the gate skipped, or one that errored. */
+  onRunMethod?: (method: MethodId) => void;
+  /** Tools mode: open a method's own detail. */
+  onOpenMethod?: (method: MethodId) => void;
+  /** Tools mode: hand a scope change to the host's confirm gate. */
+  onRequestScopeChange?: (next: { frame: "self" | "baseline"; baselineId?: string }) => void;
 }
 
 function Subhead({ children }: { children: React.ReactNode }) {
@@ -134,10 +141,15 @@ function FindingBody({
 }
 
 export function InvestigateSheet({
+  caseId,
+  timelineId,
   railWidth,
   onClose,
+  onRunMethod,
+  onOpenMethod,
+  onRequestScopeChange,
   ...rest
-}: Props & SheetMode & { children?: React.ReactNode }) {
+}: Props & SheetMode) {
   // Escape returns to the grid. The sheet covers what the analyst is trying to
   // look at, so leaving it must not require finding a target.
   useEffect(() => {
@@ -186,7 +198,16 @@ export function InvestigateSheet({
             />
           )}
           {rest.mode === "method" && <MethodBody methodId={rest.methodId} />}
-          {/* Tools mode is filled in by ToolsSheet in the next task. */}
+          {rest.mode === "tools" && (
+            <ToolsSheet
+              caseId={caseId}
+              timelineId={timelineId}
+              section={rest.section}
+              onRunMethod={onRunMethod ?? (() => {})}
+              onOpenMethod={onOpenMethod ?? (() => {})}
+              onRequestScopeChange={onRequestScopeChange ?? (() => {})}
+            />
+          )}
         </div>
       </div>
     </>
