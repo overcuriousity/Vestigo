@@ -536,8 +536,9 @@ def _escape_like(value: str) -> str:
 
 
 # Match modes accepted for field filters/exclusions. "exact" is the implied
-# default everywhere a mode map has no entry for a field key.
-VALID_MATCH_MODES = ("exact", "wildcard", "regex")
+# default everywhere a mode map has no entry for a field key. "empty" is the
+# presence predicate: it carries no value, and its value list is a placeholder.
+VALID_MATCH_MODES = ("exact", "wildcard", "regex", "empty")
 
 
 def _glob_to_like(value: str) -> str:
@@ -828,11 +829,16 @@ class _ParameterizedQueryBuilder:
 
         Exact keeps typed comparison (no toString) so `=`/`NOT IN` compare
         against typed literals; wildcard/regex are string operations and need
-        non-string top-level columns cast.
+        non-string top-level columns cast. ``empty`` casts for the same reason
+        and additionally coalesces: a NULL top-level column would otherwise
+        make ``= ''`` and ``!= ''`` both evaluate to NULL, dropping the row
+        from the include and the exclude side alike. An absent ``attributes``
+        Map key already reads as ``''`` in ClickHouse, so one predicate covers
+        "key missing" and "key present but blank".
         """
         if mode == "exact":
             return self._column_expr(key)
-        return _field_column_expr(
+        expr = _field_column_expr(
             key,
             self.parameters,
             self._param_name,
@@ -840,6 +846,7 @@ class _ParameterizedQueryBuilder:
             field_mappings=self._field_mappings,
             source_offsets=self._source_offsets,
         )
+        return f"ifNull({expr}, '')" if mode == "empty" else expr
 
     def add_field_filter(self, key: str, values: list[str], mode: str = "exact") -> None:
         """Add a filter on a top-level column or attribute.
@@ -849,7 +856,13 @@ class _ParameterizedQueryBuilder:
         equality, wildcard (*/? glob via ILIKE, case-insensitive), or regex
         (RE2 match(), case-sensitive). Routers validate mode strings up
         front; the ValueError here is a defense-in-depth backstop.
+
+        ``empty`` ignores *values* entirely and asks only whether the field
+        has a value at all.
         """
+        if mode == "empty":
+            self.conditions.append(f"{self._match_column_expr(key, mode)} = ''")
+            return
         if not values:
             return
         column = self._match_column_expr(key, mode)
@@ -885,7 +898,13 @@ class _ParameterizedQueryBuilder:
 
         Exact uses `!=`/`NOT IN`; wildcard/regex OR one predicate per value
         and negate the whole, so "matches none of the patterns".
+
+        ``empty`` ignores *values* and keeps only rows where the field has a
+        value — the negative form of the presence predicate.
         """
+        if mode == "empty":
+            self.conditions.append(f"{self._match_column_expr(key, mode)} != ''")
+            return
         column = self._match_column_expr(key, mode)
         if mode == "exact":
             if len(values) == 1:

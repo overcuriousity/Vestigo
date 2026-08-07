@@ -239,11 +239,11 @@ def _parse_multivalue_object(value: str | None) -> dict[str, list[str]]:
     return result
 
 
-_VALID_FILTER_MODES = {"exact", "wildcard", "regex"}
+_VALID_FILTER_MODES = {"exact", "wildcard", "regex", "empty"}
 
 
 def _parse_modes_object(value: str | None) -> dict[str, str]:
-    """Parse a ``{"field": "exact"|"wildcard"|"regex"}`` match-mode map.
+    """Parse a ``{"field": "exact"|"wildcard"|"regex"|"empty"}`` match-mode map.
 
     Absent keys mean exact everywhere downstream; explicit ``"exact"``
     entries are accepted and harmless. Unknown mode strings are a client
@@ -635,8 +635,9 @@ async def list_events(
         default=None,
         description=(
             "JSON object mapping a `filters` field to its match mode "
-            '("exact"|"wildcard"|"regex"), e.g. {"src_ip":"wildcard"}. '
-            "Absent fields match exact."
+            '("exact"|"wildcard"|"regex"|"empty"), e.g. {"src_ip":"wildcard"}. '
+            'Absent fields match exact. "empty" ignores the field\'s values '
+            "and matches rows where it has no value at all."
         ),
     ),
     exclusion_modes: str | None = Query(
@@ -822,7 +823,7 @@ class BulkAnnotateByFilterRequest(BaseModel):
     )
     filter_modes: str | None = Field(
         default=None,
-        description='JSON match-mode map for `filters`, e.g. {"src_ip":"wildcard"}.',
+        description='JSON match-mode map for `filters`, e.g. {"src_ip":"wildcard"} or {"ua":"empty"}.',
     )
     exclusion_modes: str | None = Field(
         default=None,

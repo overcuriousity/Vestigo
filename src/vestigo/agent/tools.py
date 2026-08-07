@@ -356,7 +356,11 @@ class FilterSpec(ObjectArgModel):
     )
     filter_modes: dict[str, str] = Field(
         default_factory=dict,
-        description='Per-field match mode for filters: "exact" (default) | "wildcard" | "regex".',
+        description=(
+            'Per-field match mode for filters: "exact" (default) | "wildcard" | '
+            '"regex" | "empty". "empty" ignores the field\'s values and matches '
+            "rows where the field has no value at all (absent or blank)."
+        ),
     )
     exclusion_modes: dict[str, str] = Field(
         default_factory=dict, description="Per-field match mode for exclusions."

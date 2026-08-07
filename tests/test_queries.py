@@ -3021,3 +3021,107 @@ def test_compare_field_numeric_baseline_cache_warm_render() -> None:
     second = svc.compare_field_numeric(p, c, "attr:bytes", bins=2, baseline_cache_token=_TOKEN)
     assert len(svc.store.client.queries) == 6
     assert second == first
+
+
+# ---------------------------------------------------------------------------
+# The "empty" match mode (presence predicate)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_mode_filter_matches_absent_or_blank_attribute(
+    service: EventQueryService,
+) -> None:
+    """`empty` include compares the string-cast column against '' so a missing
+    Map key (which ClickHouse reads as '') and a stored blank both match."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"user_agent": [""]},
+            filter_modes={"user_agent": "empty"},
+        )
+    )
+    query, params = _last_query(service)
+    assert "ifNull(" in query
+    assert ", '') = ''" in query
+    assert params is not None
+    assert "user_agent" in params.values()
+
+
+def test_empty_mode_exclusion_keeps_only_rows_with_a_value(
+    service: EventQueryService,
+) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_exclusions={"user_agent": [""]},
+            exclusion_modes={"user_agent": "empty"},
+        )
+    )
+    query, _ = _last_query(service)
+    assert ", '') != ''" in query
+
+
+def test_empty_mode_ignores_the_placeholder_value(service: EventQueryService) -> None:
+    """The value list is a placeholder — it must never reach the SQL as a
+    literal, or an analyst could smuggle a comparison in through it."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"user_agent": ["not-a-real-value"]},
+            filter_modes={"user_agent": "empty"},
+        )
+    )
+    query, params = _last_query(service)
+    assert ", '') = ''" in query
+    assert params is not None
+    assert "not-a-real-value" not in params.values()
+
+
+def test_empty_mode_with_no_values_still_emits_a_predicate(
+    service: EventQueryService,
+) -> None:
+    """An empty value list must not silently drop the predicate the way it
+    does for exact/wildcard/regex — there is nothing to have values for."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"user_agent": []},
+            filter_modes={"user_agent": "empty"},
+        )
+    )
+    query, _ = _last_query(service)
+    assert ", '') = ''" in query
+
+
+def test_empty_mode_on_a_top_level_column_is_null_safe(
+    service: EventQueryService,
+) -> None:
+    """A NULL top-level column must not evaluate the comparison to NULL —
+    that would drop the row from BOTH sides of the filter."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"display_name": [""]},
+            filter_modes={"display_name": "empty"},
+        )
+    )
+    query, _ = _last_query(service)
+    assert "ifNull(display_name, '') = ''" in query
+
+
+def test_empty_mode_casts_a_non_string_column_before_comparing(
+    service: EventQueryService,
+) -> None:
+    """Not every top-level column is a String; the comparison against '' only
+    compiles once the column is cast, and the cast has to sit inside the
+    ifNull so a NULL still coalesces."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"timestamp": [""]},
+            filter_modes={"timestamp": "empty"},
+        )
+    )
+    query, _ = _last_query(service)
+    assert "ifNull(toString(" in query
+    assert ", '') = ''" in query

@@ -872,6 +872,17 @@ def test_parse_modes_object_accepts_valid_modes():
     }
 
 
+def test_parse_modes_object_accepts_the_empty_presence_mode():
+    assert events._parse_modes_object('{"user_agent": "empty"}') == {"user_agent": "empty"}
+
+
+def test_validate_field_regexes_ignores_empty_mode_fields():
+    """`empty` carries no pattern, so the regex pre-check must skip it rather
+    than trying to compile its placeholder value."""
+    events._validate_field_regexes({"user_agent": [""]}, {"user_agent": "empty"})
+    events._validate_field_regexes({"user_agent": ["(["]}, {"user_agent": "empty"})
+
+
 def test_parse_modes_object_rejects_unknown_mode_with_400():
     with pytest.raises(HTTPException) as exc_info:
         events._parse_modes_object('{"src_ip": "glob"}')
