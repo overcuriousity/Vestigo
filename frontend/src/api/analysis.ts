@@ -37,10 +37,29 @@ export interface AnalysisPlan {
   events_total: number;
 }
 
+/**
+ * A log-template row. Templating is a browser, not a scored detector, so its
+ * rows carry a shape and a count rather than a score — typing them into
+ * `AnomalyFinding` would mean inventing a score for something that has none.
+ */
+export interface LogTemplateRow {
+  template: string;
+  count: number;
+  template_hash?: string;
+  first_seen?: string;
+  last_seen?: string;
+}
+
+export type MethodResult = AnomalyFinding | LogTemplateRow;
+
+export function isTemplateRow(row: MethodResult): row is LogTemplateRow {
+  return "template" in row;
+}
+
 export interface MethodFindings {
   method: MethodId;
   status: string;
-  results: AnomalyFinding[];
+  results: MethodResult[];
   total_findings: number;
   dismissed_count?: number;
   warnings: string[];
