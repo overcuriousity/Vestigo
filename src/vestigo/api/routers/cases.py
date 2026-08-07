@@ -1338,12 +1338,25 @@ async def delete_view(
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a saved view."""
+    """Delete a saved view, or hide it when a story block still references it.
+
+    A ``view_ref`` block resolves its View at render and export time, so
+    removing one out from under a story would make that story's export fail.
+    Such a view is hidden instead, and swept once the last block referencing it
+    goes away; ``hidden`` in the response is what lets the UI say which of the
+    two happened. ``deleted`` reports whether the row is actually gone — a
+    client that reads only that field must not be told the view no longer
+    exists when it does.
+    """
     store = get_store()
-    deleted = await store.delete_view(case.id, view_id)
-    if not deleted:
+    outcome = await store.delete_view(case.id, view_id)
+    if outcome is None:
         raise HTTPException(status_code=404, detail="View not found")
-    return {"deleted": True, "view_id": view_id}
+    return {
+        "deleted": outcome == "deleted",
+        "view_id": view_id,
+        "hidden": outcome == "hidden",
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════

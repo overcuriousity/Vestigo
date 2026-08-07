@@ -59,6 +59,7 @@ from vestigo.db.postgres import (
     ANNOTATION_ORIGIN_AGENT,
     AgentConversation,
     Case,
+    ReferentGoneError,
     User,
     generate_id,
 )
@@ -1177,6 +1178,11 @@ async def _apply_story_block_proposal(
                     origin="agent",
                     after_block_id=after_block_id,
                 )
+            except ReferentGoneError:
+                # The view this block points at was deleted between the scope
+                # check above and the insert. Re-placing it would only hit the
+                # same lock — report it like any other referent failure.
+                raise
             except ValueError:
                 # The anchor block vanished since propose time — append instead
                 # of failing a decided proposal.

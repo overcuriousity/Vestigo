@@ -36,7 +36,7 @@ from vestigo.api.routers.events import (
     _resolve_timeline_source_ids,
     _run_regex_guarded,
     _uses_regex,
-    _validate_field_regexes,
+    _validate_field_modes,
     _validate_regex,
 )
 from vestigo.db._time_fields import TIME_FIELD_SPECS
@@ -90,8 +90,8 @@ async def _resolve_event_query(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,

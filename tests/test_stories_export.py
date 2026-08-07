@@ -16,10 +16,18 @@ def _user() -> User:
     return User(id="u1", username="alice", is_admin=True, is_active=True)
 
 
-async def _case_with_story(store, blocks):
+async def _case_with_story(store, blocks, setup=None):
+    """Build a case + story and add *blocks*.
+
+    ``setup`` runs against the case before the blocks are added: a ``view_ref``
+    block is written under its referent's row lock, so any view it points at
+    has to exist by then.
+    """
     await store.init_schema()
     case = await store.create_case("c1", "Case One")
     story = await store.create_story(case.id, "s1", "Report", None, user="alice")
+    if setup is not None:
+        await setup(case)
     created = []
     for i, (kind, content) in enumerate(blocks):
         created.append(
@@ -28,7 +36,25 @@ async def _case_with_story(store, blocks):
     return case, story, created
 
 
+async def _hard_delete_view(store, case_id, view_id):
+    """Remove a view row outright, past the hide-if-referenced rule.
+
+    Reproduces the state a pre-``deleted_at`` database or an imported case can
+    still be in — a ``view_ref`` block whose referent is simply gone. The write
+    path no longer produces it (the insert takes the referent's row lock), so
+    the resolver's dangling branch has to be set up rather than created.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    async with store.session_factory() as session:
+        await session.execute(sa_delete(View).where(View.case_id == case_id, View.id == view_id))
+        await session.commit()
+
+
 async def test_markdown_and_dangling_view_resolve(store):
+    async def _setup(case):
+        await store.create_view(case.id, "ghost", "Ghost", "", {})
+
     case, story, blocks = await _case_with_story(
         store,
         [
@@ -38,7 +64,9 @@ async def test_markdown_and_dangling_view_resolve(store):
                 {"view_id": "ghost", "timeline_id": "t1", "display": {"limit": 200}},
             ),
         ],
+        setup=_setup,
     )
+    await _hard_delete_view(store, case.id, "ghost")
     snapshot = await resolve_story_snapshot(
         story, blocks, user=_user(), store=store, now=lambda: FROZEN_NOW
     )
@@ -52,11 +80,14 @@ async def test_markdown_and_dangling_view_resolve(store):
 
 
 async def test_view_block_truncation_flagged(store):
+    async def _setup(case):
+        await store.create_view(case.id, "v1", "SSH hits", query="ssh", view_filter={"q": "ssh"})
+
     case, story, blocks = await _case_with_story(
         store,
         [("view_ref", {"view_id": "v1", "timeline_id": "t1", "display": {"limit": 200}})],
+        setup=_setup,
     )
-    await store.create_view(case.id, "v1", "SSH hits", query="ssh", view_filter={"q": "ssh"})
 
     def fake_event_query(query):
         rows = [{"event_id": f"e{i}", "message": "ssh"} for i in range(query.limit)]
@@ -83,11 +114,15 @@ async def test_view_block_query_carries_the_timeline_field_mappings(store):
     """A frozen view resolves through the same canonical fields the analyst saw
     on screen — both for filtering and for the values the rows carry
     (db/field_mappings.py::project_mapped_fields runs off this)."""
+
+    async def _setup(case):
+        await store.create_view(case.id, "v1", "IPs", query=None, view_filter={})
+
     case, story, blocks = await _case_with_story(
         store,
         [("view_ref", {"view_id": "v1", "timeline_id": "t1", "display": {"limit": 10}})],
+        setup=_setup,
     )
-    await store.create_view(case.id, "v1", "IPs", query=None, view_filter={})
     mappings = {"ip_address": ["src_ip", "ip_addr"]}
     seen = {}
 

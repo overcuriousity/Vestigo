@@ -613,6 +613,13 @@ class View(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     query: Mapped[str] = mapped_column(String(4096), nullable=False, default="")
     view_filter: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Set when an analyst deleted this view while a story block still
+    # referenced it. The row survives so that story keeps rendering and
+    # exporting; it is hard-deleted once the last reference goes away (see
+    # ``purge_orphaned_hidden_views``). NULL means live.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -633,6 +640,7 @@ class View(Base):
             "name": self.name,
             "query": self.query,
             "filter": self.view_filter or {},
+            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -789,6 +797,16 @@ class StaleBlockError(Exception):
     def __init__(self, current: StoryBlock) -> None:
         super().__init__(f"stale version for block {current.id}")
         self.current = current
+
+
+class ReferentGoneError(ValueError):
+    """A block write's referent was deleted before the write could commit.
+
+    A ``ValueError`` subclass so every caller that already maps the pre-write
+    scope check (:mod:`vestigo.stories.refs`) to a 422 keeps doing so
+    unchanged; named so the agent's confirm handler can tell it apart from the
+    "anchor block vanished" ValueError, which it retries.
+    """
 
 
 class _Unset:
@@ -3058,17 +3076,30 @@ class PostgresStore:
     # ------------------------------------------------------------------
 
     async def list_views(self, case_id: str) -> list[View]:
-        """Return all saved views for a case ordered by creation time (newest first)."""
+        """Return a case's live saved views, newest first.
+
+        Hidden views (``deleted_at`` set — deleted by an analyst while a story
+        block still referenced them) are excluded: they exist only to keep that
+        story rendering, and must not come back as something anyone can pick or
+        embed again.
+        """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(View).where(View.case_id == case_id).order_by(View.created_at.desc())
+                select(View)
+                .where(View.case_id == case_id, View.deleted_at.is_(None))
+                .order_by(View.created_at.desc())
             )
             return list(result.scalars().all())
 
     async def get_view(self, case_id: str, view_id: str) -> View | None:
-        """Return a saved view by case and view IDs."""
+        """Return a saved view by case and view IDs.
+
+        Deliberately *not* filtered on ``deleted_at``: resolving a hidden view
+        is the whole point of hiding rather than deleting it, since a story
+        block's render and export both go through here.
+        """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
@@ -3099,23 +3130,135 @@ class PostgresStore:
             await session.refresh(view)
             return view
 
-    async def delete_view(self, case_id: str, view_id: str) -> bool:
-        """Delete a saved view row.
+    async def _case_id_for_story(self, session: Any, story_id: str) -> str | None:
+        """The case a story belongs to — the hop a block-level mutation needs
+        before it can sweep that case's hidden views."""
+        from sqlalchemy import select
 
-        Returns True if the row existed and was removed.
+        return (
+            await session.execute(select(Story.case_id).where(Story.id == story_id))
+        ).scalar_one_or_none()
+
+    async def _view_ref_counts(self, session: Any, case_id: str) -> dict[str, int]:
+        """How many ``view_ref`` blocks in *case_id* point at each view id.
+
+        Counted in Python over the case's ``view_ref`` blocks rather than with
+        a JSON path operator in SQL: those differ between PostgreSQL and
+        SQLite, and the test suite runs on SQLite. The row count here is
+        bounded by the case's story blocks, which is small.
+        """
+        from sqlalchemy import select
+
+        rows = await session.execute(
+            select(StoryBlock.content)
+            .join(Story, Story.id == StoryBlock.story_id)
+            .where(Story.case_id == case_id, StoryBlock.kind == "view_ref")
+        )
+        counts: dict[str, int] = {}
+        for (content,) in rows.all():
+            view_id = (content or {}).get("view_id")
+            if view_id:
+                counts[view_id] = counts.get(view_id, 0) + 1
+        return counts
+
+    async def _lock_live_view(self, session: Any, case_id: str, view_id: str) -> None:
+        """Take the view row's lock inside *session*; raise if it isn't live.
+
+        The counterpart to the same lock in :meth:`delete_view`, and what makes
+        "delete a view no block references" and "create a block referencing a
+        view" serialize against each other. Without it the two interleave:
+        ``delete_view`` counts zero references, a collaborator commits a
+        ``view_ref`` block, and the delete then removes the view out from under
+        it — leaving a dangling reference that surfaces as a frozen
+        ``resolution.error`` in a forensic export, which is precisely the
+        outcome the hide-instead-of-delete design exists to prevent.
+
+        A block write holds this lock until it commits, so ``delete_view``
+        either runs first (and the block write then finds the view gone) or
+        waits and counts the now-committed reference. Raises ValueError so
+        callers map it exactly like the pre-write scope check in
+        :mod:`vestigo.stories.refs`.
+        """
+        from sqlalchemy import select
+
+        view = (
+            await session.execute(
+                select(View).where(View.case_id == case_id, View.id == view_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if view is None or view.deleted_at is not None:
+            raise ReferentGoneError(f"view {view_id!r} is not in this case")
+
+    async def _lock_referenced_view(self, session: Any, story_id: str, kind: str, content: dict):
+        """Lock the view a ``view_ref`` block points at; no-op for other kinds."""
+        if kind != "view_ref":
+            return
+        case_id = await self._case_id_for_story(session, story_id)
+        if case_id is None:  # pragma: no cover - the story lock already proved it exists
+            return
+        await self._lock_live_view(session, case_id, str(content.get("view_id")))
+
+    async def delete_view(self, case_id: str, view_id: str) -> str | None:
+        """Delete a saved view, or hide it when a story block still needs it.
+
+        Returns ``"deleted"`` when the row was removed, ``"hidden"`` when it
+        was stamped ``deleted_at`` because a ``view_ref`` block references it,
+        and None when there was no such view. Hiding rather than deleting is
+        what keeps a story that embeds the view rendering and exporting;
+        :meth:`purge_orphaned_hidden_views` finishes the job once the last
+        reference is gone.
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
+            # Locked before counting: a block write takes the same lock and
+            # holds it to commit, so the count below cannot miss a reference
+            # that lands between the count and the delete.
             result = await session.execute(
-                select(View).where(View.case_id == case_id, View.id == view_id)
+                select(View).where(View.case_id == case_id, View.id == view_id).with_for_update()
             )
             view = result.scalar_one_or_none()
             if view is None:
-                return False
+                return None
+            counts = await self._view_ref_counts(session, case_id)
+            if counts.get(view_id, 0) > 0:
+                if view.deleted_at is None:
+                    view.deleted_at = datetime.now(UTC)
+                    await session.commit()
+                return "hidden"
             await session.delete(view)
             await session.commit()
-            return True
+            return "deleted"
+
+    async def purge_orphaned_hidden_views(self, case_id: str) -> int:
+        """Hard-delete hidden views nothing references any more; return the count.
+
+        Idempotent and cheap, so every operation that can drop a ``view_ref``
+        calls it unconditionally rather than working out whether this
+        particular change orphaned anything. Sweeping the case instead of
+        tracking one view is what makes it impossible to forget a code path.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            counts = await self._view_ref_counts(session, case_id)
+            hidden = (
+                (
+                    await session.execute(
+                        select(View).where(View.case_id == case_id, View.deleted_at.is_not(None))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            removed = 0
+            for view in hidden:
+                if counts.get(view.id, 0) == 0:
+                    await session.delete(view)
+                    removed += 1
+            if removed:
+                await session.commit()
+            return removed
 
     # ------------------------------------------------------------------
     # Saved charts
@@ -3317,12 +3460,13 @@ class PostgresStore:
             await session.execute(delete(StoryExport).where(StoryExport.story_id == story_id))
             await session.delete(story)
             await session.commit()
-            return {
-                "block_count": int(block_count or 0),
-                "exports": [
-                    {"id": e[0], "snapshot_hash": e[1], "html_hash": e[2]} for e in exports
-                ],
-            }
+        # The story's view_ref blocks are gone, which may have been the last
+        # thing keeping a hidden view alive.
+        await self.purge_orphaned_hidden_views(case_id)
+        return {
+            "block_count": int(block_count or 0),
+            "exports": [{"id": e[0], "snapshot_hash": e[1], "html_hash": e[2]} for e in exports],
+        }
 
     async def list_story_blocks(self, story_id: str) -> list[StoryBlock]:
         """Return a story's blocks in document order.
@@ -3537,6 +3681,11 @@ class PostgresStore:
                     position = self._story_position_for(order, after_block_id)
             if position is None:  # pragma: no cover - unreachable after a renumber
                 raise RuntimeError(f"no free position in story {story_id!r} even after renumbering")
+            # Re-checked under the view's row lock, held until this commit.
+            # `validate_block_scope` already ran, but in an earlier transaction
+            # — only the lock keeps a concurrent `delete_view` from hard-
+            # deleting the referent in between.
+            await self._lock_referenced_view(session, story_id, kind, content)
             block = StoryBlock(
                 id=block_id,
                 story_id=story_id,
@@ -3596,10 +3745,21 @@ class PostgresStore:
                 session.expunge(current)
                 raise StaleBlockError(current)
             block = await self._reload_block(session, block_id)
+            if block is not None:
+                # Repointing a view_ref makes this write a new reference, so it
+                # takes the referent's row lock exactly like a create does —
+                # see :meth:`_lock_live_view`. Raising here rolls the update
+                # back with the session close.
+                await self._lock_referenced_view(session, block.story_id, block.kind, content)
             await session.commit()
             if block is not None:
                 await session.refresh(block)
-            return block
+            case_id = await self._case_id_for_story(session, block.story_id) if block else None
+        # Repointing a view_ref may have dropped the last reference to a
+        # hidden view. Runs only on the success path — a 409 changed nothing.
+        if case_id:
+            await self.purge_orphaned_hidden_views(case_id)
+        return block
 
     async def move_story_block(
         self, block_id: str, after_block_id: str | None, expected_version: int, user: str
@@ -3696,6 +3856,10 @@ class PostgresStore:
         that skips the check.
         """
         async with self.session_factory() as session:
+            # Resolved before the delete: afterwards there is no row to walk
+            # back to the story, and the sweep needs the case.
+            doomed = await self._reload_block(session, block_id)
+            case_id = await self._case_id_for_story(session, doomed.story_id) if doomed else None
             stmt = delete(StoryBlock).where(StoryBlock.id == block_id)
             if expected_version is not None:
                 stmt = stmt.where(StoryBlock.version == expected_version)
@@ -3708,7 +3872,11 @@ class PostgresStore:
                 session.expunge(current)
                 raise StaleBlockError(current)
             await session.commit()
-            return True
+        # Deleting a view_ref may have dropped the last reference to a hidden
+        # view. Runs only on the success path — a 409 changed nothing.
+        if case_id:
+            await self.purge_orphaned_hidden_views(case_id)
+        return True
 
     async def create_story_export(
         self,

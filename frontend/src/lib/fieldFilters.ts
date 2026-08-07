@@ -18,6 +18,21 @@ export function dropMode(
 }
 
 /**
+ * Drop the `""` placeholder an `empty`-mode entry carries.
+ *
+ * `""` is not a value an analyst ever asked to match — it exists only so that
+ * an `empty` mode has a key to hang off (the backend drops a mode whose key is
+ * absent from `filters`). Adding a clicked literal alongside it also drops the
+ * mode, so leaving the placeholder in place would turn "blank user_agent" plus
+ * "curl/7" into `user_agent IN ('', 'curl/7')` — every blank row silently
+ * riding along with the one the analyst clicked. `FilterRail.addFilter` strips
+ * it for the same reason.
+ */
+function withoutEmptyPlaceholder(prev: string[] | undefined): string[] {
+  return (prev ?? []).filter((v) => v !== "");
+}
+
+/**
  * Return a copy of *f* with `fieldKey = value` applied as an include or
  * exclude filter. Special cases:
  *   - filterKey "q"        → sets the free-text search (include only)
@@ -54,7 +69,7 @@ export function applyFieldFilter(
       next.excludeTag = value;
     }
   } else if (include) {
-    const prev = next.filters?.[fieldKey] ?? [];
+    const prev = withoutEmptyPlaceholder(next.filters?.[fieldKey]);
     if (!prev.includes(value)) {
       next.filters = { ...(next.filters ?? {}), [fieldKey]: [...prev, value] };
     }
@@ -62,14 +77,14 @@ export function applyFieldFilter(
     // otherwise the clicked text would be reinterpreted as glob/regex.
     next.filterModes = dropMode(next.filterModes, fieldKey);
   } else {
-    const prev = next.exclusions?.[fieldKey] ?? [];
+    const prev = withoutEmptyPlaceholder(next.exclusions?.[fieldKey]);
     if (!prev.includes(value)) {
       next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
-      // Same literal-value rule; mode is per key, so this also flips any
-      // pre-existing pattern-mode values of the key back to exact —
-      // visible via the chips' badge disappearing.
-      next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
     }
+    // Same literal-value rule; mode is per key, so this also flips any
+    // pre-existing pattern-mode values of the key back to exact —
+    // visible via the chips' badge disappearing.
+    next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
   }
 
   return next;

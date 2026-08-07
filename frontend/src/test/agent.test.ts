@@ -70,12 +70,24 @@ describe("specToEventFilters", () => {
     ).toEqual({});
   });
 
-  it('ignores unknown match modes (only "wildcard"/"regex" survive)', () => {
+  it('ignores unknown match modes (only "wildcard"/"regex"/"empty" survive)', () => {
     const filters = specToEventFilters({
       filters: { f: ["v"] },
       filter_modes: { f: "exact" },
     });
     expect(filters.filterModes).toBeUndefined();
+  });
+
+  it("keeps the empty presence mode alongside its placeholder value", () => {
+    // Dropping the mode but keeping FilterSpec's `[""]` placeholder would run
+    // an *exact* match on the literal empty string, which skips `ifNull(...)`
+    // and so shows a different row set than the agent's own answer.
+    const filters = specToEventFilters({
+      filters: { user_agent: [""] },
+      filter_modes: { user_agent: "empty" },
+    });
+    expect(filters.filterModes).toEqual({ user_agent: "empty" });
+    expect(filters.filters).toEqual({ user_agent: [""] });
   });
 
   it("maps annotation-state, run, ids and routine-collapse fields", () => {

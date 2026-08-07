@@ -249,6 +249,10 @@ export interface View {
   name: string;
   query: string;
   filter: Record<string, unknown>;
+  /** Set when this view was deleted while a story block still referenced it.
+   *  Such views never appear in a list response; the field exists so a client
+   *  resolving one directly can tell. */
+  deleted_at?: string | null;
   created_at: string;
 }
 
@@ -993,8 +997,12 @@ export interface HealthResponse {
   annotated_tag?: string;
 }
 
-/** Non-default field-filter match modes; "exact" is implied by absence. */
-export type FieldMatchMode = "wildcard" | "regex";
+/**
+ * Non-default field-filter match modes; "exact" is implied by absence.
+ * "empty" is a presence predicate rather than a comparison: it carries no
+ * value, and its value list is a `[""]` placeholder on the wire.
+ */
+export type FieldMatchMode = "wildcard" | "regex" | "empty";
 
 /** Filter params for the events query */
 export interface EventFilters {

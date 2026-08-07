@@ -130,13 +130,13 @@ async def execute_chart_spec(
         service = _get_query_service()
 
     if validated is None:
-        from vestigo.api.routers.events import _validate_field_regexes, _validate_regex
+        from vestigo.api.routers.events import _validate_field_modes, _validate_regex
 
         def validated(fspec: FilterSpec | None) -> FilterSpec:
             fspec = fspec or FilterSpec()
             _validate_regex(fspec.q, fspec.q_regex)
-            _validate_field_regexes(fspec.filters, fspec.filter_modes)
-            _validate_field_regexes(fspec.exclusions, fspec.exclusion_modes)
+            _validate_field_modes(fspec.filters, fspec.filter_modes)
+            _validate_field_modes(fspec.exclusions, fspec.exclusion_modes)
             return fspec
 
     if check_field is None:

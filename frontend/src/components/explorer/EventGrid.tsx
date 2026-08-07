@@ -10,14 +10,31 @@
  * Parser tags and user annotation tags both appear as chips under the message.
  * The annotation column shows outlier/tag/comment icons that open edit popovers.
  */
-import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from "react";
+import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   useReactTable,
   getCoreRowModel,
   flexRender,
   type ColumnDef,
+  type Header,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
 import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
 import { isAnalystAnnotation } from "@/api/types";
@@ -34,11 +51,97 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
+import { reorderColumns } from "@/lib/columns";
 import { getAttributeDecoration, hasEnrichmentSiblings } from "@/lib/enrichment";
 
 // Keep in sync with --grid-row-height in index.css.
 const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
 const OVERSCAN = 10;
+
+const HEADER_CELL_CLASS =
+  "relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none";
+
+/**
+ * Grid-internal columns the analyst never reorders: they carry no label and
+ * `lib/columns.ts::reorderColumns` refuses them as a drag id. `sanitizeColumns`
+ * lets them through, so a saved view or a localStorage entry can legitimately
+ * list one — which is why membership in `visibleColumns` is not enough to
+ * decide whether a header is draggable.
+ */
+const PINNED_COLUMN_IDS = new Set(["_select", "_annotations", "_expand"]);
+
+/** Width/flex for a header cell — `message` is the one that absorbs slack. */
+function headerCellSize(h: Header<Event, unknown>) {
+  return {
+    width: h.column.id === "message" ? undefined : h.getSize(),
+    flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
+  };
+}
+
+/** A header cell's label and resize grip, shared by the sortable and the
+ *  pinned branch so the two can never drift apart visually. */
+function HeaderCellBody({ h }: { h: Header<Event, unknown> }) {
+  const raw = h.column.columnDef.header;
+  const label = typeof raw === "string" ? raw : undefined;
+  return (
+    <>
+      {/* Clip a too-narrow header at its START (rtl) so the meaningful tail
+        * stays visible, and surface the full label on hover. The inner ltr
+        * wrapper keeps the text itself readable. */}
+      <span className="block truncate" style={{ direction: "rtl" }} title={label}>
+        <span className="inline-block align-bottom" style={{ direction: "ltr" }}>
+          {flexRender(raw, h.getContext())}
+        </span>
+      </span>
+      {h.column.getCanResize() && (
+        <div
+          // pointerdown is what dnd-kit's PointerSensor listens on, so without
+          // stopping it here, grabbing the grip would start a column drag.
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+          onTouchStart={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute right-0 top-0 h-full w-1 cursor-col-resize select-none touch-none opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
+          style={{ marginRight: -2 }}
+        />
+      )}
+    </>
+  );
+}
+
+/** One draggable header cell. The pinned grid-internal columns render through
+ *  the plain branch in the header map instead of this. */
+function SortableHeaderCell({ h }: { h: Header<Event, unknown> }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: h.column.id });
+  // KeyboardSensor's activator is this cell's onKeyDown and it does not look at
+  // the event target, so Enter/Space on the timestamp sort button inside would
+  // start a keyboard drag and preventDefault the sort. Only a keypress on the
+  // cell itself starts a drag; anything focusable inside keeps its own keys.
+  const keyboardListeners = listeners && {
+    ...listeners,
+    onKeyDown: (e: ReactKeyboardEvent) => {
+      if (e.target !== e.currentTarget) return;
+      listeners.onKeyDown?.(e);
+    },
+  };
+  return (
+    <div
+      ref={setNodeRef}
+      data-column-drag={h.column.id}
+      className={cn(HEADER_CELL_CLASS, "cursor-grab", isDragging && "opacity-50")}
+      style={{
+        ...headerCellSize(h),
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
+      {...attributes}
+      {...keyboardListeners}
+    >
+      <HeaderCellBody h={h} />
+    </div>
+  );
+}
 
 interface Props {
   events: Event[];
@@ -61,6 +164,11 @@ interface Props {
   hasNextPage: boolean;
   isFetching: boolean;
   visibleColumns: string[];
+  /** Called with the full reordered visible-column list after a header drag.
+   *  Omit to render a non-reorderable grid — headers then register no sortable
+   *  node at all, so they carry neither the grab cursor nor a drag that would
+   *  quietly go nowhere. */
+  onReorderColumns?: (next: string[]) => void;
   sortDir: "asc" | "desc";
   onSortToggle: () => void;
   /** Active (not-yet-tagged) analysis findings, keyed by event ID. */
@@ -376,6 +484,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   hasNextPage,
   isFetching,
   visibleColumns,
+  onReorderColumns,
   sortDir,
   onSortToggle,
   liveAnomalies,
@@ -385,6 +494,36 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   locatedHiddenId,
 }, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const headerRef = useRef<HTMLDivElement | null>(null);
+  // Distance from the top of the scrolled content to the first row. The header
+  // is part of that content (so it can scroll horizontally with the columns),
+  // which shifts every vertical offset the virtualizer and the scroll handler
+  // reason about. Measured rather than hardcoded: the header's height follows
+  // the font and the density setting.
+  //
+  // `offsetTop` is relative to the nearest *positioned* ancestor, so the
+  // grid-content wrapper carries `position: relative` — without it the offset
+  // would be the body's distance from the page top (top bar, toolbars,
+  // histogram) instead of the header's height, and the virtualizer would
+  // render its window hundreds of pixels off.
+  //
+  // Observed on the *header*, not on the body: the offset is the header's
+  // height, and a header that grows without the body's box changing (a larger
+  // font, a column label wrapping to two lines) would otherwise leave the
+  // scroll margin, the row offsets and the histogram's position indicator
+  // stale by exactly that delta, with nothing on screen saying so.
+  const [bodyOffset, setBodyOffset] = useState(0);
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    const header = headerRef.current;
+    if (!el || !header) return;
+    const measure = () => setBodyOffset(el.offsetTop);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(header);
+    return () => ro.disconnect();
+  }, []);
   const density = useUiStore((s) => s.density);
   const ROW_HEIGHT = ROW_HEIGHT_BY_DENSITY[density];
   // The backend names this tag; the chip must read the same word the filter
@@ -675,6 +814,23 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     prevResizingColRef.current = resizingColumnId;
   }, [resizingColumnId, columnSizing, setColumnWidth]);
 
+  const sensors = useSensors(
+    // 8px, not the story editor's 4: this header also carries the timestamp
+    // sort button, and a plain click on it must never arm a drag.
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const handleColumnDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || !onReorderColumns) return;
+      const next = reorderColumns(visibleColumns, String(active.id), String(over.id));
+      if (next !== visibleColumns) onReorderColumns(next);
+    },
+    [visibleColumns, onReorderColumns],
+  );
+
   const rows = table.getRowModel().rows;
 
   const rowVirtualizer = useVirtualizer({
@@ -682,6 +838,10 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     getScrollElement: () => parentRef.current,
     estimateSize: () => ROW_HEIGHT,
     overscan: OVERSCAN,
+    // The header occupies the top of the scrolled content; without this the
+    // virtualizer would believe row 0 starts at scrollTop 0 and render the
+    // wrong window by exactly the header's height.
+    scrollMargin: bodyOffset,
   });
 
   const virtualItems = rowVirtualizer.getVirtualItems();
@@ -707,14 +867,20 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     const el = parentRef.current;
     const ts =
       el && rows.length > 0
-        ? (rows[Math.min(rows.length - 1, Math.max(0, Math.floor(el.scrollTop / ROW_HEIGHT)))]
-            ?.original.timestamp ?? null)
+        ? (rows[
+            Math.min(
+              rows.length - 1,
+              // The header scrolls with the content, so the first bodyOffset
+              // pixels of scrollTop are header, not rows.
+              Math.max(0, Math.floor((el.scrollTop - bodyOffset) / ROW_HEIGHT)),
+            )
+          ]?.original.timestamp ?? null)
         : null;
     if (ts !== lastReportedTsRef.current) {
       lastReportedTsRef.current = ts;
       onVisibleTimestampChange(ts);
     }
-  }, [rows, onVisibleTimestampChange, ROW_HEIGHT]);
+  }, [rows, onVisibleTimestampChange, ROW_HEIGHT, bodyOffset]);
 
   useEffect(() => {
     reportVisibleTimestamp();
@@ -725,6 +891,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   // which would otherwise cause a visible jump. Capture an anchor right
   // before requesting the earlier page, then correct scrollTop once the new
   // rows land (row height is fixed, so this is exact, cheap arithmetic).
+  // Deliberately unaffected by the header's `bodyOffset`: both the captured
+  // and the restored scrollTop include it, so a constant offset cancels.
   const prependAnchorRef = useRef<{ scrollTop: number; firstEventId: string } | null>(null);
 
   const handleLoadEarlier = useCallback(() => {
@@ -808,60 +976,81 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     [events, sortDir, rowVirtualizer],
   );
 
+  // The ids dnd-kit sorts, taken from the cells that actually register a
+  // sortable node rather than from `visibleColumns`. The two diverge: the
+  // grid-internal ids survive `sanitizeColumns` and so can sit in a saved
+  // view's or localStorage's column list, but the column builder skips them.
+  // An id with no node throws off dnd-kit's index lookup for every column
+  // after it, landing drops in the wrong slot.
+  //
+  // The pinned ids are excluded by name rather than by "absent from
+  // `visibleColumns`": `_annotations` *can* be in that list, and then the
+  // header the analyst cannot reorder (`reorderColumns` refuses a pinned id,
+  // and its header renders no label) would still pick up a grab cursor and a
+  // drag they get nothing back from.
+  const isSortableColumn = (id: string) =>
+    Boolean(onReorderColumns) && !PINNED_COLUMN_IDS.has(id) && visibleColumns.includes(id);
+  const sortableColumnIds = table
+    .getHeaderGroups()
+    .flatMap((hg) => hg.headers)
+    .filter((h) => isSortableColumn(h.column.id))
+    .map((h) => h.column.id);
+
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">
-      {/* Header row */}
-      <div className="flex shrink-0 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]">
-        {table.getHeaderGroups().map((hg) =>
-          hg.headers.map((h) => (
-            <div
-              key={h.id}
-              className="relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
-              style={{
-                width: h.column.id === "message" ? undefined : h.getSize(),
-                flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
-              }}
-            >
-              {/* Clip a too-narrow header at its START (rtl) so the meaningful
-                * tail stays visible, and surface the full label on hover. The
-                * inner ltr wrapper keeps the text itself readable. */}
-              {(() => {
-                const raw = h.column.columnDef.header;
-                const label = typeof raw === "string" ? raw : undefined;
-                return (
-                  <span
-                    className="block truncate"
-                    style={{ direction: "rtl" }}
-                    title={label}
-                  >
-                    <span className="inline-block align-bottom" style={{ direction: "ltr" }}>
-                      {flexRender(raw, h.getContext())}
-                    </span>
-                  </span>
-                );
-              })()}
-              {h.column.getCanResize() && (
-                <div
-                  onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
-                  onTouchStart={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute right-0 top-0 h-full w-1 cursor-col-resize select-none touch-none opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
-                  style={{ marginRight: -2 }}
-                />
-              )}
-            </div>
-          )),
-        )}
-      </div>
-
-      {/* Virtualized body */}
       <div
         ref={parentRef}
+        data-testid="grid-scroll"
         data-tour="event-grid"
         className="flex-1 overflow-auto"
         onScroll={handleScroll}
       >
-        <div style={{ height: totalHeight, position: "relative" }}>
+      {/* One wrapper at content width, so the header and every row span the
+        * same box. Without it the header could not scroll with the columns,
+        * and rows would be sized to the viewport — cutting their background,
+        * hover state and borders off at the right edge.
+        * `relative` makes this the offset parent the body measures against
+        * (see `bodyOffset`); it does not affect the sticky header, which
+        * positions against the scroll container. */}
+      <div
+        data-testid="grid-content"
+        className="relative"
+        style={{ minWidth: table.getTotalSize() }}
+      >
+      {/* Header row — inside the scroller so it tracks horizontal scroll,
+        * sticky so it still holds its place vertically. */}
+      <div
+        ref={headerRef}
+        data-testid="grid-header"
+        className="sticky top-0 z-20 flex border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      >
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleColumnDragEnd}
+        >
+          <SortableContext items={sortableColumnIds} strategy={horizontalListSortingStrategy}>
+            {table.getHeaderGroups().map((hg) =>
+              hg.headers.map((h) =>
+                isSortableColumn(h.column.id) ? (
+                  <SortableHeaderCell key={h.id} h={h} />
+                ) : (
+                  <div key={h.id} className={HEADER_CELL_CLASS} style={headerCellSize(h)}>
+                    <HeaderCellBody h={h} />
+                  </div>
+                ),
+              ),
+            )}
+          </SortableContext>
+        </DndContext>
+      </div>
+
+      {/* Virtualized body */}
+        <div
+          ref={bodyRef}
+          data-testid="grid-body"
+          style={{ height: totalHeight, position: "relative" }}
+        >
           {virtualItems.map((vItem) => {
             const row = rows[vItem.index];
             const event = row.original;
@@ -895,7 +1084,10 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                 key={vItem.key}
                 style={{
                   position: "absolute",
-                  top: vItem.start,
+                  // vItem.start is measured in scroll-element space once
+                  // scrollMargin is set; the row sits inside grid-body, so
+                  // this converts between the two.
+                  top: vItem.start - bodyOffset,
                   left: 0,
                   right: 0,
                   height: ROW_HEIGHT,
@@ -963,6 +1155,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             );
           })}
         </div>
+      </div>
       </div>
 
       {/* Footer */}

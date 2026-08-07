@@ -37,6 +37,30 @@ describe("applyFieldFilter", () => {
     expect(applyFieldFilter(base, "status", "500", true).filters).toEqual({ status: ["500"] });
   });
 
+  it("drops an empty-mode placeholder instead of ORing it with the clicked value", () => {
+    // `[""]` only exists to give the `empty` mode a key to hang off. Keeping it
+    // once the mode is dropped would turn "blank user_agent" plus a clicked
+    // "curl/7" into `user_agent IN ('', 'curl/7')` — every blank row riding
+    // along with the one the analyst actually clicked.
+    const base: EventFilters = {
+      filters: { user_agent: [""] },
+      filterModes: { user_agent: "empty" },
+    };
+    const next = applyFieldFilter(base, "user_agent", "curl/7", true);
+    expect(next.filters).toEqual({ user_agent: ["curl/7"] });
+    expect(next.filterModes).toBeUndefined();
+  });
+
+  it("drops an empty-mode placeholder on the exclude side too", () => {
+    const base: EventFilters = {
+      exclusions: { user_agent: [""] },
+      exclusionModes: { user_agent: "empty" },
+    };
+    const next = applyFieldFilter(base, "user_agent", "curl/7", false);
+    expect(next.exclusions).toEqual({ user_agent: ["curl/7"] });
+    expect(next.exclusionModes).toBeUndefined();
+  });
+
   it("resets a pattern match mode on the key — clicked values are literal", () => {
     const base: EventFilters = {
       filters: { ip: ["10.*"] },

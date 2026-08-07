@@ -416,6 +416,7 @@ export function ExplorerPage() {
   const seededSeqRef = useRef(0);
   const tlKey = `${caseId}/${timelineId}`;
   const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
+  const setVisibleColumns = useUiStore((s) => s.setVisibleColumns);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
   const setHistogramOpen = useUiStore((s) => s.setHistogramOpen);
   const setSortDir = useUiStore((s) => s.setSortDir);
@@ -1172,7 +1173,12 @@ export function ExplorerPage() {
           filters={filters}
           onChange={setFilters}
           views={views ?? []}
-          onApplyView={setFilters}
+          onApplyView={(f, columns) => {
+            setFilters(f);
+            // A view saved before layouts were stored carries none, and must
+            // leave the analyst's current columns alone rather than blank them.
+            if (columns) setVisibleColumns(tlKey, columns);
+          }}
           onSaveView={() => setSaveViewOpen(true)}
           onClose={() => setFilterRailOpen(false)}
           mergedTagSuggestions={mergedTagSuggestions}
@@ -1443,6 +1449,9 @@ export function ExplorerPage() {
                   hasNextPage={!!hasNextPage}
                   isFetching={isFetching}
                   visibleColumns={visibleColumns}
+                  // Writes the same per-timeline override a manual column
+                  // choice writes, so the precedence in lib/columns.ts holds.
+                  onReorderColumns={(next) => setVisibleColumns(tlKey, next)}
                   sortDir={sortDir}
                   onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
                   liveAnomalies={liveAnomaliesByEvent}
@@ -1549,6 +1558,7 @@ export function ExplorerPage() {
         onClose={() => setSaveViewOpen(false)}
         caseId={caseId!}
         filters={filters}
+        visibleColumns={visibleColumns}
       />
     </div>
   );

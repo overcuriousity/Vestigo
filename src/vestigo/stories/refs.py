@@ -33,8 +33,13 @@ async def validate_block_scope(
     timeline_id = content.get("timeline_id")
     if timeline_id and await store.get_timeline(case_id, timeline_id) is None:
         raise ValueError(f"timeline {timeline_id!r} is not in this case")
-    if kind == "view_ref" and await store.get_view(case_id, content["view_id"]) is None:
-        raise ValueError(f"view {content['view_id']!r} is not in this case")
+    if kind == "view_ref":
+        view = await store.get_view(case_id, content["view_id"])
+        # A hidden view (deleted while some block still referenced it) keeps
+        # its existing block working, but must not become the referent of a
+        # new one — that would resurrect an artifact the analyst deleted.
+        if view is None or view.deleted_at is not None:
+            raise ValueError(f"view {content['view_id']!r} is not in this case")
     if kind == "chart_ref":
         chart = await store.get_saved_chart(case_id, timeline_id, content["chart_id"])
         if chart is None:

@@ -427,7 +427,12 @@ export function specToEventFilters(raw: AgentFilterSpec | string | null | undefi
     if (!parsed) return undefined;
     const out: Record<string, FieldMatchMode> = {};
     for (const [k, v] of Object.entries(parsed)) {
-      if (v === "wildcard" || v === "regex") out[k] = v;
+      // Keep this list in step with `queryParams.ts::sanitizeModes` and the
+      // backend's `_VALID_FILTER_MODES`. Dropping `empty` here would not drop
+      // the `[""]` placeholder `FilterSpec` pairs with it, so the Explorer
+      // would run an *exact* match on the literal empty string — which skips
+      // `ifNull(...)` and so silently excludes NULL rows the agent counted.
+      if (v === "wildcard" || v === "regex" || v === "empty") out[k] = v;
     }
     return Object.keys(out).length > 0 ? out : undefined;
   };

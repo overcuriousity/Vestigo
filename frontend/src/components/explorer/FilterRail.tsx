@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex, Trash2 } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
@@ -12,11 +12,14 @@ import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
 import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import { vizApi } from "@/api/viz";
+import { viewsApi } from "@/api/views";
+import { Dialog, DialogContent, DialogClose } from "@/components/ui/Dialog";
+import { toast } from "@/stores/toasts";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/cn";
 import type { EventFilters, FieldMatchMode, View } from "@/api/types";
 import { fmtRelative } from "@/lib/time";
-import { viewPayloadToFilters } from "@/lib/queryParams";
+import { viewPayloadColumns, viewPayloadToFilters } from "@/lib/queryParams";
 
 /** Debounced top-N distinct values of `fieldKey`, for value autocomplete.
  * Deliberately unfiltered (empty EventFilters): suggestions describe the
@@ -51,13 +54,23 @@ const MATCH_MODE_OPTIONS: { mode: RowMatchMode; label: string; tooltip: string }
     label: ".*",
     tooltip: "RE2 regular expression — case-sensitive, prefix (?i) for case-insensitive",
   },
+  {
+    mode: "empty",
+    label: "∅",
+    tooltip: "No value — field is absent or blank",
+  },
 ];
 
 const MODE_PLACEHOLDER: Record<RowMatchMode, string> = {
   exact: "value",
   wildcard: "e.g. 10.0.*",
   regex: "RE2 pattern — (?i) for case-insensitive",
+  empty: "(empty)",
 };
+
+/** Saved-view count above which the list gets a search box. Five rows are
+ *  faster to scan than to filter. */
+const VIEW_SEARCH_MIN = 5;
 
 /** 3-state exact/wildcard/regex selector for one field-filter entry row. */
 function MatchModeControl({
@@ -111,7 +124,9 @@ interface Props {
   filters: EventFilters;
   onChange: (f: EventFilters) => void;
   views: View[];
-  onApplyView: (f: EventFilters) => void;
+  /** Applies a saved view. The second argument is the view's column layout,
+   *  or undefined for a view saved before layouts were stored. */
+  onApplyView: (f: EventFilters, columns?: string[]) => void;
   onSaveView: () => void;
   onClose?: () => void;
   /** Merged (annotation + parser) tag values, for the unified Tags filter. */
@@ -162,6 +177,39 @@ export function FilterRail({
   const [excludeKey, setExcludeKey] = useState("");
   const [excludeVal, setExcludeVal] = useState("");
   const [excludeMode, setExcludeMode] = useState<RowMatchMode>("exact");
+  const [viewSearch, setViewSearch] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<View | null>(null);
+
+  const qc = useQueryClient();
+  const deleteView = useMutation({
+    mutationFn: (v: View) => viewsApi.delete(caseId, v.id),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["views", caseId] });
+      setPendingDelete(null);
+      if (res.hidden) {
+        toast.success(
+          "Removed from the list",
+          "A story still embeds this view, so it is kept until that block is gone.",
+        );
+      } else {
+        toast.success("View deleted");
+      }
+    },
+    onError: (err: Error) => toast.error("Could not delete view", err.message),
+  });
+
+  /** Case-insensitive substring match on the view name.
+   *
+   * Gated on the same threshold that renders the search box: deleting a view
+   * can take the list back under it, and a needle still filtering after its
+   * input has unmounted would strand the panel on "No views match" with no
+   * control left to clear it. */
+  const viewSearchShown = views.length > VIEW_SEARCH_MIN;
+  const matchingViews = useMemo(() => {
+    const needle = viewSearch.trim().toLowerCase();
+    if (!needle || views.length <= VIEW_SEARCH_MIN) return views;
+    return views.filter((v) => v.name.toLowerCase().includes(needle));
+  }, [views, viewSearch]);
 
   const fieldValueSuggestions = useFieldValueSuggestions(caseId, timelineId, fieldKey);
   const excludeValueSuggestions = useFieldValueSuggestions(caseId, timelineId, excludeKey);
@@ -197,9 +245,12 @@ export function FilterRail({
   }, [semanticMode, filters.qRegex, searchInput]);
 
   const addFilter = (value?: string) => {
-    const v = (value ?? fieldVal).trim();
     const key = fieldKey.trim();
-    if (!key || !v) return;
+    if (!key) return;
+    // Empty mode is a presence predicate — there is no value to type, and the
+    // one that goes on the wire is a placeholder the backend ignores.
+    const v = fieldMode === "empty" ? "" : (value ?? fieldVal).trim();
+    if (fieldMode !== "empty" && !v) return;
     // "exact" is never stored — absence means exact (legacy compatibility).
     const modes = { ...(filters.filterModes ?? {}) };
     if (fieldMode === "exact") delete modes[key];
@@ -207,8 +258,19 @@ export function FilterRail({
     // Append to the field's value list (src_port 22, then 23 → OR'd), skipping
     // duplicates — mirrors addExclusion. Mode-per-key: this mode applies to
     // ALL of the key's values.
-    const prevValues = filters.filters?.[key] ?? [];
-    const nextValues = prevValues.includes(v) ? prevValues : [...prevValues, v];
+    //
+    // Empty mode is the exception: the mode covers the whole key, so any value
+    // already listed would stop being matched while still sitting in the
+    // filter — invisible in the chips, and its removal handler would then take
+    // two clicks to clear one chip. The placeholder replaces the list, and
+    // switching the key back off empty drops the placeholder again.
+    const prevValues = (filters.filters?.[key] ?? []).filter((x) => x !== "");
+    const nextValues =
+      fieldMode === "empty"
+        ? [""]
+        : prevValues.includes(v)
+          ? prevValues
+          : [...prevValues, v];
     onChange({
       ...filters,
       filters: { ...(filters.filters ?? {}), [key]: nextValues },
@@ -220,20 +282,30 @@ export function FilterRail({
   };
 
   const addExclusion = (value?: string) => {
-    const v = (value ?? excludeVal).trim();
     const key = excludeKey.trim();
-    if (!key || !v) return;
+    if (!key) return;
+    const v = excludeMode === "empty" ? "" : (value ?? excludeVal).trim();
+    if (excludeMode !== "empty" && !v) return;
     // Mode-per-key: the mode chosen here becomes the key's mode for ALL its
     // excluded values — every chip of the key shows the (updated) badge, so
     // a semantics change is visible, never silent.
     const modes = { ...(filters.exclusionModes ?? {}) };
     if (excludeMode === "exact") delete modes[key];
     else modes[key] = excludeMode;
+    // Same placeholder rule as addFilter, and the same dedupe: without it a
+    // repeated add accumulates duplicate values the chips render twice.
+    const prevValues = (filters.exclusions?.[key] ?? []).filter((x) => x !== "");
+    const nextValues =
+      excludeMode === "empty"
+        ? [""]
+        : prevValues.includes(v)
+          ? prevValues
+          : [...prevValues, v];
     onChange({
       ...filters,
       exclusions: {
         ...(filters.exclusions ?? {}) as Record<string, string[]>,
-        [key]: [...(filters.exclusions?.[key] ?? []), v],
+        [key]: nextValues,
       },
       exclusionModes: Object.keys(modes).length > 0 ? modes : undefined,
     });
@@ -563,17 +635,31 @@ export function FilterRail({
               suggestions={fieldSuggestions}
               className="w-24"
             />
-            <TagInput
-              placeholder={MODE_PLACEHOLDER[fieldMode]}
-              openOnFocus
-              value={fieldVal}
-              onChange={setFieldVal}
-              onSubmit={addFilter}
-              onCancel={() => setFieldVal("")}
-              suggestions={fieldValueSuggestions}
-              className="flex-1"
-            />
-            <Button size="icon" variant="outline" onClick={() => addFilter()}>
+            {fieldMode === "empty" ? (
+              /* Nothing to type: the value is a placeholder the backend
+               * ignores, so offering an input would invite a value that
+               * silently does nothing. */
+              <span className="flex flex-1 items-center rounded border border-dashed border-[var(--color-border-strong)] px-2 text-xs text-[var(--color-fg-muted)] select-none">
+                (empty)
+              </span>
+            ) : (
+              <TagInput
+                placeholder={MODE_PLACEHOLDER[fieldMode]}
+                openOnFocus
+                value={fieldVal}
+                onChange={setFieldVal}
+                onSubmit={addFilter}
+                onCancel={() => setFieldVal("")}
+                suggestions={fieldValueSuggestions}
+                className="flex-1"
+              />
+            )}
+            <Button
+              size="icon"
+              variant="outline"
+              aria-label="Add filter"
+              onClick={() => addFilter()}
+            >
               <PlusCircle size={13} />
             </Button>
           </div>
@@ -603,17 +689,28 @@ export function FilterRail({
               suggestions={fieldSuggestions}
               className="w-24"
             />
-            <TagInput
-              placeholder={MODE_PLACEHOLDER[excludeMode]}
-              openOnFocus
-              value={excludeVal}
-              onChange={setExcludeVal}
-              onSubmit={addExclusion}
-              onCancel={() => setExcludeVal("")}
-              suggestions={excludeValueSuggestions}
-              className="flex-1"
-            />
-            <Button size="icon" variant="outline" onClick={() => addExclusion()}>
+            {excludeMode === "empty" ? (
+              <span className="flex flex-1 items-center rounded border border-dashed border-[var(--color-border-strong)] px-2 text-xs text-[var(--color-fg-muted)] select-none">
+                (empty)
+              </span>
+            ) : (
+              <TagInput
+                placeholder={MODE_PLACEHOLDER[excludeMode]}
+                openOnFocus
+                value={excludeVal}
+                onChange={setExcludeVal}
+                onSubmit={addExclusion}
+                onCancel={() => setExcludeVal("")}
+                suggestions={excludeValueSuggestions}
+                className="flex-1"
+              />
+            )}
+            <Button
+              size="icon"
+              variant="outline"
+              aria-label="Add exclusion"
+              onClick={() => addExclusion()}
+            >
               <MinusCircle size={13} />
             </Button>
           </div>
@@ -633,21 +730,51 @@ export function FilterRail({
             <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
               <BookmarkCheck size={13} /> Saved Views
             </label>
+            {/* Search earns its space only once the list is long enough to
+              * need it — five rows are faster to scan than to filter. */}
+            {viewSearchShown && (
+              <Input
+                className="mb-1.5"
+                placeholder="Search views"
+                value={viewSearch}
+                onChange={(e) => setViewSearch(e.target.value)}
+              />
+            )}
             <div className="space-y-1">
-              {views.map((v) => (
-                <button
-                  key={v.id}
-                  className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)] hover:text-[var(--color-fg-primary)] transition-base"
-                  onClick={() =>
-                    onApplyView(viewPayloadToFilters(v.filter as Record<string, unknown>))
-                  }
-                >
-                  <div className="truncate font-medium">{v.name}</div>
-                  <div className="text-[var(--color-fg-muted)]">
-                    {fmtRelative(v.created_at)}
+              {matchingViews.length === 0 ? (
+                <p className="px-2.5 py-1.5 text-xs text-[var(--color-fg-muted)]">
+                  No views match
+                </p>
+              ) : (
+                matchingViews.map((v) => (
+                  <div
+                    key={v.id}
+                    className="group flex items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] transition-base hover:border-[var(--color-accent)]"
+                  >
+                    <button
+                      className="min-w-0 flex-1 px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] group-hover:text-[var(--color-fg-primary)]"
+                      onClick={() => {
+                        const payload = v.filter as Record<string, unknown>;
+                        onApplyView(viewPayloadToFilters(payload), viewPayloadColumns(payload));
+                      }}
+                    >
+                      <div className="truncate font-medium">{v.name}</div>
+                      <div className="text-[var(--color-fg-muted)]">
+                        {fmtRelative(v.created_at)}
+                      </div>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Delete view ${v.name}`}
+                      className="mr-1 shrink-0 text-[var(--color-fg-muted)] opacity-0 hover:text-[var(--color-danger)] focus-visible:opacity-100 group-hover:opacity-100"
+                      onClick={() => setPendingDelete(v)}
+                    >
+                      <Trash2 size={13} />
+                    </Button>
                   </div>
-                </button>
-              ))}
+                ))
+              )}
             </div>
           </div>
         )}
@@ -679,6 +806,42 @@ export function FilterRail({
           }}
         />
       </div>
+
+      {/* Deleting an unreferenced view is not undoable, so it is asked once.
+        * The two outcomes (deleted vs kept for a story) are reported by the
+        * toast afterwards rather than predicted here — only the server knows
+        * whether a block still references it. */}
+      <Dialog
+        open={!!pendingDelete}
+        onOpenChange={(o) => {
+          if (!o) setPendingDelete(null);
+        }}
+      >
+        <DialogContent
+          title="Delete view"
+          description={
+            pendingDelete
+              ? `"${pendingDelete.name}" will be removed from this case. This cannot be undone.`
+              : ""
+          }
+        >
+          <div className="flex justify-end gap-2">
+            <DialogClose asChild>
+              <Button variant="ghost" size="sm" onClick={() => setPendingDelete(null)}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={deleteView.isPending}
+              onClick={() => pendingDelete && deleteView.mutate(pendingDelete)}
+            >
+              {deleteView.isPending ? "Deleting…" : "Delete"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 }

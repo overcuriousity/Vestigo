@@ -107,11 +107,11 @@ def _validate_filters(fspec):
     Mirrors the ``validated`` helper ``execute_chart_spec`` builds; kept here
     so the view-block path can't drift away from the chart path.
     """
-    from vestigo.api.routers.events import _validate_field_regexes, _validate_regex
+    from vestigo.api.routers.events import _validate_field_modes, _validate_regex
 
     _validate_regex(fspec.q, fspec.q_regex)
-    _validate_field_regexes(fspec.filters, fspec.filter_modes)
-    _validate_field_regexes(fspec.exclusions, fspec.exclusion_modes)
+    _validate_field_modes(fspec.filters, fspec.filter_modes)
+    _validate_field_modes(fspec.exclusions, fspec.exclusion_modes)
     return fspec
 
 

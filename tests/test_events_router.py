@@ -872,6 +872,30 @@ def test_parse_modes_object_accepts_valid_modes():
     }
 
 
+def test_parse_modes_object_accepts_the_empty_presence_mode():
+    assert events._parse_modes_object('{"user_agent": "empty"}') == {"user_agent": "empty"}
+
+
+def test_validate_field_modes_ignores_empty_mode_fields():
+    """`empty` carries no pattern, so the regex pre-check must skip it rather
+    than trying to compile its placeholder value."""
+    events._validate_field_modes({"user_agent": [""]}, {"user_agent": "empty"})
+    events._validate_field_modes({"user_agent": ["(["]}, {"user_agent": "empty"})
+
+
+def test_validate_field_modes_rejects_orphan_empty_mode_with_400():
+    """An `empty` mode whose key is absent from the filter map would be
+    silently ignored by the query builder and answer with the whole timeline —
+    reachable from a hand-edited or truncated shared URL."""
+    with pytest.raises(HTTPException) as exc_info:
+        events._validate_field_modes({}, {"user_agent": "empty"})
+    assert exc_info.value.status_code == 400
+    assert "no matching filter entry" in exc_info.value.detail
+    # A different key present is not the key the mode names.
+    with pytest.raises(HTTPException):
+        events._validate_field_modes({"src_ip": ["10.0.0.1"]}, {"user_agent": "empty"})
+
+
 def test_parse_modes_object_rejects_unknown_mode_with_400():
     with pytest.raises(HTTPException) as exc_info:
         events._parse_modes_object('{"src_ip": "glob"}')
@@ -879,20 +903,20 @@ def test_parse_modes_object_rejects_unknown_mode_with_400():
     assert "invalid match mode" in exc_info.value.detail
 
 
-def test_validate_field_regexes_rejects_invalid_pattern_with_400():
+def test_validate_field_modes_rejects_invalid_pattern_with_400():
     with pytest.raises(HTTPException) as exc_info:
-        events._validate_field_regexes({"msg": "(["}, {"msg": "regex"})
+        events._validate_field_modes({"msg": "(["}, {"msg": "regex"})
     assert exc_info.value.status_code == 400
     assert "invalid regular expression" in exc_info.value.detail
     # Exclusion-shaped (list) values are checked per value.
     with pytest.raises(HTTPException):
-        events._validate_field_regexes({"msg": ["ok", "(["]}, {"msg": "regex"})
+        events._validate_field_modes({"msg": ["ok", "(["]}, {"msg": "regex"})
 
 
-def test_validate_field_regexes_ignores_non_regex_modes():
+def test_validate_field_modes_ignores_non_regex_modes():
     # "([" is an invalid regex but valid literal/wildcard — must not raise.
-    events._validate_field_regexes({"msg": "(["}, {"msg": "wildcard"})
-    events._validate_field_regexes({"msg": "(["}, {})
+    events._validate_field_modes({"msg": "(["}, {"msg": "wildcard"})
+    events._validate_field_modes({"msg": "(["}, {})
 
 
 def test_uses_regex_detects_field_modes():
