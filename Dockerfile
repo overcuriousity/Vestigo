@@ -17,7 +17,7 @@ ARG FRONTEND_STAGE=frontend-build
 # on the even-numbered releases — a dependabot bump onto an odd-numbered (non-LTS)
 # line is a bump to review, not to take. `.github/workflows/{ci,release}.yml`
 # build the same frontend on the same major.
-FROM node:24-alpine AS frontend-build
+FROM node:25-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
