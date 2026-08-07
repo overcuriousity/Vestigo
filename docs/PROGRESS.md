@@ -1,11 +1,69 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-08 (session 163 — PR #262 review: the confirm path that 500s on
-PostgreSQL and never ran in tests, dispositions the new endpoint forgot to apply, and
-"Run anyway" that could not run anything).
+Last updated: 2026-08-08 (session 164 — PR #262 second review: cache-key inputs that were
+not request parameters, and the actions the redesign left with no surface).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 164 — 2026-08-08: PR #262 second review
+
+**Why.** A second review of the same branch found eleven defects. One was
+severe, and the rest share a shape: the redesign moved a surface and left an
+action stranded behind it.
+
+**The fingerprint omitted four inputs, none of them request parameters.** The
+cache key covered the timeline, source hashes, enrichment generation, frame,
+`baseline_id`, method, params, limit and `dispositions_hash` — everything the
+client sends. It did not cover the baseline definition's *contents* (a `PUT`
+replaces the windows in place and keeps the id, so an analyst who moved a
+suspect window was served the pre-edit findings, stamped with the new baseline's
+name and reported as a hit), the timeline's `field_mappings`, the per-source
+`time_offset_seconds`, or the runtime-editable `stat_*` thresholds the runners
+fall back to when a knob is omitted. All four are now in the key; the settings
+arm is a prefix sweep rather than an enumerated list, because forgetting a newly
+added threshold means a wrong answer served as proof. `stat_scan_*` stays out —
+it tunes ClickHouse's resource budget, not the conclusion.
+
+**A cache write could fail a request whose scan had already succeeded.** Two
+tabs missing the same key both insert against a unique index; the loser raised
+`IntegrityError` and the analyst saw the method as "failed to run". Two clients
+that miss the same key computed the same answer over the same inputs — that is
+what the key means — so the loser is swallowed.
+
+**`frame` and `baseline_id` were never cross-validated.** The runners key off
+the id; the response is stamped with the frame, and that stamp is what a verdict
+records as its provenance. `frame=self&baseline_id=X` therefore ran the
+two-window comparison and labelled it "all events scanned", and `build_plan`
+disagreed with the runner about the same request. Now a 422.
+
+**Three actions had lost their surface.** `TemplatesView` was orphaned by the
+rail rewrite, taking the log-template mute *and unmute* with it — while
+`events.py` kept collapsing muted templates out of the grid, histogram and
+export, so a pre-existing mute hid evidence with nothing left to reverse it. The
+show-dismissed toggle was hardcoded off, making a mis-click unrecoverable. The
+rail lost its resize handle, freezing the only fixed-width surface in the flow
+at whatever the store last persisted. All three are back, the toggle now as one
+UI-store flag rather than per-view state, since the rail and the sheet render
+the same query results.
+
+**A method that could not score rendered as a checked zero.** `MethodFindings.status`
+and `warnings` were read nowhere in the new surface, so `insufficient_data` and
+a clean scan looked identical — the exact "checked, clear" misread the rail's own
+comment forbids. It renders as a dash and the runner's warning now. The Tools
+summary likewise counted queued heavy methods as "ran"; they are named as still
+running.
+
+**Two smaller honesty fixes.** The gate built its field inventory without the
+timeline's `field_mappings`, so `reason_facts` — rendered verbatim as arithmetic
+the analyst is invited to check — described a field set the detectors do not use;
+the canonical entries are now approximated from the same stats cache rather than
+aggregated live, which keeps the endpoint's no-scan contract and errs toward
+offering a method rather than withholding one. And `disposition_identity` put
+`analysis_scope` in the key for `confirmed` while every pre-upgrade row carries
+`NULL`, so the first re-confirm after the upgrade wrote a duplicate; an
+unstamped row now adopts the scope instead, with an exact match always winning
+over it.
 
 ## Session 163 — 2026-08-08: PR #262 review findings
 

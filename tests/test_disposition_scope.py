@@ -176,3 +176,77 @@ def test_bulk_verdicts_carry_scope_too(client, seeded):
     )
     assert r.status_code == 200, r.text
     assert all(d["analysis_scope"] == SCOPE for d in r.json()["dispositions"])
+
+
+def _post_confirmed(client, case_id, timeline_id, analysis_scope):
+    body = {
+        "kind": "confirmed",
+        "detector": "value_novelty",
+        "source_id": "s1",
+        "event_id": "e1",
+    }
+    if analysis_scope is not None:
+        body["analysis_scope"] = analysis_scope
+    return client.post(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/dispositions", json=body
+    ).json()["disposition"]
+
+
+def test_reconfirming_an_unstamped_verdict_adopts_the_scope_rather_than_duplicating(
+    client, seeded
+):
+    """Every ``confirmed`` row written before scope provenance existed has none.
+
+    The frontend now always sends a scope, so without adoption the first
+    re-confirm after the upgrade writes a second row for the same event and
+    inflates the triage counts once per upgraded case.
+    """
+    case_id, timeline_id = seeded
+    before = _post_confirmed(client, case_id, timeline_id, None)
+    assert before["analysis_scope"] is None
+
+    after = _post_confirmed(client, case_id, timeline_id, SCOPE)
+    assert after["id"] == before["id"]
+    assert after["analysis_scope"] == SCOPE
+
+    # Adoption is once, not a wildcard: a genuinely different comparison is
+    # still a separate claim.
+    other = {**SCOPE, "baseline_id": "bl-2", "baseline_name": "Mar 1 – Mar 2"}
+    assert _post_confirmed(client, case_id, timeline_id, other)["id"] != after["id"]
+
+
+def test_an_exact_scope_match_wins_over_an_unstamped_row(client, seeded):
+    """Adoption must not shadow a row that already carries this scope."""
+    case_id, timeline_id = seeded
+    unstamped = _post_confirmed(client, case_id, timeline_id, None)
+    other = {**SCOPE, "baseline_id": "bl-2", "baseline_name": "Mar 1 – Mar 2"}
+    # The unstamped row adopts `other`, then a second scope creates its own row.
+    adopted = _post_confirmed(client, case_id, timeline_id, other)
+    assert adopted["id"] == unstamped["id"]
+    stamped = _post_confirmed(client, case_id, timeline_id, SCOPE)
+    assert stamped["id"] != unstamped["id"]
+    # Repeating the exact scope returns the row carrying it, not the older one.
+    assert _post_confirmed(client, case_id, timeline_id, SCOPE)["id"] == stamped["id"]
+
+
+def test_bulk_reconfirming_adopts_the_scope_too(client, seeded):
+    """The identity rule is stated in both paths; a drift writes a duplicate."""
+    case_id, timeline_id = seeded
+    before = _post_confirmed(client, case_id, timeline_id, None)
+    r = client.post(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/dispositions/bulk",
+        json={
+            "items": [
+                {
+                    "kind": "confirmed",
+                    "detector": "value_novelty",
+                    "source_id": "s1",
+                    "event_id": "e1",
+                    "analysis_scope": SCOPE,
+                }
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["dispositions"][0]["id"] == before["id"]
+    assert r.json()["dispositions"][0]["analysis_scope"] == SCOPE

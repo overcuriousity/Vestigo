@@ -33,6 +33,7 @@ export function InvestigateSheetHost({
   onOpenMethod,
   onRunMethod,
   onTagFilter,
+  onDrillField,
   similarAnchor,
   onSimilarClose,
   onSelectEvent,
@@ -46,6 +47,8 @@ export function InvestigateSheetHost({
   /** Open the method's sheet already running it. */
   onRunMethod: (method: MethodId) => void;
   onTagFilter?: (tag: string) => void;
+  /** Drill a template into the grid's filters, from the Tools sheet. */
+  onDrillField?: (field: string, value: string) => void;
   similarAnchor?: Event | null;
   onSimilarClose?: () => void;
   onSelectEvent?: (event: Event) => void;
@@ -127,6 +130,7 @@ export function InvestigateSheetHost({
           onRunMethod={onRunMethod}
           onRequestScopeChange={(next) => scopeChange.request(next)}
           onTagFilter={onTagFilter}
+          onDrillField={onDrillField}
           similarAnchor={similarAnchor}
           onSimilarClose={onSimilarClose}
           onSelectEvent={onSelectEvent}

@@ -367,3 +367,87 @@ def test_findings_requires_case_read(client, seeded, stub_detector):
     client.post("/api/auth/logout")
     r = client.get(_url(case_id, timeline_id, "value_novelty"))
     assert r.status_code in (401, 403)
+
+
+def test_editing_a_baseline_in_place_invalidates_its_cached_answers(
+    client, seeded, stub_detector
+):
+    """A definition keeps its id across a PUT, so the id alone is not the key.
+
+    Without the definition's content hash in the fingerprint, an analyst who
+    moves a suspect window and reopens Investigate is served the pre-edit
+    findings — stamped with the new baseline's name and reported as a hit,
+    which the cache docstring calls proof the answer still holds.
+    """
+    case_id, timeline_id = seeded
+    definition = client.post(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/baselines",
+        json={
+            "name": "feb",
+            "baseline_start": "2024-02-01T00:00:00Z",
+            "baseline_end": "2024-02-08T00:00:00Z",
+            "suspect_windows": [
+                {"label": "w1", "start": "2024-02-08T00:00:00Z", "end": "2024-02-09T00:00:00Z"}
+            ],
+        },
+    ).json()["baseline"]
+    url = _url(
+        case_id,
+        timeline_id,
+        "frequency",
+        extra=f"&frame=baseline&baseline_id={definition['id']}",
+    )
+    assert client.get(url).json()["cache"] == "miss"
+    assert client.get(url).json()["cache"] == "hit"
+
+    client.put(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/baselines/{definition['id']}",
+        json={
+            "name": "feb",
+            "baseline_start": "2024-02-01T00:00:00Z",
+            "baseline_end": "2024-02-08T00:00:00Z",
+            "suspect_windows": [
+                {"label": "w1", "start": "2024-02-10T00:00:00Z", "end": "2024-02-11T00:00:00Z"}
+            ],
+        },
+    )
+    assert client.get(url).json()["cache"] == "miss"
+    assert len(stub_detector["detector"]) == 2
+
+
+def test_a_changed_detector_setting_invalidates_the_cache(
+    client, seeded, stub_detector, monkeypatch
+):
+    """The runners fall back to these whenever a knob is omitted."""
+    from vestigo.core.config import get_settings
+
+    case_id, timeline_id = seeded
+    url = _url(case_id, timeline_id, "frequency")
+    assert client.get(url).json()["cache"] == "miss"
+    assert client.get(url).json()["cache"] == "hit"
+
+    cfg = get_settings()
+    monkeypatch.setattr(cfg, "stat_z_threshold", cfg.stat_z_threshold + 1.0)
+    assert client.get(url).json()["cache"] == "miss"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "&frame=self&baseline_id=bl-1",
+        "&frame=baseline",
+    ],
+)
+def test_a_frame_that_disagrees_with_the_baseline_id_is_rejected(
+    client, seeded, stub_detector, extra
+):
+    """The runner keys off the id; the response is stamped with the frame.
+
+    Accepting the mismatch would run the two-window comparison and label it
+    "all events scanned" (or the reverse) — and that label is what a verdict
+    records as its provenance.
+    """
+    case_id, timeline_id = seeded
+    r = client.get(_url(case_id, timeline_id, "value_novelty", extra=extra))
+    assert r.status_code == 422, r.text
+    assert stub_detector["detector"] == []

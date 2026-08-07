@@ -42,7 +42,7 @@ def stub_inputs(monkeypatch):
         }
         base.update(over)
 
-        async def _fake(case_id, timeline_id, source_ids, frame, baseline_id):
+        async def _fake(case_id, timeline_id, source_ids, frame, baseline_id, field_mappings):
             return PlanInputs(**base)
 
         monkeypatch.setattr(analysis_router, "_collect_plan_inputs", _fake)

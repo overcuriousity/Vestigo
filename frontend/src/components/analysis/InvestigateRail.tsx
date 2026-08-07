@@ -17,9 +17,9 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Eye, EyeOff } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
-import { useStreamingSweep } from "@/hooks/useMethodFindings";
+import { useIncludeDismissed, useStreamingSweep } from "@/hooks/useMethodFindings";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { ScopeStrip } from "./ScopeStrip";
 import { FindingGroup } from "./FindingGroup";
@@ -120,6 +120,7 @@ export function InvestigateRail({
 }: Props) {
   const { byMethod, scope, done, total, planLoading } = useStreamingSweep(caseId, timelineId);
   const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
+  const { includeDismissed, setIncludeDismissed } = useIncludeDismissed();
   const [preset, setPreset] = useState("all");
 
   const active = PRESETS.find((p) => p.id === preset) ?? PRESETS[0];
@@ -205,6 +206,28 @@ export function InvestigateRail({
             {p.label}
           </button>
         ))}
+        {/* The reveal. A dismissal is presentation-only on the server and
+            reversible there, so the UI owes a way back to it — without this a
+            mis-click removes a finding from every surface permanently. */}
+        <button
+          data-testid="toggle-dismissed"
+          onClick={() => setIncludeDismissed(!includeDismissed)}
+          aria-pressed={includeDismissed}
+          title={
+            includeDismissed
+              ? "Hide dismissed findings again"
+              : "Show dismissed findings, dimmed, so a dismissal can be undone"
+          }
+          className={cn(
+            "ml-auto flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-base",
+            includeDismissed
+              ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-accent)]"
+              : "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-strong)]",
+          )}
+        >
+          {includeDismissed ? <Eye size={10} /> : <EyeOff size={10} />}
+          Dismissed
+        </button>
       </div>
 
       {done < total && (

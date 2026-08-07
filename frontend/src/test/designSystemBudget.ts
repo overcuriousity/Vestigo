@@ -34,11 +34,15 @@ export const BUDGET: Record<string, FileBudget> = {
   "../components/agent/ToolSelector.tsx": { fontSize: 8, rawButton: 2 },
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
   "../components/analysis/FindingGroup.tsx": { fontSize: 3, rawButton: 1 },
-  "../components/analysis/InvestigateRail.tsx": { fontSize: 4, rawButton: 2 },
+  // +1 each for the show-dismissed toggle, which is deliberately the same
+  // pill as the preset filters it sits beside — a `Button` there would read as
+  // a different kind of control than the row it belongs to.
+  "../components/analysis/InvestigateRail.tsx": { fontSize: 5, rawButton: 3 },
   "../components/analysis/InvestigateSheet.tsx": { fontSize: 4 },
   "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 3 },
   "../components/analysis/ScopeStrip.tsx": { fontSize: 1, rawButton: 1 },
-  "../components/analysis/ToolsSheet.tsx": { fontSize: 7, rawButton: 2 },
+  // +1 for the log-template blurb, matching the motif blurb above it.
+  "../components/analysis/ToolsSheet.tsx": { fontSize: 8, rawButton: 2 },
   "../components/analysis/PatternsView.tsx": { fontSize: 1, rawButton: 3 },
   "../components/analysis/SigmaPanel.tsx": { fontSize: 7, rawButton: 5 },
   "../components/analysis/SimilarEvents.tsx": { rawButton: 1 },

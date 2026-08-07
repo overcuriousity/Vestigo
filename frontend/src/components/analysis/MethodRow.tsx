@@ -14,11 +14,23 @@
  * The reason is never rendered as a bare verdict. "Not applicable" is a shrug;
  * "no field parses as numeric (0 of 19 sampled)" is a claim someone can check
  * and argue with, which is the standard this panel is held to.
+ *
+ * A fourth situation hides inside "applicable": the method ran and could not
+ * score (`insufficient_data`, `no_data` — a suspect window too small, a field
+ * absent from the scan). That is not a clean zero, and showing it as one is the
+ * "checked, clear" misread this whole surface exists to prevent, so it renders
+ * as a dash with the runner's own words rather than a count.
  */
 import { AlertTriangle, Play, Settings2 } from "lucide-react";
 import type { MethodState } from "@/hooks/useMethodFindings";
 import type { MethodId } from "./method-registry";
 import { cn } from "@/lib/cn";
+
+/**
+ * The runner's own statuses for "scanned, could not reach a verdict".
+ * `db/anomaly_stats.py` is the source of these strings.
+ */
+const UNSCORED_STATUSES = new Set(["insufficient_data", "no_data"]);
 
 /** Render `reason_facts` as a short parenthetical, in declaration order. */
 function facts(reasonFacts: Record<string, number | string | boolean> | undefined): string | null {
@@ -43,6 +55,10 @@ export function MethodRow({
   const { meta, plan, status } = state;
   const gated = status !== "applicable";
   const detail = gated ? facts(plan?.reason_facts) : null;
+  // The runner's own verdict about the data, only meaningful once it has run.
+  const unscored =
+    !gated && !state.error && !state.pending && UNSCORED_STATUSES.has(state.dataStatus ?? "");
+  const warning = state.warnings?.[0];
 
   return (
     <div
@@ -57,7 +73,10 @@ export function MethodRow({
       <meta.icon size={12} className="shrink-0 text-[var(--color-fg-muted)]" />
       <div className="min-w-0 flex-1">
         <b className="block font-medium text-[var(--color-fg-primary)]">{meta.label}</b>
-        <em className="not-italic text-[11px] text-[var(--color-fg-muted)]">
+        <em
+          data-testid={`method-detail-${meta.id}`}
+          className="not-italic text-[11px] text-[var(--color-fg-muted)]"
+        >
           {gated ? (
             <>
               {plan?.reason}
@@ -65,22 +84,43 @@ export function MethodRow({
             </>
           ) : state.error ? (
             "failed to run"
+          ) : unscored ? (
+            // The runner's warning says *which* data it lacked; the status
+            // alone would be another bare verdict.
+            (warning ?? "ran, but the data could not be scored")
           ) : (
-            meta.hint
+            <>
+              {meta.hint}
+              {/* A warning on an answer that *did* score is a caveat on that
+                  answer, not a replacement for it. */}
+              {warning && (
+                <span className="block text-[var(--color-warning)]">{warning}</span>
+              )}
+            </>
           )}
         </em>
       </div>
 
-      {state.error && <AlertTriangle size={12} className="shrink-0 text-[var(--color-warning)]" />}
+      {(state.error || unscored) && (
+        <AlertTriangle size={12} className="shrink-0 text-[var(--color-warning)]" />
+      )}
 
       {!gated && !state.error && (
         <span
+          data-testid={`method-count-${meta.id}`}
           className={cn(
             "shrink-0 font-mono font-semibold",
-            state.total > 0 ? "text-[var(--color-anomaly)]" : "text-[var(--color-fg-disabled)]",
+            unscored
+              ? "text-[var(--color-fg-muted)]"
+              : state.total > 0
+                ? "text-[var(--color-anomaly)]"
+                : "text-[var(--color-fg-disabled)]",
           )}
+          // A dash, not a zero: "0" asserts the method looked and found
+          // nothing, which is exactly what it could not do.
+          title={unscored ? "This method ran but could not score this data" : undefined}
         >
-          {state.total}
+          {unscored ? "—" : state.total}
         </span>
       )}
 

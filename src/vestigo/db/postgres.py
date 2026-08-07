@@ -4356,14 +4356,10 @@ class PostgresStore:
                 FindingDisposition.source_id == source_id,
                 FindingDisposition.event_id == event_id,
             ]
-            if scope_in_identity:
-                # Valid because the column is JSONB on PostgreSQL; `json` has no
-                # equality operator there. See the column's comment.
-                conditions.append(FindingDisposition.analysis_scope == analysis_scope)
-            # `first`, not `scalar_one_or_none`: nothing in the schema enforces
-            # this tuple's uniqueness, and pre-existing duplicates must dedupe
-            # to the oldest rather than raise MultipleResultsFound.
-            existing = (
+            # All matches, not `scalar_one_or_none`: nothing in the schema
+            # enforces this tuple's uniqueness, and pre-existing duplicates must
+            # dedupe to the oldest rather than raise MultipleResultsFound.
+            candidates = (
                 (
                     await session.execute(
                         select(FindingDisposition)
@@ -4372,9 +4368,32 @@ class PostgresStore:
                     )
                 )
                 .scalars()
-                .first()
+                .all()
             )
+            # The scope arm of the key is settled here rather than in SQL. Both
+            # dialects can compare the *canonical* form (see `canonical_scope`),
+            # but neither can express the NULL arm portably: SQLAlchemy's JSON
+            # comparator does not render `IS NULL` as a plain SQL null test. The
+            # candidate set is one row per scope this exact finding was confirmed
+            # under, so the filter costs nothing to do in Python.
+            if scope_in_identity:
+                # An exact match wins over an unstamped row. Every `confirmed`
+                # row written before scope provenance existed carries no scope,
+                # and the frontend now always sends one — without adopting, the
+                # first re-confirm after an upgrade writes a second row for the
+                # same event and inflates the triage counts once per case. But
+                # adoption must not shadow a row that already carries this scope.
+                existing = next(
+                    (r for r in candidates if r.analysis_scope == analysis_scope),
+                    next((r for r in candidates if r.analysis_scope is None), None),
+                )
+            else:
+                existing = candidates[0] if candidates else None
             if existing is not None:
+                if scope_in_identity and existing.analysis_scope is None and analysis_scope:
+                    existing.analysis_scope = analysis_scope
+                    await session.commit()
+                    await session.refresh(existing)
                 return existing
             row = FindingDisposition(
                 id=generate_id(f"disp_{kind}"),
@@ -4462,6 +4481,25 @@ class PostgresStore:
                     analysis_scope=it.get("analysis_scope"),
                 )
                 existing = by_key.get(key)
+                if existing is None and it["kind"] == "confirmed":
+                    # Same pre-upgrade adoption the single-row path performs —
+                    # see :meth:`create_disposition`. Stated in both places
+                    # because a drifted dedupe writes a duplicate verdict.
+                    unstamped = disposition_identity(
+                        timeline_id=it.get("timeline_id"),
+                        kind=it["kind"],
+                        detector=it.get("detector", "*"),
+                        field=it.get("field"),
+                        value=it.get("value"),
+                        source_id=it.get("source_id"),
+                        event_id=it.get("event_id"),
+                        analysis_scope=None,
+                    )
+                    existing = by_key.get(unstamped)
+                    if existing is not None and it.get("analysis_scope"):
+                        existing.analysis_scope = canonical_scope(it["analysis_scope"])
+                        del by_key[unstamped]
+                        by_key[key] = existing
                 if existing is not None:
                     rows.append(existing)
                     continue

@@ -73,6 +73,7 @@ import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { InvestigateRail } from "@/components/analysis/InvestigateRail";
 import { InvestigateSheetHost } from "@/components/analysis/InvestigateSheetHost";
+import { RailResizeHandle } from "@/components/analysis/RailResizeHandle";
 import type { MethodId } from "@/components/analysis/method-registry";
 import { AgentPanel } from "@/components/agent/AgentPanel";
 import { useAgentStore } from "@/stores/agent";
@@ -1533,6 +1534,7 @@ export function ExplorerPage() {
                       flex: `0 1 ${investigatePanelWidth}px`,
                     }}
                   >
+                    <RailResizeHandle />
                     <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2.5">
                       <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
                         Investigate
@@ -1583,6 +1585,7 @@ export function ExplorerPage() {
                       setSheet({ kind: "method", method, autorun: true })
                     }
                     onTagFilter={handleTagDrill}
+                    onDrillField={handleDrillField}
                     similarAnchor={similarAnchor}
                     onSimilarClose={() => setSimilarAnchor(null)}
                     onSelectEvent={(ev) => handleExpandEvent(ev)}

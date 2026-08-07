@@ -12,9 +12,13 @@ import { InvestigateRail } from "@/components/analysis/InvestigateRail";
 import { METHODS_BY_ID } from "@/components/analysis/method-registry";
 
 const sweep = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
+const dismissed = vi.hoisted(() => ({
+  current: { includeDismissed: false, setIncludeDismissed: (_: boolean) => {} },
+}));
 vi.mock("@/hooks/useMethodFindings", () => ({
   useStreamingSweep: () => sweep.current,
   useMethodFindings: () => ({ data: undefined, isLoading: false }),
+  useIncludeDismissed: () => dismissed.current,
   METHOD_LIMIT: 50,
 }));
 
@@ -84,6 +88,7 @@ function renderRail(overrides: Record<string, unknown>, ready = readiness.curren
 describe("InvestigateRail", () => {
   beforeEach(() => {
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
+    dismissed.current = { includeDismissed: false, setIncludeDismissed: () => {} };
   });
 
   it("orders groups strongest-claim first", () => {
@@ -204,5 +209,16 @@ describe("InvestigateRail", () => {
     });
     expect(screen.getByTestId("method-errors")).toHaveTextContent(/charset|Charset/i);
     expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
+  });
+
+  it("offers a way back to a dismissed finding", () => {
+    // Dismissal is presentation-only and reversible on the server. With no
+    // reveal anywhere in the UI, a mis-click removes a finding from every
+    // surface permanently.
+    const setIncludeDismissed = vi.fn();
+    dismissed.current = { includeDismissed: false, setIncludeDismissed };
+    renderRail({});
+    screen.getByTestId("toggle-dismissed").click();
+    expect(setIncludeDismissed).toHaveBeenCalledWith(true);
   });
 });

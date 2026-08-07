@@ -18,6 +18,7 @@ const sweep = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("@/hooks/useMethodFindings", () => ({
   useStreamingSweep: () => sweep.current,
   useMethodFindings: () => ({ data: undefined, isLoading: false }),
+  useIncludeDismissed: () => ({ includeDismissed: false, setIncludeDismissed: () => {} }),
   METHOD_LIMIT: 50,
 }));
 vi.mock("@/components/analysis/SigmaPanel", () => ({
@@ -31,6 +32,19 @@ vi.mock("@/components/analysis/BaselineBuilderDrawer", () => ({
 }));
 vi.mock("@/components/analysis/SimilarEvents", () => ({
   SimilarEvents: () => <div>similar-events</div>,
+}));
+vi.mock("@/components/analysis/TemplatesView", () => ({
+  TemplatesView: () => <div>templates-view</div>,
+}));
+
+const baselineStore = vi.hoisted(() => ({ current: { activeBaselineId: null as string | null } }));
+vi.mock("@/stores/baseline", () => ({
+  useBaselineStore: (sel: (s: unknown) => unknown) => sel(baselineStore.current),
+}));
+vi.mock("@/api/baselines", () => ({
+  baselinesApi: {
+    list: () => Promise.resolve({ baselines: [{ id: "bl-1", name: "Feb 24 – Mar 1" }] }),
+  },
 }));
 
 const capabilities = vi.hoisted(() => ({ current: { embeddings: true, sigma: true } }));
@@ -61,7 +75,11 @@ function state(id: string, over: Record<string, unknown> = {}) {
   };
 }
 
-function renderTools(props: Record<string, unknown> = {}, scope: Record<string, unknown> = {}) {
+function renderTools(
+  props: Record<string, unknown> = {},
+  scope: Record<string, unknown> = {},
+  overrides: Record<string, unknown> = {},
+) {
   sweep.current = {
     scope: { frame: "self", baseline_id: null, baseline_name: null, ...scope },
     done: 10,
@@ -97,6 +115,7 @@ function renderTools(props: Record<string, unknown> = {}, scope: Record<string, 
         }),
       ],
       ["value_novelty", state("value_novelty", { total: 12 })],
+      ...Object.entries(overrides),
     ]),
   };
   return render(
@@ -117,6 +136,7 @@ describe("ToolsSheet", () => {
   beforeEach(() => {
     capabilities.current = { embeddings: true, sigma: true };
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
+    baselineStore.current = { activeBaselineId: null };
   });
 
   it("shows the arithmetic behind a skip, not a bare verdict", () => {
@@ -213,5 +233,50 @@ describe("ToolsSheet", () => {
     expect(button).toHaveTextContent(/pick a baseline/i);
     button.click();
     expect(onRequestScopeChange).not.toHaveBeenCalled();
+  });
+
+  it("carries the template browser, which is the only surface that can reverse a mute", () => {
+    // `events.py` still collapses muted templates out of the grid, histogram
+    // and export. Without a surface that lists and unmutes them, a pre-existing
+    // mute hides evidence with nothing left to inspect or undo it.
+    renderTools();
+    expect(screen.getByText("templates-view")).toBeInTheDocument();
+  });
+
+  it("counts a method still in flight as neither ran nor skipped", () => {
+    // On first open the heavy set is queued behind the cheap one. Claiming it
+    // "ran" is an accounting that has not happened yet.
+    renderTools({}, {}, { value_novelty: state("value_novelty", { pending: true }) });
+    expect(screen.getByTestId("methods-summary")).toHaveTextContent(/1 still running/i);
+  });
+
+  it("renders a dash, not a zero, for a method that ran without scoring", () => {
+    // A zero asserts the method looked and found nothing, which is exactly
+    // what `insufficient_data` says it could not do.
+    renderTools(
+      {},
+      {},
+      {
+        frequency: state("frequency", {
+          dataStatus: "insufficient_data",
+          warnings: ["suspect window holds too few buckets to score"],
+        }),
+      },
+    );
+    expect(screen.getByTestId("method-count-frequency")).toHaveTextContent("—");
+    expect(screen.getByTestId("method-detail-frequency")).toHaveTextContent(/too few buckets/i);
+  });
+
+  it("requests the baseline frame when a definition is already selected", () => {
+    // `scope.baseline_id` is null in the self frame by construction, so reading
+    // `needsDefinition` from it made "Compare baseline" always open the builder
+    // and never request the switch it names.
+    baselineStore.current = { activeBaselineId: "bl-1" };
+    const onRequestScopeChange = vi.fn();
+    renderTools({ onRequestScopeChange });
+    screen.getByTestId("scope-switch-baseline").click();
+    expect(onRequestScopeChange).toHaveBeenCalledWith(
+      expect.objectContaining({ frame: "baseline", baselineId: "bl-1" }),
+    );
   });
 });

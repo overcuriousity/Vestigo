@@ -14,17 +14,21 @@
  * tools out of it entirely.
  */
 import { useEffect, useRef } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Layers, ScanLine } from "lucide-react";
 import { METHODS, type MethodId } from "./method-registry";
 import { MethodRow } from "./MethodRow";
 import { useStreamingSweep } from "@/hooks/useMethodFindings";
 import { SigmaPanel } from "./SigmaPanel";
 import { PatternsView } from "./PatternsView";
+import { TemplatesView } from "./TemplatesView";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
 import { SimilarEvents } from "./SimilarEvents";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
+import { baselinesApi } from "@/api/baselines";
 import { useCapabilities } from "@/api/health";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
+import { useBaselineStore } from "@/stores/baseline";
 import { useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 import type { AnalysisScope } from "@/api/analysis";
@@ -48,6 +52,8 @@ interface Props {
   }) => void;
   /** Sigma hits filter the grid by their "sigma: <title>" tag. */
   onTagFilter?: (tag: string) => void;
+  /** Drill a template (or any field/value) into the grid's filters. */
+  onDrillField?: (field: string, value: string) => void;
   /** The event the analyst anchored from the grid, if any. */
   similarAnchor?: Event | null;
   onSimilarClose?: () => void;
@@ -81,6 +87,7 @@ export function ToolsSheet({
   onOpenMethod,
   onRequestScopeChange,
   onTagFilter,
+  onDrillField,
   similarAnchor,
   onSimilarClose,
   onSelectEvent,
@@ -105,7 +112,12 @@ export function ToolsSheet({
   }, [section]);
 
   const states = METHODS.map((m) => byMethod[m.id]).filter(Boolean);
-  const ran = states.filter((s) => s.status === "applicable" && !s.error).length;
+  // `pending`, not just the plan status: on first open the heavy set is still
+  // queued behind `cheapSettled`, and counting it as run claims an accounting
+  // that has not happened yet. A method still in flight is neither ran nor
+  // skipped, so it is named separately rather than folded into either.
+  const running = states.filter((s) => s.status === "applicable" && s.pending).length;
+  const ran = states.filter((s) => s.status === "applicable" && !s.error && !s.pending).length;
   const skipped = states.filter((s) => s.status !== "applicable").length;
 
   const openBaselineBuilder = () => setBaselineBuilderOpen(true);
@@ -115,6 +127,7 @@ export function ToolsSheet({
       <Section id="methods" title="Methods">
         <p data-testid="methods-summary" className="mb-2 text-[11px] text-[var(--color-fg-muted)]">
           {METHODS.length} considered · {ran} ran · {skipped} skipped
+          {running > 0 && ` · ${running} still running`}
         </p>
         <div className="space-y-1">
           {METHODS.map((meta) =>
@@ -170,10 +183,29 @@ export function ToolsSheet({
         </p>
         <GuidancePanel id="investigate-patterns" />
         <PatternsView caseId={caseId} timelineId={timelineId} onSelectEvent={() => {}} />
+
+        {/* Log templates. The rail lists template *rows*, but muting one — a
+            `kind="routine"`, `detector="log_template"` disposition — is only
+            offered here, and this is the only surface that can list and reverse
+            an existing mute. `events.py` still collapses matching events out of
+            the grid, histogram and export, so dropping it would leave a mute
+            hiding evidence with no way left to inspect or undo it. */}
+        <p className="mt-3 mb-2 text-[11px] text-[var(--color-fg-muted)]">
+          Log-line shapes, with the variable parts masked. Muting one{" "}
+          <strong className="font-medium">collapses</strong> its events out of the grid — always
+          with a visible count, and reversible here.
+        </p>
+        <TemplatesView caseId={caseId} timelineId={timelineId} onDrillField={onDrillField} />
       </Section>
 
       <Section id="scope" title="Scope">
-        <ScopeSection scope={scope} onRequest={onRequestScopeChange} onManage={openBaselineBuilder} />
+        <ScopeSection
+          caseId={caseId}
+          timelineId={timelineId}
+          scope={scope}
+          onRequest={onRequestScopeChange}
+          onManage={openBaselineBuilder}
+        />
       </Section>
 
       <BaselineBuilderDrawer caseId={caseId} timelineId={timelineId} />
@@ -182,14 +214,35 @@ export function ToolsSheet({
 }
 
 function ScopeSection({
+  caseId,
+  timelineId,
   scope,
   onRequest,
   onManage,
 }: {
+  caseId: string;
+  timelineId: string;
   scope: AnalysisScope;
   onRequest: Props["onRequestScopeChange"];
   onManage: () => void;
 }) {
+  // The *selected* definition, from the store — not `scope.baseline_id`, which
+  // the plan response only carries in the baseline frame. Reading it from the
+  // scope made `needsDefinition` permanently true in the self frame, so
+  // "Compare baseline" could never request the switch it names and always fell
+  // through to opening the builder.
+  const selectedBaselineId = useBaselineStore((s) => s.activeBaselineId);
+  const baselineId = scope.baseline_id ?? selectedBaselineId;
+  // Only to name a selection the scope cannot: in the self frame the plan
+  // response carries no baseline at all, so without this the button offering
+  // the switch could not say what it would switch to.
+  const { data: baselines } = useQuery({
+    queryKey: ["baselines", caseId, timelineId],
+    queryFn: () => baselinesApi.list(caseId, timelineId),
+  });
+  const baselineName =
+    scope.baseline_name ?? baselines?.baselines.find((b) => b.id === baselineId)?.name ?? null;
+
   const options = [
     {
       id: "self" as const,
@@ -200,9 +253,9 @@ function ScopeSection({
     {
       id: "baseline" as const,
       icon: Layers,
-      label: scope.baseline_name ? "Compare baseline" : "Pick a baseline…",
-      hint: scope.baseline_name
-        ? `Suspect windows against “${scope.baseline_name}”.`
+      label: baselineName ? "Compare baseline" : "Pick a baseline…",
+      hint: baselineName
+        ? `Suspect windows against “${baselineName}”.`
         : "Pick or build a baseline definition to enable the comparison methods.",
     },
   ];
@@ -215,7 +268,7 @@ function ScopeSection({
           // Switching to the baseline frame without a definition cannot take
           // effect — the store falls back to `self` — so this affordance opens
           // the builder instead of promising a re-run that will not happen.
-          const needsDefinition = opt.id === "baseline" && !scope.baseline_id;
+          const needsDefinition = opt.id === "baseline" && !baselineId;
           return (
             <button
               key={opt.id}
@@ -225,8 +278,8 @@ function ScopeSection({
                   ? onManage()
                   : onRequest({
                       frame: opt.id,
-                      baselineId: scope.baseline_id ?? undefined,
-                      baselineName: scope.baseline_name,
+                      baselineId: baselineId ?? undefined,
+                      baselineName,
                     })
               }
               className={cn(

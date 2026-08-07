@@ -51,6 +51,17 @@ interface UiState {
   investigatePanelWidth: number;
   setInvestigatePanelWidth: (w: number) => void;
 
+  /**
+   * Keep dismissed findings visible (flagged, dimmed) instead of filtered.
+   *
+   * Global rather than per-view: the rail and the sheet render the same query
+   * results, and a per-component toggle would show a finding as dismissed in
+   * one and absent in the other. Without a reveal anywhere, a mis-click is
+   * unrecoverable from the UI — the server keeps supporting both.
+   */
+  includeDismissedFindings: boolean;
+  setIncludeDismissedFindings: (include: boolean) => void;
+
   /** Persisted event grid column widths (px), keyed by column id. */
   columnWidths: Record<string, number>;
   setColumnWidth: (id: string, width: number) => void;
@@ -176,6 +187,8 @@ export const useUiStore = create<UiState>()(
 
       investigatePanelWidth: 400,
       setInvestigatePanelWidth: (w) => set({ investigatePanelWidth: w }),
+      includeDismissedFindings: false,
+      setIncludeDismissedFindings: (include) => set({ includeDismissedFindings: include }),
 
       columnWidths: {},
       setColumnWidth: (id, width) =>
@@ -188,7 +201,7 @@ export const useUiStore = create<UiState>()(
     }),
     {
       name: "vestigo-ui",
-      version: 5,
+      version: 6,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -217,6 +230,11 @@ export const useUiStore = create<UiState>()(
           // Adopting those keys is `onRehydrateStorage`'s job (see
           // `adoptLegacyGuidanceKeys`); all this branch owes is the field.
           state.collapsedGuidance = state.collapsedGuidance ?? {};
+        }
+        if (version < 6) {
+          // Hiding is the default the reveal toggles away from, so an upgraded
+          // session must not come back with dismissed findings already shown.
+          state.includeDismissedFindings = false;
         }
         return state;
       },

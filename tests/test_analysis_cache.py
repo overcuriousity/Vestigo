@@ -31,6 +31,10 @@ BASE = {
     "enrichment_generation": "gen-1",
     "frame": "baseline",
     "baseline_id": "bl-1",
+    "baseline_config_hash": "cfg-1",
+    "field_mappings": {"user": ["usr", "username"]},
+    "source_offsets": {"src-1": 0},
+    "detector_settings": {"stat_z_threshold": 2.5},
     "method": "frequency",
     "params": {"z_threshold": 3.0, "bucket_count": 12},
     "limit": 50,
@@ -59,6 +63,16 @@ def test_params_key_order_does_not_change_the_key():
         ("enrichment_generation", "gen-2"),
         ("frame", "self"),
         ("baseline_id", "bl-2"),
+        # A definition is edited in place and keeps its id, so its *contents*
+        # have to be in the key or an edited window serves the pre-edit answer.
+        ("baseline_config_hash", "cfg-2"),
+        # Both are resolved per request and handed to every detector: a remapped
+        # field changes what was scanned, an offset shifts every timestamp.
+        ("field_mappings", {"user": ["usr"]}),
+        ("source_offsets", {"src-1": 3600}),
+        # The runtime-editable thresholds a runner falls back to when a knob is
+        # omitted. An admin lowering one in the console changes every answer.
+        ("detector_settings", {"stat_z_threshold": 2.0}),
         ("method", "charset"),
         ("params", {"z_threshold": 2.0, "bucket_count": 12}),
         # The runners truncate to `limit`, so a payload computed at 50 rows is
@@ -69,6 +83,52 @@ def test_params_key_order_does_not_change_the_key():
 )
 def test_every_input_independently_changes_the_key(field, value):
     assert fingerprint(**{**BASE, field: value}) != fingerprint(**BASE)
+
+
+def test_mapping_and_offset_ordering_does_not_change_the_key():
+    """Both arrive as dicts assembled per request; only their content is the key."""
+    reordered = {
+        **BASE,
+        "field_mappings": {"user": ["username", "usr"]},
+        "source_offsets": {"src-1": 0},
+    }
+    assert fingerprint(**reordered) == fingerprint(**BASE)
+
+
+def test_detector_settings_material_covers_stat_knobs_but_not_scan_budget():
+    """The prefix sweep is what keeps a newly added threshold from being missed.
+
+    ``stat_scan_*`` is excluded deliberately: those tune ClickHouse's resource
+    budget for the scan and cannot change what the scan concludes, so including
+    them would evict every cached answer on a memory tweak.
+    """
+    from vestigo.core.config import Settings
+    from vestigo.db.analysis_cache import detector_settings
+
+    material = detector_settings(Settings())
+    assert "stat_z_threshold" in material
+    assert "stat_interval_fdr_q" in material
+    assert not any(name.startswith("stat_scan_") for name in material)
+    assert not any(name.startswith("analysis_gate_") for name in material)
+
+
+@pytest.mark.asyncio
+async def test_losing_the_insert_race_is_not_an_error(migrated, monkeypatch):
+    """Two clients missing the same key both computed the same answer.
+
+    The loser's unique-index violation must not fail a request whose ClickHouse
+    scan already succeeded — that would report a method as unrunnable because a
+    *cache write* collided.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from vestigo.db import analysis_cache
+
+    async def boom(*_args, **_kwargs):
+        raise IntegrityError("insert", {}, Exception("duplicate key"))
+
+    monkeypatch.setattr(analysis_cache, "_cache_put", boom)
+    await cache_put(migrated, "case-1", "racy", {"n": 1}, max_rows=10)
 
 
 @pytest.mark.asyncio

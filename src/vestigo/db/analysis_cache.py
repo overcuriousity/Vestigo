@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 
 from vestigo.db.postgres import AnalysisCache, SourceFieldStats, generate_id
 
@@ -38,6 +39,10 @@ def fingerprint(
     enrichment_generation: str,
     frame: str,
     baseline_id: str | None,
+    baseline_config_hash: str | None,
+    field_mappings: dict[str, list[str]] | None,
+    source_offsets: dict[str, int] | None,
+    detector_settings: dict[str, Any],
     method: str,
     params: dict[str, Any],
     limit: int,
@@ -52,6 +57,20 @@ def fingerprint(
     ``limit`` is in the key because the runners truncate to it: a payload
     computed at 50 rows is not the answer to a request for 500, and serving it
     as a hit would assert a completeness it does not have.
+
+    Four inputs are here for the same reason and are easy to forget, because
+    none of them is a request parameter:
+
+    - ``baseline_config_hash`` — a definition is edited *in place*, keeping its
+      id. Keying on the id alone would serve the pre-edit answer for a window
+      the analyst has since moved.
+    - ``field_mappings`` — every detector resolves canonical field aliases
+      through them, so remapping a field changes what was scanned.
+    - ``source_offsets`` — a declared per-source clock-skew correction shifts
+      every timestamp the temporal detectors bucket by.
+    - ``detector_settings`` — the runtime-editable thresholds the runners fall
+      back to whenever a knob is omitted. An admin lowering ``stat_z_threshold``
+      in the console changes every default-parameter answer in the system.
     """
     material = json.dumps(
         {
@@ -60,6 +79,10 @@ def fingerprint(
             "enrichment_generation": enrichment_generation,
             "frame": frame,
             "baseline_id": baseline_id,
+            "baseline_config_hash": baseline_config_hash,
+            "field_mappings": {k: sorted(v) for k, v in sorted((field_mappings or {}).items())},
+            "source_offsets": dict(sorted((source_offsets or {}).items())),
+            "detector_settings": detector_settings,
             "method": method,
             "params": params,
             "limit": limit,
@@ -70,6 +93,28 @@ def fingerprint(
         default=str,
     )
     return hashlib.sha256(material.encode()).hexdigest()
+
+
+#: Settings-field prefixes whose values the detectors read as knob fallbacks.
+#: ``stat_scan_*`` is deliberately excluded: those tune ClickHouse's resource
+#: budget for the scan, not what the scan concludes.
+_DETECTOR_SETTING_PREFIXES = ("stat_",)
+_DETECTOR_SETTING_EXCLUDED = ("stat_scan_",)
+
+
+def detector_settings(settings: Any) -> dict[str, Any]:
+    """The detector-affecting subset of the resolved settings, as key material.
+
+    Taken as a prefix sweep rather than an enumerated list: a new ``stat_*``
+    threshold added without touching this file must still invalidate the cache,
+    and the failure mode of forgetting one is a wrong answer served as proof.
+    """
+    return {
+        name: getattr(settings, name)
+        for name in sorted(type(settings).model_fields)
+        if name.startswith(_DETECTOR_SETTING_PREFIXES)
+        and not name.startswith(_DETECTOR_SETTING_EXCLUDED)
+    }
 
 
 async def enrichment_generation(store: PostgresStore, source_ids: list[str]) -> str:
@@ -119,7 +164,22 @@ async def cache_put(
 
     Eviction is scoped to the writing case: one busy investigation must not
     evict a quiet one's answers, since the two share nothing but a table.
+
+    Losing the insert race is not an error. Two clients that miss the same key
+    computed the same answer over the same inputs — that is what the key means —
+    so the loser's ``IntegrityError`` is swallowed rather than allowed to fail a
+    request whose scan already succeeded. Failing there would report a method as
+    unrunnable because a *cache write* collided.
     """
+    try:
+        await _cache_put(store, case_id, key, payload, max_rows)
+    except IntegrityError:
+        return
+
+
+async def _cache_put(
+    store: PostgresStore, case_id: str, key: str, payload: dict[str, Any], max_rows: int
+) -> None:
     async with store.session_factory() as session:
         existing = (
             await session.execute(

@@ -38,14 +38,19 @@ from vestigo.core.config import get_settings
 from vestigo.db._buckets import query_timestamp_range
 from vestigo.db._dt import ensure_utc
 from vestigo.db.analysis_cache import cache_get, cache_put, enrichment_generation, fingerprint
+from vestigo.db.analysis_cache import detector_settings as detector_settings_material
 from vestigo.db.analysis_plan import (
     PlanInputs,
     build_plan,
     numeric_tokens_from_stats,
     series_distinct_from_stats,
 )
-from vestigo.db.field_stats import ensure_source_field_stats, merged_inventory
-from vestigo.db.postgres import Case, dispositions_hash
+from vestigo.db.field_stats import (
+    approximate_canonical_inventory,
+    ensure_source_field_stats,
+    merged_inventory,
+)
+from vestigo.db.postgres import Case, _windows_config_hash, dispositions_hash
 
 router = APIRouter(prefix="/api/cases", tags=["analysis"])
 
@@ -54,12 +59,35 @@ router = APIRouter(prefix="/api/cases", tags=["analysis"])
 DEFAULT_SERIES_FIELD = "artifact"
 
 
+def _validate_scope_args(frame: str, baseline_id: str | None) -> None:
+    """Reject a request whose frame and baseline id describe different questions.
+
+    The runners key off ``baseline_id`` alone while ``frame`` is what the
+    response — and therefore every verdict's recorded provenance — is stamped
+    with. ``frame=self`` plus an id would run the two-window comparison and
+    label the result "all events scanned"; ``frame=baseline`` without one would
+    do the reverse, and ``build_plan`` would disagree with the runner about the
+    same request. Neither is recoverable after the fact, so neither is guessed.
+    """
+    if frame == "baseline" and baseline_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="frame=baseline requires baseline_id — name the definition to compare against.",
+        )
+    if frame == "self" and baseline_id is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="frame=self takes no baseline_id — pass frame=baseline to compare against one.",
+        )
+
+
 async def _collect_plan_inputs(
     case_id: str,
     timeline_id: str,
     source_ids: list[str],
     frame: str,
     baseline_id: str | None,
+    field_mappings: dict[str, list[str]] | None,
 ) -> PlanInputs:
     """Assemble the gate's snapshot from already-cached data plus one probe.
 
@@ -85,7 +113,15 @@ async def _collect_plan_inputs(
         )
 
     stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
-    inventory, events_total = merged_inventory(stats)
+    # With the timeline's mappings, exactly as every detector path resolves
+    # them. Without them the gate counts each mapped raw key as its own field
+    # and never sees the canonical token, so `reason_facts` — which the Tools
+    # sheet renders verbatim as arithmetic the analyst is invited to check —
+    # would describe a field set no detector uses. The canonical entries are
+    # approximated from the same cache rather than aggregated live, because
+    # this endpoint's contract is that it answers without a scan.
+    inventory, events_total = merged_inventory(stats, field_mappings)
+    inventory = inventory + approximate_canonical_inventory(stats, field_mappings)
 
     # Offloaded: this is a blocking ClickHouse round-trip in an async handler,
     # and the rail fires a dozen findings requests immediately after the plan
@@ -116,8 +152,8 @@ async def _collect_plan_inputs(
 
 async def _scope_object(
     case_id: str, timeline_id: str, frame: str, baseline_id: str | None
-) -> dict[str, Any]:
-    """The scope every response is stamped with.
+) -> tuple[dict[str, Any], str | None]:
+    """The scope every response is stamped with, plus the definition's content hash.
 
     A finding is meaningless without the comparison that produced it, so this
     object travels with every plan and every findings response, and is what a
@@ -126,14 +162,21 @@ async def _scope_object(
     An unresolvable ``baseline_id`` is a 404 rather than a silent fall back to
     the self frame: quietly answering a different question than the one asked
     is the failure mode this whole object exists to prevent.
+
+    The content hash is returned *beside* the scope rather than inside it. It is
+    cache-key material, and the scope object is recorded verbatim as a verdict's
+    provenance — putting it there would make two verdicts on the same comparison
+    fail to dedupe the moment the definition was edited.
     """
     baseline_name = None
+    config_hash = None
     if baseline_id is not None:
         definition = await get_store().get_baseline_definition(case_id, timeline_id, baseline_id)
         if definition is None:
             raise HTTPException(status_code=404, detail="Baseline definition not found")
         baseline_name = definition.name
-    return {"frame": frame, "baseline_id": baseline_id, "baseline_name": baseline_name}
+        config_hash = _windows_config_hash(definition.windows_payload())
+    return {"frame": frame, "baseline_id": baseline_id, "baseline_name": baseline_name}, config_hash
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/analysis/plan")
@@ -154,11 +197,14 @@ async def get_analysis_plan(
     Nothing here is enforcement: every method remains runnable through the
     findings endpoint regardless of its verdict.
     """
-    source_ids, _field_mappings, _source_offsets = await _resolve_timeline_scope(
+    _validate_scope_args(frame, baseline_id)
+    source_ids, field_mappings, _source_offsets = await _resolve_timeline_scope(
         case_id, timeline_id
     )
-    scope = await _scope_object(case_id, timeline_id, frame, baseline_id)
-    inputs = await _collect_plan_inputs(case_id, timeline_id, source_ids, frame, baseline_id)
+    scope, _config_hash = await _scope_object(case_id, timeline_id, frame, baseline_id)
+    inputs = await _collect_plan_inputs(
+        case_id, timeline_id, source_ids, frame, baseline_id, field_mappings
+    )
     plans = build_plan(inputs, get_settings())
     return {
         "methods": [
@@ -489,10 +535,11 @@ async def get_analysis_findings(
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=422, detail="params must be a JSON object.")
 
+    _validate_scope_args(frame, baseline_id)
     cfg = get_settings()
     store = get_store()
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
-    scope = await _scope_object(case_id, timeline_id, frame, baseline_id)
+    scope, baseline_config_hash = await _scope_object(case_id, timeline_id, frame, baseline_id)
     kwargs = _adapt_params(method, parsed)
 
     scoped = set(source_ids)
@@ -506,6 +553,13 @@ async def get_analysis_findings(
         enrichment_generation=await enrichment_generation(store, source_ids),
         frame=frame,
         baseline_id=baseline_id,
+        # The definition's *contents*, not just its id: `PUT .../baselines/{id}`
+        # replaces the windows in place, so an edited baseline keeps its id and
+        # would otherwise be served the pre-edit answer under the new name.
+        baseline_config_hash=baseline_config_hash,
+        field_mappings=field_mappings,
+        source_offsets=source_offsets,
+        detector_settings=detector_settings_material(cfg),
         method=method,
         # The validated params, not the raw object: `2` and `2.0` are the same
         # question and must share a key.

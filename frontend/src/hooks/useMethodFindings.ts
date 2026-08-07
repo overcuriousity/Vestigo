@@ -29,11 +29,29 @@ import {
   type ScopeParams,
 } from "@/api/analysis";
 import { METHODS, type MethodId, type MethodMeta } from "@/components/analysis/method-registry";
-import { HIDE_DISMISSED_KEY } from "@/components/analysis/detector-hooks";
+import {
+  HIDE_DISMISSED_KEY,
+  SHOW_DISMISSED_KEY,
+} from "@/components/analysis/detector-hooks";
+import { useUiStore } from "@/stores/ui";
 import { useAnalysisPlan, useScopeParams } from "./useAnalysisPlan";
 
 /** Per-method fetch cap, mirrored in the rail's coverage copy. */
 export const METHOD_LIMIT = 50;
+
+/**
+ * The reveal toggle, as one store flag rather than per-view state.
+ *
+ * The rail and the sheet render the same finding set from the same query keys,
+ * so a per-component toggle would show a finding as dismissed in one and gone
+ * in the other. The named key segment (not the raw boolean) is what
+ * `useDisposition` scans to pick its optimistic-update branch.
+ */
+export function useIncludeDismissed() {
+  const includeDismissed = useUiStore((s) => s.includeDismissedFindings);
+  const setIncludeDismissed = useUiStore((s) => s.setIncludeDismissedFindings);
+  return { includeDismissed, setIncludeDismissed };
+}
 
 function findingsQueryOptions(
   caseId: string,
@@ -42,6 +60,7 @@ function findingsQueryOptions(
   scopeParams: ScopeParams,
   params: Record<string, unknown>,
   enabled: boolean,
+  includeDismissed: boolean,
 ) {
   return {
     queryKey: [
@@ -54,7 +73,7 @@ function findingsQueryOptions(
       scopeParams.baseline_id ?? "none",
       JSON.stringify(params),
       METHOD_LIMIT,
-      HIDE_DISMISSED_KEY,
+      includeDismissed ? SHOW_DISMISSED_KEY : HIDE_DISMISSED_KEY,
     ],
     queryFn: () =>
       analysisApi.findings(caseId, timelineId, {
@@ -62,6 +81,7 @@ function findingsQueryOptions(
         method,
         params,
         limit: METHOD_LIMIT,
+        ...(includeDismissed ? { include_dismissed: true } : {}),
       }),
     enabled,
     // The server cache makes a repeat cheap and provably current, so the
@@ -78,8 +98,17 @@ export function useMethodFindings(
   opts: { enabled: boolean; params?: Record<string, unknown> },
 ) {
   const scopeParams = useScopeParams();
+  const { includeDismissed } = useIncludeDismissed();
   return useQuery<MethodFindings>(
-    findingsQueryOptions(caseId, timelineId, method, scopeParams, opts.params ?? {}, opts.enabled),
+    findingsQueryOptions(
+      caseId,
+      timelineId,
+      method,
+      scopeParams,
+      opts.params ?? {},
+      opts.enabled,
+      includeDismissed,
+    ),
   );
 }
 
@@ -99,6 +128,15 @@ export interface MethodState {
   pending: boolean;
   error: boolean;
   cache?: MethodFindings["cache"];
+  /**
+   * What the *run* concluded, as distinct from what the plan predicted.
+   * `insufficient_data` / `no_data` mean the method scanned and could not
+   * score — which is not the same claim as a clean zero, and rendering the two
+   * identically is the "checked, clear" misread the rail is built to avoid.
+   */
+  dataStatus?: string;
+  /** Caveats the runner attached to an answer it did produce. */
+  warnings: string[];
 }
 
 const CHEAP_IDS = METHODS.filter((m) => m.costClass === "cheap").map((m) => m.id);
@@ -108,6 +146,7 @@ const HEAVY_IDS = METHODS.filter((m) => m.costClass === "heavy").map((m) => m.id
 export function useStreamingSweep(caseId: string, timelineId: string) {
   const { planById, scope, isLoading: planLoading } = useAnalysisPlan(caseId, timelineId);
   const scopeParams = useScopeParams();
+  const { includeDismissed } = useIncludeDismissed();
 
   const runnable = useCallback(
     (id: MethodId) => !planLoading && planById[id]?.status === "applicable",
@@ -116,7 +155,7 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
 
   const cheapResults = useQueries({
     queries: CHEAP_IDS.map((id) =>
-      findingsQueryOptions(caseId, timelineId, id, scopeParams, {}, runnable(id)),
+      findingsQueryOptions(caseId, timelineId, id, scopeParams, {}, runnable(id), includeDismissed),
     ),
   });
   // Settled, not "not loading": a disabled query is neither, and asking
@@ -128,7 +167,15 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
 
   const heavyResults = useQueries({
     queries: HEAVY_IDS.map((id) =>
-      findingsQueryOptions(caseId, timelineId, id, scopeParams, {}, runnable(id) && cheapSettled),
+      findingsQueryOptions(
+        caseId,
+        timelineId,
+        id,
+        scopeParams,
+        {},
+        runnable(id) && cheapSettled,
+        includeDismissed,
+      ),
     ),
   });
 
@@ -156,6 +203,8 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         pending: runnable(meta.id) && !query?.isFetched && !query?.isError,
         error: Boolean(query?.isError),
         cache: data?.cache,
+        dataStatus: data?.status,
+        warnings: data?.warnings ?? [],
       };
     }
     return out;

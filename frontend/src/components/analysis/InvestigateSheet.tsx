@@ -66,6 +66,8 @@ interface Props {
   }) => void;
   /** Tools mode: Sigma hits filter the grid by tag. */
   onTagFilter?: (tag: string) => void;
+  /** Tools mode: drill a template into the grid's filters. */
+  onDrillField?: (field: string, value: string) => void;
   /** Tools mode: the event anchored from a grid row, for similarity. */
   similarAnchor?: Event | null;
   onSimilarClose?: () => void;
@@ -295,6 +297,7 @@ export function InvestigateSheet({
   onOpenMethod,
   onRequestScopeChange,
   onTagFilter,
+  onDrillField,
   similarAnchor,
   onSimilarClose,
   onSelectEvent,
@@ -371,6 +374,7 @@ export function InvestigateSheet({
               onOpenMethod={onOpenMethod ?? (() => {})}
               onRequestScopeChange={onRequestScopeChange ?? (() => {})}
               onTagFilter={onTagFilter}
+              onDrillField={onDrillField}
               similarAnchor={similarAnchor}
               onSimilarClose={onSimilarClose}
               onSelectEvent={onSelectEvent}

@@ -201,6 +201,30 @@ sorted set of source content hashes, the enrichment generation, the frame and
 baseline, the method, its canonical params, the row `limit`, and
 `dispositions_hash`.
 
+Four of those inputs are not request parameters, and each closes a way of
+being served a wrong answer as proof:
+
+- **the baseline definition's content hash**, not just its id. `PUT
+  .../baselines/{id}` replaces the windows in place, so an edited definition
+  keeps its id — keying on the id alone would serve the pre-edit findings under
+  the new name.
+- **the timeline's `field_mappings`**, which every detector resolves canonical
+  field aliases through. Remapping a field changes what was scanned.
+- **the per-source `time_offset_seconds`**, the declared clock-skew correction
+  the temporal detectors bucket against.
+- **the runtime-editable `stat_*` settings**, the thresholds every runner falls
+  back to when a knob is omitted. An admin lowering `stat_z_threshold` in the
+  console changes every default-parameter answer in the system. Taken as a
+  prefix sweep so a newly added threshold cannot be forgotten; `stat_scan_*` is
+  excluded, since those tune ClickHouse's resource budget rather than the
+  conclusion.
+
+`frame` and `baseline_id` are cross-validated rather than trusted
+independently: the runners key off the id while the response — and therefore
+every verdict's recorded provenance — is stamped with the frame, so a request
+where the two disagree is a 422 rather than a comparison labelled as its
+opposite.
+
 `limit` is in the key because every runner truncates to it: a payload computed
 at fifty rows is not the answer to a request for five hundred, and serving it
 as a hit would assert a completeness it does not have.
