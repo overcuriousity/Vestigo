@@ -210,7 +210,10 @@ process'`, which names the cgroup and the RSS at kill time.
    limit so the server refuses a query rather than being killed. By default it is
    derived as 0.9 × detected RAM, and a containerized server can misdetect that
    badly (503 GiB observed on a 128 GiB VM), in which case it never self-throttles.
-   Pin an absolute value: see `deploy/clickhouse/memory.xml.example`.
+   Pin an absolute value: see `deploy/clickhouse/memory.xml.example`. Pinning does
+   not disable the ratio — the effective ceiling is the *lower* of the two, and
+   ClickHouse logs a "lowered to" line when it clamps the pinned value down, so
+   confirm the value it actually adopted in the server log.
 3. **Vestigo's scan budget** (`VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`) — a *total across
    concurrent heavy scans*; each query is granted budget ÷
    `VESTIGO_STAT_SCAN_CONCURRENCY` as its `max_memory_usage`. Must sit below (2).

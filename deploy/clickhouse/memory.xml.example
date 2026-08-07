@@ -20,8 +20,13 @@
 <clickhouse>
   <!-- 10 GiB. -->
   <max_server_memory_usage>10737418240</max_server_memory_usage>
-  <!-- Ignored once the absolute value above is set; spelled out so an operator
-       who clears max_server_memory_usage doesn't silently fall back to 0.9 of
-       a possibly-misdetected total. -->
+  <!-- The effective ceiling is the *lower* of the absolute value above and
+       (this ratio x detected RAM) — ClickHouse clamps the absolute value down
+       and logs a "lowered to" line when it does. So on a box where the server
+       under-detects RAM, or if this file is copied onto a smaller node, the
+       real limit may be under what is pinned above; check the server log
+       before trusting the pinned number. Spelled out rather than left at the
+       default so an operator who clears max_server_memory_usage doesn't
+       silently fall back to 0.9 of a possibly-misdetected total. -->
   <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
 </clickhouse>

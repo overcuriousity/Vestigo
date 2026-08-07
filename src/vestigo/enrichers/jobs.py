@@ -33,6 +33,19 @@ recomputable — the run route refuses with 409 while a marker exists.
 Provenance: which enricher config/data version produced a source's derived
 fields is recorded per source in Postgres (``SourceEnrichment``) at apply
 time, replacing the per-row hash column of the former side-table design.
+
+**This module assumes a single application process.** ``_ACTIVE_RUNS`` and
+``_APPLY_LOCKS`` are plain in-memory dicts, so under more than one uvicorn
+worker a run that is live in worker A looks dead to worker B: B's enrichers
+dialog would offer Resume for it and B's resume route would claim a slot A
+cannot see. The result is two concurrent partition rewrites of the same
+source, the second silently discarding the first's keys while both record
+``SourceEnrichment`` rows — a reproducibility break, not merely a duplicated
+job. Single-process is the documented deployment (``CLAUDE.md``,
+``core/jobs.py``'s ephemeral JobStore), and these structures are now
+load-bearing for evidence integrity rather than only for job dedup, so
+multi-worker deployment needs a durable claim (a Postgres advisory lock or a
+row-level claim on ``EnrichmentJobRun``) before it is safe.
 """
 
 from __future__ import annotations
@@ -57,7 +70,9 @@ logger = logging.getLogger(__name__)
 # only happen on the event-loop thread with no await between check and set,
 # so a plain dict is race-free without a lock — document-by-invariant, the
 # same reasoning core/jobs.py::JobStore relies on. Purely in-memory: a crash
-# self-heals on restart (startup reconciliation re-schedules what was lost).
+# self-heals on restart (startup reconciliation re-schedules what was lost),
+# but see the module docstring — process-local means single-process-only, and
+# that is now an evidence-integrity constraint, not just a dedup one.
 _ACTIVE_RUNS: dict[tuple[str, str], str] = {}
 
 # Strong references to fire-and-forget enrichment tasks so asyncio doesn't
@@ -108,6 +123,23 @@ def try_claim_enricher_run(timeline_id: str, enricher_key: str, job_id: str) -> 
         return existing
     _ACTIVE_RUNS[(timeline_id, enricher_key)] = job_id
     return None
+
+
+def oldest_unfinished_run(markers: Collection[EnrichmentJobRun]) -> EnrichmentJobRun | None:
+    """Pick the one marker every surface should name, or None if there are none.
+
+    Multiple markers can exist for the same (timeline, enricher) on any
+    database written by a build that let "Run now" mint a fresh job while an
+    earlier one was still unapplied. Oldest-first is the tie-break everywhere —
+    the enrichers dialog's banner, the run route's 409 detail and the
+    auto-trigger's skip log — so an analyst who resumes the job they were shown
+    is never blocked again by a job nobody mentioned. Resume clears exactly one
+    marker, so repeated resume drains the queue FIFO and terminates.
+
+    Callers pass markers they have already established are dead (marker present
+    and the run slot not held by that job id); this only orders them.
+    """
+    return min(markers, key=lambda m: m.created_at) if markers else None
 
 
 def release_enricher_run(timeline_id: str, enricher_key: str, job_id: str) -> None:

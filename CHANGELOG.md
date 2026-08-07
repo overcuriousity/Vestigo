@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Auto field selection is reproducible.** The novelty-field recommender ranked
+  recommended-first, then by coverage — and stopped there. Coverage ties are the normal
+  case (every field of one source covers that source's events), so the tie order came
+  from a ClickHouse `GROUP BY` that does not promise a stable row order. The detectors
+  that auto-pick fields take the top 1 (`value_novelty`) or top 2 (`value_combo`) of
+  that list, so the same timeline could be scanned on different fields each time it was
+  opened. The ranking now breaks ties on the field token, and the inventory query orders
+  its `LIMIT` by `cov_count DESC, key ASC` so truncation is stable too.
+- **The enrichment partition rewrite no longer raises insert parallelism.**
+  `VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS` was removed rather than re-defaulted:
+  ClickHouse's default of 0 means a single-threaded `INSERT SELECT`, so shipping 2 gave
+  each thread its own squashing buffer on the exact query that OOM-killed a host — more
+  write-side memory, presented as a guardrail.
+  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` now defaults to 64 MiB (it previously
+  shipped ClickHouse's own 256 MiB default, so it bounded nothing) and is no longer
+  marked restart-required, because the apply reads it per call.
+- **The enrichers dialog clears its own interrupted-run banner.** A resume's partition
+  rewrite runs after the request returns, so the marker was still present at the only
+  refetch the dialog did — leaving "an earlier run was interrupted" on screen, with Run
+  now disabled, until the dialog was closed and reopened. The tracked job now invalidates
+  the enrichers list on completion, and Resume stays disabled until that job is terminal
+  instead of re-arming into a 409 against the analyst's own resume.
+- **One interrupted run, one job id.** The dialog surfaced the oldest stale marker while
+  the run route's 409 named the newest, so with more than one marker an analyst could
+  resume the job they were shown and be blocked again by a job nobody mentioned. Oldest
+  wins everywhere now. The auto-trigger's skip log also no longer reports a healthy
+  in-flight run as needing a resume.
+
 ## [1.11.0] — 2026-08-07
 
 ### Added
@@ -57,9 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a ClickHouse memory error, so nothing appears in the server's own log. It now holds a
   gate slot across the whole rewrite including the `REPLACE PARTITION` swap, which
   queues merges on freshly written parts that the per-query cap never covered, and its
-  write side is bounded separately (`VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS`,
-  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`) because the scan settings bound a read
-  while the rewrite also materializes a full copy of the partition.
+  write side is bounded separately (`VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`, the
+  block squash floor, set below ClickHouse's default) because the scan settings bound a
+  read while the rewrite also materializes a full copy of the partition.
   - **Operators on a full-docker stack should also set memory ceilings.** The automatic
     scan budget is detected in the *app* container and sizes itself as though ClickHouse
     owned the machine, which is wrong as soon as they are separate containers. The

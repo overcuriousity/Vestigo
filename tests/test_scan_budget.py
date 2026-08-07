@@ -145,8 +145,11 @@ def test_enrichment_partition_rewrite_takes_a_gate_slot():
 
         def query(self, sql, parameters=None):
             assert seen == ["acquired"], "rewrite ran outside the gate"
-            assert "max_insert_threads" in sql
             assert "min_insert_block_size_bytes" in sql
+            # Left at ClickHouse's default (0 = single-threaded INSERT SELECT):
+            # every insert thread carries its own squashing buffer, so raising
+            # it adds write-side memory to the query being bounded here.
+            assert "max_insert_threads" not in sql
 
     store = ClickHouseStore.__new__(ClickHouseStore)
     store.client = _Client()
@@ -162,3 +165,37 @@ def test_enrichment_partition_rewrite_takes_a_gate_slot():
         ch_mod.HEAVY_SCAN_GATE = original
 
     assert seen == ["acquired", "released"]
+
+
+def test_apply_insert_block_size_is_read_per_call():
+    """An admin-console edit reaches the next apply without a restart.
+
+    ``enrichment_apply_insert_block_bytes`` is declared ``restart_required=False``
+    in the settings registry, unlike every ``stat_scan_*`` setting — those are
+    frozen into the module-level ``HEAVY_SCAN_SETTINGS`` string at import, while
+    this one is interpolated from ``get_settings()`` when the apply runs. This
+    test is what makes that claim honest.
+    """
+    from vestigo.core.config import set_runtime_overrides
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    sql_seen: list[str] = []
+
+    class _Client:
+        def command(self, sql):
+            pass
+
+        def query(self, sql, parameters=None):
+            sql_seen.append(sql)
+
+    store = ClickHouseStore.__new__(ClickHouseStore)
+    store.client = _Client()
+    store.database = "testdb"
+
+    try:
+        set_runtime_overrides({"enrichment_apply_insert_block_bytes": 8_388_608})
+        store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
+    finally:
+        set_runtime_overrides({})
+
+    assert "min_insert_block_size_bytes = 8388608" in sql_seen[0]

@@ -782,9 +782,16 @@ class ClickHouseStore:
         queues merges on the freshly written parts, and merge memory was never
         covered by the per-query cap.
 
-        Write-side memory is bounded separately from the scan settings
-        (``VESTIGO_ENRICHMENT_APPLY_*``) — the INSERT materializes a full copy
-        of the partition, and each insert thread holds its own block buffers.
+        Write-side memory is bounded separately from the scan settings — the
+        INSERT materializes a full copy of the partition, which the scan
+        settings (a read budget) do not cover. The one knob we set is
+        ``min_insert_block_size_bytes``
+        (``VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES``), the size a block is
+        squashed to before a part is written. ``max_insert_threads`` is
+        deliberately left at ClickHouse's default of 0 — a single-threaded
+        ``INSERT SELECT``. Raising it would give each thread its own squashing
+        buffer, i.e. more peak memory on the exact query this method exists to
+        keep bounded, in exchange for speed this path does not need.
         """
         settings = get_settings()
         rows_table, events_table = self._enrichment_scratch_tables(scratch_suffix)
@@ -833,7 +840,6 @@ class ClickHouseStore:
                 ) AS m ON e.event_id = m.event_id
                 WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
                 {HEAVY_SCAN_SETTINGS}, join_use_nulls = 0, join_algorithm = 'grace_hash',
-                max_insert_threads = {settings.enrichment_apply_max_insert_threads},
                 min_insert_block_size_bytes = {settings.enrichment_apply_insert_block_bytes}
                 """,
                 parameters={

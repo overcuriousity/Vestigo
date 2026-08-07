@@ -105,9 +105,14 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   and merge memory was never covered by the per-query cap). Ungated, that
   rewrite stacked on top of a full set of admitted detector scans and
   OOM-killed clickhouse-server on a 32 GiB full-docker host mid-apply. Its
-  write side is bounded separately (`VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS`,
-  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`), since the scan settings bound a
-  read and the rewrite also materializes a full copy of the partition.
+  write side is bounded separately by `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`,
+  since the scan settings bound a read and the rewrite also materializes a full
+  copy of the partition. That setting is ClickHouse's `min_insert_block_size_bytes`
+  — a squash *floor*, the size a block accumulates to before a part is written —
+  shipped below ClickHouse's own 256 MiB default so it bounds something out of the
+  box. `max_insert_threads` is deliberately left at the ClickHouse default (0, a
+  single-threaded `INSERT SELECT`): each insert thread carries its own squashing
+  buffer, so raising it adds write-side memory to the query being bounded.
   Anything else that adds a whole-partition or whole-corpus query — read or
   write — takes a slot too.
 - **Every `VESTIGO_STAT_SCAN_*` setting is restart-required.** The SETTINGS
@@ -115,6 +120,9 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   imported by value into each scan module, so an admin-console edit cannot
   reach the running process. They are declared `restart_required` in the
   settings registry rather than silently accepting an edit that does nothing.
+  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` is **not** in that group: it is
+  read via `get_settings()` and interpolated when the apply runs, so an
+  admin-console edit takes effect on the next enrichment apply.
 - **Window-function sorts cannot spill** (verified empirically on ClickHouse
   26.6: the `MergeSortingTransform` feeding a window function runs into
   `max_memory_usage` regardless of `max_bytes_before_external_sort`, code
@@ -373,6 +381,17 @@ pass's expansion width plus the residual per-field queries for top-level
 columns and mapped canonical fields. The highest-coverage recommended fields
 win the cap; you can always override with an explicit field list via the
 Fields picker to scan something the auto-selector skipped.
+
+**The ranking is a total order, deliberately.** Coverage ties are the normal
+case — every field of one source covers exactly that source's events — so
+recommended-then-coverage alone leaves the tie order to whatever the inventory
+`GROUP BY` happened to return, which ClickHouse does not promise to keep stable
+between runs. The field token breaks the tie (and the inventory query's own
+`LIMIT` orders by `cov_count DESC, key ASC` for the same reason). Without it the
+same timeline could be auto-scanned on different fields each time it was opened,
+which is a reproducibility defect, not just noise: the demo case's `value_combo`
+pair flipped between one that finds the fabricated lateral movement and one that
+finds nothing at all.
 
 ### Value combinations (the `value_combo` variant)
 

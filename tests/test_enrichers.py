@@ -2248,6 +2248,56 @@ async def test_list_timeline_enrichers_survives_a_failing_eligibility_check(stor
     assert "clickhouse down" in row["eligibility_error"]
 
 
+@pytest.mark.asyncio
+async def test_oldest_marker_is_what_every_surface_names(store, monkeypatch):
+    """Dialog banner, run-route 409 and the skip log must agree on one job id.
+
+    Two markers for one (timeline, enricher) are reachable on any database
+    written before the run route refused while a marker exists. The banner used
+    to surface the oldest (dict last-write-wins over a newest-first list) while
+    the 409 named the newest, so resuming the job the analyst was shown left
+    them blocked by a job nobody had mentioned.
+    """
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import list_timeline_enrichers, run_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers.jobs import oldest_unfinished_run
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-order")
+    for job_id in ("job-old", "job-new"):
+        await store.start_enrichment_job_run(
+            job_id, timeline_id=timeline.id, case_id=case.id, enricher_key="stub-order"
+        )
+        await _stage_one_row(store, job_id=job_id)
+
+    markers = await store.list_enrichment_job_runs_for_timeline(case.id, timeline.id)
+    # The query orders newest-first; the tie-break deliberately does not.
+    assert [m.job_id for m in markers] == ["job-new", "job-old"]
+    assert oldest_unfinished_run(markers).job_id == "job-old"
+
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    row = next(e for e in res["enrichers"] if e["key"] == "stub-order")
+    assert row["unfinished_run"]["job_id"] == "job-old"
+
+    with pytest.raises(HTTPException) as excinfo:
+        await run_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-order",
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=User(id="u1", username="t", is_admin=True, is_active=True),
+        )
+    assert excinfo.value.status_code == 409
+    assert "job-old" in excinfo.value.detail
+
+
+def test_oldest_unfinished_run_of_nothing_is_none():
+    from vestigo.enrichers.jobs import oldest_unfinished_run
+
+    assert oldest_unfinished_run([]) is None
+
+
 # --- resume route ----------------------------------------------------------
 
 
@@ -2582,3 +2632,43 @@ async def test_auto_trigger_skips_when_unfinished_marker_exists(store, monkeypat
     assert job_store._jobs == {}
     assert _jobs.get_active_enricher_run(timeline.id, "stub-auto") is None
     assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_reports_a_live_run_as_running_not_resumable(store, monkeypatch, caplog):
+    """A marker held by its own live job is not something an analyst can resume.
+
+    Without excluding the run-slot holder, a healthy auto-run still going on a
+    sibling source is logged as "must be resumed first" and points the operator
+    at a resume that would only 409. Both paths skip either way — this is about
+    the log telling the truth, which is exactly what cost hours in session-56.
+    """
+    import logging
+
+    from vestigo.api.routers.cases import _trigger_automatic_enrichments
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-auto-live")
+    await store.upsert_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-auto-live",
+        mode="automatic",
+        enabled=True,
+        updated_by=None,
+    )
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-auto-live"
+    )
+
+    job_store = JobStore()
+    _jobs.try_claim_enricher_run(timeline.id, "stub-auto-live", "job1")
+    try:
+        with caplog.at_level(logging.INFO, logger="vestigo.api.routers.cases"):
+            await _trigger_automatic_enrichments(store, None, job_store, case.id, "s1")
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-auto-live", "job1")
+
+    assert job_store._jobs == {}
+    assert "already running" in caplog.text
+    assert "must be resumed" not in caplog.text

@@ -61,8 +61,7 @@ model migrates once, not twice.**
 ## Milestone 3 — polish
 
 - [ ] **Make the scan guardrails live instead of restart-required.** Every
-  `VESTIGO_STAT_SCAN_*` (and the two `VESTIGO_ENRICHMENT_APPLY_*`) setting is declared
-  `restart_required` because `HEAVY_SCAN_SETTINGS` is a module-level string built once at
+  `VESTIGO_STAT_SCAN_*` setting is declared `restart_required` because `HEAVY_SCAN_SETTINGS` is a module-level string built once at
   import and `HEAVY_SCAN_GATE` is imported *by value* into `db/queries.py`,
   `db/anomaly_stats.py`, `sigma/runner.py` and `db/clickhouse.py` — rebinding the `_scan`
   globals would not reach those bindings. An operator tuning the budget in response to an

@@ -2481,6 +2481,11 @@ class PostgresStore:
         the slot is claimed before the marker is written and released after it
         would have been deleted, so "marker present and slot not held by it"
         is what actually means dead.
+
+        Newest-first is a display order, not a tie-break: a caller that has to
+        name *one* dead marker (banner, 409 detail, skip log) must pick it with
+        ``enrichers.jobs.oldest_unfinished_run`` rather than by index, so every
+        surface names the same job.
         """
         async with self.session_factory() as session:
             stmt = select(EnrichmentJobRun).where(

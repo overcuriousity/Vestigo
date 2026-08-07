@@ -29,6 +29,8 @@ interface Props {
  */
 export function EnrichersDialog({ caseId, timeline }: Props) {
   const [open, setOpen] = useState(false);
+  /** enricher key -> the job id its resume started, for the disabled-state check below. */
+  const [resumeJobs, setResumeJobs] = useState<Record<string, string>>({});
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
 
@@ -91,24 +93,46 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
       addJob(res.job_id, `${vars.key} enrichment`, [
         ["events", caseId, timeline.id],
         ["fields", caseId, timeline.id],
+        // A run that dies mid-apply leaves a marker behind; refetch on job
+        // completion so the banner reflects what the run actually left.
+        [...queryKey],
       ]);
     },
   });
 
-  // Applies an interrupted run's already-staged results. Invalidates the list
-  // on settle so the banner clears (success) or stays (failure).
+  // Applies an interrupted run's already-staged results. The marker only clears
+  // once the background apply finishes, which is *after* the POST returns — so
+  // the banner has to be refetched on job completion (via addJob), not just on
+  // settle. The settle invalidation stays: while the apply is in flight the
+  // banner is still true and should keep showing.
   const resumeMutation = useMutation({
     mutationFn: (vars: { key: string; jobId: string }) =>
       enrichersApi.resume(caseId, timeline.id, vars.key, vars.jobId),
     onSuccess: (res, vars) => {
+      setResumeJobs((prev) => ({ ...prev, [vars.key]: res.job_id }));
       addJob(res.job_id, `${vars.key} enrichment (resume)`, [
         ["events", caseId, timeline.id],
         ["fields", caseId, timeline.id],
+        [...queryKey],
       ]);
     },
     onSettled: () => qc.invalidateQueries({ queryKey }),
     meta: { errorTitle: "Could not resume the enrichment run" },
   });
+
+  // A resume's partition rewrite runs in a BackgroundTasks callback, so the
+  // mutation settles long before the work is done. Track the job it started and
+  // keep the button disabled until that job reports terminal, or a second click
+  // 409s against the analyst's own in-progress resume. A *failed* resume
+  // re-enables the button; a successful one clears the banner outright.
+  const jobs = useJobsStore((s) => s.jobs);
+  const isResumeInFlight = (key: string) => {
+    if (resumeMutation.isPending && resumeMutation.variables?.key === key) return true;
+    const jobId = resumeJobs[key];
+    if (!jobId) return false;
+    const status = jobs[jobId]?.status;
+    return status !== undefined && status !== "completed" && status !== "failed";
+  };
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -145,7 +169,7 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
                 resumeMutation.mutate({ key: e.key, jobId: e.unfinished_run.job_id })
               }
               isRunning={runMutation.isPending && runMutation.variables?.key === e.key}
-              isResuming={resumeMutation.isPending && resumeMutation.variables?.key === e.key}
+              isResuming={isResumeInFlight(e.key)}
             />
           ))}
         </div>

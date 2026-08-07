@@ -1,9 +1,51 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 159 — the enrichment OOM-kill and resuming an interrupted run).
+Last updated: 2026-08-07 (session 160 — closing the PR #242 review, and a coin-flip in
+auto field selection).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 160 — 2026-08-07: closing the PR #242 review
+
+**Why.** The review of the session-159 branch surfaced nine findings, two of them
+behavioral, and CI then failed on something the review had not looked for at all.
+
+**The one that mattered most was backwards.** `finalize_enrichment_apply` set
+`max_insert_threads = 2` and documented it as a write-side guardrail. ClickHouse's
+default for that setting is `0`, which means a *single-threaded* `INSERT SELECT` — so
+the "guardrail" doubled insert parallelism on the exact query that OOM-killed the host,
+each thread carrying its own squashing buffer. The setting is gone rather than
+re-defaulted: this path runs once per source at job end and buys nothing with the extra
+thread. Its sibling `min_insert_block_size_bytes` was mis-described as a cap on
+in-flight block size (it is a squash *floor*) and shipped at ClickHouse's own default,
+so it bounded nothing out of the box; it now defaults to 64 MiB and, since the apply
+reads it via `get_settings()` per call, is no longer flagged restart-required.
+
+**A CI failure that was never about this branch.** `test_demo_detector_coverage_
+clickhouse.py::…[find_value_combos]` failed once, then passed twice on re-run — and
+passed on `main`. The demo generator is fully seeded, so the nondeterminism had to be
+downstream of the data. It was: `recommend_novelty_fields` sorted on
+`(not recommended, -coverage)` and stopped. In the demo case `attr:computer_name` and
+`attr:event_id` tie at coverage 0.3707 (both come from the same source), so which one
+took rank 2 was decided by the row order of a ClickHouse `GROUP BY` — and
+`find_value_combos`' auto mode takes the top two. `(user, computer_name)` finds 20
+combinations; `(user, event_id)` finds none. Probing it directly gave 7 runs of one
+pair and 1 of the other. The fix is a total order (token as the final key, and
+`cov_count DESC, key ASC` in the inventory's own `LIMIT`, where a tie at the cutoff
+could drop different fields entirely). This is a reproducibility defect in its own
+right — the same timeline could be auto-scanned on different fields each time it was
+opened — and the demo test was doing exactly its job in catching it.
+
+**The rest.** One canonical stale marker (oldest) for the dialog banner, the run route's
+409 and the auto-trigger log, which previously disagreed; the auto-trigger no longer
+reports a healthy in-flight run as needing a resume; the enrichers dialog invalidates
+itself when the resume job *completes* rather than when the POST returns, and keeps
+Resume disabled until then; `deploy/clickhouse/memory.xml.example` no longer claims the
+RAM ratio is ignored once an absolute ceiling is pinned (ClickHouse clamps to the lower
+of the two and logs "lowered to"); and `enrichers/jobs.py` now records that its
+in-memory run slot is single-process-only, which after this branch is load-bearing for
+evidence integrity rather than only for job dedup.
 
 ## Session 159 — 2026-08-07: the enrichment OOM-kill, and resuming an interrupted run
 
@@ -28,8 +70,10 @@ detector scans, each carrying a full cap — the session-52 failure mode reached
 enrichment side. It now holds a slot for the whole rewrite, **including the REPLACE**: the
 swap queues merges on freshly written parts, and merge memory was never covered by the
 per-query cap. The write side is bounded separately
-(`VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS`, `..._INSERT_BLOCK_BYTES`) because the scan
-settings bound a read while this also materializes a full copy of the partition.
+(`VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`) because the scan settings bound a read
+while this also materializes a full copy of the partition. `max_insert_threads` is left at
+ClickHouse's default (0 = single-threaded `INSERT SELECT`): raising it gives every thread
+its own squashing buffer, which is more write-side memory on the query being bounded.
 
 **Cause 2: the auto-detected budget assumes ClickHouse owns the box.** `db/_scan.py`
 detects from the *app* process's cgroup, or the host's `MemTotal` when there is none. The

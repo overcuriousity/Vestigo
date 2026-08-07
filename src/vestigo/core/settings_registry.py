@@ -584,19 +584,15 @@ _SPECS: tuple[SettingSpec, ...] = (
         restart_required=True,
     ),
     SettingSpec(
-        "enrichment_apply_max_insert_threads",
-        "scans",
-        "Enrichment apply insert threads",
-        "Insert threads for the enrichment partition rewrite. Each holds its own block "
-        "buffers, so this bounds the rewrite's write-side memory.",
-        restart_required=True,
-    ),
-    SettingSpec(
         "enrichment_apply_insert_block_bytes",
         "scans",
-        "Enrichment apply insert block (bytes)",
-        "Max in-flight insert block for the enrichment partition rewrite.",
-        restart_required=True,
+        "Enrichment apply insert block size (bytes)",
+        "Squash floor for the enrichment partition rewrite's INSERT: rows accumulate until "
+        "a block reaches at least this size before a part is written. Lower it to trade more "
+        "(smaller) parts and more merge work for less insert-time memory. Unlike the scan "
+        "settings this one is not restart-required — it is interpolated per call, not frozen "
+        "into a module-level SETTINGS clause at import.",
+        restart_required=False,
     ),
     # ── Enrichment ───────────────────────────────────────────────────────
     SettingSpec(

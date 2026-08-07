@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -484,6 +485,7 @@ async def _trigger_automatic_enrichments(
     """
     from vestigo.enrichers.jobs import (
         get_active_enricher_run,
+        oldest_unfinished_run,
         run_enrichment_job,
         spawn_tracked_enrichment_task,
         try_claim_enricher_run,
@@ -504,14 +506,26 @@ async def _trigger_automatic_enrichments(
         # misleading log. The analyst resumes it from the enrichers dialog.
         # Awaited here rather than below so the check/create/claim sequence
         # stays await-free.
-        if await store.list_enrichment_job_runs_for_timeline(
+        #
+        # A *live* run has a marker too, so exclude the job currently holding
+        # the run slot — same "marker present and slot not held by it" rule the
+        # enrichers dialog applies. Without it, a healthy auto-run still going
+        # on a sibling source would be reported as needing a resume that would
+        # only 409; the truthful message is the "already running" one below.
+        # This read is for message accuracy only — the authoritative slot check
+        # is re-read after the await.
+        running_job_id = get_active_enricher_run(timeline_id, enricher_key)
+        markers = await store.list_enrichment_job_runs_for_timeline(
             case_id, timeline_id, enricher_key=enricher_key
-        ):
+        )
+        dead = oldest_unfinished_run([m for m in markers if m.job_id != running_job_id])
+        if dead is not None:
             logger.info(
-                "Skipping auto-enrichment %s for timeline %s: an unfinished run must be "
+                "Skipping auto-enrichment %s for timeline %s: unfinished run %s must be "
                 "resumed first (enrichers dialog)",
                 enricher_key,
                 timeline_id,
+                dead.job_id,
             )
             continue
         # Check before creating the job so a skip leaves no orphan pending
@@ -1718,7 +1732,7 @@ async def list_timeline_enrichers(
     GUI until an admin makes them available.
     """
     from vestigo.enrichers.base import effective_enricher_state
-    from vestigo.enrichers.jobs import get_active_enricher_run
+    from vestigo.enrichers.jobs import get_active_enricher_run, oldest_unfinished_run
     from vestigo.enrichers.registry import all_enrichers, get_cached_availability
 
     store = get_store()
@@ -1742,7 +1756,14 @@ async def list_timeline_enrichers(
     markers = await store.list_enrichment_job_runs_for_timeline(case_id, timeline_id)
     stale = [m for m in markers if get_active_enricher_run(timeline_id, m.enricher_key) != m.job_id]
     staged_counts = await store.count_staged_rows_by_job([m.job_id for m in stale])
-    stale_by_key = {m.enricher_key: m for m in stale}
+    # One marker per enricher, chosen by the shared oldest-first tie-break so the
+    # banner names the same job as the run route's 409 and the auto-trigger's log.
+    by_key: dict[str, list[EnrichmentJobRun]] = defaultdict(list)
+    for marker in stale:
+        by_key[marker.enricher_key].append(marker)
+    stale_by_key = {
+        key: run for key, markers_ in by_key.items() if (run := oldest_unfinished_run(markers_))
+    }
 
     available = [
         enricher
@@ -1863,6 +1884,7 @@ async def run_timeline_enricher(
     """
     from vestigo.enrichers.jobs import (
         get_active_enricher_run,
+        oldest_unfinished_run,
         run_enrichment_job,
         try_claim_enricher_run,
     )
@@ -1906,14 +1928,16 @@ async def run_timeline_enricher(
     # resume first; resume is always available and always terminal, so this can
     # never wedge. Any marker reaching here is dead by the run-slot invariant:
     # a live run would have 409'd on the check above.
-    unfinished = await store.list_enrichment_job_runs_for_timeline(
-        case_id, timeline_id, enricher_key=enricher_key
+    unfinished = oldest_unfinished_run(
+        await store.list_enrichment_job_runs_for_timeline(
+            case_id, timeline_id, enricher_key=enricher_key
+        )
     )
-    if unfinished:
+    if unfinished is not None:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"An unfinished enrichment run (job {unfinished[0].job_id}) must be "
+                f"An unfinished enrichment run (job {unfinished.job_id}) must be "
                 "resumed before a new run can start"
             ),
         )
