@@ -447,6 +447,42 @@ def test_markdown_block_size_is_bounded(client, admin_bootstrap, store):
     assert resp.status_code == 422, resp.text
 
 
+def test_export_freezes_an_error_for_a_genuinely_missing_view(client, admin_bootstrap, store):
+    """The delete endpoint can no longer strand a view_ref, but a row can
+    still go missing out of band (a partial import, a manual repair). That
+    must degrade to a frozen `resolution.error`, never fail the export."""
+    import asyncio
+
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    story = _create_story(client, case_id)
+    base = f"/api/cases/{case_id}/stories/{story['id']}"
+    view = _create_view(client, case_id)
+    timeline_id = _default_timeline(client, case_id)
+    added = client.post(
+        f"{base}/blocks",
+        json={"kind": "view_ref", "content": {"view_id": view["id"], "timeline_id": timeline_id}},
+    )
+    assert added.status_code == 200, added.text
+
+    # Straight past the reference guard, the way an out-of-band repair would.
+    async def _drop_row() -> None:
+        from sqlalchemy import delete as sa_delete
+
+        from vestigo.db.postgres import View
+
+        async with store.session_factory() as session:
+            await session.execute(sa_delete(View).where(View.id == view["id"]))
+            await session.commit()
+
+    asyncio.get_event_loop().run_until_complete(_drop_row())
+
+    export = client.post(f"{base}/exports")
+    assert export.status_code == 200, export.text
+    (block,) = export.json()["export"]["snapshot"]["blocks"]
+    assert block["resolution"]["error"] is not None
+
+
 def test_export_flow(client, admin_bootstrap, store):
     from vestigo.stories.schemas import canonical_hash
 
@@ -455,8 +491,8 @@ def test_export_flow(client, admin_bootstrap, store):
     story = _create_story(client, case_id)
     base = f"/api/cases/{case_id}/stories/{story['id']}"
     client.post(f"{base}/blocks", json={"kind": "markdown", "content": {"text": "# frozen"}})
-    # A view ref that goes dangling after the fact (the view is deleted out
-    # from under the block) must not fail the export — it freezes as an error.
+    # Deleting a view a block references no longer dangles it: the view is
+    # hidden rather than removed, so the export still resolves the real data.
     view = _create_view(client, case_id)
     timeline_id = _default_timeline(client, case_id)
     added = client.post(
@@ -467,7 +503,9 @@ def test_export_flow(client, admin_bootstrap, store):
         },
     )
     assert added.status_code == 200, added.text
-    assert client.delete(f"/api/cases/{case_id}/views/{view['id']}").status_code == 200
+    deleted = client.delete(f"/api/cases/{case_id}/views/{view['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["hidden"] is True
 
     resp = client.post(f"{base}/exports")
     assert resp.status_code == 200, resp.text
@@ -476,7 +514,7 @@ def test_export_flow(client, admin_bootstrap, store):
     assert snapshot["v"] == 1
     md, view = snapshot["blocks"]
     assert md["data"] == {"text": "# frozen"}
-    assert view["resolution"]["error"] is not None
+    assert view["resolution"]["error"] is None
     assert export["snapshot_hash"] == canonical_hash(snapshot)
     assert export["has_artifact"] is False
 
