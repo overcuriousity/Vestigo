@@ -185,7 +185,9 @@ instead of rebuilding.
   weight and is the *only* fixed-width surface that flow spends; `InvestigateSheet` is one
   absolutely-positioned overlay in three modes — finding, method, tools — so detail can be
   wide without ever widening the row; `method-registry.ts` is the single description of all
-  twelve methods, including the prose that used to live in a Method tab), `viz/`
+  twelve methods, including the prose that used to live in a Method tab; the sheet's method
+  mode runs a method with the analyst's own knob values, which is what keeps the analysis
+  gate advice rather than a lock in the UI as well as the API), `viz/`
   (charts), `agent/`, `stories/`, `cases/`, `timelines/`, `sources/`, `auth/`, `jobs/`,
   `tour/`, `layout/` (app shell, top bar, job tray), `ui/` (design-system primitives on top
   of Radix).
@@ -211,12 +213,18 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
   through `/analysis/findings` and returns what an unconditional sweep would have. A wrong
   precondition fails silently, so `tests/test_demo_detector_coverage_clickhouse.py` asserts
   the gate offers every method that file proves finds something.
-- A `require_case_read` endpoint does not write. One deliberate exception exists and is not a
-  precedent: `api/routers/cases.py::_settle_dead_recommendations` relabels a `running` column
-  recommendation whose job is provably gone, because a read-only member has no other way to
-  repair a timeline that reports "suggesting columns…" forever. It is bounded to display
-  metadata, recomputes nothing, touches no evidence and records no audit row. Anything else
-  that wants to write from a read endpoint needs its own argument, not this one.
+- A `require_case_read` endpoint does not write. Two deliberate exceptions exist, neither of
+  them a precedent — each carries its own argument, and a third would need its own too:
+  - `api/routers/cases.py::_settle_dead_recommendations` relabels a `running` column
+    recommendation whose job is provably gone, because a read-only member has no other way to
+    repair a timeline that reports "suggesting columns…" forever. It is bounded to display
+    metadata, recomputes nothing, touches no evidence and records no audit row.
+  - `api/routers/analysis.py::get_analysis_findings` writes the answer it just computed into
+    `analysis_cache`. The row is derived data keyed by a fingerprint of its own inputs, so it
+    asserts nothing the request did not already establish; it touches no evidence, records no
+    audit row, and eviction is bounded per case. Refusing the write for read-only members
+    would make the surface they use slowest the one that never warms — and every member's
+    first open pays the full sweep either way.
 - Airgapped/offline-by-default is a design goal (`VESTIGO_ALLOW_ONLINE`, `docs/TECH_STACK.md` §6).
   Don't add code paths that reach the network unconditionally. Exception: optional OIDC SSO
   (`VESTIGO_OIDC_ENABLED`) is deliberately independent of `VESTIGO_ALLOW_ONLINE` — see `TECH_STACK.md` §6.

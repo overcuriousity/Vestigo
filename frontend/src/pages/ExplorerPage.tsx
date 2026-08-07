@@ -4,7 +4,8 @@
  * Panels:
  *   Left:   FilterRail (collapsible via toolbar toggle)
  *   Center: EventGrid (always visible)
- *   Right:  EventDetailPanel + InvestigatePanel (independently closeable)
+ *   Right:  EventDetailPanel + the Investigate rail (independently closeable),
+ *           with the Investigate sheet overlaying the stage rather than joining it
  *
  * All filter state lives in the URL so investigation links are shareable.
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
@@ -357,7 +358,7 @@ export function ExplorerPage() {
   /** What the Investigate overlay is showing, if anything. */
   const [sheet, setSheet] = useState<
     | { kind: "finding"; method: MethodId; rank: number }
-    | { kind: "method"; method: MethodId }
+    | { kind: "method"; method: MethodId; autorun?: boolean }
     | { kind: "tools"; section?: "methods" | "signatures" | "explore" | "scope" }
     | null
   >(null);
@@ -908,7 +909,6 @@ export function ExplorerPage() {
     // or this anchor would be set and never shown.
     setInvestigatePanelOpen(true);
     setSheet({ kind: "tools", section: "explore" });
-    setInvestigatePanelOpen(true);
   }, [setInvestigatePanelOpen]);
 
   const handleHistogramRange = useCallback(
@@ -1579,6 +1579,9 @@ export function ExplorerPage() {
                     sheet={sheet}
                     onClose={() => setSheet(null)}
                     onOpenMethod={(method: MethodId) => setSheet({ kind: "method", method })}
+                    onRunMethod={(method: MethodId) =>
+                      setSheet({ kind: "method", method, autorun: true })
+                    }
                     onTagFilter={handleTagDrill}
                     similarAnchor={similarAnchor}
                     onSimilarClose={() => setSimilarAnchor(null)}

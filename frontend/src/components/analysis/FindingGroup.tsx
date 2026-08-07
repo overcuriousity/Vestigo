@@ -46,7 +46,8 @@ interface Props {
   onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
 }
 
-function TemplateRows({
+/** Exported for the method sheet's own results list — see `ScoredRow`. */
+export function TemplateRows({
   rows,
   onSelect,
 }: {
@@ -72,7 +73,13 @@ function TemplateRows({
   );
 }
 
-function ScoredRow({
+/**
+ * Exported so the method sheet can render a run's results with the same row —
+ * including its disposition controls. A second row implementation there would
+ * fork the verdict semantics, which is the one thing in this subsystem that
+ * has to stay single-sourced.
+ */
+export function ScoredRow({
   item,
   caseId,
   timelineId,

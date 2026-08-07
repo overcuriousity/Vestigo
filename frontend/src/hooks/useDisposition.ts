@@ -266,8 +266,7 @@ export function useDisposition(caseId: string, timelineId: string) {
               : filterFindings(data, t),
         );
       }
-      // The shared detector sweep (feeding FindingsFeed and the accordion's
-      // badges) lives under its own key, not the ["anomalies", …] prefix —
+      // The legacy shared detector sweep lives under its own key, not the ["anomalies", …] prefix —
       // without filtering it too, a verdict declared from the feed leaves the
       // row visibly untouched and reads as a dead button. Sweeps are always
       // fetched without include_dismissed, so plain removal matches a refetch.

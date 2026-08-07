@@ -16,9 +16,11 @@
  * controls live in the sheet, where there is room for them.
  */
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { AlertTriangle } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
 import { useStreamingSweep } from "@/hooks/useMethodFindings";
+import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { ScopeStrip } from "./ScopeStrip";
 import { FindingGroup } from "./FindingGroup";
 import { AnalysisEmptyState } from "./detector-shared";
@@ -57,6 +59,38 @@ const PRESETS: { id: string; label: string; methods: MethodId[] | null }[] = [
   { id: "integrity", label: "Evidence integrity", methods: ["timestamp_order", "numeric_range"] },
 ];
 
+/**
+ * Nothing to analyse — said once for the whole rail, with somewhere to go.
+ *
+ * The two arms are genuinely different situations: mid-ingest resolves itself
+ * and needs only somewhere to watch, while an empty case needs an action and a
+ * link to perform it.
+ */
+function NoEventsState({ caseId, stillIngesting }: { caseId: string; stillIngesting: boolean }) {
+  return (
+    <AnalysisEmptyState
+      hint={
+        stillIngesting ? (
+          "The job tray in the top bar shows progress. Events become searchable as they land."
+        ) : (
+          <>
+            Upload a log file on the{" "}
+            <Link to={`/cases/${caseId}`} className="text-[var(--color-accent)] hover:underline">
+              case overview
+            </Link>{" "}
+            to begin — every method here works over a timeline's events, and this one has none
+            yet.
+          </>
+        )
+      }
+    >
+      {stillIngesting
+        ? "This timeline's sources are still ingesting."
+        : "No events in this timeline yet."}
+    </AnalysisEmptyState>
+  );
+}
+
 interface Props {
   caseId: string;
   timelineId: string;
@@ -84,7 +118,8 @@ export function InvestigateRail({
   onComboDrill,
   onFrequencyDrill,
 }: Props) {
-  const { byMethod, scope, done, total } = useStreamingSweep(caseId, timelineId);
+  const { byMethod, scope, done, total, planLoading } = useStreamingSweep(caseId, timelineId);
+  const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   const [preset, setPreset] = useState("all");
 
   const active = PRESETS.find((p) => p.id === preset) ?? PRESETS[0];
@@ -134,6 +169,17 @@ export function InvestigateRail({
   const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);
   const anyFindings = visible.some((m) => byMethod[m.id].findings.length > 0);
+
+  // Said before anything else, and instead of everything else: a findings list
+  // over a timeline with no events is not "clear", it is unanswered.
+  if (nothingToAnalyse) {
+    return (
+      <div className="space-y-2">
+        <GuidancePanel id="investigate-anomalies" />
+        <NoEventsState caseId={caseId} stillIngesting={stillIngesting} />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-2">
@@ -209,9 +255,21 @@ export function InvestigateRail({
         />
       ))}
 
-      {!anyFindings && done === total && (
+      {/* "No findings" is a claim that every method that could run, ran. It
+          may not be made while the plan is still resolving (nothing is
+          runnable yet, so done === total is vacuously true) or while any
+          method is still pending. */}
+      {!anyFindings && !planLoading && total > 0 && done === total && (
         <AnalysisEmptyState hint="Open Tools to run a method the gate skipped, or set a baseline to enable the comparison methods.">
           No findings under this scope.
+        </AnalysisEmptyState>
+      )}
+
+      {/* Every method gated off. Not the same statement as "nothing found" —
+          nothing ran. */}
+      {!planLoading && total === 0 && (
+        <AnalysisEmptyState hint="Open Tools to see why each was skipped and run one anyway, or set a baseline to enable the comparison methods.">
+          No method applies to this data yet.
         </AnalysisEmptyState>
       )}
 

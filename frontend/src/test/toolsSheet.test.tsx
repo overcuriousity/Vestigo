@@ -10,7 +10,7 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ToolsSheet } from "@/components/analysis/ToolsSheet";
 import { METHODS, METHODS_BY_ID } from "@/components/analysis/method-registry";
 
@@ -28,6 +28,19 @@ vi.mock("@/components/analysis/PatternsView", () => ({
 }));
 vi.mock("@/components/analysis/BaselineBuilderDrawer", () => ({
   BaselineBuilderDrawer: () => null,
+}));
+vi.mock("@/components/analysis/SimilarEvents", () => ({
+  SimilarEvents: () => <div>similar-events</div>,
+}));
+
+const capabilities = vi.hoisted(() => ({ current: { embeddings: true, sigma: true } }));
+vi.mock("@/api/health", () => ({ useCapabilities: () => capabilities.current }));
+
+const readiness = vi.hoisted(() => ({
+  current: { stillIngesting: false, nothingToAnalyse: false },
+}));
+vi.mock("@/hooks/useTimelineReadiness", () => ({
+  useTimelineReadiness: () => readiness.current,
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -48,9 +61,9 @@ function state(id: string, over: Record<string, unknown> = {}) {
   };
 }
 
-function renderTools(props: Record<string, unknown> = {}) {
+function renderTools(props: Record<string, unknown> = {}, scope: Record<string, unknown> = {}) {
   sweep.current = {
-    scope: { frame: "self", baseline_id: null, baseline_name: null },
+    scope: { frame: "self", baseline_id: null, baseline_name: null, ...scope },
     done: 10,
     total: 10,
     planLoading: false,
@@ -101,6 +114,11 @@ function renderTools(props: Record<string, unknown> = {}) {
 }
 
 describe("ToolsSheet", () => {
+  beforeEach(() => {
+    capabilities.current = { embeddings: true, sigma: true };
+    readiness.current = { stillIngesting: false, nothingToAnalyse: false };
+  });
+
   it("shows the arithmetic behind a skip, not a bare verdict", () => {
     renderTools();
     const row = screen.getByTestId("method-row-numeric_range");
@@ -152,10 +170,48 @@ describe("ToolsSheet", () => {
     expect(screen.getByText("patterns-view")).toBeInTheDocument();
   });
 
+  it("renders no Sigma entry point when Sigma is unconfigured", () => {
+    // The house rule for every optional subsystem: absent, not disabled. A
+    // disabled control is a question the analyst then has to answer.
+    capabilities.current = { embeddings: true, sigma: false };
+    renderTools();
+    expect(screen.queryByText("sigma-panel")).toBeNull();
+  });
+
+  it("renders no similarity affordance when embeddings are unconfigured", () => {
+    capabilities.current = { embeddings: false, sigma: true };
+    renderTools();
+    expect(screen.queryByText(/find events like it/i)).toBeNull();
+  });
+
+  it("offers no Sigma scan on a timeline with nothing to scan", () => {
+    // Zero matches there reads as "these rules cleared you". They did not —
+    // there was nothing to match against.
+    readiness.current = { stillIngesting: false, nothingToAnalyse: true };
+    renderTools();
+    expect(screen.queryByText("sigma-panel")).toBeNull();
+  });
+
   it("routes a scope change through a confirm rather than applying it directly", () => {
     const onRequestScopeChange = vi.fn();
-    renderTools({ onRequestScopeChange });
+    renderTools({ onRequestScopeChange }, { baseline_id: "bl-1", baseline_name: "Feb 24 – Mar 1" });
     screen.getByTestId("scope-switch-baseline").click();
-    expect(onRequestScopeChange).toHaveBeenCalled();
+    expect(onRequestScopeChange).toHaveBeenCalledWith({
+      frame: "baseline",
+      baselineId: "bl-1",
+      baselineName: "Feb 24 – Mar 1",
+    });
+  });
+
+  it("asks for a definition rather than confirming a baseline frame that cannot take effect", () => {
+    // Confirming a baseline frame with no definition would announce a re-run
+    // and then silently fall back to self — the store clears the frame with the
+    // id. The affordance has to lead to the builder instead.
+    const onRequestScopeChange = vi.fn();
+    renderTools({ onRequestScopeChange });
+    const button = screen.getByTestId("scope-switch-baseline");
+    expect(button).toHaveTextContent(/pick a baseline/i);
+    button.click();
+    expect(onRequestScopeChange).not.toHaveBeenCalled();
   });
 });

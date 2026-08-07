@@ -131,6 +131,32 @@ def test_a_confirmed_verdict_is_per_scope_but_a_normal_one_is_not(client, seeded
     assert _post("normal", SCOPE)["id"] == _post("normal", other)["id"]
 
 
+def test_key_order_does_not_split_one_verdict_into_two(client, seeded):
+    """Dedupe compares the stored scope, and the two dialects disagree on what
+    that means: JSONB normalizes key order, SQLite's JSON text does not. Both
+    only agree if the canonical form is what gets written and compared."""
+    case_id, timeline_id = seeded
+    reordered = {
+        "baseline_name": SCOPE["baseline_name"],
+        "frame": SCOPE["frame"],
+        "baseline_id": SCOPE["baseline_id"],
+    }
+
+    def _post(analysis_scope):
+        return client.post(
+            f"/api/cases/{case_id}/timelines/{timeline_id}/dispositions",
+            json={
+                "kind": "confirmed",
+                "detector": "value_novelty",
+                "source_id": "s1",
+                "event_id": "e1",
+                "analysis_scope": analysis_scope,
+            },
+        ).json()["disposition"]
+
+    assert _post(SCOPE)["id"] == _post(reordered)["id"]
+
+
 def test_bulk_verdicts_carry_scope_too(client, seeded):
     case_id, timeline_id = seeded
     r = client.post(

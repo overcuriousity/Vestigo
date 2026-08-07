@@ -6,7 +6,8 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { InvestigateRail } from "@/components/analysis/InvestigateRail";
 import { METHODS_BY_ID } from "@/components/analysis/method-registry";
 
@@ -17,9 +18,20 @@ vi.mock("@/hooks/useMethodFindings", () => ({
   METHOD_LIMIT: 50,
 }));
 
+const readiness = vi.hoisted(() => ({
+  current: { stillIngesting: false, nothingToAnalyse: false },
+}));
+vi.mock("@/hooks/useTimelineReadiness", () => ({
+  useTimelineReadiness: () => readiness.current,
+}));
+
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
+  );
 }
 
 const finding = (over: Record<string, unknown> = {}) => ({
@@ -47,7 +59,8 @@ function state(id: string, over: Record<string, unknown> = {}) {
   };
 }
 
-function renderRail(overrides: Record<string, unknown>) {
+function renderRail(overrides: Record<string, unknown>, ready = readiness.current) {
+  readiness.current = ready;
   sweep.current = {
     scope: { frame: "self", baseline_id: null, baseline_name: null },
     done: 2,
@@ -69,6 +82,10 @@ function renderRail(overrides: Record<string, unknown>) {
 }
 
 describe("InvestigateRail", () => {
+  beforeEach(() => {
+    readiness.current = { stillIngesting: false, nothingToAnalyse: false };
+  });
+
   it("orders groups strongest-claim first", () => {
     renderRail({
       byMethod: {
@@ -145,6 +162,37 @@ describe("InvestigateRail", () => {
     );
     screen.getByText(/curl\/7\.68\.0/).click();
     expect(onSelectFinding).toHaveBeenCalledWith("value_novelty", 0);
+  });
+
+  it("says the timeline is empty rather than that nothing was found", () => {
+    // "No findings under this scope" on a timeline with no events reads as an
+    // all-clear. Nothing was scanned; there was nothing to scan.
+    renderRail({}, { stillIngesting: false, nothingToAnalyse: true });
+    expect(screen.getByText("No events in this timeline yet.")).toBeInTheDocument();
+    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+    expect(screen.getByRole("link", { name: /case overview/i })).toHaveAttribute(
+      "href",
+      "/cases/c1",
+    );
+  });
+
+  it("says the sources are still ingesting rather than that there is nothing", () => {
+    renderRail({}, { stillIngesting: true, nothingToAnalyse: true });
+    expect(screen.getByText("This timeline's sources are still ingesting.")).toBeInTheDocument();
+  });
+
+  it("makes no all-clear claim while the plan is still resolving", () => {
+    // Nothing is runnable during plan load, so `done === total` is vacuously
+    // true — the empty state must not read that as "everything checked, clear".
+    renderRail({ done: 0, total: 0, planLoading: true });
+    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+    expect(screen.queryByText(/No method applies/i)).toBeNull();
+  });
+
+  it("distinguishes nothing-found from nothing-ran", () => {
+    renderRail({ done: 0, total: 0, planLoading: false });
+    expect(screen.getByText(/No method applies to this data yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
   });
 
   it("renders a method's error without hiding the rest of the stream", () => {

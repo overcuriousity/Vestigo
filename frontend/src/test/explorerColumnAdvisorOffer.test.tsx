@@ -119,7 +119,6 @@ vi.mock("@/components/explorer/TimelineHistogram", () => ({ TimelineHistogram: (
 vi.mock("@/components/explorer/FilterRail", () => ({ FilterRail: () => null }));
 vi.mock("@/components/explorer/FilterChips", () => ({ FilterChips: () => null }));
 vi.mock("@/components/explorer/EventDetailPanel", () => ({ EventDetailPanel: () => null }));
-vi.mock("@/components/analysis/InvestigatePanel", () => ({ InvestigatePanel: () => null }));
 vi.mock("@/components/agent/AgentPanel", () => ({ AgentPanel: () => null }));
 vi.mock("@/components/viz/FieldHistogramModal", () => ({ FieldHistogramModal: () => null }));
 

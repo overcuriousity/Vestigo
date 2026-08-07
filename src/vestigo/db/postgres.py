@@ -30,6 +30,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
@@ -1034,7 +1035,16 @@ class FindingDisposition(Base):
     # Named `analysis_scope`, not `scope`: this class already uses "scope" for
     # the value-vs-event distinction (see the class docstring), and one word
     # meaning two things in one model is how the wrong one gets read.
-    analysis_scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #
+    # The one JSONB column in this model, and the only one anywhere that is
+    # *compared* rather than merely stored: `create_disposition` puts it in the
+    # dedupe predicate for `confirmed`, and PostgreSQL has no equality operator
+    # for `json` — only for `jsonb`. SQLite keeps the plain-JSON text encoding,
+    # where `=` is byte equality, so both dialects only agree if the value is
+    # canonicalized first (see :func:`canonical_scope`).
+    analysis_scope: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1063,6 +1073,44 @@ class FindingDisposition(Base):
 
 
 DISPOSITION_KINDS = ("normal", "dismissed", "confirmed", "routine")
+
+
+def canonical_scope(scope: dict | None) -> dict | None:
+    """Return *scope* with its keys in a fixed order, or None.
+
+    ``analysis_scope`` is the one JSON column that participates in an equality
+    comparison, and the two dialects disagree about what equality means: JSONB
+    normalizes, SQLite's JSON is text and compares byte for byte. Writing and
+    comparing the canonical form makes the same two verdicts collide on both.
+    """
+    return None if scope is None else json.loads(json.dumps(scope, sort_keys=True))
+
+
+def disposition_identity(
+    *,
+    timeline_id: Any,
+    kind: Any,
+    detector: Any,
+    field: Any,
+    value: Any,
+    source_id: Any,
+    event_id: Any,
+    analysis_scope: Any = None,
+) -> tuple:
+    """The dedupe key for a disposition row, as one hashable tuple.
+
+    ``analysis_scope`` joins the key for ``confirmed`` only — see
+    :meth:`PostgresStore.create_disposition` for why the two verdict families
+    differ. Serialized because a dict is unhashable.
+
+    Shared by the single-row and bulk paths so the identity rule is stated once:
+    two expressions of it drift, and a drifted dedupe silently writes a
+    duplicate verdict.
+    """
+    scope_part = (
+        json.dumps(canonical_scope(analysis_scope), sort_keys=True) if kind == "confirmed" else None
+    )
+    return (timeline_id, kind, detector, field, value, source_id, event_id, scope_part)
 
 
 def dispositions_hash(rows: Iterable[FindingDisposition]) -> str:
@@ -4296,6 +4344,7 @@ class PostgresStore:
         expressing anything new.
         """
         scope_in_identity = kind == "confirmed"
+        analysis_scope = canonical_scope(analysis_scope)
         async with self.session_factory() as session:
             conditions = [
                 FindingDisposition.case_id == case_id,
@@ -4308,10 +4357,23 @@ class PostgresStore:
                 FindingDisposition.event_id == event_id,
             ]
             if scope_in_identity:
+                # Valid because the column is JSONB on PostgreSQL; `json` has no
+                # equality operator there. See the column's comment.
                 conditions.append(FindingDisposition.analysis_scope == analysis_scope)
+            # `first`, not `scalar_one_or_none`: nothing in the schema enforces
+            # this tuple's uniqueness, and pre-existing duplicates must dedupe
+            # to the oldest rather than raise MultipleResultsFound.
             existing = (
-                await session.execute(select(FindingDisposition).where(*conditions))
-            ).scalar_one_or_none()
+                (
+                    await session.execute(
+                        select(FindingDisposition)
+                        .where(*conditions)
+                        .order_by(FindingDisposition.created_at.asc())
+                    )
+                )
+                .scalars()
+                .first()
+            )
             if existing is not None:
                 return existing
             row = FindingDisposition(
@@ -4354,22 +4416,6 @@ class PostgresStore:
         if not items:
             return []
 
-        def _scope_key(
-            timeline_id: Any,
-            kind: Any,
-            detector: Any,
-            field: Any,
-            value: Any,
-            source_id: Any,
-            event_id: Any,
-            analysis_scope: Any = None,
-        ) -> tuple:
-            # analysis_scope joins the key for `confirmed` only — see
-            # :meth:`create_disposition` for why the two verdict families
-            # differ. Serialized because a dict is unhashable.
-            scope_part = json.dumps(analysis_scope, sort_keys=True) if kind == "confirmed" else None
-            return (timeline_id, kind, detector, field, value, source_id, event_id, scope_part)
-
         async with self.session_factory() as session:
             # One prefetch covering every row a batch item could collide with.
             # NULL scope columns rule out a composite-tuple IN (NULL never
@@ -4391,29 +4437,29 @@ class PostgresStore:
                 .all()
             )
             by_key: dict[tuple, FindingDisposition] = {
-                _scope_key(
-                    r.timeline_id,
-                    r.kind,
-                    r.detector,
-                    r.field,
-                    r.value,
-                    r.source_id,
-                    r.event_id,
-                    r.analysis_scope,
+                disposition_identity(
+                    timeline_id=r.timeline_id,
+                    kind=r.kind,
+                    detector=r.detector,
+                    field=r.field,
+                    value=r.value,
+                    source_id=r.source_id,
+                    event_id=r.event_id,
+                    analysis_scope=r.analysis_scope,
                 ): r
                 for r in existing_rows
             }
             rows: list[FindingDisposition] = []
             for it in items:
-                key = _scope_key(
-                    it.get("timeline_id"),
-                    it["kind"],
-                    it.get("detector", "*"),
-                    it.get("field"),
-                    it.get("value"),
-                    it.get("source_id"),
-                    it.get("event_id"),
-                    it.get("analysis_scope"),
+                key = disposition_identity(
+                    timeline_id=it.get("timeline_id"),
+                    kind=it["kind"],
+                    detector=it.get("detector", "*"),
+                    field=it.get("field"),
+                    value=it.get("value"),
+                    source_id=it.get("source_id"),
+                    event_id=it.get("event_id"),
+                    analysis_scope=it.get("analysis_scope"),
                 )
                 existing = by_key.get(key)
                 if existing is not None:
@@ -4431,7 +4477,7 @@ class PostgresStore:
                     event_id=it.get("event_id"),
                     note=it.get("note"),
                     details=it.get("details"),
-                    analysis_scope=it.get("analysis_scope"),
+                    analysis_scope=canonical_scope(it.get("analysis_scope")),
                     created_by=it.get("created_by"),
                 )
                 session.add(row)

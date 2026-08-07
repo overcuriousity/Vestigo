@@ -198,7 +198,29 @@ every method applicable and runs everything.
 `GET .../analysis/findings` is memoized in `analysis_cache` (`db/analysis_cache.py`),
 keyed on a SHA-256 of everything that can change an answer: the timeline, the
 sorted set of source content hashes, the enrichment generation, the frame and
-baseline, the method, its canonical params, and `dispositions_hash`.
+baseline, the method, its canonical params, the row `limit`, and
+`dispositions_hash`.
+
+`limit` is in the key because every runner truncates to it: a payload computed
+at fifty rows is not the answer to a request for five hundred, and serving it
+as a hit would assert a completeness it does not have.
+
+Params enter the key **after** validation, not as the client sent them. Each
+method declares its knobs as a Pydantic model in `api/routers/analysis.py`
+(`METHOD_MODELS`), with `extra="forbid"` and the same bounds `GET /anomalies`
+declares as query constraints. That model is the single declaration of a
+method's parameters — `METHOD_PARAMS`, which the frontend's method-registry
+test checks its knobs against, is derived from it. Two consequences: a typo'd
+knob 422s rather than computing the default answer under a key claiming the
+typo, and `2` and `2.0` are one question with one key.
+
+Dismissals and confirmations are applied to the **response**, after the cache,
+never before it. The key covers `normal` verdicts only, since those are what
+change a computation; a cached payload that had already been
+dismissal-filtered would keep a later dismissal invisible until something
+unrelated invalidated it. `include_dismissed` is therefore presentation-only in
+the full sense — it changes what is shown and never what is computed or
+stored.
 
 Sources are immutable after ingestion (enrichment applies excepted, and those
 move the generation), so identical inputs cannot describe different data: **a
@@ -215,7 +237,9 @@ rescan rather than a wrong answer.
 
 Every row is derived data. Eviction is LRU per case
 (`analysis_cache_max_rows_per_case`) and costs a rescan and nothing else, which
-is why it needs no audit trail. `DetectorRun` is unchanged and keeps its
+is why it needs no audit trail. "Least recently *computed*" is literal: a
+refresh restamps `computed_at`, so a key in active use never ages past one
+nobody has asked for since. `DetectorRun` is unchanged and keeps its
 separate role: the accumulating forensic diary of what an analyst ran.
 
 ### Scope provenance
@@ -229,7 +253,11 @@ sides now record it:
   reached under. Nullable — rows written before this existed read as "scope not
   recorded", which is honest where a backfill would be invention. Named
   `analysis_scope` because that model already uses "scope" for the
-  value-vs-event distinction.
+  value-vs-event distinction. It is the one JSON column in the model that is
+  *compared* rather than only stored, hence `JSONB` on PostgreSQL (migration
+  `0027`): `json` has no equality operator there. SQLite keeps the plain-JSON
+  text encoding, so both dialects only agree because writes and comparisons go
+  through the canonical key-sorted form (`postgres.canonical_scope`).
 
 `analysis_scope` is deliberately **not** part of `dispositions_hash`: that
 hashes detection-affecting facts, and scope-at-verdict-time is provenance.

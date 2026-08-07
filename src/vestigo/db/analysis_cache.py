@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, select
@@ -39,6 +40,7 @@ def fingerprint(
     baseline_id: str | None,
     method: str,
     params: dict[str, Any],
+    limit: int,
     dispositions_hash: str,
 ) -> str:
     """Return the cache key for one method run under one scope over one dataset.
@@ -46,6 +48,10 @@ def fingerprint(
     Source hashes are sorted and the JSON is key-sorted, so the key depends on
     the *content* of the inputs and not on the order a caller happened to
     assemble them in.
+
+    ``limit`` is in the key because the runners truncate to it: a payload
+    computed at 50 rows is not the answer to a request for 500, and serving it
+    as a hit would assert a completeness it does not have.
     """
     material = json.dumps(
         {
@@ -56,6 +62,7 @@ def fingerprint(
             "baseline_id": baseline_id,
             "method": method,
             "params": params,
+            "limit": limit,
             "dispositions_hash": dispositions_hash,
         },
         sort_keys=True,
@@ -123,6 +130,10 @@ async def cache_put(
         ).scalar_one_or_none()
         if existing is not None:
             existing.payload = payload
+            # Eviction keeps the newest `computed_at`, so a refreshed row that
+            # kept its original stamp would age while in active use and be
+            # evicted ahead of rows nobody has asked for since.
+            existing.computed_at = datetime.now(UTC)
         else:
             session.add(
                 AnalysisCache(

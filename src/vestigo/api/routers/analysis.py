@@ -19,13 +19,16 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from vestigo.api.deps import get_store, require_case_read
 from vestigo.api.routers.events import (
+    _apply_confirmations,
+    _apply_dismissals,
     _get_stat_anomaly_service,
     _resolve_timeline_scope,
     _run_stat_detector,
@@ -84,7 +87,11 @@ async def _collect_plan_inputs(
     stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
     inventory, events_total = merged_inventory(stats)
 
-    min_ts, max_ts = query_timestamp_range(
+    # Offloaded: this is a blocking ClickHouse round-trip in an async handler,
+    # and the rail fires a dozen findings requests immediately after the plan
+    # resolves — holding the event loop here stalls all of them.
+    min_ts, max_ts = await run_in_threadpool(
+        query_timestamp_range,
         svc.ch.client,
         svc.ch.database,
         "case_id = {case_id:String} AND source_id IN {source_ids:Array(String)}",
@@ -169,57 +176,155 @@ async def get_analysis_plan(
     }
 
 
-#: Per-method parameter schemas: the params-object field a client sends, mapped
-#: to the keyword the underlying runner takes. Declaring this table is what lets
-#: the cache key be ``hash(params)`` with no per-method allowlist — a method
-#: cannot get a wrong key by omission, because a key it does not declare is
-#: rejected outright rather than silently dropped.
-METHOD_PARAMS: dict[str, dict[str, str]] = {
-    "value_novelty": {"fields": "fields"},
-    "value_combo": {"fields": "fields"},
-    "numeric_range": {"fields": "fields"},
-    "charset": {"fields": "fields", "group_field": "group_field"},
-    "entropy": {"fields": "fields"},
-    "frequency": {"series_field": "series_field", "z_threshold": "z_threshold"},
-    "proportion_shift": {"fields": "fields", "fdr_q": "fdr_q", "min_ratio": "min_ratio"},
-    "value_distribution_drift": {"fields": "fields", "fdr_q": "fdr_q"},
-    "interval_periodicity": {
-        "series_field": "series_field",
-        "fdr_q": "fdr_q",
-        "min_ratio": "min_ratio",
-    },
-    "timestamp_order": {"min_skew_seconds": "min_skew_seconds"},
-    "sequence_novelty": {
-        "series_field": "series_field",
-        "ngram_size": "ngram_size",
-        "max_gap_seconds": "max_gap_seconds",
-    },
+class _Params(BaseModel):
+    """Base for every method's parameter model.
+
+    One model per method is the single declaration of that method's knobs: the
+    accepted keys, their types and their bounds. Rejecting an unknown key
+    matters for the cache — a typo'd knob that was silently dropped would
+    compute the *default* answer and store it under a key claiming the typo'd
+    parameters, so a later analyst would be served a cached answer to a question
+    nobody asked. Rejecting a wrong *type* matters for the same reason plus one
+    more: the runners take these values unchecked, so a list where a string is
+    expected is a 500 rather than a 422.
+
+    Bounds mirror the ``Query(...)`` constraints ``GET /anomalies`` declares for
+    the same knobs. The model's field names are the runner keywords; where a
+    client-facing name ever needs to differ, declare it as a Pydantic ``alias``
+    rather than reintroducing a second mapping table.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    def runner_kwargs(self) -> dict[str, Any]:
+        """Validated params as runner keywords, defaults included.
+
+        Defaults are included deliberately: this dict is also the cache key
+        material, and "omitted" and "sent at its default value" are the same
+        question and must hash the same.
+        """
+        return self.model_dump()
+
+
+class _FieldsParams(_Params):
+    """Methods that take a field selection and nothing else."""
+
+    fields: str | None = None
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def _join_fields(cls, v: Any) -> Any:
+        """Accept a JSON list as well as the comma-joined string.
+
+        A list is the natural JSON encoding of a multi-field knob, and it is
+        what a client writes first. ``_parse_novelty_fields`` splits a string,
+        so normalize here rather than letting ``.split`` fail downstream. The
+        ``__none__`` sentinel (explicitly "no fields") passes through as-is.
+        """
+        if isinstance(v, list | tuple):
+            return ",".join(str(x) for x in v)
+        return v
+
+
+class _ValueNoveltyParams(_FieldsParams):
+    pass
+
+
+class _ValueComboParams(_FieldsParams):
+    pass
+
+
+class _NumericRangeParams(_FieldsParams):
+    pass
+
+
+class _EntropyParams(_FieldsParams):
+    pass
+
+
+class _CharsetParams(_FieldsParams):
+    group_field: str | None = None
+
+
+class _FrequencyParams(_Params):
+    series_field: str = DEFAULT_SERIES_FIELD
+    z_threshold: float | None = Field(default=None, gt=0)
+
+
+class _ProportionShiftParams(_FieldsParams):
+    fdr_q: float | None = Field(default=None, gt=0, le=1)
+    min_ratio: float | None = Field(default=None, gt=1)
+
+
+class _ValueDistributionDriftParams(_FieldsParams):
+    fdr_q: float | None = Field(default=None, gt=0, le=1)
+
+
+class _IntervalPeriodicityParams(_Params):
+    series_field: str = DEFAULT_SERIES_FIELD
+    fdr_q: float | None = Field(default=None, gt=0, le=1)
+    min_ratio: float | None = Field(default=None, gt=1)
+
+
+class _TimestampOrderParams(_Params):
+    min_skew_seconds: float | None = Field(default=None, ge=0)
+
+
+class _SequenceNoveltyParams(_Params):
+    series_field: str = DEFAULT_SERIES_FIELD
+    ngram_size: int | None = Field(default=None, ge=2, le=5)
+    max_gap_seconds: int | None = Field(default=None, ge=1)
+
+
+class _LogTemplateParams(_Params):
     #: Not a `_run_stat_detector` detector — log templating is a browser with
     #: its own service call (see :func:`_run_log_templates`). Routing it through
     #: the detector dispatch would run a different analysis under this label.
-    "log_template": {"field": "field", "order": "order", "only_new": "only_new"},
+    field: str = "message"
+    order: Literal["count", "first_seen", "last_seen"] = "count"
+    only_new: bool = False
+
+
+METHOD_MODELS: dict[str, type[_Params]] = {
+    "value_novelty": _ValueNoveltyParams,
+    "value_combo": _ValueComboParams,
+    "numeric_range": _NumericRangeParams,
+    "charset": _CharsetParams,
+    "entropy": _EntropyParams,
+    "frequency": _FrequencyParams,
+    "proportion_shift": _ProportionShiftParams,
+    "value_distribution_drift": _ValueDistributionDriftParams,
+    "interval_periodicity": _IntervalPeriodicityParams,
+    "timestamp_order": _TimestampOrderParams,
+    "sequence_novelty": _SequenceNoveltyParams,
+    "log_template": _LogTemplateParams,
+}
+
+#: Accepted params-object keys per method, derived from the models so the two
+#: cannot drift. Read by the frontend's method-registry test, which asserts
+#: every knob it declares is a key this endpoint accepts.
+METHOD_PARAMS: dict[str, set[str]] = {
+    method: set(model.model_fields) for method, model in METHOD_MODELS.items()
 }
 
 
 def _adapt_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Map a params object onto runner keywords, rejecting unknown keys.
-
-    Rejecting rather than ignoring matters for the cache: a typo'd knob that was
-    silently dropped would compute the *default* answer and store it under a key
-    claiming the typo'd parameters, so a later analyst would be served a cached
-    answer to a question nobody asked.
-    """
-    schema = METHOD_PARAMS[method]
-    unknown = sorted(set(params) - set(schema))
-    if unknown:
+    """Validate a params object against its method's model, returning runner keywords."""
+    try:
+        model = METHOD_MODELS[method].model_validate(params)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or 'params'}: {err['msg']}"
+            for err in exc.errors()
+        )
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Unknown parameter(s) for {method}: {', '.join(unknown)}. "
-                f"Accepted: {', '.join(sorted(schema))}."
+                f"Invalid parameters for {method}: {problems}. "
+                f"Accepted: {', '.join(sorted(METHOD_PARAMS[method]))}."
             ),
-        )
-    return {schema[k]: v for k, v in params.items()}
+        ) from exc
+    return model.runner_kwargs()
 
 
 async def _run_log_templates(
@@ -301,6 +406,45 @@ async def _normal_dispositions_hash(case_id: str, timeline_id: str, source_ids: 
     return dispositions_hash(rows)
 
 
+async def _apply_dispositions(
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str],
+    method: str,
+    payload: dict[str, Any],
+    include_dismissed: bool,
+) -> dict[str, Any]:
+    """Filter dismissed findings and badge confirmed ones, as ``/anomalies`` does.
+
+    The same two functions the older endpoint uses, applied at the same point in
+    the response's life — presentation, after the answer exists. Without this a
+    dismissal is undone by the next refetch and a confirmed finding never
+    carries the flag its badge reads.
+
+    ``log_template`` rows carry neither ``event_id`` nor
+    ``details.allowlist_*``, so both appliers are no-ops there. That is the
+    correct outcome rather than an oversight: a template is a browsing row, and
+    nothing records a verdict against one.
+    """
+    if not payload.get("results"):
+        payload["dismissed_count"] = 0
+        return payload
+    # Both appliers flag findings in place, and `results` may still be the list
+    # the cache row holds. Copy the rows before touching them.
+    payload["results"] = [dict(f) for f in payload["results"]]
+    rows = await get_store().list_dispositions(
+        case_id,
+        timeline_id=timeline_id,
+        source_ids=source_ids,
+        kinds=["dismissed", "confirmed"],
+        detector=method,
+    )
+    payload = _apply_dismissals(
+        payload, [d for d in rows if d.kind == "dismissed"], include_dismissed
+    )
+    return _apply_confirmations(payload, [d for d in rows if d.kind == "confirmed"])
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/analysis/findings")
 async def get_analysis_findings(
     case_id: str,
@@ -314,9 +458,9 @@ async def get_analysis_findings(
         default=False,
         description=(
             "Keep dismissed-disposition findings in `results`, flagged rather "
-            "than filtered. Bypasses the cache in both directions — it is a "
-            "presentation-only reveal, and caching both variants would double "
-            "every key for a mode used rarely."
+            "than filtered. Presentation-only: dismissals are applied to the "
+            "response after the cache, so this changes what is shown and never "
+            "what is computed or stored."
         ),
     ),
     case: Case = Depends(require_case_read),
@@ -326,6 +470,12 @@ async def get_analysis_findings(
     The gate never restricts this endpoint: a method the plan reports as
     ``not_applicable`` runs exactly as it would have without a gate, and returns
     exactly what an unconditional sweep would have returned.
+
+    Dismissals and confirmations are applied *after* the cache, never before.
+    The fingerprint covers ``kind="normal"`` verdicts only — those change what a
+    detector computes — so a cached payload that had already been
+    dismissal-filtered would keep a later dismissal invisible, and a later
+    confirmation unbadged, until something unrelated invalidated the key.
     """
     if method not in METHOD_PARAMS:
         raise HTTPException(
@@ -345,21 +495,32 @@ async def get_analysis_findings(
     scope = await _scope_object(case_id, timeline_id, frame, baseline_id)
     kwargs = _adapt_params(method, parsed)
 
+    scoped = set(source_ids)
     sources = await store.list_timeline_sources(case_id, timeline_id)
     key = fingerprint(
         timeline_id=timeline_id,
-        source_hashes=[s.file_hash for s in sources if s.id in set(source_ids)],
+        # `or ""` rather than a filter: a source still without its hash is part
+        # of the scope, and dropping it would give it the key of a timeline that
+        # never had it. sorted() also refuses to compare None with str.
+        source_hashes=[s.file_hash or "" for s in sources if s.id in scoped],
         enrichment_generation=await enrichment_generation(store, source_ids),
         frame=frame,
         baseline_id=baseline_id,
         method=method,
-        params=parsed,
+        # The validated params, not the raw object: `2` and `2.0` are the same
+        # question and must share a key.
+        params=kwargs,
+        limit=limit,
         dispositions_hash=await _normal_dispositions_hash(case_id, timeline_id, source_ids),
     )
-    if not include_dismissed:
-        cached = await cache_get(store, case_id, key)
-        if cached is not None:
-            return {**cached, "cache": "hit"}
+    cached = await cache_get(store, case_id, key)
+    if cached is not None:
+        return {
+            **await _apply_dispositions(
+                case_id, timeline_id, source_ids, method, dict(cached), include_dismissed
+            ),
+            "cache": "hit",
+        }
 
     if method == "log_template":
         body = await _run_log_templates(
@@ -398,6 +559,10 @@ async def get_analysis_findings(
         "scope": scope,
         "computed_at": datetime.now(UTC).isoformat(),
     }
-    if not include_dismissed:
-        await cache_put(store, case_id, key, payload, cfg.analysis_cache_max_rows_per_case)
-    return {**payload, "cache": "miss"}
+    await cache_put(store, case_id, key, payload, cfg.analysis_cache_max_rows_per_case)
+    return {
+        **await _apply_dispositions(
+            case_id, timeline_id, source_ids, method, dict(payload), include_dismissed
+        ),
+        "cache": "miss",
+    }

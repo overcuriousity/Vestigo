@@ -21,22 +21,27 @@ def seeded(client, admin_bootstrap) -> tuple[str, str]:
 
 @pytest.fixture()
 def stub_detector(monkeypatch):
-    """Count detector invocations so cache hits are observable."""
-    calls: dict[str, list] = {"detector": [], "templates": []}
+    """Count detector invocations so cache hits are observable.
+
+    ``calls["results"]`` is what the stub returns as findings — tests that care
+    about response shaping (dismissals, confirmations) fill it in.
+    """
+    calls: dict[str, list] = {"detector": [], "templates": [], "results": []}
 
     async def _fake_detector(case_id, timeline_id, source_ids, **kwargs):
         calls["detector"].append(kwargs)
+        findings = [dict(f) for f in calls["results"]]
 
         class _Result:
             status = "ok"
             detector = kwargs["detector"]
             method = "stub"
             baseline_size = 0
-            results: list = []
+            results: list = findings
             z_threshold = None
             warnings: list = []
             windows = None
-            total_findings = 0
+            total_findings = len(findings)
 
         return _Result(), {
             "baseline_id": kwargs.get("baseline_id"),
@@ -50,9 +55,42 @@ def stub_detector(monkeypatch):
         calls["templates"].append({**params, "_baseline_id": baseline_id})
         return {"status": "ok", "results": [], "total_findings": 0, "warnings": []}
 
+    def _fake_serialize(result):
+        # The stub's findings are already wire-shaped dicts, so the real
+        # dataclass-dispatching serializer has nothing to dispatch on.
+        return {
+            "status": result.status,
+            "detector": result.detector,
+            "method": result.method,
+            "baseline_size": result.baseline_size,
+            "results": result.results,
+            "z_threshold": result.z_threshold,
+            "warnings": result.warnings,
+            "windows": result.windows,
+            "total_findings": result.total_findings,
+        }
+
     monkeypatch.setattr(analysis_router, "_run_stat_detector", _fake_detector)
     monkeypatch.setattr(analysis_router, "_run_log_templates", _fake_templates)
+    monkeypatch.setattr(analysis_router, "_serialize_stat_result", _fake_serialize)
     return calls
+
+
+@pytest.fixture()
+def scoped_source(monkeypatch):
+    """Give the timeline one source id, so event-scoped verdicts are in scope.
+
+    ``list_dispositions`` reaches event-scoped rows through the timeline's
+    sources (they carry ``timeline_id = NULL``), and a freshly created case has
+    none. Ingesting a real file to get one would be a detour for a test about
+    response shaping.
+    """
+
+    async def _fake_scope(case_id, timeline_id):
+        return ["s-1"], {}, {}
+
+    monkeypatch.setattr(analysis_router, "_resolve_timeline_scope", _fake_scope)
+    return "s-1"
 
 
 def _url(case_id, timeline_id, method, params=None, extra=""):
@@ -119,7 +157,9 @@ def test_log_template_runs_the_template_browser_not_a_detector(client, seeded, s
     case_id, timeline_id = seeded
     r = client.get(_url(case_id, timeline_id, "log_template", {"field": "message"}))
     assert r.status_code == 200
-    assert stub_detector["templates"] == [{"field": "message", "_baseline_id": None}]
+    assert stub_detector["templates"] == [
+        {"field": "message", "order": "count", "only_new": False, "_baseline_id": None}
+    ]
     assert stub_detector["detector"] == []
 
 
@@ -143,13 +183,55 @@ def test_each_method_gets_its_own_cache_entry(client, seeded, stub_detector):
     assert len(stub_detector["detector"]) == 2
 
 
-def test_include_dismissed_bypasses_the_cache(client, seeded, stub_detector):
-    """A presentation-only reveal must not populate or serve the shared entry."""
+def test_include_dismissed_reuses_the_cache(client, seeded, stub_detector):
+    """A presentation-only reveal must not force a rescan.
+
+    Dismissals are applied to the response *after* the cache, so revealing them
+    changes what is shown and never what is computed — the same cached answer
+    serves both, and the reveal costs nothing.
+    """
     case_id, timeline_id = seeded
     client.get(_url(case_id, timeline_id, "value_novelty"))
     r = client.get(_url(case_id, timeline_id, "value_novelty", extra="&include_dismissed=true"))
+    assert len(stub_detector["detector"]) == 1
+    assert r.json()["cache"] == "hit"
+
+
+def test_a_different_limit_is_a_different_answer(client, seeded, stub_detector):
+    """The runners truncate to `limit`, so 50 rows is not the answer to 500."""
+    case_id, timeline_id = seeded
+    client.get(_url(case_id, timeline_id, "value_novelty", extra="&limit=50"))
+    r = client.get(_url(case_id, timeline_id, "value_novelty", extra="&limit=500"))
     assert len(stub_detector["detector"]) == 2
     assert r.json()["cache"] == "miss"
+
+
+def test_a_list_of_fields_is_accepted(client, seeded, stub_detector):
+    """A JSON list is the natural encoding of a multi-field knob."""
+    case_id, timeline_id = seeded
+    r = client.get(_url(case_id, timeline_id, "value_novelty", {"fields": ["host", "user"]}))
+    assert r.status_code == 200, r.text
+    assert stub_detector["detector"][0]["fields"] == "host,user"
+
+
+@pytest.mark.parametrize(
+    "method,params",
+    [
+        ("frequency", {"z_threshold": "abc"}),
+        ("frequency", {"z_threshold": 0}),
+        ("sequence_novelty", {"ngram_size": 9}),
+        ("proportion_shift", {"fdr_q": 2.0}),
+        ("log_template", {"order": "sideways"}),
+    ],
+)
+def test_out_of_contract_param_values_are_422_not_500(
+    client, seeded, stub_detector, method, params
+):
+    """The runners take these unchecked — an unvalidated value is a 500."""
+    case_id, timeline_id = seeded
+    r = client.get(_url(case_id, timeline_id, method, params))
+    assert r.status_code == 422, r.text
+    assert stub_detector["detector"] == []
 
 
 def test_detector_receives_field_mappings_and_offsets(client, seeded, stub_detector):
@@ -160,6 +242,124 @@ def test_detector_receives_field_mappings_and_offsets(client, seeded, stub_detec
     kwargs = stub_detector["detector"][0]
     assert "field_mappings" in kwargs
     assert "source_offsets" in kwargs
+
+
+def _dispose(client, case_id, timeline_id, body):
+    r = client.post(f"/api/cases/{case_id}/timelines/{timeline_id}/dispositions", json=body)
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
+def test_a_dismissed_finding_stays_dismissed_across_a_cache_hit(
+    client, seeded, stub_detector, scoped_source
+):
+    """The regression this endpoint shipped with: dismissals were never applied,
+    so a finding the analyst dismissed came straight back on the next refetch."""
+    case_id, timeline_id = seeded
+    stub_detector["results"] = [
+        {
+            "type": "value_novelty",
+            "score": 1.0,
+            "details": {"allowlist_field": "f", "allowlist_value": "v"},
+        },
+        {
+            "type": "value_novelty",
+            "score": 0.5,
+            "details": {"allowlist_field": "f", "allowlist_value": "keep"},
+        },
+    ]
+    url = _url(case_id, timeline_id, "value_novelty")
+    assert len(client.get(url).json()["results"]) == 2
+
+    _dispose(
+        client,
+        case_id,
+        timeline_id,
+        {"kind": "dismissed", "detector": "value_novelty", "field": "f", "value": "v"},
+    )
+    body = client.get(url).json()
+    assert body["cache"] == "hit"
+    assert [f["details"]["allowlist_value"] for f in body["results"]] == ["keep"]
+    assert body["dismissed_count"] == 1
+
+
+def test_include_dismissed_flags_rather_than_filters(client, seeded, stub_detector, scoped_source):
+    case_id, timeline_id = seeded
+    stub_detector["results"] = [
+        {
+            "type": "value_novelty",
+            "score": 1.0,
+            "details": {"allowlist_field": "f", "allowlist_value": "v"},
+        },
+    ]
+    _dispose(
+        client,
+        case_id,
+        timeline_id,
+        {"kind": "dismissed", "detector": "value_novelty", "field": "f", "value": "v"},
+    )
+    body = client.get(
+        _url(case_id, timeline_id, "value_novelty", extra="&include_dismissed=true")
+    ).json()
+    assert len(body["results"]) == 1
+    assert body["results"][0]["dismissed"] is True
+    assert body["dismissed_count"] == 1
+
+
+def test_a_confirmed_finding_carries_the_flag_its_badge_reads(
+    client, seeded, stub_detector, scoped_source
+):
+    case_id, timeline_id = seeded
+    stub_detector["results"] = [
+        {"type": "value_novelty", "score": 1.0, "event_id": "e-1", "details": {}},
+        {"type": "value_novelty", "score": 0.5, "event_id": "e-2", "details": {}},
+    ]
+    _dispose(
+        client,
+        case_id,
+        timeline_id,
+        {
+            "kind": "confirmed",
+            "detector": "value_novelty",
+            "source_id": scoped_source,
+            "event_id": "e-1",
+        },
+    )
+    body = client.get(_url(case_id, timeline_id, "value_novelty")).json()
+    flags = {f["event_id"]: f.get("confirmed") for f in body["results"]}
+    assert flags == {"e-1": True, "e-2": None}
+
+
+def test_the_cached_payload_is_not_rewritten_by_a_verdict(
+    client, seeded, stub_detector, scoped_source
+):
+    """Dispositions are applied to the response, never to the stored answer.
+
+    If the filtered payload were cached, revealing dismissed findings later
+    could not show what was filtered — the row would no longer contain it.
+    """
+    case_id, timeline_id = seeded
+    stub_detector["results"] = [
+        {
+            "type": "value_novelty",
+            "score": 1.0,
+            "details": {"allowlist_field": "f", "allowlist_value": "v"},
+        },
+    ]
+    client.get(_url(case_id, timeline_id, "value_novelty"))
+    _dispose(
+        client,
+        case_id,
+        timeline_id,
+        {"kind": "dismissed", "detector": "value_novelty", "field": "f", "value": "v"},
+    )
+    assert client.get(_url(case_id, timeline_id, "value_novelty")).json()["results"] == []
+    revealed = client.get(
+        _url(case_id, timeline_id, "value_novelty", extra="&include_dismissed=true")
+    ).json()
+    assert len(revealed["results"]) == 1
+    # One computation served all three requests.
+    assert len(stub_detector["detector"]) == 1
 
 
 def test_findings_requires_case_read(client, seeded, stub_detector):

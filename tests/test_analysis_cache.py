@@ -33,6 +33,7 @@ BASE = {
     "baseline_id": "bl-1",
     "method": "frequency",
     "params": {"z_threshold": 3.0, "bucket_count": 12},
+    "limit": 50,
     "dispositions_hash": "dh-1",
 }
 
@@ -60,6 +61,9 @@ def test_params_key_order_does_not_change_the_key():
         ("baseline_id", "bl-2"),
         ("method", "charset"),
         ("params", {"z_threshold": 2.0, "bucket_count": 12}),
+        # The runners truncate to `limit`, so a payload computed at 50 rows is
+        # not the answer to a request for 500.
+        ("limit", 500),
         ("dispositions_hash", "dh-2"),
     ],
 )
@@ -109,3 +113,20 @@ async def test_put_on_an_existing_key_replaces_rather_than_duplicates(migrated):
     await cache_put(migrated, "case-1", key, {"n": 1}, max_rows=10)
     await cache_put(migrated, "case-1", key, {"n": 2}, max_rows=10)
     assert await cache_get(migrated, "case-1", key) == {"n": 2}
+
+
+@pytest.mark.asyncio
+async def test_refreshing_a_row_makes_it_the_newest(migrated):
+    """Eviction is by ``computed_at``, so a refresh must move the row.
+
+    Otherwise a key written once and recomputed daily keeps its first
+    timestamp, ages past rows nobody has asked for since, and is evicted first —
+    the inverse of the policy.
+    """
+    await cache_put(migrated, "case-1", "old", {"n": 0}, max_rows=2)
+    await cache_put(migrated, "case-1", "mid", {"n": 1}, max_rows=2)
+    # Refresh "old", then add a third row: "mid" is now the oldest and goes.
+    await cache_put(migrated, "case-1", "old", {"n": 2}, max_rows=2)
+    await cache_put(migrated, "case-1", "new", {"n": 3}, max_rows=2)
+    assert await cache_get(migrated, "case-1", "old") == {"n": 2}
+    assert await cache_get(migrated, "case-1", "mid") is None

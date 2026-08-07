@@ -1,11 +1,98 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 162 — the Investigate panel redesign: a gate that
-decides what is worth running, a cache whose hits are proof, and one rail plus one
-overlay in place of five tabs).
+Last updated: 2026-08-08 (session 163 — PR #262 review: the confirm path that 500s on
+PostgreSQL and never ran in tests, dispositions the new endpoint forgot to apply, and
+"Run anyway" that could not run anything).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 163 — 2026-08-08: PR #262 review findings
+
+**Why.** A high-effort review of the Investigate redesign branch found thirteen
+defects. Four broke shipped behavior, and the pattern joining them is worth
+naming: each was invisible to the test suite for a structural reason, not a
+missing assertion.
+
+**The confirm path never ran on PostgreSQL.** `create_disposition` compared
+`analysis_scope` — an `sa.JSON` column — with `==` to dedupe `confirmed`
+verdicts by the comparison they were reached under. PostgreSQL has no equality
+operator for `json`, only for `jsonb`, so every confirm was a 500. The tests
+run on SQLite, where JSON is text and `=` works, so the whole feature passed
+green while being unusable in any real deployment. Migration `0027` moves the
+column to `JSONB` on PostgreSQL and no-ops on SQLite; the model declares
+`JSON().with_variant(JSONB(), "postgresql")`. Storage type alone does not make
+the dialects agree, though — JSONB normalizes key order and SQLite text does
+not — so writes and comparisons now go through `canonical_scope`, and
+`disposition_identity` replaces the second, differently-expressed copy of the
+identity rule that lived inside `create_dispositions_bulk`.
+
+**The findings endpoint never applied dispositions.** `/api/anomalies` calls
+`_apply_dismissals` and `_apply_confirmations`; `/analysis/findings` called
+neither. A dismissal was optimistically removed from the rail and came straight
+back on the next refetch, `include_dismissed` was a no-op, and no finding ever
+carried the `confirmed` flag its badge reads. Both are plain functions over a
+serialized payload, so the fix is to call them — but *after* the cache, never
+before. The fingerprint covers `normal` verdicts only, since those are what
+change a computation; caching a dismissal-filtered payload would hide a later
+dismissal until something unrelated invalidated the key. Applying afterwards
+also makes `include_dismissed` presentation-only in the full sense, so its cache
+bypass could go: revealing dismissed findings now costs nothing.
+
+**The gate was a lock in practice.** `onRunMethod` was wired to `onOpenMethod`,
+and the sheet's findings query was enabled only in finding mode — so "Run
+anyway" on a gated method and "Retry" on a failed one both opened prose and ran
+nothing. The endpoint allowed everything the docs promise; the UI had no path
+to it. Method mode now owns a params object and renders its own results, with
+`autorun` for the Tools sheet's entry point. The knobs became real at the same
+time: they were uncontrolled inputs nothing read, which is why the two tests
+this branch deleted (`charsetGroupField`, `eventSequenceMaxGap`) had no
+surviving home — `group_field` and `max_gap_seconds` were unreachable from the
+app. Both are ported to the new surface.
+
+**Params are typed now.** `METHOD_PARAMS` checked keys and passed values
+through untouched, so `{"fields": ["a","b"]}` — the natural JSON encoding of a
+multi-field knob — reached `.split()` and 500'd. Each method declares a
+Pydantic model with `extra="forbid"` and the bounds `/anomalies` already
+states as query constraints; `METHOD_PARAMS` is derived from the models, so the
+cross-language invariant the frontend test checks has one source. The validated
+params, not the raw object, go into the cache key, which also makes `2` and
+`2.0` one question.
+
+**Smaller, same shape.** `limit` joined the fingerprint (a 50-row payload is not
+the answer to a request for 500, and serving it as a hit asserted a
+completeness it did not have). `cache_put` restamps `computed_at` on refresh,
+so "least recently computed" is literal rather than inverted. The plan
+endpoint's timestamp probe moved to a threadpool — it is a blocking ClickHouse
+call in an async handler, and the rail fires a dozen requests right behind it.
+
+**What the rail was claiming.** Progress counted a heavy method as settled
+while it was still queued behind the cheap set, so the bar reached 100%, the
+empty state flashed "No findings under this scope", and the count then fell
+back — an all-clear asserted over methods that had not started. `MethodState`
+gained `pending`, which is about expectation rather than fetch status. The
+empty state also could not tell "checked, nothing" from "nothing ran": it now
+requires the plan to have resolved and at least one method to have been
+runnable, and says something different when every method is gated. And the
+empty-timeline guard the old panel carried came back as
+`useTimelineReadiness`, shared by the rail and the Tools sheet — a Sigma scan
+that matches nothing on a mid-ingest timeline reads as "these rules cleared
+you", which is the claim it exists to prevent.
+
+**Capability gates and three orphans.** `SemanticSearch`, `TriageBurndown` and
+`EmbeddingStatusBanner` lost their only mount when `InvestigatePanel` was
+deleted and are removed. The Explore section's similarity affordance and the
+Signatures section are now gated on `capabilities.embeddings` / `.sigma`,
+restoring the house rule that an unconfigured subsystem renders no entry point
+at all. `AnomalyFieldPicker` is kept — it is the field picker the `fields` knob
+should grow into.
+
+**One convention amended.** `CLAUDE.md` said a `require_case_read` endpoint does
+not write, with one named exception. `cache_put` on the findings path is a
+second, and the rule demands an argument rather than silence: the row is
+derived data keyed by a fingerprint of its own inputs, so it asserts nothing
+the request did not already establish, and refusing it for read-only members
+would make the surface they use slowest the one that never warms.
 
 ## Session 162 — 2026-08-07: the Investigate panel redesign
 

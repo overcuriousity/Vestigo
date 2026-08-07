@@ -1,5 +1,5 @@
 /**
- * SigmaPanel — the Sigma tab of the InvestigatePanel.
+ * SigmaPanel — the Signatures section of the Tools sheet.
  *
  * Deterministic signature matching, deliberately separate from the
  * statistical detectors: analysts pick rules (admin-managed global set +

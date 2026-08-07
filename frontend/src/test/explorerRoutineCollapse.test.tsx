@@ -135,9 +135,6 @@ vi.mock("@/components/explorer/EventDetailPanel", () => ({
     return null;
   },
 }));
-vi.mock("@/components/analysis/InvestigatePanel", () => ({
-  InvestigatePanel: () => null,
-}));
 vi.mock("@/components/agent/AgentPanel", () => ({
   AgentPanel: (props: Record<string, unknown>) => {
     captures.agent = props;

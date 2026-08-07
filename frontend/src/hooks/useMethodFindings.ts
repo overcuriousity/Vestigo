@@ -20,7 +20,7 @@
  * elsewhere would leave the row visibly unchanged after a click, which reads as
  * a dead button. The "dismissed-hidden" segment is part of the same contract.
  */
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import {
   analysisApi,
@@ -90,6 +90,13 @@ export interface MethodState {
   findings: MethodFindings["results"];
   total: number;
   isLoading: boolean;
+  /**
+   * Expected to produce an answer, and hasn't yet. Distinct from `isLoading`:
+   * a heavy method waiting behind the cheap set is not fetching but is very
+   * much not settled, and counting it as done is what made the progress bar
+   * finish before half the sweep had started.
+   */
+  pending: boolean;
   error: boolean;
   cache?: MethodFindings["cache"];
 }
@@ -102,14 +109,22 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
   const { planById, scope, isLoading: planLoading } = useAnalysisPlan(caseId, timelineId);
   const scopeParams = useScopeParams();
 
-  const runnable = (id: MethodId) => !planLoading && planById[id]?.status === "applicable";
+  const runnable = useCallback(
+    (id: MethodId) => !planLoading && planById[id]?.status === "applicable",
+    [planById, planLoading],
+  );
 
   const cheapResults = useQueries({
     queries: CHEAP_IDS.map((id) =>
       findingsQueryOptions(caseId, timelineId, id, scopeParams, {}, runnable(id)),
     ),
   });
-  const cheapSettled = cheapResults.every((q) => !q.isLoading);
+  // Settled, not "not loading": a disabled query is neither, and asking
+  // `isFetched` says what this actually means without depending on how
+  // react-query happens to derive `isLoading` from pending/fetching.
+  const cheapSettled = cheapResults.every(
+    (q, i) => !runnable(CHEAP_IDS[i]) || q.isFetched || q.isError,
+  );
 
   const heavyResults = useQueries({
     queries: HEAVY_IDS.map((id) =>
@@ -133,19 +148,21 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         status: plan?.status ?? "applicable",
         findings: data?.results ?? [],
         total: data?.total_findings ?? 0,
-        // A disabled query sits at `fetchStatus === "idle"` with
-        // `isLoading === true`; without this guard every gated-off method
-        // would render as loading forever.
-        isLoading: Boolean(query?.isLoading) && query?.fetchStatus !== "idle",
+        isLoading: Boolean(query?.isFetching),
+        // A method the plan says to run is pending until its query has
+        // actually produced something — including while it is still disabled
+        // behind `cheapSettled`, which is exactly the window a naive
+        // "not loading" check reported as finished.
+        pending: runnable(meta.id) && !query?.isFetched && !query?.isError,
         error: Boolean(query?.isError),
         cache: data?.cache,
       };
     }
     return out;
-  }, [cheapResults, heavyResults, planById]);
+  }, [cheapResults, heavyResults, planById, runnable]);
 
   const expected = METHODS.filter((m) => runnable(m.id));
-  const settled = expected.filter((m) => !byMethod[m.id].isLoading).length;
+  const settled = expected.filter((m) => !byMethod[m.id].pending).length;
 
   return { byMethod, scope, done: settled, total: expected.length, planLoading };
 }

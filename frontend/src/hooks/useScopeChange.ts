@@ -53,7 +53,15 @@ export function useScopeChange(caseId: string, timelineId: string) {
 
   return {
     pending,
-    request: (next: PendingScope) => setPending(next),
+    // A baseline frame with no definition is not a scope change — the store
+    // resets the frame to `self` when the id is cleared, so confirming it would
+    // promise a re-run against a different comparison and then change nothing.
+    // Refuse it here as well as in the UI: the dialog must never offer a
+    // confirm that cannot take effect.
+    request: (next: PendingScope) => {
+      if (next.frame === "baseline" && !next.baselineId) return;
+      setPending(next);
+    },
     cancel: () => setPending(null),
     confirm: () => {
       if (!pending) return;

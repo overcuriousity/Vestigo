@@ -23,6 +23,8 @@ import { PatternsView } from "./PatternsView";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
 import { SimilarEvents } from "./SimilarEvents";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
+import { useCapabilities } from "@/api/health";
+import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 import type { AnalysisScope } from "@/api/analysis";
@@ -39,7 +41,11 @@ interface Props {
   /** Never applies a scope change directly — it invalidates every cached
    * method at once and reframes every verdict already recorded, so the host
    * routes it through a confirm. */
-  onRequestScopeChange: (next: { frame: "self" | "baseline"; baselineId?: string }) => void;
+  onRequestScopeChange: (next: {
+    frame: "self" | "baseline";
+    baselineId?: string;
+    baselineName?: string | null;
+  }) => void;
   /** Sigma hits filter the grid by their "sigma: <title>" tag. */
   onTagFilter?: (tag: string) => void;
   /** The event the analyst anchored from the grid, if any. */
@@ -80,6 +86,8 @@ export function ToolsSheet({
   onSelectEvent,
 }: Props) {
   const { byMethod, scope } = useStreamingSweep(caseId, timelineId);
+  const { embeddings, sigma } = useCapabilities();
+  const { nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -123,31 +131,39 @@ export function ToolsSheet({
         </div>
       </Section>
 
-      <Section id="signatures" title="Signatures">
-        <GuidancePanel id="investigate-sigma" />
-        <SigmaPanel caseId={caseId} timelineId={timelineId} onTagFilter={onTagFilter} />
-      </Section>
+      {/* Absent, not disabled, when Sigma is unconfigured — the house rule for
+          every optional subsystem. And absent on an empty timeline: a run that
+          matches nothing there reads as "these rules cleared you", when in
+          fact there was nothing to match against. */}
+      {sigma && !nothingToAnalyse && (
+        <Section id="signatures" title="Signatures">
+          <GuidancePanel id="investigate-sigma" />
+          <SigmaPanel caseId={caseId} timelineId={timelineId} onTagFilter={onTagFilter} />
+        </Section>
+      )}
 
       <Section id="explore" title="Explore">
         {/* Similarity is anchor-driven: it cannot join an unprompted sweep, so
             it lives here and appears once the analyst anchors an event from a
             grid row. Without this the grid's "find similar" action would set
-            an anchor nothing ever reads — a dead button. */}
-        {similarAnchor && onSelectEvent ? (
-          <div className="mb-3">
-            <SimilarEvents
-              caseId={caseId}
-              timelineId={timelineId}
-              anchorEvent={similarAnchor}
-              onClose={onSimilarClose ?? (() => {})}
-              onSelectEvent={onSelectEvent}
-            />
-          </div>
-        ) : (
-          <p className="mb-3 text-[11px] text-[var(--color-fg-muted)]">
-            Click the search icon on any event row to find events like it.
-          </p>
-        )}
+            an anchor nothing ever reads — a dead button. Gated on embeddings:
+            with no vector store configured there is nothing to be similar in. */}
+        {embeddings &&
+          (similarAnchor && onSelectEvent ? (
+            <div className="mb-3">
+              <SimilarEvents
+                caseId={caseId}
+                timelineId={timelineId}
+                anchorEvent={similarAnchor}
+                onClose={onSimilarClose ?? (() => {})}
+                onSelectEvent={onSelectEvent}
+              />
+            </div>
+          ) : (
+            <p className="mb-3 text-[11px] text-[var(--color-fg-muted)]">
+              Click the search icon on any event row to find events like it.
+            </p>
+          ))}
         <p className="mb-2 text-[11px] text-[var(--color-fg-muted)]">
           Motif mining answers &ldquo;what is routine here?&rdquo; — its results{" "}
           <strong className="font-medium">suppress</strong> findings rather than raising them.
@@ -184,7 +200,7 @@ function ScopeSection({
     {
       id: "baseline" as const,
       icon: Layers,
-      label: "Compare baseline",
+      label: scope.baseline_name ? "Compare baseline" : "Pick a baseline…",
       hint: scope.baseline_name
         ? `Suspect windows against “${scope.baseline_name}”.`
         : "Pick or build a baseline definition to enable the comparison methods.",
@@ -196,11 +212,23 @@ function ScopeSection({
       <div className="space-y-1">
         {options.map((opt) => {
           const active = scope.frame === opt.id;
+          // Switching to the baseline frame without a definition cannot take
+          // effect — the store falls back to `self` — so this affordance opens
+          // the builder instead of promising a re-run that will not happen.
+          const needsDefinition = opt.id === "baseline" && !scope.baseline_id;
           return (
             <button
               key={opt.id}
               data-testid={`scope-switch-${opt.id}`}
-              onClick={() => onRequest({ frame: opt.id, baselineId: scope.baseline_id ?? undefined })}
+              onClick={() =>
+                needsDefinition
+                  ? onManage()
+                  : onRequest({
+                      frame: opt.id,
+                      baselineId: scope.baseline_id ?? undefined,
+                      baselineName: scope.baseline_name,
+                    })
+              }
               className={cn(
                 "flex w-full items-start gap-2 rounded border px-2 py-1.5 text-left text-xs transition-base",
                 active

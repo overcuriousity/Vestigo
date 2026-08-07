@@ -40,6 +40,11 @@ const SCOPE = {
   baseline_name: "Feb 24 – Mar 1",
 };
 
+/** A settled, empty findings query — method mode always has one. */
+function idleQuery(overrides: Record<string, unknown> = {}) {
+  return { data: undefined, isFetching: false, isError: false, ...overrides };
+}
+
 function renderSheet(props: Record<string, unknown>) {
   const merged = {
     caseId: "c1",
@@ -53,7 +58,7 @@ function renderSheet(props: Record<string, unknown>) {
 
 describe("InvestigateSheet", () => {
   it("carries the methodology prose the Method tab used to hold", () => {
-    renderSheet({ mode: "method", methodId: "interval_periodicity" });
+    renderSheet({ mode: "method", methodId: "interval_periodicity", onRun: () => {}, query: idleQuery() });
     expect(screen.getByText(/inter-arrival distribution/i)).toBeInTheDocument();
   });
 
@@ -99,12 +104,12 @@ describe("InvestigateSheet", () => {
   });
 
   it("renders one knob per declared parameter", () => {
-    renderSheet({ mode: "method", methodId: "sequence_novelty" });
+    renderSheet({ mode: "method", methodId: "sequence_novelty", onRun: () => {}, query: idleQuery() });
     expect(screen.getAllByTestId("method-knob")).toHaveLength(3);
   });
 
   it("renders as an overlay, never as a flex sibling that could widen the row", () => {
-    renderSheet({ mode: "method", methodId: "value_novelty" });
+    renderSheet({ mode: "method", methodId: "value_novelty", onRun: () => {}, query: idleQuery() });
     const sheet = screen.getByTestId("investigate-sheet");
     expect(sheet.className).toContain("absolute");
     expect(sheet.className).not.toContain("shrink-0");
@@ -113,8 +118,70 @@ describe("InvestigateSheet", () => {
 
   it("closes on the escape key so the grid is one keystroke away", () => {
     const onClose = vi.fn();
-    renderSheet({ mode: "method", methodId: "value_novelty", onClose });
+    renderSheet({ mode: "method", methodId: "value_novelty", onClose, onRun: () => {}, query: idleQuery() });
     fireEvent.keyDown(window, { key: "Escape", code: "Escape" });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("sends nothing for an untouched knob", () => {
+    const onRun = vi.fn();
+    renderSheet({ mode: "method", methodId: "charset", onRun, query: idleQuery() });
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    expect(onRun).toHaveBeenCalledWith({});
+  });
+
+  it("sends group_field when the analyst types one", () => {
+    const onRun = vi.fn();
+    renderSheet({ mode: "method", methodId: "charset", onRun, query: idleQuery() });
+    fireEvent.change(screen.getByTestId("method-knob-group_field"), {
+      target: { value: "display_name" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    expect(onRun).toHaveBeenCalledWith({ group_field: "display_name" });
+  });
+
+  it("sends a numeric knob as a number, not the analyst's typing", () => {
+    const onRun = vi.fn();
+    renderSheet({ mode: "method", methodId: "sequence_novelty", onRun, query: idleQuery() });
+    fireEvent.change(screen.getByTestId("method-knob-max_gap_seconds"), {
+      target: { value: "300" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    expect(onRun).toHaveBeenCalledWith({ max_gap_seconds: 300 });
+  });
+
+  it("says a run found nothing rather than showing nothing at all", () => {
+    renderSheet({
+      mode: "method",
+      methodId: "charset",
+      onRun: () => {},
+      query: idleQuery({ data: { results: [], total_findings: 0 } }),
+    });
+    expect(screen.getByText(/found nothing under these parameters/i)).toBeInTheDocument();
+  });
+
+  it("shows a gated method's results in the sheet — the gate is advice, not a lock", () => {
+    renderSheet({
+      mode: "method",
+      methodId: "value_novelty",
+      onRun: () => {},
+      query: idleQuery({
+        data: {
+          results: [
+            {
+              type: "value_novelty",
+              field: "attr:user_agent",
+              value: "curl/7.68.0",
+              score: 8.2,
+              count: 1,
+              event_id: "e9",
+              details: {},
+            },
+          ],
+          total_findings: 1,
+        },
+      }),
+    });
+    expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
   });
 });
