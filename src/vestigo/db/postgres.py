@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -2462,6 +2462,78 @@ class PostgresStore:
         async with self.session_factory() as session:
             result = await session.execute(select(EnrichmentJobRun))
             return list(result.scalars().all())
+
+    async def get_enrichment_job_run(self, job_id: str) -> EnrichmentJobRun | None:
+        """Return one enrichment job marker by id, or None if it has no marker."""
+        async with self.session_factory() as session:
+            return await session.get(EnrichmentJobRun, job_id)
+
+    async def list_enrichment_job_runs_for_timeline(
+        self, case_id: str, timeline_id: str, enricher_key: str | None = None
+    ) -> list[EnrichmentJobRun]:
+        """Markers for one timeline (optionally one enricher), newest first.
+
+        The timeline-scoped counterpart to
+        :meth:`list_orphaned_enrichment_job_runs`, which is startup-only and
+        deliberately unfiltered. A row here is **not** necessarily orphaned — a
+        live run has a marker too. Callers must exclude the job currently
+        holding the in-memory run slot (``enrichers.jobs.get_active_enricher_run``);
+        the slot is claimed before the marker is written and released after it
+        would have been deleted, so "marker present and slot not held by it"
+        is what actually means dead.
+
+        Newest-first is a display order, not a tie-break: a caller that has to
+        name *one* dead marker (banner, 409 detail, skip log) must pick it with
+        ``enrichers.jobs.oldest_unfinished_run`` rather than by index, so every
+        surface names the same job.
+        """
+        async with self.session_factory() as session:
+            stmt = select(EnrichmentJobRun).where(
+                EnrichmentJobRun.case_id == case_id,
+                EnrichmentJobRun.timeline_id == timeline_id,
+            )
+            if enricher_key is not None:
+                stmt = stmt.where(EnrichmentJobRun.enricher_key == enricher_key)
+            result = await session.execute(stmt.order_by(EnrichmentJobRun.created_at.desc()))
+            return list(result.scalars().all())
+
+    async def staged_summary_by_job(
+        self, job_ids: Collection[str]
+    ) -> dict[str, tuple[int, set[str]]]:
+        """Map ``job_id -> (staged_row_count, set of source ids with staged rows)``.
+
+        One GROUP BY for every marker on a timeline, so the enrichers dialog
+        doesn't fan out a count query per enricher. Job ids with no staged rows
+        are simply absent from the result — a marker can legitimately have
+        zero staged rows (the run died before its first batch, or its apply got
+        far enough to drain them), and that is still a resumable marker.
+
+        The source *ids* rather than their count, because the dialog's
+        partial-coverage caveat is "some staged source was never staged fully",
+        which is the staged set minus ``EnrichmentJobRun.completed_source_ids``.
+        Comparing the two cardinalities instead gets this backwards after a
+        partially-applied resume, which deletes staged rows source by source and
+        so shrinks the staged count below the (durable) completed one.
+        Cardinality is per timeline, so materializing the ids is cheap.
+        """
+        if not job_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    EnrichmentResultStaging.job_id,
+                    EnrichmentResultStaging.source_id,
+                    func.count(),
+                )
+                .where(EnrichmentResultStaging.job_id.in_(list(job_ids)))
+                .group_by(EnrichmentResultStaging.job_id, EnrichmentResultStaging.source_id)
+            )
+            summary: dict[str, tuple[int, set[str]]] = {}
+            for job_id, source_id, rows in result.all():
+                total, sources = summary.get(job_id, (0, set()))
+                sources.add(source_id)
+                summary[job_id] = (total + int(rows), sources)
+            return summary
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:
         """Delete a source row and its enrichment provenance/staging.

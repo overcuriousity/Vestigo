@@ -7,6 +7,14 @@
 # the app-layer RBAC entirely. To expose a service on the LAN, change its bind address AND
 # set real credentials (e.g. the commented QDRANT__SERVICE__API_KEY below, a real
 # POSTGRES_PASSWORD, and a ClickHouse user/password).
+#
+# MEMORY LIMITS: none are set here, so every service can grow into all of the host's
+# RAM and the kernel picks the victim when they collectively don't fit — usually
+# ClickHouse, which then dies as `exited with code 137` (SIGKILL) rather than as a
+# clean ClickHouse memory error. Each service below carries commented `mem_limit`
+# values sized for a 32 GiB host; uncomment and adjust to your box before running
+# anything real. See docs/DEPLOYMENT.md "Resource sizing" for how the numbers relate
+# to the app's own VESTIGO_STAT_SCAN_* budget (editable in the admin console).
 
 services:
   postgres:
@@ -17,6 +25,8 @@ services:
       POSTGRES_DB: vestigo
     ports:
       - "127.0.0.1:5432:5432"
+    # Metadata only — never holds events. 4g is generous on a 32 GiB host.
+    # mem_limit: 4g
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -34,12 +44,21 @@ services:
     ports:
       - "127.0.0.1:8123:8123"
       - "127.0.0.1:9000:9000"
+    # Where query cost actually lives, and the service the kernel kills first.
+    # 12g suits a 32 GiB host running the whole stack. A cgroup limit alone is
+    # not enough — pair it with the memory.xml drop-in below, because a
+    # containerized ClickHouse can misdetect total RAM when deriving its own
+    # 90%-of-RAM server limit, and would then never self-throttle.
+    # mem_limit: 12g
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       # >= 25.x images restrict the `default` user to localhost — see the
       # comment in the mounted file.
       # (`z` = SELinux relabel for rootless podman on Fedora; harmless on Docker)
       - ./deploy/clickhouse/allow-default-network.xml:/etc/clickhouse-server/users.d/zz-allow-default-network.xml:ro,z
+      # Server-side memory ceiling. Copy memory.xml.example to memory.xml,
+      # set the value to match mem_limit above, then uncomment this line.
+      # - ./deploy/clickhouse/memory.xml:/etc/clickhouse-server/config.d/zz-memory.xml:ro,z
     healthcheck:
       # clickhouse-client is bundled in the image and always present, unlike
       # wget/curl which vary across the alpine base and gave false negatives.
@@ -53,6 +72,8 @@ services:
     image: docker.io/qdrant/qdrant:v1.18.2
     ports:
       - "127.0.0.1:6333:6333"
+    # Only used when embeddings are enabled; memory scales with vector count.
+    # mem_limit: 4g
     volumes:
       - qdrant_data:/qdrant/storage
     environment:

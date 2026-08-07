@@ -36,7 +36,7 @@ from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
-from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+from vestigo.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
 from vestigo.db._template import template_hash_expr
 from vestigo.models.event import Event
 
@@ -770,7 +770,30 @@ class ClickHouseStore:
         OOM-kill the ClickHouse *server* on a large source (the per-query cap
         fails one apply, which crash-recovers from staging; a dead server
         takes every query down with it).
+
+        It also takes a ``HEAVY_SCAN_GATE`` slot for its whole duration, the
+        same admission control every ``find_*`` detector uses. ``max_memory_usage``
+        is per *query*: without the gate this rewrite stacked on top of
+        ``VESTIGO_STAT_SCAN_CONCURRENCY`` already-admitted detector scans, each
+        carrying a full cap, which is how a 32 GiB full-docker host OOM-killed
+        clickhouse-server mid-apply (session-56 incident — the same failure
+        mode as session-52, reached from the enrichment side). The slot is held
+        across the INSERT *and* the REPLACE, not just the INSERT: the swap
+        queues merges on the freshly written parts, and merge memory was never
+        covered by the per-query cap.
+
+        Write-side memory is bounded separately from the scan settings — the
+        INSERT materializes a full copy of the partition, which the scan
+        settings (a read budget) do not cover. The one knob we set is
+        ``min_insert_block_size_bytes``
+        (``VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES``), the size a block is
+        squashed to before a part is written. ``max_insert_threads`` is
+        deliberately left at ClickHouse's default of 0 — a single-threaded
+        ``INSERT SELECT``. Raising it would give each thread its own squashing
+        buffer, i.e. more peak memory on the exact query this method exists to
+        keep bounded, in exchange for speed this path does not need.
         """
+        settings = get_settings()
         rows_table, events_table = self._enrichment_scratch_tables(scratch_suffix)
         partition_expr = _partition_expr(case_id, source_id)
         # Strip this enricher's previously-derived keys (last ':'-segment in
@@ -787,42 +810,48 @@ class ClickHouseStore:
             else f"e.{column}"
             for column in _EVENT_COLUMNS
         )
-        self.client.command(f"DROP TABLE IF EXISTS {events_table}")
-        # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
-        # indexes, settings) — required for REPLACE PARTITION. The MATERIALIZED
-        # search_blob column is cloned too, and the base-column INSERT below
-        # recomputes it from the post-mapUpdate attributes — swapped-in parts
-        # land with the blob (and its index) fully materialized.
-        self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
-        self.client.query(
-            f"""
-            INSERT INTO {events_table} ({", ".join(_EVENT_COLUMNS)})
-            SELECT
-                {select_columns}
-            FROM {self.database}.events AS e
-            LEFT JOIN (
+        # One admission slot for the whole rewrite. Acquired here rather than
+        # by the caller so no future call site can forget it — the enrichment
+        # job already runs this in a worker thread (asyncio.to_thread), so
+        # blocking on the semaphore is correct.
+        with HEAVY_SCAN_GATE:
+            self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+            # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
+            # indexes, settings) — required for REPLACE PARTITION. The MATERIALIZED
+            # search_blob column is cloned too, and the base-column INSERT below
+            # recomputes it from the post-mapUpdate attributes — swapped-in parts
+            # land with the blob (and its index) fully materialized.
+            self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
+            self.client.query(
+                f"""
+                INSERT INTO {events_table} ({", ".join(_EVENT_COLUMNS)})
                 SELECT
-                    event_id,
-                    CAST(
-                        (groupArray(field_key), groupArray(value)),
-                        'Map(String, String)'
-                    ) AS enr
-                FROM {rows_table}
-                GROUP BY event_id
-            ) AS m ON e.event_id = m.event_id
-            WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
-            {HEAVY_SCAN_SETTINGS}, join_use_nulls = 0, join_algorithm = 'grace_hash'
-            """,
-            parameters={
-                "case_id": case_id,
-                "source_id": source_id,
-                "owned_suffixes": owned_suffixes or [],
-            },
-        )
-        self.client.command(
-            f"ALTER TABLE {self.database}.events "
-            f"REPLACE PARTITION {partition_expr} FROM {events_table}"
-        )
+                    {select_columns}
+                FROM {self.database}.events AS e
+                LEFT JOIN (
+                    SELECT
+                        event_id,
+                        CAST(
+                            (groupArray(field_key), groupArray(value)),
+                            'Map(String, String)'
+                        ) AS enr
+                    FROM {rows_table}
+                    GROUP BY event_id
+                ) AS m ON e.event_id = m.event_id
+                WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
+                {HEAVY_SCAN_SETTINGS}, join_use_nulls = 0, join_algorithm = 'grace_hash',
+                min_insert_block_size_bytes = {settings.enrichment_apply_insert_block_bytes}
+                """,
+                parameters={
+                    "case_id": case_id,
+                    "source_id": source_id,
+                    "owned_suffixes": owned_suffixes or [],
+                },
+            )
+            self.client.command(
+                f"ALTER TABLE {self.database}.events "
+                f"REPLACE PARTITION {partition_expr} FROM {events_table}"
+            )
 
     def drop_enrichment_scratch(self, scratch_suffix: str) -> None:
         """Drop both scratch tables for ``scratch_suffix``, ignoring errors."""

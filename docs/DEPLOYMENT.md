@@ -182,6 +182,74 @@ The selection is an alias stage (`FROM ${FRONTEND_STAGE} AS frontend`) rather th
 while buildah/podman performs it — the terser form builds locally under podman and
 fails every Docker build. Keep the alias if you edit this.
 
+## Resource sizing
+
+The reference stack ships **no memory limits**. That is fine for evaluation on a
+roomy box and wrong for anything real: four processes (app, ClickHouse, Postgres,
+Qdrant) share one host's RAM, none of them knows about the others, and the kernel
+resolves the shortfall by killing whichever is largest. That is almost always
+ClickHouse.
+
+**Recognizing it.** A kernel/cgroup kill shows up as
+
+```
+clickhouse-1 exited with code 137 (restarting)
+```
+
+and, in the app's log, a burst of `Connection refused` against `clickhouse:8123`.
+Exit 137 is SIGKILL from outside — **not** a ClickHouse memory error. If ClickHouse
+had hit its own limit you would instead see a `MEMORY_LIMIT_EXCEEDED` query failure
+and the server would still be alive. Confirm with `dmesg -T | grep -i -A5 'killed
+process'`, which names the cgroup and the RSS at kill time.
+
+### The three ceilings, and how they must relate
+
+1. **The container limit** (`mem_limit` in `docker-compose.yml`) — the hard stop.
+   Above it the kernel kills, without warning or a log line from the victim.
+2. **ClickHouse's own `max_server_memory_usage`** — must sit *below* the container
+   limit so the server refuses a query rather than being killed. By default it is
+   derived as 0.9 × detected RAM, and a containerized server can misdetect that
+   badly (503 GiB observed on a 128 GiB VM), in which case it never self-throttles.
+   Pin an absolute value: see `deploy/clickhouse/memory.xml.example`. Pinning does
+   not disable the ratio — the effective ceiling is the *lower* of the two, and
+   ClickHouse logs a "lowered to" line when it clamps the pinned value down, so
+   confirm the value it actually adopted in the server log.
+3. **Vestigo's scan budget** (`VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`) — a *total across
+   concurrent heavy scans*; each query is granted budget ÷
+   `VESTIGO_STAT_SCAN_CONCURRENCY` as its `max_memory_usage`. Must sit below (2).
+
+The trap is (3) when left at its `0` (auto) default. Detection runs **in the app
+process**, from its cgroup limit or, failing that, the host's `MemTotal`. In a
+full-docker stack with no limits set, the app reads the whole host and sizes a
+budget as though ClickHouse owned the machine. On a 32 GiB host that is 32 × 0.8 ÷ 2
+= 12.8 GiB granted to a single query, while Postgres, Qdrant and the app are also
+resident. Pin it explicitly whenever the app and ClickHouse are in separate
+containers — the automatic value is only correct when they genuinely share one
+memory limit.
+
+Heavy scans are admission-controlled (`VESTIGO_STAT_SCAN_CONCURRENCY`, default 2),
+and the enrichment partition rewrite takes a slot too — so the worst case is
+`concurrency × per-query cap`, not one query's cap.
+
+### Worked example: 32 GiB host, full-docker
+
+| Setting | Value | Where |
+| --- | --- | --- |
+| ClickHouse container limit | 12 GiB | `mem_limit: 12g` |
+| ClickHouse server limit | 10 GiB | `deploy/clickhouse/memory.xml` |
+| Vestigo scan budget (total) | 8 GiB | `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES=8000000000` |
+| → per-query cap | 4 GiB | budget ÷ concurrency (2) |
+| Postgres | 4 GiB | `mem_limit: 4g` |
+| Qdrant | 4 GiB | `mem_limit: 4g` (only with embeddings) |
+
+That leaves roughly 12 GiB for the app process and the OS page cache. Scale the
+ClickHouse numbers first when you have more RAM; it is where query cost lives.
+
+Every `VESTIGO_STAT_SCAN_*` value is editable in the admin console, but all of them
+are **restart-required** — the SETTINGS clause is built once at import and the
+admission semaphore is shared by value across the scan modules, so a saved edit does
+nothing until the app restarts. The console labels them accordingly.
+
 ## Airgapped installation
 
 Two supported routes. Pick by how the host runs Vestigo:
@@ -550,7 +618,9 @@ against one database. To serve more concurrent analysts, scale the box (the API 
 and I/O-bound; heavy scans are already admission-controlled by `HEAVY_SCAN_GATE`, and
 transfers by `VESTIGO_TRANSFER_MAX_CONCURRENT`) and scale ClickHouse, which is where query
 cost actually lives. Nothing here caps **data** volume — the reference case is 300M rows
-and single timelines run to 80 GiB+.
+and single timelines run to 80 GiB+. Scaling the box without also raising the memory
+ceilings is how you get an OOM-killed ClickHouse — see [Resource
+sizing](#resource-sizing).
 
 Multi-process scale-out is possible but unbuilt: it means moving those state holders
 to a shared backend (Postgres or Redis for jobs and backoff, a real pub/sub for the event

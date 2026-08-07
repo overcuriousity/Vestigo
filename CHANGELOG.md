@@ -7,6 +7,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-08-07
+
+### Added
+
+- **An `empty` field match mode** — a fourth mode beside exact, wildcard and regex that
+  asks whether a field has a value at all. Include means "is empty", exclude means "has
+  a value". It rides the existing per-key mode maps, so URLs, saved views, export,
+  bulk-annotate and the histogram all inherit it, and the filter rail renders it as a
+  static `(empty)` label rather than a value input the backend would ignore. The
+  predicate is `ifNull(<col>, '') = ''`: an absent `attributes` map key already reads as
+  `''` in ClickHouse, the cast covers non-String columns, and the coalesce stops a NULL
+  from evaluating to NULL and dropping the row from *both* sides of the filter.
+  Whitespace-only values count as values — `' '` is what the source recorded, and
+  folding it into "absent" would make the filter lie about the evidence.
+- **Drag grid columns by their headers to reorder them.** Visible columns were already
+  an ordered array driving render order, so a drag rewrites it into the same
+  per-timeline override a manual column choice writes, under the precedence rules that
+  already existed. The checkbox, annotation and expand columns stay pinned outside the
+  sortable set, and the pointer sensor takes an 8px activation distance so clicking the
+  timestamp sort button still sorts.
+- **Saved views carry the grid column layout.** A view now records the columns it was
+  saved with, inside its already-opaque JSON payload — no migration, no backend change.
+  Views saved before this leave the current layout untouched, which falls out of the
+  undefined case rather than needing a version flag. The agent's finding cards and story
+  pushes deliberately omit the key: neither speaks for a grid.
+- **Search and delete in the saved-views list.** Case-insensitive substring search
+  appears once the list passes five entries (five rows are faster to scan than to
+  filter), and each row gains a delete behind a confirmation, since deleting an
+  unreferenced view is not undoable. The `DELETE` endpoint and its client method already
+  existed and had simply never been called from the UI.
+- **Resume an enrichment run that was interrupted before its results were saved.** The
+  enrichers dialog now surfaces any run whose staged results were never applied — how
+  many events across how many sources, and how long ago — with a **Resume** button that
+  applies them without re-scanning anything. Previously the only recovery was startup
+  reconciliation, so a run orphaned while the app stayed up (see the ClickHouse fix
+  below) was unrecoverable short of restarting the app. Recovery is deliberately manual
+  — no timer, no reconnect hook — so every partition rewrite traces to a named actor;
+  the request and its outcome are both audited (`enricher.resume_requested`,
+  `enricher.job_recovered` with `trigger`, `enricher.resume_failed`).
+
+### Fixed
+
+- **Two enrichment applies could still meet over one source.** The run route read its
+  conflict check ~65 lines above the claim it belonged to, with three awaits in between,
+  and discarded the claim's return value — so the loser of a race spawned its job anyway,
+  and, holding no run slot, its *live* marker read as dead to the enrichers dialog, which
+  then offered Resume on a running job. Separately, startup reconciliation (which runs
+  after the app is serving) never claimed a slot at all, so the dialog offered Resume for
+  a marker it was in the middle of applying. Because the ClickHouse scratch tables are
+  keyed on the job id alone while the apply lock is per source, the two applies could
+  finalize one source's partition from another's rows — a `mapUpdate` matching nothing
+  plus stale-key stripping that removes derived keys that were there. The claim is now
+  the authoritative check everywhere, and reconciliation holds the slot for the duration
+  of its apply.
+- **The interrupted-run banner tells the truth after a half-finished resume.** Its
+  partial-coverage caveat compared the durable "sources fully staged" count against the
+  count of sources *still* staged — and a resume deletes staged rows as it applies them,
+  so the comparison inverted exactly when the caveat applied. The API now reports
+  `partial_sources` as a set difference. A marker with nothing left staged also no longer
+  claims "0 events across 0 sources were enriched but never written"; it says the run
+  left nothing pending and that resuming clears the record.
+- **The enrichers dialog admits when a run is in flight.** A live run's marker is hidden
+  on purpose, which left "Run now" enabled during any run in progress — including a
+  startup recovery still applying — with a 409 as the only feedback. The listing now
+  reports the running job and the buttons disable on it, server-derived so it survives a
+  page reload.
+- **Auto field selection is reproducible.** The novelty-field recommender ranked
+  recommended-first, then by coverage — and stopped there. Coverage ties are the normal
+  case (every field of one source covers that source's events), so the tie order came
+  from a ClickHouse `GROUP BY` that does not promise a stable row order. The detectors
+  that auto-pick fields take the top 1 (`value_novelty`) or top 2 (`value_combo`) of
+  that list, so the same timeline could be scanned on different fields each time it was
+  opened. The ranking now breaks ties on the field token, and the inventory query orders
+  its `LIMIT` by `cov_count DESC, key ASC` so truncation is stable too.
+- **The enrichment partition rewrite no longer raises insert parallelism.**
+  `VESTIGO_ENRICHMENT_APPLY_MAX_INSERT_THREADS` was removed rather than re-defaulted:
+  ClickHouse's default of 0 means a single-threaded `INSERT SELECT`, so shipping 2 gave
+  each thread its own squashing buffer on the exact query that OOM-killed a host — more
+  write-side memory, presented as a guardrail.
+  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` now defaults to 64 MiB (it previously
+  shipped ClickHouse's own 256 MiB default, so it bounded nothing) and is no longer
+  marked restart-required, because the apply reads it per call.
+- **The enrichers dialog clears its own interrupted-run banner.** A resume's partition
+  rewrite runs after the request returns, so the marker was still present at the only
+  refetch the dialog did — leaving "an earlier run was interrupted" on screen, with Run
+  now disabled, until the dialog was closed and reopened. The tracked job now invalidates
+  the enrichers list on completion, and Resume stays disabled until that job is terminal
+  instead of re-arming into a 409 against the analyst's own resume.
+- **One interrupted run, one job id.** The dialog surfaced the oldest stale marker while
+  the run route's 409 named the newest, so with more than one marker an analyst could
+  resume the job they were shown and be blocked again by a job nobody mentioned. Oldest
+  wins everywhere now. The auto-trigger's skip log also no longer reports a healthy
+  in-flight run as needing a resume.
+- **A ClickHouse OOM-kill during enrichment (`exited with code 137`).** The enrichment
+  partition rewrite carried the heavy-scan memory settings but never took a slot in the
+  admission gate that every detector scan takes, so it stacked on top of a full set of
+  admitted scans — each holding its own per-query cap — and the kernel killed
+  clickhouse-server mid-apply. Note the symptom: exit 137 is SIGKILL from *outside*, not
+  a ClickHouse memory error, so nothing appears in the server's own log. It now holds a
+  gate slot across the whole rewrite including the `REPLACE PARTITION` swap, which
+  queues merges on freshly written parts that the per-query cap never covered, and its
+  write side is bounded separately (`VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`, the
+  block squash floor, set below ClickHouse's default) because the scan settings bound a
+  read while the rewrite also materializes a full copy of the partition.
+  - **Operators on a full-docker stack should also set memory ceilings.** The automatic
+    scan budget is detected in the *app* container and sizes itself as though ClickHouse
+    owned the machine, which is wrong as soon as they are separate containers. The
+    reference `docker-compose.yml` now carries **commented** `mem_limit` values sized
+    for a 32 GiB host and a new `deploy/clickhouse/memory.xml.example` drop-in — nothing
+    changes on upgrade, you have to opt in. A worked example and the relationship
+    between the three ceilings are in `docs/DEPLOYMENT.md` §"Resource sizing".
+- **Editing a scan-guardrail setting in the admin console appeared to work and did
+  nothing.** The SETTINGS clause is built once at import and the admission semaphore is
+  shared by value across the scan modules, so no `VESTIGO_STAT_SCAN_*` edit could reach
+  the running process. They are now declared restart-required and labelled as such,
+  rather than silently accepting an edit with no effect.
+- **Starting a fresh enrichment run no longer strands an interrupted run's results.**
+  The run route consulted neither the durable job marker nor the staged rows, so "Run
+  now" minted a new job id, re-scanned everything, and orphaned the earlier run's output
+  permanently — output that is not even recomputable once the enricher's data version
+  has changed, since it is stamped with a pinned config hash. Both the manual route and
+  the post-ingest auto-trigger now refuse (409) or skip while an unfinished run exists,
+  pointing at Resume; the conflict checks run before the "already enriched, nothing to
+  do" short-circuit, which would otherwise have been a misleading answer.
+- **One failing enricher eligibility check no longer blanks the whole enrichers dialog.**
+  The checks were gathered without `return_exceptions`, so an unreachable ClickHouse
+  emptied the list — precisely when an analyst needs to see the resume banner. Failed
+  checks now render with their error.
+- **"Force re-run" survives a page refresh.** It was gated on component state that only
+  appeared after a skipped run in the same dialog session, making the documented
+  recovery path unreachable after any reload. It is now a standing affordance. Relatedly,
+  "Run now" is no longer disabled by a negative eligibility result — that is a heuristic
+  sample scan and must never be the thing that locks an analyst out of running.
+- **Deleting a saved view that a story embeds no longer breaks that story's export.** A
+  `view_ref` block resolves its view live at render and export time; deleting a
+  referenced view froze a `resolution.error` in place of the evidence the block was
+  built on — the quieter and worse outcome for a forensic report. Deletion is now
+  conditional: an unreferenced view is removed, a referenced one is hidden via a new
+  nullable `views.deleted_at` and disappears from every list an analyst sees while the
+  story keeps working, then is hard-deleted once the last reference goes. The sweep runs
+  after every block delete, block content update and story delete, so no path can forget
+  it.
+- **The event-grid header scrolls with its columns.** It was a sibling of the scroll
+  container, so scrolling right moved the columns out from under it. The same fix sizes
+  rows to the content rather than the viewport, which had been cutting their background,
+  hover state and borders off at the right edge whenever columns overflowed.
+- Several defects found reviewing the above: `specToEventFilters` dropped the `empty`
+  mode while keeping its placeholder value, so a finding card's "open in Explorer" ran
+  an exact match against the literal empty string and excluded the very NULL rows the
+  agent had counted; the click-to-filter reducer had the same blind spot from the other
+  direction; an `empty` mode naming a key absent from `filters` validated and was then
+  ignored, answering with the whole timeline; `delete_view`'s count-then-delete could
+  race a `view_ref` write and recreate the dangling reference the design exists to
+  prevent; the virtualizer's scroll margin used `offsetTop` against an unpositioned
+  ancestor and put the rendered window hundreds of pixels off; and `viewMatchesFilters`
+  compared a key `filtersToViewPayload` never emits, so every explorer-saved view was
+  unreusable and each story push minted a duplicate.
+
 ### Changed
 
 - **Vendored `*2timesketch` converters re-synced to upstream 1.1.0 (`1bbe64f`).** The only

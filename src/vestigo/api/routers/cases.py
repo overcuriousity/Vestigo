@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +46,14 @@ from vestigo.db.field_stats import (
     merged_list_fields,
     refresh_source_field_stats,
 )
-from vestigo.db.postgres import Case, PostgresStore, Timeline, User, generate_id
+from vestigo.db.postgres import (
+    Case,
+    EnrichmentJobRun,
+    PostgresStore,
+    Timeline,
+    User,
+    generate_id,
+)
 from vestigo.db.qdrant import QdrantStore
 from vestigo.ingestion.parser import detect_format
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -476,6 +485,7 @@ async def _trigger_automatic_enrichments(
     """
     from vestigo.enrichers.jobs import (
         get_active_enricher_run,
+        oldest_unfinished_run,
         run_enrichment_job,
         spawn_tracked_enrichment_task,
         try_claim_enricher_run,
@@ -489,6 +499,34 @@ async def _trigger_automatic_enrichments(
         enricher = get_enricher(enricher_key)
         availability = get_cached_availability(enricher_key)
         if enricher is None or availability is None or not availability.available:
+            continue
+        # Skip (never raise) when an unfinished run is waiting to be resumed:
+        # a fresh run would strand its staged rows, and this code path runs
+        # inside the ingestion job where an exception is swallowed with a
+        # misleading log. The analyst resumes it from the enrichers dialog.
+        # Awaited here rather than below so the check/create/claim sequence
+        # stays await-free.
+        #
+        # A *live* run has a marker too, so exclude the job currently holding
+        # the run slot — same "marker present and slot not held by it" rule the
+        # enrichers dialog applies. Without it, a healthy auto-run still going
+        # on a sibling source would be reported as needing a resume that would
+        # only 409; the truthful message is the "already running" one below.
+        # This read is for message accuracy only — the authoritative slot check
+        # is re-read after the await.
+        running_job_id = get_active_enricher_run(timeline_id, enricher_key)
+        markers = await store.list_enrichment_job_runs_for_timeline(
+            case_id, timeline_id, enricher_key=enricher_key
+        )
+        dead = oldest_unfinished_run([m for m in markers if m.job_id != running_job_id])
+        if dead is not None:
+            logger.info(
+                "Skipping auto-enrichment %s for timeline %s: unfinished run %s must be "
+                "resumed first (enrichers dialog)",
+                enricher_key,
+                timeline_id,
+                dead.job_id,
+            )
             continue
         # Check before creating the job so a skip leaves no orphan pending
         # job in the store; check + create + claim happen in the same event-
@@ -505,7 +543,19 @@ async def _trigger_automatic_enrichments(
         job = job_store.create(
             kind="enrich", progress={"processed": 0, "total": 0}, created_by=None, case_id=case_id
         )
-        try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        # Checked, not discarded: the read above is only as authoritative as the
+        # absence of an await between it and here, and that is an invariant a
+        # later edit can break silently. The claim itself cannot be raced.
+        conflict = try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        if conflict is not None:
+            job_store.update(job.id, status="failed", error="Enrichment already running")
+            logger.info(
+                "Enrichment %s already running for timeline %s (job %s); skipping auto-trigger",
+                enricher_key,
+                timeline_id,
+                conflict,
+            )
+            continue
         # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
         # inside the background ingestion job, where no request scope exists.
         # spawn_tracked_enrichment_task keeps the strong reference that stops
@@ -1649,6 +1699,51 @@ class TimelineEnricherConfigUpdate(BaseModel):
     enabled: bool
 
 
+class EnricherResumeRequest(BaseModel):
+    """Body for resuming an unfinished enrichment run."""
+
+    job_id: str = Field(..., min_length=1, max_length=64)
+
+
+def _unfinished_run_payload(
+    run: EnrichmentJobRun | None, staged: dict[str, tuple[int, set[str]]]
+) -> dict[str, Any] | None:
+    """Describe a dead enrichment run for the enrichers dialog, or None.
+
+    ``partial_sources`` is the partial-coverage signal: staged sources that the
+    run never finished staging, which get their values applied but stay
+    provenance-free and re-runnable. It is computed as a set difference rather
+    than by comparing ``staged_sources`` with ``completed_sources``, because
+    those two are not measured the same way — ``staged_sources`` is what is
+    *still* staged now, and a resume that dies partway through has already
+    deleted the staged rows of the sources it applied, driving that count below
+    the durable ``completed_sources`` and flipping a naive comparison to "not
+    partial" exactly when the caveat is true.
+
+    A marker with zero staged rows is still reported — it is still resumable (a
+    no-op apply that clears the marker), which is how an analyst lifts the
+    "resume before running" conflict. The dialog says something different for
+    that case, since "0 events were enriched but never written" is not what
+    happened.
+    """
+    if run is None:
+        return None
+    rows, staged_source_ids = staged.get(run.job_id, (0, set()))
+    completed = set(run.completed_source_ids or [])
+    started = run.created_at
+    if started.tzinfo is None:  # SQLite round-trips naive datetimes
+        started = started.replace(tzinfo=UTC)
+    return {
+        "job_id": run.job_id,
+        "started_at": started.isoformat(),
+        "age_seconds": max(0, int((datetime.now(UTC) - started).total_seconds())),
+        "staged_rows": rows,
+        "staged_sources": len(staged_source_ids),
+        "completed_sources": len(completed),
+        "partial_sources": len(staged_source_ids - completed),
+    }
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/enrichers")
 async def list_timeline_enrichers(
     timeline_id: str,
@@ -1661,6 +1756,7 @@ async def list_timeline_enrichers(
     GUI until an admin makes them available.
     """
     from vestigo.enrichers.base import effective_enricher_state
+    from vestigo.enrichers.jobs import get_active_enricher_run, oldest_unfinished_run
     from vestigo.enrichers.registry import all_enrichers, get_cached_availability
 
     store = get_store()
@@ -1674,6 +1770,23 @@ async def list_timeline_enrichers(
     configs = {c.enricher_key: c for c in await store.list_timeline_enrichers(timeline_id)}
     global_defaults = {
         c.enricher_key: c.auto_run_default for c in await store.list_enricher_global_configs()
+    }
+
+    # Unfinished runs: a marker whose (timeline, enricher) run slot is not held
+    # by that same job id is provably dead — the slot is claimed before the
+    # marker is written and released after it would have been deleted. A run
+    # orphaned while the process stayed up (ClickHouse died mid-apply) is
+    # invisible to startup reconciliation, so this is how an analyst finds it.
+    markers = await store.list_enrichment_job_runs_for_timeline(case_id, timeline_id)
+    stale = [m for m in markers if get_active_enricher_run(timeline_id, m.enricher_key) != m.job_id]
+    staged_counts = await store.staged_summary_by_job([m.job_id for m in stale])
+    # One marker per enricher, chosen by the shared oldest-first tie-break so the
+    # banner names the same job as the run route's 409 and the auto-trigger's log.
+    by_key: dict[str, list[EnrichmentJobRun]] = defaultdict(list)
+    for marker in stale:
+        by_key[marker.enricher_key].append(marker)
+    stale_by_key = {
+        key: run for key, markers_ in by_key.items() if (run := oldest_unfinished_run(markers_))
     }
 
     available = [
@@ -1691,8 +1804,12 @@ async def list_timeline_enrichers(
     def _check_one(enricher):
         return enricher.check_eligibility(ClickHouseStore(), case_id, ready_source_ids)
 
+    # return_exceptions: one unreachable/failing check must not blank the whole
+    # dialog. ClickHouse being down is exactly when an analyst needs to see the
+    # unfinished-run banner, and eligibility is only advisory anyway.
     eligibilities = await asyncio.gather(
-        *(run_in_threadpool(_check_one, enricher) for enricher in available)
+        *(run_in_threadpool(_check_one, enricher) for enricher in available),
+        return_exceptions=True,
     )
     result = []
     for enricher, eligibility in zip(available, eligibilities, strict=True):
@@ -1702,16 +1819,41 @@ async def list_timeline_enrichers(
             config.mode if config else None,
             global_defaults.get(enricher.key, False),
         )
+        failed = isinstance(eligibility, BaseException)
+        if failed:
+            logger.warning(
+                "Eligibility check failed for enricher %s on timeline %s: %s",
+                enricher.key,
+                timeline_id,
+                eligibility,
+            )
         result.append(
             {
                 "key": enricher.key,
                 "display_name": enricher.display_name,
                 "description": enricher.description,
-                "eligible": eligibility.eligible,
-                "sample_checked": eligibility.sample_checked,
-                "sample_matched": eligibility.sample_matched,
+                "eligible": False if failed else eligibility.eligible,
+                "sample_checked": 0 if failed else eligibility.sample_checked,
+                "sample_matched": 0 if failed else eligibility.sample_matched,
+                "eligibility_error": str(eligibility) if failed else None,
                 "mode": mode,
                 "enabled": enabled,
+                # The job holding the run slot, or None. A run in flight is
+                # exactly the case where `unfinished_run` is None *and* a run
+                # would 409: its marker is filtered out of `stale` above because
+                # the slot is held by it. Without this the dialog offers "Run
+                # now" during a live run — including one startup reconciliation
+                # is still applying — and the click fails with an "already
+                # running" error the analyst had no way to anticipate.
+                "running_job_id": get_active_enricher_run(timeline_id, enricher.key),
+                # None unless this enricher has a dead run waiting to be resumed.
+                # Markers for a currently-*unavailable* enricher are not rendered
+                # (it is filtered out of `available` above) — that enricher cannot
+                # be run either, so no new deadlock; startup reconciliation and a
+                # later re-availability both still reach it.
+                "unfinished_run": _unfinished_run_payload(
+                    stale_by_key.get(enricher.key), staged_counts
+                ),
             }
         )
     return {"enrichers": result}
@@ -1774,6 +1916,7 @@ async def run_timeline_enricher(
     """
     from vestigo.enrichers.jobs import (
         get_active_enricher_run,
+        oldest_unfinished_run,
         run_enrichment_job,
         try_claim_enricher_run,
     )
@@ -1797,6 +1940,44 @@ async def run_timeline_enricher(
     if not source_ids:
         raise HTTPException(status_code=422, detail="Timeline has no ready sources to enrich")
 
+    # Both conflict checks run *before* the provenance skip below: if a run is
+    # in flight or unfinished, "everything is already enriched, nothing to do"
+    # would be a misleading answer — the staged rows of an unfinished run are
+    # precisely the work that has not been applied yet.
+    #
+    # This read is for the *early* 409 only: several awaits separate it from the
+    # claim below, so it cannot be the authoritative check. The claim's own
+    # return value is (see there).
+    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
+    if active_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {active_job_id})",
+        )
+
+    # An unfinished run's staged rows are completed enrichment output stamped
+    # with a pinned enricher config/data version. A fresh run would strand them
+    # permanently (_apply_staged_rows only ever lists its own job's staged
+    # sources) and, if the enricher's data version has since changed, they are
+    # not recomputable at all — discarding them would destroy derived evidence
+    # that the pinned-hash design exists to keep reproducible. Make the analyst
+    # resume first; resume is always available and always terminal, so this can
+    # never wedge. Any marker reaching here is dead by the run-slot invariant:
+    # a live run would have 409'd on the check above.
+    unfinished = oldest_unfinished_run(
+        await store.list_enrichment_job_runs_for_timeline(
+            case_id, timeline_id, enricher_key=enricher_key
+        )
+    )
+    if unfinished is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An unfinished enrichment run (job {unfinished.job_id}) must be "
+                "resumed before a new run can start"
+            ),
+        )
+
     # Skip sources already enriched at the current config: a source's derived
     # fields live on its ClickHouse partition, not on the timeline, so a source
     # carried into a new timeline is already enriched. config_hash folds in the
@@ -1817,13 +1998,6 @@ async def run_timeline_enricher(
             "skipped_source_ids": skipped_source_ids,
         }
 
-    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
-    if active_job_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Enrichment already running (job {active_job_id})",
-        )
-
     job_store = get_job_store()
     # Construct the ClickHouse client *before* claiming the run slot: its
     # constructor can raise when ClickHouse is unreachable, and a claim taken
@@ -1839,7 +2013,23 @@ async def run_timeline_enricher(
     )
     # Claim now (before the response) so a double-click is rejected with 409
     # even though the job itself only starts after the response is sent.
-    try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    #
+    # The claim's return value is the authoritative conflict check, not the read
+    # near the top of this handler: three awaits sit between them (the marker
+    # query, the config_hash thread hop, the provenance query), so two "Run now"
+    # clicks — or one racing ``_trigger_automatic_enrichments`` from a concurrent
+    # ingest — can both pass that read. Losing the claim and spawning anyway
+    # would put two applies on the same source *and* leave the loser's live
+    # marker looking dead to the enrichers dialog (marker present, slot held by
+    # the winner), which offers Resume on a running job — exactly the concurrent
+    # partition rewrite ``enrichers/jobs.py`` exists to prevent.
+    conflict = try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    if conflict is not None:
+        job_store.update(job.id, status="failed", error="Enrichment already running")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {conflict})",
+        )
     background_tasks.add_task(
         run_enrichment_job,
         job_id=job.id,
@@ -1870,4 +2060,137 @@ async def run_timeline_enricher(
         "status": job.status,
         "source_ids": source_ids,
         "skipped_source_ids": skipped_source_ids,
+    }
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/enrichers/{enricher_key}/resume")
+async def resume_timeline_enricher(
+    timeline_id: str,
+    enricher_key: str,
+    body: EnricherResumeRequest,
+    background_tasks: BackgroundTasks,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Finish an enrichment run that died before its results were applied.
+
+    Applies the run's already-staged rows and clears its marker — no re-scan,
+    no recomputation. This is the recovery path when ClickHouse dies mid-apply
+    and comes back under a live app, which startup reconciliation never sees.
+
+    Auth matches the run route: resume performs the same partition rewrite, so
+    it cannot require less, and it computes nothing new, so it must not require
+    ``require_case_manage`` (reserved for changing enricher configuration).
+
+    ``body.job_id`` is optimistic concurrency, not routing: the dialog may have
+    been open for minutes, and echoing the id the analyst actually saw turns a
+    stale view into a clean 404 instead of a silent rewrite of a partition
+    nobody looked at.
+    """
+    from vestigo.enrichers.jobs import (
+        get_active_enricher_run,
+        run_resume_job,
+        try_claim_enricher_run,
+    )
+    from vestigo.enrichers.registry import get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+    # Deliberately no availability check: resume applies already-computed rows
+    # and never calls enrich_value, so a removed .mmdb must not strand valid
+    # results. _apply_staged_rows already degrades gracefully for an enricher
+    # it cannot resolve (it just skips stale-key stripping).
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    run = await store.get_enrichment_job_run(body.job_id)
+    if (
+        run is None
+        or run.case_id != case_id
+        or run.timeline_id != timeline_id
+        or run.enricher_key != enricher_key
+    ):
+        # One 404 for all four cases — a mismatched marker must not confirm
+        # that some other case's job id exists.
+        raise HTTPException(status_code=404, detail="No unfinished enrichment run with that id")
+
+    summary = await store.staged_summary_by_job([run.job_id])
+    staged_rows, staged_source_ids = summary.get(run.job_id, (0, set()))
+
+    # From here to the claim there is no await: check-then-claim must happen in
+    # one event-loop tick or two concurrent resumes both pass. Same
+    # document-by-invariant discipline _ACTIVE_RUNS relies on throughout.
+    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
+    if active_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {active_job_id})",
+        )
+
+    job_store = get_job_store()
+    # Before the claim, for the same reason as the run route: a constructor
+    # raise after claiming would wedge this (timeline, enricher) at 409.
+    ch_store = ClickHouseStore()
+    job = job_store.create(
+        kind="enrich",
+        progress={"processed": 0, "total": 0},
+        created_by=user.id,
+        case_id=case_id,
+    )
+    # Claim under the *marker's* job id, not the poll job's. That keeps the
+    # discovery invariant sound (marker present + slot held by it = live), so a
+    # second analyst cannot fire a second resume over the same staged rows, and
+    # it makes the run route's 409 name the run they already know about.
+    # Checked rather than discarded for the same reason as the run route: the
+    # read above is only authoritative while nothing awaits between it and here.
+    conflict = try_claim_enricher_run(timeline_id, enricher_key, run.job_id)
+    if conflict is not None:
+        job_store.update(job.id, status="failed", error="Enrichment already running")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {conflict})",
+        )
+
+    # Recorded before spawning so the named actor is on file even if the apply
+    # then fails.
+    await store.record_audit(
+        action="enricher.resume_requested",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "enricher_key": enricher_key,
+            "job_id": run.job_id,
+            "poll_job_id": job.id,
+            "staged_rows": staged_rows,
+            "staged_sources": len(staged_source_ids),
+            "completed_sources": len(run.completed_source_ids or []),
+            "partial_sources": len(staged_source_ids - set(run.completed_source_ids or [])),
+        },
+    )
+    background_tasks.add_task(
+        run_resume_job,
+        poll_job_id=job.id,
+        run=run,
+        job_store=job_store,
+        store=store,
+        ch_store=ch_store,
+        actor_user_id=user.id,
+        actor_username=user.username,
+    )
+    return {
+        # Two distinct ids: `job_id` polls the JobStore, `resumed_job_id` is the
+        # enrichment run whose staged rows are being applied. They cannot be the
+        # same value — the latter keys the staged rows and names the ClickHouse
+        # scratch table, so it stays pinned to the original run.
+        "job_id": job.id,
+        "resumed_job_id": run.job_id,
+        "status": job.status,
+        "staged_rows": staged_rows,
+        "staged_sources": len(staged_source_ids),
     }

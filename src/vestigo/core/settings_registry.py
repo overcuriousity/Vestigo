@@ -534,43 +534,65 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Memoized baseline layers for compare renders. 0 disables the cache.",
     ),
     # ── Scan guardrails ──────────────────────────────────────────────────
+    # All restart_required: the SETTINGS clause is a module-level string built
+    # once at import and the admission semaphore is imported by value into
+    # every scan module, so neither reacts to a runtime edit (db/_scan.py).
     SettingSpec(
         "stat_scan_max_threads",
         "scans",
         "Max threads per scan",
         "ClickHouse max_threads for heavy detector/inventory scans.",
+        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_external_group_by_bytes",
         "scans",
         "GROUP BY spill threshold (bytes)",
         "Bytes after which a heavy GROUP BY spills to disk.",
+        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_external_sort_bytes",
         "scans",
         "ORDER BY spill threshold (bytes)",
         "Bytes after which a plain sort spills to disk (window sorts cannot spill).",
+        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_max_memory_bytes",
         "scans",
         "Scan memory budget (bytes)",
         "Total budget shared across concurrent scans. 0 = auto-derive from detected RAM. "
-        "Pin it when ClickHouse runs on another host — size it to that host.",
+        "Pin it when ClickHouse runs on another host — size it to that host. In a "
+        "full-docker stack the automatic value is detected from the *app* container and "
+        "assumes ClickHouse owns the box, so pin it there too.",
+        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_memory_ratio",
         "scans",
         "Auto-budget memory ratio",
         "Fraction of detected RAM the automatic budget uses.",
+        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_concurrency",
         "scans",
         "Concurrent heavy scans",
         "Scans allowed against ClickHouse at once; the rest queue. Guards against an "
-        "OOM-kill of the server.",
+        "OOM-kill of the server. The enrichment partition rewrite takes a slot too.",
+        restart_required=True,
+    ),
+    SettingSpec(
+        "enrichment_apply_insert_block_bytes",
+        "scans",
+        "Enrichment apply insert block size (bytes)",
+        "Squash floor for the enrichment partition rewrite's INSERT: rows accumulate until "
+        "a block reaches at least this size before a part is written. Lower it to trade more "
+        "(smaller) parts and more merge work for less insert-time memory. Unlike the scan "
+        "settings this one is not restart-required — it is interpolated per call, not frozen "
+        "into a module-level SETTINGS clause at import.",
+        restart_required=False,
     ),
     # ── Enrichment ───────────────────────────────────────────────────────
     SettingSpec(

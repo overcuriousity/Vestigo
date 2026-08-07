@@ -60,6 +60,19 @@ model migrates once, not twice.**
 
 ## Milestone 3 — polish
 
+- [ ] **Make the scan guardrails live instead of restart-required.** Every
+  `VESTIGO_STAT_SCAN_*` setting is declared `restart_required` because `HEAVY_SCAN_SETTINGS` is a module-level string built once at
+  import and `HEAVY_SCAN_GATE` is imported *by value* into `db/queries.py`,
+  `db/anomaly_stats.py`, `sigma/runner.py` and `db/clickhouse.py` — rebinding the `_scan`
+  globals would not reach those bindings. An operator tuning the budget in response to an
+  OOM incident (session 159) has to restart to apply it. Needs the clause resolved at call
+  time and the semaphore behind an accessor, not a rebind.
+- [ ] **Per-source progress on a resumed enrichment run.** `run_resume_job` reports
+  status only, so the analyst sees a spinner for the duration of a whole-partition
+  rewrite. `_apply_staged_rows` has no progress hook and its signature is shared with
+  startup reconciliation; the minimal shape is an optional `on_source_done` callback
+  defaulted to `None`, with the route seeding `total` from the staged-source count it
+  already computes.
 - [ ] **Show env-pinned settings as pinned in the admin console.** A field the operator
   set in the environment silently wins over the stored override (`core/config.py::
   env_pinned`), so an admin can flip a toggle, get a 200, and see nothing change —
