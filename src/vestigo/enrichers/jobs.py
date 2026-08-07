@@ -20,6 +20,16 @@ per-source read offsets durably. Re-applying and re-running are both safe
 because ``mapUpdate`` overwrites the same derived keys with recomputed
 values (idempotent), not because of any read-time dedup.
 
+A run can also be orphaned *without* the process dying — ClickHouse going
+away mid-apply and coming back leaves the marker and staged rows behind under
+a live app, which startup reconciliation will never see. That case is
+recovered by ``resume_enrichment_run`` via the analyst-triggered resume
+route; recovery is deliberately manual (no timer, no reconnect hook) so every
+partition rewrite traces to a named actor. Because a fresh run would strand
+those staged rows — ``_apply_staged_rows`` only ever sees its own job id, and
+values computed against a since-replaced enricher data version are not
+recomputable — the run route refuses with 409 while a marker exists.
+
 Provenance: which enricher config/data version produced a source's derived
 fields is recorded per source in Postgres (``SourceEnrichment``) at apply
 time, replacing the per-row hash column of the former side-table design.
@@ -100,7 +110,7 @@ def try_claim_enricher_run(timeline_id: str, enricher_key: str, job_id: str) -> 
     return None
 
 
-def _release_enricher_run(timeline_id: str, enricher_key: str, job_id: str) -> None:
+def release_enricher_run(timeline_id: str, enricher_key: str, job_id: str) -> None:
     """Release the run slot, but only if this job still owns it."""
     if _ACTIVE_RUNS.get((timeline_id, enricher_key)) == job_id:
         del _ACTIVE_RUNS[(timeline_id, enricher_key)]
@@ -398,7 +408,7 @@ async def run_enrichment_job(
     prototype = get_enricher(enricher_key)
     if prototype is None:
         job_store.update(job_id, status="failed", error=f"Unknown enricher: {enricher_key}")
-        _release_enricher_run(timeline_id, enricher_key, job_id)
+        release_enricher_run(timeline_id, enricher_key, job_id)
         return
     # spawn() can do blocking I/O (GeoIP reads the whole database into memory to
     # pin its identity for the run) — keep it off the event loop. spawn is
@@ -541,7 +551,141 @@ async def run_enrichment_job(
             )
     finally:
         enricher.close()
-        _release_enricher_run(timeline_id, enricher_key, job_id)
+        release_enricher_run(timeline_id, enricher_key, job_id)
+
+
+async def resume_enrichment_run(
+    store: PostgresStore,
+    ch_store: ClickHouseStore,
+    run: EnrichmentJobRun,
+    *,
+    trigger: str = "startup",
+    actor_user_id: str | None = None,
+    actor_username: str | None = None,
+) -> int:
+    """Apply one unfinished run's staged rows, clear its marker, and audit it.
+
+    The single recover-forward primitive, shared by startup reconciliation
+    (:func:`reconcile_orphaned_enrichment_jobs`) and the analyst-triggered
+    resume route. Returns the number of enrichment pairs applied.
+
+    Provenance is granted exactly to ``run.completed_source_ids`` — the only
+    durable evidence that a source was staged *fully*. ``list_staged_sources``
+    cannot substitute: it returns every source with any staged row and can't
+    tell a finished source from one cut off mid-scan, and provenance written
+    off partial staging permanently blocks that source, because the run route
+    skips provenance-matched sources. A partially staged source still gets its
+    values applied (they are valid, the rewrite idempotent) and stays eligible.
+
+    Raises on failure with the marker and staged rows left **intact**, so the
+    run stays discoverable and resumable. Callers decide whether that is a
+    logged skip (startup) or a failed job (manual).
+
+    The actor is passed as scalars rather than a ``User`` because the manual
+    path runs from a ``BackgroundTasks`` callback, after the request's session
+    is gone.
+    """
+    applied = await _apply_staged_rows(
+        store,
+        ch_store,
+        run.job_id,
+        complete_source_ids=frozenset(run.completed_source_ids or []),
+    )
+    await store.finish_enrichment_job_run(run.job_id)
+    await store.record_audit(
+        action="enricher.job_recovered",
+        user_id=actor_user_id,
+        username_snapshot=actor_username,
+        case_id=run.case_id,
+        target_type="timeline",
+        target_id=run.timeline_id,
+        detail={
+            "job_id": run.job_id,
+            "enricher_key": run.enricher_key,
+            "fields_applied": applied,
+            "trigger": trigger,
+        },
+    )
+    return applied
+
+
+async def run_resume_job(
+    poll_job_id: str,
+    run: EnrichmentJobRun,
+    job_store: JobStore,
+    store: PostgresStore,
+    ch_store: ClickHouseStore,
+    actor_user_id: str | None = None,
+    actor_username: str | None = None,
+) -> None:
+    """Analyst-triggered resume, tracked in the JobStore so the UI can poll it.
+
+    Owns the ``_ACTIVE_RUNS`` slot for ``(run.timeline_id, run.enricher_key)``
+    under ``run.job_id`` — the route claims it before responding, this releases
+    it — so no fresh run can start a competing partition rewrite mid-apply.
+    Two concurrent applies would each build their copy from a different
+    snapshot and, worse, race the ``SourceEnrichment`` upsert: whichever landed
+    last would win a provenance row whose ``enricher_config_hash`` need not be
+    the one that produced the fields actually on the partition, which is a
+    silent reproducibility break.
+
+    Deliberately does **not** schedule a follow-up run the way startup
+    reconciliation does. That exists to recover coverage when nobody is
+    present to decide; here an analyst is in the dialog, and once the marker
+    clears "Run now" is one attributed click away.
+
+    ``poll_job_id`` is the JobStore handle, distinct from ``run.job_id``: the
+    latter keys the staged rows *and* names the ClickHouse scratch table, so
+    it stays pinned to the original run.
+    """
+    job_store.update(poll_job_id, status="running")
+    try:
+        applied = await resume_enrichment_run(
+            store,
+            ch_store,
+            run,
+            trigger="manual",
+            actor_user_id=actor_user_id,
+            actor_username=actor_username,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Manual resume of enrichment job %s (enricher=%s, timeline=%s) failed; "
+            "marker and staged rows left intact for another attempt",
+            run.job_id,
+            run.enricher_key,
+            run.timeline_id,
+        )
+        job_store.update(poll_job_id, status="failed", error=str(exc))
+        # Unlike the startup path (log-only, because a failing marker retries
+        # every boot and would flood the audit log), a manual failure is a
+        # single deliberate act and belongs on the record.
+        await store.record_audit(
+            action="enricher.resume_failed",
+            user_id=actor_user_id,
+            username_snapshot=actor_username,
+            case_id=run.case_id,
+            target_type="timeline",
+            target_id=run.timeline_id,
+            detail={
+                "job_id": run.job_id,
+                "enricher_key": run.enricher_key,
+                "error": str(exc),
+            },
+        )
+    else:
+        job_store.update(
+            poll_job_id,
+            status="completed",
+            result={
+                "resumed_job_id": run.job_id,
+                "enricher_key": run.enricher_key,
+                "fields_applied": applied,
+                "resumed": True,
+            },
+        )
+    finally:
+        release_enricher_run(run.timeline_id, run.enricher_key, run.job_id)
 
 
 async def reconcile_orphaned_enrichment_jobs(
@@ -554,32 +698,27 @@ async def reconcile_orphaned_enrichment_jobs(
     (delete), this recovers forward (apply + reschedule) — a shared helper
     would need mode flags that obscure both. The in-memory JobStore is empty
     on a fresh boot, so any ``EnrichmentJobRun`` marker still present means
-    the process died mid-run. Staged rows are valid results — they are
-    applied to ``events.attributes`` here rather than discarded, then the
-    marker is cleared. Provenance is granted exactly to the sources the
-    marker's ``completed_source_ids`` lists (appended durably after each
-    source finished staging), so a crashed 200-source job that completed 199
-    re-runs one source, not 200; a source whose staging was cut short stays
-    provenance-free and eligible. Returns the recovered runs so the caller
-    can schedule fresh re-runs (``schedule_enrichment_reruns``) to cover
-    whatever the crashed run never processed — the re-run skips
-    provenance-matched sources; the run/re-run overlap is safe because
-    ``mapUpdate`` overwrites the same derived keys with recomputed values.
+    the process died mid-run. Each is applied by
+    :func:`resume_enrichment_run`, which is where the apply/provenance
+    semantics are documented; this function is the startup *discovery and
+    error policy* around it. Returns the recovered runs so the caller can
+    schedule fresh re-runs (``schedule_enrichment_reruns``) to cover whatever
+    the crashed run never processed — the re-run skips provenance-matched
+    sources; the run/re-run overlap is safe because ``mapUpdate`` overwrites
+    the same derived keys with recomputed values.
 
     If applying fails (e.g. ClickHouse unreachable), the marker and staged
     rows are left intact for the next restart.
+
+    This runs at startup only. A run orphaned while the process stays up —
+    ClickHouse dying and coming back under a live app — is recovered instead
+    by the analyst-facing resume route, which calls the same primitive.
     """
     orphaned = await store.list_orphaned_enrichment_job_runs()
     recovered: list[EnrichmentJobRun] = []
     for run in orphaned:
         try:
-            applied = await _apply_staged_rows(
-                store,
-                ch_store,
-                run.job_id,
-                complete_source_ids=frozenset(run.completed_source_ids or []),
-            )
-            await store.finish_enrichment_job_run(run.job_id)
+            applied = await resume_enrichment_run(store, ch_store, run, trigger="startup")
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Could not recover orphaned enrichment job %s (enricher=%s, timeline=%s); "
@@ -589,17 +728,6 @@ async def reconcile_orphaned_enrichment_jobs(
                 run.timeline_id,
             )
             continue
-        await store.record_audit(
-            action="enricher.job_recovered",
-            case_id=run.case_id,
-            target_type="timeline",
-            target_id=run.timeline_id,
-            detail={
-                "job_id": run.job_id,
-                "enricher_key": run.enricher_key,
-                "fields_applied": applied,
-            },
-        )
         logger.warning(
             "Recovered orphaned enrichment job %s (enricher=%s, timeline=%s): "
             "applied %d staged enrichment fields, scheduling re-run",

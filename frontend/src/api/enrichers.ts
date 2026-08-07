@@ -9,6 +9,21 @@ export interface EnricherInfo {
   reason: string | null;
 }
 
+/** An enrichment run that died before its staged results were applied.
+ *
+ * The work is already computed and one partition rewrite away from landing;
+ * resuming applies it without re-scanning. `completed_sources` below
+ * `staged_sources` means some source's staging was cut short — its values
+ * still apply, but it stays eligible for a later run. */
+export interface UnfinishedEnrichmentRun {
+  job_id: string;
+  started_at: string;
+  age_seconds: number;
+  staged_rows: number;
+  staged_sources: number;
+  completed_sources: number;
+}
+
 export interface TimelineEnricherInfo {
   key: string;
   display_name: string;
@@ -16,8 +31,12 @@ export interface TimelineEnricherInfo {
   eligible: boolean;
   sample_checked: number;
   sample_matched: number;
+  /** Set when the eligibility scan itself failed (e.g. ClickHouse down).
+   * `eligible` is then false because it is unknown, not because it is no. */
+  eligibility_error: string | null;
   mode: "automatic" | "manual";
   enabled: boolean;
+  unfinished_run: UnfinishedEnrichmentRun | null;
 }
 
 export interface EnricherAssetInfo {
@@ -71,6 +90,21 @@ export const enrichersApi = {
       `/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/run${force ? "?force=true" : ""}`,
       {},
     ),
+
+  /** Apply an unfinished run's already-staged results and clear its marker.
+   * No re-scan, no recomputation. `jobId` is the marker's id from
+   * `unfinished_run`, echoed back so a stale dialog 404s instead of resuming
+   * something the analyst never saw. Returns a *different* id to poll. */
+  resume: (caseId: string, timelineId: string, key: string, jobId: string) =>
+    post<{
+      job_id: string;
+      resumed_job_id: string;
+      status: string;
+      staged_rows: number;
+      staged_sources: number;
+    }>(`/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/resume`, {
+      job_id: jobId,
+    }),
 
   adminConfigs: () =>
     get<{ enrichers: AdminEnricherConfig[] }>("/admin/enrichers/config").then(
