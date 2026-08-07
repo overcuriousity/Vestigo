@@ -4,6 +4,7 @@ import { SHOW_DISMISSED_KEY } from "@/components/analysis/detector-hooks";
 import { DETECTORS, type DetectorId } from "@/components/analysis/detector-registry";
 import { dispositionsApi } from "@/api/dispositions";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
+import { useScopeParams } from "@/hooks/useAnalysisPlan";
 import { toast } from "@/stores/toasts";
 import type {
   AnomaliesResponse,
@@ -149,6 +150,14 @@ const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string;
  */
 export function useDisposition(caseId: string, timelineId: string) {
   const qc = useQueryClient();
+  // Every verdict records the comparison it was reached under. Read from the
+  // same store the analysis requests read, so the stamp cannot drift from the
+  // scope the findings on screen were actually computed with.
+  const scopeParams = useScopeParams();
+  const analysisScope = {
+    frame: scopeParams.frame,
+    baseline_id: scopeParams.baseline_id ?? null,
+  };
   return useMutation({
     mutationFn: async (
       t: DispositionTarget,
@@ -173,6 +182,7 @@ export function useDisposition(caseId: string, timelineId: string) {
           // routine needs the motif snapshot (details.values drives the
           // occurrence materialization server-side).
           details: t.kind === "routine" ? (t.details ?? null) : undefined,
+          analysis_scope: analysisScope,
         });
         return {
           dispositionId: res.disposition.id,
@@ -189,6 +199,7 @@ export function useDisposition(caseId: string, timelineId: string) {
         detector: t.detector,
         source_id: t.sourceId,
         event_id: t.eventId,
+        analysis_scope: analysisScope,
       });
       return { dispositionId: res.disposition.id };
     },
