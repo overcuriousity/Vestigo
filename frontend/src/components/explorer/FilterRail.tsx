@@ -16,7 +16,7 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/cn";
 import type { EventFilters, FieldMatchMode, View } from "@/api/types";
 import { fmtRelative } from "@/lib/time";
-import { viewPayloadToFilters } from "@/lib/queryParams";
+import { viewPayloadColumns, viewPayloadToFilters } from "@/lib/queryParams";
 
 /** Debounced top-N distinct values of `fieldKey`, for value autocomplete.
  * Deliberately unfiltered (empty EventFilters): suggestions describe the
@@ -117,7 +117,9 @@ interface Props {
   filters: EventFilters;
   onChange: (f: EventFilters) => void;
   views: View[];
-  onApplyView: (f: EventFilters) => void;
+  /** Applies a saved view. The second argument is the view's column layout,
+   *  or undefined for a view saved before layouts were stored. */
+  onApplyView: (f: EventFilters, columns?: string[]) => void;
   onSaveView: () => void;
   onClose?: () => void;
   /** Merged (annotation + parser) tag values, for the unified Tags filter. */
@@ -673,9 +675,10 @@ export function FilterRail({
                 <button
                   key={v.id}
                   className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)] hover:text-[var(--color-fg-primary)] transition-base"
-                  onClick={() =>
-                    onApplyView(viewPayloadToFilters(v.filter as Record<string, unknown>))
-                  }
+                  onClick={() => {
+                    const payload = v.filter as Record<string, unknown>;
+                    onApplyView(viewPayloadToFilters(payload), viewPayloadColumns(payload));
+                  }}
                 >
                   <div className="truncate font-medium">{v.name}</div>
                   <div className="text-[var(--color-fg-muted)]">

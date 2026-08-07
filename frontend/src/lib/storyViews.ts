@@ -58,5 +58,8 @@ export async function findOrCreateView(
 ): Promise<View> {
   const existing = (await viewsApi.list(caseId)).find((v) => viewMatchesFilters(v, filters));
   if (existing) return existing;
+  // No `columns` key, deliberately: a story block references a View for its
+  // filters, and pushing one says nothing about the pusher's column layout.
+  // Applying such a View later therefore leaves the analyst's columns alone.
   return viewsApi.create(caseId, name, filters.q ?? "", filtersToViewPayload(filters));
 }

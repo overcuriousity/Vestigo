@@ -1173,7 +1173,12 @@ export function ExplorerPage() {
           filters={filters}
           onChange={setFilters}
           views={views ?? []}
-          onApplyView={setFilters}
+          onApplyView={(f, columns) => {
+            setFilters(f);
+            // A view saved before layouts were stored carries none, and must
+            // leave the analyst's current columns alone rather than blank them.
+            if (columns) setVisibleColumns(tlKey, columns);
+          }}
           onSaveView={() => setSaveViewOpen(true)}
           onClose={() => setFilterRailOpen(false)}
           mergedTagSuggestions={mergedTagSuggestions}
@@ -1553,6 +1558,7 @@ export function ExplorerPage() {
         onClose={() => setSaveViewOpen(false)}
         caseId={caseId!}
         filters={filters}
+        visibleColumns={visibleColumns}
       />
     </div>
   );
