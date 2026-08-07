@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex, Trash2 } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
@@ -12,6 +12,9 @@ import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
 import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import { vizApi } from "@/api/viz";
+import { viewsApi } from "@/api/views";
+import { Dialog, DialogContent, DialogClose } from "@/components/ui/Dialog";
+import { toast } from "@/stores/toasts";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/cn";
 import type { EventFilters, FieldMatchMode, View } from "@/api/types";
@@ -170,6 +173,33 @@ export function FilterRail({
   const [excludeKey, setExcludeKey] = useState("");
   const [excludeVal, setExcludeVal] = useState("");
   const [excludeMode, setExcludeMode] = useState<RowMatchMode>("exact");
+  const [viewSearch, setViewSearch] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<View | null>(null);
+
+  const qc = useQueryClient();
+  const deleteView = useMutation({
+    mutationFn: (v: View) => viewsApi.delete(caseId, v.id),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["views", caseId] });
+      setPendingDelete(null);
+      if (res.hidden) {
+        toast.success(
+          "Removed from the list",
+          "A story still embeds this view, so it is kept until that block is gone.",
+        );
+      } else {
+        toast.success("View deleted");
+      }
+    },
+    onError: (err: Error) => toast.error("Could not delete view", err.message),
+  });
+
+  /** Case-insensitive substring match on the view name. */
+  const matchingViews = useMemo(() => {
+    const needle = viewSearch.trim().toLowerCase();
+    if (!needle) return views;
+    return views.filter((v) => v.name.toLowerCase().includes(needle));
+  }, [views, viewSearch]);
 
   const fieldValueSuggestions = useFieldValueSuggestions(caseId, timelineId, fieldKey);
   const excludeValueSuggestions = useFieldValueSuggestions(caseId, timelineId, excludeKey);
@@ -670,22 +700,51 @@ export function FilterRail({
             <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
               <BookmarkCheck size={13} /> Saved Views
             </label>
+            {/* Search earns its space only once the list is long enough to
+              * need it — five rows are faster to scan than to filter. */}
+            {views.length > 5 && (
+              <Input
+                className="mb-1.5"
+                placeholder="Search views"
+                value={viewSearch}
+                onChange={(e) => setViewSearch(e.target.value)}
+              />
+            )}
             <div className="space-y-1">
-              {views.map((v) => (
-                <button
-                  key={v.id}
-                  className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)] hover:text-[var(--color-fg-primary)] transition-base"
-                  onClick={() => {
-                    const payload = v.filter as Record<string, unknown>;
-                    onApplyView(viewPayloadToFilters(payload), viewPayloadColumns(payload));
-                  }}
-                >
-                  <div className="truncate font-medium">{v.name}</div>
-                  <div className="text-[var(--color-fg-muted)]">
-                    {fmtRelative(v.created_at)}
+              {matchingViews.length === 0 ? (
+                <p className="px-2.5 py-1.5 text-xs text-[var(--color-fg-muted)]">
+                  No views match
+                </p>
+              ) : (
+                matchingViews.map((v) => (
+                  <div
+                    key={v.id}
+                    className="group flex items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] transition-base hover:border-[var(--color-accent)]"
+                  >
+                    <button
+                      className="min-w-0 flex-1 px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] group-hover:text-[var(--color-fg-primary)]"
+                      onClick={() => {
+                        const payload = v.filter as Record<string, unknown>;
+                        onApplyView(viewPayloadToFilters(payload), viewPayloadColumns(payload));
+                      }}
+                    >
+                      <div className="truncate font-medium">{v.name}</div>
+                      <div className="text-[var(--color-fg-muted)]">
+                        {fmtRelative(v.created_at)}
+                      </div>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Delete view ${v.name}`}
+                      className="mr-1 shrink-0 text-[var(--color-fg-muted)] opacity-0 hover:text-[var(--color-danger)] focus-visible:opacity-100 group-hover:opacity-100"
+                      onClick={() => setPendingDelete(v)}
+                    >
+                      <Trash2 size={13} />
+                    </Button>
                   </div>
-                </button>
-              ))}
+                ))
+              )}
             </div>
           </div>
         )}
@@ -717,6 +776,42 @@ export function FilterRail({
           }}
         />
       </div>
+
+      {/* Deleting an unreferenced view is not undoable, so it is asked once.
+        * The two outcomes (deleted vs kept for a story) are reported by the
+        * toast afterwards rather than predicted here — only the server knows
+        * whether a block still references it. */}
+      <Dialog
+        open={!!pendingDelete}
+        onOpenChange={(o) => {
+          if (!o) setPendingDelete(null);
+        }}
+      >
+        <DialogContent
+          title="Delete view"
+          description={
+            pendingDelete
+              ? `"${pendingDelete.name}" will be removed from this case. This cannot be undone.`
+              : ""
+          }
+        >
+          <div className="flex justify-end gap-2">
+            <DialogClose asChild>
+              <Button variant="ghost" size="sm" onClick={() => setPendingDelete(null)}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={deleteView.isPending}
+              onClick={() => pendingDelete && deleteView.mutate(pendingDelete)}
+            >
+              {deleteView.isPending ? "Deleting…" : "Delete"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 }
