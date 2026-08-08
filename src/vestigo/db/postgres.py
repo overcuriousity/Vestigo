@@ -4395,9 +4395,7 @@ class PostgresStore:
                 # backfill would make the audit column assert a frame the
                 # verdict was not reached under. Re-confirming such a finding
                 # writes a new, stamped row and leaves the old one honest.
-                existing = next(
-                    (r for r in candidates if r.analysis_scope == analysis_scope), None
-                )
+                existing = next((r for r in candidates if r.analysis_scope == analysis_scope), None)
             else:
                 existing = candidates[0] if candidates else None
             if existing is not None:

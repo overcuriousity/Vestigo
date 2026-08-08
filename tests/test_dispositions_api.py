@@ -528,7 +528,11 @@ def test_materialization_outcome_persisted_on_disposition(
 
     # The job helper opens a fresh store (thread/loop isolation); point it at
     # the test database instead of the configured Postgres.
-    test_url = str(store.engine.url)
+    # `str(URL)` masks the password as `***` — fine against SQLite, which has
+    # none, and an authentication failure against the real PostgreSQL. The
+    # helper swallows its own exceptions, so that failure would surface only as
+    # a missing key three lines below.
+    test_url = store.engine.url.render_as_string(hide_password=False)
     monkeypatch.setattr(
         "vestigo.db.postgres.PostgresStore",
         lambda url=None: PostgresStore(url=test_url),

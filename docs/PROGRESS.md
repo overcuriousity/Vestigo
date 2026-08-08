@@ -43,14 +43,26 @@ Three things the switch exposed, each a real difference rather than a porting
 annoyance: test DDL written with `AUTOINCREMENT` and `1`/`0` for booleans (both
 rejected outright, now `SERIAL` and `true`/`false`), schema assertions reading
 `PRAGMA table_info`/`sqlite_master` (now `information_schema`, so the migration
-tests inspect the database the migrations actually run on), and connections
-crossing event loops. That last one is why every test store uses
-`poolclass=NullPool`: asyncpg binds a connection to the loop that opened it, and
-both the CLI (one `asyncio.run` per command) and a `TestClient` built outside a
-`with` block run each unit of work on a fresh loop. SQLite tolerated it;
-PostgreSQL reports "Event loop is closed", which reads like a failure about
-permissions when it happens inside an RBAC test. `PostgresStore.__init__` takes
-`**engine_kwargs` for that, rather than tests reaching into its internals.
+tests inspect the database the migrations actually run on), and a URL built with
+`str(engine.url)` — which masks the password as `***`, harmless against a
+password-less SQLite file and an authentication failure against PostgreSQL. That
+last one only surfaced as a missing dict key, because the helper under test
+swallows its own exceptions by design.
+
+And connections crossing event loops. asyncpg binds a connection to the loop
+that opened it; `TestClient` drives the app from its own portal loop, and a test
+may hold two of them. SQLite tolerated the crossing, PostgreSQL reports "Event
+loop is closed" — which reads like a failure about permissions when it lands in
+an RBAC test. Unpooling every test store fixed it and cost 17:31 against a
+SQLite baseline of 8:15, so it is scoped instead: a store is unpooled when its
+test takes `client`, or is marked `multiloop` (the CLI, one `asyncio.run` per
+command). `PostgresStore.__init__` takes `**engine_kwargs` for that, rather than
+tests reaching into its internals. The fixture also stopped disposing its
+engine, which was failing already-passed tests in teardown for the same
+cross-loop reason; the per-test database is dropped `WITH (FORCE)` regardless.
+
+The suite lands at **12:34** — about four minutes over the SQLite baseline, paid
+for a suite that can see the dialect it ships on.
 
 The orphan sweep only drops databases with no live connections, so two suites
 running at once do not delete each other's clones.

@@ -369,9 +369,7 @@ def test_findings_requires_case_read(client, seeded, stub_detector):
     assert r.status_code in (401, 403)
 
 
-def test_editing_a_baseline_in_place_invalidates_its_cached_answers(
-    client, seeded, stub_detector
-):
+def test_editing_a_baseline_in_place_invalidates_its_cached_answers(client, seeded, stub_detector):
     """A definition keeps its id across a PUT, so the id alone is not the key.
 
     Without the definition's content hash in the fingerprint, an analyst who

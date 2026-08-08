@@ -139,8 +139,10 @@ def _admin_url() -> URL:
 def _db_url(name: str) -> str:
     # `str(URL)` masks the password as `***`; the rendered form is what a driver
     # can actually connect with.
-    return make_url(get_settings().postgres_url).set(database=name).render_as_string(
-        hide_password=False
+    return (
+        make_url(get_settings().postgres_url)
+        .set(database=name)
+        .render_as_string(hide_password=False)
     )
 
 
@@ -258,21 +260,43 @@ def blank_pg_database(_pg_template) -> Iterator[str]:
 
 
 @pytest_asyncio.fixture()
-async def store(pg_database, monkeypatch):
+async def store(pg_database, request, monkeypatch):
     """The store every router shares via api.deps.get_store(), on real Postgres.
 
-    ``NullPool``, deliberately. asyncpg binds a connection to the event loop
-    that opened it, and a `TestClient` constructed outside a `with` block runs
-    each request on its own loop — which several RBAC tests do to hold two
-    logged-in sessions at once. A pooled connection handed across that boundary
-    raises "Event loop is closed", a failure about test plumbing that reads like
-    a failure about permissions. Not pooling costs a connect per operation
-    against a local server and buys immunity from the whole class.
+    Pooled by default. asyncpg binds a connection to the event loop that opened
+    it, so a test that drives work on more than one loop — a `TestClient` built
+    outside a `with` block gets its own portal loop, and the CLI runs each
+    command in its own ``asyncio.run`` — cannot reuse a pooled connection and
+    fails with "Event loop is closed", which reads like a failure about
+    whatever the test was actually asserting.
+
+    ``NullPool`` fixes that by never reusing a connection, but it costs a
+    connect per operation: applied to every test it made the suite roughly
+    three times slower. So it is opt-in, by marker, for the handful of tests
+    that genuinely need it::
+
+        @pytest.mark.multiloop
+        def test_two_sessions(client, store): ...
     """
-    s = PostgresStore(url=pg_database, poolclass=NullPool)
+    # `TestClient` drives the app from its own portal thread and loop, and a
+    # test may hold two of them at once (two logged-in sessions). asyncpg binds
+    # a connection to the loop that opened it, so a pooled connection crossing
+    # that boundary raises "Event loop is closed" — a failure about plumbing
+    # that reads like a failure about whatever was being asserted.
+    #
+    # Not pooling costs a connect per operation, so it is applied where it is
+    # needed rather than everywhere: any test that takes `client`, plus anything
+    # marked `multiloop` (the CLI, which runs each command in its own
+    # `asyncio.run`). Tests that only await the store directly stay pooled.
+    unpooled = "client" in request.fixturenames or request.node.get_closest_marker("multiloop")
+    s = PostgresStore(url=pg_database, **({"poolclass": NullPool} if unpooled else {}))
     monkeypatch.setattr(deps, "_store", s)
     yield s
-    await s.engine.dispose()
+    # No `engine.dispose()`. Its connections may belong to a `TestClient`'s
+    # portal loop rather than this one, and disposing across that boundary
+    # raises "attached to a different loop" *during teardown* — failing a test
+    # that already passed. Nothing leaks: `pg_database` drops the whole
+    # database WITH (FORCE) a moment later, which closes them server-side.
 
 
 @pytest.fixture(autouse=True)
