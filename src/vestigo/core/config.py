@@ -169,6 +169,32 @@ class Settings(BaseSettings):
     # Only the top-K merged candidates by support get the second cadence
     # pass — bounds the PARTITION BY gram window sort (can't spill).
     stat_motif_cadence_top_k: int = 500
+    # ── Analysis gate ────────────────────────────────────────────────────────
+    # Structural preconditions deciding which methods the Investigate rail
+    # offers up front (db/analysis_plan.py). A method is gated off only when it
+    # *cannot* produce a finding on the data — never when it is merely unlikely
+    # to — and a gated method is always still runnable on request. Raising any
+    # of these therefore costs coverage of the "offered automatically" set, not
+    # reachability.
+    #
+    # Share of a field's sampled values that must parse as a number before the
+    # numeric-range band has anything to learn.
+    analysis_gate_min_numeric_ratio: float = Field(default=0.9, gt=0, le=1)
+    # A field with at most this many distinct values is enum-like: every value
+    # is one of a handful of literals, so charset novelty and entropy bands
+    # have no shape to learn from it.
+    analysis_gate_max_enum_distinct: int = Field(default=5, ge=1)
+    # Distinct series values needed before consecutive n-grams can differ from
+    # each other at all.
+    analysis_gate_min_series_distinct: int = Field(default=3, ge=2)
+    # Buckets a timeline's span must be able to cover before a count spike is
+    # distinguishable from the bucket containing it.
+    analysis_gate_min_frequency_buckets: int = Field(default=12, ge=2)
+    # Repeats a series value needs before an inter-arrival cadence can be fitted.
+    analysis_gate_min_interval_periods: int = Field(default=3, ge=2)
+    # Cached method results retained per case, least-recently-computed evicted
+    # first. Every row is derived data: eviction costs a rescan and nothing else.
+    analysis_cache_max_rows_per_case: int = Field(default=500, ge=1)
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.

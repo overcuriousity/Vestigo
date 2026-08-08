@@ -1,10 +1,342 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 161 — the second PR #242 review pass: two ways two
-enrichment applies could still meet).
+Last updated: 2026-08-08 (session 165 — PR #262 third review, plus a test suite that now
+refuses to start without ClickHouse instead of failing slowly and vaguely).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 165 — 2026-08-08: PR #262 third review
+
+**The suite now refuses to start without ClickHouse.** Running it with the dev
+stack down cost most of a session. Nothing said the container was stopped:
+`clickhouse`-marked modules each opened their own connection inside a
+`try/except Exception: pytest.skip(...)`, paying the driver's retries one module
+at a time, while the much larger set that reaches ClickHouse *indirectly through
+the app* — `test_agent_api.py` and friends — simply failed, eight minutes in,
+with connection-pool tracebacks that named a pool rather than a missing service.
+`pytest_configure` now probes `/ping` once with `urllib` and a 1.5s timeout, and
+on failure exits before collection with the `podman compose up -d` fix in the
+message: about 0.0s to the answer instead of eight minutes to a wall of red.
+
+No opt-out flag, deliberately — a run that cannot pass is not worth starting,
+and "most of it passed" is a worse outcome than a clear stop. The eighteen
+per-module reachability skips are gone with it: reachability is settled before
+any of them run, and as blanket `except Exception` they also turned a genuine
+`init_schema` failure into a green skip.
+
+**And the suite no longer fakes PostgreSQL with SQLite.** The two dialects
+disagree about precisely what this model leans on, and the gap was not
+hypothetical: session 163's review found the `confirmed` disposition path had
+shipped broken on PostgreSQL while every SQLite test passed, because `json` has
+no equality operator there. Every store now comes from `pg_database` — a private
+database cloned from a template Alembic migrated once per session
+(`blank_pg_database` for tests that drive Alembic themselves,
+`module_pg_database` for a corpus built once per module).
+
+The usual argument for SQLite turns out to be backwards. Alembic runs per test
+either way; cloning a migrated template costs ~55ms against PostgreSQL versus
+~101ms replaying the migrations into a fresh SQLite file. So this is the faster
+option *and* the honest one.
+
+Three things the switch exposed, each a real difference rather than a porting
+annoyance: test DDL written with `AUTOINCREMENT` and `1`/`0` for booleans (both
+rejected outright, now `SERIAL` and `true`/`false`), schema assertions reading
+`PRAGMA table_info`/`sqlite_master` (now `information_schema`, so the migration
+tests inspect the database the migrations actually run on), and a URL built with
+`str(engine.url)` — which masks the password as `***`, harmless against a
+password-less SQLite file and an authentication failure against PostgreSQL. That
+last one only surfaced as a missing dict key, because the helper under test
+swallows its own exceptions by design.
+
+And connections crossing event loops. asyncpg binds a connection to the loop
+that opened it; `TestClient` drives the app from its own portal loop, and a test
+may hold two of them. SQLite tolerated the crossing, PostgreSQL reports "Event
+loop is closed" — which reads like a failure about permissions when it lands in
+an RBAC test. Unpooling every test store fixed it and cost 17:31 against a
+SQLite baseline of 8:15, so it is scoped instead: a store is unpooled when its
+test takes `client`, or is marked `multiloop` (the CLI, one `asyncio.run` per
+command). `PostgresStore.__init__` takes `**engine_kwargs` for that, rather than
+tests reaching into its internals. The fixture also stopped disposing its
+engine, which was failing already-passed tests in teardown for the same
+cross-loop reason; the per-test database is dropped `WITH (FORCE)` regardless.
+
+The suite lands at **12:34** — about four minutes over the SQLite baseline, paid
+for a suite that can see the dialect it ships on.
+
+The orphan sweep only drops databases with no live connections, so two suites
+running at once do not delete each other's clones.
+
+**Why.** A third review of the branch found six defects. One froze the Explorer
+outright; the rest are each a place where a surface says something the data does
+not support.
+
+**The rail's marker publication was an unbounded render loop.** The rail derives
+histogram markers from `useStreamingSweep` and hands them to `ExplorerPage`,
+which stores them in state — a feedback edge that only settles if the published
+value is stable when nothing changed. It was not: `useAnalysisPlan` rebuilt
+`planById` with a fresh spread every render, so `runnable` churned, so
+`byMethod`'s memo (keyed on the `useQueries` arrays, which are new objects every
+render regardless) recomputed, so the markers array was new, so the effect
+refired and set state again. Measured at 300+ renders in ~200ms as soon as any
+timestamped finding landed. Fixed at the source — `planById`/`scope` memoized,
+`byMethod` keyed on the four fields it actually reads rather than on the result
+objects — and again at the edge, where publication is now keyed on a content
+signature so no upstream hook losing its memo can reintroduce the loop. The old
+`useAnomalyMarkers` carried exactly this protection and the rewrite dropped it;
+the test that covers the rail could not see it, because it mocks the sweep and
+passes no marker callback. The new test runs the real hooks.
+
+**`delete_case` left the analysis cache behind.** `analysis_cache` has no FK to
+`cases`, like every other case-scoped table here, and was not in the explicit
+delete list. Its payloads hold event ids, field values and message templates,
+and eviction only ever runs on a write for the same case — which can no longer
+happen — so up to `analysis_cache_max_rows_per_case` rows of evidence-derived
+data survived the case forever.
+
+**Re-confirming a pre-provenance verdict rewrote its history.** A `confirmed`
+row written before `analysis_scope` existed carries `NULL`, and the dedupe
+adopted it by stamping *today's* scope onto it — making a forensic audit column
+assert a comparison frame the verdict was not reached under, which is precisely
+what migration `0026` left the column nullable to avoid. The adoption branch is
+gone from both the single and bulk paths: identity is the exact scope, an
+unstamped row stays unstamped and answers only for "scope not recorded", and a
+re-confirm writes its own stamped row. (Session 163 introduced the adoption to
+stop the first post-upgrade re-confirm writing a duplicate. A duplicate row is a
+counting problem; a fabricated provenance stamp is an evidentiary one.)
+
+**Three smaller honesty and navigation fixes.** The sheet reset its run
+parameters on `[method, autorun]`, so running a method with custom knobs and
+then clicking one of that *same* method's rail rows changed neither dep — the
+finding view keyed on the custom run while the rail's rank addressed the plain
+sweep, rendering a different finding than the one clicked, or none at all; the
+sheet's `kind` is part of the reset now. Confirming a switch to the `self` frame
+cleared `activeBaselineId` as well as the frame, so a baseline → self → baseline
+round-trip lost the selection and reopened the builder; only the frame moves
+now. And `MethodRow` gated its dash on `pending` but not its count, so nine
+methods queued behind the cheap set rendered `0` in the found-nothing style —
+they render `…` until they have actually run.
+
+## Session 164 — 2026-08-08: PR #262 second review
+
+**Why.** A second review of the same branch found eleven defects. One was
+severe, and the rest share a shape: the redesign moved a surface and left an
+action stranded behind it.
+
+**The fingerprint omitted four inputs, none of them request parameters.** The
+cache key covered the timeline, source hashes, enrichment generation, frame,
+`baseline_id`, method, params, limit and `dispositions_hash` — everything the
+client sends. It did not cover the baseline definition's *contents* (a `PUT`
+replaces the windows in place and keeps the id, so an analyst who moved a
+suspect window was served the pre-edit findings, stamped with the new baseline's
+name and reported as a hit), the timeline's `field_mappings`, the per-source
+`time_offset_seconds`, or the runtime-editable `stat_*` thresholds the runners
+fall back to when a knob is omitted. All four are now in the key; the settings
+arm is a prefix sweep rather than an enumerated list, because forgetting a newly
+added threshold means a wrong answer served as proof. `stat_scan_*` stays out —
+it tunes ClickHouse's resource budget, not the conclusion.
+
+**A cache write could fail a request whose scan had already succeeded.** Two
+tabs missing the same key both insert against a unique index; the loser raised
+`IntegrityError` and the analyst saw the method as "failed to run". Two clients
+that miss the same key computed the same answer over the same inputs — that is
+what the key means — so the loser is swallowed.
+
+**`frame` and `baseline_id` were never cross-validated.** The runners key off
+the id; the response is stamped with the frame, and that stamp is what a verdict
+records as its provenance. `frame=self&baseline_id=X` therefore ran the
+two-window comparison and labelled it "all events scanned", and `build_plan`
+disagreed with the runner about the same request. Now a 422.
+
+**Three actions had lost their surface.** `TemplatesView` was orphaned by the
+rail rewrite, taking the log-template mute *and unmute* with it — while
+`events.py` kept collapsing muted templates out of the grid, histogram and
+export, so a pre-existing mute hid evidence with nothing left to reverse it. The
+show-dismissed toggle was hardcoded off, making a mis-click unrecoverable. The
+rail lost its resize handle, freezing the only fixed-width surface in the flow
+at whatever the store last persisted. All three are back, the toggle now as one
+UI-store flag rather than per-view state, since the rail and the sheet render
+the same query results.
+
+**A method that could not score rendered as a checked zero.** `MethodFindings.status`
+and `warnings` were read nowhere in the new surface, so `insufficient_data` and
+a clean scan looked identical — the exact "checked, clear" misread the rail's own
+comment forbids. It renders as a dash and the runner's warning now. The Tools
+summary likewise counted queued heavy methods as "ran"; they are named as still
+running.
+
+**Two smaller honesty fixes.** The gate built its field inventory without the
+timeline's `field_mappings`, so `reason_facts` — rendered verbatim as arithmetic
+the analyst is invited to check — described a field set the detectors do not use;
+the canonical entries are now approximated from the same stats cache rather than
+aggregated live, which keeps the endpoint's no-scan contract and errs toward
+offering a method rather than withholding one. And `disposition_identity` put
+`analysis_scope` in the key for `confirmed` while every pre-upgrade row carries
+`NULL`, so the first re-confirm after the upgrade wrote a duplicate; an
+unstamped row now adopts the scope instead, with an exact match always winning
+over it.
+
+## Session 163 — 2026-08-08: PR #262 review findings
+
+**Why.** A high-effort review of the Investigate redesign branch found thirteen
+defects. Four broke shipped behavior, and the pattern joining them is worth
+naming: each was invisible to the test suite for a structural reason, not a
+missing assertion.
+
+**The confirm path never ran on PostgreSQL.** `create_disposition` compared
+`analysis_scope` — an `sa.JSON` column — with `==` to dedupe `confirmed`
+verdicts by the comparison they were reached under. PostgreSQL has no equality
+operator for `json`, only for `jsonb`, so every confirm was a 500. The tests
+run on SQLite, where JSON is text and `=` works, so the whole feature passed
+green while being unusable in any real deployment. Migration `0027` moves the
+column to `JSONB` on PostgreSQL and no-ops on SQLite; the model declares
+`JSON().with_variant(JSONB(), "postgresql")`. Storage type alone does not make
+the dialects agree, though — JSONB normalizes key order and SQLite text does
+not — so writes and comparisons now go through `canonical_scope`, and
+`disposition_identity` replaces the second, differently-expressed copy of the
+identity rule that lived inside `create_dispositions_bulk`.
+
+**The findings endpoint never applied dispositions.** `/api/anomalies` calls
+`_apply_dismissals` and `_apply_confirmations`; `/analysis/findings` called
+neither. A dismissal was optimistically removed from the rail and came straight
+back on the next refetch, `include_dismissed` was a no-op, and no finding ever
+carried the `confirmed` flag its badge reads. Both are plain functions over a
+serialized payload, so the fix is to call them — but *after* the cache, never
+before. The fingerprint covers `normal` verdicts only, since those are what
+change a computation; caching a dismissal-filtered payload would hide a later
+dismissal until something unrelated invalidated the key. Applying afterwards
+also makes `include_dismissed` presentation-only in the full sense, so its cache
+bypass could go: revealing dismissed findings now costs nothing.
+
+**The gate was a lock in practice.** `onRunMethod` was wired to `onOpenMethod`,
+and the sheet's findings query was enabled only in finding mode — so "Run
+anyway" on a gated method and "Retry" on a failed one both opened prose and ran
+nothing. The endpoint allowed everything the docs promise; the UI had no path
+to it. Method mode now owns a params object and renders its own results, with
+`autorun` for the Tools sheet's entry point. The knobs became real at the same
+time: they were uncontrolled inputs nothing read, which is why the two tests
+this branch deleted (`charsetGroupField`, `eventSequenceMaxGap`) had no
+surviving home — `group_field` and `max_gap_seconds` were unreachable from the
+app. Both are ported to the new surface.
+
+**Params are typed now.** `METHOD_PARAMS` checked keys and passed values
+through untouched, so `{"fields": ["a","b"]}` — the natural JSON encoding of a
+multi-field knob — reached `.split()` and 500'd. Each method declares a
+Pydantic model with `extra="forbid"` and the bounds `/anomalies` already
+states as query constraints; `METHOD_PARAMS` is derived from the models, so the
+cross-language invariant the frontend test checks has one source. The validated
+params, not the raw object, go into the cache key, which also makes `2` and
+`2.0` one question.
+
+**Smaller, same shape.** `limit` joined the fingerprint (a 50-row payload is not
+the answer to a request for 500, and serving it as a hit asserted a
+completeness it did not have). `cache_put` restamps `computed_at` on refresh,
+so "least recently computed" is literal rather than inverted. The plan
+endpoint's timestamp probe moved to a threadpool — it is a blocking ClickHouse
+call in an async handler, and the rail fires a dozen requests right behind it.
+
+**What the rail was claiming.** Progress counted a heavy method as settled
+while it was still queued behind the cheap set, so the bar reached 100%, the
+empty state flashed "No findings under this scope", and the count then fell
+back — an all-clear asserted over methods that had not started. `MethodState`
+gained `pending`, which is about expectation rather than fetch status. The
+empty state also could not tell "checked, nothing" from "nothing ran": it now
+requires the plan to have resolved and at least one method to have been
+runnable, and says something different when every method is gated. And the
+empty-timeline guard the old panel carried came back as
+`useTimelineReadiness`, shared by the rail and the Tools sheet — a Sigma scan
+that matches nothing on a mid-ingest timeline reads as "these rules cleared
+you", which is the claim it exists to prevent.
+
+**Capability gates and three orphans.** `SemanticSearch`, `TriageBurndown` and
+`EmbeddingStatusBanner` lost their only mount when `InvestigatePanel` was
+deleted and are removed. The Explore section's similarity affordance and the
+Signatures section are now gated on `capabilities.embeddings` / `.sigma`,
+restoring the house rule that an unconfigured subsystem renders no entry point
+at all. `AnomalyFieldPicker` is kept — it is the field picker the `fields` knob
+should grow into.
+
+**One convention amended.** `CLAUDE.md` said a `require_case_read` endpoint does
+not write, with one named exception. `cache_put` on the findings path is a
+second, and the rule demands an argument rather than silence: the row is
+derived data keyed by a fingerprint of its own inputs, so it asserts nothing
+the request did not already establish, and refusing it for read-only members
+would make the surface they use slowest the one that never warms.
+
+## Session 162 — 2026-08-07: the Investigate panel redesign
+
+**Why.** Three complaints, one structural. Opening Investigate fired all eleven
+detectors at once and showed a spinner until the slowest returned, with nothing
+cached server-side. Several of those detectors could not have found anything —
+`numeric_range` on a timeline with no numeric field, the two-window methods in
+the self frame, where they are empty by construction. And the panel was a
+`shrink-0` flex sibling next to the filter rail, the grid and the event detail
+panel, so on a laptop the sum of their minimum widths pushed it off screen.
+Underneath all three: five tabs that sorted fourteen tools by which subsystem
+built them, so the analyst had to guess where a thing would have been noticed
+before they could look for it.
+
+**The gate.** `db/analysis_plan.py` decides, per method and without scanning an
+event, whether that method *can* produce a finding on this data —
+`field_stats` plus one timestamp probe. The contract is narrow on purpose:
+`not_applicable` means structurally impossible, never unpromising, and nothing
+is ever withheld. Every verdict carries the arithmetic behind it, so the UI
+states "no field parses as numeric (0 of 19 sampled ≥ 90%)" rather than a
+shrug. The plan fails open — a broken gate may cost time, never hide a method.
+
+**The guard earned itself immediately.** Wiring
+`test_demo_detector_coverage_clickhouse.py` to assert the gate never skips a
+method that file proves works caught two real bugs on first run, both failing
+silently in the same direction. Series distinct came from `merged_inventory`,
+which merges `distinct` as max-across-sources: on a timeline whose sources each
+carry one artifact type that reports 1 however many the timeline holds, so the
+sequence methods were gated off. And the log-template precondition looked for
+`message` in the inventory, but `message` is deliberately absent from
+`_NOVELTY_CANDIDATE_TOP_LEVEL` — it matched nowhere, so templating was withheld
+from every timeline. Thresholds needed no tuning once both were fixed.
+
+**The cache.** `analysis_cache` keys on a hash of everything that can change an
+answer: source content hashes, enrichment generation, scope, method, params,
+dispositions hash. Sources are immutable, so a hit is *proof* the answer still
+holds rather than a guess that it is recent — which is why there is no TTL, and
+why the panel never has to ask an analyst to judge staleness. Verified live:
+plan ~19 ms, a cold method ~60 ms, every warm call a byte-identical hit at
+~18 ms, and each of scope, params and a `normal` verdict independently missing.
+
+**Scope provenance.** A verdict is an assertion about a comparison, and nothing
+recorded which comparison — `finding_dispositions` had no scope column at all,
+so "confirmed on 4 March" could not say what against. It does now, nullable so
+older rows read as "not recorded" rather than being backfilled with invention,
+and deliberately outside `dispositions_hash` (provenance, not a detection
+input). It joins the dedupe identity for `confirmed` only: escalating against
+two baselines is two claims, while `normal` is a standing declaration about a
+value under every frame.
+
+**The panel.** One rail holding findings grouped by evidence weight — named
+techniques, statistical outliers, exploration — with the group note ("odd, not
+necessarily bad") next to the rows it qualifies instead of in a methodology
+tab. Everything else is one overlay sheet in three modes, absolutely
+positioned, so Investigate spends exactly one fixed width and the overflow is
+structurally impossible rather than tuned away. `EventDetailPanel` and
+`AgentPanel` were also `shrink-0`, so they were made shrinkable too — fixing
+only Investigate would have left the same bug reachable with two panels open.
+Sixteen components deleted, ~5,900 lines net.
+
+**What the deletion nearly took with it.** Four affordances lived in the panel
+rather than in the things they served, and only surfaced as unused variables:
+histogram anomaly markers, the grid's "find similar" (which would have set an
+anchor nothing read — a dead button), the combo and frequency drills that a
+single field/value filter cannot express, and the first-run explainers. All
+rewired. The baseline gesture needed the same treatment: the brush still set a
+pending range, but the builder now mounts inside the Tools sheet, so nothing
+rendered it.
+
+**Verified end-to-end** against real Postgres and ClickHouse on isolated
+databases: migration 0026, the gate's reasoning on real data, the cache and
+every invalidation path, a gate-skipped method still running on request
+(returning `insufficient_data` — the detector agreeing with the gate), a typo'd
+knob rejected with the accepted names rather than silently defaulting, and
+`GET /anomalies` untouched for the agent.
 
 ## Session 161 — 2026-08-07: the second review pass on PR #242
 

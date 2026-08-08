@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import Collection, Iterable
@@ -29,6 +30,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
@@ -1023,6 +1025,26 @@ class FindingDisposition(Base):
     note: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # confirmed: the finding's structured details snapshot at confirm time.
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The comparison this verdict was reached under — frame, baseline id and
+    # name. A verdict is an assertion about a *comparison*, so without this
+    # "confirmed on 4 March" cannot say what the finding was compared against.
+    # Nullable: rows written before scope provenance existed read as "not
+    # recorded", which is honest where a backfill would be invention.
+    # Deliberately NOT part of :func:`dispositions_hash` — that hashes
+    # detection-affecting facts, and scope-at-verdict-time is provenance.
+    # Named `analysis_scope`, not `scope`: this class already uses "scope" for
+    # the value-vs-event distinction (see the class docstring), and one word
+    # meaning two things in one model is how the wrong one gets read.
+    #
+    # The one JSONB column in this model, and the only one anywhere that is
+    # *compared* rather than merely stored: `create_disposition` puts it in the
+    # dedupe predicate for `confirmed`, and PostgreSQL has no equality operator
+    # for `json` — only for `jsonb`. SQLite keeps the plain-JSON text encoding,
+    # where `=` is byte equality, so both dialects only agree if the value is
+    # canonicalized first (see :func:`canonical_scope`).
+    analysis_scope: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1044,12 +1066,51 @@ class FindingDisposition(Base):
             "event_id": self.event_id,
             "note": self.note,
             "details": self.details,
+            "analysis_scope": self.analysis_scope,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
 DISPOSITION_KINDS = ("normal", "dismissed", "confirmed", "routine")
+
+
+def canonical_scope(scope: dict | None) -> dict | None:
+    """Return *scope* with its keys in a fixed order, or None.
+
+    ``analysis_scope`` is the one JSON column that participates in an equality
+    comparison, and the two dialects disagree about what equality means: JSONB
+    normalizes, SQLite's JSON is text and compares byte for byte. Writing and
+    comparing the canonical form makes the same two verdicts collide on both.
+    """
+    return None if scope is None else json.loads(json.dumps(scope, sort_keys=True))
+
+
+def disposition_identity(
+    *,
+    timeline_id: Any,
+    kind: Any,
+    detector: Any,
+    field: Any,
+    value: Any,
+    source_id: Any,
+    event_id: Any,
+    analysis_scope: Any = None,
+) -> tuple:
+    """The dedupe key for a disposition row, as one hashable tuple.
+
+    ``analysis_scope`` joins the key for ``confirmed`` only — see
+    :meth:`PostgresStore.create_disposition` for why the two verdict families
+    differ. Serialized because a dict is unhashable.
+
+    Shared by the single-row and bulk paths so the identity rule is stated once:
+    two expressions of it drift, and a drifted dedupe silently writes a
+    duplicate verdict.
+    """
+    scope_part = (
+        json.dumps(canonical_scope(analysis_scope), sort_keys=True) if kind == "confirmed" else None
+    )
+    return (timeline_id, kind, detector, field, value, source_id, event_id, scope_part)
 
 
 def dispositions_hash(rows: Iterable[FindingDisposition]) -> str:
@@ -1120,6 +1181,38 @@ class DetectorRun(Base):
             "result": self.result,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class AnalysisCache(Base):
+    """Memoized analysis results, keyed on a fingerprint of everything that can change them.
+
+    Distinct in kind from :class:`DetectorRun`, which is the accumulating
+    forensic diary of what an analyst ran, with what parameters, and when. This
+    table answers a different question: "for exactly this data and exactly these
+    settings, what is the answer?" Because sources are immutable after ingestion
+    (enrichment applies excepted, and those move the fingerprint), a hit is
+    *proof* the answer still holds rather than a guess that it is recent enough
+    — which is why nothing here has a TTL and no caller ever has to judge
+    staleness.
+
+    Every row is derived data. Evicting one costs a rescan and nothing else,
+    which is why eviction needs no policy discussion, no audit trail and no
+    analyst-visible consequence.
+    """
+
+    __tablename__ = "analysis_cache"
+    __table_args__ = (Index("ix_analysis_cache_case_key", "case_id", "cache_key", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    cache_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        index=True,
+    )
 
 
 # Origin of an agent-confirmed annotation (A1): distinguishes it from
@@ -1806,9 +1899,17 @@ def _pre_alembic_fixups(sync_conn: Any) -> None:
 class PostgresStore:
     """Async PostgreSQL store for metadata."""
 
-    def __init__(self, url: str | None = None) -> None:
+    def __init__(self, url: str | None = None, **engine_kwargs: Any) -> None:
+        """Open the metadata store.
+
+        ``engine_kwargs`` go straight to :func:`create_async_engine`. The one
+        caller that needs it passes ``poolclass=NullPool``: asyncpg binds a
+        connection to the event loop that opened it, so a pooled connection is
+        unusable to a process that runs each unit of work in its own
+        ``asyncio.run`` — which is what the CLI tests do.
+        """
         self.url = url or get_settings().postgres_url
-        self.engine = create_async_engine(self.url, echo=False, future=True)
+        self.engine = create_async_engine(self.url, echo=False, future=True, **engine_kwargs)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -3095,7 +3196,10 @@ class PostgresStore:
         ``StoryBlock``, ``StoryExport`` — the last of which holds frozen event
         data the operator believes went with the case), and the enrichment
         tables (``SourceEnrichment``, ``EnrichmentResultStaging``,
-        ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
+        ``EnrichmentJobRun``) and ``AnalysisCache`` (derived, but its payloads
+        hold event ids, field values and message templates, and its eviction
+        only ever runs on a write for the same case — so a row left here would
+        never be reclaimed) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
         ``cases.id``), so they must be deleted explicitly here alongside
         ``Timeline``/``Source`` or they'd silently orphan on every case delete
@@ -3129,6 +3233,7 @@ class PostgresStore:
             await session.execute(
                 delete(EnrichmentJobRun).where(EnrichmentJobRun.case_id == case_id)
             )
+            await session.execute(delete(AnalysisCache).where(AnalysisCache.case_id == case_id))
             await session.execute(delete(SigmaRule).where(SigmaRule.case_id == case_id))
             await session.execute(delete(SigmaRun).where(SigmaRun.case_id == case_id))
             # StoryBlock has no case_id of its own — reach it through its story.
@@ -4229,6 +4334,7 @@ class PostgresStore:
         event_id: str | None = None,
         note: str | None = None,
         details: dict | None = None,
+        analysis_scope: dict | None = None,
         created_by: str | None = None,
     ) -> FindingDisposition:
         """Create a disposition row, or return the existing identical one.
@@ -4238,22 +4344,60 @@ class PostgresStore:
         case/timeline — so repeating the same verdict is a no-op rather than
         an error and the UI action stays idempotent. Scope validation (exactly
         one of value/event scope) lives in the API layer.
+
+        ``analysis_scope`` joins that key for ``confirmed`` only, because the
+        two verdict families mean different things. A ``confirmed`` verdict is
+        an assertion *about a comparison* — escalating a finding against the
+        February baseline and escalating it again against the March one are two
+        separate claims, and collapsing them would lose one. ``normal`` (and
+        ``dismissed``/``routine``) are standing declarations about a value,
+        effective under every frame; duplicating those per scope would inflate
+        :func:`dispositions_hash`'s input and the triage burndown without
+        expressing anything new.
         """
+        scope_in_identity = kind == "confirmed"
+        analysis_scope = canonical_scope(analysis_scope)
         async with self.session_factory() as session:
-            existing = (
-                await session.execute(
-                    select(FindingDisposition).where(
-                        FindingDisposition.case_id == case_id,
-                        FindingDisposition.timeline_id == timeline_id,
-                        FindingDisposition.kind == kind,
-                        FindingDisposition.detector == detector,
-                        FindingDisposition.field == field,
-                        FindingDisposition.value == value,
-                        FindingDisposition.source_id == source_id,
-                        FindingDisposition.event_id == event_id,
+            conditions = [
+                FindingDisposition.case_id == case_id,
+                FindingDisposition.timeline_id == timeline_id,
+                FindingDisposition.kind == kind,
+                FindingDisposition.detector == detector,
+                FindingDisposition.field == field,
+                FindingDisposition.value == value,
+                FindingDisposition.source_id == source_id,
+                FindingDisposition.event_id == event_id,
+            ]
+            # All matches, not `scalar_one_or_none`: nothing in the schema
+            # enforces this tuple's uniqueness, and pre-existing duplicates must
+            # dedupe to the oldest rather than raise MultipleResultsFound.
+            candidates = (
+                (
+                    await session.execute(
+                        select(FindingDisposition)
+                        .where(*conditions)
+                        .order_by(FindingDisposition.created_at.asc())
                     )
                 )
-            ).scalar_one_or_none()
+                .scalars()
+                .all()
+            )
+            # The scope arm of the key is settled here rather than in SQL. Both
+            # dialects can compare the *canonical* form (see `canonical_scope`),
+            # but neither can express the NULL arm portably: SQLAlchemy's JSON
+            # comparator does not render `IS NULL` as a plain SQL null test. The
+            # candidate set is one row per scope this exact finding was confirmed
+            # under, so the filter costs nothing to do in Python.
+            if scope_in_identity:
+                # Exact scope match, and nothing else. A row carrying no scope
+                # was confirmed under a comparison nobody recorded, so it can
+                # neither answer for this scope nor be backfilled with it — the
+                # backfill would make the audit column assert a frame the
+                # verdict was not reached under. Re-confirming such a finding
+                # writes a new, stamped row and leaves the old one honest.
+                existing = next((r for r in candidates if r.analysis_scope == analysis_scope), None)
+            else:
+                existing = candidates[0] if candidates else None
             if existing is not None:
                 return existing
             row = FindingDisposition(
@@ -4268,6 +4412,7 @@ class PostgresStore:
                 event_id=event_id,
                 note=note,
                 details=details,
+                analysis_scope=analysis_scope,
                 created_by=created_by,
             )
             session.add(row)
@@ -4295,17 +4440,6 @@ class PostgresStore:
         if not items:
             return []
 
-        def _scope_key(
-            timeline_id: Any,
-            kind: Any,
-            detector: Any,
-            field: Any,
-            value: Any,
-            source_id: Any,
-            event_id: Any,
-        ) -> tuple:
-            return (timeline_id, kind, detector, field, value, source_id, event_id)
-
         async with self.session_factory() as session:
             # One prefetch covering every row a batch item could collide with.
             # NULL scope columns rule out a composite-tuple IN (NULL never
@@ -4327,22 +4461,32 @@ class PostgresStore:
                 .all()
             )
             by_key: dict[tuple, FindingDisposition] = {
-                _scope_key(
-                    r.timeline_id, r.kind, r.detector, r.field, r.value, r.source_id, r.event_id
+                disposition_identity(
+                    timeline_id=r.timeline_id,
+                    kind=r.kind,
+                    detector=r.detector,
+                    field=r.field,
+                    value=r.value,
+                    source_id=r.source_id,
+                    event_id=r.event_id,
+                    analysis_scope=r.analysis_scope,
                 ): r
                 for r in existing_rows
             }
             rows: list[FindingDisposition] = []
             for it in items:
-                key = _scope_key(
-                    it.get("timeline_id"),
-                    it["kind"],
-                    it.get("detector", "*"),
-                    it.get("field"),
-                    it.get("value"),
-                    it.get("source_id"),
-                    it.get("event_id"),
+                key = disposition_identity(
+                    timeline_id=it.get("timeline_id"),
+                    kind=it["kind"],
+                    detector=it.get("detector", "*"),
+                    field=it.get("field"),
+                    value=it.get("value"),
+                    source_id=it.get("source_id"),
+                    event_id=it.get("event_id"),
+                    analysis_scope=it.get("analysis_scope"),
                 )
+                # Exact identity only — an unstamped `confirmed` row is never
+                # adopted here either. See :meth:`create_disposition`.
                 existing = by_key.get(key)
                 if existing is not None:
                     rows.append(existing)
@@ -4359,6 +4503,7 @@ class PostgresStore:
                     event_id=it.get("event_id"),
                     note=it.get("note"),
                     details=it.get("details"),
+                    analysis_scope=canonical_scope(it.get("analysis_scope")),
                     created_by=it.get("created_by"),
                 )
                 session.add(row)

@@ -69,7 +69,6 @@ dev = [
     "pytest-cov>=6.0.0",
     "ruff>=0.16.0",
     "httpx>=0.28.0",
-    "aiosqlite>=0.20.0",
     "evtx>=0.12",
 ]
 
@@ -185,4 +184,5 @@ asyncio_mode = "auto"
 addopts = "--cov=vestigo --cov-report=term-missing"
 markers = [
     "clickhouse: requires a reachable ClickHouse (dev compose stack); skipped otherwise",
+    "multiloop: drives work on more than one event loop (a second TestClient, the CLI); gives the test an unpooled store, since asyncpg binds a connection to the loop that opened it",
 ]

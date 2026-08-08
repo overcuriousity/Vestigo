@@ -58,11 +58,8 @@ def ch_store():
     # Constructing the store already opens a connection — keep it inside the
     # guard so an unreachable ClickHouse skips the module instead of erroring
     # every test at fixture setup.
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     events = [
         _event(SRC_A, 1, {"src_ip": "10.0.0.1", "status": "200"}),
         _event(SRC_A, 2, {"src_ip": "10.0.0.2", "status": "200"}),
@@ -77,9 +74,8 @@ def ch_store():
 
 
 @pytest_asyncio.fixture()
-async def pg_store(tmp_path):
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/field_stats.db")
-    await s.init_schema()
+async def pg_store(pg_database):
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 

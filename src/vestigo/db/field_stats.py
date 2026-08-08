@@ -310,6 +310,39 @@ def merged_list_fields(
     }
 
 
+def approximate_canonical_inventory(
+    stats: dict[str, tuple[int, dict[str, Any]]],
+    field_mappings: dict[str, list[str]] | None,
+) -> list[tuple[str, int, int]]:
+    """Cache-only stand-in for ``StatisticalAnomalyService.canonical_inventory``.
+
+    The exact aggregate needs a live coalesce over the events table, because
+    per-raw-key counts double-count an event carrying several of the raw keys.
+    Callers that must not scan (the analysis gate) take this instead: within a
+    source, ``coverage`` is the largest of the raw keys' coverages rather than
+    their sum, which is the tightest bound the cached per-key numbers support.
+    ``distinct`` follows ``merged_inventory``'s max-across-sources convention.
+
+    Deliberately an under-estimate of coverage and never an over-estimate: the
+    gate's predicates are thresholds, and a bound that can only be too low
+    offers a method the data might not support rather than withholding one it
+    does — which is the direction the gate is required to fail in.
+    """
+    out: list[tuple[str, int, int]] = []
+    for canonical, raws in sorted((field_mappings or {}).items()):
+        distinct = 0
+        coverage = 0
+        for _, payload in stats.values():
+            entries = [payload.get("attributes", {}).get(r) for r in raws]
+            present = [e for e in entries if e]
+            if not present:
+                continue
+            distinct = max(distinct, max(int(e.get("distinct", 0)) for e in present))
+            coverage += max(int(e.get("coverage", 0)) for e in present)
+        out.append((canonical, distinct, coverage))
+    return out
+
+
 def merged_inventory(
     stats: dict[str, tuple[int, dict[str, Any]]],
     field_mappings: dict[str, list[str]] | None = None,

@@ -134,25 +134,14 @@ export function useCappedFindings<T>(findings: T[], initial = 20) {
  * Query-key sentinels for the show-dismissed toggle. `useDisposition` selects
  * its optimistic-update branch by scanning the key for SHOW_DISMISSED_KEY —
  * a named segment, so its position in the key doesn't matter.
+ *
+ * The toggle itself lives in the UI store (`useIncludeDismissed` in
+ * `hooks/useMethodFindings`), not here: the rail and the sheet render the same
+ * query results, so per-view state would show a finding as dismissed in one and
+ * absent in the other.
  */
 export const SHOW_DISMISSED_KEY = "dismissed-shown";
 export const HIDE_DISMISSED_KEY = "dismissed-hidden";
-
-/**
- * Per-view "show dismissed" reveal toggle. When on, the scan request carries
- * `include_dismissed=true` and dismissed findings come back flagged
- * `dismissed: true` instead of dropped — rendered dimmed by `FindingShell`.
- * Put `keyPart` (not the raw boolean) in the query key so toggling refetches
- * AND `useDisposition` can recognize revealed caches by the named segment.
- */
-export function useShowDismissed() {
-  const [enabled, setEnabled] = useState(false);
-  return {
-    enabled,
-    toggle: () => setEnabled((v) => !v),
-    keyPart: enabled ? SHOW_DISMISSED_KEY : HIDE_DISMISSED_KEY,
-  };
-}
 
 /**
  * Server-side findings limit with stepped "load more" (…→50→150→500, capped by
@@ -218,14 +207,15 @@ export function useOpenEvent(
   });
 }
 
-/** Publish the active view's persisted run_id, clearing it on unmount. */
-export function useDetectorRunId(
-  runId: string | null | undefined,
-  onRunIdChange?: (runId: string | undefined) => void,
-) {
-  useEffect(() => {
-    if (!onRunIdChange) return;
-    onRunIdChange(runId ?? undefined);
-    return () => onRunIdChange(undefined);
-  }, [runId, onRunIdChange]);
-}
+/*
+ * There is deliberately no "publish the active view's run_id" hook any more.
+ *
+ * The Investigate surface runs through `/analysis/findings`, which memoizes an
+ * answer and never persists a `DetectorRun` — the run table stays the forensic
+ * diary of what an analyst *ran*, not a by-product of opening a panel (see
+ * `db/analysis_cache.py`). With no run to name, a hook that published one could
+ * only ever publish `undefined`, which is a dead affordance rather than a
+ * narrowing. `EventFilters.anomalyRunId` therefore has exactly one producer:
+ * `restoreOverlays`, replaying a saved chart or story block that recorded a run
+ * from the era when one existed.
+ */

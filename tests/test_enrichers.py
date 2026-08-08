@@ -15,11 +15,8 @@ from vestigo.enrichers.geoip import IP_REGEX, GeoIPEnricher
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    db_path = tmp_path / "test_enrichers.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database):
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 
@@ -409,7 +406,7 @@ def test_process_batch_dedups_lookups_per_distinct_value():
 
 
 @pytest.mark.asyncio
-async def test_init_schema_drops_legacy_staging_table(tmp_path):
+async def test_init_schema_drops_legacy_staging_table(blank_pg_database):
     """M16 destructive migration: a legacy row-per-field staging table
     (recognized by its field_key column) is dropped and recreated in the
     row-per-(job, event) shape; orphaned pre-upgrade rows are discarded.
@@ -421,8 +418,7 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
 
     from vestigo.db.postgres import Base
 
-    db_path = tmp_path / "legacy_staging.db"
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
+    s = PostgresStore(url=blank_pg_database)
     async with s.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # A real pre-Alembic database has only the revision-0001 tables.
@@ -442,6 +438,8 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.execute(text("DROP TABLE agent_settings"))
         # 0020 adds the instance settings table.
         await conn.execute(text("DROP TABLE app_settings"))
+        # 0026 adds the analysis result cache and the verdict's analysis scope.
+        await conn.execute(text("DROP TABLE analysis_cache"))
         # 0016 adds the Stories tables.
         await conn.execute(text("DROP TABLE stories"))
         await conn.execute(text("DROP TABLE story_blocks"))
@@ -470,7 +468,9 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.execute(
             text(
                 "CREATE TABLE enrichment_results_staging ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id VARCHAR(64), "
+                # SERIAL, not SQLite's AUTOINCREMENT: this DDL now runs against
+                # the real PostgreSQL the migration will meet in production.
+                "id SERIAL PRIMARY KEY, job_id VARCHAR(64), "
                 "case_id VARCHAR(64), source_id VARCHAR(64), timeline_id VARCHAR(64), "
                 "event_id VARCHAR(64), enricher_key VARCHAR(128), "
                 "field_key VARCHAR(128), value VARCHAR(1024), computed_at TIMESTAMP)"

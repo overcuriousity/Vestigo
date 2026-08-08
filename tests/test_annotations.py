@@ -9,13 +9,9 @@ from vestigo.db.postgres import Annotation, PostgresStore
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    """In-memory SQLite store for fast, dependency-free annotation tests."""
-    db_path = tmp_path / "test_annotations.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
-    # Seed a minimal case and source so FKs don't block (no FK constraints in SQLite by default).
+async def store(pg_database):
+    """A private, already-migrated PostgreSQL database (see tests/conftest.py)."""
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 

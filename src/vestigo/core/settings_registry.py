@@ -528,6 +528,42 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Merged candidates that get the second (cadence) pass.",
     ),
     SettingSpec(
+        "analysis_gate_min_numeric_ratio",
+        "detectors",
+        "Gate: numeric-field ratio",
+        "Share of a field's sampled values that must parse as numbers before the numeric-range method is offered automatically. Gated methods stay runnable on request.",
+    ),
+    SettingSpec(
+        "analysis_gate_max_enum_distinct",
+        "detectors",
+        "Gate: enum-like distinct ceiling",
+        "A field with at most this many distinct values counts as enum-like, so charset novelty and entropy have no value shape to learn from it.",
+    ),
+    SettingSpec(
+        "analysis_gate_min_series_distinct",
+        "detectors",
+        "Gate: minimum series values",
+        "Distinct values the series field needs before consecutive n-grams can differ from each other.",
+    ),
+    SettingSpec(
+        "analysis_gate_min_frequency_buckets",
+        "detectors",
+        "Gate: minimum frequency buckets",
+        "Buckets a timeline's span must cover before a count spike is distinguishable from the bucket holding it.",
+    ),
+    SettingSpec(
+        "analysis_gate_min_interval_periods",
+        "detectors",
+        "Gate: minimum cadence periods",
+        "Repeats a series value needs before an inter-arrival cadence can be fitted.",
+    ),
+    SettingSpec(
+        "analysis_cache_max_rows_per_case",
+        "detectors",
+        "Analysis cache rows per case",
+        "Cached method results retained per case, least-recently-computed evicted first. Every row is derived data — eviction only costs a rescan.",
+    ),
+    SettingSpec(
         "viz_baseline_cache_entries",
         "detectors",
         "Visualize baseline cache entries",

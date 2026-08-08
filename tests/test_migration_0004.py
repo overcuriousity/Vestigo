@@ -25,8 +25,8 @@ def _alembic(sync_conn: Any, verb: str, target: str) -> None:
 
 
 @pytest_asyncio.fixture()
-async def engine(tmp_path):
-    store = pg.PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path / 'mig.db'}")
+async def engine(blank_pg_database):
+    store = pg.PostgresStore(url=blank_pg_database)
     yield store.engine
     await store.engine.dispose()
 
@@ -44,19 +44,19 @@ async def test_upgrade_moves_legacy_rows(engine):
         await conn.execute(
             text(
                 "INSERT INTO annotations (id, case_id, source_id, event_id, annotation_type, content, origin, pinned) "
-                "VALUES ('an_norm', 'c1', 's1', 'e-norm', 'normal', 'normal operation', 'user', 0)"
+                "VALUES ('an_norm', 'c1', 's1', 'e-norm', 'normal', 'normal operation', 'user', false)"
             )
         )
         await conn.execute(
             text(
                 "INSERT INTO annotations (id, case_id, source_id, event_id, annotation_type, content, origin, pinned, detector) "
-                "VALUES ('an_pin', 'c1', 's1', 'e-pin', 'anomaly', 'confirmed finding', 'system', 1, 'charset')"
+                "VALUES ('an_pin', 'c1', 's1', 'e-pin', 'anomaly', 'confirmed finding', 'system', true, 'charset')"
             )
         )
         await conn.execute(
             text(
                 "INSERT INTO annotations (id, case_id, source_id, event_id, annotation_type, content, origin, pinned) "
-                "VALUES ('an_tag', 'c1', 's1', 'e-tag', 'tag', 'malware', 'user', 0)"
+                "VALUES ('an_tag', 'c1', 's1', 'e-tag', 'tag', 'malware', 'user', false)"
             )
         )
 
@@ -87,15 +87,30 @@ async def test_upgrade_moves_legacy_rows(engine):
         # normal annotation deleted; pinned anomaly + tag kept.
         assert [tuple(a) for a in anns] == [("an_pin", "anomaly"), ("an_tag", "tag")]
 
-        # pinned column gone, detector_allowlist gone.
+        # pinned column gone, detector_allowlist gone. Read from
+        # information_schema rather than SQLite's PRAGMA/sqlite_master: this
+        # migration is now exercised against the PostgreSQL it actually runs on.
         cols = [
-            r[1] for r in (await conn.execute(text("PRAGMA table_info(annotations)"))).fetchall()
+            r[0]
+            for r in (
+                await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'annotations'"
+                    )
+                )
+            ).fetchall()
         ]
         assert "pinned" not in cols
         tables = [
             r[0]
             for r in (
-                await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+                await conn.execute(
+                    text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public'"
+                    )
+                )
             ).fetchall()
         ]
         assert "detector_allowlist" not in tables

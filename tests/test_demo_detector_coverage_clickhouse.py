@@ -53,22 +53,17 @@ _WINDOWLESS = ("find_order_violations", "find_sequence_motifs", "list_log_templa
 
 @pytest.fixture(scope="module")
 def ch_store():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse unavailable")
+    store = ClickHouseStore()
+    store.init_schema()
     return store
 
 
 @pytest_asyncio.fixture(scope="module")
-async def demo(tmp_path_factory, ch_store):
+async def demo(module_pg_database, ch_store):
     """Seed the demo case once for the whole module, then drop its partitions."""
     from vestigo.db.postgres import PostgresStore
 
-    db_path = tmp_path_factory.mktemp("demo-coverage") / "coverage.db"
-    store = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
-    await store.init_schema()
+    store = PostgresStore(url=module_pg_database)
     owner = await store.create_user(user_id="u_coverage", username="coverage")
     result = await build_demo_case(store, ch_store, owner_id=owner.id)
     sources = [s.id for s in await store.list_sources(result.case_id)]
@@ -154,3 +149,69 @@ def test_sigma_rules_match_real_demo_events(demo, ch_store):
             parameters={"cid": case_id, **params},
         ).result_rows
         assert rows[0][0] > 0, f"Sigma rule {title!r} matched no events in the demo case"
+
+
+def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(demo, ch_store):
+    """The gate's thresholds must be satisfied by data known to produce findings.
+
+    Every other test in this file asserts that some analysis tool finds
+    something in the demo case. That makes this file the right place to assert
+    the gate never *stops offering* one of them: if a precondition would skip a
+    method here, the precondition is wrong, because the method demonstrably
+    works on this data.
+
+    Builds ``PlanInputs`` directly from the demo's sources rather than through
+    ``_collect_plan_inputs``: this module has no timeline and does not patch
+    ``deps.get_store``, and the gate's inputs are what is under test, not the
+    router plumbing around them.
+    """
+    from vestigo.core.config import get_settings
+    from vestigo.db._buckets import query_timestamp_range
+    from vestigo.db.analysis_plan import (
+        PlanInputs,
+        build_plan,
+        numeric_tokens_from_stats,
+        series_distinct_from_stats,
+    )
+    from vestigo.db.field_stats import compute_source_field_stats, merged_inventory
+
+    case_id, source_ids, _windows = demo
+    cfg = get_settings()
+
+    stats = {
+        source_id: compute_source_field_stats(ch_store, case_id, source_id)
+        for source_id in source_ids
+    }
+    inventory, events_total = merged_inventory(stats)
+    in_clause, params = ch_store.string_in_clause("src", source_ids)
+    min_ts, max_ts = query_timestamp_range(
+        ch_store.client,
+        ch_store.database,
+        f"case_id = {{cid:String}} AND source_id IN ({in_clause})",
+        {"cid": case_id, **params},
+    )
+    inputs = PlanInputs(
+        inventory=inventory,
+        numeric_tokens=numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio),
+        series_distinct=series_distinct_from_stats(
+            stats, "artifact", next((d for token, d, _c in inventory if token == "artifact"), 0)
+        ),
+        events_total=events_total,
+        span_seconds=(max_ts - min_ts).total_seconds() if min_ts and max_ts else 0.0,
+        frame="self",
+        has_active_baseline=False,
+    )
+    plans = {p.method: p for p in build_plan(inputs, cfg)}
+
+    for method, plan in plans.items():
+        # The two-window methods legitimately need setup in the self frame —
+        # there is no second window to test against until an analyst declares
+        # one. Every other method must be offered on data this file proves
+        # they find things in.
+        if method in {"proportion_shift", "value_distribution_drift"}:
+            assert plan.status == "needs_setup", f"{method}: {plan.status} ({plan.reason})"
+            continue
+        assert plan.status == "applicable", (
+            f"gate skipped {method} on the demo case ({plan.reason}: {plan.reason_facts}), "
+            "but this file asserts that method finds something here"
+        )

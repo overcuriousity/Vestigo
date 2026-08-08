@@ -19,11 +19,8 @@ pytestmark = pytest.mark.clickhouse
 
 @pytest.fixture(scope="module")
 def ch_store():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse unavailable")
+    store = ClickHouseStore()
+    store.init_schema()
     return store
 
 

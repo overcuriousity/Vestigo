@@ -55,6 +55,14 @@ class DispositionCreate(BaseModel):
     event_id: str | None = Field(default=None, max_length=64)
     note: str | None = Field(default=None, max_length=4096)
     details: dict | None = None
+    #: The analysis comparison this verdict was reached under — ``frame``,
+    #: ``baseline_id``, ``baseline_name``, as echoed by the analysis endpoints.
+    #: A verdict is an assertion about a comparison, so without it "confirmed
+    #: on 4 March" cannot say what the finding was compared against. Optional:
+    #: clients that do not know their scope record none rather than a guess.
+    #: Named ``analysis_scope`` because "scope" is already taken above for the
+    #: value-vs-event distinction.
+    analysis_scope: dict | None = None
 
 
 class DispositionBulkCreate(BaseModel):
@@ -456,6 +464,7 @@ async def _create_one(
         event_id=payload.event_id,
         note=payload.note,
         details=payload.details,
+        analysis_scope=payload.analysis_scope,
         created_by=user.id,
     )
     return row.to_dict()
@@ -527,6 +536,7 @@ async def bulk_create_dispositions(
                     "event_id": item.event_id,
                     "note": item.note,
                     "details": item.details,
+                    "analysis_scope": item.analysis_scope,
                     "created_by": user.id,
                 }
                 for item, scope in zip(payload.items, scopes, strict=True)

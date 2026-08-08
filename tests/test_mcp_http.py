@@ -116,6 +116,7 @@ def test_mcp_body_cap_413(mcp_client, admin_bootstrap, monkeypatch):
     assert resp.status_code == 413
 
 
+@pytest.mark.multiloop  # drives its own asyncio.run alongside the client's loop
 def test_mcp_batch_tools_call_still_audited(mcp_client, admin_bootstrap, store):
     """A JSON-RPC batch array writes one agent.tool_call audit row per member.
 
