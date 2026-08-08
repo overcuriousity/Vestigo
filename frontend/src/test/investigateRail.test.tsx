@@ -5,9 +5,9 @@
  */
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InvestigateRail } from "@/components/analysis/InvestigateRail";
 import { METHODS_BY_ID } from "@/components/analysis/method-registry";
 
@@ -27,6 +27,11 @@ const readiness = vi.hoisted(() => ({
 }));
 vi.mock("@/hooks/useTimelineReadiness", () => ({
   useTimelineReadiness: () => readiness.current,
+}));
+
+const sigma = vi.hoisted(() => ({ current: [] as unknown[] }));
+vi.mock("@/hooks/useSigmaFindings", () => ({
+  useSigmaFindings: () => ({ findings: sigma.current, isLoading: false, available: true }),
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -63,7 +68,11 @@ function state(id: string, over: Record<string, unknown> = {}) {
   };
 }
 
-function renderRail(overrides: Record<string, unknown>, ready = readiness.current) {
+function renderRail(
+  overrides: Record<string, unknown>,
+  ready = readiness.current,
+  props: Record<string, unknown> = {},
+) {
   readiness.current = ready;
   sweep.current = {
     scope: { frame: "self", baseline_id: null, baseline_name: null },
@@ -80,6 +89,7 @@ function renderRail(overrides: Record<string, unknown>, ready = readiness.curren
       onSelectFinding={() => {}}
       onOpenTools={() => {}}
       onSelectEvent={() => {}}
+      {...props}
     />,
     { wrapper },
   );
@@ -220,5 +230,97 @@ describe("InvestigateRail", () => {
     renderRail({});
     screen.getByTestId("toggle-dismissed").click();
     expect(setIncludeDismissed).toHaveBeenCalledWith(true);
+  });
+});
+
+describe("scope provenance on a row", () => {
+  it("marks a verdict reached under another comparison instead of badging it", () => {
+    // `confirmed` is the one disposition kind whose identity includes the
+    // scope, so a February verdict is not a claim about March. Badging it as
+    // confirmed here would disable Confirm and make the second claim
+    // unreachable; showing nothing at all would hide that the finding has
+    // already been escalated somewhere.
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", {
+          findings: [finding({ confirmed_other_scope: true })],
+          total: 1,
+        }),
+      },
+    });
+    expect(screen.getByTestId("confirmed-other-scope")).toHaveTextContent("confirmed elsewhere");
+    expect(screen.queryByText(/^confirmed$/)).toBeNull();
+  });
+
+  it("badges a verdict reached under the comparison on screen", () => {
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", {
+          findings: [finding({ confirmed: true })],
+          total: 1,
+        }),
+      },
+    });
+    expect(screen.getByText("confirmed")).toBeInTheDocument();
+    expect(screen.queryByTestId("confirmed-other-scope")).toBeNull();
+  });
+});
+
+describe("named techniques", () => {
+  const HIT = {
+    ruleKey: "psexec_service_install",
+    title: "psexec service install",
+    level: "high",
+    matchCount: 3,
+    tag: "sigma: psexec service install",
+  };
+
+  afterEach(() => {
+    sigma.current = [];
+  });
+
+  it("fills the strongest group with Sigma hits", () => {
+    // The group shipped structurally empty: no method in the registry carries
+    // `evidenceClass: "named"`, so the rail reserved its strongest slot for
+    // something nothing could ever put there.
+    sigma.current = [HIT];
+    renderRail({});
+    expect(screen.getByText(/Named techniques/)).toBeInTheDocument();
+    expect(screen.getByText("psexec service install")).toBeInTheDocument();
+  });
+
+  it("keeps the group out of the rail when no run has hit anything", () => {
+    renderRail({});
+    expect(screen.queryByText(/Named techniques/)).toBeNull();
+  });
+
+  it("counts a Sigma hit as a finding, so the rail does not claim it is clear", () => {
+    sigma.current = [HIT];
+    renderRail({ done: 2, total: 2 });
+    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+  });
+
+  it("drills a rule's hits into the grid with the tag the Tools sheet uses", () => {
+    sigma.current = [HIT];
+    const onTagFilter = vi.fn();
+    renderRail({}, readiness.current, { onTagFilter });
+    fireEvent.click(screen.getByTestId("sigma-drill"));
+    expect(onTagFilter).toHaveBeenCalledWith("sigma: psexec service install");
+  });
+
+  it("filters to Sigma alone under Known-bad, and away from it under the rest", () => {
+    sigma.current = [HIT];
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", { findings: [finding()], total: 1 }),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Known-bad" }));
+    expect(screen.getByText("psexec service install")).toBeInTheDocument();
+    expect(screen.queryByText(/curl\/7\.68\.0/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Unusual values" }));
+    expect(screen.queryByText("psexec service install")).toBeNull();
+    expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
   });
 });

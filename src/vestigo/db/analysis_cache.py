@@ -23,7 +23,7 @@ import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from vestigo.db.postgres import AnalysisCache, SourceFieldStats, generate_id
@@ -165,6 +165,16 @@ async def cache_put(
     Eviction is scoped to the writing case: one busy investigation must not
     evict a quiet one's answers, since the two share nothing but a table.
 
+    It is least-recently-**computed**, not least-recently-used. ``cache_get``
+    deliberately writes nothing: ``/analysis/findings`` is a ``require_case_read``
+    endpoint whose single write exception (see CLAUDE.md) is the miss path, and
+    turning every hit into a write would trade the whole point of the hit path
+    for a better eviction order. The consequence is bounded — a hot entry that
+    was computed long ago can be evicted ahead of a cold one computed recently,
+    and it costs exactly one rescan. Every row is derived data keyed by a
+    fingerprint of its own inputs, so eviction can never produce a wrong answer,
+    only a slower one.
+
     Losing the insert race is not an error. Two clients that miss the same key
     computed the same answer over the same inputs — that is what the key means —
     so the loser's ``IntegrityError`` is swallowed rather than allowed to fail a
@@ -190,33 +200,48 @@ async def _cache_put(
         ).scalar_one_or_none()
         if existing is not None:
             existing.payload = payload
-            # Eviction keeps the newest `computed_at`, so a refreshed row that
-            # kept its original stamp would age while in active use and be
-            # evicted ahead of rows nobody has asked for since.
+            # Eviction keeps the newest `computed_at`, so a recomputed row that
+            # kept its original stamp would age while it is still being answered
+            # from, and be evicted ahead of rows nobody has recomputed since.
             existing.computed_at = datetime.now(UTC)
-        else:
-            session.add(
-                AnalysisCache(
-                    id=generate_id("cache"), case_id=case_id, cache_key=key, payload=payload
-                )
-            )
+            await session.commit()
+            # A replace cannot grow the table, so it can never push the case
+            # over the cap. Running eviction here was pure waste on a path that
+            # already holds the row it just wrote.
+            return
+
+        session.add(
+            AnalysisCache(id=generate_id("cache"), case_id=case_id, cache_key=key, payload=payload)
+        )
         await session.flush()
 
-        keep = (
-            (
-                await session.execute(
-                    select(AnalysisCache.id)
-                    .where(AnalysisCache.case_id == case_id)
-                    .order_by(AnalysisCache.computed_at.desc(), AnalysisCache.id.desc())
-                    .limit(max_rows)
+        # Only an insert can exceed the cap, and only then is the delete worth
+        # its cost: materializing up to `max_rows` ids and issuing a `NOT IN`
+        # over them on every single miss is a lot of work to discover there is
+        # nothing to evict.
+        rows = (
+            await session.execute(
+                select(func.count())
+                .select_from(AnalysisCache)
+                .where(AnalysisCache.case_id == case_id)
+            )
+        ).scalar_one()
+        if rows > max_rows:
+            keep = (
+                (
+                    await session.execute(
+                        select(AnalysisCache.id)
+                        .where(AnalysisCache.case_id == case_id)
+                        .order_by(AnalysisCache.computed_at.desc(), AnalysisCache.id.desc())
+                        .limit(max_rows)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.execute(
+                delete(AnalysisCache).where(
+                    AnalysisCache.case_id == case_id, AnalysisCache.id.notin_(keep)
                 )
             )
-            .scalars()
-            .all()
-        )
-        await session.execute(
-            delete(AnalysisCache).where(
-                AnalysisCache.case_id == case_id, AnalysisCache.id.notin_(keep)
-            )
-        )
         await session.commit()

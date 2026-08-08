@@ -83,6 +83,11 @@ class PlanInputs:
 
     inventory: list[tuple[str, int, int]]
     numeric_tokens: list[str]
+    #: How many field tokens ``numeric_tokens_from_stats`` actually tested. The
+    #: denominator the gate quotes must be the one its numerator came from —
+    #: ``len(inventory)`` counts a different, capped population, and
+    #: ``reason_facts`` exists to be checked.
+    numeric_tokens_examined: int
     series_distinct: int
     events_total: int
     span_seconds: float
@@ -106,10 +111,24 @@ class MethodPlan:
     reason_facts: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class NumericTokenScan:
+    """Which tokens qualified as numeric, and how many were tested.
+
+    Both halves are returned together because the gate quotes them as a
+    fraction. Deriving the denominator from anywhere else — the merged
+    inventory, say, which caps attribute keys and appends canonical entries —
+    produces a "0 of 19" whose 19 was never the population the 0 came from.
+    """
+
+    tokens: list[str]
+    examined: int
+
+
 def numeric_tokens_from_stats(
     stats: dict[str, tuple[int, dict[str, Any]]], min_ratio: float
-) -> list[str]:
-    """Return field tokens whose sampled values are at least *min_ratio* numeric.
+) -> NumericTokenScan:
+    """Return the field tokens whose sampled values are at least *min_ratio* numeric.
 
     Reads the per-field sampled top values already in the ``field_stats``
     payload rather than issuing ``_numeric_ratio_probe``'s ClickHouse scan.
@@ -140,8 +159,13 @@ def numeric_tokens_from_stats(
                 token = f"{prefix}{key}"
                 hit, total = ratios.get(token, (0.0, 0.0))
                 ratios[token] = (hit + numeric, total + seen)
-    return sorted(
-        token for token, (hit, total) in ratios.items() if total > 0 and hit / total >= min_ratio
+    return NumericTokenScan(
+        tokens=sorted(
+            token
+            for token, (hit, total) in ratios.items()
+            if total > 0 and hit / total >= min_ratio
+        ),
+        examined=len(ratios),
     )
 
 
@@ -234,38 +258,52 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
             "no field parses as numeric",
             {
                 "numeric_fields": 0,
-                "sampled": len(inputs.inventory),
+                "sampled": inputs.numeric_tokens_examined,
                 "threshold": cfg.analysis_gate_min_numeric_ratio,
             },
         )
     )
 
-    # Charset and entropy both learn a per-field model of value *shape*. An
-    # enum-like field has no shape to learn: every value is one of a handful of
-    # literals, so a never-seen character or an out-of-band entropy cannot occur
-    # by construction.
+    # Charset learns each field's alphabet *from the field's own values*. When
+    # every field is enum-like, the learned alphabet is the union of a handful
+    # of literals and every value is drawn from it — so a never-seen character
+    # cannot occur by construction. That is a structural impossibility, which is
+    # the only thing this gate is allowed to act on.
+    #
+    # Entropy deliberately does NOT share it. Its band is learned across values
+    # and an outlier is measured against that band, so one of five enum literals
+    # can still sit far outside it — a base64 blob among four short words scores
+    # exactly as it should. Gating it here marked a scoreable method
+    # not_applicable, which is the silent failure this module exists to avoid.
     enum_only = max_distinct <= cfg.analysis_gate_max_enum_distinct
-    for method in ("charset", "entropy"):
-        plans[method] = (
-            _no(
-                method,
-                f"every field is enum-like (at most {cfg.analysis_gate_max_enum_distinct} distinct values)",
-                {"max_distinct": max_distinct, "threshold": cfg.analysis_gate_max_enum_distinct},
-            )
-            if enum_only
-            else _ok(method)
+    plans["charset"] = (
+        _no(
+            "charset",
+            f"every field is enum-like (at most {cfg.analysis_gate_max_enum_distinct} distinct values), so no character can be novel",
+            {"max_distinct": max_distinct, "threshold": cfg.analysis_gate_max_enum_distinct},
         )
+        if enum_only
+        else _ok("charset")
+    )
+    plans["entropy"] = _ok("entropy")
 
     # One bucket cannot be an outlier against itself, and buckets narrower than
-    # a second collapse into each other.
+    # a second collapse into each other. The threshold is in *seconds of span*,
+    # not in buckets — the detector always splits the span into
+    # `stat_frequency_buckets` of them, so both numbers are quoted rather than
+    # letting the reason imply the setting names the divisor.
     needed = cfg.analysis_gate_min_frequency_buckets
     plans["frequency"] = (
         _ok("frequency")
         if inputs.span_seconds >= float(needed)
         else _no(
             "frequency",
-            f"span is too short to fill {needed} buckets",
-            {"span_seconds": inputs.span_seconds, "required_buckets": needed},
+            f"span is under {needed}s, too short to bucket",
+            {
+                "span_seconds": inputs.span_seconds,
+                "required_seconds": needed,
+                "bucket_count": cfg.stat_frequency_buckets,
+            },
         )
     )
 
@@ -295,12 +333,18 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         )
     )
 
+    # A single distinct series value yields exactly one n-gram, repeated: no
+    # ordering can be novel against a reference set containing only itself.
+    # Two values already yield 2**n distinct n-grams, and a rare one among them
+    # is perfectly scoreable — so the floor is 2, not "enough values to look
+    # interesting". A two-artifact-type timeline is an ordinary two-source case,
+    # and it used to lose this method silently.
     plans["sequence_novelty"] = (
         _ok("sequence_novelty")
         if inputs.series_distinct >= cfg.analysis_gate_min_series_distinct
         else _no(
             "sequence_novelty",
-            "series field has too few distinct values for n-grams to differ",
+            "the series field holds one value, so every n-gram is the same one",
             {
                 "series_distinct": inputs.series_distinct,
                 "required": cfg.analysis_gate_min_series_distinct,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -51,8 +52,24 @@ def stub_detector(monkeypatch):
             "dispositions_count": 0,
         }
 
-    async def _fake_templates(case_id, timeline_id, source_ids, params, limit, baseline_id=None):
-        calls["templates"].append({**params, "_baseline_id": baseline_id})
+    async def _fake_templates(
+        case_id,
+        timeline_id,
+        source_ids,
+        params,
+        limit,
+        baseline_id=None,
+        field_mappings=None,
+        source_offsets=None,
+    ):
+        calls["templates"].append(
+            {
+                **params,
+                "_baseline_id": baseline_id,
+                "_field_mappings": field_mappings,
+                "_source_offsets": source_offsets,
+            }
+        )
         return {"status": "ok", "results": [], "total_findings": 0, "warnings": []}
 
     def _fake_serialize(result):
@@ -158,7 +175,16 @@ def test_log_template_runs_the_template_browser_not_a_detector(client, seeded, s
     r = client.get(_url(case_id, timeline_id, "log_template", {"field": "message"}))
     assert r.status_code == 200
     assert stub_detector["templates"] == [
-        {"field": "message", "order": "count", "only_new": False, "_baseline_id": None}
+        {
+            "field": "message",
+            "order": "count",
+            "only_new": False,
+            "_baseline_id": None,
+            # Handed down from the caller's single scope resolve, not resolved
+            # again inside the runner.
+            "_field_mappings": None,
+            "_source_offsets": None,
+        }
     ]
     assert stub_detector["detector"] == []
 
@@ -449,3 +475,171 @@ def test_a_frame_that_disagrees_with_the_baseline_id_is_rejected(
     r = client.get(_url(case_id, timeline_id, "value_novelty", extra=extra))
     assert r.status_code == 422, r.text
     assert stub_detector["detector"] == []
+
+
+def _baseline(client, case_id, timeline_id, name, day):
+    return client.post(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/baselines",
+        json={
+            "name": name,
+            "baseline_start": "2024-02-01T00:00:00Z",
+            "baseline_end": f"2024-02-0{day}T00:00:00Z",
+            "suspect_windows": [
+                {
+                    "label": "w1",
+                    "start": f"2024-02-0{day}T00:00:00Z",
+                    "end": f"2024-02-0{day + 1}T00:00:00Z",
+                }
+            ],
+        },
+    ).json()["baseline"]["id"]
+
+
+def test_a_verdict_from_another_baseline_is_marked_not_badged(
+    client, seeded, stub_detector, scoped_source
+):
+    """Confirming under one comparison must not claim the row under another.
+
+    ``confirmed`` is the one disposition kind whose identity includes the
+    scope, precisely so escalating a finding against February and again against
+    March are two claims. If the February verdict badged the row under March,
+    the UI would disable Confirm and the second claim could never be made — the
+    per-scope dedupe would be unreachable code.
+
+    The row is not left blank either: it carries ``confirmed_other_scope``, the
+    "marked so you can re-examine them" the scope-change dialog promises.
+    """
+    case_id, timeline_id = seeded
+    feb = _baseline(client, case_id, timeline_id, "feb", 8)
+    mar = _baseline(client, case_id, timeline_id, "mar", 3)
+    stub_detector["results"] = [
+        {"type": "value_novelty", "score": 1.0, "event_id": "e-1", "details": {}},
+    ]
+    _dispose(
+        client,
+        case_id,
+        timeline_id,
+        {
+            "kind": "confirmed",
+            "detector": "value_novelty",
+            "source_id": scoped_source,
+            "event_id": "e-1",
+            "analysis_scope": {"frame": "baseline", "baseline_id": feb},
+        },
+    )
+
+    under_feb = client.get(
+        _url(case_id, timeline_id, "value_novelty", extra=f"&frame=baseline&baseline_id={feb}")
+    ).json()["results"][0]
+    assert under_feb.get("confirmed") is True
+    assert under_feb.get("confirmed_other_scope") is None
+
+    under_mar = client.get(
+        _url(case_id, timeline_id, "value_novelty", extra=f"&frame=baseline&baseline_id={mar}")
+    ).json()["results"][0]
+    assert under_mar.get("confirmed") is None
+    assert under_mar.get("confirmed_other_scope") is True
+
+
+def test_a_verdict_recorded_before_scope_provenance_still_badges_everywhere(
+    client, seeded, stub_detector, scoped_source
+):
+    """A NULL scope means "nobody recorded one", not "reached under self".
+
+    Demoting those rows would silently unbadge existing evidence to assert a
+    comparison the database never stored.
+    """
+    case_id, timeline_id = seeded
+    feb = _baseline(client, case_id, timeline_id, "feb", 8)
+    stub_detector["results"] = [
+        {"type": "value_novelty", "score": 1.0, "event_id": "e-1", "details": {}},
+    ]
+    _dispose(
+        client,
+        case_id,
+        timeline_id,
+        {
+            "kind": "confirmed",
+            "detector": "value_novelty",
+            "source_id": scoped_source,
+            "event_id": "e-1",
+        },
+    )
+    for extra in ("", f"&frame=baseline&baseline_id={feb}"):
+        body = client.get(_url(case_id, timeline_id, "value_novelty", extra=extra)).json()
+        assert body["results"][0].get("confirmed") is True
+
+
+def test_log_templates_report_the_total_before_the_limit(monkeypatch):
+    """ "Showing N of M" has to name the M that was measured, not the cap.
+
+    Every scored method returns `total_findings` counted before the `limit`
+    cap, and the rail's count reads it that way. Returning `len(results)` for
+    templates made a timeline with 400 distinct shapes report exactly 50, with
+    nothing on screen saying anything had been cut.
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Result:
+        field: str
+        total_templates: int
+        templates: list
+
+    class _Svc:
+        def list_log_templates(self, **kwargs):
+            return _Result(
+                field="message",
+                total_templates=400,
+                templates=[{"template": f"t{i}", "count": 1} for i in range(50)],
+            )
+
+    monkeypatch.setattr(analysis_router, "_get_stat_anomaly_service", lambda: _Svc())
+    body = asyncio.run(
+        analysis_router._run_log_templates("c-1", "tl-1", ["s-1"], {}, 50, baseline_id=None)
+    )
+    assert len(body["results"]) == 50
+    assert body["total_findings"] == 400
+
+
+def test_log_templates_do_not_re_resolve_the_timeline_scope(monkeypatch):
+    """The caller resolved the scope; a second resolve is a second source list.
+
+    Two independently-resolved lists are equal only by construction, so a later
+    change to either resolution point would diverge silently — and the runner
+    was already scanning the caller's list while discarding its own.
+    """
+    seen: dict[str, object] = {}
+
+    class _Svc:
+        def list_log_templates(self, **kwargs):
+            seen.update(kwargs)
+
+            class _R:
+                field = "message"
+                total_templates = 0
+                templates: list = []
+
+            from dataclasses import make_dataclass
+
+            return make_dataclass("R", ["field", "total_templates", "templates"])("message", 0, [])
+
+    async def _explode(*_a, **_k):  # pragma: no cover - must never be reached
+        raise AssertionError("_run_log_templates re-resolved the timeline scope")
+
+    monkeypatch.setattr(analysis_router, "_get_stat_anomaly_service", lambda: _Svc())
+    monkeypatch.setattr(analysis_router, "_resolve_timeline_scope", _explode)
+    asyncio.run(
+        analysis_router._run_log_templates(
+            "c-1",
+            "tl-1",
+            ["s-1"],
+            {},
+            50,
+            field_mappings={"host": ["attr:hostname"]},
+            source_offsets={"s-1": 60},
+        )
+    )
+    assert seen["source_ids"] == ["s-1"]
+    assert seen["field_mappings"] == {"host": ["attr:hostname"]}
+    assert seen["source_offsets"] == {"s-1": 60}

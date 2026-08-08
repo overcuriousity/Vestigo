@@ -33,6 +33,7 @@ def _inputs(**over) -> PlanInputs:
     base = {
         "inventory": [("artifact", 5, 1000), ("message", 900, 1000), ("attr:src_ip", 41, 1000)],
         "numeric_tokens": ["attr:bytes_out"],
+        "numeric_tokens_examined": 19,
         "series_distinct": 8,
         "events_total": 1000,
         "span_seconds": 86_400.0,
@@ -60,7 +61,9 @@ def test_rich_timeline_leaves_everything_applicable(cfg):
 def test_numeric_range_gated_off_without_numeric_fields(cfg):
     plan = _by_id(build_plan(_inputs(numeric_tokens=[]), cfg))["numeric_range"]
     assert plan.status == "not_applicable"
-    assert plan.reason_facts == {"numeric_fields": 0, "sampled": 3, "threshold": 0.9}
+    # The denominator is the count of tokens the numeric scan tested, not
+    # the merged inventory's length — a different, capped population.
+    assert plan.reason_facts == {"numeric_fields": 0, "sampled": 19, "threshold": 0.9}
 
 
 def test_two_window_methods_need_setup_in_self_frame(cfg):
@@ -76,13 +79,24 @@ def test_two_window_methods_applicable_once_a_baseline_is_active(cfg):
     assert plans["value_distribution_drift"].status == "applicable"
 
 
-def test_charset_and_entropy_gated_off_on_enum_only_fields(cfg):
+def test_charset_gated_off_on_enum_only_fields_but_entropy_is_not(cfg):
+    """Only charset's impossibility is structural.
+
+    Charset learns each field's alphabet from that field's own values, so when
+    every value is one of a handful of literals the learned alphabet already
+    contains every character present — nothing can be novel.
+
+    Entropy's band is a *comparison*: one of five enum literals can still sit
+    far outside it (a base64 blob among four short words). Gating it here marked
+    a scoreable method not_applicable, which is exactly the silent failure the
+    module docstring forbids.
+    """
     enum_only = [("artifact", 3, 1000), ("attr:level", 4, 1000)]
     plans = _by_id(build_plan(_inputs(inventory=enum_only), cfg))
-    for method in ("charset", "entropy"):
-        assert plans[method].status == "not_applicable"
-        assert plans[method].reason_facts["max_distinct"] == 4
-        assert plans[method].reason_facts["threshold"] == 5
+    assert plans["charset"].status == "not_applicable"
+    assert plans["charset"].reason_facts["max_distinct"] == 4
+    assert plans["charset"].reason_facts["threshold"] == 5
+    assert plans["entropy"].status == "applicable"
 
 
 def test_charset_applicable_one_value_above_the_enum_ceiling(cfg):
@@ -98,12 +112,19 @@ def test_value_combo_needs_two_categorical_fields(cfg):
     assert plans["value_combo"].reason_facts == {"categorical_fields": 1, "required": 2}
 
 
-def test_frequency_gated_off_on_a_span_under_the_bucket_minimum(cfg):
-    """A span shorter than one second per bucket cannot separate the buckets."""
+def test_frequency_gated_off_on_a_span_under_the_minimum(cfg):
+    """The threshold is seconds of span, and the reason must say which is which.
+
+    The setting's name reads like a bucket count, but it is compared against
+    `span_seconds`; the divisor is `stat_frequency_buckets`. Both are quoted so
+    the arithmetic on screen is checkable rather than implying one number does
+    two jobs.
+    """
     plans = _by_id(build_plan(_inputs(span_seconds=8.0), cfg))
     assert plans["frequency"].status == "not_applicable"
     assert plans["frequency"].reason_facts["span_seconds"] == 8.0
-    assert plans["frequency"].reason_facts["required_buckets"] == 12
+    assert plans["frequency"].reason_facts["required_seconds"] == 12
+    assert plans["frequency"].reason_facts["bucket_count"] == cfg.stat_frequency_buckets
 
 
 def test_interval_gated_off_without_enough_events_per_series_value(cfg):
@@ -113,10 +134,22 @@ def test_interval_gated_off_without_enough_events_per_series_value(cfg):
     assert plans["interval_periodicity"].reason_facts["events_per_series_value"] == 2
 
 
-def test_sequence_gated_off_below_the_series_distinct_minimum(cfg):
-    plans = _by_id(build_plan(_inputs(series_distinct=2), cfg))
+def test_sequence_is_offered_on_two_distinct_series_values(cfg):
+    """Two values already yield 2**n distinct n-grams, and a rare one scores.
+
+    The floor used to be three, which silently withheld n-gram novelty from any
+    timeline with exactly two artifact types — an ordinary two-source case.
+    """
+    assert _by_id(build_plan(_inputs(series_distinct=2), cfg))["sequence_novelty"].status == (
+        "applicable"
+    )
+
+
+def test_sequence_gated_off_when_the_series_field_holds_one_value(cfg):
+    """One value yields one n-gram, repeated: nothing can be novel against it."""
+    plans = _by_id(build_plan(_inputs(series_distinct=1), cfg))
     assert plans["sequence_novelty"].status == "not_applicable"
-    assert plans["sequence_novelty"].reason_facts == {"series_distinct": 2, "required": 3}
+    assert plans["sequence_novelty"].reason_facts == {"series_distinct": 1, "required": 2}
 
 
 def test_log_template_is_never_gated_off(cfg):
@@ -172,7 +205,13 @@ def test_numeric_tokens_read_sampled_values_not_a_clickhouse_probe():
             },
         )
     }
-    assert numeric_tokens_from_stats(stats, 0.9) == ["attr:bytes_out"]
+    scan = numeric_tokens_from_stats(stats, 0.9)
+    assert scan.tokens == ["attr:bytes_out"]
+    # And the denominator the gate quotes comes from this same scan: both
+    # tokens were tested, one qualified. Sourcing it from the merged inventory
+    # instead quoted a capped, differently-built population, so "0 of 19" named
+    # a 19 the 0 was never measured against.
+    assert scan.examined == 2
 
 
 def test_numeric_tokens_reject_a_mostly_numeric_field_below_the_ratio():
@@ -191,7 +230,7 @@ def test_numeric_tokens_reject_a_mostly_numeric_field_below_the_ratio():
             },
         )
     }
-    assert numeric_tokens_from_stats(stats, 0.9) == []
+    assert numeric_tokens_from_stats(stats, 0.9).tokens == []
 
 
 def test_numeric_tokens_merge_the_ratio_across_sources():
@@ -206,7 +245,7 @@ def test_numeric_tokens_merge_the_ratio_across_sources():
             {"top_level": {}, "attributes": {"port": {"values": [["n/a", 50]]}}},
         ),
     }
-    assert numeric_tokens_from_stats(stats, 0.9) == []
+    assert numeric_tokens_from_stats(stats, 0.9).tokens == []
 
 
 def test_series_distinct_unions_sampled_values_across_sources():

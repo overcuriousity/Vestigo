@@ -101,7 +101,7 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       ts = ts ?? f.first_seen;
       break;
     case "sequence_motif":
-      // Not part of the sweep (lives in the Patterns tab) — handled for
+      // Not part of the sweep (mined from Tools -> Explore) — handled for
       // exhaustiveness so the union stays covered if that ever changes.
       title = `${fieldLabel(f.field)}: ${truncate(f.value, 70)}`;
       subtitle = `×${f.support}${f.period_seconds !== null ? ` every ~${f.period_seconds}s` : ""}`;

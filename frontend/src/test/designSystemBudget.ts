@@ -32,6 +32,8 @@ export const BUDGET: Record<string, FileBudget> = {
   "../components/agent/ProposalCard.tsx": { fontSize: 3 },
   "../components/agent/StoryBlockProposalCard.tsx": { fontSize: 2 },
   "../components/agent/ToolSelector.tsx": { fontSize: 8, rawButton: 2 },
+  // Unmounted, but deliberately kept: ROADMAP's "the method sheet's `fields`
+  // knob is a text box" item wires this exact component back in.
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
   "../components/analysis/FindingGroup.tsx": { fontSize: 3, rawButton: 1 },
   // +1 each for the show-dismissed toggle, which is deliberately the same
@@ -45,6 +47,11 @@ export const BUDGET: Record<string, FileBudget> = {
   "../components/analysis/ToolsSheet.tsx": { fontSize: 8, rawButton: 2 },
   "../components/analysis/PatternsView.tsx": { fontSize: 1, rawButton: 3 },
   "../components/analysis/SigmaPanel.tsx": { fontSize: 7, rawButton: 5 },
+  // Same two allowances FindingGroup carries, for the same reason: these rows
+  // sit in the same list as its rows and must read as the same kind of thing —
+  // one 10px detector chip, and one dimmed-at-rest hover action where a
+  // `Button` would be a visually heavier control than the row it acts on.
+  "../components/analysis/SigmaFindings.tsx": { fontSize: 1, rawButton: 1 },
   "../components/analysis/SimilarEvents.tsx": { rawButton: 1 },
   "../components/analysis/TemplatesView.tsx": { rawButton: 3 },
   "../components/analysis/WindowsNormality.tsx": { fontSize: 7, rawButton: 7 },

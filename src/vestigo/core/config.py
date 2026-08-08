@@ -180,15 +180,18 @@ class Settings(BaseSettings):
     # Share of a field's sampled values that must parse as a number before the
     # numeric-range band has anything to learn.
     analysis_gate_min_numeric_ratio: float = Field(default=0.9, gt=0, le=1)
-    # A field with at most this many distinct values is enum-like: every value
-    # is one of a handful of literals, so charset novelty and entropy bands
-    # have no shape to learn from it.
+    # A field with at most this many distinct values is enum-like: its learned
+    # alphabet is the union of a handful of literals and every value is drawn
+    # from it, so charset novelty cannot fire. Entropy is deliberately not
+    # gated on this — its band is a comparison, and one enum literal can sit
+    # far outside it.
     analysis_gate_max_enum_distinct: int = Field(default=5, ge=1)
-    # Distinct series values needed before consecutive n-grams can differ from
-    # each other at all.
-    analysis_gate_min_series_distinct: int = Field(default=3, ge=2)
-    # Buckets a timeline's span must be able to cover before a count spike is
-    # distinguishable from the bucket containing it.
+    # Distinct series values needed before two n-grams can differ at all. One
+    # value yields a single repeated n-gram; two already yield 2**n.
+    analysis_gate_min_series_distinct: int = Field(default=2, ge=2)
+    # Seconds of span a timeline must cover before frequency bucketing is
+    # meaningful — below this the buckets it splits into (stat_frequency_buckets)
+    # are narrower than a second and collapse into each other.
     analysis_gate_min_frequency_buckets: int = Field(default=12, ge=2)
     # Repeats a series value needs before an inter-arrival cadence can be fitted.
     analysis_gate_min_interval_periods: int = Field(default=3, ge=2)

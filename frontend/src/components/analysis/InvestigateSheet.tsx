@@ -8,11 +8,16 @@
  * to remove.
  *
  * Modes:
- *   finding — the verdict in plain language, the evidence, the score with its
- *             unit, the scope it was computed under, how the method works, its
- *             knobs, and the query it ran.
+ *   finding — the verdict in plain language, the evidence where the payload
+ *             carries any, the score with its unit, the scope it was computed
+ *             under, how the method works, its knobs, the shape of the query it
+ *             runs, and the verdict controls pinned below all of it.
  *   method  — the same explanation and controls without a specific finding.
  *   tools   — the machinery accounting (ToolsSheet).
+ *
+ * "Query shape" is a sketch, not a transcript: unlike the Sigma runner, the
+ * detectors do not return their compiled SQL, so presenting one as the executed
+ * statement would be a claim nothing in the codebase backs.
  *
  * The methodology prose lives in the method registry and renders here rather
  * than in a separate Method tab: "what does this actually do" is only ever
@@ -25,8 +30,12 @@ import { METHODS_BY_ID, type MethodId, type MethodMeta } from "./method-registry
 import { EVIDENCE_CLASSES } from "./method-registry";
 import { ToolsSheet } from "./ToolsSheet";
 import { ScoredRow, TemplateRows } from "./FindingGroup";
+import { FindingRowActions, FindingRowState } from "./detector-shared";
 import { DETECTORS } from "./detector-registry";
+import { FindingEvidence } from "./FindingEvidence";
 import { normalizeFinding } from "@/lib/finding-normalize";
+import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
+import { findingVerdict } from "@/lib/finding-verdict";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
@@ -38,7 +47,15 @@ import { isTemplateRow } from "@/api/analysis";
 const DETECTOR_BY_API_KEY = Object.fromEntries(DETECTORS.map((d) => [d.detector, d]));
 
 export type SheetMode =
-  | { mode: "finding"; methodId: MethodId; finding: MethodResult; scope: AnalysisScope }
+  | {
+      mode: "finding";
+      methodId: MethodId;
+      finding: MethodResult;
+      scope: AnalysisScope;
+      /** Re-runs the method with the knobs as typed, in method mode. */
+      onRun?: (params: Record<string, unknown>) => void;
+      running?: boolean;
+    }
   | {
       mode: "method";
       methodId: MethodId;
@@ -66,8 +83,10 @@ interface Props {
   }) => void;
   /** Tools mode: Sigma hits filter the grid by tag. */
   onTagFilter?: (tag: string) => void;
-  /** Tools mode: drill a template into the grid's filters. */
+  /** Drill into the grid's filters — a template in Tools, a value in finding mode. */
   onDrillField?: (field: string, value: string) => void;
+  /** Finding mode: jump the grid to the finding's time. */
+  onJumpToTime?: (ts: string, eventId?: string) => void;
   /** Tools mode: the event anchored from a grid row, for similarity. */
   similarAnchor?: Event | null;
   onSimilarClose?: () => void;
@@ -104,11 +123,17 @@ function buildParams(meta: MethodMeta, raw: Record<string, string>): Record<stri
 function MethodBody({
   methodId,
   onRun,
+  runLabel = "Run",
   running,
 }: {
   methodId: MethodId;
-  /** Absent in finding mode: the finding on screen already has its answer. */
+  /**
+   * Runs the method with the knobs as typed. Present in both modes: a form of
+   * inputs with no way to submit them is a control that lies about being one,
+   * and finding mode had exactly that.
+   */
   onRun?: (params: Record<string, unknown>) => void;
+  runLabel?: string;
   running?: boolean;
 }) {
   const meta = METHODS_BY_ID[methodId];
@@ -152,7 +177,7 @@ function MethodBody({
         {onRun && (
           <Button type="submit" variant="outline" size="sm" disabled={running}>
             <Play size={11} />
-            {running ? "Running…" : "Run"}
+            {running ? "Running…" : runLabel}
           </Button>
         )}
       </form>
@@ -161,6 +186,15 @@ function MethodBody({
           Fields is a comma-separated list of tokens; leave it empty to let the method choose.
         </p>
       )}
+
+      <Subhead>Query shape</Subhead>
+      <pre className="overflow-x-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2 font-mono text-xs text-[var(--color-fg-secondary)]">
+        {meta.querySketch}
+      </pre>
+      <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+        The structure of the statement this method runs. Fields, windows and thresholds are bound
+        from the parameters above — this is not a transcript of the executed query.
+      </p>
     </>
   );
 }
@@ -236,12 +270,18 @@ function MethodResults({
  * `first_seen` (frequency findings carry a window instead), so this reads
  * defensively rather than asserting a field the union does not guarantee.
  */
-function when(finding: MethodResult): string {
-  if (isTemplateRow(finding)) return finding.first_seen ?? "—";
-  const ts =
+function rawTs(finding: MethodResult): string | null {
+  if (isTemplateRow(finding)) return finding.first_seen ?? null;
+  return (
     finding.event?.timestamp ??
     ("first_seen" in finding ? finding.first_seen : null) ??
-    ("window_start" in finding ? finding.window_start : null);
+    ("window_start" in finding ? finding.window_start : null) ??
+    ("timestamp" in finding ? finding.timestamp : null)
+  );
+}
+
+function when(finding: MethodResult): string {
+  const ts = rawTs(finding);
   return ts ? fmtTs(ts) : "—";
 }
 
@@ -250,17 +290,44 @@ function FindingBody({
   methodId,
   finding,
   scope,
+  onRun,
+  running,
 }: {
   methodId: MethodId;
   finding: MethodResult;
   scope: AnalysisScope;
+  onRun?: (params: Record<string, unknown>) => void;
+  running?: boolean;
 }) {
   const meta = METHODS_BY_ID[methodId];
   const evidence = EVIDENCE_CLASSES.find((c) => c.id === meta.evidenceClass);
   const template = isTemplateRow(finding);
+  const verdict = findingVerdict(finding);
+  const caption = evidenceCaption(finding);
 
   return (
     <>
+      {/* The claim, before the arithmetic. The rail row states the finding in
+          the detector's vocabulary, which is right for a list and wrong for the
+          surface an analyst opens to decide whether it is real. */}
+      <p
+        data-testid="finding-verdict"
+        className="mb-3 text-sm leading-relaxed text-[var(--color-fg-primary)]"
+      >
+        {verdict.lead}{" "}
+        <span className="rounded-sm bg-[var(--color-anomaly-dim)] px-1 font-semibold text-[var(--color-anomaly,var(--color-warning))]">
+          {verdict.highlight}
+        </span>{" "}
+        {verdict.tail}
+      </p>
+
+      {hasEvidence(finding) && (
+        <div data-testid="finding-evidence" className="mb-3">
+          <Subhead>Evidence{caption ? ` — ${caption}` : ""}</Subhead>
+          <FindingEvidence finding={finding} />
+        </div>
+      )}
+
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11px]">
         <dt className="text-[var(--color-fg-muted)]">Score</dt>
         <dd data-testid="finding-score" className="m-0 font-mono text-[var(--color-fg-primary)]">
@@ -283,8 +350,77 @@ function FindingBody({
         </dd>
       </dl>
 
-      <MethodBody methodId={methodId} />
+      <MethodBody
+        methodId={methodId}
+        onRun={onRun}
+        runLabel="Run with these"
+        running={running}
+      />
     </>
+  );
+}
+
+/**
+ * The verdict row, pinned below the scroll area.
+ *
+ * The same `FindingRowActions` the rail rows use, wrapped in the same row-state
+ * provider — a second implementation here would fork the disposition semantics,
+ * and the sheet is exactly where an analyst decides. Sticky rather than inline
+ * because the body scrolls: a verdict control that scrolls out of reach is the
+ * one control that must not.
+ */
+function FindingActions({
+  caseId,
+  timelineId,
+  methodId,
+  finding,
+  onDrillField,
+  onJumpToTime,
+}: {
+  caseId: string;
+  timelineId: string;
+  methodId: MethodId;
+  finding: MethodResult;
+  onDrillField?: (field: string, value: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string) => void;
+}) {
+  // Templates carry no event and no value key, so nothing can be dispositioned
+  // against one — the browsing row it is.
+  if (isTemplateRow(finding)) return null;
+  const verdict = findingVerdict(finding);
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2">
+      <span className="text-xs text-[var(--color-fg-muted)]">Verdict</span>
+      <div
+        data-testid="finding-actions"
+        className="flex items-center gap-1.5 text-[var(--color-fg-secondary)]"
+      >
+        <FindingRowState
+          confirmed={finding.confirmed}
+          confirmedOtherScope={finding.confirmed_other_scope}
+        >
+          <FindingRowActions
+            ts={rawTs(finding)}
+            eventId={"event_id" in finding ? finding.event_id : null}
+            field={finding.type === "value_novelty" ? finding.field : undefined}
+            value={finding.type === "value_novelty" ? String(finding.value) : undefined}
+            onDrillField={onDrillField}
+            onJumpToTime={onJumpToTime}
+            disposition={{
+              caseId,
+              timelineId,
+              detector: methodId,
+              details: finding.details,
+              sourceId: finding.event?.source_id ?? null,
+              // What a confirmed finding is stored as. The sentence on screen
+              // is the one the analyst just read and accepted, so it is also
+              // the honest thing to persist.
+              content: `${verdict.lead} ${verdict.highlight} ${verdict.tail}`,
+            }}
+          />
+        </FindingRowState>
+      </div>
+    </div>
   );
 }
 
@@ -298,6 +434,7 @@ export function InvestigateSheet({
   onRequestScopeChange,
   onTagFilter,
   onDrillField,
+  onJumpToTime,
   similarAnchor,
   onSimilarClose,
   onSelectEvent,
@@ -348,6 +485,8 @@ export function InvestigateSheet({
               methodId={rest.methodId}
               finding={rest.finding}
               scope={rest.scope}
+              onRun={rest.onRun}
+              running={rest.running}
             />
           )}
           {rest.mode === "method" && (
@@ -381,6 +520,17 @@ export function InvestigateSheet({
             />
           )}
         </div>
+
+        {rest.mode === "finding" && (
+          <FindingActions
+            caseId={caseId}
+            timelineId={timelineId}
+            methodId={rest.methodId}
+            finding={rest.finding}
+            onDrillField={onDrillField}
+            onJumpToTime={onJumpToTime}
+          />
+        )}
       </div>
     </>
   );

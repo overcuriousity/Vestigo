@@ -167,11 +167,33 @@ the same way.
 | `value_novelty`, `timestamp_order`, `log_template` | none — always offered | — |
 | `value_combo` | ≥2 categorical fields | — |
 | `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
-| `charset`, `entropy` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
-| `frequency` | span long enough to hold the bucket minimum | `analysis_gate_min_frequency_buckets` |
+| `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
+| `entropy` | none — always offered | — |
+| `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
 | `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
-| `sequence_novelty` | series field with enough distinct values for n-grams to differ | `analysis_gate_min_series_distinct` |
+| `sequence_novelty` | series field with ≥2 distinct values | `analysis_gate_min_series_distinct` |
 | `proportion_shift`, `value_distribution_drift` | a second window exists — i.e. the baseline frame with an active definition | — (reported as `needs_setup`) |
+
+Three of those rows encode a distinction worth stating, because each was once
+drawn in the wrong place:
+
+- **`charset` is gated on enum-like fields; `entropy` is not.** Charset learns
+  each field's alphabet *from that field's own values*, so when every value is
+  one of a handful of literals the alphabet already contains every character
+  present and nothing can be novel — a structural impossibility. Entropy's band
+  is a comparison, and one of five enum literals can still sit far outside it (a
+  base64 blob among four short words). Gating entropy here marked a scoreable
+  method `not_applicable`.
+- **`sequence_novelty`'s floor is two distinct series values, not "enough to
+  look interesting".** One value yields a single repeated n-gram and nothing can
+  be novel against it; two already yield 2ⁿ distinct n-grams, and a rare one
+  among them scores normally. A timeline with exactly two artifact types is an
+  ordinary two-source case.
+- **`analysis_gate_min_frequency_buckets` is a count of *seconds*, not of
+  buckets**, despite its name. The detector always splits the span into
+  `stat_frequency_buckets` (60) of them; the gate asks only that the span be
+  wide enough for a bucket to exceed a second. Both numbers appear in the
+  verdict's `reason_facts` so the arithmetic on screen is checkable.
 
 `needs_setup` is a third status, not a weaker skip: an analyst action makes the
 method applicable, so the UI offers that action rather than a "run anyway" that
@@ -190,7 +212,10 @@ Two properties are load-bearing and are enforced by tests:
 
 Every verdict carries `reason_facts`, the arithmetic behind it, so the UI can
 state "no field parses as numeric (0 of 19 sampled ≥ 90 %)" rather than a bare
-"not applicable". The plan is also fail-open: if it errors, the client marks
+"not applicable". The numbers in it must come from the measurement they
+describe: `sampled` is the count of tokens the numeric scan actually tested
+(`NumericTokenScan.examined`), not the merged inventory's length, which counts a
+capped and differently-built population. The plan is also fail-open: if it errors, the client marks
 every method applicable and runs everything.
 
 ### The analysis cache
@@ -259,12 +284,18 @@ that would otherwise keep showing it. That hash is timeline-wide rather than
 per-method, which over-invalidates slightly — the safe direction, costing a
 rescan rather than a wrong answer.
 
-Every row is derived data. Eviction is LRU per case
+Every row is derived data. Eviction is per case
 (`analysis_cache_max_rows_per_case`) and costs a rescan and nothing else, which
-is why it needs no audit trail. "Least recently *computed*" is literal: a
-refresh restamps `computed_at`, so a key in active use never ages past one
-nobody has asked for since. `DetectorRun` is unchanged and keeps its
-separate role: the accumulating forensic diary of what an analyst ran.
+is why it needs no audit trail. It is least-recently-**computed**, not
+least-recently-used, and the distinction is deliberate: a cache *hit* writes
+nothing, because `GET .../analysis/findings` is a `require_case_read` endpoint
+whose one write exception is the miss path, and restamping on every hit would
+trade the entire value of the hit path for a better eviction order. A recompute
+does restamp `computed_at`. The worst case is that a hot entry computed long ago
+is evicted ahead of a cold one computed recently — one rescan, never a wrong
+answer. Eviction runs only on an insert that actually exceeds the cap; a replace
+cannot grow the table. `DetectorRun` is unchanged and keeps its separate role:
+the accumulating forensic diary of what an analyst ran.
 
 ### Scope provenance
 
@@ -306,10 +337,27 @@ the same invention the nullable column exists to avoid. The cost is one extra
 row per legacy finding that gets re-confirmed, which is a counting artifact
 rather than a false claim.
 
+Every write path stamps it, including `POST
+.../anomalies/persist` — the endpoint behind the UI's Confirm button, and the
+only one it reaches. That is not incidental: `confirmed` is the sole kind whose
+identity includes the scope, so a persist path that dropped it would leave every
+confirmed row in a real deployment carrying `NULL`, and the column, its
+migration and the per-scope dedupe would all be unreachable code.
+
+Reading follows the same rule. `_apply_confirmations` badges a finding
+`confirmed` only when the covering verdict was reached under the comparison the
+request ran under; a verdict from a *different* one sets
+`confirmed_other_scope`, which the rail renders as a muted "confirmed
+elsewhere" marker with Confirm still live. Without that split the February
+verdict would badge the row under March and disable Confirm, making the second
+claim unreachable from the UI. A row with no recorded scope badges under every
+comparison — demoting it would silently unbadge existing evidence.
+
 Changing scope re-runs every method and reframes every verdict already
 recorded, so the UI gates it behind a confirm that names both counts. Existing
 verdicts are never discarded or rewritten — they are kept and stay tagged with
-the scope they were reached under.
+the scope they were reached under, and findings covered only by an
+out-of-scope verdict are marked so they can be re-examined.
 
 ### Baseline definitions, suspect windows, and the normality model
 

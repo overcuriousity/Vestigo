@@ -169,7 +169,13 @@ describe("useDisposition optimistic filtering", () => {
       CASE,
       "s1",
       "ev1",
-      expect.objectContaining({ detector: "charset", content: "confirmed finding" }),
+      expect.objectContaining({
+        detector: "charset",
+        content: "confirmed finding",
+        // `confirmed` is the only kind whose identity includes the scope, so
+        // dropping it here would collapse one claim per baseline into one row.
+        analysis_scope: { frame: "self", baseline_id: null },
+      }),
     );
     // Row stays, optimistically flagged confirmed — the durable badge state.
     const data = qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.charset);

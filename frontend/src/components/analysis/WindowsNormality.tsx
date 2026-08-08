@@ -352,7 +352,7 @@ const KIND_META: Record<
   },
   routine: {
     heading: "Routine",
-    hint: "Recurring expected patterns (Patterns tab) — collapsible in the event grid.",
+    hint: "Recurring expected patterns (Tools → Explore) — collapsible in the event grid.",
     removeTitle: "Remove — its events reappear in the grid",
   },
 };

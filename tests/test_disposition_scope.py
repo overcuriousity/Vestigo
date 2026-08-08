@@ -252,3 +252,43 @@ def test_bulk_does_not_backfill_either(client, seeded):
     assert r.status_code == 200, r.text
     assert r.json()["dispositions"][0]["id"] != before["id"]
     assert r.json()["dispositions"][0]["analysis_scope"] == SCOPE
+
+
+def _persist(client, case_id, analysis_scope, event_id="e1"):
+    """Confirm through the endpoint the UI's Confirm button actually calls."""
+    body = {
+        "detector": "value_novelty",
+        "content": "Manually confirmed finding",
+        "details": {},
+    }
+    if analysis_scope is not None:
+        body["analysis_scope"] = analysis_scope
+    r = client.post(
+        f"/api/cases/{case_id}/sources/s1/events/{event_id}/anomalies/persist", json=body
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["disposition"]
+
+
+def test_the_confirm_button_records_the_scope_it_was_pressed_under(client, seeded):
+    """The persist endpoint is the *only* path the UI's Confirm button reaches.
+
+    Scope provenance is a ``confirmed``-only feature — it is the one kind whose
+    ``disposition_identity`` includes the scope. So a persist path that dropped
+    it would make every confirmed row in a real deployment carry ``NULL``, and
+    the whole column, its migration and the per-scope dedupe would be dead code
+    that no test on the dispositions router could catch.
+    """
+    case_id, _timeline_id = seeded
+    assert _persist(client, case_id, SCOPE)["analysis_scope"] == SCOPE
+
+
+def test_confirming_one_finding_under_two_baselines_makes_two_claims(client, seeded):
+    """Escalating against February and again against March are two claims."""
+    case_id, _timeline_id = seeded
+    other = {**SCOPE, "baseline_id": "bl-2", "baseline_name": "Mar 1 – Mar 2"}
+    first = _persist(client, case_id, SCOPE)
+    second = _persist(client, case_id, other)
+    assert first["id"] != second["id"]
+    # And repeating one is still idempotent, so a double-click is not a claim.
+    assert _persist(client, case_id, SCOPE)["id"] == first["id"]

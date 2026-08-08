@@ -39,8 +39,7 @@ export function useScopeChange(caseId: string, timelineId: string) {
   const affectedVerdicts = useMemo(() => {
     const rows = dispositions?.dispositions ?? [];
     return rows.filter((d) => {
-      const recorded = (d as { analysis_scope?: { frame?: string; baseline_id?: string | null } })
-        .analysis_scope;
+      const recorded = d.analysis_scope;
       if (!recorded) return false;
       return (
         recorded.frame === scope.frame &&

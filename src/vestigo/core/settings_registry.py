@@ -537,19 +537,19 @@ _SPECS: tuple[SettingSpec, ...] = (
         "analysis_gate_max_enum_distinct",
         "detectors",
         "Gate: enum-like distinct ceiling",
-        "A field with at most this many distinct values counts as enum-like, so charset novelty and entropy have no value shape to learn from it.",
+        "A field with at most this many distinct values counts as enum-like: every value is drawn from the alphabet learned from those same values, so charset novelty cannot fire. Entropy is not gated on this — its band is a comparison one enum literal can still sit outside.",
     ),
     SettingSpec(
         "analysis_gate_min_series_distinct",
         "detectors",
         "Gate: minimum series values",
-        "Distinct values the series field needs before consecutive n-grams can differ from each other.",
+        "Distinct values the series field needs before two n-grams can differ at all. One value yields a single repeated n-gram; two already yield 2^n.",
     ),
     SettingSpec(
         "analysis_gate_min_frequency_buckets",
         "detectors",
-        "Gate: minimum frequency buckets",
-        "Buckets a timeline's span must cover before a count spike is distinguishable from the bucket holding it.",
+        "Gate: minimum frequency span (seconds)",
+        "Seconds of span a timeline must cover before a count spike is distinguishable from the bucket holding it. Compare with Frequency buckets, which is how many buckets that span is split into.",
     ),
     SettingSpec(
         "analysis_gate_min_interval_periods",

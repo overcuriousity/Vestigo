@@ -34,6 +34,7 @@ export function InvestigateSheetHost({
   onRunMethod,
   onTagFilter,
   onDrillField,
+  onJumpToTime,
   similarAnchor,
   onSimilarClose,
   onSelectEvent,
@@ -47,8 +48,10 @@ export function InvestigateSheetHost({
   /** Open the method's sheet already running it. */
   onRunMethod: (method: MethodId) => void;
   onTagFilter?: (tag: string) => void;
-  /** Drill a template into the grid's filters, from the Tools sheet. */
+  /** Drill into the grid's filters — a template in Tools, a value in finding mode. */
   onDrillField?: (field: string, value: string) => void;
+  /** Jump the grid to a finding's time, from the finding sheet's verdict row. */
+  onJumpToTime?: (ts: string, eventId?: string) => void;
   similarAnchor?: Event | null;
   onSimilarClose?: () => void;
   onSelectEvent?: (event: Event) => void;
@@ -61,6 +64,13 @@ export function InvestigateSheetHost({
   // it is: the Tools sheet's Run anyway / Retry.
   const [runParams, setRunParams] = useState<Record<string, unknown> | null>(null);
 
+  // Set when the analyst submits the knobs from *finding* mode ("Run with
+  // these"). The question they just asked is a method-wide one — "what does
+  // this method find at these settings" — so the sheet answers it in method
+  // mode rather than re-rendering one finding that the new parameters may no
+  // longer produce.
+  const [ranFromFinding, setRanFromFinding] = useState(false);
+
   // Reset whenever the sheet changes what it is showing, so the knobs typed for
   // one view never silently become the request for the next. `kind` is part of
   // that: running a method with custom parameters and then clicking one of that
@@ -72,6 +82,7 @@ export function InvestigateSheetHost({
   const autorun = sheet.kind === "method" && Boolean(sheet.autorun);
   useEffect(() => {
     setRunParams(autorun ? {} : null);
+    setRanFromFinding(false);
   }, [sheet.kind, methodKey, autorun]);
 
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
@@ -83,7 +94,7 @@ export function InvestigateSheetHost({
 
   return (
     <>
-      {sheet.kind === "finding" && finding && findings.data ? (
+      {sheet.kind === "finding" && !ranFromFinding && finding && findings.data ? (
         <InvestigateSheet
           caseId={caseId}
           timelineId={timelineId}
@@ -93,6 +104,13 @@ export function InvestigateSheetHost({
           methodId={sheet.method}
           finding={finding}
           scope={findings.data.scope}
+          onRun={(params) => {
+            setRunParams(params);
+            setRanFromFinding(true);
+          }}
+          running={findings.isFetching}
+          onDrillField={onDrillField}
+          onJumpToTime={onJumpToTime}
         />
       ) : sheet.kind === "finding" ? (
         // The rail addresses a finding as (method, rank), so the sheet can open

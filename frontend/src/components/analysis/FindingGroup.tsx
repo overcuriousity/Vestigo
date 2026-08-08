@@ -44,6 +44,18 @@ interface Props {
   onComboDrill?: (pairs: [string, string][]) => void;
   /** Frequency findings drill the anomalous window *and* the series value. */
   onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
+  /**
+   * Rows this group holds that no sweep method produces — today, Sigma hits in
+   * the Named-techniques group.
+   *
+   * A slot rather than a thirteenth entry in `METHODS`: that registry is pinned
+   * by tests to exactly the twelve ids `db/analysis_plan.py` plans for and the
+   * twelve param sets `api/routers/analysis.py` accepts, and Sigma is neither
+   * planned nor run through the findings endpoint.
+   */
+  extraRows?: React.ReactNode;
+  /** How many rows `extraRows` renders, for the group's count. */
+  extraCount?: number;
 }
 
 /** Exported for the method sheet's own results list — see `ScoredRow`. */
@@ -128,6 +140,7 @@ export function ScoredRow({
     <FindingShell
       dismissed={item.raw.dismissed}
       confirmed={item.raw.confirmed}
+      confirmedOtherScope={item.raw.confirmed_other_scope}
       details={item.raw.details}
       onClick={onSelect}
       actions={
@@ -210,6 +223,8 @@ export function FindingGroup({
   onDrillField,
   onComboDrill,
   onFrequencyDrill,
+  extraRows,
+  extraCount = 0,
 }: Props) {
   const scored = methods.filter((m) => m.id !== "log_template");
   const templates = methods.find((m) => m.id === "log_template");
@@ -231,7 +246,7 @@ export function FindingGroup({
     isTemplateRow,
   );
 
-  if (items.length === 0 && templateRows.length === 0) return null;
+  if (items.length === 0 && templateRows.length === 0 && extraCount === 0) return null;
 
   return (
     <section className="mt-3 first:mt-0">
@@ -242,10 +257,11 @@ export function FindingGroup({
         {evidenceClass.label}
         <span className="font-normal normal-case tracking-normal">— {evidenceClass.note}</span>
         <span className="ml-auto font-mono text-[var(--color-fg-disabled)]">
-          {items.length + templateRows.length}
+          {items.length + templateRows.length + extraCount}
         </span>
       </h4>
       <div className="space-y-1.5">
+        {extraRows}
         {items.map((item, i) => (
           <ScoredRow
             key={`${item.detectorId}:${item.rank}:${i}`}

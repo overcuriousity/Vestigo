@@ -1565,6 +1565,7 @@ export function ExplorerPage() {
                         onAnomalyMarkers={setAnomalyMarkers}
                         onComboDrill={handleComboDrill}
                         onFrequencyDrill={handleFrequencyDrill}
+                        onTagFilter={handleTagDrill}
                       />
                     </div>
                   </div>
@@ -1586,6 +1587,7 @@ export function ExplorerPage() {
                     }
                     onTagFilter={handleTagDrill}
                     onDrillField={handleDrillField}
+                    onJumpToTime={handleJumpToTime}
                     similarAnchor={similarAnchor}
                     onSimilarClose={() => setSimilarAnchor(null)}
                     onSelectEvent={(ev) => handleExpandEvent(ev)}

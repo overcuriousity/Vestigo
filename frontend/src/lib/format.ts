@@ -108,7 +108,7 @@ export function tagResultLabel(
 
 /** Friendly display label for an anomaly-detector field token (e.g.
  * "attr:user_agent" -> "user_agent", "parser_name" -> "Parser"). Shared
- * between AnomalyFieldPicker and ValueNoveltyView so the same token reads
+ * across every surface that names a field, so the same token reads
  * identically wherever it's shown. */
 export function anomalyFieldLabel(token: string): string {
   if (token.startsWith("attr:")) return token.slice(5);

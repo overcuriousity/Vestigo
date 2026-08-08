@@ -190,9 +190,11 @@ def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(demo, ch_st
         f"case_id = {{cid:String}} AND source_id IN ({in_clause})",
         {"cid": case_id, **params},
     )
+    numeric = numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio)
     inputs = PlanInputs(
         inventory=inventory,
-        numeric_tokens=numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio),
+        numeric_tokens=numeric.tokens,
+        numeric_tokens_examined=numeric.examined,
         series_distinct=series_distinct_from_stats(
             stats, "artifact", next((d for token, d, _c in inventory if token == "artifact"), 0)
         ),

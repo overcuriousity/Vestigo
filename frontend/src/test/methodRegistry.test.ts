@@ -74,3 +74,22 @@ describe("method registry", () => {
     expect(Object.keys(METHODS_BY_ID)).toHaveLength(METHODS.length);
   });
 });
+
+describe("query shapes", () => {
+  it("gives every method one", () => {
+    // The sheet renders this under "Query shape" for every method it can open.
+    // A missing one renders an empty <pre> under a heading promising a query.
+    for (const m of METHODS) {
+      expect(m.querySketch.trim().length, `${m.id} has no querySketch`).toBeGreaterThan(0);
+    }
+  });
+
+  it("names the events table and never claims to be a transcript", () => {
+    // It is a teaching aid. The detectors do not return compiled SQL (Sigma
+    // does), so a sketch that read like a captured statement would assert
+    // something no code can be pointed at.
+    for (const m of METHODS) {
+      expect(m.querySketch, `${m.id}`).toMatch(/\bevents\b/);
+    }
+  });
+});

@@ -1,10 +1,84 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-08 (session 165 — PR #262 third review, plus a test suite that now
-refuses to start without ClickHouse instead of failing slowly and vaguely).
+Last updated: 2026-08-08 (session 166 — PR #262 fourth review: scope provenance made real,
+two gate predicates corrected, and the finding sheet built out to what the design round chose).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 166 — 2026-08-08: PR #262 fourth review, and the sheet the design round asked for
+
+**Scope provenance was inert.** `confirmed` is the one disposition kind whose
+`disposition_identity` includes `analysis_scope` — and it was the one kind whose write path
+never supplied one. `useDisposition`'s confirmed branch returns early through
+`anomaliesApi.persistFinding`, and neither that client nor
+`PersistAnomalyFindingRequest` carried the field, so every confirmed row in a real deployment
+landed with `analysis_scope = NULL`. Everything downstream followed: the per-scope dedupe arm
+always compared `None == None`, migration 0026's column recorded nothing, and the scope-change
+dialog's verdict count — whose entire purpose is to warn about confirmed verdicts — could never
+be non-zero. Both halves now stamp it, and `tests/test_disposition_scope.py` covers the endpoint
+the Confirm button actually reaches rather than only the dispositions router.
+
+Reading was the mirror defect. `_apply_confirmations` matched by `event_id` alone, so a verdict
+reached against February badged the row under March and disabled Confirm — making the second,
+scope-distinct claim the dedupe exists to allow unreachable from the UI. It now takes the
+request's scope: same-scope badges `confirmed`, other-scope sets `confirmed_other_scope` and the
+rail shows a muted "confirmed elsewhere" with Confirm live. That also makes good on a promise
+`ScopeChangeDialog` had been making in prose and nothing implemented. An unstamped row still
+badges under every scope — demoting it would silently unbadge existing evidence to assert a
+comparison nobody recorded.
+
+**Two gate predicates were gating on "unlikely", not "impossible".** `analysis_plan.py`'s
+contract is that `not_applicable` means the method structurally *cannot* score, because a wrong
+precondition fails silently. `sequence_novelty` required three distinct series values; two yield
+2³ distinct trigrams and a rare one scores fine, so every two-artifact-type timeline — an
+ordinary two-source case — quietly lost n-gram novelty. And `entropy` shared `charset`'s
+enum-like gate, which only holds for charset: its alphabet is learned from the field's own
+values, so nothing can be novel, while an entropy band is a comparison one of five enum literals
+can sit far outside. Floor lowered to 2, entropy ungated, charset unchanged.
+
+**Counts that were not the counts.** `log_template` returned `len(templates)` — already capped by
+`limit` — where every other method reports the pre-cap total, so 400 distinct templates read as
+exactly 50 with nothing saying so. `numeric_range`'s skip reason quoted `len(inputs.inventory)`
+as its denominator while the numerator came from a different, uncapped scan; `reason_facts`
+exists to be checked, so `numeric_tokens_from_stats` now returns the population it tested.
+
+**Smaller, same session:** the plan's span probe now uses the offset-corrected timestamp every
+detector buckets on, so the gate and the frequency detector cannot disagree about a clock-skewed
+timeline; the frequency gate's seconds-vs-buckets confusion is fixed in the reason text and the
+setting help rather than by a breaking rename; `_run_log_templates` stopped re-resolving a
+timeline scope its caller had already resolved; and `analysis_cache` eviction now says
+least-recently-*computed* (which is what it is), skips the pointless pass on replaces, and
+guards the `NOT IN` delete behind a row count. Eviction stays non-LRU on purpose — writing on
+every cache *hit* would turn `require_case_read`'s one bounded write exception into a
+per-request one, to buy an eviction order whose worst case is a single rescan.
+
+**And the finding sheet became the thing the design round chose.** Comparing the shipped
+Investigate surface against the mockup the redesign was picked from turned up two gaps that were
+not review findings but were not decisions either. The rail's strongest group, "Named techniques
+— a rule author named this", was structurally always empty: no method carries
+`evidenceClass: "named"` and Sigma hits never joined the stream, which is also why the mockup's
+"Known-bad" preset shipped as "Evidence integrity". Sigma's latest completed run now feeds that
+group through a `FindingGroup.extraRows` slot — a row is a rule and its match count, since that
+is what a run records — and Known-bad is back.
+
+The sheet itself was a four-row definition list, while the spec, the mockup and the file's own
+docstring all described a verdict sentence, an evidence figure, the query and a verdict action
+row. All four exist now: `lib/finding-verdict.ts` states each finding as a claim built only from
+the payload's own numbers, `FindingEvidence.tsx` draws the comparison it rests on, `MethodMeta`
+gained a `querySketch`, and a sticky footer reuses `FindingRowActions` so the verdict is made
+where the decision is made. The finding-mode knobs — previously a form with no submit — got
+"Run with these".
+
+Two departures from the mockup are deliberate and worth recording. The evidence figure draws
+**nothing** for rare values, value combos and templates: their payloads carry no second number,
+and the mockup's evenly-spaced cadence chart was plotted from per-event timestamps the API does
+not return. A plausible chart assembled from unmeasured numbers is worse than no chart here. And
+the query block is "Query shape", explicitly not a transcript — the detectors, unlike the Sigma
+runner, do not return compiled SQL, so labelling it "the query it ran" would be a claim no code
+backs.
+
+Full finding text: [`archive/PR262_REVIEW_FINDINGS.md`](./archive/PR262_REVIEW_FINDINGS.md).
 
 ## Session 165 — 2026-08-08: PR #262 third review
 

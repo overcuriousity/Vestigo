@@ -34,6 +34,7 @@ def stub_inputs(monkeypatch):
         base = {
             "inventory": [("artifact", 5, 1000), ("message", 900, 1000)],
             "numeric_tokens": [],
+            "numeric_tokens_examined": 2,
             "series_distinct": 5,
             "events_total": 1000,
             "span_seconds": 86_400.0,
@@ -42,7 +43,7 @@ def stub_inputs(monkeypatch):
         }
         base.update(over)
 
-        async def _fake(case_id, timeline_id, source_ids, frame, baseline_id, field_mappings):
+        async def _fake(case_id, source_ids, frame, baseline_id, field_mappings, source_offsets):
             return PlanInputs(**base)
 
         monkeypatch.setattr(analysis_router, "_collect_plan_inputs", _fake)

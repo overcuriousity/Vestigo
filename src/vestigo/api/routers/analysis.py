@@ -37,6 +37,7 @@ from vestigo.api.routers.events import (
 from vestigo.core.config import get_settings
 from vestigo.db._buckets import query_timestamp_range
 from vestigo.db._dt import ensure_utc
+from vestigo.db._offsets import bind_offset_params, effective_ts_sql
 from vestigo.db.analysis_cache import cache_get, cache_put, enrichment_generation, fingerprint
 from vestigo.db.analysis_cache import detector_settings as detector_settings_material
 from vestigo.db.analysis_plan import (
@@ -83,11 +84,11 @@ def _validate_scope_args(frame: str, baseline_id: str | None) -> None:
 
 async def _collect_plan_inputs(
     case_id: str,
-    timeline_id: str,
     source_ids: list[str],
     frame: str,
     baseline_id: str | None,
     field_mappings: dict[str, list[str]] | None,
+    source_offsets: dict[str, int] | None,
 ) -> PlanInputs:
     """Assemble the gate's snapshot from already-cached data plus one probe.
 
@@ -96,6 +97,12 @@ async def _collect_plan_inputs(
     cost and warms the cache for them too. The timestamp probe is a
     ``min``/``max`` over a sorted column — cheap enough not to need its own
     cache layer.
+
+    ``source_offsets`` matters for the same reason ``field_mappings`` does: the
+    span this probe measures is what gates the frequency method, and every
+    detector buckets the *offset-corrected* timestamp. Probing the raw column
+    would let the gate and the detector disagree about the same data whenever a
+    source carries a declared clock-skew correction.
     """
     cfg = get_settings()
     store = get_store()
@@ -105,6 +112,7 @@ async def _collect_plan_inputs(
         return PlanInputs(
             inventory=[],
             numeric_tokens=[],
+            numeric_tokens_examined=0,
             series_distinct=0,
             events_total=0,
             span_seconds=0.0,
@@ -126,18 +134,23 @@ async def _collect_plan_inputs(
     # Offloaded: this is a blocking ClickHouse round-trip in an async handler,
     # and the rail fires a dozen findings requests immediately after the plan
     # resolves — holding the event loop here stalls all of them.
+    probe_params: dict[str, Any] = {"case_id": case_id, "source_ids": source_ids}
+    bind_offset_params(source_offsets, probe_params)
     min_ts, max_ts = await run_in_threadpool(
         query_timestamp_range,
         svc.ch.client,
         svc.ch.database,
         "case_id = {case_id:String} AND source_id IN {source_ids:Array(String)}",
-        {"case_id": case_id, "source_ids": source_ids},
+        probe_params,
+        effective_ts_sql(source_offsets),
     )
     span_seconds = (max_ts - min_ts).total_seconds() if min_ts and max_ts else 0.0
 
+    numeric = numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio)
     return PlanInputs(
         inventory=inventory,
-        numeric_tokens=numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio),
+        numeric_tokens=numeric.tokens,
+        numeric_tokens_examined=numeric.examined,
         series_distinct=series_distinct_from_stats(
             stats,
             DEFAULT_SERIES_FIELD,
@@ -198,12 +211,10 @@ async def get_analysis_plan(
     findings endpoint regardless of its verdict.
     """
     _validate_scope_args(frame, baseline_id)
-    source_ids, field_mappings, _source_offsets = await _resolve_timeline_scope(
-        case_id, timeline_id
-    )
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     scope, _config_hash = await _scope_object(case_id, timeline_id, frame, baseline_id)
     inputs = await _collect_plan_inputs(
-        case_id, timeline_id, source_ids, frame, baseline_id, field_mappings
+        case_id, source_ids, frame, baseline_id, field_mappings, source_offsets
     )
     plans = build_plan(inputs, get_settings())
     return {
@@ -380,6 +391,8 @@ async def _run_log_templates(
     params: dict[str, Any],
     limit: int,
     baseline_id: str | None = None,
+    field_mappings: dict[str, list[str]] | None = None,
+    source_offsets: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Run the log-template browser and shape its result like a findings response.
 
@@ -391,12 +404,15 @@ async def _run_log_templates(
     so the baseline comes from the request's *scope* rather than from a params
     key. Carrying it in params too would let a client ask for templates new
     against one baseline while the response claimed the scope of another.
+
+    ``source_ids``, ``field_mappings`` and ``source_offsets`` all come from the
+    caller's single ``_resolve_timeline_scope``. Resolving them again here cost
+    a second round-trip and produced a second source list that only happened to
+    equal the one actually scanned — a divergence a later change to either
+    resolution point would introduce silently.
     """
     store = get_store()
     svc = _get_stat_anomaly_service()
-    _source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(
-        case_id, timeline_id
-    )
 
     baseline_end = None
     only_new = bool(params.get("only_new"))
@@ -430,7 +446,11 @@ async def _run_log_templates(
     return {
         "status": payload.get("status", "ok"),
         "results": templates,
-        "total_findings": len(templates),
+        # The count *before* the LIMIT, exactly as every scored method reports
+        # `total_findings`. `len(templates)` is already capped, so a timeline
+        # with 400 distinct templates would report 50 and the rail's "showing N
+        # of M" would claim nothing was cut.
+        "total_findings": payload.get("total_templates", len(templates)),
         "warnings": payload.get("warnings", []),
     }
 
@@ -459,6 +479,7 @@ async def _apply_dispositions(
     method: str,
     payload: dict[str, Any],
     include_dismissed: bool,
+    analysis_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Filter dismissed findings and badge confirmed ones, as ``/anomalies`` does.
 
@@ -471,6 +492,11 @@ async def _apply_dispositions(
     ``details.allowlist_*``, so both appliers are no-ops there. That is the
     correct outcome rather than an oversight: a template is a browsing row, and
     nothing records a verdict against one.
+
+    ``analysis_scope`` is the comparison this request ran under. Confirmations
+    are matched against it so a verdict reached under a different baseline is
+    marked as such rather than badged as this one — see
+    :func:`_apply_confirmations`.
     """
     if not payload.get("results"):
         payload["dismissed_count"] = 0
@@ -488,7 +514,7 @@ async def _apply_dispositions(
     payload = _apply_dismissals(
         payload, [d for d in rows if d.kind == "dismissed"], include_dismissed
     )
-    return _apply_confirmations(payload, [d for d in rows if d.kind == "confirmed"])
+    return _apply_confirmations(payload, [d for d in rows if d.kind == "confirmed"], analysis_scope)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/analysis/findings")
@@ -571,14 +597,27 @@ async def get_analysis_findings(
     if cached is not None:
         return {
             **await _apply_dispositions(
-                case_id, timeline_id, source_ids, method, dict(cached), include_dismissed
+                case_id,
+                timeline_id,
+                source_ids,
+                method,
+                dict(cached),
+                include_dismissed,
+                analysis_scope=scope,
             ),
             "cache": "hit",
         }
 
     if method == "log_template":
         body = await _run_log_templates(
-            case_id, timeline_id, source_ids, kwargs, limit, baseline_id=baseline_id
+            case_id,
+            timeline_id,
+            source_ids,
+            kwargs,
+            limit,
+            baseline_id=baseline_id,
+            field_mappings=field_mappings,
+            source_offsets=source_offsets,
         )
     else:
         result, resolution = await _run_stat_detector(
@@ -616,7 +655,13 @@ async def get_analysis_findings(
     await cache_put(store, case_id, key, payload, cfg.analysis_cache_max_rows_per_case)
     return {
         **await _apply_dispositions(
-            case_id, timeline_id, source_ids, method, dict(payload), include_dismissed
+            case_id,
+            timeline_id,
+            source_ids,
+            method,
+            dict(payload),
+            include_dismissed,
+            analysis_scope=scope,
         ),
         "cache": "miss",
     }

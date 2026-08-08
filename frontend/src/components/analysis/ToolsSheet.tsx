@@ -174,7 +174,7 @@ export function ToolsSheet({
             </div>
           ) : (
             <p className="mb-3 text-[11px] text-[var(--color-fg-muted)]">
-              Click the search icon on any event row to find events like it.
+              Expand an event in the grid, then use the search icon in its detail panel to find events like it.
             </p>
           ))}
         <p className="mb-2 text-[11px] text-[var(--color-fg-muted)]">

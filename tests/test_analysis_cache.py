@@ -190,3 +190,28 @@ async def test_refreshing_a_row_makes_it_the_newest(migrated):
     await cache_put(migrated, "case-1", "new", {"n": 3}, max_rows=2)
     assert await cache_get(migrated, "case-1", "old") == {"n": 2}
     assert await cache_get(migrated, "case-1", "mid") is None
+
+
+@pytest.mark.asyncio
+async def test_a_replace_at_the_cap_evicts_nothing(migrated):
+    """Replacing a row cannot push the case over the cap, so it must not evict.
+
+    The eviction pass used to run on every write, including replaces that left
+    the row count untouched — materializing up to `max_rows` ids and issuing a
+    `NOT IN` over them to discover there was nothing to do.
+    """
+    for i in range(3):
+        await cache_put(migrated, "case-1", f"key-{i}", {"n": i}, max_rows=3)
+    await cache_put(migrated, "case-1", "key-0", {"n": 99}, max_rows=3)
+    assert await cache_get(migrated, "case-1", "key-0") == {"n": 99}
+    for i in (1, 2):
+        assert await cache_get(migrated, "case-1", f"key-{i}") == {"n": i}
+
+
+@pytest.mark.asyncio
+async def test_an_insert_exactly_at_the_cap_evicts_nothing(migrated):
+    """Boundary: the cap is a ceiling to reach, not one to fall below."""
+    for i in range(3):
+        await cache_put(migrated, "case-1", f"key-{i}", {"n": i}, max_rows=3)
+    for i in range(3):
+        assert await cache_get(migrated, "case-1", f"key-{i}") == {"n": i}

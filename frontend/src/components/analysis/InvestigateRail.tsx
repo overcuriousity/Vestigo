@@ -21,8 +21,10 @@ import { AlertTriangle, Eye, EyeOff } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
 import { useIncludeDismissed, useStreamingSweep } from "@/hooks/useMethodFindings";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
+import { useSigmaFindings } from "@/hooks/useSigmaFindings";
 import { ScopeStrip } from "./ScopeStrip";
 import { FindingGroup } from "./FindingGroup";
+import { SigmaFindingRows } from "./SigmaFindings";
 import { AnalysisEmptyState } from "./detector-shared";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { DETECTORS } from "./detector-registry";
@@ -39,24 +41,42 @@ const DETECTOR_BY_API_KEY = Object.fromEntries(DETECTORS.map((d) => [d.detector,
  * stream rather than as containers. Containers would put a finding somewhere
  * you have to remember to look; a filter never hides anything by default.
  */
-const PRESETS: { id: string; label: string; methods: MethodId[] | null }[] = [
-  { id: "all", label: "Everything", methods: null },
+const PRESETS: {
+  id: string;
+  label: string;
+  methods: MethodId[] | null;
+  /** Whether Sigma hits — the only non-method findings — survive this filter. */
+  sigma: boolean;
+}[] = [
+  { id: "all", label: "Everything", methods: null, sigma: true },
+  // The one preset that is *only* Sigma. It shipped as "Evidence integrity"
+  // because nothing could ever fill the Named group, so a Known-bad pill would
+  // have filtered to a guaranteed-empty list.
+  { id: "known", label: "Known-bad", methods: [], sigma: true },
   {
     id: "changed",
     label: "Changed vs. baseline",
     methods: ["proportion_shift", "value_distribution_drift", "frequency"],
+    sigma: false,
   },
   {
     id: "repeats",
     label: "Repeating",
     methods: ["interval_periodicity", "sequence_novelty", "log_template"],
+    sigma: false,
   },
   {
     id: "unusual",
     label: "Unusual values",
     methods: ["value_novelty", "value_combo", "charset", "entropy"],
+    sigma: false,
   },
-  { id: "integrity", label: "Evidence integrity", methods: ["timestamp_order", "numeric_range"] },
+  {
+    id: "integrity",
+    label: "Evidence integrity",
+    methods: ["timestamp_order", "numeric_range"],
+    sigma: false,
+  },
 ];
 
 /**
@@ -104,6 +124,8 @@ interface Props {
   onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
   onComboDrill?: (pairs: [string, string][]) => void;
   onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
+  /** Filter the grid to a Sigma rule's hits, by its `sigma: <title>` tag. */
+  onTagFilter?: (tag: string) => void;
 }
 
 export function InvestigateRail({
@@ -117,11 +139,16 @@ export function InvestigateRail({
   onAnomalyMarkers,
   onComboDrill,
   onFrequencyDrill,
+  onTagFilter,
 }: Props) {
   const { byMethod, scope, done, total, planLoading } = useStreamingSweep(caseId, timelineId);
   const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   const { includeDismissed, setIncludeDismissed } = useIncludeDismissed();
   const [preset, setPreset] = useState("all");
+  // The Named-techniques group's only source. Empty until Sigma is
+  // configured *and* a run has completed on this timeline — a rule that has
+  // not been run is not a finding about anything.
+  const { findings: sigmaFindings } = useSigmaFindings(caseId, timelineId);
 
   const active = PRESETS.find((p) => p.id === preset) ?? PRESETS[0];
   const visible = useMemo(
@@ -179,7 +206,9 @@ export function InvestigateRail({
 
   const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);
-  const anyFindings = visible.some((m) => byMethod[m.id].findings.length > 0);
+  const showSigma = active.sigma && sigmaFindings.length > 0;
+  const anyFindings =
+    visible.some((m) => byMethod[m.id].findings.length > 0) || showSigma;
 
   // Said before anything else, and instead of everything else: a findings list
   // over a timeline with no events is not "clear", it is unanswered.
@@ -285,6 +314,12 @@ export function InvestigateRail({
           onDrillField={onDrillField}
           onComboDrill={onComboDrill}
           onFrequencyDrill={onFrequencyDrill}
+          extraRows={
+            cls.id === "named" && showSigma ? (
+              <SigmaFindingRows findings={sigmaFindings} onTagFilter={onTagFilter} />
+            ) : null
+          }
+          extraCount={cls.id === "named" && showSigma ? sigmaFindings.length : 0}
         />
       ))}
 
