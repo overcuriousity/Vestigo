@@ -66,17 +66,47 @@ def test_numeric_range_gated_off_without_numeric_fields(cfg):
     assert plan.reason_facts == {"numeric_fields": 0, "sampled": 19, "threshold": 0.9}
 
 
+#: Every method whose detector returns ``insufficient_data`` the moment its
+#: window pair is missing — the two explicit two-window tests plus the two
+#: temporal-only ones, whose data-shape gates only get to speak once a
+#: baseline exists.
+TWO_WINDOW_METHODS = (
+    "proportion_shift",
+    "value_distribution_drift",
+    "interval_periodicity",
+    "sequence_novelty",
+)
+
+
 def test_two_window_methods_need_setup_in_self_frame(cfg):
     plans = _by_id(build_plan(_inputs(frame="self", has_active_baseline=False), cfg))
-    for method in ("proportion_shift", "value_distribution_drift"):
+    for method in TWO_WINDOW_METHODS:
         assert plans[method].status == "needs_setup"
         assert "baseline" in plans[method].reason
 
 
 def test_two_window_methods_applicable_once_a_baseline_is_active(cfg):
     plans = _by_id(build_plan(_inputs(frame="baseline", has_active_baseline=True), cfg))
-    assert plans["proportion_shift"].status == "applicable"
-    assert plans["value_distribution_drift"].status == "applicable"
+    for method in TWO_WINDOW_METHODS:
+        assert plans[method].status == "applicable"
+
+
+def test_temporal_only_methods_prefer_setup_over_their_shape_gate(cfg):
+    """A missing baseline outranks the data-shape reason, and is recoverable.
+
+    ``sequence_novelty`` on a single-valued series field cannot produce a
+    finding for two independent reasons. The one the analyst can act on is the
+    one worth reporting, and reporting the other as ``not_applicable`` would
+    hide the "Set a baseline" affordance behind a dead end.
+    """
+    plans = _by_id(
+        build_plan(
+            _inputs(frame="self", has_active_baseline=False, series_distinct=1, events_total=2),
+            cfg,
+        )
+    )
+    assert plans["sequence_novelty"].status == "needs_setup"
+    assert plans["interval_periodicity"].status == "needs_setup"
 
 
 def test_charset_gated_off_on_enum_only_fields_but_entropy_is_not(cfg):

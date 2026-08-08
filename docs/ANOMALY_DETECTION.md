@@ -170,8 +170,8 @@ the same way.
 | `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
 | `entropy` | none — always offered | — |
 | `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
-| `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
-| `sequence_novelty` | series field with ≥2 distinct values | `analysis_gate_min_series_distinct` |
+| `interval_periodicity` | a second window, then enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` (window: `needs_setup`) |
+| `sequence_novelty` | a second window, then a series field with ≥2 distinct values | `analysis_gate_min_series_distinct` (window: `needs_setup`) |
 | `proportion_shift`, `value_distribution_drift` | a second window exists — i.e. the baseline frame with an active definition | — (reported as `needs_setup`) |
 
 Three of those rows encode a distinction worth stating, because each was once
@@ -194,6 +194,14 @@ drawn in the wrong place:
   `stat_frequency_buckets` (60) of them; the gate asks only that the span be
   wide enough for a bucket to exceed a second. Both numbers appear in the
   verdict's `reason_facts` so the arithmetic on screen is checkable.
+
+All four temporal methods share the window precondition, and it is checked
+*before* their data-shape gates. `interval_periodicity` and `sequence_novelty`
+are temporal-only — both return `insufficient_data` the moment their window
+pair is missing, exactly as the two drift tests do — so gating them on shape
+alone counted them applicable in the self frame, ran them, and rendered a dash
+where the "Set a baseline" affordance belongs. When both a missing window and a
+shape problem apply, the window wins: it is the reason the analyst can act on.
 
 `needs_setup` is a third status, not a weaker skip: an analyst action makes the
 method applicable, so the UI offers that action rather than a "run anyway" that

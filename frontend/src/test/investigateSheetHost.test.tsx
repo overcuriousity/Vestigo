@@ -26,7 +26,17 @@ vi.mock("@/hooks/useMethodFindings", () => ({
     opts: { enabled: boolean; params?: Record<string, unknown> },
   ) => {
     calls.current.push({ method, ...opts });
-    return { data: undefined, isFetching: false, isError: false };
+    return {
+      // Enough of a result set for finding mode to render — the rail addresses
+      // a rank, and the host falls back to method mode when that rank is
+      // missing, which would make the rank-change case untestable.
+      data: {
+        results: [{ rank: 0 }, { rank: 1 }, { rank: 2 }],
+        scope: { frame: "self", baseline_id: null },
+      },
+      isFetching: false,
+      isError: false,
+    };
   },
   METHOD_LIMIT: 50,
 }));
@@ -108,6 +118,39 @@ describe("InvestigateSheetHost run parameters", () => {
     // very bug it exists to catch.
     expect(calls.current.at(-1)).toMatchObject({ method: "value_novelty" });
     expect(calls.current.at(-1)!.params).toEqual({});
+  });
+
+  it("drops a custom run when a different rank of the same method is opened", () => {
+    calls.current = [];
+    const sheetAt = (rank: number): SheetRequest => ({
+      kind: "finding",
+      method: "value_novelty",
+      rank,
+    });
+    const { rerender, getByTestId } = renderHost(sheetAt(0));
+
+    // "Run with these" from *finding* mode: the sheet flips to method mode and
+    // keeps the typed knobs.
+    fireEvent.click(getByTestId("sheet-finding"));
+    expect(calls.current.at(-1)!.params).toEqual({ fields: "attr:user_agent" });
+    getByTestId("sheet-method");
+
+    // Clicking a different row of the same method changes neither `kind` nor
+    // `method`, so only the rank can tell the host to go back to the plain
+    // sweep and render the row that was clicked.
+    rerender(
+      <InvestigateSheetHost
+        caseId="c1"
+        timelineId="t1"
+        railWidth={320}
+        sheet={sheetAt(1)}
+        onClose={() => {}}
+        onOpenMethod={() => {}}
+        onRunMethod={() => {}}
+      />,
+    );
+    expect(calls.current.at(-1)!.params).toEqual({});
+    getByTestId("sheet-finding");
   });
 
   it("keeps autorun's empty params when the Tools sheet runs a method", () => {

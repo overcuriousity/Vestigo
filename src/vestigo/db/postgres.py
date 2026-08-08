@@ -2643,6 +2643,15 @@ class PostgresStore:
         source by a plain ``source_id`` column (no FK/cascade), so they are
         deleted here too or they'd orphan when the source is removed.
 
+        ``AnalysisCache`` is purged for the whole case rather than for this
+        source: its rows are keyed by a fingerprint, not by source id, so there
+        is no way to select the ones computed over these events — and their
+        payloads hold event ids, field values and message templates from a
+        source the operator just deleted. Being unreachable (the fingerprint
+        covers the source set) is not the same as being gone, and eviction only
+        runs on a later write for the same case. The whole-case sweep costs a
+        rescan of derived data and nothing else.
+
         Returns True if a row was removed, False if it did not exist.
         """
         from sqlalchemy import delete, select
@@ -2675,6 +2684,7 @@ class PostgresStore:
                     SourceFieldStats.source_id == source_id,
                 )
             )
+            await session.execute(delete(AnalysisCache).where(AnalysisCache.case_id == case_id))
             await session.delete(source)
             await session.commit()
             return True

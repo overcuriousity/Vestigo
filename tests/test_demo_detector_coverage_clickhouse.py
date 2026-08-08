@@ -208,9 +208,16 @@ def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(demo, ch_st
     for method, plan in plans.items():
         # The two-window methods legitimately need setup in the self frame —
         # there is no second window to test against until an analyst declares
-        # one. Every other method must be offered on data this file proves
-        # they find things in.
-        if method in {"proportion_shift", "value_distribution_drift"}:
+        # one, and the two temporal-only methods return `insufficient_data`
+        # without that pair just as flatly as the explicit drift tests do.
+        # Every other method must be offered on data this file proves they
+        # find things in.
+        if method in {
+            "proportion_shift",
+            "value_distribution_drift",
+            "interval_periodicity",
+            "sequence_novelty",
+        }:
             assert plan.status == "needs_setup", f"{method}: {plan.status} ({plan.reason})"
             continue
         assert plan.status == "applicable", (

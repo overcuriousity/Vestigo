@@ -127,6 +127,24 @@ def test_findings_returns_results_and_scope(client, seeded, stub_detector):
     assert body["cache"] == "miss"
 
 
+def test_the_mode_the_detector_ran_in_survives_the_method_id(client, seeded, stub_detector):
+    """``method`` on a detector result is the *mode* it ran in, not the method id.
+
+    "cadence", "self-baseline", "temporal", "z-score" — provenance the older
+    ``/anomalies`` responses carried. Stamping the requested method id over the
+    key used to drop it from both the response and the cached payload.
+    """
+    case_id, timeline_id = seeded
+    url = _url(case_id, timeline_id, "value_novelty")
+    body = client.get(url).json()
+    assert body["method"] == "value_novelty"
+    assert body["analysis_mode"] == "stub"
+    # And it is cached with it, not recovered by rerunning.
+    cached = client.get(url).json()
+    assert cached["cache"] == "hit"
+    assert cached["analysis_mode"] == "stub"
+
+
 def test_second_identical_request_is_served_from_cache(client, seeded, stub_detector):
     case_id, timeline_id = seeded
     url = _url(case_id, timeline_id, "value_novelty")

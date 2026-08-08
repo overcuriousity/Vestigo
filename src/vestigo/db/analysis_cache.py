@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
-from vestigo.db.postgres import AnalysisCache, SourceFieldStats, generate_id
+from vestigo.db.postgres import AnalysisCache, SourceEnrichment, SourceFieldStats, generate_id
 
 if TYPE_CHECKING:
     from vestigo.db.postgres import PostgresStore
@@ -124,6 +124,16 @@ async def enrichment_generation(store: PostgresStore, source_ids: list[str]) -> 
     the only two paths that mutate ``events.attributes``, and both already
     refresh that row. Reusing it means no new bookkeeping and no second
     invalidation path to keep in sync with the first.
+
+    :class:`SourceEnrichment` is folded in because the stats row alone has a
+    state it cannot distinguish: *absent*. ``enrichers/jobs.py`` drops the row
+    when the post-apply refresh fails, so two successive enrichers that both
+    fail their refresh leave the identical "no row" material while the
+    attributes underneath differ — a hit served for data computed before the
+    second enricher existed, under a contract that says a hit is proof. The
+    enrichment provenance row is upserted per ``(source_id, enricher_key)``
+    with its own ``applied_at``/``job_id``, so it separates those two states
+    and does so durably, independent of whether the refresh succeeded.
     """
     if not source_ids:
         return "empty"
@@ -137,9 +147,24 @@ async def enrichment_generation(store: PostgresStore, source_ids: list[str]) -> 
                 ).where(SourceFieldStats.source_id.in_(source_ids))
             )
         ).all()
+        applies = (
+            await session.execute(
+                select(
+                    SourceEnrichment.source_id,
+                    SourceEnrichment.enricher_key,
+                    SourceEnrichment.enricher_config_hash,
+                    SourceEnrichment.job_id,
+                    SourceEnrichment.applied_at,
+                ).where(SourceEnrichment.source_id.in_(source_ids))
+            )
+        ).all()
     material = sorted(
         f"{source_id}:{version}:{computed_at.isoformat() if computed_at else ''}"
         for source_id, computed_at, version in rows
+    )
+    material += sorted(
+        f"{source_id}:{key}:{config_hash}:{job_id}:{applied_at.isoformat() if applied_at else ''}"
+        for source_id, key, config_hash, job_id, applied_at in applies
     )
     return hashlib.sha256("|".join(material).encode()).hexdigest()[:32]
 

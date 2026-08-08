@@ -646,12 +646,20 @@ async def get_analysis_findings(
         body = _serialize_stat_result(result)
         scope = {**scope, "dispositions_hash": resolution.get("dispositions_hash")}
 
+    # `method` here is the method id the caller asked for. The detectors put
+    # something else under that key — the *mode* they ran in ("cadence",
+    # "self-baseline", "temporal", "z-score") — which overwriting would drop
+    # from both the response and the cached payload, losing provenance the
+    # older /anomalies responses carried. Keep it under its own key.
+    analysis_mode = body.get("method")
     payload = {
         **body,
         "method": method,
         "scope": scope,
         "computed_at": datetime.now(UTC).isoformat(),
     }
+    if isinstance(analysis_mode, str) and analysis_mode != method:
+        payload["analysis_mode"] = analysis_mode
     await cache_put(store, case_id, key, payload, cfg.analysis_cache_max_rows_per_case)
     return {
         **await _apply_dispositions(

@@ -308,19 +308,30 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
     )
 
     # Two-window tests: no second window, no test. Recoverable by an analyst
-    # action, so needs_setup rather than not_applicable.
-    for method in ("proportion_shift", "value_distribution_drift"):
-        plans[method] = (
-            _ok(method)
-            if two_windows
-            else _setup(
+    # action, so needs_setup rather than not_applicable. `interval_periodicity`
+    # and `sequence_novelty` belong here too — both return `insufficient_data`
+    # the moment their window pair is missing, so their own data-shape gates
+    # below only ever get to speak when a baseline exists. Gating them on shape
+    # alone used to count them as applicable in an unbaselined frame, run them,
+    # and render a dash where the "Set a baseline" button belongs.
+    needs_windows = (
+        "proportion_shift",
+        "value_distribution_drift",
+        "interval_periodicity",
+        "sequence_novelty",
+    )
+    for method in needs_windows:
+        if not two_windows:
+            plans[method] = _setup(
                 method,
                 "needs a baseline window to compare against",
                 {"frame": inputs.frame, "has_active_baseline": inputs.has_active_baseline},
             )
-        )
+    for method in ("proportion_shift", "value_distribution_drift"):
+        plans.setdefault(method, _ok(method))
 
-    plans["interval_periodicity"] = (
+    plans.setdefault(
+        "interval_periodicity",
         _ok("interval_periodicity")
         if per_series >= cfg.analysis_gate_min_interval_periods
         else _no(
@@ -330,7 +341,7 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
                 "events_per_series_value": per_series,
                 "required": cfg.analysis_gate_min_interval_periods,
             },
-        )
+        ),
     )
 
     # A single distinct series value yields exactly one n-gram, repeated: no
@@ -339,7 +350,8 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
     # is perfectly scoreable — so the floor is 2, not "enough values to look
     # interesting". A two-artifact-type timeline is an ordinary two-source case,
     # and it used to lose this method silently.
-    plans["sequence_novelty"] = (
+    plans.setdefault(
+        "sequence_novelty",
         _ok("sequence_novelty")
         if inputs.series_distinct >= cfg.analysis_gate_min_series_distinct
         else _no(
@@ -349,7 +361,7 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
                 "series_distinct": inputs.series_distinct,
                 "required": cfg.analysis_gate_min_series_distinct,
             },
-        )
+        ),
     )
 
     # Log templating clusters the `message` materialized column, which is part

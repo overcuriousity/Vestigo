@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import pytest
 
-from vestigo.db.analysis_cache import cache_get, cache_put, fingerprint
+from vestigo.db.analysis_cache import (
+    cache_get,
+    cache_put,
+    enrichment_generation,
+    fingerprint,
+)
 
 
 @pytest.fixture()
@@ -215,3 +220,59 @@ async def test_an_insert_exactly_at_the_cap_evicts_nothing(migrated):
         await cache_put(migrated, "case-1", f"key-{i}", {"n": i}, max_rows=3)
     for i in range(3):
         assert await cache_get(migrated, "case-1", f"key-{i}") == {"n": i}
+
+
+@pytest.mark.asyncio
+async def test_successive_enrichment_applies_move_the_generation_without_stats(migrated):
+    """The stats row can be absent, and "absent" must not be one single state.
+
+    ``enrichers/jobs.py`` drops the field-stats row when the post-apply refresh
+    fails, so two enrichers that both fail their refresh leave identical
+    stats-derived material over different attributes — a hit computed before
+    the second enricher's fields existed, served under a contract that calls a
+    hit proof. The provenance row separates them.
+    """
+    await migrated.create_case("case-e", "Enriched")
+    await migrated.create_source("case-e", "src-e", "s.csv", "hash-e", 10)
+
+    empty = await enrichment_generation(migrated, ["src-e"])
+    await migrated.record_source_enrichment(
+        case_id="case-e",
+        source_id="src-e",
+        timeline_id="tl-e",
+        enricher_key="geoip",
+        enricher_config_hash="cfg-a",
+        job_id="job-a",
+        rows_applied=10,
+    )
+    after_first = await enrichment_generation(migrated, ["src-e"])
+    await migrated.record_source_enrichment(
+        case_id="case-e",
+        source_id="src-e",
+        timeline_id="tl-e",
+        enricher_key="asn",
+        enricher_config_hash="cfg-b",
+        job_id="job-b",
+        rows_applied=10,
+    )
+    after_second = await enrichment_generation(migrated, ["src-e"])
+
+    assert empty != after_first
+    assert after_first != after_second
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_source_purges_the_case_cache(migrated):
+    """Cached payloads hold event ids, field values and message templates.
+
+    They are keyed by a fingerprint rather than by source id, so there is no
+    way to select the rows computed over the deleted source's events —
+    unreachable is not gone, and eviction only ever runs on a later write for
+    the same case.
+    """
+    await migrated.create_case("case-d", "Doomed")
+    await migrated.create_source("case-d", "src-d", "s.csv", "hash-d", 10)
+    await cache_put(migrated, "case-d", "findings", {"results": ["evidence"]}, max_rows=10)
+
+    assert await migrated.delete_source("case-d", "src-d") is True
+    assert await cache_get(migrated, "case-d", "findings") is None

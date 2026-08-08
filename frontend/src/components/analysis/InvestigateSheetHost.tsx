@@ -77,13 +77,18 @@ export function InvestigateSheetHost({
   // *same* method's rows in the rail leaves the method unchanged, and without
   // resetting here the finding view would key on the custom run while the rail
   // addressed a rank in the plain sweep — rendering a different finding than
-  // the one clicked, or none at all.
+  // the one clicked, or none at all. So is `rank`: after "Run with these" the
+  // sheet sits in method mode with `ranFromFinding` set, and clicking a
+  // *different* rank of the same method changes neither `kind` nor `method`.
+  // Without the rank in here that click resets nothing and appears dead — the
+  // sheet keeps showing the custom run and never renders the row clicked.
   const methodKey = sheet.kind === "tools" ? null : sheet.method;
+  const rankKey = sheet.kind === "finding" ? sheet.rank : null;
   const autorun = sheet.kind === "method" && Boolean(sheet.autorun);
   useEffect(() => {
     setRunParams(autorun ? {} : null);
     setRanFromFinding(false);
-  }, [sheet.kind, methodKey, autorun]);
+  }, [sheet.kind, methodKey, rankKey, autorun]);
 
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
     enabled: sheet.kind === "finding" || (sheet.kind === "method" && runParams !== null),
