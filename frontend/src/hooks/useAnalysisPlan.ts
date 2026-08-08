@@ -7,6 +7,7 @@
  * unconditional sweep. A broken gate may cost time; it may never quietly show
  * an analyst fewer methods than exist.
  */
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { analysisApi, type AnalysisScope, type MethodPlanEntry, type ScopeParams } from "@/api/analysis";
 import { METHODS, type MethodId } from "@/components/analysis/method-registry";
@@ -52,18 +53,31 @@ export function useAnalysisPlan(caseId: string, timelineId: string) {
     retry: 1,
   });
 
-  const planById = query.data
-    ? ({
-        ...FAIL_OPEN,
-        ...Object.fromEntries(query.data.methods.map((m) => [m.method, m])),
-      } as Record<MethodId, MethodPlanEntry>)
-    : FAIL_OPEN;
+  // Memoized on the query's own data, which react-query keeps referentially
+  // stable between fetches. A fresh object spread per render would make every
+  // hook downstream (`useStreamingSweep`'s `runnable` and `byMethod`, and the
+  // rail's markers built from them) churn identity on every render too — which
+  // is a re-render loop the moment any of it feeds a parent's setState.
+  const planById = useMemo(
+    () =>
+      query.data
+        ? ({
+            ...FAIL_OPEN,
+            ...Object.fromEntries(query.data.methods.map((m) => [m.method, m])),
+          } as Record<MethodId, MethodPlanEntry>)
+        : FAIL_OPEN,
+    [query.data],
+  );
 
-  const scope: AnalysisScope = query.data?.scope ?? {
-    frame: scopeParams.frame,
-    baseline_id: scopeParams.baseline_id ?? null,
-    baseline_name: null,
-  };
+  const scope: AnalysisScope = useMemo(
+    () =>
+      query.data?.scope ?? {
+        frame: scopeParams.frame,
+        baseline_id: scopeParams.baseline_id ?? null,
+        baseline_name: null,
+      },
+    [query.data, scopeParams.frame, scopeParams.baseline_id],
+  );
 
   return {
     plan: query.data,

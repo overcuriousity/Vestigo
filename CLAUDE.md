@@ -75,6 +75,27 @@ uv run alembic upgrade head      # apply migrations (the app also does this on s
 via `VESTIGO_*` variables (see `.env.example` and `src/vestigo/core/config.py`), loaded through
 pydantic-settings.
 
+**The test suite requires reachable ClickHouse and PostgreSQL, and refuses to start without
+them.** `tests/conftest.py::pytest_configure` probes both once (~0s) and, if either fails, exits
+before collecting anything with the `podman compose up -d` fix in the message. There is no
+opt-out flag, and no test skips itself over reachability any more: most of the suite reaches
+them *indirectly through the app*, so a stopped container used to mean an eight-minute run
+ending in driver tracebacks that never named the actual problem. Qdrant is faked, so it is not
+probed. A `ClickHouseStore()` that now raises in a fixture is a real failure — don't
+reintroduce a `try/except Exception: pytest.skip(...)` around it, which is exactly how a broken
+`init_schema` would read as a green run.
+
+**Tests run against real PostgreSQL, never SQLite.** The `store` fixture takes `pg_database`: a
+private database cloned from a session-scoped template that Alembic migrated once (`~55ms` per
+test, and *faster* than replaying the migrations into a fresh SQLite file). Variants:
+`blank_pg_database` for tests that drive Alembic themselves, `module_pg_database` for a corpus
+built once per module. Don't add a `sqlite+aiosqlite` URL back — the dialects disagree about
+exactly what this model leans on (`JSONB` equality, `json` having no equality operator, server
+defaults, boolean literals), and the `confirmed` disposition path once shipped broken on
+PostgreSQL with every SQLite test passing. Test stores use `poolclass=NullPool`: asyncpg binds a
+connection to the event loop that opened it, and both the CLI and a bare `TestClient` run work
+on a fresh loop each time.
+
 Postgres schema is managed by **Alembic** (`src/vestigo/db/migrations`; `env.py` resolves
 the DSN from `get_settings()`). `PostgresStore.init_schema` upgrades to head on startup and
 auto-adopts a pre-Alembic database (stamps it at revision `0001`), so deploys need no manual

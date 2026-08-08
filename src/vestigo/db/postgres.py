@@ -1899,9 +1899,17 @@ def _pre_alembic_fixups(sync_conn: Any) -> None:
 class PostgresStore:
     """Async PostgreSQL store for metadata."""
 
-    def __init__(self, url: str | None = None) -> None:
+    def __init__(self, url: str | None = None, **engine_kwargs: Any) -> None:
+        """Open the metadata store.
+
+        ``engine_kwargs`` go straight to :func:`create_async_engine`. The one
+        caller that needs it passes ``poolclass=NullPool``: asyncpg binds a
+        connection to the event loop that opened it, so a pooled connection is
+        unusable to a process that runs each unit of work in its own
+        ``asyncio.run`` — which is what the CLI tests do.
+        """
         self.url = url or get_settings().postgres_url
-        self.engine = create_async_engine(self.url, echo=False, future=True)
+        self.engine = create_async_engine(self.url, echo=False, future=True, **engine_kwargs)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -3188,7 +3196,10 @@ class PostgresStore:
         ``StoryBlock``, ``StoryExport`` — the last of which holds frozen event
         data the operator believes went with the case), and the enrichment
         tables (``SourceEnrichment``, ``EnrichmentResultStaging``,
-        ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
+        ``EnrichmentJobRun``) and ``AnalysisCache`` (derived, but its payloads
+        hold event ids, field values and message templates, and its eviction
+        only ever runs on a write for the same case — so a row left here would
+        never be reclaimed) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
         ``cases.id``), so they must be deleted explicitly here alongside
         ``Timeline``/``Source`` or they'd silently orphan on every case delete
@@ -3222,6 +3233,7 @@ class PostgresStore:
             await session.execute(
                 delete(EnrichmentJobRun).where(EnrichmentJobRun.case_id == case_id)
             )
+            await session.execute(delete(AnalysisCache).where(AnalysisCache.case_id == case_id))
             await session.execute(delete(SigmaRule).where(SigmaRule.case_id == case_id))
             await session.execute(delete(SigmaRun).where(SigmaRun.case_id == case_id))
             # StoryBlock has no case_id of its own — reach it through its story.
@@ -4377,23 +4389,18 @@ class PostgresStore:
             # candidate set is one row per scope this exact finding was confirmed
             # under, so the filter costs nothing to do in Python.
             if scope_in_identity:
-                # An exact match wins over an unstamped row. Every `confirmed`
-                # row written before scope provenance existed carries no scope,
-                # and the frontend now always sends one — without adopting, the
-                # first re-confirm after an upgrade writes a second row for the
-                # same event and inflates the triage counts once per case. But
-                # adoption must not shadow a row that already carries this scope.
+                # Exact scope match, and nothing else. A row carrying no scope
+                # was confirmed under a comparison nobody recorded, so it can
+                # neither answer for this scope nor be backfilled with it — the
+                # backfill would make the audit column assert a frame the
+                # verdict was not reached under. Re-confirming such a finding
+                # writes a new, stamped row and leaves the old one honest.
                 existing = next(
-                    (r for r in candidates if r.analysis_scope == analysis_scope),
-                    next((r for r in candidates if r.analysis_scope is None), None),
+                    (r for r in candidates if r.analysis_scope == analysis_scope), None
                 )
             else:
                 existing = candidates[0] if candidates else None
             if existing is not None:
-                if scope_in_identity and existing.analysis_scope is None and analysis_scope:
-                    existing.analysis_scope = analysis_scope
-                    await session.commit()
-                    await session.refresh(existing)
                 return existing
             row = FindingDisposition(
                 id=generate_id(f"disp_{kind}"),
@@ -4480,26 +4487,9 @@ class PostgresStore:
                     event_id=it.get("event_id"),
                     analysis_scope=it.get("analysis_scope"),
                 )
+                # Exact identity only — an unstamped `confirmed` row is never
+                # adopted here either. See :meth:`create_disposition`.
                 existing = by_key.get(key)
-                if existing is None and it["kind"] == "confirmed":
-                    # Same pre-upgrade adoption the single-row path performs —
-                    # see :meth:`create_disposition`. Stated in both places
-                    # because a drifted dedupe writes a duplicate verdict.
-                    unstamped = disposition_identity(
-                        timeline_id=it.get("timeline_id"),
-                        kind=it["kind"],
-                        detector=it.get("detector", "*"),
-                        field=it.get("field"),
-                        value=it.get("value"),
-                        source_id=it.get("source_id"),
-                        event_id=it.get("event_id"),
-                        analysis_scope=None,
-                    )
-                    existing = by_key.get(unstamped)
-                    if existing is not None and it.get("analysis_scope"):
-                        existing.analysis_scope = canonical_scope(it["analysis_scope"])
-                        del by_key[unstamped]
-                        by_key[key] = existing
                 if existing is not None:
                     rows.append(existing)
                     continue

@@ -107,11 +107,8 @@ def _fixture_events() -> list[Event]:
 
 @pytest.fixture(scope="module")
 def svc():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     store.insert_events(_fixture_events())
     service = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     service.ch = store
@@ -243,11 +240,8 @@ def sub_svc():
     does not and the burst survives. Nothing here is more than a second apart,
     so surviving is the correct answer.
     """
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     base = SUB_START + timedelta(hours=12, milliseconds=900)
     events = [
         _sub_event(i, base + timedelta(milliseconds=1200 * i), proc)

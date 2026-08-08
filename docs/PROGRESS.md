@@ -1,10 +1,109 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-08 (session 164 — PR #262 second review: cache-key inputs that were
-not request parameters, and the actions the redesign left with no surface).
+Last updated: 2026-08-08 (session 165 — PR #262 third review, plus a test suite that now
+refuses to start without ClickHouse instead of failing slowly and vaguely).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 165 — 2026-08-08: PR #262 third review
+
+**The suite now refuses to start without ClickHouse.** Running it with the dev
+stack down cost most of a session. Nothing said the container was stopped:
+`clickhouse`-marked modules each opened their own connection inside a
+`try/except Exception: pytest.skip(...)`, paying the driver's retries one module
+at a time, while the much larger set that reaches ClickHouse *indirectly through
+the app* — `test_agent_api.py` and friends — simply failed, eight minutes in,
+with connection-pool tracebacks that named a pool rather than a missing service.
+`pytest_configure` now probes `/ping` once with `urllib` and a 1.5s timeout, and
+on failure exits before collection with the `podman compose up -d` fix in the
+message: about 0.0s to the answer instead of eight minutes to a wall of red.
+
+No opt-out flag, deliberately — a run that cannot pass is not worth starting,
+and "most of it passed" is a worse outcome than a clear stop. The eighteen
+per-module reachability skips are gone with it: reachability is settled before
+any of them run, and as blanket `except Exception` they also turned a genuine
+`init_schema` failure into a green skip.
+
+**And the suite no longer fakes PostgreSQL with SQLite.** The two dialects
+disagree about precisely what this model leans on, and the gap was not
+hypothetical: session 163's review found the `confirmed` disposition path had
+shipped broken on PostgreSQL while every SQLite test passed, because `json` has
+no equality operator there. Every store now comes from `pg_database` — a private
+database cloned from a template Alembic migrated once per session
+(`blank_pg_database` for tests that drive Alembic themselves,
+`module_pg_database` for a corpus built once per module).
+
+The usual argument for SQLite turns out to be backwards. Alembic runs per test
+either way; cloning a migrated template costs ~55ms against PostgreSQL versus
+~101ms replaying the migrations into a fresh SQLite file. So this is the faster
+option *and* the honest one.
+
+Three things the switch exposed, each a real difference rather than a porting
+annoyance: test DDL written with `AUTOINCREMENT` and `1`/`0` for booleans (both
+rejected outright, now `SERIAL` and `true`/`false`), schema assertions reading
+`PRAGMA table_info`/`sqlite_master` (now `information_schema`, so the migration
+tests inspect the database the migrations actually run on), and connections
+crossing event loops. That last one is why every test store uses
+`poolclass=NullPool`: asyncpg binds a connection to the loop that opened it, and
+both the CLI (one `asyncio.run` per command) and a `TestClient` built outside a
+`with` block run each unit of work on a fresh loop. SQLite tolerated it;
+PostgreSQL reports "Event loop is closed", which reads like a failure about
+permissions when it happens inside an RBAC test. `PostgresStore.__init__` takes
+`**engine_kwargs` for that, rather than tests reaching into its internals.
+
+The orphan sweep only drops databases with no live connections, so two suites
+running at once do not delete each other's clones.
+
+**Why.** A third review of the branch found six defects. One froze the Explorer
+outright; the rest are each a place where a surface says something the data does
+not support.
+
+**The rail's marker publication was an unbounded render loop.** The rail derives
+histogram markers from `useStreamingSweep` and hands them to `ExplorerPage`,
+which stores them in state — a feedback edge that only settles if the published
+value is stable when nothing changed. It was not: `useAnalysisPlan` rebuilt
+`planById` with a fresh spread every render, so `runnable` churned, so
+`byMethod`'s memo (keyed on the `useQueries` arrays, which are new objects every
+render regardless) recomputed, so the markers array was new, so the effect
+refired and set state again. Measured at 300+ renders in ~200ms as soon as any
+timestamped finding landed. Fixed at the source — `planById`/`scope` memoized,
+`byMethod` keyed on the four fields it actually reads rather than on the result
+objects — and again at the edge, where publication is now keyed on a content
+signature so no upstream hook losing its memo can reintroduce the loop. The old
+`useAnomalyMarkers` carried exactly this protection and the rewrite dropped it;
+the test that covers the rail could not see it, because it mocks the sweep and
+passes no marker callback. The new test runs the real hooks.
+
+**`delete_case` left the analysis cache behind.** `analysis_cache` has no FK to
+`cases`, like every other case-scoped table here, and was not in the explicit
+delete list. Its payloads hold event ids, field values and message templates,
+and eviction only ever runs on a write for the same case — which can no longer
+happen — so up to `analysis_cache_max_rows_per_case` rows of evidence-derived
+data survived the case forever.
+
+**Re-confirming a pre-provenance verdict rewrote its history.** A `confirmed`
+row written before `analysis_scope` existed carries `NULL`, and the dedupe
+adopted it by stamping *today's* scope onto it — making a forensic audit column
+assert a comparison frame the verdict was not reached under, which is precisely
+what migration `0026` left the column nullable to avoid. The adoption branch is
+gone from both the single and bulk paths: identity is the exact scope, an
+unstamped row stays unstamped and answers only for "scope not recorded", and a
+re-confirm writes its own stamped row. (Session 163 introduced the adoption to
+stop the first post-upgrade re-confirm writing a duplicate. A duplicate row is a
+counting problem; a fabricated provenance stamp is an evidentiary one.)
+
+**Three smaller honesty and navigation fixes.** The sheet reset its run
+parameters on `[method, autorun]`, so running a method with custom knobs and
+then clicking one of that *same* method's rail rows changed neither dep — the
+finding view keyed on the custom run while the rail's rank addressed the plain
+sweep, rendering a different finding than the one clicked, or none at all; the
+sheet's `kind` is part of the reset now. Confirming a switch to the `self` frame
+cleared `activeBaselineId` as well as the frame, so a baseline → self → baseline
+round-trip lost the selection and reopened the builder; only the frame moves
+now. And `MethodRow` gated its dash on `pending` but not its count, so nine
+methods queued behind the cheap set rendered `0` in the found-nothing style —
+they render `…` until they have actually run.
 
 ## Session 164 — 2026-08-08: PR #262 second review
 

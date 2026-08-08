@@ -15,7 +15,7 @@
  * The old five-tab split is gone. So is the Advanced accordion: per-method
  * controls live in the sheet, where there is room for them.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { AlertTriangle, Eye, EyeOff } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
@@ -161,11 +161,21 @@ export function InvestigateRail({
     return out;
   }, [byMethod]);
 
+  // Publication is keyed on the markers' *content*, not on the array's
+  // identity. The parent stores what it receives in state, so an identity that
+  // changed for any reason other than a real change — a churning hook upstream,
+  // a re-render from anywhere — would be an unbreakable render loop that
+  // freezes the Explorer. A cheap signature makes that structurally impossible
+  // rather than dependent on every hook above staying memoized.
+  const markersRef = useRef(markers);
+  markersRef.current = markers;
+  const markerSig = markers.map((m) => `${m.ts}|${m.eventId ?? ""}|${m.detector}`).join("");
+
   useEffect(() => {
     if (!onAnomalyMarkers) return;
-    onAnomalyMarkers(markers);
+    onAnomalyMarkers(markersRef.current);
     return () => onAnomalyMarkers([]);
-  }, [markers, onAnomalyMarkers]);
+  }, [markerSig, onAnomalyMarkers]);
 
   const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);

@@ -298,6 +298,14 @@ expressing anything new. A consequence worth stating: a case can hold two
 `confirmed` verdicts on one finding, so coverage counters must count distinct
 findings rather than disposition rows.
 
+An unstamped row is never adopted into a stamped one. A `confirmed` verdict
+carrying no scope answers only for "scope not recorded"; re-confirming that
+finding under a real scope writes its own row rather than backfilling the old
+one, because stamping a frame onto a verdict that was not reached under it is
+the same invention the nullable column exists to avoid. The cost is one extra
+row per legacy finding that gets re-confirmed, which is a counting artifact
+rather than a false claim.
+
 Changing scope re-runs every method and reframes every verdict already
 recorded, so the UI gates it behind a confirm that names both counts. Existing
 verdicts are never discarded or rewritten — they are kept and stay tagged with

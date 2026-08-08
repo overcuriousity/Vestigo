@@ -61,13 +61,18 @@ export function InvestigateSheetHost({
   // it is: the Tools sheet's Run anyway / Retry.
   const [runParams, setRunParams] = useState<Record<string, unknown> | null>(null);
 
-  // Reset when the sheet changes method, so the knobs typed for one method
-  // never silently become the request for the next.
+  // Reset whenever the sheet changes what it is showing, so the knobs typed for
+  // one view never silently become the request for the next. `kind` is part of
+  // that: running a method with custom parameters and then clicking one of that
+  // *same* method's rows in the rail leaves the method unchanged, and without
+  // resetting here the finding view would key on the custom run while the rail
+  // addressed a rank in the plain sweep — rendering a different finding than
+  // the one clicked, or none at all.
   const methodKey = sheet.kind === "tools" ? null : sheet.method;
   const autorun = sheet.kind === "method" && Boolean(sheet.autorun);
   useEffect(() => {
     setRunParams(autorun ? {} : null);
-  }, [methodKey, autorun]);
+  }, [sheet.kind, methodKey, autorun]);
 
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
     enabled: sheet.kind === "finding" || (sheet.kind === "method" && runParams !== null),

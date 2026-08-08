@@ -64,11 +64,8 @@ def _fixture_events() -> list[Event]:
 
 @pytest.fixture(scope="module")
 def store():
-    try:
-        s = ClickHouseStore()
-        s.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    s = ClickHouseStore()
+    s.init_schema()
     s.insert_events(_fixture_events())
     yield s
     s.delete_source_events(CASE_ID, SOURCE_ID)

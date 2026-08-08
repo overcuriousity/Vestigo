@@ -29,12 +29,23 @@ def run_async(coro):
 
 
 @pytest.fixture()
-def store(tmp_path, monkeypatch):
-    """In-memory SQLite store wired into the CLI's _get_store()."""
-    db_path = tmp_path / "test_cli.db"
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
-    run_async(s.init_schema())
-    monkeypatch.setattr(cli_main, "_get_store", lambda: s)
+def store(pg_database, monkeypatch):
+    """A private PostgreSQL database, wired into the CLI's _get_store().
+
+    Every store here is built with ``NullPool``. The CLI runs each command in
+    its own ``asyncio.run``, and asyncpg binds a connection to the loop that
+    opened it — a pooled connection handed to the next command is attached to a
+    loop that has since closed. SQLite tolerated that; PostgreSQL says "Event
+    loop is closed", which is a property of this test's shape rather than of
+    anything the CLI does in production (one command, one loop, one process).
+    """
+    from sqlalchemy.pool import NullPool
+
+    def _fresh() -> PostgresStore:
+        return PostgresStore(url=pg_database, poolclass=NullPool)
+
+    s = _fresh()
+    monkeypatch.setattr(cli_main, "_get_store", _fresh)
     yield s
     run_async(s.engine.dispose())
 

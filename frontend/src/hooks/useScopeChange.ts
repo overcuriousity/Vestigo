@@ -65,8 +65,17 @@ export function useScopeChange(caseId: string, timelineId: string) {
     cancel: () => setPending(null),
     confirm: () => {
       if (!pending) return;
-      setFrame(pending.frame);
-      setActiveBaselineId(pending.frame === "baseline" ? (pending.baselineId ?? null) : null);
+      if (pending.frame === "baseline") {
+        // Setting the id implies the frame (see the baseline store).
+        setActiveBaselineId(pending.baselineId ?? null);
+      } else {
+        // Only the frame. Clearing the id as well would discard the analyst's
+        // chosen definition, so a baseline → self → baseline round-trip would
+        // land on "Pick a baseline…" and the builder instead of switching back
+        // to the comparison they were just looking at. `useScopeParams` reads
+        // the frame first, so a retained id changes nothing while in `self`.
+        setFrame("self");
+      }
       setPending(null);
     },
     methodsToRerun,

@@ -192,45 +192,47 @@ def _post_confirmed(client, case_id, timeline_id, analysis_scope):
     ).json()["disposition"]
 
 
-def test_reconfirming_an_unstamped_verdict_adopts_the_scope_rather_than_duplicating(
-    client, seeded
-):
-    """Every ``confirmed`` row written before scope provenance existed has none.
+def test_an_unstamped_verdict_is_never_backfilled_with_a_scope(client, seeded):
+    """A ``confirmed`` row carrying no scope stays that way, forever.
 
-    The frontend now always sends a scope, so without adoption the first
-    re-confirm after the upgrade writes a second row for the same event and
-    inflates the triage counts once per upgraded case.
+    Every such row was written before scope provenance existed, under a
+    comparison nobody recorded. Stamping today's scope onto it would make the
+    audit column assert a frame the verdict was not reached under — which is
+    exactly what migration 0026 left the column nullable to avoid. Re-confirming
+    writes a new, stamped row instead.
     """
     case_id, timeline_id = seeded
     before = _post_confirmed(client, case_id, timeline_id, None)
     assert before["analysis_scope"] is None
 
     after = _post_confirmed(client, case_id, timeline_id, SCOPE)
-    assert after["id"] == before["id"]
+    assert after["id"] != before["id"]
     assert after["analysis_scope"] == SCOPE
 
-    # Adoption is once, not a wildcard: a genuinely different comparison is
-    # still a separate claim.
-    other = {**SCOPE, "baseline_id": "bl-2", "baseline_name": "Mar 1 – Mar 2"}
-    assert _post_confirmed(client, case_id, timeline_id, other)["id"] != after["id"]
+    # And the old row is untouched by that write: it still answers for "no
+    # scope recorded", which is the only claim it can honestly make.
+    again = _post_confirmed(client, case_id, timeline_id, None)
+    assert again["id"] == before["id"]
+    assert again["analysis_scope"] is None
 
 
-def test_an_exact_scope_match_wins_over_an_unstamped_row(client, seeded):
-    """Adoption must not shadow a row that already carries this scope."""
+def test_each_scope_gets_exactly_one_row(client, seeded):
+    """Identity is the exact scope — no row answers for a scope it lacks."""
     case_id, timeline_id = seeded
     unstamped = _post_confirmed(client, case_id, timeline_id, None)
     other = {**SCOPE, "baseline_id": "bl-2", "baseline_name": "Mar 1 – Mar 2"}
-    # The unstamped row adopts `other`, then a second scope creates its own row.
-    adopted = _post_confirmed(client, case_id, timeline_id, other)
-    assert adopted["id"] == unstamped["id"]
+    first = _post_confirmed(client, case_id, timeline_id, other)
+    assert first["id"] != unstamped["id"]
     stamped = _post_confirmed(client, case_id, timeline_id, SCOPE)
-    assert stamped["id"] != unstamped["id"]
-    # Repeating the exact scope returns the row carrying it, not the older one.
+    assert stamped["id"] not in {unstamped["id"], first["id"]}
+    # Repeating a scope returns the row carrying it, never a sibling.
     assert _post_confirmed(client, case_id, timeline_id, SCOPE)["id"] == stamped["id"]
+    assert _post_confirmed(client, case_id, timeline_id, other)["id"] == first["id"]
+    assert _post_confirmed(client, case_id, timeline_id, None)["id"] == unstamped["id"]
 
 
-def test_bulk_reconfirming_adopts_the_scope_too(client, seeded):
-    """The identity rule is stated in both paths; a drift writes a duplicate."""
+def test_bulk_does_not_backfill_either(client, seeded):
+    """The identity rule is stated in both paths; a drift rewrites history."""
     case_id, timeline_id = seeded
     before = _post_confirmed(client, case_id, timeline_id, None)
     r = client.post(
@@ -248,5 +250,5 @@ def test_bulk_reconfirming_adopts_the_scope_too(client, seeded):
         },
     )
     assert r.status_code == 200, r.text
-    assert r.json()["dispositions"][0]["id"] == before["id"]
+    assert r.json()["dispositions"][0]["id"] != before["id"]
     assert r.json()["dispositions"][0]["analysis_scope"] == SCOPE

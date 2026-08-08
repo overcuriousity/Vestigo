@@ -5,15 +5,13 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from vestigo.db.analysis_cache import cache_get, cache_put
 from vestigo.db.postgres import PostgresStore
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    db_path = tmp_path / "test_postgres_store.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database):
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 
@@ -98,6 +96,10 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
     # An export snapshot holds frozen event data — the most important of these
     # to take with the case, and the easiest to leave behind.
     await store.create_story_export("ex1", story.id, "c1", {"v": 1}, "hash", user="alice")
+    # Derived, but the payload holds event ids, field values and message
+    # templates — and eviction only ever runs on a write for the same case, so
+    # a row left behind here is never reclaimed by anything.
+    await cache_put(store, "c1", "k1", {"results": [{"event_id": "e1"}]}, max_rows=10)
 
     assert await store.delete_case("c1") is True
 
@@ -109,6 +111,7 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
     assert await store.get_story("c1", "st1") is None
     assert await store.list_story_blocks("st1") == []
     assert await store.list_story_exports("st1") == []
+    assert await cache_get(store, "c1", "k1") is None
 
 
 @pytest.mark.asyncio
@@ -198,11 +201,11 @@ async def test_saved_chart_rename_and_delete_scoped_by_timeline(store):
 
 
 @pytest.mark.asyncio
-async def test_init_schema_fresh_db_reaches_alembic_head(tmp_path):
+async def test_init_schema_fresh_db_reaches_alembic_head(blank_pg_database):
     """A fresh database is created entirely by `alembic upgrade head`."""
     from sqlalchemy import inspect, text
 
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/fresh.db")
+    s = PostgresStore(url=blank_pg_database)
     await s.init_schema()
     async with s.engine.begin() as conn:
         tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
@@ -215,14 +218,14 @@ async def test_init_schema_fresh_db_reaches_alembic_head(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_init_schema_adopts_pre_alembic_db(tmp_path):
+async def test_init_schema_adopts_pre_alembic_db(blank_pg_database):
     """A database created by the old create_all path (no alembic_version) is
     normalized by the legacy fixups, stamped at 0001, then upgraded."""
     from sqlalchemy import inspect, text
 
     from vestigo.db.postgres import Base
 
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/legacy.db")
+    s = PostgresStore(url=blank_pg_database)
     async with s.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # A real pre-Alembic database has only the revision-0001 tables —

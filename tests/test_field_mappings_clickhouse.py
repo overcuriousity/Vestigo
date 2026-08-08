@@ -53,11 +53,8 @@ def ch_store():
     # Constructing the store already opens a connection — keep it inside the
     # guard so an unreachable ClickHouse skips the module instead of erroring
     # every test at fixture setup.
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     events = [
         # Source A uses src_ip; one shared value (10.0.0.1) and one unique.
         _event(SRC_A, 1, {"src_ip": "10.0.0.1", "status": "200"}),

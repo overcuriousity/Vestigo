@@ -250,6 +250,16 @@ describe("ToolsSheet", () => {
     expect(screen.getByTestId("methods-summary")).toHaveTextContent(/1 still running/i);
   });
 
+  it("never shows a zero for a method that has not run yet", () => {
+    // A queued method has `total === 0` because nothing scanned, and "0" in the
+    // found-nothing style is the "checked, clear" misread this surface exists
+    // to prevent — the same reason an unscored run renders a dash.
+    renderTools({}, {}, { value_novelty: state("value_novelty", { pending: true, total: 0 }) });
+    const count = screen.getByTestId("method-count-value_novelty");
+    expect(count).not.toHaveTextContent("0");
+    expect(count).toHaveTextContent("…");
+  });
+
   it("renders a dash, not a zero, for a method that ran without scoring", () => {
     // A zero asserts the method looked and found nothing, which is exactly
     // what `insufficient_data` says it could not do.

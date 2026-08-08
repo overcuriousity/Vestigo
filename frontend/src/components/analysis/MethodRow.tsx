@@ -110,17 +110,26 @@ export function MethodRow({
           data-testid={`method-count-${meta.id}`}
           className={cn(
             "shrink-0 font-mono font-semibold",
-            unscored
+            state.pending || unscored
               ? "text-[var(--color-fg-muted)]"
               : state.total > 0
                 ? "text-[var(--color-anomaly)]"
                 : "text-[var(--color-fg-disabled)]",
           )}
           // A dash, not a zero: "0" asserts the method looked and found
-          // nothing, which is exactly what it could not do.
-          title={unscored ? "This method ran but could not score this data" : undefined}
+          // nothing, which is exactly what it could not do. A method still
+          // queued behind the cheap set has not looked *yet* and has the same
+          // `total === 0` — so it gets its own mark rather than borrowing
+          // either answer.
+          title={
+            state.pending
+              ? "Queued — this method has not run yet"
+              : unscored
+                ? "This method ran but could not score this data"
+                : undefined
+          }
         >
-          {unscored ? "—" : state.total}
+          {state.pending ? "…" : unscored ? "—" : state.total}
         </span>
       )}
 

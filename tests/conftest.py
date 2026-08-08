@@ -3,17 +3,28 @@
 Every router now shares a single ``PostgresStore`` via ``api.deps.get_store``
 (see ``tests/test_uploads.py``/``test_events_router.py`` for the same
 monkeypatch pattern used against individual router modules before that
-centralization). These fixtures spin up a full FastAPI app against an
-in-memory SQLite store so auth/session/RBAC/audit behavior can be exercised
-end-to-end through the real HTTP layer rather than by calling handlers
+centralization). These fixtures spin up a full FastAPI app against a private,
+already-migrated PostgreSQL database so auth/session/RBAC/audit behavior can be
+exercised end-to-end through the real HTTP layer rather than by calling handlers
 directly.
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections.abc import Iterator
+
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 from vestigo.api import deps
 from vestigo.api.main import create_app
@@ -21,13 +32,244 @@ from vestigo.core.config import get_settings
 from vestigo.core.login_backoff import reset_login_backoff
 from vestigo.db.postgres import PostgresStore, User
 
+# ---------------------------------------------------------------------------
+# Backing services
+# ---------------------------------------------------------------------------
+
+#: How long the probe waits before calling ClickHouse down. Deliberately short:
+#: this runs against a local container, and the whole point is to answer before
+#: anyone has time to walk away from the terminal.
+_PROBE_TIMEOUT_SECONDS = 1.5
+
+
+def _probe_clickhouse(url: str) -> str | None:
+    """Return None if ClickHouse answers ``/ping``, else a one-line reason.
+
+    Uses ``urllib`` rather than ``clickhouse_connect`` on purpose. The driver
+    retries, and its failure surfaces as a paragraph of connection-pool
+    traceback — which is exactly how a stopped container used to read as a
+    mysterious test failure minutes into a run.
+    """
+    ping = urllib.parse.urljoin(url.rstrip("/") + "/", "ping")
+    try:
+        with urllib.request.urlopen(ping, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
+            if resp.status != 200:
+                return f"HTTP {resp.status} from {ping}"
+        return None
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code} from {ping}"
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return f"{reason} ({ping})"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Refuse to start a run that cannot possibly pass.
+
+    ClickHouse and PostgreSQL are both genuinely required (Qdrant is faked, so
+    it is not probed), and a large share of the suite reaches them indirectly
+    through the app rather than through anything marked ``clickhouse``. With a
+    container stopped those tests do not skip: they each retry, then fail with a
+    driver traceback that names a connection pool rather than the actual
+    problem, and an eight-minute run ends in a wall of red that says nothing
+    about the one thing that was wrong.
+
+    So the reachability question is asked once, up front, in about a second,
+    and answered with the command that fixes it. There is no opt-out: a run
+    that cannot pass is not worth starting, and "most of it passed" is a worse
+    outcome than a clear stop.
+    """
+    if config.option.collectonly or config.option.help:
+        return
+
+    settings = get_settings()
+    started = time.monotonic()
+    down = [
+        (name, problem)
+        for name, problem in (
+            ("ClickHouse", _probe_clickhouse(settings.clickhouse_url)),
+            ("PostgreSQL", _probe_postgres()),
+        )
+        if problem is not None
+    ]
+    elapsed = time.monotonic() - started
+    if not down:
+        return
+
+    detail = "\n".join(f"  {name} — {problem}" for name, problem in down)
+    pytest.exit(
+        "\n"
+        f"Backing services are not reachable (probed in {elapsed:.1f}s):\n"
+        f"{detail}\n"
+        "\n"
+        "  The test suite needs them: most tests reach ClickHouse and Postgres\n"
+        "  through the app, and without them they fail slowly with driver\n"
+        "  tracebacks instead of saying this. Start the dev stack and re-run:\n"
+        "\n"
+        "      podman compose up -d\n",
+        returncode=pytest.ExitCode.USAGE_ERROR,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-test PostgreSQL databases
+# ---------------------------------------------------------------------------
+#
+# Tests run against the real thing, not SQLite. The two dialects disagree about
+# exactly the things this model leans on — `JSONB` equality, `json` having no
+# equality operator at all, server defaults — and a suite that cannot see those
+# differences cannot see the bugs that live in them: the `confirmed` disposition
+# path shipped broken on PostgreSQL while every SQLite test passed.
+#
+# It is also *faster*. Alembic runs per test either way; against PostgreSQL a
+# template database replays the migrations once per session and every test
+# clones it (~55ms vs ~101ms replaying them into a fresh SQLite file).
+
+#: Migrated once per session; every test's database is a clone of it.
+_TEMPLATE_DB = "vestigo_test_template"
+#: Prefix for per-test clones, and what the orphan sweep matches on.
+_TEST_DB_PREFIX = "vestigo_test_"
+
+
+def _admin_url() -> URL:
+    """The configured server, pointed at `postgres` so we can create databases."""
+    return make_url(get_settings().postgres_url).set(database="postgres")
+
+
+def _db_url(name: str) -> str:
+    # `str(URL)` masks the password as `***`; the rendered form is what a driver
+    # can actually connect with.
+    return make_url(get_settings().postgres_url).set(database=name).render_as_string(
+        hide_password=False
+    )
+
+
+def _admin_sql(*statements: str) -> list:
+    """Run DDL against the server itself, returning the last result's rows.
+
+    Synchronous by design — every caller is a sync fixture — but built on the
+    project's only PostgreSQL driver rather than pulling in psycopg2 for this.
+    AUTOCOMMIT because CREATE/DROP DATABASE cannot run inside a transaction, and
+    the engine is disposed before returning: a lingering pooled connection would
+    block the next DROP against whatever it was attached to.
+    """
+
+    async def _run() -> list:
+        engine = create_async_engine(_admin_url(), isolation_level="AUTOCOMMIT")
+        try:
+            async with engine.connect() as conn:
+                rows: list = []
+                for sql in statements:
+                    result = await conn.exec_driver_sql(sql)
+                    # DDL returns no rows at all, and asking a closed result for
+                    # them raises rather than yielding an empty list.
+                    rows = list(result.scalars().all()) if result.returns_rows else []
+                return rows
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
+
+
+def _probe_postgres() -> str | None:
+    """Return None if the configured PostgreSQL accepts a connection."""
+    try:
+        _admin_sql("SELECT 1")
+        return None
+    except Exception as exc:  # noqa: BLE001 — any failure is the same answer here
+        return f"{type(exc).__name__}: {str(exc).strip().splitlines()[0]}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _pg_template():
+    """Build the template database once, and clean up after killed runs.
+
+    The sweep matters more than it looks: an interrupted run leaves its clone
+    behind, and without this they accumulate silently until someone wonders why
+    the dev server has four hundred databases.
+    """
+    pattern = _TEST_DB_PREFIX.replace("_", r"\_") + "%"
+    # Only databases nobody is connected to. A second suite running right now
+    # holds connections to its own clones, and dropping those out from under it
+    # would fail that run with something it has no way to explain.
+    stale = _admin_sql(
+        "SELECT d.datname FROM pg_database d "
+        f"WHERE d.datname LIKE '{pattern}' "
+        "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
+    )
+    for name in stale:
+        _admin_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    _admin_sql(f'CREATE DATABASE "{_TEMPLATE_DB}"')
+
+    # Migrate it exactly once. Every test then pays a clone, not an upgrade.
+    async def _migrate():
+        s = PostgresStore(url=_db_url(_TEMPLATE_DB))
+        await s.init_schema()
+        await s.engine.dispose()
+
+    asyncio.run(_migrate())
+    yield
+    _admin_sql(f'DROP DATABASE IF EXISTS "{_TEMPLATE_DB}" WITH (FORCE)')
+
+
+@pytest.fixture()
+def pg_database(_pg_template) -> Iterator[str]:
+    """A private, already-migrated database URL for one test."""
+    name = f"{_TEST_DB_PREFIX}{uuid.uuid4().hex[:12]}"
+    _admin_sql(f'CREATE DATABASE "{name}" TEMPLATE "{_TEMPLATE_DB}"')
+    try:
+        yield _db_url(name)
+    finally:
+        # FORCE, because a test that failed mid-request can leave a pooled
+        # connection open and a plain DROP would fail the teardown instead of
+        # the test — reporting the wrong thing as broken.
+        _admin_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture(scope="module")
+def module_pg_database(_pg_template) -> Iterator[str]:
+    """One database shared by a module, for fixtures that seed once and reuse.
+
+    Same guarantees as :func:`pg_database`, different lifetime — the modules
+    that build an expensive corpus (the demo case) cannot afford to rebuild it
+    per test.
+    """
+    name = f"{_TEST_DB_PREFIX}{uuid.uuid4().hex[:12]}"
+    _admin_sql(f'CREATE DATABASE "{name}" TEMPLATE "{_TEMPLATE_DB}"')
+    try:
+        yield _db_url(name)
+    finally:
+        _admin_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture()
+def blank_pg_database(_pg_template) -> Iterator[str]:
+    """An *empty* database — no tables, no `alembic_version`.
+
+    For the tests that are about schema management itself, which have to start
+    from nothing and drive Alembic themselves.
+    """
+    name = f"{_TEST_DB_PREFIX}{uuid.uuid4().hex[:12]}"
+    _admin_sql(f'CREATE DATABASE "{name}"')
+    try:
+        yield _db_url(name)
+    finally:
+        _admin_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
 
 @pytest_asyncio.fixture()
-async def store(tmp_path, monkeypatch):
-    """In-memory SQLite store shared by every router via api.deps.get_store()."""
-    db_path = tmp_path / "test_auth.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
+async def store(pg_database, monkeypatch):
+    """The store every router shares via api.deps.get_store(), on real Postgres.
+
+    ``NullPool``, deliberately. asyncpg binds a connection to the event loop
+    that opened it, and a `TestClient` constructed outside a `with` block runs
+    each request on its own loop — which several RBAC tests do to hold two
+    logged-in sessions at once. A pooled connection handed across that boundary
+    raises "Event loop is closed", a failure about test plumbing that reads like
+    a failure about permissions. Not pooling costs a connect per operation
+    against a local server and buys immunity from the whole class.
+    """
+    s = PostgresStore(url=pg_database, poolclass=NullPool)
     monkeypatch.setattr(deps, "_store", s)
     yield s
     await s.engine.dispose()

@@ -14,10 +14,8 @@ from vestigo.db.postgres import PostgresStore, ReferentGoneError
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    db_path = tmp_path / "test_view_lifecycle.db"
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
-    await s.init_schema()
+async def store(pg_database):
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 

@@ -53,22 +53,17 @@ _WINDOWLESS = ("find_order_violations", "find_sequence_motifs", "list_log_templa
 
 @pytest.fixture(scope="module")
 def ch_store():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse unavailable")
+    store = ClickHouseStore()
+    store.init_schema()
     return store
 
 
 @pytest_asyncio.fixture(scope="module")
-async def demo(tmp_path_factory, ch_store):
+async def demo(module_pg_database, ch_store):
     """Seed the demo case once for the whole module, then drop its partitions."""
     from vestigo.db.postgres import PostgresStore
 
-    db_path = tmp_path_factory.mktemp("demo-coverage") / "coverage.db"
-    store = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
-    await store.init_schema()
+    store = PostgresStore(url=module_pg_database)
     owner = await store.create_user(user_id="u_coverage", username="coverage")
     result = await build_demo_case(store, ch_store, owner_id=owner.id)
     sources = [s.id for s in await store.list_sources(result.case_id)]

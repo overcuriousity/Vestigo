@@ -179,6 +179,22 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
     ),
   });
 
+  // `useQueries` returns a fresh array (and fresh result objects) on every
+  // render, so memoizing on it memoizes nothing. Depend instead on the four
+  // fields actually read: `data` is referentially stable between fetches and
+  // the rest are primitives. The dependency list has a constant length —
+  // METHODS is a module constant — which is what makes spreading it legal.
+  //
+  // This stability is load-bearing: InvestigateRail derives histogram markers
+  // from `byMethod` and publishes them into ExplorerPage state. A `byMethod`
+  // that changed identity every render would make that an infinite loop.
+  const queryDeps = [...cheapResults, ...heavyResults].flatMap((q) => [
+    q.data,
+    q.isFetching,
+    q.isFetched,
+    q.isError,
+  ]);
+
   const byMethod = useMemo(() => {
     const results = new Map<MethodId, (typeof cheapResults)[number]>();
     CHEAP_IDS.forEach((id, i) => results.set(id, cheapResults[i]));
@@ -208,7 +224,8 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
       };
     }
     return out;
-  }, [cheapResults, heavyResults, planById, runnable]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see queryDeps above
+  }, [...queryDeps, planById, runnable]);
 
   const expected = METHODS.filter((m) => runnable(m.id));
   const settled = expected.filter((m) => !byMethod[m.id].pending).length;
