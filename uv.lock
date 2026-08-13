@@ -1475,7 +1475,7 @@ email = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.29.0"
+version = "2.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1487,9 +1487,9 @@ dependencies = [
     { name = "pydantic-graph" },
     { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/47/9ea38824b27efae7d19a34e2288697e0a84aa5cdd8c119ac85d030395ea3/pydantic_ai_slim-2.29.0.tar.gz", hash = "sha256:a5de25ebf8cf50187fe71be101e318e18e8ed469e5d8d1551d92b81ded1e3e99", size = 1197221, upload-time = "2026-08-13T04:16:29.027Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/bb/464898fb1259adb9c7c39a583e7d83447182468d4459a4191ada12d4e588/pydantic_ai_slim-2.27.0.tar.gz", hash = "sha256:9f827840e2ef1d2317e071899e640ac32429b3c19d6ce05d972b842c0ae4a206", size = 1016384, upload-time = "2026-08-08T04:02:47.451Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/42/fda259cd11f88eb0ce7e54ee6a29011c0dd6a0af474403a2bb32d5dddb79/pydantic_ai_slim-2.29.0-py3-none-any.whl", hash = "sha256:cb5f5b7a941715b7f8894baae48ac178a603bdcf729726535964eaec25b07eb1", size = 1414034, upload-time = "2026-08-13T04:16:22.19Z" },
+    { url = "https://files.pythonhosted.org/packages/26/10/512641450549b15dd0b49600f975991a8b0067c921ec9e9b7caa0e89cff0/pydantic_ai_slim-2.27.0-py3-none-any.whl", hash = "sha256:d30cabd5e60680574f46df2b8d8e78eb7a5dd5d0963fc50e26fa802909130219", size = 1216383, upload-time = "2026-08-08T04:02:39.9Z" },
 ]
 
 [package.optional-dependencies]
@@ -1532,7 +1532,7 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.29.0"
+version = "2.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1541,9 +1541,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/a4/364964ff4ca90fac651ffc969e04d75941389a39009fa2e950379bbcec93/pydantic_graph-2.29.0.tar.gz", hash = "sha256:078d2d7ab53ffb695e1a66c2a741880c88fef36611004736bf7313f8a5ec4465", size = 45180, upload-time = "2026-08-13T04:16:30.94Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/80/50/ed9203338db139ef6d3f94814f6d6b2f6bce4042bb2278299b9ccb307a90/pydantic_graph-2.27.0.tar.gz", hash = "sha256:b124bd5d329d0e01d3b8c4070366a71db198ea9befc8453e56275fb1656da78b", size = 45181, upload-time = "2026-08-08T04:02:49.907Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/d5/9a7e31a4895904c5d81989069630c47b7ef28d07256ae7ce1b8cda9964d1/pydantic_graph-2.29.0-py3-none-any.whl", hash = "sha256:afc81688c9abca9e93c4f7b81dd1112e8a7a8d4d41514413bd8d2c674bd2dfa1", size = 52661, upload-time = "2026-08-13T04:16:24.994Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/ce/6ecafa2680d70ce34b8c3fdc1667228896f1cd19df2f236dd7fa54214117/pydantic_graph-2.27.0-py3-none-any.whl", hash = "sha256:f80a9f1cfbd3c07b64b032b45fa0710315d6d7e2ae35afc142d4992d99498a4d", size = 52661, upload-time = "2026-08-08T04:02:43.282Z" },
 ]
 
 [[package]]
@@ -1928,8 +1928,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform != 'darwin'" },
-    { name = "jeepney", marker = "sys_platform != 'darwin'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -2114,13 +2114,13 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "sys_platform == 'darwin'" },
-    { name = "networkx", marker = "sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "sys_platform == 'darwin'" },
-    { name = "sympy", marker = "sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:33449899ce5496c1b84b4853179d94fd102028ae1407314d9fb956bb79e70d09", upload-time = "2026-07-08T12:26:23Z" },
@@ -2134,13 +2134,13 @@ resolution-markers = [
     "sys_platform != 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "sys_platform != 'darwin'" },
-    { name = "networkx", marker = "sys_platform != 'darwin'" },
-    { name = "setuptools", marker = "sys_platform != 'darwin'" },
-    { name = "sympy", marker = "sys_platform != 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp313-cp313-linux_s390x.whl", hash = "sha256:966d020354f465672dc7dd10d3a5c6cd17d7eb48620aa1d265b48a1f78f06898", upload-time = "2026-07-08T19:29:30Z" },
@@ -2351,7 +2351,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "pyarrow", specifier = ">=25.0.0" },
     { name = "pydantic", specifier = ">=2.10.0" },
-    { name = "pydantic-ai-slim", extras = ["anthropic", "mcp", "openai"], specifier = ">=2.23.0" },
+    { name = "pydantic-ai-slim", extras = ["anthropic", "mcp", "openai"], specifier = ">=2.27.0" },
     { name = "pydantic-settings", specifier = ">=2.7.0" },
     { name = "pysigma", specifier = ">=1.5.0,<2.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
