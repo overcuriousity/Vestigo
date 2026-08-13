@@ -171,13 +171,6 @@ and the migration is done when the file is `{}`.
   Tools sections) rather than one tab away, and evidence-class notes carry some of what step 2
   used to. The placement complaint above still stands.
 
-- [ ] **The method sheet's `fields` knob is a text box.** PR #262's review made the knobs real,
-  but `fields` still takes a comma-separated string the analyst has to know the tokens for.
-  `AnomalyFieldPicker` already solves exactly this — cardinality-ranked candidates, Standard
-  vs Dynamic grouping, min/max selection for `value_combo`'s 2–4 — and is currently unmounted.
-  Wiring it in for `kind: "fields"` is the last step of that fix, not a new feature. The
-  component is kept on disk for exactly this reason — it is unmounted, not dead code.
-
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand store,
   so it is per-browser: an analyst who folds a panel away at their desk meets it again on a
   second machine, and vice versa. The backend half already exists — `User.preferences` (JSON,

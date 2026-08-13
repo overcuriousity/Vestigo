@@ -9,18 +9,42 @@
  */
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { InvestigateSheet } from "@/components/analysis/InvestigateSheet";
+import { TooltipProvider } from "@/components/ui/Tooltip";
 
 vi.mock("@/hooks/useMethodFindings", () => ({
   useMethodFindings: () => ({ data: undefined, isLoading: false, isError: false }),
   METHOD_LIMIT: 50,
 }));
 
+/**
+ * The field inventory both field knobs are populated from — one recommended
+ * field and one the picker leaves unchecked, which is what lets a test tell an
+ * explicit pick apart from the auto default it starts in.
+ */
+vi.mock("@/api/anomalies", () => ({
+  anomaliesApi: {
+    fields: async () => ({
+      fields: [
+        { token: "attr:src_ip", distinct: 42, coverage: 0.98, kind: "categorical", recommended: true },
+        { token: "attr:session", distinct: 9001, coverage: 0.4, kind: "identifier", recommended: false },
+      ],
+    }),
+    numericFields: async () => ({ fields: [] }),
+  },
+}));
+
+// TooltipProvider because the field picker's chips carry their coverage and
+// cardinality in a tooltip; AppShell provides it around the real app.
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>{children}</TooltipProvider>
+    </QueryClientProvider>
+  );
 }
 
 /**
@@ -155,6 +179,50 @@ describe("InvestigateSheet", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
     expect(onRun).toHaveBeenCalledWith({ group_field: "display_name" });
+  });
+
+  /**
+   * Which fields a method scans is a choice among this timeline's own columns.
+   * The rail-plus-overlay refactor deleted the per-detector views and with them
+   * both controls that offered those columns, leaving a text box the analyst had
+   * to spell `attr:` tokens into from memory. These four hold the fix.
+   */
+  it("offers the fields knob as a picker, not a text box", async () => {
+    renderSheet({ mode: "method", methodId: "value_novelty", onRun: () => {}, query: idleQuery() });
+    expect(screen.queryByTestId("method-knob-fields")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /fields/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("sends the picked fields as a list, not a string the analyst typed", async () => {
+    const onRun = vi.fn();
+    renderSheet({ mode: "method", methodId: "value_novelty", onRun, query: idleQuery() });
+    fireEvent.click(screen.getByRole("button", { name: /fields/i }));
+    // The recommended field starts checked (that is the auto default made
+    // visible); adding the unchecked one is the analyst's explicit pick.
+    fireEvent.click(await screen.findByText("session"));
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    // An explicit pick travels as a list, which _FieldsParams._join_fields
+    // accepts alongside the comma-joined string. An untouched picker sends
+    // nothing at all — see the untouched-knob test above.
+    expect(onRun).toHaveBeenCalledWith({ fields: ["attr:src_ip", "attr:session"] });
+  });
+
+  it("offers a single-field knob as this timeline's own fields", async () => {
+    renderSheet({ mode: "method", methodId: "sequence_novelty", onRun: () => {}, query: idleQuery() });
+    const select = screen.getByTestId("method-knob-series_field");
+    expect(select.tagName).toBe("SELECT");
+    // Standard columns immediately; the timeline's attribute keys once the
+    // inventory arrives.
+    expect(screen.getByRole("option", { name: "Artifact type" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("option", { name: "src_ip" })).toBeInTheDocument());
+  });
+
+  it("holds value_combo's picker to the two-to-four fields it can combine", async () => {
+    renderSheet({ mode: "method", methodId: "value_combo", onRun: () => {}, query: idleQuery() });
+    fireEvent.click(screen.getByRole("button", { name: /fields/i }));
+    expect(await screen.findByText(/Pick 2–4 fields/i)).toBeInTheDocument();
   });
 
   it("sends a numeric knob as a number, not the analyst's typing", () => {

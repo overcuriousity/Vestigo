@@ -32,8 +32,8 @@ export const BUDGET: Record<string, FileBudget> = {
   "../components/agent/ProposalCard.tsx": { fontSize: 3 },
   "../components/agent/StoryBlockProposalCard.tsx": { fontSize: 2 },
   "../components/agent/ToolSelector.tsx": { fontSize: 8, rawButton: 2 },
-  // Unmounted, but deliberately kept: ROADMAP's "the method sheet's `fields`
-  // knob is a text box" item wires this exact component back in.
+  // Mounted again by the method sheet's `fields` knob, which was a text box
+  // between the rail-plus-overlay refactor and this fix.
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
   // The mute chips are the same pill as InvestigateRail's preset filters they
   // sit directly above, for the reason recorded there: a `Button` reads as a

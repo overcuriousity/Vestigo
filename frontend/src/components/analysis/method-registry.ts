@@ -57,12 +57,47 @@ export const EVIDENCE_CLASSES: { id: EvidenceClass; label: string; note: string 
   { id: "exploration", label: "Exploration", note: "leads, not verdicts" },
 ];
 
+/**
+ * How a `kind: "fields"` knob configures `AnomalyFieldPicker`.
+ *
+ * These are not presentation preferences: each one mirrors what the backend
+ * actually scans for that method, so the picker's checked set is a preview of
+ * the run rather than a guess. Restored verbatim from the per-detector views
+ * deleted in the rail-plus-overlay refactor.
+ */
+export interface FieldPickerConfig {
+  /** Floor an explicit selection must keep — value_combo needs two to combine. */
+  minSelected?: number;
+  /** Ceiling an explicit selection may hold. */
+  maxSelected?: number;
+  /** How many recommended fields auto mode really scans, so the preview matches. */
+  autoCount?: number;
+  /** Name for the auto default in the picker's footer. */
+  autoLabel?: string;
+  /** Auto mode also scans identifier-kind fields (charset/entropy's target). */
+  autoIncludesIdentifiers?: boolean;
+  /** Offer numeric-parseable candidates instead of the cardinality inventory. */
+  numeric?: boolean;
+}
+
 export interface MethodKnob {
   /** Params-object key — must exist in METHOD_PARAMS in api/routers/analysis.py. */
   param: string;
   label: string;
-  kind: "number" | "text" | "fields";
+  /**
+   * `fields` renders `AnomalyFieldPicker`, `field` renders `MethodFieldSelect`.
+   * Neither is a text box: a field name is one of a fixed set of columns plus
+   * this timeline's `attr:` keys, which no analyst can be asked to spell from
+   * memory. `text` is for the knobs that really are free-form.
+   */
+  kind: "number" | "text" | "field" | "fields";
   placeholder: string;
+  /** `kind: "fields"` only. */
+  picker?: FieldPickerConfig;
+  /** `kind: "field"` only — the standard (non-attribute) choices, in order. */
+  fieldOptions?: { value: string; label: string }[];
+  /** `kind: "field"` only — names the empty choice, i.e. the method's default. */
+  noneLabel?: string;
 }
 
 export interface MethodMeta {
@@ -105,17 +140,33 @@ export interface MethodMeta {
   knobs: MethodKnob[];
 }
 
+/** The plain multi-field knob: recommended set, no floor, no ceiling. */
 const FIELDS_KNOB: MethodKnob = {
   param: "fields",
   label: "Fields",
   kind: "fields",
   placeholder: "auto",
 };
+const fieldsKnob = (picker: FieldPickerConfig): MethodKnob => ({ ...FIELDS_KNOB, picker });
+
+/**
+ * Series fields: the standard columns an event can be partitioned by. Attribute
+ * keys are appended per timeline by `MethodFieldSelect`.
+ */
+const SERIES_FIELD_OPTIONS = [
+  { value: "artifact", label: "Artifact type" },
+  { value: "timestamp_desc", label: "Event category" },
+  { value: "display_name", label: "Display name" },
+  { value: "parser_name", label: "Parser" },
+  { value: "source_file", label: "Source file" },
+];
 const SERIES_KNOB: MethodKnob = {
   param: "series_field",
   label: "Series field",
-  kind: "text",
+  kind: "field",
   placeholder: "artifact",
+  fieldOptions: SERIES_FIELD_OPTIONS,
+  noneLabel: "Artifact type (default)",
 };
 const FDR_KNOB: MethodKnob = {
   param: "fdr_q",
@@ -141,7 +192,7 @@ export const METHODS: MethodMeta[] = [
     scoreUnit: "surprise",
     what: "Ranks field values by −log(frequency): the rarer a value is in the scanned corpus, the higher it scores. Works immediately after ingestion, with no baseline.",
     querySketch: `SELECT <field> AS value, count() AS n\nFROM events\nWHERE case_id = {case} AND source_id IN {sources}\nGROUP BY value\nORDER BY n ASC\nLIMIT {limit}\n-- score = -log(n / total)`,
-    knobs: [FIELDS_KNOB],
+    knobs: [fieldsKnob({ autoCount: 15 })],
   },
   {
     id: "value_combo",
@@ -153,7 +204,8 @@ export const METHODS: MethodMeta[] = [
     scoreUnit: "surprise",
     what: "The multi-field extension of rare values: scores field pairs, catching the case where each value is common on its own but their co-occurrence is not.",
     querySketch: `SELECT <field_a>, <field_b>, count() AS n\nFROM events\nWHERE case_id = {case} AND source_id IN {sources}\nGROUP BY 1, 2\nORDER BY n ASC\nLIMIT {limit}\n-- score = -log(n / total)`,
-    knobs: [FIELDS_KNOB],
+    // Two to four fields, of which auto combines the top two.
+    knobs: [fieldsKnob({ minSelected: 2, maxSelected: 4, autoCount: 2, autoLabel: "top 2" })],
   },
   {
     id: "numeric_range",
@@ -166,7 +218,7 @@ export const METHODS: MethodMeta[] = [
     railFloor: 2,
     what: "Learns a band per numeric field from the reference data and reports values outside it, scored by how many band widths out they sit.",
     querySketch: `SELECT toFloat64OrNull(<field>) AS num, count() AS n\nFROM events\nWHERE case_id = {case} AND num IS NOT NULL\nGROUP BY num\n-- band from the reference quantiles; score = excess / band width`,
-    knobs: [FIELDS_KNOB],
+    knobs: [fieldsKnob({ autoCount: 15, numeric: true })],
   },
   {
     id: "charset",
@@ -179,8 +231,17 @@ export const METHODS: MethodMeta[] = [
     what: "Learns the alphabet each field uses, then flags values containing characters that alphabet has never contained — a script change or an injected byte, regardless of what the value means.",
     querySketch: `SELECT <field> AS value, count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- alphabet learned from the reference values;\n-- reported when a value contains a character outside it`,
     knobs: [
-      FIELDS_KNOB,
-      { param: "group_field", label: "Group by", kind: "text", placeholder: "(none)" },
+      fieldsKnob({ autoIncludesIdentifiers: true }),
+      {
+        param: "group_field",
+        label: "Group by",
+        kind: "field",
+        placeholder: "(none)",
+        // Learn one alphabet per value of this field (per host, say) instead of
+        // one merged alphabet over the whole scope.
+        fieldOptions: SERIES_FIELD_OPTIONS.filter((o) => o.value !== "source_file"),
+        noneLabel: "Whole scope",
+      },
     ],
   },
   {
@@ -194,7 +255,7 @@ export const METHODS: MethodMeta[] = [
     railFloor: 2,
     what: "Measures Shannon entropy per value against a learned per-field band, catching both random-looking payloads and degenerate repeats at the other extreme.",
     querySketch: `SELECT <field> AS value, count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- Shannon entropy per value against the learned per-field band`,
-    knobs: [FIELDS_KNOB],
+    knobs: [fieldsKnob({ autoIncludesIdentifiers: true })],
   },
   {
     id: "frequency",
@@ -285,7 +346,16 @@ export const METHODS: MethodMeta[] = [
     scoreUnit: "cluster",
     what: "Clusters raw messages into templates by masking their variable tokens. A template with no earlier occurrence is a kind of log line this system has not produced before — a lead to read, not a scored finding.",
     querySketch: `SELECT template_id, any(template) AS template, count() AS n\nFROM (\n  SELECT <field> AS message, <masked tokens> AS template_id\n  FROM events WHERE case_id = {case}\n)\nGROUP BY template_id\nORDER BY n DESC\nLIMIT {limit}`,
-    knobs: [{ param: "field", label: "Field", kind: "text", placeholder: "message" }],
+    knobs: [
+      {
+        param: "field",
+        label: "Field",
+        kind: "field",
+        placeholder: "message",
+        fieldOptions: [{ value: "message", label: "Message" }],
+        noneLabel: "Message (default)",
+      },
+    ],
   },
 ];
 

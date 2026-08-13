@@ -29,6 +29,8 @@ import type { UseQueryResult } from "@tanstack/react-query";
 import { METHODS_BY_ID, type MethodId, type MethodMeta } from "./method-registry";
 import { EVIDENCE_CLASSES } from "./method-registry";
 import { ToolsSheet } from "./ToolsSheet";
+import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
+import { MethodFieldSelect } from "./MethodFieldSelect";
 import { ScoredRow, TemplateRows } from "./FindingGroup";
 import { FindingRowActions, FindingRowState } from "./detector-shared";
 import { DETECTORS } from "./detector-registry";
@@ -110,10 +112,23 @@ function Subhead({ children }: { children: React.ReactNode }) {
  * coerced into a different question under a cache key claiming otherwise.
  * Numbers are coerced here because the endpoint's per-method models are typed,
  * and a numeric knob arriving as a string is the analyst's typing, not intent.
+ *
+ * A `fields` selection is sent as a list, which `_FieldsParams._join_fields`
+ * accepts alongside the comma-joined string. `null` there is the picker's "auto"
+ * — the same untouched-knob case, so it is omitted for the same reason.
  */
-function buildParams(meta: MethodMeta, raw: Record<string, string>): Record<string, unknown> {
+function buildParams(
+  meta: MethodMeta,
+  raw: Record<string, string>,
+  fields: Record<string, string[] | null>,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const knob of meta.knobs) {
+    if (knob.kind === "fields") {
+      const selected = fields[knob.param];
+      if (selected) out[knob.param] = selected;
+      continue;
+    }
     const value = (raw[knob.param] ?? "").trim();
     if (!value) continue;
     out[knob.param] = knob.kind === "number" ? Number(value) : value;
@@ -122,11 +137,16 @@ function buildParams(meta: MethodMeta, raw: Record<string, string>): Record<stri
 }
 
 function MethodBody({
+  caseId,
+  timelineId,
   methodId,
   onRun,
   runLabel = "Run",
   running,
 }: {
+  /** The field knobs offer this timeline's own columns, so both ids are needed. */
+  caseId: string;
+  timelineId: string;
   methodId: MethodId;
   /**
    * Runs the method with the knobs as typed. Present in both modes: a form of
@@ -139,10 +159,16 @@ function MethodBody({
 }) {
   const meta = METHODS_BY_ID[methodId];
   const [values, setValues] = useState<Record<string, string>>({});
+  // Field selections are kept apart from the typed knobs: `null` is a real
+  // value here ("let the method choose"), which an empty string cannot express.
+  const [fields, setFields] = useState<Record<string, string[] | null>>({});
 
   // Switching methods must not carry the previous method's typing across —
   // the knobs look the same and the params would silently be the old ones.
-  useEffect(() => setValues({}), [methodId]);
+  useEffect(() => {
+    setValues({});
+    setFields({});
+  }, [methodId]);
 
   return (
     <>
@@ -154,27 +180,59 @@ function MethodBody({
         className="flex flex-wrap items-center gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          onRun?.(buildParams(meta, values));
+          onRun?.(buildParams(meta, values, fields));
         }}
       >
-        {meta.knobs.map((knob) => (
-          <label
-            key={knob.param}
-            data-testid="method-knob"
-            className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
-          >
-            {knob.label}
-            <input
-              aria-label={knob.label}
-              data-testid={`method-knob-${knob.param}`}
-              type={knob.kind === "number" ? "number" : "text"}
-              value={values[knob.param] ?? ""}
-              onChange={(e) => setValues((v) => ({ ...v, [knob.param]: e.target.value }))}
-              placeholder={knob.placeholder}
-              className="w-16 bg-transparent font-mono text-[11px] text-[var(--color-fg-primary)] outline-none placeholder:text-[var(--color-fg-disabled)]"
+        {meta.knobs.map((knob) =>
+          // Which fields to scan is a choice among this timeline's own columns,
+          // ranked by cardinality — the picker is the control for it, and a
+          // text box asking the analyst to recall `attr:` token spellings is
+          // not a smaller version of the same thing.
+          knob.kind === "fields" ? (
+            <AnomalyFieldPicker
+              key={knob.param}
+              caseId={caseId}
+              timelineId={timelineId}
+              selected={fields[knob.param] ?? null}
+              onChange={(tokens) => setFields((f) => ({ ...f, [knob.param]: tokens }))}
+              minSelected={knob.picker?.minSelected}
+              maxSelected={knob.picker?.maxSelected}
+              autoCount={knob.picker?.autoCount}
+              autoIncludesIdentifiers={knob.picker?.autoIncludesIdentifiers}
+              autoLabel={knob.picker?.autoLabel}
+              numeric={knob.picker?.numeric}
             />
-          </label>
-        ))}
+          ) : (
+            <label
+              key={knob.param}
+              data-testid="method-knob"
+              className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+            >
+              {knob.label}
+              {/* A field name comes from the timeline's own inventory; anything
+                  else is the analyst's own number or string. */}
+              {knob.kind === "field" ? (
+                <MethodFieldSelect
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  knob={knob}
+                  value={values[knob.param] ?? ""}
+                  onChange={(next) => setValues((v) => ({ ...v, [knob.param]: next }))}
+                />
+              ) : (
+                <input
+                  aria-label={knob.label}
+                  data-testid={`method-knob-${knob.param}`}
+                  type={knob.kind === "number" ? "number" : "text"}
+                  value={values[knob.param] ?? ""}
+                  onChange={(e) => setValues((v) => ({ ...v, [knob.param]: e.target.value }))}
+                  placeholder={knob.placeholder}
+                  className="w-16 bg-transparent font-mono text-[11px] text-[var(--color-fg-primary)] outline-none placeholder:text-[var(--color-fg-disabled)]"
+                />
+              )}
+            </label>
+          ),
+        )}
         {onRun && (
           <Button type="submit" variant="outline" size="sm" disabled={running}>
             <Play size={11} />
@@ -182,11 +240,6 @@ function MethodBody({
           </Button>
         )}
       </form>
-      {meta.knobs.some((k) => k.kind === "fields") && (
-        <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
-          Fields is a comma-separated list of tokens; leave it empty to let the method choose.
-        </p>
-      )}
 
       <Subhead>Query shape</Subhead>
       <pre className="overflow-x-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2 font-mono text-xs text-[var(--color-fg-secondary)]">
@@ -288,12 +341,16 @@ function when(finding: MethodResult): string {
 
 
 function FindingBody({
+  caseId,
+  timelineId,
   methodId,
   finding,
   scope,
   onRun,
   running,
 }: {
+  caseId: string;
+  timelineId: string;
   methodId: MethodId;
   finding: MethodResult;
   scope: AnalysisScope;
@@ -374,6 +431,8 @@ function FindingBody({
       </dl>
 
       <MethodBody
+        caseId={caseId}
+        timelineId={timelineId}
         methodId={methodId}
         onRun={onRun}
         runLabel="Run with these"
@@ -511,6 +570,8 @@ export function InvestigateSheet({
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
           {rest.mode === "finding" && (
             <FindingBody
+              caseId={caseId}
+              timelineId={timelineId}
               methodId={rest.methodId}
               finding={rest.finding}
               scope={rest.scope}
@@ -521,6 +582,8 @@ export function InvestigateSheet({
           {rest.mode === "method" && (
             <>
               <MethodBody
+                caseId={caseId}
+                timelineId={timelineId}
                 methodId={rest.methodId}
                 onRun={rest.onRun}
                 running={rest.query.isFetching}

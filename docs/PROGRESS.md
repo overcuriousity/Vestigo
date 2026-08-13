@@ -1,6 +1,35 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-13 (session 170 — the disposition list gets a home again, 1.12.1).
+Last updated: 2026-08-13 (session 171 — the field knobs stop being text boxes).
+
+## Session 171 — 2026-08-13: field knobs are choices again, not typing
+
+Reported as a regression in the Investigate panels: the `fields` knob asks the analyst to
+type field names. It does — and the same refactor took the single-field knobs with it.
+
+`cadaa5c` replaced eleven per-detector views with one generic knob renderer that types every
+knob as `<input type="text">`. Eight of those views mounted `AnomalyFieldPicker` (cardinality-
+ranked candidates, Standard vs Dynamic grouping, coverage and distinct counts per chip,
+`value_combo`'s 2–4 floor and ceiling); four more offered `series_field`, `group_field` and the
+log-template `field` as `<select>`s built from the same `/anomalies/fields` inventory. A field
+name is not free text — it is a fixed set of columns plus whatever `attr:` keys the timeline
+happens to carry, and nobody can spell those from memory for a source they ingested an hour
+ago. The knobs were reachable but unusable, which is the worse failure: the sheet's method mode
+is what keeps the analysis gate advice rather than a lock, and that argument only holds if
+running a method with your own parameters is actually possible.
+
+Both controls are back. `kind: "fields"` renders the picker, configured per method from the
+registry with the values the deleted views used (auto counts, `value_combo`'s 2–4, charset and
+entropy's identifier-inclusive auto set, numeric-range's numeric candidate list) — so the
+checked set previews what the backend will really scan. New `kind: "field"` renders
+`MethodFieldSelect`, the single-field counterpart, which merges each knob's standard options
+with this timeline's attribute keys. A picked selection travels as a list, which
+`_FieldsParams._join_fields` already accepted alongside the comma-joined string; an untouched
+picker still sends nothing, so "auto" stays the method's own default rather than an empty
+string dressed up as one.
+
+`MethodFieldSelect` renders only the `<select>` and inherits the labelled chrome from the
+caller, so the fix adds no new arbitrary font size to the design-system budget.
 
 ## Session 170 — 2026-08-13: the undo path 1.12.0 dropped
 
