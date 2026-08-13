@@ -19,7 +19,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { AlertTriangle, Eye, EyeOff } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
-import { useIncludeDismissed, useStreamingSweep } from "@/hooks/useMethodFindings";
+import {
+  useIncludeDismissed,
+  useStreamingSweep,
+} from "@/hooks/useMethodFindings";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { useSigmaFindings } from "@/hooks/useSigmaFindings";
 import { useMutedMethods } from "@/hooks/useMutedMethods";
@@ -36,7 +39,9 @@ import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
 /** See FindingGroup: method ids are API keys, detector-registry uses UI slugs. */
-const DETECTOR_BY_API_KEY = Object.fromEntries(DETECTORS.map((d) => [d.detector, d]));
+const DETECTOR_BY_API_KEY = Object.fromEntries(
+  DETECTORS.map((d) => [d.detector, d]),
+);
 
 /**
  * The analyst questions from the design round, surviving as filters over one
@@ -88,7 +93,13 @@ const PRESETS: {
  * and needs only somewhere to watch, while an empty case needs an action and a
  * link to perform it.
  */
-function NoEventsState({ caseId, stillIngesting }: { caseId: string; stillIngesting: boolean }) {
+function NoEventsState({
+  caseId,
+  stillIngesting,
+}: {
+  caseId: string;
+  stillIngesting: boolean;
+}) {
   return (
     <AnalysisEmptyState
       hint={
@@ -97,11 +108,14 @@ function NoEventsState({ caseId, stillIngesting }: { caseId: string; stillIngest
         ) : (
           <>
             Upload a log file on the{" "}
-            <Link to={`/cases/${caseId}`} className="text-[var(--color-accent)] hover:underline">
+            <Link
+              to={`/cases/${caseId}`}
+              className="text-[var(--color-accent)] hover:underline"
+            >
               case overview
             </Link>{" "}
-            to begin — every method here works over a timeline's events, and this one has none
-            yet.
+            to begin — every method here works over a timeline's events, and
+            this one has none yet.
           </>
         )
       }
@@ -117,7 +131,9 @@ interface Props {
   caseId: string;
   timelineId: string;
   onSelectFinding: (method: MethodId, rank: number) => void;
-  onOpenTools: (section?: "methods" | "signatures" | "explore" | "scope") => void;
+  onOpenTools: (
+    section?: "methods" | "signatures" | "explore" | "scope",
+  ) => void;
   onSelectEvent: (event: Event) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
   /** Drill a finding's field/value into the grid's filters. */
@@ -125,7 +141,12 @@ interface Props {
   /** Publish every timestamped finding as a histogram/grid marker. */
   onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
   onComboDrill?: (pairs: [string, string][]) => void;
-  onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
+  onFrequencyDrill?: (
+    field: string,
+    value: string,
+    start: string,
+    end: string,
+  ) => void;
   /** Filter the grid to a Sigma rule's hits, by its `sigma: <title>` tag. */
   onTagFilter?: (tag: string) => void;
 }
@@ -143,13 +164,19 @@ export function InvestigateRail({
   onFrequencyDrill,
   onTagFilter,
 }: Props) {
-  const { byMethod, scope, done, total, planLoading } = useStreamingSweep(caseId, timelineId);
+  const { byMethod, scope, done, total, planLoading } = useStreamingSweep(
+    caseId,
+    timelineId,
+  );
   // Read from the hook rather than from the sweep's return, so the strip and
   // the feed cannot disagree about what is muted — the sweep uses the very
   // same hook to decide what not to fetch.
   const mute = useMutedMethods(caseId, timelineId);
   const muted = mute.muted;
-  const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
+  const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(
+    caseId,
+    timelineId,
+  );
   const { includeDismissed, setIncludeDismissed } = useIncludeDismissed();
   const [preset, setPreset] = useState("all");
   // Findings below their method's `railFloor` are out of the ranked feed until
@@ -181,9 +208,15 @@ export function InvestigateRail({
   // Publish findings onto the histogram and grid. Without this the marks the
   // old panel put there simply vanish, and the timeline stops showing where
   // the findings are — which is most of how an analyst navigates to them.
+  //
+  // Muted methods are filtered here too, not just out of `visible`: disabling
+  // the query does not evict what react-query already cached, so a method
+  // muted mid-session keeps returning findings. "A muted detector leaves the
+  // feed, the histogram and the grid marks" has to hold on this pass as well.
   const markers = useMemo(() => {
     const out: AnomalyMarker[] = [];
     for (const meta of METHODS) {
+      if (muted.has(meta.id)) continue;
       const state = byMethod[meta.id];
       if (!state) continue;
       const detectorMeta = DETECTOR_BY_API_KEY[meta.id];
@@ -200,12 +233,13 @@ export function InvestigateRail({
           sourceId: item.sourceId,
           detector: item.detector as AnomalyMarker["detector"],
           rawDetails: item.raw.details,
-          windowEnd: item.raw.type === "frequency" ? item.raw.window_end : undefined,
+          windowEnd:
+            item.raw.type === "frequency" ? item.raw.window_end : undefined,
         });
       }
     }
     return out;
-  }, [byMethod]);
+  }, [byMethod, muted]);
 
   // Publication is keyed on the markers' *content*, not on the array's
   // identity. The parent stores what it receives in state, so an identity that
@@ -215,7 +249,9 @@ export function InvestigateRail({
   // rather than dependent on every hook above staying memoized.
   const markersRef = useRef(markers);
   markersRef.current = markers;
-  const markerSig = markers.map((m) => `${m.ts}|${m.eventId ?? ""}|${m.detector}`).join("");
+  const markerSig = markers
+    .map((m) => `${m.ts}|${m.eventId ?? ""}|${m.detector}`)
+    .join("");
 
   useEffect(() => {
     if (!onAnomalyMarkers) return;
@@ -226,7 +262,9 @@ export function InvestigateRail({
   // Muted methods this preset would otherwise have shown. Distinguishes "this
   // preset is empty because nothing applies" from "…because you silenced it".
   const presetMuted = METHODS.filter(
-    (m) => (active.methods === null || active.methods.includes(m.id)) && muted.has(m.id),
+    (m) =>
+      (active.methods === null || active.methods.includes(m.id)) &&
+      muted.has(m.id),
   );
   const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);
@@ -236,7 +274,9 @@ export function InvestigateRail({
   // Both empty states are claims about *what this preset shows*, so they are
   // counted over `visible` — the sweep's global done/total would let a preset
   // whose own methods never ran inherit "clear" from methods it hides.
-  const visibleRunnable = visible.filter((m) => byMethod[m.id].status === "applicable");
+  const visibleRunnable = visible.filter(
+    (m) => byMethod[m.id].status === "applicable",
+  );
   const visibleSettled = visibleRunnable.every((m) => !byMethod[m.id].pending);
 
   // Said before anything else, and instead of everything else: a findings list
@@ -322,10 +362,13 @@ export function InvestigateRail({
           data-testid="method-errors"
           className="flex items-start gap-1.5 rounded border border-[var(--color-warning)] bg-[var(--color-warning-dim)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
         >
-          <AlertTriangle size={11} className="mt-0.5 shrink-0 text-[var(--color-warning)]" />
+          <AlertTriangle
+            size={11}
+            className="mt-0.5 shrink-0 text-[var(--color-warning)]"
+          />
           <span>
-            {errored.map((m) => m.label).join(", ")} failed to run. Other methods are unaffected —
-            open Tools to retry.
+            {errored.map((m) => m.label).join(", ")} failed to run. Other
+            methods are unaffected — open Tools to retry.
           </span>
         </p>
       )}
@@ -346,10 +389,15 @@ export function InvestigateRail({
           onFrequencyDrill={onFrequencyDrill}
           extraRows={
             cls.id === "named" && showSigma ? (
-              <SigmaFindingRows findings={sigmaFindings} onTagFilter={onTagFilter} />
+              <SigmaFindingRows
+                findings={sigmaFindings}
+                onTagFilter={onTagFilter}
+              />
             ) : null
           }
-          extraCount={cls.id === "named" && showSigma ? sigmaFindings.length : 0}
+          extraCount={
+            cls.id === "named" && showSigma ? sigmaFindings.length : 0
+          }
           showWeak={showWeak}
           onShowWeak={() => setShowWeak(true)}
         />
@@ -360,26 +408,39 @@ export function InvestigateRail({
           runnable yet, so the check is vacuously true), while any of this
           preset's methods is still pending, or when none of them was runnable
           at all — a preset whose methods all need setup checked nothing. */}
-      {!anyFindings && !planLoading && visibleRunnable.length > 0 && visibleSettled && (
-        <AnalysisEmptyState hint="Open Tools to run a method the gate skipped, or set a baseline to enable the comparison methods.">
-          No findings under this scope.
-        </AnalysisEmptyState>
-      )}
+      {!anyFindings &&
+        !planLoading &&
+        visibleRunnable.length > 0 &&
+        visibleSettled && (
+          <AnalysisEmptyState hint="Open Tools to run a method the gate skipped, or set a baseline to enable the comparison methods.">
+            No findings under this scope.
+          </AnalysisEmptyState>
+        )}
 
       {/* Every method under this preset gated off. Not the same statement as
           "nothing found" — nothing ran. And when the reason nothing ran is that
           the analyst muted it, saying "no method applies" would blame the gate
-          for a choice somebody made: two different situations, two states. */}
-      {!planLoading && visibleRunnable.length === 0 && presetMuted.length > 0 && (
-        <AnalysisEmptyState hint="Unmute a detector in the strip above to put it back in the sweep, or open Tools to run one without unmuting it.">
-          Every detector for this view is muted.
-        </AnalysisEmptyState>
-      )}
-      {!planLoading && visibleRunnable.length === 0 && presetMuted.length === 0 && (
-        <AnalysisEmptyState hint="Open Tools to see why each was skipped and run one anyway, or set a baseline to enable the comparison methods.">
-          No method applies to this data yet.
-        </AnalysisEmptyState>
-      )}
+          for a choice somebody made: two different situations, two states.
+          Both are guarded by `!anyFindings` because a preset can list findings
+          that came from no method at all: Known-bad is `methods: []` and draws
+          entirely on Sigma, so it has zero runnable methods *by construction*
+          and would otherwise disclaim the rule hits printed right above it. */}
+      {!anyFindings &&
+        !planLoading &&
+        visibleRunnable.length === 0 &&
+        presetMuted.length > 0 && (
+          <AnalysisEmptyState hint="Unmute a detector in the strip above to put it back in the sweep, or open Tools to run one without unmuting it.">
+            Every detector for this view is muted.
+          </AnalysisEmptyState>
+        )}
+      {!anyFindings &&
+        !planLoading &&
+        visibleRunnable.length === 0 &&
+        presetMuted.length === 0 && (
+          <AnalysisEmptyState hint="Open Tools to see why each was skipped and run one anyway, or set a baseline to enable the comparison methods.">
+            No method applies to this data yet.
+          </AnalysisEmptyState>
+        )}
 
       {/* A skipped method is never a zero — a zero reads as "checked, clear",
           and these were not checked. The count routes into the accounting. */}
@@ -389,8 +450,8 @@ export function InvestigateRail({
           onClick={() => onOpenTools("methods")}
           className="w-full rounded border border-dashed border-[var(--color-border)] px-2 py-1.5 text-left text-[11px] text-[var(--color-fg-muted)] transition-base hover:border-[var(--color-border-strong)] hover:text-[var(--color-fg-secondary)]"
         >
-          {skipped.length} method{skipped.length === 1 ? "" : "s"} not applicable here — see why, or
-          run anyway
+          {skipped.length} method{skipped.length === 1 ? "" : "s"} not
+          applicable here — see why, or run anyway
         </button>
       )}
     </div>

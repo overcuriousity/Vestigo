@@ -5,35 +5,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- **Detectors can be muted per timeline.** Some defects belong to the evidence rather than
-  to the behavior it records — a capture whose sources disagree about the clock makes
-  `timestamp_order` fire on millions of true, useless findings — so a strip at the top of
-  the Investigate rail takes a method out of the sweep entirely: no findings, no histogram
-  or grid marks, no query issued. The mute is shared case state on the timeline
-  (`PATCH .../timelines/{id}/muted-methods`, audited) rather than a browser preference, so
-  the next analyst inherits the conclusion instead of rediscovering it. It is a reading
-  preference and never a lock: the analysis plan does not consult it, and a muted method
-  still runs from Tools when asked for by name. The rail always names how many detectors it
-  is holding back, and the Tools accounting counts them apart from both "ran" and "skipped".
-
-### Changed
-
-- **The Tools sheet is now tabbed, Scope first, and reachable directly.** Its four sections
-  were one long scroll in which a thousand-row template list buried the baseline picker —
-  the control that reframes every other section — below all of it. Each section is now its
-  own tab that scrolls independently, and the Investigate rail header carries a Tools
-  button, so the sheet no longer has to be reached sideways through an error message or the
-  skipped-methods summary. Every existing entry point still lands on its own section.
-
-### Fixed
-
-- The Sigma and pattern-mining guidance panels rendered twice in the Tools sheet, once from
-  the sheet and once from the panel inside it.
-
 ## [1.12.0] — 2026-08-13
 
 ### Added
@@ -54,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their compiled statement and presenting one anyway would be a claim we cannot point at
   code for. The method's parameters are editable in place and re-run from there, which is
   what keeps the analysis gate advice rather than a lock in the UI as well as the API.
+- **Detectors can be muted per timeline.** Some defects belong to the evidence rather than
+  to the behavior it records — a capture whose sources disagree about the clock makes
+  `timestamp_order` fire on millions of true, useless findings — so a strip at the top of
+  the Investigate rail takes a method out of the sweep entirely: no findings, no histogram
+  or grid marks, no query issued. The mute is shared case state on the timeline
+  (`PATCH .../timelines/{id}/muted-methods`, audited) rather than a browser preference, so
+  the next analyst inherits the conclusion instead of rediscovering it. It is a reading
+  preference and never a lock: the analysis plan does not consult it, and a muted method
+  still runs from Tools when asked for by name. The rail always names how many detectors it
+  is holding back, and the Tools accounting counts them apart from both "ran" and "skipped".
 - **An analysis gate.** `GET /api/cases/{id}/timelines/{id}/analysis/plan` answers, per
   method and without scanning a single event, whether that method *can* produce a finding
   on this data — from the per-source field-stats cache plus one timestamp-range probe. A
@@ -82,6 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Tools sheet is tabbed, Scope first, and reachable directly.** Its four sections
+  were one long scroll in which a thousand-row template list buried the baseline picker —
+  the control that reframes every other section — below all of it. Each section is now its
+  own tab that scrolls independently, and the Investigate rail header carries a Tools
+  button, so the sheet no longer has to be reached sideways through an error message or the
+  skipped-methods summary. Every existing entry point still lands on its own section.
 - **The rail's ranked feed carries a display floor for the two band methods.** Findings
   rotate method-by-method so every method has a row near the top, which means a value one
   band width outside its learned band would otherwise sit above one tens of band widths
@@ -96,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Investigate sheet is positioned against the grid stage it belongs to. It and its scrim
+  had no positioned ancestor, so both resolved against the viewport: the sheet covered the
+  top bar and toolbar, and a full-page scrim swallowed every click in the application.
+- Muting a detector clears its histogram and grid marks in the same session. Disabling the
+  sweep's query does not evict what was already fetched, so the rows left the feed and the
+  strip reported the mute while every mark stayed on the timeline.
+- The "Known-bad" preset no longer prints "no method applies to this data yet" underneath
+  the Sigma rule hits it is listing. It is a Sigma-only preset, so it has no runnable method
+  by construction, and that empty state was not guarded by whether anything had been found.
+- The Sigma and pattern-mining guidance panels rendered twice in the Tools sheet, once from
+  the sheet and once from the panel inside it.
 - A `confirmed` verdict is deduplicated by the comparison it was reached under — frame and
   baseline id — rather than by the whole scope object, so renaming a baseline no longer
   splits one claim into two rows with two system annotations.

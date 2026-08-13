@@ -26,7 +26,10 @@ import { METHODS } from "@/components/analysis/method-registry";
 import type { AnomalyMarker } from "@/api/types";
 
 vi.mock("@/hooks/useTimelineReadiness", () => ({
-  useTimelineReadiness: () => ({ stillIngesting: false, nothingToAnalyse: false }),
+  useTimelineReadiness: () => ({
+    stillIngesting: false,
+    nothingToAnalyse: false,
+  }),
 }));
 vi.mock("@/hooks/useSigmaFindings", () => ({
   useSigmaFindings: () => ({ findings: [] }),
@@ -100,7 +103,11 @@ vi.mock("@/api/analysis", async (importOriginal) => {
 vi.mock("@/api/timelines", () => ({
   timelinesApi: {
     get: () =>
-      Promise.resolve({ id: "t1", case_id: "c1", muted_methods: [...timeline.muted] }),
+      Promise.resolve({
+        id: "t1",
+        case_id: "c1",
+        muted_methods: [...timeline.muted],
+      }),
     patchMutedMethods: (_c: string, _t: string, next: string[]) => {
       patched.calls.push(next);
       timeline.muted = next;
@@ -110,7 +117,9 @@ vi.mock("@/api/timelines", () => ({
 }));
 
 vi.mock("@/api/cases", () => ({
-  casesApi: { get: () => Promise.resolve({ id: "c1", access_level: "contribute" }) },
+  casesApi: {
+    get: () => Promise.resolve({ id: "c1", access_level: "contribute" }),
+  },
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -162,7 +171,39 @@ describe("muting a detector", () => {
     renderRail((m) => markers.push(m));
     await waitFor(() => expect(asked.methods.length).toBe(METHODS.length - 1));
     await waitFor(() => expect(markers.at(-1)?.length).toBeGreaterThan(0));
-    expect(markers.at(-1)?.some((m) => m.detector === "timestamp_order")).toBe(false);
+    expect(markers.at(-1)?.some((m) => m.detector === "timestamp_order")).toBe(
+      false,
+    );
+  });
+
+  it("clears the muted method's marks when the mute happens mid-session", async () => {
+    // The case the mute is actually written for: the findings are already on
+    // screen and littering the histogram when the analyst silences them.
+    // Disabling the query does not evict what react-query already cached, so
+    // the marks survive unless the publisher filters on `muted` too.
+    const markers: AnomalyMarker[][] = [];
+    renderRail((m) => markers.push(m));
+    await waitFor(() =>
+      expect(
+        markers.at(-1)?.some((m) => m.detector === "timestamp_order"),
+      ).toBe(true),
+    );
+
+    fireEvent.click(screen.getByTestId("detector-mute-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("mute-chip-timestamp_order")).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByTestId("mute-chip-timestamp_order"));
+
+    await waitFor(() =>
+      expect(
+        markers.at(-1)?.some((m) => m.detector === "timestamp_order"),
+      ).toBe(false),
+    );
+    // The control method's mark is untouched — this is a mute, not a clear.
+    expect(markers.at(-1)?.some((m) => m.detector === "value_novelty")).toBe(
+      true,
+    );
   });
 
   it("says how many detectors it is holding back", async () => {
@@ -171,20 +212,26 @@ describe("muting a detector", () => {
     timeline.muted = ["timestamp_order", "entropy"];
     renderRail();
     await waitFor(() =>
-      expect(screen.getByTestId("detector-mute-count")).toHaveTextContent("2 muted"),
+      expect(screen.getByTestId("detector-mute-count")).toHaveTextContent(
+        "2 muted",
+      ),
     );
   });
 
   it("claims nothing when nothing is muted", async () => {
     renderRail();
-    await waitFor(() => expect(screen.getByTestId("detector-mute-strip")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("detector-mute-strip")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("detector-mute-count")).toBeNull();
   });
 
   it("mutes a detector by its method id", async () => {
     renderRail();
     fireEvent.click(screen.getByTestId("detector-mute-toggle"));
-    await waitFor(() => expect(screen.getByTestId("mute-chip-timestamp_order")).toBeEnabled());
+    await waitFor(() =>
+      expect(screen.getByTestId("mute-chip-timestamp_order")).toBeEnabled(),
+    );
     fireEvent.click(screen.getByTestId("mute-chip-timestamp_order"));
     await waitFor(() => expect(patched.calls).toEqual([["timestamp_order"]]));
   });
@@ -204,7 +251,9 @@ describe("muting a detector", () => {
     for (const m of METHODS) timeline.muted.push(m.id);
     renderRail();
     await waitFor(() =>
-      expect(screen.getByText(/every detector for this view is muted/i)).toBeInTheDocument(),
+      expect(
+        screen.getByText(/every detector for this view is muted/i),
+      ).toBeInTheDocument(),
     );
     expect(screen.queryByText(/no method applies to this data/i)).toBeNull();
   });

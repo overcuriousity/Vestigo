@@ -31,7 +31,11 @@ vi.mock("@/hooks/useTimelineReadiness", () => ({
 
 const sigma = vi.hoisted(() => ({ current: [] as unknown[] }));
 vi.mock("@/hooks/useSigmaFindings", () => ({
-  useSigmaFindings: () => ({ findings: sigma.current, isLoading: false, available: true }),
+  useSigmaFindings: () => ({
+    findings: sigma.current,
+    isLoading: false,
+    available: true,
+  }),
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -58,7 +62,13 @@ const finding = (over: Record<string, unknown> = {}) => ({
 function state(id: string, over: Record<string, unknown> = {}) {
   return {
     meta: METHODS_BY_ID[id as keyof typeof METHODS_BY_ID],
-    plan: { method: id, status: "applicable", reason: "", reason_facts: {}, cost_class: "cheap" },
+    plan: {
+      method: id,
+      status: "applicable",
+      reason: "",
+      reason_facts: {},
+      cost_class: "cheap",
+    },
     status: "applicable",
     findings: [],
     total: 0,
@@ -98,29 +108,45 @@ function renderRail(
 describe("InvestigateRail", () => {
   beforeEach(() => {
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
-    dismissed.current = { includeDismissed: false, setIncludeDismissed: () => {} };
+    dismissed.current = {
+      includeDismissed: false,
+      setIncludeDismissed: () => {},
+    };
   });
 
   it("orders groups strongest-claim first", () => {
     renderRail({
       byMethod: {
-        value_novelty: state("value_novelty", { findings: [finding()], total: 1 }),
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
         log_template: state("log_template", {
-          findings: [{ template: "GET <PATH> <NUM>", count: 6, template_hash: "h1" }],
+          findings: [
+            { template: "GET <PATH> <NUM>", count: 6, template_hash: "h1" },
+          ],
           total: 1,
         }),
       },
     });
-    const headings = screen.getAllByTestId("evidence-group").map((el) => el.textContent);
+    const headings = screen
+      .getAllByTestId("evidence-group")
+      .map((el) => el.textContent);
     expect(headings[0]).toContain("Statistical outliers");
     expect(headings[1]).toContain("Exploration");
   });
 
   it("states the scope it is showing findings under", () => {
     renderRail({
-      scope: { frame: "baseline", baseline_id: "bl-1", baseline_name: "Feb 24 – Mar 1" },
+      scope: {
+        frame: "baseline",
+        baseline_id: "bl-1",
+        baseline_name: "Feb 24 – Mar 1",
+      },
     });
-    expect(screen.getByTestId("scope-strip")).toHaveTextContent("Feb 24 – Mar 1");
+    expect(screen.getByTestId("scope-strip")).toHaveTextContent(
+      "Feb 24 – Mar 1",
+    );
   });
 
   it("never renders a gated method as an all-clear", () => {
@@ -163,7 +189,12 @@ describe("InvestigateRail", () => {
       done: 1,
       total: 1,
       planLoading: false,
-      byMethod: { value_novelty: state("value_novelty", { findings: [finding()], total: 1 }) },
+      byMethod: {
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
+      },
     };
     render(
       <InvestigateRail
@@ -183,17 +214,20 @@ describe("InvestigateRail", () => {
     // "No findings under this scope" on a timeline with no events reads as an
     // all-clear. Nothing was scanned; there was nothing to scan.
     renderRail({}, { stillIngesting: false, nothingToAnalyse: true });
-    expect(screen.getByText("No events in this timeline yet.")).toBeInTheDocument();
+    expect(
+      screen.getByText("No events in this timeline yet."),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
-    expect(screen.getByRole("link", { name: /case overview/i })).toHaveAttribute(
-      "href",
-      "/cases/c1",
-    );
+    expect(
+      screen.getByRole("link", { name: /case overview/i }),
+    ).toHaveAttribute("href", "/cases/c1");
   });
 
   it("says the sources are still ingesting rather than that there is nothing", () => {
     renderRail({}, { stillIngesting: true, nothingToAnalyse: true });
-    expect(screen.getByText("This timeline's sources are still ingesting.")).toBeInTheDocument();
+    expect(
+      screen.getByText("This timeline's sources are still ingesting."),
+    ).toBeInTheDocument();
   });
 
   it("makes no all-clear claim while the plan is still resolving", () => {
@@ -206,7 +240,9 @@ describe("InvestigateRail", () => {
 
   it("distinguishes nothing-found from nothing-ran", () => {
     renderRail({ done: 0, total: 0, planLoading: false });
-    expect(screen.getByText(/No method applies to this data yet/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No method applies to this data yet/i),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
   });
 
@@ -219,7 +255,10 @@ describe("InvestigateRail", () => {
       done: 2,
       total: 2,
       byMethod: {
-        value_novelty: state("value_novelty", { findings: [finding()], total: 1 }),
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
         frequency: state("frequency", {
           status: "not_applicable",
           plan: {
@@ -232,9 +271,13 @@ describe("InvestigateRail", () => {
         }),
       },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Changed vs. baseline" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Changed vs. baseline" }),
+    );
     expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
-    expect(screen.getByText(/No method applies to this data yet/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No method applies to this data yet/i),
+    ).toBeInTheDocument();
   });
 
   it("still says nothing-found when this preset's methods did all run", () => {
@@ -244,7 +287,9 @@ describe("InvestigateRail", () => {
       byMethod: { value_novelty: state("value_novelty") },
     });
     fireEvent.click(screen.getByRole("button", { name: "Unusual values" }));
-    expect(screen.getByText(/No findings under this scope/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No findings under this scope/i),
+    ).toBeInTheDocument();
   });
 
   it("keeps a barely-out-of-band finding out of the ranked feed, and says so", () => {
@@ -284,7 +329,10 @@ describe("InvestigateRail", () => {
     // `frequency` carries `z_threshold`, so its floor belongs in the run.
     renderRail({
       byMethod: {
-        value_novelty: state("value_novelty", { findings: [finding({ score: 0.4 })], total: 1 }),
+        value_novelty: state("value_novelty", {
+          findings: [finding({ score: 0.4 })],
+          total: 1,
+        }),
       },
     });
     expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
@@ -294,11 +342,16 @@ describe("InvestigateRail", () => {
   it("renders a method's error without hiding the rest of the stream", () => {
     renderRail({
       byMethod: {
-        value_novelty: state("value_novelty", { findings: [finding()], total: 1 }),
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
         charset: state("charset", { error: true }),
       },
     });
-    expect(screen.getByTestId("method-errors")).toHaveTextContent(/charset|Charset/i);
+    expect(screen.getByTestId("method-errors")).toHaveTextContent(
+      /charset|Charset/i,
+    );
     expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
   });
 
@@ -329,7 +382,9 @@ describe("scope provenance on a row", () => {
         }),
       },
     });
-    expect(screen.getByTestId("confirmed-other-scope")).toHaveTextContent("confirmed elsewhere");
+    expect(screen.getByTestId("confirmed-other-scope")).toHaveTextContent(
+      "confirmed elsewhere",
+    );
     expect(screen.queryByText(/^confirmed$/)).toBeNull();
   });
 
@@ -393,7 +448,10 @@ describe("named techniques", () => {
     sigma.current = [HIT];
     renderRail({
       byMethod: {
-        value_novelty: state("value_novelty", { findings: [finding()], total: 1 }),
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
       },
     });
     fireEvent.click(screen.getByRole("button", { name: "Known-bad" }));
@@ -403,5 +461,26 @@ describe("named techniques", () => {
     fireEvent.click(screen.getByRole("button", { name: "Unusual values" }));
     expect(screen.queryByText("psexec service install")).toBeNull();
     expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
+  });
+
+  it("does not disclaim the hits it is showing under Known-bad", () => {
+    // Known-bad is `methods: []`, so it has no runnable method *by
+    // construction* — which used to print "No method applies to this data yet"
+    // directly underneath the rule rows it had just listed.
+    sigma.current = [HIT];
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Known-bad" }));
+    expect(screen.getByText("psexec service install")).toBeInTheDocument();
+    expect(screen.queryByText(/no method applies to this data/i)).toBeNull();
+    expect(
+      screen.queryByText(/every detector for this view is muted/i),
+    ).toBeNull();
   });
 });

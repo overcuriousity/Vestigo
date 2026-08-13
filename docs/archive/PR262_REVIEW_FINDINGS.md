@@ -1,8 +1,10 @@
 # PR #262 review findings — `redesign/investigate-panel`
 
-Point-in-time record of the fourth review round on the Investigate redesign (analysis gate,
-fingerprint cache, scope provenance, the rail and its sheet). Ten defects, all resolved in
-session 166 unless noted. Kept in full here so `ROADMAP.md` carries pointers rather than prose.
+Point-in-time record of the review rounds on the Investigate redesign (analysis gate,
+fingerprint cache, scope provenance, the rail and its sheet). Ten defects from the fourth
+round, all resolved in session 166 unless noted, plus three from the seventh round in session
+169 (see the last section). Kept in full here so `ROADMAP.md` carries pointers rather than
+prose.
 
 Verified clean at review time: `uv run ruff check .`, `npx tsc -b --noEmit`, `npm run lint`.
 The `analysis_cache` payload path is JSON-safe (`_normalize_event_datetimes` stringifies
@@ -124,3 +126,47 @@ Found while comparing the shipped surface against the mockup the redesign was ch
   "Windows & normality below" and was itself unreferenced; several docstrings still said
   "the Patterns tab". Fixed; `NeedsBaselinePrompt` deleted. `AnomalyFieldPicker` is also
   unmounted but was **kept** — the `fields`-knob roadmap item wires that exact component back in.
+
+## Seventh review round — three defects, all in the new UI (session 169)
+
+Reviewed against `main...HEAD` once the mute strip had landed. The backend halves of the
+redesign — the fingerprint cache's key coverage, the gate's advice-not-lock property, and
+`scope_identity`'s narrowing across the hit and miss paths — were re-read and held. All three
+findings were in the surface itself, and each was verified failing before the fix.
+
+**11. The Investigate sheet had no positioned ancestor.** `InvestigateSheet` renders
+`absolute top-0 …` over a scrim of `absolute inset-0`, and its docstring says it is positioned
+inside the grid stage — but the stage row, its parents, `ExplorerPage`'s root and `AppShell`
+were all `position: static`. The only `relative` on the page is on the rail, which is the
+sheet host's *sibling*; `overflow-hidden` establishes no containing block. Both elements
+therefore resolved against the viewport: the sheet covered the top bar and toolbar instead of
+the stage, and the full-viewport scrim swallowed every click in the application. **Fixed:**
+`relative` on the stage container, with a comment saying it is load-bearing — this is the kind
+of class a later tidy-up deletes as decorative.
+
+**12. The "Known-bad" preset disclaimed the hits it was showing.** That preset is
+`methods: []` by construction — it draws entirely on Sigma — so `visibleRunnable` is
+necessarily empty, and the "No method applies to this data yet" state was not guarded by
+`anyFindings` the way the "No findings under this scope" state above it is. With Sigma
+configured and a completed run, the rail listed the rule hits and then denied them in the
+next paragraph. **Fixed:** both `visibleRunnable.length === 0` states now require
+`!anyFindings`, which already counts Sigma.
+
+**13. Muting a detector mid-session left its histogram and grid marks.** The marker publisher
+iterated all of `METHODS` with no `muted` check, unlike `visible`. Muting only flips the
+sweep's queries to `enabled: false`, and react-query keeps serving the data it already cached
+for a disabled query, so the findings stayed live for the rest of the session. The rows left
+the feed and the strip said "1 muted" while every mark stayed on the timeline — the exact
+contradiction of the mute's own promise, in the one scenario it exists for (the analyst mutes
+`timestamp_order` *after* its findings have littered the histogram). The existing
+`detectorMute.test.tsx` only covered muted-at-mount, where nothing was ever fetched.
+**Fixed:** `markers` filters on `muted`, with a regression test that mutes through the strip
+after the marks are on screen.
+
+Not counted as findings, both noted for the follow-up queue: `lib/triage-coverage.ts`'s
+`computeDetectorCoverage` still counts disposition *rows* per kind rather than distinct
+findings, which one finding carrying two `confirmed` rows (one per baseline) now makes wrong —
+harmless only because `useTriageCoverage` lost its last consumer when `TriageBurndown` was
+deleted, i.e. it is dead code that should either be revived correctly or removed. And
+`useMutedMethods`'s `write` callback depends on the whole mutation object, so `toggle` and
+`unmuteAll` change identity every render; no correctness impact today.

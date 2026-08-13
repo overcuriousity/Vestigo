@@ -1,10 +1,44 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-13 (session 168 — per-timeline detector muting, and the Tools sheet
-restructured into tabs).
+Last updated: 2026-08-13 (session 169 — the seventh PR #262 review, and 1.12.0 shipped).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 169 — 2026-08-13: the last review round on the Investigate redesign, and 1.12.0
+
+Seventh review pass over `main...redesign/investigate-panel`. The backend halves held — the
+findings cache's key coverage, the gate staying advice rather than a lock, `scope_identity`
+narrowing the same way on the hit and the miss path — and all three defects were in the new
+surface. Full text in [`archive/PR262_REVIEW_FINDINGS.md`](./archive/PR262_REVIEW_FINDINGS.md)
+§"Seventh review round"; the short version:
+
+The Investigate sheet had **no positioned ancestor**. Its docstring says it is positioned
+inside the grid stage, and every parent up to `AppShell` was static, so the sheet and its
+scrim both resolved against the viewport: the sheet sat over the top bar and the scrim ate
+every click in the application. One `relative`, and a comment saying so — an unexplained
+utility class on a container is exactly what a later tidy-up deletes as decorative.
+
+The other two are the same shape as each other, and the same shape as the misread this whole
+surface exists to prevent: **a UI making a claim it had not checked.** "Known-bad" is a
+Sigma-only preset with `methods: []`, so it has no runnable method by construction and
+printed "no method applies to this data yet" directly under the rule hits it had just listed.
+And muting a detector mid-session left its histogram and grid marks: disabling a query does
+not evict what react-query already cached, so the marks outlived the rows in exactly the
+scenario the mute was written for — an analyst silencing `timestamp_order` *after* three
+million clock-skew findings have littered the timeline. The existing test only covered
+muted-at-mount, where nothing had ever been fetched; the regression test now mutes through
+the strip with the marks already on screen.
+
+Two follow-ups left as notes rather than fixes: `computeDetectorCoverage` counts disposition
+rows where it now needs distinct findings, harmless only because `useTriageCoverage` became
+dead code when `TriageBurndown` was deleted — revive it correctly or remove it; and
+`useMutedMethods`'s `write` depends on the whole mutation object, so its callbacks change
+identity every render.
+
+**1.12.0.** The muting work landed after the release commit but before the tag, so it folded
+into 1.12.0 rather than opening a 1.13.0 — the same call as `1baf8b5` made for 1.11.0. The
+branch merged to `main` and the tag was cut there.
 
 ## Session 168 — 2026-08-13: muting a detector, and Tools stops being a scroll
 
