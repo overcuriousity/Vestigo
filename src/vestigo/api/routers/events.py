@@ -60,6 +60,7 @@ from vestigo.db.postgres import (
     User,
     dispositions_hash,
     generate_id,
+    scope_identity,
 )
 from vestigo.db.queries import EventQuery, EventQueryService, TagFilter
 from vestigo.db.similarity import EncoderUnavailableError, SimilarityService
@@ -2450,22 +2451,71 @@ def _apply_dismissals(
     return payload
 
 
-def _apply_confirmations(payload: dict[str, Any], confirmed_rows: list[Any]) -> dict[str, Any]:
+def _scope_key(scope: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """The two fields that identify a comparison: frame and baseline id.
+
+    Delegates to :func:`vestigo.db.postgres.scope_identity` so badging here and
+    the ``confirmed`` dedupe there cannot drift: one narrowing and the other
+    comparing whole dicts is how the same verdict gets written twice and then
+    displayed once.
+    """
+    return scope_identity(scope)
+
+
+def _apply_confirmations(
+    payload: dict[str, Any],
+    confirmed_rows: list[Any],
+    analysis_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Stamp ``"confirmed": true`` on findings covered by a confirmed disposition.
 
     Presentation-only, like :func:`_apply_dismissals` — the flag lets the UI
     render a durable confirmed state (badge, disabled re-confirm) instead of
     leaving the row indistinguishable from an untriaged one. Confirmed
     dispositions are always event-scoped with a concrete detector
-    (``_validate_scope``), so matching is by ``event_id`` alone; the
+    (``_validate_scope``), so the *event* is what identifies the finding; the
     dispositions read is already detector-filtered.
+
+    The event alone is not the whole claim, though. ``confirmed`` is the one
+    kind whose ``disposition_identity`` includes the scope, precisely so that
+    escalating a finding against the February baseline and again against the
+    March one are two claims. Badging by event alone collapses them back: the
+    February verdict would badge the row under March and disable Confirm, so
+    the second claim could never be made from the UI.
+
+    So, given a scope:
+
+    - a row reached under the *same* comparison sets ``confirmed``;
+    - a row reached under a *different* one sets ``confirmed_other_scope``,
+      which the rail renders as a muted marker with Confirm still live — this
+      is the "marked so you can re-examine them" the scope-change dialog
+      promises;
+    - a row carrying **no** scope sets ``confirmed`` under every comparison. It
+      predates scope provenance, and demoting it would silently unbadge
+      existing evidence to assert something the database never recorded.
+
+    ``analysis_scope=None`` means scope-blind, which is the older
+    ``/anomalies`` endpoints' behavior and what they keep passing.
     """
-    event_ids = {d.event_id for d in confirmed_rows if d.event_id is not None}
-    if not event_ids:
+    if not confirmed_rows:
         return payload
+    want = _scope_key(analysis_scope)
+    in_scope: set[str] = set()
+    other_scope: set[str] = set()
+    for d in confirmed_rows:
+        if d.event_id is None:
+            continue
+        recorded = getattr(d, "analysis_scope", None)
+        if analysis_scope is None or recorded is None or _scope_key(recorded) == want:
+            in_scope.add(d.event_id)
+        else:
+            other_scope.add(d.event_id)
     for f in payload.get("results", []):
-        if f.get("event_id") in event_ids:
+        event_id = f.get("event_id")
+        if event_id in in_scope:
             f["confirmed"] = True
+        elif event_id in other_scope:
+            f["confirmed_other_scope"] = True
     return payload
 
 
@@ -3367,6 +3417,15 @@ class PersistAnomalyFindingRequest(BaseModel):
         description="Human-readable finding description, as shown in the Analysis panel.",
     )
     details: dict[str, Any] = Field(default_factory=dict)
+    analysis_scope: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "The comparison this verdict was reached under (frame, baseline_id), as "
+            "recorded on the disposition. Confirmed is the only kind whose identity "
+            "includes it, so two analysts confirming the same event against different "
+            "baselines make two distinct claims rather than one deduplicated row."
+        ),
+    )
 
 
 @router.post("/{case_id}/sources/{source_id}/events/{event_id}/anomalies/persist")
@@ -3411,6 +3470,7 @@ async def persist_anomaly_finding(
         source_id=source_id,
         event_id=event_id,
         details=body.details,
+        analysis_scope=body.analysis_scope,
         created_by=user.id,
     )
     publish_annotation_change(case_id, None, event_id, user)
@@ -3424,6 +3484,7 @@ async def persist_anomaly_finding(
             "detector": body.detector,
             "source_id": source_id,
             "disposition_id": disposition.id,
+            "analysis_scope": body.analysis_scope,
         },
     )
     return {"annotation": annotation.to_dict(), "disposition": disposition.to_dict()}

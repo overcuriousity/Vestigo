@@ -1,10 +1,565 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-07 (session 161 — the second PR #242 review pass: two ways two
-enrichment applies could still meet).
+Last updated: 2026-08-13 (session 169 — the seventh PR #262 review, and 1.12.0 shipped).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 169 — 2026-08-13: the last review round on the Investigate redesign, and 1.12.0
+
+Seventh review pass over `main...redesign/investigate-panel`. The backend halves held — the
+findings cache's key coverage, the gate staying advice rather than a lock, `scope_identity`
+narrowing the same way on the hit and the miss path — and all three defects were in the new
+surface. Full text in [`archive/PR262_REVIEW_FINDINGS.md`](./archive/PR262_REVIEW_FINDINGS.md)
+§"Seventh review round"; the short version:
+
+The Investigate sheet had **no positioned ancestor**. Its docstring says it is positioned
+inside the grid stage, and every parent up to `AppShell` was static, so the sheet and its
+scrim both resolved against the viewport: the sheet sat over the top bar and the scrim ate
+every click in the application. One `relative`, and a comment saying so — an unexplained
+utility class on a container is exactly what a later tidy-up deletes as decorative.
+
+The other two are the same shape as each other, and the same shape as the misread this whole
+surface exists to prevent: **a UI making a claim it had not checked.** "Known-bad" is a
+Sigma-only preset with `methods: []`, so it has no runnable method by construction and
+printed "no method applies to this data yet" directly under the rule hits it had just listed.
+And muting a detector mid-session left its histogram and grid marks: disabling a query does
+not evict what react-query already cached, so the marks outlived the rows in exactly the
+scenario the mute was written for — an analyst silencing `timestamp_order` *after* three
+million clock-skew findings have littered the timeline. The existing test only covered
+muted-at-mount, where nothing had ever been fetched; the regression test now mutes through
+the strip with the marks already on screen.
+
+Two follow-ups left as notes rather than fixes: `computeDetectorCoverage` counts disposition
+rows where it now needs distinct findings, harmless only because `useTriageCoverage` became
+dead code when `TriageBurndown` was deleted — revive it correctly or remove it; and
+`useMutedMethods`'s `write` depends on the whole mutation object, so its callbacks change
+identity every render.
+
+**1.12.0.** The muting work landed after the release commit but before the tag, so it folded
+into 1.12.0 rather than opening a 1.13.0 — the same call as `1baf8b5` made for 1.11.0. The
+branch merged to `main` and the tag was cut there.
+
+## Session 168 — 2026-08-13: muting a detector, and Tools stops being a scroll
+
+**Muting.** Reading the rail against the same 7.8M-event capture surfaced a class of finding
+no threshold fixes: `timestamp_order` returned 2.97M hits because that capture's sources
+disagree about the clock. Every one of them is true, and none of them is the investigation —
+a defect in the evidence rather than in the behavior it records. Dismissing them one at a
+time is not triage, so a method can now be taken out of the sweep: `Timeline.muted_methods`
+(migration 0028), written through an audited `PATCH .../muted-methods`.
+
+Shared state, not a browser preference — the first instinct was localStorage beside the
+column choices, and it was wrong. "This source's clocks are a mess" is a conclusion about the
+*data*, and the next analyst on the case should inherit it rather than rediscover it against
+three million rows.
+
+The care went into keeping the mute from becoming the thing this surface exists to prevent.
+The plan endpoint does not consult it: a mute is not a claim that the method cannot score
+here, and folding it into `not_applicable` would have put an analyst's preference into the
+gate's mouth. `/analysis/findings` still runs a muted method by name, so Tools' "Run anyway"
+means the same thing for a mute as it does for a gate verdict. The client is the only thing
+that skips, in one place — `useStreamingSweep` never issues the query — which is what makes
+"gone from the feed, the histogram markers and the progress denominator" follow from one
+decision rather than three that drift apart. And a muted row shows no count at all, because
+its query never ran and a `0` there would assert exactly the "checked, clear" misread the
+rail is built around. The rail's top strip always states how many detectors are held back.
+
+**Tools.** Four sections in one scroll worked until the template list reached a thousand rows
+and put the baseline picker — the control that reframes every other section — below all of
+it. Tabs now, Scope leading, each scrolling on its own; the section a rail affordance asks
+for selects a tab instead of scroll-jumping, and a tab that vanishes under the selection
+(Sigma unconfigured) falls back rather than rendering an empty sheet. The rail header gained
+a Tools button, since every previous way in required something to have gone wrong first.
+Along the way: the Sigma and pattern guidance panels had been rendering twice, once from the
+sheet and once from the panel inside it.
+
+## Session 167 — 2026-08-13: the sixth review, the rail read against real evidence, and 1.12.0
+
+**Sixth review of the branch, five findings.** The `confirmed` dedupe compared the whole
+`analysis_scope` dict while badging narrows to `(frame, baseline_id)` — so a baseline rename,
+or the analyst's own previous verdict moving `dispositions_hash`, made re-confirming one
+finding write a second row and a second system annotation for one claim. `scope_identity`
+now states the narrowing once and the badging path delegates to it, so the two cannot drift.
+The histogram's mark gesture set a pending range and opened the Tools sheet but never opened
+the drawer that is the range's only consumer, so the brushed range vanished and mark mode
+stayed on. The rail's two empty states counted the sweep's global done/total while describing
+a preset-filtered list, so "Changed vs. baseline" with no baseline asserted a clean sweep for
+methods that never ran. The scope-change dialog counted every disposition kind although only
+`confirmed` folds scope into its identity. And the plan endpoint's timestamp probe aggregated
+the offset-corrected expression, which cannot use the sort key — an unbudgeted full read of
+the case on every scope change, from the one handler documented as answering without scanning
+an event; it reads the raw column and widens by the offsets' extremes instead, which can only
+make the gate err open.
+
+**Then the rail was read against a real 7.8M-event case, which is a different exercise.**
+Seven things showed up that no test would have caught. The largest: the finding sheet never
+named the value the finding was about. Its own sentence says "this value of captured_length
+appears in 1 event" — and `56` appeared nowhere on the surface an analyst opens to decide
+whether the finding is real, so recognizing it meant closing the sheet to re-read the row
+underneath. `lib/finding-subject.ts` now derives the subject exhaustively over the same union
+`finding-verdict` covers, and the sheet leads with it. Findings that are not about one value
+say what they *are* about rather than inventing one. The sheet also stretched to the full
+viewport, stranding the verdict bar a screen below the claim it answers; it sizes to its
+content now.
+
+The out-of-band evidence strip drew its marker to scale and then labelled it in a
+`justify-between` row, so a value at 10% of the axis was captioned at 50% — right where the
+band starts, reading as in-band, which is the exact misread the to-scale marker exists to
+prevent. Redrawn in CSS, which also stopped `preserveAspectRatio="none"` from stretching the
+marker into a smear. The timestamp-order row headlined a ~60-character source id whose first
+24 characters repeat across every source in the case; it leads with the record's line now and
+carries the id's distinguishing tail in the subtitle. The routine-collapse chip announced "0
+routine events hidden (0.0% of timeline)".
+
+**One ordering decision, taken deliberately.** Rows rotate method-by-method because scores are
+incomparable across methods, and that is worth keeping — but it put a finding 1.03 band widths
+outside its band above one 46 band widths out. Rather than fabricate a common scale, methods
+whose score is continuous *and* who have no threshold knob of their own (numeric range,
+entropy) gained a `railFloor`: weak rows leave the ranked feed, the group's count still
+includes them, and a row says how many with one click to show them. Frequency has `z_threshold`
+and the two-window methods have their q-cut, so for those the floor stays in the run.
+
+Deliberately not changed: field auto-selection still offers value-shaped methods on
+high-cardinality numeric fields (rare values on `captured_length`, entropy on `tcp_ack`),
+because deciding which fields are meaningful is the analyst's, and pre-filtering risks hiding
+a real finding in a field we guessed was boring. The rail and the agent panel may still be
+open together — reading a finding while asking about it is the intended workflow — so
+`CLAUDE.md`'s "only fixed-width surface" line was corrected to describe what ships.
+
+**Nineteen dependabot PRs folded into the release.** All applied locally in one pass —
+both lockfiles regenerated rather than merged nineteen times, which is where the conflicts
+would have been — then verified against the full suites. Two needed attention. A
+transitive nanoid advisory (GHSA-2v37-7h3g-55p8) cleared with `npm audit fix`. And
+`@tanstack/react-table` 9.0.0 is a breaking rewrite around composable features. The first
+attempt took the vendor's `useLegacyTable` shim — the cheap path — and that was the wrong
+call: it leaves the grid on a deprecated adapter and defers a migration that turned out to
+be small. `EventGrid` now declares the three features it uses (column sizing, resizing,
+visibility) and subscribes to the one state slice it reads rather than to all of it. Row
+selection, sorting, filtering and expansion stay unregistered on purpose: this grid does
+all four against the server, and enabling them would keep a second, empty copy of that
+state beside the real one.
+
+Two things moved that no type check would have caught in a looser codebase, and one that
+none catches at all. `ColumnDef`/`Header` take the feature set as their first type
+argument — loud. Live resize state is `columnResizing.isResizingColumn`, not v8's
+`columnSizingInfo` — reading the old key leaves the gesture looking unfinished forever, so
+a resized column's width would never be written back. That one is invisible to types, so
+`src/test/eventGridResize.test.tsx` now drives the whole gesture (mousedown, move,
+release) and asserts exactly one persisted write on release and none mid-drag; pointing
+the subscription at a constant makes it fail, which was checked rather than assumed.
+
+Vite 8.2 also warned that `__dirname` will not survive its native config loader; the
+config uses `import.meta.dirname` now.
+
+Released as **1.12.0**: the Investigate rail, the gate, the fingerprint cache and scope
+provenance are features, so a patch would have been wrong.
+
+## Session 166 — 2026-08-08: PR #262 fourth review, and the sheet the design round asked for
+
+**Scope provenance was inert.** `confirmed` is the one disposition kind whose
+`disposition_identity` includes `analysis_scope` — and it was the one kind whose write path
+never supplied one. `useDisposition`'s confirmed branch returns early through
+`anomaliesApi.persistFinding`, and neither that client nor
+`PersistAnomalyFindingRequest` carried the field, so every confirmed row in a real deployment
+landed with `analysis_scope = NULL`. Everything downstream followed: the per-scope dedupe arm
+always compared `None == None`, migration 0026's column recorded nothing, and the scope-change
+dialog's verdict count — whose entire purpose is to warn about confirmed verdicts — could never
+be non-zero. Both halves now stamp it, and `tests/test_disposition_scope.py` covers the endpoint
+the Confirm button actually reaches rather than only the dispositions router.
+
+Reading was the mirror defect. `_apply_confirmations` matched by `event_id` alone, so a verdict
+reached against February badged the row under March and disabled Confirm — making the second,
+scope-distinct claim the dedupe exists to allow unreachable from the UI. It now takes the
+request's scope: same-scope badges `confirmed`, other-scope sets `confirmed_other_scope` and the
+rail shows a muted "confirmed elsewhere" with Confirm live. That also makes good on a promise
+`ScopeChangeDialog` had been making in prose and nothing implemented. An unstamped row still
+badges under every scope — demoting it would silently unbadge existing evidence to assert a
+comparison nobody recorded.
+
+**Two gate predicates were gating on "unlikely", not "impossible".** `analysis_plan.py`'s
+contract is that `not_applicable` means the method structurally *cannot* score, because a wrong
+precondition fails silently. `sequence_novelty` required three distinct series values; two yield
+2³ distinct trigrams and a rare one scores fine, so every two-artifact-type timeline — an
+ordinary two-source case — quietly lost n-gram novelty. And `entropy` shared `charset`'s
+enum-like gate, which only holds for charset: its alphabet is learned from the field's own
+values, so nothing can be novel, while an entropy band is a comparison one of five enum literals
+can sit far outside. Floor lowered to 2, entropy ungated, charset unchanged.
+
+**Counts that were not the counts.** `log_template` returned `len(templates)` — already capped by
+`limit` — where every other method reports the pre-cap total, so 400 distinct templates read as
+exactly 50 with nothing saying so. `numeric_range`'s skip reason quoted `len(inputs.inventory)`
+as its denominator while the numerator came from a different, uncapped scan; `reason_facts`
+exists to be checked, so `numeric_tokens_from_stats` now returns the population it tested.
+
+**Smaller, same session:** the plan's span probe now uses the offset-corrected timestamp every
+detector buckets on, so the gate and the frequency detector cannot disagree about a clock-skewed
+timeline; the frequency gate's seconds-vs-buckets confusion is fixed in the reason text and the
+setting help rather than by a breaking rename; `_run_log_templates` stopped re-resolving a
+timeline scope its caller had already resolved; and `analysis_cache` eviction now says
+least-recently-*computed* (which is what it is), skips the pointless pass on replaces, and
+guards the `NOT IN` delete behind a row count. Eviction stays non-LRU on purpose — writing on
+every cache *hit* would turn `require_case_read`'s one bounded write exception into a
+per-request one, to buy an eviction order whose worst case is a single rescan.
+
+**And the finding sheet became the thing the design round chose.** Comparing the shipped
+Investigate surface against the mockup the redesign was picked from turned up two gaps that were
+not review findings but were not decisions either. The rail's strongest group, "Named techniques
+— a rule author named this", was structurally always empty: no method carries
+`evidenceClass: "named"` and Sigma hits never joined the stream, which is also why the mockup's
+"Known-bad" preset shipped as "Evidence integrity". Sigma's latest completed run now feeds that
+group through a `FindingGroup.extraRows` slot — a row is a rule and its match count, since that
+is what a run records — and Known-bad is back.
+
+The sheet itself was a four-row definition list, while the spec, the mockup and the file's own
+docstring all described a verdict sentence, an evidence figure, the query and a verdict action
+row. All four exist now: `lib/finding-verdict.ts` states each finding as a claim built only from
+the payload's own numbers, `FindingEvidence.tsx` draws the comparison it rests on, `MethodMeta`
+gained a `querySketch`, and a sticky footer reuses `FindingRowActions` so the verdict is made
+where the decision is made. The finding-mode knobs — previously a form with no submit — got
+"Run with these".
+
+Two departures from the mockup are deliberate and worth recording. The evidence figure draws
+**nothing** for rare values, value combos and templates: their payloads carry no second number,
+and the mockup's evenly-spaced cadence chart was plotted from per-event timestamps the API does
+not return. A plausible chart assembled from unmeasured numbers is worse than no chart here. And
+the query block is "Query shape", explicitly not a transcript — the detectors, unlike the Sigma
+runner, do not return compiled SQL, so labelling it "the query it ran" would be a claim no code
+backs.
+
+Full finding text: [`archive/PR262_REVIEW_FINDINGS.md`](./archive/PR262_REVIEW_FINDINGS.md).
+
+## Session 165 — 2026-08-08: PR #262 third review
+
+**The suite now refuses to start without ClickHouse.** Running it with the dev
+stack down cost most of a session. Nothing said the container was stopped:
+`clickhouse`-marked modules each opened their own connection inside a
+`try/except Exception: pytest.skip(...)`, paying the driver's retries one module
+at a time, while the much larger set that reaches ClickHouse *indirectly through
+the app* — `test_agent_api.py` and friends — simply failed, eight minutes in,
+with connection-pool tracebacks that named a pool rather than a missing service.
+`pytest_configure` now probes `/ping` once with `urllib` and a 1.5s timeout, and
+on failure exits before collection with the `podman compose up -d` fix in the
+message: about 0.0s to the answer instead of eight minutes to a wall of red.
+
+No opt-out flag, deliberately — a run that cannot pass is not worth starting,
+and "most of it passed" is a worse outcome than a clear stop. The eighteen
+per-module reachability skips are gone with it: reachability is settled before
+any of them run, and as blanket `except Exception` they also turned a genuine
+`init_schema` failure into a green skip.
+
+**And the suite no longer fakes PostgreSQL with SQLite.** The two dialects
+disagree about precisely what this model leans on, and the gap was not
+hypothetical: session 163's review found the `confirmed` disposition path had
+shipped broken on PostgreSQL while every SQLite test passed, because `json` has
+no equality operator there. Every store now comes from `pg_database` — a private
+database cloned from a template Alembic migrated once per session
+(`blank_pg_database` for tests that drive Alembic themselves,
+`module_pg_database` for a corpus built once per module).
+
+The usual argument for SQLite turns out to be backwards. Alembic runs per test
+either way; cloning a migrated template costs ~55ms against PostgreSQL versus
+~101ms replaying the migrations into a fresh SQLite file. So this is the faster
+option *and* the honest one.
+
+Three things the switch exposed, each a real difference rather than a porting
+annoyance: test DDL written with `AUTOINCREMENT` and `1`/`0` for booleans (both
+rejected outright, now `SERIAL` and `true`/`false`), schema assertions reading
+`PRAGMA table_info`/`sqlite_master` (now `information_schema`, so the migration
+tests inspect the database the migrations actually run on), and a URL built with
+`str(engine.url)` — which masks the password as `***`, harmless against a
+password-less SQLite file and an authentication failure against PostgreSQL. That
+last one only surfaced as a missing dict key, because the helper under test
+swallows its own exceptions by design.
+
+And connections crossing event loops. asyncpg binds a connection to the loop
+that opened it; `TestClient` drives the app from its own portal loop, and a test
+may hold two of them. SQLite tolerated the crossing, PostgreSQL reports "Event
+loop is closed" — which reads like a failure about permissions when it lands in
+an RBAC test. Unpooling every test store fixed it and cost 17:31 against a
+SQLite baseline of 8:15, so it is scoped instead: a store is unpooled when its
+test takes `client`, or is marked `multiloop` (the CLI, one `asyncio.run` per
+command). `PostgresStore.__init__` takes `**engine_kwargs` for that, rather than
+tests reaching into its internals. The fixture also stopped disposing its
+engine, which was failing already-passed tests in teardown for the same
+cross-loop reason; the per-test database is dropped `WITH (FORCE)` regardless.
+
+The suite lands at **12:34** — about four minutes over the SQLite baseline, paid
+for a suite that can see the dialect it ships on.
+
+The orphan sweep only drops databases with no live connections, so two suites
+running at once do not delete each other's clones.
+
+**Why.** A third review of the branch found six defects. One froze the Explorer
+outright; the rest are each a place where a surface says something the data does
+not support.
+
+**The rail's marker publication was an unbounded render loop.** The rail derives
+histogram markers from `useStreamingSweep` and hands them to `ExplorerPage`,
+which stores them in state — a feedback edge that only settles if the published
+value is stable when nothing changed. It was not: `useAnalysisPlan` rebuilt
+`planById` with a fresh spread every render, so `runnable` churned, so
+`byMethod`'s memo (keyed on the `useQueries` arrays, which are new objects every
+render regardless) recomputed, so the markers array was new, so the effect
+refired and set state again. Measured at 300+ renders in ~200ms as soon as any
+timestamped finding landed. Fixed at the source — `planById`/`scope` memoized,
+`byMethod` keyed on the four fields it actually reads rather than on the result
+objects — and again at the edge, where publication is now keyed on a content
+signature so no upstream hook losing its memo can reintroduce the loop. The old
+`useAnomalyMarkers` carried exactly this protection and the rewrite dropped it;
+the test that covers the rail could not see it, because it mocks the sweep and
+passes no marker callback. The new test runs the real hooks.
+
+**`delete_case` left the analysis cache behind.** `analysis_cache` has no FK to
+`cases`, like every other case-scoped table here, and was not in the explicit
+delete list. Its payloads hold event ids, field values and message templates,
+and eviction only ever runs on a write for the same case — which can no longer
+happen — so up to `analysis_cache_max_rows_per_case` rows of evidence-derived
+data survived the case forever.
+
+**Re-confirming a pre-provenance verdict rewrote its history.** A `confirmed`
+row written before `analysis_scope` existed carries `NULL`, and the dedupe
+adopted it by stamping *today's* scope onto it — making a forensic audit column
+assert a comparison frame the verdict was not reached under, which is precisely
+what migration `0026` left the column nullable to avoid. The adoption branch is
+gone from both the single and bulk paths: identity is the exact scope, an
+unstamped row stays unstamped and answers only for "scope not recorded", and a
+re-confirm writes its own stamped row. (Session 163 introduced the adoption to
+stop the first post-upgrade re-confirm writing a duplicate. A duplicate row is a
+counting problem; a fabricated provenance stamp is an evidentiary one.)
+
+**Three smaller honesty and navigation fixes.** The sheet reset its run
+parameters on `[method, autorun]`, so running a method with custom knobs and
+then clicking one of that *same* method's rail rows changed neither dep — the
+finding view keyed on the custom run while the rail's rank addressed the plain
+sweep, rendering a different finding than the one clicked, or none at all; the
+sheet's `kind` is part of the reset now. Confirming a switch to the `self` frame
+cleared `activeBaselineId` as well as the frame, so a baseline → self → baseline
+round-trip lost the selection and reopened the builder; only the frame moves
+now. And `MethodRow` gated its dash on `pending` but not its count, so nine
+methods queued behind the cheap set rendered `0` in the found-nothing style —
+they render `…` until they have actually run.
+
+## Session 164 — 2026-08-08: PR #262 second review
+
+**Why.** A second review of the same branch found eleven defects. One was
+severe, and the rest share a shape: the redesign moved a surface and left an
+action stranded behind it.
+
+**The fingerprint omitted four inputs, none of them request parameters.** The
+cache key covered the timeline, source hashes, enrichment generation, frame,
+`baseline_id`, method, params, limit and `dispositions_hash` — everything the
+client sends. It did not cover the baseline definition's *contents* (a `PUT`
+replaces the windows in place and keeps the id, so an analyst who moved a
+suspect window was served the pre-edit findings, stamped with the new baseline's
+name and reported as a hit), the timeline's `field_mappings`, the per-source
+`time_offset_seconds`, or the runtime-editable `stat_*` thresholds the runners
+fall back to when a knob is omitted. All four are now in the key; the settings
+arm is a prefix sweep rather than an enumerated list, because forgetting a newly
+added threshold means a wrong answer served as proof. `stat_scan_*` stays out —
+it tunes ClickHouse's resource budget, not the conclusion.
+
+**A cache write could fail a request whose scan had already succeeded.** Two
+tabs missing the same key both insert against a unique index; the loser raised
+`IntegrityError` and the analyst saw the method as "failed to run". Two clients
+that miss the same key computed the same answer over the same inputs — that is
+what the key means — so the loser is swallowed.
+
+**`frame` and `baseline_id` were never cross-validated.** The runners key off
+the id; the response is stamped with the frame, and that stamp is what a verdict
+records as its provenance. `frame=self&baseline_id=X` therefore ran the
+two-window comparison and labelled it "all events scanned", and `build_plan`
+disagreed with the runner about the same request. Now a 422.
+
+**Three actions had lost their surface.** `TemplatesView` was orphaned by the
+rail rewrite, taking the log-template mute *and unmute* with it — while
+`events.py` kept collapsing muted templates out of the grid, histogram and
+export, so a pre-existing mute hid evidence with nothing left to reverse it. The
+show-dismissed toggle was hardcoded off, making a mis-click unrecoverable. The
+rail lost its resize handle, freezing the only fixed-width surface in the flow
+at whatever the store last persisted. All three are back, the toggle now as one
+UI-store flag rather than per-view state, since the rail and the sheet render
+the same query results.
+
+**A method that could not score rendered as a checked zero.** `MethodFindings.status`
+and `warnings` were read nowhere in the new surface, so `insufficient_data` and
+a clean scan looked identical — the exact "checked, clear" misread the rail's own
+comment forbids. It renders as a dash and the runner's warning now. The Tools
+summary likewise counted queued heavy methods as "ran"; they are named as still
+running.
+
+**Two smaller honesty fixes.** The gate built its field inventory without the
+timeline's `field_mappings`, so `reason_facts` — rendered verbatim as arithmetic
+the analyst is invited to check — described a field set the detectors do not use;
+the canonical entries are now approximated from the same stats cache rather than
+aggregated live, which keeps the endpoint's no-scan contract and errs toward
+offering a method rather than withholding one. And `disposition_identity` put
+`analysis_scope` in the key for `confirmed` while every pre-upgrade row carries
+`NULL`, so the first re-confirm after the upgrade wrote a duplicate; an
+unstamped row now adopts the scope instead, with an exact match always winning
+over it.
+
+## Session 163 — 2026-08-08: PR #262 review findings
+
+**Why.** A high-effort review of the Investigate redesign branch found thirteen
+defects. Four broke shipped behavior, and the pattern joining them is worth
+naming: each was invisible to the test suite for a structural reason, not a
+missing assertion.
+
+**The confirm path never ran on PostgreSQL.** `create_disposition` compared
+`analysis_scope` — an `sa.JSON` column — with `==` to dedupe `confirmed`
+verdicts by the comparison they were reached under. PostgreSQL has no equality
+operator for `json`, only for `jsonb`, so every confirm was a 500. The tests
+run on SQLite, where JSON is text and `=` works, so the whole feature passed
+green while being unusable in any real deployment. Migration `0027` moves the
+column to `JSONB` on PostgreSQL and no-ops on SQLite; the model declares
+`JSON().with_variant(JSONB(), "postgresql")`. Storage type alone does not make
+the dialects agree, though — JSONB normalizes key order and SQLite text does
+not — so writes and comparisons now go through `canonical_scope`, and
+`disposition_identity` replaces the second, differently-expressed copy of the
+identity rule that lived inside `create_dispositions_bulk`.
+
+**The findings endpoint never applied dispositions.** `/api/anomalies` calls
+`_apply_dismissals` and `_apply_confirmations`; `/analysis/findings` called
+neither. A dismissal was optimistically removed from the rail and came straight
+back on the next refetch, `include_dismissed` was a no-op, and no finding ever
+carried the `confirmed` flag its badge reads. Both are plain functions over a
+serialized payload, so the fix is to call them — but *after* the cache, never
+before. The fingerprint covers `normal` verdicts only, since those are what
+change a computation; caching a dismissal-filtered payload would hide a later
+dismissal until something unrelated invalidated the key. Applying afterwards
+also makes `include_dismissed` presentation-only in the full sense, so its cache
+bypass could go: revealing dismissed findings now costs nothing.
+
+**The gate was a lock in practice.** `onRunMethod` was wired to `onOpenMethod`,
+and the sheet's findings query was enabled only in finding mode — so "Run
+anyway" on a gated method and "Retry" on a failed one both opened prose and ran
+nothing. The endpoint allowed everything the docs promise; the UI had no path
+to it. Method mode now owns a params object and renders its own results, with
+`autorun` for the Tools sheet's entry point. The knobs became real at the same
+time: they were uncontrolled inputs nothing read, which is why the two tests
+this branch deleted (`charsetGroupField`, `eventSequenceMaxGap`) had no
+surviving home — `group_field` and `max_gap_seconds` were unreachable from the
+app. Both are ported to the new surface.
+
+**Params are typed now.** `METHOD_PARAMS` checked keys and passed values
+through untouched, so `{"fields": ["a","b"]}` — the natural JSON encoding of a
+multi-field knob — reached `.split()` and 500'd. Each method declares a
+Pydantic model with `extra="forbid"` and the bounds `/anomalies` already
+states as query constraints; `METHOD_PARAMS` is derived from the models, so the
+cross-language invariant the frontend test checks has one source. The validated
+params, not the raw object, go into the cache key, which also makes `2` and
+`2.0` one question.
+
+**Smaller, same shape.** `limit` joined the fingerprint (a 50-row payload is not
+the answer to a request for 500, and serving it as a hit asserted a
+completeness it did not have). `cache_put` restamps `computed_at` on refresh,
+so "least recently computed" is literal rather than inverted. The plan
+endpoint's timestamp probe moved to a threadpool — it is a blocking ClickHouse
+call in an async handler, and the rail fires a dozen requests right behind it.
+
+**What the rail was claiming.** Progress counted a heavy method as settled
+while it was still queued behind the cheap set, so the bar reached 100%, the
+empty state flashed "No findings under this scope", and the count then fell
+back — an all-clear asserted over methods that had not started. `MethodState`
+gained `pending`, which is about expectation rather than fetch status. The
+empty state also could not tell "checked, nothing" from "nothing ran": it now
+requires the plan to have resolved and at least one method to have been
+runnable, and says something different when every method is gated. And the
+empty-timeline guard the old panel carried came back as
+`useTimelineReadiness`, shared by the rail and the Tools sheet — a Sigma scan
+that matches nothing on a mid-ingest timeline reads as "these rules cleared
+you", which is the claim it exists to prevent.
+
+**Capability gates and three orphans.** `SemanticSearch`, `TriageBurndown` and
+`EmbeddingStatusBanner` lost their only mount when `InvestigatePanel` was
+deleted and are removed. The Explore section's similarity affordance and the
+Signatures section are now gated on `capabilities.embeddings` / `.sigma`,
+restoring the house rule that an unconfigured subsystem renders no entry point
+at all. `AnomalyFieldPicker` is kept — it is the field picker the `fields` knob
+should grow into.
+
+**One convention amended.** `CLAUDE.md` said a `require_case_read` endpoint does
+not write, with one named exception. `cache_put` on the findings path is a
+second, and the rule demands an argument rather than silence: the row is
+derived data keyed by a fingerprint of its own inputs, so it asserts nothing
+the request did not already establish, and refusing it for read-only members
+would make the surface they use slowest the one that never warms.
+
+## Session 162 — 2026-08-07: the Investigate panel redesign
+
+**Why.** Three complaints, one structural. Opening Investigate fired all eleven
+detectors at once and showed a spinner until the slowest returned, with nothing
+cached server-side. Several of those detectors could not have found anything —
+`numeric_range` on a timeline with no numeric field, the two-window methods in
+the self frame, where they are empty by construction. And the panel was a
+`shrink-0` flex sibling next to the filter rail, the grid and the event detail
+panel, so on a laptop the sum of their minimum widths pushed it off screen.
+Underneath all three: five tabs that sorted fourteen tools by which subsystem
+built them, so the analyst had to guess where a thing would have been noticed
+before they could look for it.
+
+**The gate.** `db/analysis_plan.py` decides, per method and without scanning an
+event, whether that method *can* produce a finding on this data —
+`field_stats` plus one timestamp probe. The contract is narrow on purpose:
+`not_applicable` means structurally impossible, never unpromising, and nothing
+is ever withheld. Every verdict carries the arithmetic behind it, so the UI
+states "no field parses as numeric (0 of 19 sampled ≥ 90%)" rather than a
+shrug. The plan fails open — a broken gate may cost time, never hide a method.
+
+**The guard earned itself immediately.** Wiring
+`test_demo_detector_coverage_clickhouse.py` to assert the gate never skips a
+method that file proves works caught two real bugs on first run, both failing
+silently in the same direction. Series distinct came from `merged_inventory`,
+which merges `distinct` as max-across-sources: on a timeline whose sources each
+carry one artifact type that reports 1 however many the timeline holds, so the
+sequence methods were gated off. And the log-template precondition looked for
+`message` in the inventory, but `message` is deliberately absent from
+`_NOVELTY_CANDIDATE_TOP_LEVEL` — it matched nowhere, so templating was withheld
+from every timeline. Thresholds needed no tuning once both were fixed.
+
+**The cache.** `analysis_cache` keys on a hash of everything that can change an
+answer: source content hashes, enrichment generation, scope, method, params,
+dispositions hash. Sources are immutable, so a hit is *proof* the answer still
+holds rather than a guess that it is recent — which is why there is no TTL, and
+why the panel never has to ask an analyst to judge staleness. Verified live:
+plan ~19 ms, a cold method ~60 ms, every warm call a byte-identical hit at
+~18 ms, and each of scope, params and a `normal` verdict independently missing.
+
+**Scope provenance.** A verdict is an assertion about a comparison, and nothing
+recorded which comparison — `finding_dispositions` had no scope column at all,
+so "confirmed on 4 March" could not say what against. It does now, nullable so
+older rows read as "not recorded" rather than being backfilled with invention,
+and deliberately outside `dispositions_hash` (provenance, not a detection
+input). It joins the dedupe identity for `confirmed` only: escalating against
+two baselines is two claims, while `normal` is a standing declaration about a
+value under every frame.
+
+**The panel.** One rail holding findings grouped by evidence weight — named
+techniques, statistical outliers, exploration — with the group note ("odd, not
+necessarily bad") next to the rows it qualifies instead of in a methodology
+tab. Everything else is one overlay sheet in three modes, absolutely
+positioned, so Investigate spends exactly one fixed width and the overflow is
+structurally impossible rather than tuned away. `EventDetailPanel` and
+`AgentPanel` were also `shrink-0`, so they were made shrinkable too — fixing
+only Investigate would have left the same bug reachable with two panels open.
+Sixteen components deleted, ~5,900 lines net.
+
+**What the deletion nearly took with it.** Four affordances lived in the panel
+rather than in the things they served, and only surfaced as unused variables:
+histogram anomaly markers, the grid's "find similar" (which would have set an
+anchor nothing read — a dead button), the combo and frequency drills that a
+single field/value filter cannot express, and the first-run explainers. All
+rewired. The baseline gesture needed the same treatment: the brush still set a
+pending range, but the builder now mounts inside the Tools sheet, so nothing
+rendered it.
+
+**Verified end-to-end** against real Postgres and ClickHouse on isolated
+databases: migration 0026, the gate's reasoning on real data, the cache and
+every invalidation path, a gate-skipped method still running on request
+(returning `insufficient_data` — the detector agreeing with the gate), a typo'd
+knob rejected with the accepted names rather than silently defaulting, and
+`GET /anomalies` untouched for the agent.
 
 ## Session 161 — 2026-08-07: the second review pass on PR #242
 

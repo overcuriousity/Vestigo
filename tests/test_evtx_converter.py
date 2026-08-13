@@ -212,6 +212,7 @@ class TestParsing:
         assert decisions["evtxecmd_maps_commit"] == converter.MAPS_SOURCE_COMMIT
         assert decisions["byte_offset_fallback_rows"] == 0
         assert decisions["chunk_errors"] == 0
+        assert decisions["scan_unresolved_records"] == 0
         assert meta[converter.META_TIMEZONE_ASSUMPTION.encode()].decode().startswith("EVTX")
 
 
@@ -678,6 +679,73 @@ class TestDegradedRecords:
         assert counts.parsed == 0
         assert counts.skipped == 1
         assert buffer.rows == []
+
+
+class TestParserReconciliation:
+    """The chunk walk knows how many record headers a chunk holds; the parser does not
+    raise on every record it cannot handle (a damaged binxml payload is skipped, broken
+    framing ends the chunk, both silently). scanned-minus-yielded is the only signal
+    that records vanished, so it is counted, warned about and stamped on the footer.
+    """
+
+    def test_clean_file_has_no_unresolved(self, converter):
+        buffer = _CapturingBuffer()
+        counts = converter._convert_evtx(FIXTURE.read_bytes(), "clean.evtx", "deadbeef", buffer)
+        assert counts.parsed == 7
+        assert counts.scan_unresolved == 0
+        assert "scan_unresolved" not in counts.scan_note
+
+    def test_silent_binxml_drop_is_counted_and_warned(self, converter, tmp_path, capsys):
+        """Corrupting a record's binxml payload (framing intact) makes the parser skip
+        the record without raising — before the reconciliation this run reported
+        "0 unparseable records skipped" while a record was gone."""
+        raw = bytearray(FIXTURE.read_bytes())
+        located = sorted(
+            converter._scan_record_offsets(bytes(raw))[0].items(), key=lambda kv: kv[1]
+        )
+        third_off = located[2][1][0]
+        for i in range(24, 56):  # well inside the payload; record header/trailer intact
+            raw[third_off + i] = 0xFF
+        source = tmp_path / "damaged.evtx"
+        source.write_bytes(bytes(raw))
+
+        pf = _convert(converter, source, tmp_path / "out.parquet")
+        assert pf.metadata.num_rows == 6
+        decisions = json.loads(pf.metadata.metadata[converter.META_PARSE_DECISIONS.encode()])
+        assert decisions["scan_unresolved_records"] == 1
+        assert "scan_unresolved=1" in decisions["chunk_scan"]["damaged.evtx"]
+        assert decisions["chunk_errors"] == 0, "the parser never raised — that is the point"
+        err = capsys.readouterr().err
+        assert "chunk scan located 1 record(s) the parser did not return" in err
+        assert "1 record(s) located by chunk scan but not returned by parser" in err
+
+    def test_parser_yielding_fewer_records_than_scanned(self, converter, monkeypatch):
+        data = FIXTURE.read_bytes()
+        known_ids = sorted(converter._scan_record_offsets(data)[0])[:2]
+        _stub_parser(
+            converter,
+            monkeypatch,
+            [
+                {"data": _STUB_XML.format("-"), "event_record_id": rid, "timestamp": ""}
+                for rid in known_ids
+            ],
+        )
+        buffer = _CapturingBuffer()
+        counts = converter._convert_evtx(data, "stub.evtx", "deadbeef", buffer)
+        assert counts.parsed == 2
+        assert counts.scan_unresolved == 5
+        assert "scan_unresolved=5" in counts.scan_note
+
+    def test_parser_constructor_failure_counts_the_whole_chunk(self, converter, monkeypatch):
+        class _Failing:
+            def __init__(self, _blob) -> None:
+                raise RuntimeError("chunk image rejected")
+
+        monkeypatch.setattr(converter, "PyEvtxParser", _Failing)
+        buffer = _CapturingBuffer()
+        counts = converter._convert_evtx(FIXTURE.read_bytes(), "stub.evtx", "deadbeef", buffer)
+        assert counts.chunk_errors == 1
+        assert counts.scan_unresolved == 7
 
 
 class TestRefineInputCap:

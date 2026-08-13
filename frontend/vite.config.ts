@@ -4,7 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { readFileSync } from "fs";
 import path from "path";
 
-const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "package.json"), "utf-8"));
+const pkg = JSON.parse(readFileSync(path.resolve(import.meta.dirname, "package.json"), "utf-8"));
 
 export default defineConfig({
   // Compile-time inject the package version so the footer never drifts from
@@ -13,7 +13,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
   server: {

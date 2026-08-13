@@ -449,8 +449,12 @@ export function EventDetailPanel({
 
   return (
     <div
-      className="relative flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] shrink-0"
-      style={{ width: detailPanelWidth }}
+      // `min-w-0` + shrink rather than `shrink-0`: with several side panels
+      // open on a laptop the sum of their fixed widths used to exceed the
+      // viewport and the last one was pushed off screen. Shrinking degrades
+      // gracefully; overflowing does not.
+      className="relative flex h-full min-w-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      style={{ width: detailPanelWidth, flex: `0 1 ${detailPanelWidth}px` }}
     >
       {/* Accent bar — reflects Normal / anomaly state, sits under the drag handle */}
       <div

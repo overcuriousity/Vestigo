@@ -1,5 +1,6 @@
 /**
- * PatternsView — the Patterns tab: latent repeating event sequences (motifs)
+ * PatternsView — motif mining, in the Tools sheet's Explore section: latent
+ * repeating event sequences (motifs)
  * mined by the sequence_motif detector. Discovery, not anomaly detection —
  * mode-less (no baseline needed), ranked by support × cadence regularity.
  *

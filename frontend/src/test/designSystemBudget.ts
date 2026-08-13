@@ -32,22 +32,39 @@ export const BUDGET: Record<string, FileBudget> = {
   "../components/agent/ProposalCard.tsx": { fontSize: 3 },
   "../components/agent/StoryBlockProposalCard.tsx": { fontSize: 2 },
   "../components/agent/ToolSelector.tsx": { fontSize: 8, rawButton: 2 },
+  // Unmounted, but deliberately kept: ROADMAP's "the method sheet's `fields`
+  // knob is a text box" item wires this exact component back in.
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
-  "../components/analysis/ComboNoveltyView.tsx": { fontSize: 1, rawButton: 2 },
-  "../components/analysis/DetectorAccordion.tsx": { fontSize: 6, rawButton: 1 },
-  "../components/analysis/DistributionDriftView.tsx": { fontSize: 1 },
-  "../components/analysis/FindingsFeed.tsx": { fontSize: 4, rawButton: 1 },
-  "../components/analysis/FrameBar.tsx": { fontSize: 2, rawButton: 1 },
-  "../components/analysis/FrequencyView.tsx": { fontSize: 1, rawButton: 1 },
-  "../components/analysis/InvestigatePanel.tsx": { fontSize: 1, rawButton: 4 },
-  "../components/analysis/OrderViolationsView.tsx": { fontSize: 2, rawButton: 1 },
+  // The mute chips are the same pill as InvestigateRail's preset filters they
+  // sit directly above, for the reason recorded there: a `Button` reads as a
+  // different kind of control than the row it belongs to. The disclosure line
+  // and the collapsed summary carry the remaining sizes.
+  "../components/analysis/DetectorMuteStrip.tsx": { fontSize: 4, rawButton: 3 },
+  "../components/analysis/FindingGroup.tsx": { fontSize: 3, rawButton: 1 },
+  // +1 each for the show-dismissed toggle, which is deliberately the same
+  // pill as the preset filters it sits beside — a `Button` there would read as
+  // a different kind of control than the row it belongs to.
+  "../components/analysis/InvestigateRail.tsx": { fontSize: 5, rawButton: 3 },
+  "../components/analysis/InvestigateSheet.tsx": { fontSize: 4 },
+  // +1 button for the per-method mute toggle, which is the same dimmed-at-rest
+  // icon affordance as the Settings2 one beside it — a `Button` there would be
+  // visually heavier than the row it acts on, the same argument SigmaFindings
+  // and FindingGroup carry.
+  "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 4 },
+  "../components/analysis/ScopeStrip.tsx": { fontSize: 1, rawButton: 1 },
+  // +1 for the log-template blurb, matching the motif blurb above it.
+  // +1 button for the section tab, which is a bottom-border tab rather than
+  // anything `Button` has a variant for.
+  "../components/analysis/ToolsSheet.tsx": { fontSize: 8, rawButton: 3 },
   "../components/analysis/PatternsView.tsx": { fontSize: 1, rawButton: 3 },
-  "../components/analysis/SemanticSearch.tsx": { rawButton: 2 },
   "../components/analysis/SigmaPanel.tsx": { fontSize: 7, rawButton: 5 },
+  // Same two allowances FindingGroup carries, for the same reason: these rows
+  // sit in the same list as its rows and must read as the same kind of thing —
+  // one 10px detector chip, and one dimmed-at-rest hover action where a
+  // `Button` would be a visually heavier control than the row it acts on.
+  "../components/analysis/SigmaFindings.tsx": { fontSize: 1, rawButton: 1 },
   "../components/analysis/SimilarEvents.tsx": { rawButton: 1 },
   "../components/analysis/TemplatesView.tsx": { rawButton: 3 },
-  "../components/analysis/TriageBurndown.tsx": { fontSize: 2 },
-  "../components/analysis/ValueNoveltyView.tsx": { fontSize: 1 },
   "../components/analysis/WindowsNormality.tsx": { fontSize: 7, rawButton: 7 },
   "../components/analysis/detector-shared.tsx": { fontSize: 3, rawButton: 10 },
   "../components/cases/ImportCaseDialog.tsx": { fontSize: 1 },

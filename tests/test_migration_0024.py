@@ -29,8 +29,8 @@ def _alembic(sync_conn: Any, verb: str, target: str) -> None:
 
 
 @pytest_asyncio.fixture()
-async def engine(tmp_path):
-    store = pg.PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path / 'mig24.db'}")
+async def engine(blank_pg_database):
+    store = pg.PostgresStore(url=blank_pg_database)
     yield store.engine
     await store.engine.dispose()
 
@@ -42,7 +42,7 @@ async def test_preexisting_timeline_upgrades_to_a_null_suggestion(engine):
         await conn.execute(
             text(
                 "INSERT INTO timelines (id, case_id, name, is_default) "
-                "VALUES ('t1', 'c1', 'All sources', 1)"
+                "VALUES ('t1', 'c1', 'All sources', true)"
             )
         )
         await conn.run_sync(lambda c: _alembic(c, "upgrade", "0024"))
@@ -64,12 +64,22 @@ async def test_downgrade_drops_the_column_and_keeps_the_row(engine):
         await conn.execute(
             text(
                 "INSERT INTO timelines (id, case_id, name, is_default, recommended_columns) "
-                "VALUES ('t1', 'c1', 'All sources', 1, '{\"status\": \"ok\"}')"
+                "VALUES ('t1', 'c1', 'All sources', true, '{\"status\": \"ok\"}')"
             )
         )
         await conn.run_sync(lambda c: _alembic(c, "downgrade", "0023"))
 
-        columns = {r[1] for r in (await conn.execute(text("PRAGMA table_info(timelines)"))).all()}
+        columns = {
+            r[0]
+            for r in (
+                await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'timelines'"
+                    )
+                )
+            ).all()
+        }
         names = [r[0] for r in (await conn.execute(text("SELECT name FROM timelines"))).all()]
 
     assert "recommended_columns" not in columns

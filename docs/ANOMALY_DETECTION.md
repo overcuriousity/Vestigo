@@ -148,6 +148,267 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   column (a uniform per-source shift cancels within a source), and only the
   reported timestamps are shifted for display.
 
+### The analysis gate: which methods are offered up front
+
+The Investigate rail does not run every method on open. `db/analysis_plan.py`
+answers, per method and without scanning a single event, whether that method
+*can* produce a finding on this data; `GET .../analysis/plan` serves the
+verdicts. Inputs are the per-source `field_stats` cache and one
+timestamp-range probe, both already paid for elsewhere. The probe reads the raw
+`timestamp` column — a sort-key prefix, so an index lookup rather than a scan —
+and widens the span it returns by the extremes of any declared per-source clock
+offsets. The span the gate sees is therefore an upper bound of the
+offset-corrected one, which can only make the gate offer a method it might have
+withheld; it never withholds one on that account.
+
+**A method is `not_applicable` if and only if it structurally cannot produce a
+finding here** — never because it looks unpromising. The distinction is the
+whole contract: a zero from a method that ran means "checked, nothing"; a
+method that was skipped was not checked, and the UI must never present the two
+the same way.
+
+| Method | Precondition | Setting |
+|---|---|---|
+| `value_novelty`, `timestamp_order`, `log_template` | none — always offered | — |
+| `value_combo` | ≥2 categorical fields | — |
+| `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
+| `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
+| `entropy` | none — always offered | — |
+| `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
+| `interval_periodicity` | a second window, then enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` (window: `needs_setup`) |
+| `sequence_novelty` | a second window, then a series field with ≥2 distinct values | `analysis_gate_min_series_distinct` (window: `needs_setup`) |
+| `proportion_shift`, `value_distribution_drift` | a second window exists — i.e. the baseline frame with an active definition | — (reported as `needs_setup`) |
+
+Three of those rows encode a distinction worth stating, because each was once
+drawn in the wrong place:
+
+- **`charset` is gated on enum-like fields; `entropy` is not.** Charset learns
+  each field's alphabet *from that field's own values*, so when every value is
+  one of a handful of literals the alphabet already contains every character
+  present and nothing can be novel — a structural impossibility. Entropy's band
+  is a comparison, and one of five enum literals can still sit far outside it (a
+  base64 blob among four short words). Gating entropy here marked a scoreable
+  method `not_applicable`.
+- **`sequence_novelty`'s floor is two distinct series values, not "enough to
+  look interesting".** One value yields a single repeated n-gram and nothing can
+  be novel against it; two already yield 2ⁿ distinct n-grams, and a rare one
+  among them scores normally. A timeline with exactly two artifact types is an
+  ordinary two-source case.
+- **`analysis_gate_min_frequency_buckets` is a count of *seconds*, not of
+  buckets**, despite its name. The detector always splits the span into
+  `stat_frequency_buckets` (60) of them; the gate asks only that the span be
+  wide enough for a bucket to exceed a second. Both numbers appear in the
+  verdict's `reason_facts` so the arithmetic on screen is checkable.
+
+All four temporal methods share the window precondition, and it is checked
+*before* their data-shape gates. `interval_periodicity` and `sequence_novelty`
+are temporal-only — both return `insufficient_data` the moment their window
+pair is missing, exactly as the two drift tests do — so gating them on shape
+alone counted them applicable in the self frame, ran them, and rendered a dash
+where the "Set a baseline" affordance belongs. When both a missing window and a
+shape problem apply, the window wins: it is the reason the analyst can act on.
+
+`needs_setup` is a third status, not a weaker skip: an analyst action makes the
+method applicable, so the UI offers that action rather than a "run anyway" that
+could only produce a guaranteed-empty scan.
+
+Two properties are load-bearing and are enforced by tests:
+
+- **Nothing is ever locked.** A `not_applicable` method runs through
+  `GET .../analysis/findings` exactly as any other, returning what an
+  unconditional sweep would have returned.
+- **The gate never skips a method that works.** A wrong precondition fails
+  silently — a method that would have found something is simply not offered —
+  so `tests/test_demo_detector_coverage_clickhouse.py`, which already asserts
+  every analysis tool finds something in the demo case, also asserts the gate
+  offers every one of them there.
+
+Every verdict carries `reason_facts`, the arithmetic behind it, so the UI can
+state "no field parses as numeric (0 of 19 sampled ≥ 90 %)" rather than a bare
+"not applicable". The numbers in it must come from the measurement they
+describe: `sampled` is the count of tokens the numeric scan actually tested
+(`NumericTokenScan.examined`), not the merged inventory's length, which counts a
+capped and differently-built population. The plan is also fail-open: if it errors, the client marks
+every method applicable and runs everything.
+
+### Muting a method
+
+Some defects belong to the evidence rather than to the behavior it records. A
+capture whose sources disagree about the clock makes `timestamp_order` fire on
+millions of rows: every finding true, none of them the investigation. Reading
+past that is not triage, so an analyst can take the method out of the sweep
+instead of dismissing its findings one at a time.
+
+The mute is a list of method ids on `Timeline.muted_methods`, written through
+`PATCH /api/cases/{case}/timelines/{timeline}/muted-methods` (contribute access,
+unknown ids rejected with a 422, every change audited as
+`timeline.update_muted_methods`). It is **shared, not per-browser**: "this
+source's clocks are a mess" is a conclusion about the data that the next analyst
+on the case should inherit rather than rediscover.
+
+A mute is a *reading* preference and is held to the same "advice, never a lock"
+contract as the gate itself:
+
+- **The plan does not consult it.** A muted method still reports its real
+  status, because a mute is not a claim that the method cannot produce a finding
+  here — that would be the gate's statement to make, and a false one. This is
+  pinned by `tests/test_timeline_muted_methods_api.py`.
+- **`GET .../analysis/findings` still runs it** when asked for by name, so the
+  Tools sheet's "Run anyway" works on a muted method exactly as it does on a
+  gated one. Running a muted method does not unmute it; they are different acts.
+- **The client is what skips it.** `useStreamingSweep` does not issue the query,
+  which is what removes the method from the findings feed, from the histogram
+  and grid markers derived from that feed, and from the sweep's progress
+  denominator, all from one decision rather than three that can drift.
+
+Because a mute makes the rail quieter, disclosure is not optional. The rail's
+top strip always names the count when anything is muted, the Tools accounting
+counts muted methods separately from both "ran" and "skipped" and shows no
+count for a muted row — its query never ran, so a `0` there would assert the
+"checked, clear" misread this whole surface exists to prevent — and every mute
+is reversible from either surface.
+
+### The analysis cache
+
+`GET .../analysis/findings` is memoized in `analysis_cache` (`db/analysis_cache.py`),
+keyed on a SHA-256 of everything that can change an answer: the timeline, the
+sorted set of source content hashes, the enrichment generation, the frame and
+baseline, the method, its canonical params, the row `limit`, and
+`dispositions_hash`.
+
+Four of those inputs are not request parameters, and each closes a way of
+being served a wrong answer as proof:
+
+- **the baseline definition's content hash**, not just its id. `PUT
+  .../baselines/{id}` replaces the windows in place, so an edited definition
+  keeps its id — keying on the id alone would serve the pre-edit findings under
+  the new name.
+- **the timeline's `field_mappings`**, which every detector resolves canonical
+  field aliases through. Remapping a field changes what was scanned.
+- **the per-source `time_offset_seconds`**, the declared clock-skew correction
+  the temporal detectors bucket against.
+- **the runtime-editable `stat_*` settings**, the thresholds every runner falls
+  back to when a knob is omitted. An admin lowering `stat_z_threshold` in the
+  console changes every default-parameter answer in the system. Taken as a
+  prefix sweep so a newly added threshold cannot be forgotten; `stat_scan_*` is
+  excluded, since those tune ClickHouse's resource budget rather than the
+  conclusion.
+
+`frame` and `baseline_id` are cross-validated rather than trusted
+independently: the runners key off the id while the response — and therefore
+every verdict's recorded provenance — is stamped with the frame, so a request
+where the two disagree is a 422 rather than a comparison labelled as its
+opposite.
+
+`limit` is in the key because every runner truncates to it: a payload computed
+at fifty rows is not the answer to a request for five hundred, and serving it
+as a hit would assert a completeness it does not have.
+
+Params enter the key **after** validation, not as the client sent them. Each
+method declares its knobs as a Pydantic model in `api/routers/analysis.py`
+(`METHOD_MODELS`), with `extra="forbid"` and the same bounds `GET /anomalies`
+declares as query constraints. That model is the single declaration of a
+method's parameters — `METHOD_PARAMS`, which the frontend's method-registry
+test checks its knobs against, is derived from it. Two consequences: a typo'd
+knob 422s rather than computing the default answer under a key claiming the
+typo, and `2` and `2.0` are one question with one key.
+
+Dismissals and confirmations are applied to the **response**, after the cache,
+never before it. The key covers `normal` verdicts only, since those are what
+change a computation; a cached payload that had already been
+dismissal-filtered would keep a later dismissal invisible until something
+unrelated invalidated it. `include_dismissed` is therefore presentation-only in
+the full sense — it changes what is shown and never what is computed or
+stored.
+
+Sources are immutable after ingestion (enrichment applies excepted, and those
+move the generation), so identical inputs cannot describe different data: **a
+hit is proof the answer still holds**, not a judgement that it is recent
+enough. There is deliberately no TTL — "is this recent?" is not the question,
+and adding one would reintroduce exactly the staleness guesswork the key
+removes.
+
+`dispositions_hash` is in the key because `normal` verdicts are
+detection-affecting: marking a value normal must invalidate cached findings
+that would otherwise keep showing it. That hash is timeline-wide rather than
+per-method, which over-invalidates slightly — the safe direction, costing a
+rescan rather than a wrong answer.
+
+Every row is derived data. Eviction is per case
+(`analysis_cache_max_rows_per_case`) and costs a rescan and nothing else, which
+is why it needs no audit trail. It is least-recently-**computed**, not
+least-recently-used, and the distinction is deliberate: a cache *hit* writes
+nothing, because `GET .../analysis/findings` is a `require_case_read` endpoint
+whose one write exception is the miss path, and restamping on every hit would
+trade the entire value of the hit path for a better eviction order. A recompute
+does restamp `computed_at`. The worst case is that a hot entry computed long ago
+is evicted ahead of a cold one computed recently — one rescan, never a wrong
+answer. Eviction runs only on an insert that actually exceeds the cap; a replace
+cannot grow the table. `DetectorRun` is unchanged and keeps its separate role:
+the accumulating forensic diary of what an analyst ran.
+
+### Scope provenance
+
+A finding is meaningless without the comparison that produced it, so both
+sides now record it:
+
+- Every plan and findings response carries a `scope` object (frame, baseline id
+  and name, dispositions hash).
+- `finding_dispositions.analysis_scope` records the comparison a verdict was
+  reached under. Nullable — rows written before this existed read as "scope not
+  recorded", which is honest where a backfill would be invention. Named
+  `analysis_scope` because that model already uses "scope" for the
+  value-vs-event distinction. It is the one JSON column in the model that is
+  *compared* rather than only stored, hence `JSONB` on PostgreSQL (migration
+  `0027`): `json` has no equality operator there. SQLite keeps the plain-JSON
+  text encoding, so both dialects only agree because writes and comparisons go
+  through the canonical key-sorted form (`postgres.canonical_scope`).
+
+`analysis_scope` is deliberately **not** part of `dispositions_hash`: that
+hashes detection-affecting facts, and scope-at-verdict-time is provenance.
+Extending it would invalidate the reproducibility record of every existing
+`DetectorRun` for no detection benefit.
+
+It *does* join the dedupe identity for `confirmed` only. That verdict asserts
+something about a comparison — escalating a finding against the February
+baseline and again against the March one are two separate claims, and
+collapsing them would lose one. `normal`, `dismissed` and `routine` are
+standing declarations about a value under every frame; duplicating those per
+scope would inflate the dispositions hash and the triage burndown without
+expressing anything new. A consequence worth stating: a case can hold two
+`confirmed` verdicts on one finding, so coverage counters must count distinct
+findings rather than disposition rows.
+
+An unstamped row is never adopted into a stamped one. A `confirmed` verdict
+carrying no scope answers only for "scope not recorded"; re-confirming that
+finding under a real scope writes its own row rather than backfilling the old
+one, because stamping a frame onto a verdict that was not reached under it is
+the same invention the nullable column exists to avoid. The cost is one extra
+row per legacy finding that gets re-confirmed, which is a counting artifact
+rather than a false claim.
+
+Every write path stamps it, including `POST
+.../anomalies/persist` — the endpoint behind the UI's Confirm button, and the
+only one it reaches. That is not incidental: `confirmed` is the sole kind whose
+identity includes the scope, so a persist path that dropped it would leave every
+confirmed row in a real deployment carrying `NULL`, and the column, its
+migration and the per-scope dedupe would all be unreachable code.
+
+Reading follows the same rule. `_apply_confirmations` badges a finding
+`confirmed` only when the covering verdict was reached under the comparison the
+request ran under; a verdict from a *different* one sets
+`confirmed_other_scope`, which the rail renders as a muted "confirmed
+elsewhere" marker with Confirm still live. Without that split the February
+verdict would badge the row under March and disable Confirm, making the second
+claim unreachable from the UI. A row with no recorded scope badges under every
+comparison — demoting it would silently unbadge existing evidence.
+
+Changing scope re-runs every method and reframes every verdict already
+recorded, so the UI gates it behind a confirm that names both counts. Existing
+verdicts are never discarded or rewritten — they are kept and stay tagged with
+the scope they were reached under, and findings covered only by an
+out-of-scope verdict are marked so they can be re-examined.
+
 ### Baseline definitions, suspect windows, and the normality model
 
 Every temporal detector (value novelty, value combos, frequency, numeric

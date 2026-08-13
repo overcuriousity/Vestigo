@@ -88,12 +88,9 @@ async def _upload(case_obj, filename: str, content: bytes, parser: str | None = 
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PostgresStore:
-    """In-memory SQLite store wired into the cases router for upload tests."""
-    db_path = tmp_path / "test_uploads.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database: str, monkeypatch: pytest.MonkeyPatch) -> PostgresStore:
+    """A private PostgreSQL database wired into the cases router for upload tests."""
+    s = PostgresStore(url=pg_database)
     # get_store() is shared across every router via api.deps now.
     monkeypatch.setattr(deps, "_store", s)
     monkeypatch.setattr(cases, "IngestionPipeline", FakeIngestionPipeline)

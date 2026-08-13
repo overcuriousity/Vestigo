@@ -23,12 +23,9 @@ from vestigo.db.queries import QueryRequestTooLargeError
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    """In-memory SQLite store — same pattern as tests/test_annotations.py."""
-    db_path = tmp_path / "test_events_router.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database):
+    """A private PostgreSQL database — same pattern as tests/test_annotations.py."""
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 

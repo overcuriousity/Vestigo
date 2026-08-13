@@ -105,6 +105,13 @@ export const anomaliesApi = {
       detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift";
       content: string;
       details: Record<string, unknown>;
+      /**
+       * The comparison this verdict was reached under. `confirmed` is the only
+       * disposition kind whose identity includes the scope, so omitting it here
+       * collapses two claims (one per baseline) into one row — see
+       * `disposition_identity` in db/postgres.py.
+       */
+      analysis_scope?: Record<string, unknown> | null;
     },
   ) =>
     post<{ annotation: Annotation }>(

@@ -909,8 +909,10 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
   return (
     <div
-      className="relative flex shrink-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
-      style={{ width: panelWidth }}
+      // See EventDetailPanel: shrinkable rather than shrink-0, so no
+      // combination of open panels can push one off the viewport.
+      className="relative flex min-w-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      style={{ width: panelWidth, flex: `0 1 ${panelWidth}px` }}
       data-testid="agent-panel"
     >
       <div

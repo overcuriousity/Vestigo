@@ -41,7 +41,7 @@ export function dispositionCoversFinding(
   const detectorOk =
     d.detector === "*" ||
     d.detector === detectorKey ||
-    // Routine verdicts are declared on sequence_motif (Patterns tab) but
+    // Routine verdicts are declared on sequence_motif (Tools -> Explore) but
     // cover the identical (series_field, " → "-joined n-gram) key that
     // sequence_novelty findings surface — exact key equality, no containment.
     (d.detector === "sequence_motif" && d.kind === "routine" && detectorKey === "sequence_novelty");

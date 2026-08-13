@@ -528,6 +528,42 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Merged candidates that get the second (cadence) pass.",
     ),
     SettingSpec(
+        "analysis_gate_min_numeric_ratio",
+        "detectors",
+        "Gate: numeric-field ratio",
+        "Share of a field's sampled values that must parse as numbers before the numeric-range method is offered automatically. Gated methods stay runnable on request.",
+    ),
+    SettingSpec(
+        "analysis_gate_max_enum_distinct",
+        "detectors",
+        "Gate: enum-like distinct ceiling",
+        "A field with at most this many distinct values counts as enum-like: every value is drawn from the alphabet learned from those same values, so charset novelty cannot fire. Entropy is not gated on this — its band is a comparison one enum literal can still sit outside.",
+    ),
+    SettingSpec(
+        "analysis_gate_min_series_distinct",
+        "detectors",
+        "Gate: minimum series values",
+        "Distinct values the series field needs before two n-grams can differ at all. One value yields a single repeated n-gram; two already yield 2^n.",
+    ),
+    SettingSpec(
+        "analysis_gate_min_frequency_buckets",
+        "detectors",
+        "Gate: minimum frequency span (seconds)",
+        "Seconds of span a timeline must cover before a count spike is distinguishable from the bucket holding it. Compare with Frequency buckets, which is how many buckets that span is split into.",
+    ),
+    SettingSpec(
+        "analysis_gate_min_interval_periods",
+        "detectors",
+        "Gate: minimum cadence periods",
+        "Repeats a series value needs before an inter-arrival cadence can be fitted.",
+    ),
+    SettingSpec(
+        "analysis_cache_max_rows_per_case",
+        "detectors",
+        "Analysis cache rows per case",
+        "Cached method results retained per case, least-recently-computed evicted first. Every row is derived data — eviction only costs a rescan.",
+    ),
+    SettingSpec(
         "viz_baseline_cache_entries",
         "detectors",
         "Visualize baseline cache entries",

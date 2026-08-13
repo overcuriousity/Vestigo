@@ -6,7 +6,8 @@
  * the feed interleaves by per-detector rank and labels each raw score).
  *
  * The sequence_motif miner is deliberately absent: it is discovery, not
- * anomaly detection, and lives in the Patterns tab (PatternsView).
+ * anomaly detection, and lives in the Tools sheet's Explore section
+ * (PatternsView).
  */
 import {
   Activity,

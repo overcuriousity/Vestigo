@@ -9,9 +9,10 @@ Two entry paths share this file:
    we build an async engine from the application settings (``VESTIGO_POSTGRES_URL``)
    so the CLI can never target a different database than the app.
 
-``render_as_batch`` is enabled on SQLite because the test suite runs the full
-migration chain against ``sqlite+aiosqlite`` stores, and SQLite cannot ALTER
-columns in place.
+``render_as_batch`` stays enabled for SQLite, which cannot ALTER columns in
+place. Nothing exercises that path any more — the test suite runs the migration
+chain against real PostgreSQL — but the flag costs nothing and is the only thing
+that would make a SQLite target work at all.
 """
 
 from __future__ import annotations

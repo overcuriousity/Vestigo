@@ -22,8 +22,27 @@ chunk. Parsing a file as a whole (the obvious approach) makes the underlying par
 permanently at the first bad chunk header — on real evidence that silently drops every
 record after the damage.
 
-Not resolved: `%%1833`-style message-table references stay as-is; rendering them needs the
-provider's WEVT templates from the originating host, which a converter does not have.
+Silent parser attrition: the underlying parser (pyevtx-rs) does not raise on every record
+it cannot handle. A record whose binxml payload is damaged is skipped silently, and a
+chunk whose record framing breaks ends silently — later records in that chunk are never
+returned, and no exception reaches the handlers below, so counting exceptions would report
+a clean run. The chunk walk already knows how many record headers each chunk holds, so
+the converter reconciles per chunk: scanned record headers minus records the parser
+returned. A non-zero difference is warned about per file on stderr, stamped on that
+file's `chunk_scan` note as `scan_unresolved=N`, and totaled in
+`vestigo.parse_decisions.scan_unresolved_records`. This is detection, not recovery — the
+missing records are counted, not restored.
+
+Not resolved:
+  - `%%1833`-style message-table references stay as-is; rendering them needs the
+    provider's WEVT templates from the originating host, which a converter does not have.
+  - Carved slack is not parsed: `*.evtx-slack`-style carves and any file without an
+    `ElfFile` header are rejected at discovery — there is no carve mode (scanning raw
+    bytes for `ElfChnk` at arbitrary offsets) yet.
+  - Records beyond a chunk's free_space_offset — remnants of overwritten events in a
+    wrapped log — are not recovered; the scan honors free_space_offset like the parser.
+  - A chunk whose record framing breaks mid-chunk is not re-synchronized: records after
+    the break are invisible to both the scan and the parser (truncated_chunks flags it).
 
 Requires pyarrow and evtx:
     pip install pyarrow evtx
@@ -80,7 +99,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "evtx2vestigo"
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Vestigo Parquet interchange format v1 — embedded copy of the spec in
@@ -3516,9 +3535,10 @@ class _FileCounts:
         self.offset_fallback = 0
         self.chunk_errors = 0
         self.sanitized = 0
+        self.scan_unresolved = 0
         self.scan_note = ""
 
-    def as_tuple(self) -> tuple[int, int, int, int, int, int, str]:
+    def as_tuple(self) -> tuple[int, int, int, int, int, int, int, str]:
         return (
             self.parsed,
             self.skipped,
@@ -3526,6 +3546,7 @@ class _FileCounts:
             self.offset_fallback,
             self.chunk_errors,
             self.sanitized,
+            self.scan_unresolved,
             self.scan_note,
         )
 
@@ -3544,6 +3565,13 @@ def _convert_evtx(
     stats = _ChunkScanStats()
 
     for blob, offsets in _iter_chunks(data, stats):
+        # Reconciliation baseline for this chunk: how many record headers the chunk
+        # walk located. The parser does not raise on every record it cannot handle
+        # (a damaged binxml payload is skipped silently, broken framing ends the
+        # chunk silently), so exception counts alone would report a clean run while
+        # records vanish. `scan_unresolved` below counts them instead.
+        scanned = sum(len(located) for located in offsets.values())
+        yielded = 0
         # How many records with a given id this chunk has already consumed. The
         # scan lists a repeated id's occurrences in document order and the parser
         # yields them in that same order, so the n-th parsed record with an id
@@ -3554,6 +3582,7 @@ def _convert_evtx(
             records = PyEvtxParser(io.BytesIO(blob)).records()
         except Exception:  # noqa: BLE001 - parser raises bare RuntimeError
             counts.chunk_errors += 1
+            counts.scan_unresolved += scanned
             continue
         while True:
             try:
@@ -3563,6 +3592,7 @@ def _convert_evtx(
             except Exception:  # noqa: BLE001 - a damaged chunk ends here, others go on
                 counts.chunk_errors += 1
                 break
+            yielded += 1
 
             sanitized = False
             try:
@@ -3636,7 +3666,14 @@ def _convert_evtx(
 
             buffer.append(source_file, file_hash, offset, content_hash, row)
             counts.parsed += 1
+        # yielded can exceed scanned only when framing was too damaged for the scan
+        # to locate records the parser still returned — those rows already took the
+        # byte_offset fallback above, so only a positive gap means silent loss.
+        counts.scan_unresolved += max(0, scanned - yielded)
     counts.scan_note = stats.note()
+    if counts.scan_unresolved:
+        sep = " " if counts.scan_note else ""
+        counts.scan_note += f"{sep}scan_unresolved={counts.scan_unresolved}"
     return counts
 
 
@@ -3658,7 +3695,7 @@ def _parse_file(
     since_dt: datetime.datetime | None = None,
     until_dt: datetime.datetime | None = None,
     no_maps: bool = False,
-) -> tuple[bytes, tuple[int, int, int, int, int, int, str]]:
+) -> tuple[bytes, tuple[int, int, int, int, int, int, int, str]]:
     """Worker: parse one .evtx file, return Arrow IPC bytes + counts."""
     sink = io.BytesIO()
     writer_ipc = pa.ipc.new_stream(sink, PARQUET_EVENT_SCHEMA)
@@ -3897,23 +3934,34 @@ def convert(
     offset_fallback_total = 0
     chunk_errors_total = 0
     sanitized_total = 0
+    scan_unresolved_total = 0
     scan_notes: dict[str, str] = {}
 
-    def _tally(path_name: str, counts: tuple[int, int, int, int, int, int, str]) -> None:
+    def _tally(path_name: str, counts: tuple[int, int, int, int, int, int, int, str]) -> None:
         nonlocal parsed_total, skipped_total, skipped_by_time_total
         nonlocal offset_fallback_total, chunk_errors_total, sanitized_total
-        parsed, skipped, by_time, fallback, chunk_errors, sanitized, note = counts
+        nonlocal scan_unresolved_total
+        parsed, skipped, by_time, fallback, chunk_errors, sanitized, unresolved, note = counts
         if parsed == 0 and not by_time:
             # Never silent: a file that contributed nothing is either damaged beyond the
             # chunk walk or not what it claims to be, and the run still exits 0 as long as
             # some other file parsed.
             sys.stderr.write(f"warning: {path_name} yielded no records ({note})\n")
+        if unresolved:
+            # The chunk walk located record headers the parser never returned — the
+            # silent-skip case the reconciliation exists to surface. Loud per file,
+            # totaled in the footer.
+            sys.stderr.write(
+                f"warning: {path_name}: chunk scan located {unresolved} record(s) the "
+                "parser did not return (possible silent parser drops)\n"
+            )
         parsed_total += parsed
         skipped_total += skipped
         skipped_by_time_total += by_time
         offset_fallback_total += fallback
         chunk_errors_total += chunk_errors
         sanitized_total += sanitized
+        scan_unresolved_total += unresolved
         scan_notes[path_name] = note
 
     schema = PARQUET_EVENT_SCHEMA.with_metadata(metadata)
@@ -4012,6 +4060,7 @@ def convert(
                         "byte_offset_fallback_rows": offset_fallback_total,
                         "content_hash": "sha256 of the raw record bytes",
                         "chunk_errors": chunk_errors_total,
+                        "scan_unresolved_records": scan_unresolved_total,
                         "xml_sanitized_rows": sanitized_total,
                         "chunk_scan": scan_notes,
                     },
@@ -4022,6 +4071,11 @@ def convert(
 
     time_note = f", {skipped_by_time_total} outside --since/--until" if (since or until) else ""
     damage_note = f", {chunk_errors_total} damaged chunk(s) skipped" if chunk_errors_total else ""
+    unresolved_note = (
+        f", {scan_unresolved_total} record(s) located by chunk scan but not returned by parser"
+        if scan_unresolved_total
+        else ""
+    )
     if split_spec is not None:
         try:
             parts = split_parquet(Path(write_target), output, split_spec, verbose)
@@ -4030,12 +4084,12 @@ def convert(
         sys.stderr.write(
             f"{CONVERTER_NAME}: wrote {parsed_total} events to {len(parts)} part "
             f"file(s) [{parts[0].name} .. {parts[-1].name}] "
-            f"({skipped_total} unparseable records skipped{time_note}{damage_note})\n"
+            f"({skipped_total} unparseable records skipped{time_note}{damage_note}{unresolved_note})\n"
         )
     else:
         sys.stderr.write(
             f"{CONVERTER_NAME}: wrote {parsed_total} events to {output} "
-            f"({skipped_total} unparseable records skipped{time_note}{damage_note})\n"
+            f"({skipped_total} unparseable records skipped{time_note}{damage_note}{unresolved_note})\n"
         )
     return 0 if parsed_total > 0 else 1
 

@@ -5,7 +5,132 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.12.0] — 2026-08-13
+
+### Added
+
+- **The Investigate surface is now a findings rail plus one overlay sheet.** Findings are
+  grouped by the *kind of claim* they make — named techniques, statistical outliers ("odd,
+  not necessarily bad"), exploration ("leads, not verdicts") — which is the one thing the
+  old panel never said: a Sigma hit and a rare value are not the same assertion. Presets
+  filter the feed by the question being asked rather than by detector. The rail is the only
+  fixed-width surface the analysis flow spends; everything else opens as an absolutely
+  positioned sheet, so detail can be wide without ever narrowing the event grid. The sheet
+  has three modes — a finding, a method, and Tools — and sizes to its content rather than
+  the viewport.
+- **A finding's sheet states the claim in prose, names its subject, and shows the query
+  shape behind it.** Every number in the sentence comes from the payload; the field and
+  value that triggered the finding are the first thing on the surface; the SQL sketch is
+  labeled as a teaching aid rather than a transcript, because the detectors do not return
+  their compiled statement and presenting one anyway would be a claim we cannot point at
+  code for. The method's parameters are editable in place and re-run from there, which is
+  what keeps the analysis gate advice rather than a lock in the UI as well as the API.
+- **Detectors can be muted per timeline.** Some defects belong to the evidence rather than
+  to the behavior it records — a capture whose sources disagree about the clock makes
+  `timestamp_order` fire on millions of true, useless findings — so a strip at the top of
+  the Investigate rail takes a method out of the sweep entirely: no findings, no histogram
+  or grid marks, no query issued. The mute is shared case state on the timeline
+  (`PATCH .../timelines/{id}/muted-methods`, audited) rather than a browser preference, so
+  the next analyst inherits the conclusion instead of rediscovering it. It is a reading
+  preference and never a lock: the analysis plan does not consult it, and a muted method
+  still runs from Tools when asked for by name. The rail always names how many detectors it
+  is holding back, and the Tools accounting counts them apart from both "ran" and "skipped".
+- **An analysis gate.** `GET /api/cases/{id}/timelines/{id}/analysis/plan` answers, per
+  method and without scanning a single event, whether that method *can* produce a finding
+  on this data — from the per-source field-stats cache plus one timestamp-range probe. A
+  method is marked `not_applicable` only when it structurally cannot score, never when it
+  looks unpromising, and it stays runnable on request: the plan is advice plus an audit
+  record. Each verdict carries the arithmetic behind it ("no field parses as numeric (0 of
+  19 sampled)"), so it is a claim an analyst can check and argue with.
+- **A fingerprint-keyed cache for findings.** The key covers every input that can change an
+  answer, and sources are immutable, so a cache hit is proof the answer still holds —
+  deliberately no TTL. It is purged with the source or case it derives from, and is
+  distinct from `DetectorRun`, which remains the forensic diary of what an analyst ran.
+- **Verdicts record the comparison they were reached under.** Dispositions carry an
+  `analysis_scope`, and `confirmed` is the one kind whose identity includes it: escalating a
+  finding against the February baseline and again against March are two claims, not one
+  deduplicated row. Findings badge verdicts reached under the scope on screen and mark
+  verdicts reached elsewhere as such, instead of silently presenting one as the other.
+- **A scope-change dialog that states its consequences in numbers** — how many methods will
+  re-run and how many verdicts were reached under the scope being left — and a baseline
+  builder reachable by marking a range directly on the histogram.
+- **The evtx converter now detects silent parser attrition.** pyevtx-rs skips a damaged
+  record and ends a broken chunk without raising, so counting exceptions reported a clean
+  run over lossy evidence. The converter reconciles scanned record headers against records
+  returned, per chunk, and reports the difference per file and in
+  `vestigo.parse_decisions.scan_unresolved_records`. Detection, not recovery: the missing
+  records are counted, not restored.
+
+### Changed
+
+- **The Tools sheet is tabbed, Scope first, and reachable directly.** Its four sections
+  were one long scroll in which a thousand-row template list buried the baseline picker —
+  the control that reframes every other section — below all of it. Each section is now its
+  own tab that scrolls independently, and the Investigate rail header carries a Tools
+  button, so the sheet no longer has to be reached sideways through an error message or the
+  skipped-methods summary. Every existing entry point still lands on its own section.
+- **The rail's ranked feed carries a display floor for the two band methods.** Findings
+  rotate method-by-method so every method has a row near the top, which means a value one
+  band width outside its learned band would otherwise sit above one tens of band widths
+  out. Numeric-range and entropy findings below 2× band leave the feed; the group's count
+  still includes them and a row says how many, one click from showing them. Presentation
+  only — the methods still return everything, and methods with a threshold of their own
+  (frequency's z, the q-gated two-window methods) keep it in the run where it belongs.
+- **`sequence_novelty` and `entropy` are no longer gated off where they can still score.**
+  Sequence novelty required three distinct series values; two yield eight distinct trigrams
+  and a rare one scores fine, so every ordinary two-source timeline had quietly lost n-gram
+  novelty. Entropy shared charset's enum-like gate, which only holds for charset.
+
+### Fixed
+
+- The Investigate sheet is positioned against the grid stage it belongs to. It and its scrim
+  had no positioned ancestor, so both resolved against the viewport: the sheet covered the
+  top bar and toolbar, and a full-page scrim swallowed every click in the application.
+- Muting a detector clears its histogram and grid marks in the same session. Disabling the
+  sweep's query does not evict what was already fetched, so the rows left the feed and the
+  strip reported the mute while every mark stayed on the timeline.
+- The "Known-bad" preset no longer prints "no method applies to this data yet" underneath
+  the Sigma rule hits it is listing. It is a Sigma-only preset, so it has no runnable method
+  by construction, and that empty state was not guarded by whether anything had been found.
+- The Sigma and pattern-mining guidance panels rendered twice in the Tools sheet, once from
+  the sheet and once from the panel inside it.
+- A `confirmed` verdict is deduplicated by the comparison it was reached under — frame and
+  baseline id — rather than by the whole scope object, so renaming a baseline no longer
+  splits one claim into two rows with two system annotations.
+- The analysis plan's timestamp probe reads the raw sort-key column and widens its span by
+  the declared clock offsets, instead of aggregating an expression that could not use the
+  index — an unbudgeted full read of the case on every scope change.
+- `delete_source` purges the analysis cache, which held event ids, field values and message
+  templates from the deleted source.
+- A detector's cached answer records the *mode* it ran in (`analysis_mode`), which the
+  runner had been overwriting with the requested method id.
+- The Investigate rail no longer claims "no findings under this scope" for a preset whose
+  methods all need setup and never ran, and the routine-collapse chip no longer announces
+  that zero events are hidden.
+- Out-of-band evidence strips label the value at its marker rather than mid-track, where it
+  read as sitting inside the band — the exact misread the to-scale marker exists to prevent.
+
+### Dependencies
+
+- Backend: fastapi 0.140.13 → 0.141.1, uvicorn 0.51.0 → 0.52.2, qdrant-client 1.18.0 →
+  1.19.0, pysigma 1.4.0 → 1.5.0, pydantic-ai-slim 2.19.0 → 2.29.0, typer 0.27.0 → 0.27.1,
+  h2 4.3.0 → 4.4.1, ruff 0.16.0 → 0.16.2.
+- Frontend: vite 8.1.5 → 8.2.0, jsdom 29.1.1 → 30.0.1, oxlint 1.75.0 → 1.77.0,
+  `@tanstack/react-virtual` 3.14.8 → 3.14.9, the Radix checkbox and toast primitives, the
+  React type packages, `@vitejs/plugin-react` 6.0.4 → 6.0.5, and a transitive nanoid
+  advisory (GHSA-2v37-7h3g-55p8). The container's Node base image goes 24-alpine →
+  25-alpine.
+- **`@tanstack/react-table` 8.21.3 → 9.0.0, migrated onto the new feature API** rather
+  than its v8 compatibility shim. `EventGrid` now declares the three features it actually
+  uses — column sizing, column resizing, column visibility — and subscribes to the single
+  state slice it reads instead of to the whole table state. Row selection, sorting,
+  filtering and expansion stay deliberately unregistered: this grid does all four against
+  the server, and enabling the features would keep a second, empty copy of that state
+  beside the real one. Two things moved and would have failed silently: the live resize
+  state is `columnResizing.isResizingColumn` (was `columnSizingInfo`), so a column's width
+  would have stopped being persisted on drag-release, and `ColumnDef`/`Header` take the
+  feature set as their first type argument. `src/test/eventGridResize.test.tsx` covers the
+  resize gesture end to end, since neither failure is visible to a type check.
 
 ## [1.11.0] — 2026-08-07
 

@@ -1,6 +1,6 @@
 [project]
 name = "vestigo"
-version = "1.11.0"
+version = "1.12.0"
 description = "Local-first, forensic-grade log investigation platform with vector-backed anomaly detection."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -19,13 +19,13 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "fastapi>=0.140.13",
-    "uvicorn[standard]>=0.51.0",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
     "typer>=0.27.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "python-dotenv>=1.0.0",
-    "qdrant-client>=1.13.0,<2.0.0",
+    "qdrant-client>=1.19.0,<2.0.0",
     "clickhouse-connect>=1.6.0",
     "sqlalchemy[asyncio]>=2.0.0",
     "asyncpg>=0.30.0",
@@ -37,9 +37,9 @@ dependencies = [
     "geoip2>=5.3.0",
     "alembic>=1.18.5",
     "pyarrow>=25.0.0",
-    "pysigma>=1.4.0,<2.0.0",
+    "pysigma>=1.5.0,<2.0.0",
     "pyyaml>=6.0",
-    "pydantic-ai-slim[anthropic,mcp,openai]>=2.19.0",
+    "pydantic-ai-slim[anthropic,mcp,openai]>=2.23.0",
     "mcp>=1.28.1",
 ]
 
@@ -67,9 +67,8 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=6.0.0",
-    "ruff>=0.16.0",
+    "ruff>=0.16.1",
     "httpx>=0.28.0",
-    "aiosqlite>=0.20.0",
     "evtx>=0.12",
 ]
 
@@ -185,4 +184,5 @@ asyncio_mode = "auto"
 addopts = "--cov=vestigo --cov-report=term-missing"
 markers = [
     "clickhouse: requires a reachable ClickHouse (dev compose stack); skipped otherwise",
+    "multiloop: drives work on more than one event loop (a second TestClient, the CLI); gives the test an unpooled store, since asyncpg binds a connection to the loop that opened it",
 ]

@@ -87,11 +87,8 @@ def _fixture_events() -> list[Event]:
 
 @pytest.fixture(scope="module")
 def svc():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     store.insert_events(_fixture_events())
     service = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     service.ch = store

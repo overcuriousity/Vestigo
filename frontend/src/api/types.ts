@@ -142,6 +142,12 @@ export interface Timeline {
   field_mappings: Record<string, string[]> | null;
   /** Data-derived default grid columns, shared by everyone with access. */
   recommended_columns: RecommendedColumns | null;
+  /**
+   * Analysis methods kept out of this timeline's unprompted sweep, shared by
+   * everyone with access. A reading preference, never a gate — the analysis
+   * plan ignores it and a muted method still runs when asked for by name.
+   */
+  muted_methods: string[];
   created_at: string;
   updated_at: string;
 }
@@ -358,6 +364,12 @@ export interface ValueNoveltyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One anomalous time window from the frequency detector. */
@@ -379,6 +391,12 @@ export interface FrequencyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One rare / first-seen field *combination* from the value_combo detector. */
@@ -399,6 +417,12 @@ export interface ValueComboFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One out-of-range numeric value from the numeric_range detector. */
@@ -420,6 +444,12 @@ export interface NumericRangeFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One value containing never-seen characters from the charset detector. */
@@ -440,6 +470,12 @@ export interface CharsetFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One entropy-outlier value from the entropy detector. */
@@ -463,6 +499,12 @@ export interface EntropyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One value-share shift between windows from the proportion_shift detector. */
@@ -495,6 +537,12 @@ export interface ProportionShiftFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One arrival-cadence change between windows from the interval_periodicity detector. */
@@ -529,6 +577,12 @@ export interface IntervalPeriodicityFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
@@ -554,6 +608,12 @@ export interface SequenceNoveltyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One out-of-order timestamp finding from the timestamp_order detector. */
@@ -577,6 +637,12 @@ export interface TimestampOrderFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One whole-field distribution change between windows from the value_distribution_drift detector. */
@@ -609,6 +675,12 @@ export interface DistributionDriftFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One recurring event-order n-gram from the sequence_motif miner. */
@@ -640,6 +712,12 @@ export interface SequenceMotifFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 export type AnomalyFinding =
@@ -769,6 +847,13 @@ export interface Disposition {
   event_id: string | null;
   note: string | null;
   details: Record<string, unknown> | null;
+  /**
+   * The comparison the verdict was reached under (`frame`, `baseline_id`).
+   * Null on rows written before scope provenance existed. Only `confirmed`
+   * folds it into the row's identity, so only that kind can hold two rows for
+   * one finding — one per scope.
+   */
+  analysis_scope?: { frame?: string; baseline_id?: string | null } | null;
   created_by: string | null;
   created_at: string | null;
 }
