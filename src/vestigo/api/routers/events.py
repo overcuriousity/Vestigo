@@ -60,6 +60,7 @@ from vestigo.db.postgres import (
     User,
     dispositions_hash,
     generate_id,
+    scope_identity,
 )
 from vestigo.db.queries import EventQuery, EventQueryService, TagFilter
 from vestigo.db.similarity import EncoderUnavailableError, SimilarityService
@@ -2453,15 +2454,12 @@ def _apply_dismissals(
 def _scope_key(scope: dict[str, Any] | None) -> tuple[str | None, str | None]:
     """The two fields that identify a comparison: frame and baseline id.
 
-    Deliberately narrower than whole-dict equality. The scope object also
-    carries display material (``baseline_name``), which a rename would change
-    without changing which comparison was run — matching on the whole object
-    would silently unbadge every verdict reached before the rename.
+    Delegates to :func:`vestigo.db.postgres.scope_identity` so badging here and
+    the ``confirmed`` dedupe there cannot drift: one narrowing and the other
+    comparing whole dicts is how the same verdict gets written twice and then
+    displayed once.
     """
-    if not scope:
-        return (None, None)
-    baseline_id = scope.get("baseline_id")
-    return (scope.get("frame"), baseline_id if baseline_id is None else str(baseline_id))
+    return scope_identity(scope)
 
 
 def _apply_confirmations(

@@ -36,9 +36,16 @@ export function useScopeChange(caseId: string, timelineId: string) {
   // Verdicts reached under the scope being left. Rows written before scope
   // provenance existed carry none and are not counted — claiming them would be
   // asserting something the database does not record.
+  //
+  // Only `confirmed` counts. `normal`/`dismissed`/`routine` are standing
+  // declarations about a value, effective under every frame (see
+  // `postgres.py::create_disposition`), so they are never re-examined on a
+  // scope change and quoting them would inflate a number the dialog exists to
+  // state exactly.
   const affectedVerdicts = useMemo(() => {
     const rows = dispositions?.dispositions ?? [];
     return rows.filter((d) => {
+      if (d.kind !== "confirmed") return false;
       const recorded = d.analysis_scope;
       if (!recorded) return false;
       return (

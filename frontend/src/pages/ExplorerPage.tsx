@@ -344,6 +344,7 @@ export function ExplorerPage() {
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
   const investigatePanelOpen = useUiStore((s) => s.investigatePanelOpen);
   const setInvestigatePanelOpen = useUiStore((s) => s.setInvestigatePanelOpen);
+  const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
   // Agent panel: only offered when the backend probe says the agent exists —
   // an unconfigured install renders zero agent UI.
   const agentAvailable = useHealth().data?.agent_available ?? false;
@@ -1370,6 +1371,9 @@ export function ExplorerPage() {
               // a pending range that nothing ever renders.
               setInvestigatePanelOpen(true);
               setSheet({ kind: "tools", section: "scope" });
+              // The drawer is the only consumer of pendingRange and it mounts
+              // closed, so opening the sheet is not enough on its own.
+              setBaselineBuilderOpen(true);
             }}
           />
         )}

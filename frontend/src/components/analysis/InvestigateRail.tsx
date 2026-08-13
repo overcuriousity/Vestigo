@@ -209,6 +209,11 @@ export function InvestigateRail({
   const showSigma = active.sigma && sigmaFindings.length > 0;
   const anyFindings =
     visible.some((m) => byMethod[m.id].findings.length > 0) || showSigma;
+  // Both empty states are claims about *what this preset shows*, so they are
+  // counted over `visible` — the sweep's global done/total would let a preset
+  // whose own methods never ran inherit "clear" from methods it hides.
+  const visibleRunnable = visible.filter((m) => byMethod[m.id].status === "applicable");
+  const visibleSettled = visibleRunnable.every((m) => !byMethod[m.id].pending);
 
   // Said before anything else, and instead of everything else: a findings list
   // over a timeline with no events is not "clear", it is unanswered.
@@ -323,19 +328,20 @@ export function InvestigateRail({
         />
       ))}
 
-      {/* "No findings" is a claim that every method that could run, ran. It
-          may not be made while the plan is still resolving (nothing is
-          runnable yet, so done === total is vacuously true) or while any
-          method is still pending. */}
-      {!anyFindings && !planLoading && total > 0 && done === total && (
+      {/* "No findings" is a claim that every method that could run *here*, ran.
+          It may not be made while the plan is still resolving (nothing is
+          runnable yet, so the check is vacuously true), while any of this
+          preset's methods is still pending, or when none of them was runnable
+          at all — a preset whose methods all need setup checked nothing. */}
+      {!anyFindings && !planLoading && visibleRunnable.length > 0 && visibleSettled && (
         <AnalysisEmptyState hint="Open Tools to run a method the gate skipped, or set a baseline to enable the comparison methods.">
           No findings under this scope.
         </AnalysisEmptyState>
       )}
 
-      {/* Every method gated off. Not the same statement as "nothing found" —
-          nothing ran. */}
-      {!planLoading && total === 0 && (
+      {/* Every method under this preset gated off. Not the same statement as
+          "nothing found" — nothing ran. */}
+      {!planLoading && visibleRunnable.length === 0 && (
         <AnalysisEmptyState hint="Open Tools to see why each was skipped and run one anyway, or set a baseline to enable the comparison methods.">
           No method applies to this data yet.
         </AnalysisEmptyState>

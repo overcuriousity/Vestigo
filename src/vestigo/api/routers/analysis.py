@@ -37,7 +37,7 @@ from vestigo.api.routers.events import (
 from vestigo.core.config import get_settings
 from vestigo.db._buckets import query_timestamp_range
 from vestigo.db._dt import ensure_utc
-from vestigo.db._offsets import bind_offset_params, effective_ts_sql
+from vestigo.db._offsets import offset_raw_bounds
 from vestigo.db.analysis_cache import cache_get, cache_put, enrichment_generation, fingerprint
 from vestigo.db.analysis_cache import detector_settings as detector_settings_material
 from vestigo.db.analysis_plan import (
@@ -100,9 +100,11 @@ async def _collect_plan_inputs(
 
     ``source_offsets`` matters for the same reason ``field_mappings`` does: the
     span this probe measures is what gates the frequency method, and every
-    detector buckets the *offset-corrected* timestamp. Probing the raw column
-    would let the gate and the detector disagree about the same data whenever a
-    source carries a declared clock-skew correction.
+    detector buckets the *offset-corrected* timestamp. Ignoring a declared
+    clock-skew correction here would let the gate and the detector disagree
+    about the same data — so the probe stays on the raw column (the cheap
+    index path) and the span it yields is widened by the offsets' extremes.
+    See the comment at the probe for why that direction is the safe one.
     """
     cfg = get_settings()
     store = get_store()
@@ -134,17 +136,34 @@ async def _collect_plan_inputs(
     # Offloaded: this is a blocking ClickHouse round-trip in an async handler,
     # and the rail fires a dozen findings requests immediately after the plan
     # resolves — holding the event loop here stalls all of them.
+    #
+    # The raw column, not the offset-corrected expression. `timestamp` is a
+    # sort-key prefix (ORDER BY case_id, source_id, timestamp, event_id), so
+    # min/max over it is an index lookup; wrapping it in the offset `transform`
+    # makes it an expression over two columns, which turns this endpoint's one
+    # "cheap enough not to need a cache layer" probe into a full read of the
+    # case whenever any source declares a clock-skew correction — unbudgeted,
+    # on every scope change, from a handler documented as answering without
+    # scanning an event.
+    #
+    # Correctness is preserved by widening instead: `offset_raw_bounds` gives
+    # the extremes any offset can shift a row by, so the derived span is a
+    # superset of the effective-ts span. The gate only ever errs open on it,
+    # which is the direction its contract requires — a method is withheld only
+    # when it structurally cannot produce a finding.
     probe_params: dict[str, Any] = {"case_id": case_id, "source_ids": source_ids}
-    bind_offset_params(source_offsets, probe_params)
     min_ts, max_ts = await run_in_threadpool(
         query_timestamp_range,
         svc.ch.client,
         svc.ch.database,
         "case_id = {case_id:String} AND source_id IN {source_ids:Array(String)}",
         probe_params,
-        effective_ts_sql(source_offsets),
     )
-    span_seconds = (max_ts - min_ts).total_seconds() if min_ts and max_ts else 0.0
+    if min_ts and max_ts:
+        max_off, min_off = offset_raw_bounds(source_offsets)
+        span_seconds = (max_ts - min_ts).total_seconds() + float(max_off - min_off)
+    else:
+        span_seconds = 0.0
 
     numeric = numeric_tokens_from_stats(stats, cfg.analysis_gate_min_numeric_ratio)
     return PlanInputs(

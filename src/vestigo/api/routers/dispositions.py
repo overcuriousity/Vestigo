@@ -61,7 +61,11 @@ class DispositionCreate(BaseModel):
     #: on 4 March" cannot say what the finding was compared against. Optional:
     #: clients that do not know their scope record none rather than a guess.
     #: Named ``analysis_scope`` because "scope" is already taken above for the
-    #: value-vs-event distinction.
+    #: value-vs-event distinction. Stored whole, but only ``frame`` and
+    #: ``baseline_id`` identify the comparison (``postgres.scope_identity``):
+    #: echoing the endpoint's scope object verbatim is correct, and the volatile
+    #: keys in it — ``baseline_name``, ``dispositions_hash`` — neither dedupe a
+    #: verdict apart nor unbadge it.
     analysis_scope: dict | None = None
 
 

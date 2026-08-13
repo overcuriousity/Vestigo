@@ -154,7 +154,12 @@ The Investigate rail does not run every method on open. `db/analysis_plan.py`
 answers, per method and without scanning a single event, whether that method
 *can* produce a finding on this data; `GET .../analysis/plan` serves the
 verdicts. Inputs are the per-source `field_stats` cache and one
-timestamp-range probe, both already paid for elsewhere.
+timestamp-range probe, both already paid for elsewhere. The probe reads the raw
+`timestamp` column — a sort-key prefix, so an index lookup rather than a scan —
+and widens the span it returns by the extremes of any declared per-source clock
+offsets. The span the gate sees is therefore an upper bound of the
+offset-corrected one, which can only make the gate offer a method it might have
+withheld; it never withholds one on that account.
 
 **A method is `not_applicable` if and only if it structurally cannot produce a
 finding here** — never because it looks unpromising. The distinction is the

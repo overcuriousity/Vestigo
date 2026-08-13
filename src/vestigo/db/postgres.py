@@ -1086,6 +1086,27 @@ def canonical_scope(scope: dict | None) -> dict | None:
     return None if scope is None else json.loads(json.dumps(scope, sort_keys=True))
 
 
+def scope_identity(scope: dict | None) -> tuple[str | None, str | None]:
+    """The two fields of an ``analysis_scope`` that identify a comparison.
+
+    Deliberately narrower than whole-dict equality, and the same rule the
+    findings endpoints badge by (``api/routers/events.py::_scope_key``, which
+    delegates here). The scope object an analyst echoes back also carries
+    display material (``baseline_name``) and a ``dispositions_hash`` that moves
+    every time any verdict is recorded; comparing the whole object would make
+    a rename — or the analyst's own previous click — look like a different
+    comparison, so re-confirming one finding would write a second ``confirmed``
+    row and a second system annotation for one claim.
+
+    The full object is still what gets *stored*: it is the audit record of what
+    was on screen. Only the comparison narrows.
+    """
+    if not scope:
+        return (None, None)
+    baseline_id = scope.get("baseline_id")
+    return (scope.get("frame"), baseline_id if baseline_id is None else str(baseline_id))
+
+
 def disposition_identity(
     *,
     timeline_id: Any,
@@ -1101,15 +1122,14 @@ def disposition_identity(
 
     ``analysis_scope`` joins the key for ``confirmed`` only — see
     :meth:`PostgresStore.create_disposition` for why the two verdict families
-    differ. Serialized because a dict is unhashable.
+    differ — and joins it narrowed to what identifies a comparison, per
+    :func:`scope_identity`.
 
     Shared by the single-row and bulk paths so the identity rule is stated once:
     two expressions of it drift, and a drifted dedupe silently writes a
     duplicate verdict.
     """
-    scope_part = (
-        json.dumps(canonical_scope(analysis_scope), sort_keys=True) if kind == "confirmed" else None
-    )
+    scope_part = scope_identity(analysis_scope) if kind == "confirmed" else None
     return (timeline_id, kind, detector, field, value, source_id, event_id, scope_part)
 
 
@@ -4392,20 +4412,26 @@ class PostgresStore:
                 .scalars()
                 .all()
             )
-            # The scope arm of the key is settled here rather than in SQL. Both
-            # dialects can compare the *canonical* form (see `canonical_scope`),
-            # but neither can express the NULL arm portably: SQLAlchemy's JSON
-            # comparator does not render `IS NULL` as a plain SQL null test. The
-            # candidate set is one row per scope this exact finding was confirmed
-            # under, so the filter costs nothing to do in Python.
+            # The scope arm of the key is settled here rather than in SQL: the
+            # comparison is over two extracted fields, not the stored JSON, and
+            # SQL cannot express even the NULL arm portably (SQLAlchemy's JSON
+            # comparator does not render `IS NULL` as a plain SQL null test).
+            # The candidate set is one row per scope this exact finding was
+            # confirmed under, so the filter costs nothing to do in Python.
             if scope_in_identity:
-                # Exact scope match, and nothing else. A row carrying no scope
-                # was confirmed under a comparison nobody recorded, so it can
-                # neither answer for this scope nor be backfilled with it — the
-                # backfill would make the audit column assert a frame the
-                # verdict was not reached under. Re-confirming such a finding
-                # writes a new, stamped row and leaves the old one honest.
-                existing = next((r for r in candidates if r.analysis_scope == analysis_scope), None)
+                # Same comparison, and nothing else — `scope_identity`, not
+                # whole-dict equality, so a baseline rename or a moved
+                # `dispositions_hash` in the echoed scope does not read as a
+                # different frame. A row carrying no scope was confirmed under a
+                # comparison nobody recorded, so it can neither answer for this
+                # scope nor be backfilled with it — the backfill would make the
+                # audit column assert a frame the verdict was not reached under.
+                # Re-confirming such a finding writes a new, stamped row and
+                # leaves the old one honest.
+                want = scope_identity(analysis_scope)
+                existing = next(
+                    (r for r in candidates if scope_identity(r.analysis_scope) == want), None
+                )
             else:
                 existing = candidates[0] if candidates else None
             if existing is not None:

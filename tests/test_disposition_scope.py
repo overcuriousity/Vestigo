@@ -192,6 +192,54 @@ def _post_confirmed(client, case_id, timeline_id, analysis_scope):
     ).json()["disposition"]
 
 
+def test_a_renamed_baseline_does_not_split_one_verdict_into_two(client, seeded):
+    """Only ``frame`` and ``baseline_id`` identify a comparison.
+
+    The scope object an analyst echoes back also carries display material and a
+    ``dispositions_hash`` that moves every time any verdict is recorded.
+    Comparing the whole object would make a rename — or the analyst's own
+    previous click — read as a different comparison, so re-confirming one
+    finding would write a second row and a second system annotation for one
+    claim. This is the same narrowing the findings endpoints badge by.
+    """
+    case_id, timeline_id = seeded
+    renamed = {**SCOPE, "baseline_name": "Feb 24 – Mar 1 (revised)"}
+    rehashed = {**SCOPE, "dispositions_hash": "0" * 64}
+
+    first = _post_confirmed(client, case_id, timeline_id, SCOPE)
+    assert _post_confirmed(client, case_id, timeline_id, renamed)["id"] == first["id"]
+    assert _post_confirmed(client, case_id, timeline_id, rehashed)["id"] == first["id"]
+    # The row keeps the scope it was written with: the narrowing governs
+    # identity only, never what the audit column records.
+    assert first["analysis_scope"] == SCOPE
+
+
+def test_bulk_dedupe_narrows_the_scope_the_same_way(client, seeded):
+    """The bulk path expresses the identity rule through the same helper.
+
+    Two expressions of it drift, and a drifted dedupe writes the duplicate the
+    single-row path just refused.
+    """
+    case_id, timeline_id = seeded
+    first = _post_confirmed(client, case_id, timeline_id, SCOPE)
+    r = client.post(
+        f"/api/cases/{case_id}/timelines/{timeline_id}/dispositions/bulk",
+        json={
+            "items": [
+                {
+                    "kind": "confirmed",
+                    "detector": "value_novelty",
+                    "source_id": "s1",
+                    "event_id": "e1",
+                    "analysis_scope": {**SCOPE, "baseline_name": "renamed"},
+                }
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["dispositions"][0]["id"] == first["id"]
+
+
 def test_an_unstamped_verdict_is_never_backfilled_with_a_scope(client, seeded):
     """A ``confirmed`` row carrying no scope stays that way, forever.
 

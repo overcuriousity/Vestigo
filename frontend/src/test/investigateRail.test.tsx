@@ -210,6 +210,43 @@ describe("InvestigateRail", () => {
     expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
   });
 
+  it("makes the all-clear claim only about the preset on screen", () => {
+    // The sweep's global done/total say nothing about what this preset shows.
+    // Reading them here let "Changed vs. baseline" — whose comparison methods
+    // are gated off without a baseline — inherit an all-clear from methods it
+    // hides, asserting a clean sweep for two methods that never ran.
+    renderRail({
+      done: 2,
+      total: 2,
+      byMethod: {
+        value_novelty: state("value_novelty", { findings: [finding()], total: 1 }),
+        frequency: state("frequency", {
+          status: "not_applicable",
+          plan: {
+            method: "frequency",
+            status: "not_applicable",
+            reason: "no baseline is set",
+            reason_facts: {},
+            cost_class: "cheap",
+          },
+        }),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Changed vs. baseline" }));
+    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+    expect(screen.getByText(/No method applies to this data yet/i)).toBeInTheDocument();
+  });
+
+  it("still says nothing-found when this preset's methods did all run", () => {
+    renderRail({
+      done: 1,
+      total: 1,
+      byMethod: { value_novelty: state("value_novelty") },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unusual values" }));
+    expect(screen.getByText(/No findings under this scope/i)).toBeInTheDocument();
+  });
+
   it("renders a method's error without hiding the rest of the stream", () => {
     renderRail({
       byMethod: {

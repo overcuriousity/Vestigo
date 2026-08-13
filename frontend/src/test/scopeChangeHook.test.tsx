@@ -20,8 +20,9 @@ vi.mock("@/hooks/useAnalysisPlan", () => ({
     scope: { frame: "self", baseline_id: null, baseline_name: null },
   }),
 }));
+const rows = vi.hoisted(() => ({ current: [] as Record<string, unknown>[] }));
 vi.mock("@/api/dispositions", () => ({
-  dispositionsApi: { list: () => Promise.resolve({ dispositions: [] }) },
+  dispositionsApi: { list: () => Promise.resolve({ dispositions: rows.current }) },
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -63,5 +64,30 @@ describe("useScopeChange.confirm", () => {
     const { result } = renderHook(() => useScopeChange("c1", "t1"), { wrapper });
     act(() => result.current.request({ frame: "baseline" }));
     expect(result.current.pending).toBeNull();
+  });
+});
+
+describe("useScopeChange.affectedVerdicts", () => {
+  const scope = { frame: "self", baseline_id: null };
+
+  beforeEach(() => {
+    rows.current = [];
+  });
+
+  it("counts only the verdicts a scope change can actually affect", async () => {
+    // `confirmed` is the one kind whose identity folds in the scope.
+    // `normal`/`dismissed`/`routine` are standing declarations about a value,
+    // effective under every frame — quoting them would promise the analyst that
+    // rows will be marked for re-examination that never can be.
+    rows.current = [
+      { kind: "confirmed", analysis_scope: scope },
+      { kind: "confirmed", analysis_scope: { frame: "baseline", baseline_id: "bl-1" } },
+      { kind: "normal", analysis_scope: scope },
+      { kind: "dismissed", analysis_scope: scope },
+      { kind: "routine", analysis_scope: scope },
+      { kind: "confirmed", analysis_scope: null },
+    ];
+    const { result } = renderHook(() => useScopeChange("c1", "t1"), { wrapper });
+    await vi.waitFor(() => expect(result.current.affectedVerdicts).toBe(1));
   });
 });
