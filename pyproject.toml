@@ -39,7 +39,7 @@ dependencies = [
     "pyarrow>=25.0.0",
     "pysigma>=1.5.0,<2.0.0",
     "pyyaml>=6.0",
-    "pydantic-ai-slim[anthropic,mcp,openai]>=2.23.0",
+    "pydantic-ai-slim[anthropic,mcp,openai]>=2.27.0",
     "mcp>=1.28.1",
 ]
 
