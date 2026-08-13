@@ -1,10 +1,44 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-13 (session 167 — PR #262 sixth review, the rail read against a real
-7.8M-event case, and the 1.12.0 release).
+Last updated: 2026-08-13 (session 168 — per-timeline detector muting, and the Tools sheet
+restructured into tabs).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 168 — 2026-08-13: muting a detector, and Tools stops being a scroll
+
+**Muting.** Reading the rail against the same 7.8M-event capture surfaced a class of finding
+no threshold fixes: `timestamp_order` returned 2.97M hits because that capture's sources
+disagree about the clock. Every one of them is true, and none of them is the investigation —
+a defect in the evidence rather than in the behavior it records. Dismissing them one at a
+time is not triage, so a method can now be taken out of the sweep: `Timeline.muted_methods`
+(migration 0028), written through an audited `PATCH .../muted-methods`.
+
+Shared state, not a browser preference — the first instinct was localStorage beside the
+column choices, and it was wrong. "This source's clocks are a mess" is a conclusion about the
+*data*, and the next analyst on the case should inherit it rather than rediscover it against
+three million rows.
+
+The care went into keeping the mute from becoming the thing this surface exists to prevent.
+The plan endpoint does not consult it: a mute is not a claim that the method cannot score
+here, and folding it into `not_applicable` would have put an analyst's preference into the
+gate's mouth. `/analysis/findings` still runs a muted method by name, so Tools' "Run anyway"
+means the same thing for a mute as it does for a gate verdict. The client is the only thing
+that skips, in one place — `useStreamingSweep` never issues the query — which is what makes
+"gone from the feed, the histogram markers and the progress denominator" follow from one
+decision rather than three that drift apart. And a muted row shows no count at all, because
+its query never ran and a `0` there would assert exactly the "checked, clear" misread the
+rail is built around. The rail's top strip always states how many detectors are held back.
+
+**Tools.** Four sections in one scroll worked until the template list reached a thousand rows
+and put the baseline picker — the control that reframes every other section — below all of
+it. Tabs now, Scope leading, each scrolling on its own; the section a rail affordance asks
+for selects a tab instead of scroll-jumping, and a tab that vanishes under the selection
+(Sigma unconfigured) falls back rather than rendering an empty sheet. The rail header gained
+a Tools button, since every previous way in required something to have gone wrong first.
+Along the way: the Sigma and pattern guidance panels had been rendering twice, once from the
+sheet and once from the panel inside it.
 
 ## Session 167 — 2026-08-13: the sixth review, the rail read against real evidence, and 1.12.0
 

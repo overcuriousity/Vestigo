@@ -213,10 +213,15 @@ instead of rebuilding.
   `analysis/` (the Investigate surface: `InvestigateRail` holds findings grouped by evidence
   weight and is the only fixed-width surface the *analysis* flow spends — the agent panel is
   the other panel an analyst may open beside it, deliberately, since reading a finding while
-  asking about it is the intended workflow; `InvestigateSheet` is one absolutely-positioned
+  asking about it is the intended workflow; `DetectorMuteStrip` sits above the feed and takes
+  a method out of the sweep entirely — shared, audited state on `Timeline.muted_methods`,
+  never a lock (the plan ignores it and a muted method still runs when asked for by name),
+  and the count it holds back is always disclosed; `InvestigateSheet` is one absolutely-positioned
   overlay in three modes — finding, method, tools — so detail can be wide without ever
   widening the row, and it sizes to its content rather than the viewport so a short finding
-  does not strand its verdict bar a screen below the claim; `method-registry.ts` is the
+  does not strand its verdict bar a screen below the claim; `ToolsSheet` is four tabs (Scope,
+  Methods, Signatures, Explore) rather than one scroll, so a thousand-row template list cannot
+  bury the baseline picker; `method-registry.ts` is the
   single description of all twelve methods, including the prose that used to live in a
   Method tab and each method's optional `railFloor`, a presentation-only bar on the ranked
   feed whose held-back count is always disclosed; the sheet's method

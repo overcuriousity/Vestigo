@@ -22,6 +22,7 @@ import {
   Columns3,
   Repeat,
   Sparkles,
+  Wrench,
   X,
 } from "lucide-react";
 
@@ -1548,6 +1549,20 @@ export function ExplorerPage() {
                       <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
                         Investigate
                       </h3>
+                      {/* Tools was only ever reachable sideways — through the
+                          scope strip, the skipped-methods summary, or an error
+                          message. Those all still land on their own section;
+                          this is the way in that does not require something to
+                          have gone wrong first. */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSheet({ kind: "tools" })}
+                        title="Methods, signatures, scope and pattern tools"
+                      >
+                        <Wrench size={12} />
+                        Tools
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"

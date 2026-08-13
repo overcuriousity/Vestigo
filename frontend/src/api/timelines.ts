@@ -47,6 +47,18 @@ export const timelinesApi = {
       },
     ).then((r) => r.timeline),
 
+  /**
+   * Replace the analysis methods muted for this timeline (empty clears them).
+   *
+   * Shared state, not a browser preference: the next analyst on the case
+   * inherits the mute, and every change lands in the audit trail.
+   */
+  patchMutedMethods: (caseId: string, timelineId: string, mutedMethods: string[]) =>
+    patch<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/muted-methods`,
+      { muted_methods: mutedMethods },
+    ).then((r) => r.timeline),
+
   /** Per-raw-field coverage across sources, for the wizard's aggregation step. */
   fieldCoverage: (caseId: string, sourceIds: string[]) =>
     get<FieldCoverageResponse>(

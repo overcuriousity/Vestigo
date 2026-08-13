@@ -35,6 +35,7 @@ import {
 } from "@/components/analysis/detector-hooks";
 import { useUiStore } from "@/stores/ui";
 import { useAnalysisPlan, useScopeParams } from "./useAnalysisPlan";
+import { useMutedMethods } from "./useMutedMethods";
 
 /** Per-method fetch cap, mirrored in the rail's coverage copy. */
 export const METHOD_LIMIT = 50;
@@ -148,9 +149,15 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
   const scopeParams = useScopeParams();
   const { includeDismissed } = useIncludeDismissed();
 
+  // Muted methods are excluded here rather than filtered out downstream, so
+  // "no findings, no histogram marks, no place in the progress denominator"
+  // all follow from one decision instead of from three that can drift. The
+  // *plan* is untouched: `status` stays the structural claim about the data,
+  // and the sheet's run-anyway path still reaches a muted method by name.
+  const { muted } = useMutedMethods(caseId, timelineId);
   const runnable = useCallback(
-    (id: MethodId) => !planLoading && planById[id]?.status === "applicable",
-    [planById, planLoading],
+    (id: MethodId) => !planLoading && !muted.has(id) && planById[id]?.status === "applicable",
+    [planById, planLoading, muted],
   );
 
   const cheapResults = useQueries({

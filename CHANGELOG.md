@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Detectors can be muted per timeline.** Some defects belong to the evidence rather than
+  to the behavior it records — a capture whose sources disagree about the clock makes
+  `timestamp_order` fire on millions of true, useless findings — so a strip at the top of
+  the Investigate rail takes a method out of the sweep entirely: no findings, no histogram
+  or grid marks, no query issued. The mute is shared case state on the timeline
+  (`PATCH .../timelines/{id}/muted-methods`, audited) rather than a browser preference, so
+  the next analyst inherits the conclusion instead of rediscovering it. It is a reading
+  preference and never a lock: the analysis plan does not consult it, and a muted method
+  still runs from Tools when asked for by name. The rail always names how many detectors it
+  is holding back, and the Tools accounting counts them apart from both "ran" and "skipped".
+
+### Changed
+
+- **The Tools sheet is now tabbed, Scope first, and reachable directly.** Its four sections
+  were one long scroll in which a thousand-row template list buried the baseline picker —
+  the control that reframes every other section — below all of it. Each section is now its
+  own tab that scrolls independently, and the Investigate rail header carries a Tools
+  button, so the sheet no longer has to be reached sideways through an error message or the
+  skipped-methods summary. Every existing entry point still lands on its own section.
+
+### Fixed
+
+- The Sigma and pattern-mining guidance panels rendered twice in the Tools sheet, once from
+  the sheet and once from the panel inside it.
+
 ## [1.12.0] — 2026-08-13
 
 ### Added

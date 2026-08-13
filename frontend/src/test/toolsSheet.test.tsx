@@ -9,7 +9,7 @@
  */
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ToolsSheet } from "@/components/analysis/ToolsSheet";
 import { METHODS, METHODS_BY_ID } from "@/components/analysis/method-registry";
@@ -45,6 +45,18 @@ vi.mock("@/api/baselines", () => ({
   baselinesApi: {
     list: () => Promise.resolve({ baselines: [{ id: "bl-1", name: "Feb 24 – Mar 1" }] }),
   },
+}));
+
+const muted = vi.hoisted(() => ({ current: new Set<string>() }));
+vi.mock("@/hooks/useMutedMethods", () => ({
+  useMutedMethods: () => ({
+    muted: muted.current,
+    isMuted: (id: string) => muted.current.has(id),
+    toggle: () => {},
+    unmuteAll: () => {},
+    canEdit: true,
+    isSaving: false,
+  }),
 }));
 
 const capabilities = vi.hoisted(() => ({ current: { embeddings: true, sigma: true } }));
@@ -137,6 +149,7 @@ describe("ToolsSheet", () => {
     capabilities.current = { embeddings: true, sigma: true };
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
     baselineStore.current = { activeBaselineId: null };
+    muted.current = new Set();
   });
 
   it("shows the arithmetic behind a skip, not a bare verdict", () => {
@@ -185,22 +198,51 @@ describe("ToolsSheet", () => {
   });
 
   it("carries the signature and exploration surfaces rather than scattering them", () => {
-    renderTools();
+    // Tabs now, not one scroll — but still one surface. The accounting is
+    // scattered if these live on other *pages*, not if they live on other tabs
+    // of the same sheet.
+    renderTools({ section: "signatures" });
     expect(screen.getByText("sigma-panel")).toBeInTheDocument();
+    renderTools({ section: "explore" });
     expect(screen.getByText("patterns-view")).toBeInTheDocument();
+  });
+
+  it("opens on the section it was asked for", () => {
+    // Every rail affordance into Tools names a section — the scope strip, the
+    // skipped-methods summary, the error copy. Landing on the default tab
+    // instead would make each of them a click that goes to the wrong place.
+    renderTools({ section: "scope" });
+    expect(screen.getByTestId("tools-tab-scope")).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("scope-switch-self")).toBeInTheDocument();
+  });
+
+  it("moves between tabs without a section request", () => {
+    renderTools({ section: "methods" });
+    fireEvent.click(screen.getByTestId("tools-tab-scope"));
+    expect(screen.getByTestId("scope-switch-self")).toBeInTheDocument();
   });
 
   it("renders no Sigma entry point when Sigma is unconfigured", () => {
     // The house rule for every optional subsystem: absent, not disabled. A
-    // disabled control is a question the analyst then has to answer.
+    // disabled control is a question the analyst then has to answer — and a
+    // tab that opens onto an explanation of its own absence is the same thing.
     capabilities.current = { embeddings: true, sigma: false };
-    renderTools();
+    renderTools({ section: "signatures" });
+    expect(screen.queryByTestId("tools-tab-signatures")).toBeNull();
     expect(screen.queryByText("sigma-panel")).toBeNull();
+  });
+
+  it("falls back to a real tab when the requested one does not exist", () => {
+    // Sigma unconfigured while something still asks for its section: rendering
+    // the selection faithfully would be an empty sheet.
+    capabilities.current = { embeddings: true, sigma: false };
+    renderTools({ section: "signatures" });
+    expect(screen.getByTestId("tools-tab-methods")).toHaveAttribute("aria-selected", "true");
   });
 
   it("renders no similarity affordance when embeddings are unconfigured", () => {
     capabilities.current = { embeddings: false, sigma: true };
-    renderTools();
+    renderTools({ section: "explore" });
     expect(screen.queryByText(/find events like it/i)).toBeNull();
   });
 
@@ -208,13 +250,17 @@ describe("ToolsSheet", () => {
     // Zero matches there reads as "these rules cleared you". They did not —
     // there was nothing to match against.
     readiness.current = { stillIngesting: false, nothingToAnalyse: true };
-    renderTools();
+    renderTools({ section: "signatures" });
+    expect(screen.queryByTestId("tools-tab-signatures")).toBeNull();
     expect(screen.queryByText("sigma-panel")).toBeNull();
   });
 
   it("routes a scope change through a confirm rather than applying it directly", () => {
     const onRequestScopeChange = vi.fn();
-    renderTools({ onRequestScopeChange }, { baseline_id: "bl-1", baseline_name: "Feb 24 – Mar 1" });
+    renderTools(
+      { onRequestScopeChange, section: "scope" },
+      { baseline_id: "bl-1", baseline_name: "Feb 24 – Mar 1" },
+    );
     screen.getByTestId("scope-switch-baseline").click();
     expect(onRequestScopeChange).toHaveBeenCalledWith({
       frame: "baseline",
@@ -228,7 +274,7 @@ describe("ToolsSheet", () => {
     // and then silently fall back to self — the store clears the frame with the
     // id. The affordance has to lead to the builder instead.
     const onRequestScopeChange = vi.fn();
-    renderTools({ onRequestScopeChange });
+    renderTools({ onRequestScopeChange, section: "scope" });
     const button = screen.getByTestId("scope-switch-baseline");
     expect(button).toHaveTextContent(/pick a baseline/i);
     button.click();
@@ -239,7 +285,7 @@ describe("ToolsSheet", () => {
     // `events.py` still collapses muted templates out of the grid, histogram
     // and export. Without a surface that lists and unmutes them, a pre-existing
     // mute hides evidence with nothing left to inspect or undo it.
-    renderTools();
+    renderTools({ section: "explore" });
     expect(screen.getByText("templates-view")).toBeInTheDocument();
   });
 
@@ -277,13 +323,56 @@ describe("ToolsSheet", () => {
     expect(screen.getByTestId("method-detail-frequency")).toHaveTextContent(/too few buckets/i);
   });
 
+  it("never shows a count for a muted method", () => {
+    // Its query was never issued, so `total === 0` here means "not asked", not
+    // "asked and clear" — a zero would be exactly the misread this whole
+    // surface exists to prevent.
+    muted.current = new Set(["value_novelty"]);
+    renderTools();
+    expect(screen.queryByTestId("method-count-value_novelty")).toBeNull();
+    expect(screen.getByTestId("method-detail-value_novelty")).toHaveTextContent(/muted/i);
+  });
+
+  it("keeps a muted method runnable rather than making the mute a lock", () => {
+    // Same contract the gate is held to: a method left out of the sweep is
+    // still a method an analyst can ask for by name.
+    const onRunMethod = vi.fn();
+    muted.current = new Set(["value_novelty"]);
+    renderTools({ onRunMethod });
+    within(screen.getByTestId("method-row-value_novelty"))
+      .getByRole("button", { name: /run anyway/i })
+      .click();
+    expect(onRunMethod).toHaveBeenCalledWith("value_novelty");
+  });
+
+  it("counts muted methods apart from both ran and skipped", () => {
+    // Folding them into "skipped" credits the gate with an analyst's decision;
+    // folding them into "ran" is a plain lie about what was examined.
+    muted.current = new Set(["value_novelty"]);
+    expect(screen.queryByTestId("methods-summary")).toBeNull();
+    renderTools();
+    expect(screen.getByTestId("methods-summary")).toHaveTextContent(/1 muted/i);
+  });
+
+  it("lists a muted method rather than dropping it from the accounting", () => {
+    // The rail hides it; Tools is the surface that has to be able to name and
+    // reverse it, the same rule the template mute follows.
+    muted.current = new Set(["value_novelty"]);
+    renderTools();
+    expect(screen.getAllByTestId(/^method-row-/)).toHaveLength(METHODS.length);
+    expect(screen.getByTestId("method-mute-value_novelty")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
   it("requests the baseline frame when a definition is already selected", () => {
     // `scope.baseline_id` is null in the self frame by construction, so reading
     // `needsDefinition` from it made "Compare baseline" always open the builder
     // and never request the switch it names.
     baselineStore.current = { activeBaselineId: "bl-1" };
     const onRequestScopeChange = vi.fn();
-    renderTools({ onRequestScopeChange });
+    renderTools({ onRequestScopeChange, section: "scope" });
     screen.getByTestId("scope-switch-baseline").click();
     expect(onRequestScopeChange).toHaveBeenCalledWith(
       expect.objectContaining({ frame: "baseline", baselineId: "bl-1" }),

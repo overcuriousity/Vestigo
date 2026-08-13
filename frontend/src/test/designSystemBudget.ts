@@ -35,16 +35,27 @@ export const BUDGET: Record<string, FileBudget> = {
   // Unmounted, but deliberately kept: ROADMAP's "the method sheet's `fields`
   // knob is a text box" item wires this exact component back in.
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
+  // The mute chips are the same pill as InvestigateRail's preset filters they
+  // sit directly above, for the reason recorded there: a `Button` reads as a
+  // different kind of control than the row it belongs to. The disclosure line
+  // and the collapsed summary carry the remaining sizes.
+  "../components/analysis/DetectorMuteStrip.tsx": { fontSize: 4, rawButton: 3 },
   "../components/analysis/FindingGroup.tsx": { fontSize: 3, rawButton: 1 },
   // +1 each for the show-dismissed toggle, which is deliberately the same
   // pill as the preset filters it sits beside — a `Button` there would read as
   // a different kind of control than the row it belongs to.
   "../components/analysis/InvestigateRail.tsx": { fontSize: 5, rawButton: 3 },
   "../components/analysis/InvestigateSheet.tsx": { fontSize: 4 },
-  "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 3 },
+  // +1 button for the per-method mute toggle, which is the same dimmed-at-rest
+  // icon affordance as the Settings2 one beside it — a `Button` there would be
+  // visually heavier than the row it acts on, the same argument SigmaFindings
+  // and FindingGroup carry.
+  "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 4 },
   "../components/analysis/ScopeStrip.tsx": { fontSize: 1, rawButton: 1 },
   // +1 for the log-template blurb, matching the motif blurb above it.
-  "../components/analysis/ToolsSheet.tsx": { fontSize: 8, rawButton: 2 },
+  // +1 button for the section tab, which is a bottom-border tab rather than
+  // anything `Button` has a variant for.
+  "../components/analysis/ToolsSheet.tsx": { fontSize: 8, rawButton: 3 },
   "../components/analysis/PatternsView.tsx": { fontSize: 1, rawButton: 3 },
   "../components/analysis/SigmaPanel.tsx": { fontSize: 7, rawButton: 5 },
   // Same two allowances FindingGroup carries, for the same reason: these rows

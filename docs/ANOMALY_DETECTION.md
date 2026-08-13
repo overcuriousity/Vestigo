@@ -231,6 +231,43 @@ describe: `sampled` is the count of tokens the numeric scan actually tested
 capped and differently-built population. The plan is also fail-open: if it errors, the client marks
 every method applicable and runs everything.
 
+### Muting a method
+
+Some defects belong to the evidence rather than to the behavior it records. A
+capture whose sources disagree about the clock makes `timestamp_order` fire on
+millions of rows: every finding true, none of them the investigation. Reading
+past that is not triage, so an analyst can take the method out of the sweep
+instead of dismissing its findings one at a time.
+
+The mute is a list of method ids on `Timeline.muted_methods`, written through
+`PATCH /api/cases/{case}/timelines/{timeline}/muted-methods` (contribute access,
+unknown ids rejected with a 422, every change audited as
+`timeline.update_muted_methods`). It is **shared, not per-browser**: "this
+source's clocks are a mess" is a conclusion about the data that the next analyst
+on the case should inherit rather than rediscover.
+
+A mute is a *reading* preference and is held to the same "advice, never a lock"
+contract as the gate itself:
+
+- **The plan does not consult it.** A muted method still reports its real
+  status, because a mute is not a claim that the method cannot produce a finding
+  here — that would be the gate's statement to make, and a false one. This is
+  pinned by `tests/test_timeline_muted_methods_api.py`.
+- **`GET .../analysis/findings` still runs it** when asked for by name, so the
+  Tools sheet's "Run anyway" works on a muted method exactly as it does on a
+  gated one. Running a muted method does not unmute it; they are different acts.
+- **The client is what skips it.** `useStreamingSweep` does not issue the query,
+  which is what removes the method from the findings feed, from the histogram
+  and grid markers derived from that feed, and from the sweep's progress
+  denominator, all from one decision rather than three that can drift.
+
+Because a mute makes the rail quieter, disclosure is not optional. The rail's
+top strip always names the count when anything is muted, the Tools accounting
+counts muted methods separately from both "ran" and "skipped" and shows no
+count for a muted row — its query never ran, so a `0` there would assert the
+"checked, clear" misread this whole surface exists to prevent — and every mute
+is reversible from either surface.
+
 ### The analysis cache
 
 `GET .../analysis/findings` is memoized in `analysis_cache` (`db/analysis_cache.py`),

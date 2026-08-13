@@ -38,6 +38,7 @@ from vestigo.core.events_bus import publish_annotation_change
 from vestigo.core.jobs import JobStore, get_job_store
 from vestigo.core.retention import retain_file as _retain_file
 from vestigo.core.retention import retention_path as _retention_path
+from vestigo.db.analysis_plan import METHOD_IDS
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import validate_field_mappings
 from vestigo.db.field_stats import (
@@ -90,6 +91,12 @@ class TimelineFieldMappingsUpdate(BaseModel):
     """Payload to replace a timeline's field mappings (None/{} clears them)."""
 
     field_mappings: dict[str, list[str]] | None = Field(default=None)
+
+
+class TimelineMutedMethodsUpdate(BaseModel):
+    """Payload to replace a timeline's muted analysis methods (None/[] clears them)."""
+
+    muted_methods: list[str] | None = Field(default=None)
 
 
 class ViewCreate(BaseModel):
@@ -1252,6 +1259,52 @@ async def update_timeline_field_mappings(
         target_type="timeline",
         target_id=timeline_id,
         detail={"previous": previous, "new": new_mappings},
+    )
+    return {"timeline": updated.to_dict()}
+
+
+@router.patch("/{case_id}/timelines/{timeline_id}/muted-methods")
+async def update_timeline_muted_methods(
+    timeline_id: str,
+    payload: TimelineMutedMethodsUpdate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Replace the analysis methods muted for this timeline (empty/None clears them).
+
+    A mute keeps a method out of the *unprompted* sweep — its findings, and the
+    histogram marks derived from them. It is not a gate: the analysis plan does
+    not consult it, and ``/analysis/findings`` still runs a muted method when
+    asked for it by name, exactly as it does for a method the gate marked
+    ``not_applicable``. So the rail owes a visible count of what it is holding
+    back, and this endpoint owes an audit row for every change.
+
+    Unknown ids are rejected rather than stored: a typo that persisted silently
+    would read in the audit trail as a deliberate mute of a method that does
+    not exist, and would never mute anything.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    requested = payload.muted_methods or []
+    unknown = sorted(set(requested) - set(METHOD_IDS))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown analysis method(s): {', '.join(unknown)}",
+        )
+    previous = timeline.muted_methods or []
+    updated = await store.update_timeline_muted_methods(case.id, timeline_id, requested)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    await store.record_audit(
+        action="timeline.update_muted_methods",
+        actor=user,
+        case_id=case.id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"previous": previous, "new": updated.muted_methods or []},
     )
     return {"timeline": updated.to_dict()}
 

@@ -22,7 +22,9 @@ import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
 import { useIncludeDismissed, useStreamingSweep } from "@/hooks/useMethodFindings";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { useSigmaFindings } from "@/hooks/useSigmaFindings";
+import { useMutedMethods } from "@/hooks/useMutedMethods";
 import { ScopeStrip } from "./ScopeStrip";
+import { DetectorMuteStrip } from "./DetectorMuteStrip";
 import { FindingGroup } from "./FindingGroup";
 import { SigmaFindingRows } from "./SigmaFindings";
 import { AnalysisEmptyState } from "./detector-shared";
@@ -142,6 +144,11 @@ export function InvestigateRail({
   onTagFilter,
 }: Props) {
   const { byMethod, scope, done, total, planLoading } = useStreamingSweep(caseId, timelineId);
+  // Read from the hook rather than from the sweep's return, so the strip and
+  // the feed cannot disagree about what is muted — the sweep uses the very
+  // same hook to decide what not to fetch.
+  const mute = useMutedMethods(caseId, timelineId);
+  const muted = mute.muted;
   const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   const { includeDismissed, setIncludeDismissed } = useIncludeDismissed();
   const [preset, setPreset] = useState("all");
@@ -156,12 +163,19 @@ export function InvestigateRail({
   const { findings: sigmaFindings } = useSigmaFindings(caseId, timelineId);
 
   const active = PRESETS.find((p) => p.id === preset) ?? PRESETS[0];
+  // Muted methods leave `visible` entirely rather than rendering as an empty
+  // group. An empty group reads as "checked, clear" — the one misread this
+  // whole surface is built to prevent — and a muted method was not checked.
+  // The strip above carries the count instead.
   const visible = useMemo(
     () =>
       METHODS.filter(
-        (m) => (active.methods === null || active.methods.includes(m.id)) && byMethod[m.id],
+        (m) =>
+          (active.methods === null || active.methods.includes(m.id)) &&
+          !muted.has(m.id) &&
+          byMethod[m.id],
       ),
-    [active, byMethod],
+    [active, byMethod, muted],
   );
 
   // Publish findings onto the histogram and grid. Without this the marks the
@@ -209,6 +223,11 @@ export function InvestigateRail({
     return () => onAnomalyMarkers([]);
   }, [markerSig, onAnomalyMarkers]);
 
+  // Muted methods this preset would otherwise have shown. Distinguishes "this
+  // preset is empty because nothing applies" from "…because you silenced it".
+  const presetMuted = METHODS.filter(
+    (m) => (active.methods === null || active.methods.includes(m.id)) && muted.has(m.id),
+  );
   const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);
   const showSigma = active.sigma && sigmaFindings.length > 0;
@@ -237,6 +256,7 @@ export function InvestigateRail({
           moved here with the findings it explains rather than being dropped
           along with the tab that used to host it. */}
       <GuidancePanel id="investigate-anomalies" />
+      <DetectorMuteStrip mute={mute} />
       <ScopeStrip scope={scope} onOpen={() => onOpenTools("scope")} />
 
       <div className="flex flex-wrap gap-1">
@@ -347,8 +367,15 @@ export function InvestigateRail({
       )}
 
       {/* Every method under this preset gated off. Not the same statement as
-          "nothing found" — nothing ran. */}
-      {!planLoading && visibleRunnable.length === 0 && (
+          "nothing found" — nothing ran. And when the reason nothing ran is that
+          the analyst muted it, saying "no method applies" would blame the gate
+          for a choice somebody made: two different situations, two states. */}
+      {!planLoading && visibleRunnable.length === 0 && presetMuted.length > 0 && (
+        <AnalysisEmptyState hint="Unmute a detector in the strip above to put it back in the sweep, or open Tools to run one without unmuting it.">
+          Every detector for this view is muted.
+        </AnalysisEmptyState>
+      )}
+      {!planLoading && visibleRunnable.length === 0 && presetMuted.length === 0 && (
         <AnalysisEmptyState hint="Open Tools to see why each was skipped and run one anyway, or set a baseline to enable the comparison methods.">
           No method applies to this data yet.
         </AnalysisEmptyState>

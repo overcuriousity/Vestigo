@@ -142,6 +142,12 @@ export interface Timeline {
   field_mappings: Record<string, string[]> | null;
   /** Data-derived default grid columns, shared by everyone with access. */
   recommended_columns: RecommendedColumns | null;
+  /**
+   * Analysis methods kept out of this timeline's unprompted sweep, shared by
+   * everyone with access. A reading preference, never a gate — the analysis
+   * plan ignores it and a muted method still runs when asked for by name.
+   */
+  muted_methods: string[];
   created_at: string;
   updated_at: string;
 }

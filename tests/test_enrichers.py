@@ -464,6 +464,8 @@ async def test_init_schema_drops_legacy_staging_table(blank_pg_database):
         await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
         # 0024 adds the per-timeline recommended grid columns.
         await conn.execute(text("ALTER TABLE timelines DROP COLUMN recommended_columns"))
+        # 0028 adds the per-timeline muted analysis methods.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN muted_methods"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(
