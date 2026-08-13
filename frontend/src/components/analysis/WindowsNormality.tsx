@@ -357,7 +357,14 @@ const KIND_META: Record<
   },
 };
 
-/** The analyst's dispositions (normal / dismissed / confirmed), grouped by verdict. */
+/**
+ * The analyst's dispositions (normal / dismissed / confirmed), grouped by verdict.
+ *
+ * The only durable way to take a verdict back — the toast's Undo lasts four
+ * seconds and then the id is gone. That makes this list the undo path for a
+ * decision that changes detection, not a convenience: mounted under Tools →
+ * Scope, beside the other control over what a sweep will show.
+ */
 export function NormalValuesList({ caseId, timelineId }: Props) {
   const qc = useQueryClient();
   const { data } = useQuery({
@@ -417,6 +424,7 @@ export function NormalValuesList({ caseId, timelineId }: Props) {
                   </span>
                 </span>
                 <button
+                  data-testid={`disposition-remove-${d.id}`}
                   className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
                   onClick={() => removeMut.mutate(d.id)}
                   title={KIND_META[kind].removeTitle}

@@ -62,6 +62,20 @@ vi.mock("@/hooks/useMutedMethods", () => ({
 const capabilities = vi.hoisted(() => ({ current: { embeddings: true, sigma: true } }));
 vi.mock("@/api/health", () => ({ useCapabilities: () => capabilities.current }));
 
+const dispositions = vi.hoisted(() => ({
+  rows: [] as Record<string, unknown>[],
+  removed: [] as string[],
+}));
+vi.mock("@/api/dispositions", () => ({
+  dispositionsApi: {
+    list: () => Promise.resolve({ dispositions: dispositions.rows }),
+    remove: (_c: string, _t: string, id: string) => {
+      dispositions.removed.push(id);
+      return Promise.resolve({ deleted: true, disposition_id: id });
+    },
+  },
+}));
+
 const readiness = vi.hoisted(() => ({
   current: { stillIngesting: false, nothingToAnalyse: false },
 }));
@@ -150,6 +164,8 @@ describe("ToolsSheet", () => {
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
     baselineStore.current = { activeBaselineId: null };
     muted.current = new Set();
+    dispositions.rows = [];
+    dispositions.removed = [];
   });
 
   it("shows the arithmetic behind a skip, not a bare verdict", () => {
@@ -377,5 +393,38 @@ describe("ToolsSheet", () => {
     expect(onRequestScopeChange).toHaveBeenCalledWith(
       expect.objectContaining({ frame: "baseline", baselineId: "bl-1" }),
     );
+  });
+
+  /**
+   * A `normal` verdict suppresses matching findings in every later sweep, so
+   * an analyst who records one by mistake has quietly narrowed what the tool
+   * will ever show them. 1.12.0 shipped with the only durable way to undo that
+   * unmounted, leaving a four-second toast as the entire revert path.
+   */
+  describe("recorded verdicts", () => {
+    it("lists them under Scope, with a way to take one back", async () => {
+      dispositions.rows = [
+        {
+          id: "d1",
+          kind: "normal",
+          detector: "value_novelty",
+          field: "attr:user_agent",
+          value: "curl/7.68.0",
+          event_id: null,
+          note: null,
+        },
+      ];
+      renderTools({ section: "scope" });
+      expect(await screen.findByText(/curl\/7\.68\.0/)).toBeInTheDocument();
+      fireEvent.click(await screen.findByTestId("disposition-remove-d1"));
+      await vi.waitFor(() => expect(dispositions.removed).toEqual(["d1"]));
+    });
+
+    it("says so when there are none, rather than rendering nothing", async () => {
+      // An empty region reads as a missing feature; the analyst has to be able
+      // to tell "no verdicts recorded" from "this surface is gone again".
+      renderTools({ section: "scope" });
+      expect(await screen.findByTestId("dispositions-section")).toHaveTextContent(/none yet/i);
+    });
   });
 });

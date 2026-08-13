@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.1] — 2026-08-13
+
+### Fixed
+
+- **A recorded verdict can be taken back again.** 1.12.0 left the disposition list
+  unmounted: the Investigate panel it lived in was replaced by the rail, and nothing in the
+  rail or the Tools sheet took over hosting it. That reduced the entire undo path for a
+  `normal` verdict to the four-second "Undo" on its toast — and a `normal` verdict is not a
+  note, it enters `dispositions_hash` and suppresses matching findings in every later scan,
+  so a misclick silently narrowed what the tool would ever show. The list is back under
+  **Tools → Scope**, beside the baseline, since both decide what a sweep will show; every
+  verdict — normal, dismissed, confirmed — is removable there, and removal re-runs the
+  detectors so suppressed findings come back. The backend endpoint was never missing, only
+  unreachable.
+- Toast and grid copy pointed at "Windows & normality", a surface that no longer exists.
+  It now names Tools → Scope.
+
+### Dependencies
+
+- Backend: pydantic-ai-slim requirement floor raised to >=2.27.0.
+- Frontend: @tanstack/react-table 9.0.0 → 9.1.2.
+
 ## [1.12.0] — 2026-08-13
 
 ### Added
