@@ -1,6 +1,30 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-13 (session 169 — the seventh PR #262 review, and 1.12.0 shipped).
+Last updated: 2026-08-13 (session 170 — the disposition list gets a home again, 1.12.1).
+
+## Session 170 — 2026-08-13: the undo path 1.12.0 dropped
+
+Asked how to revert a `normal` marked by mistake, and there was no good answer. The
+disposition list (`NormalValuesList`) survived the redesign fully working, but the panel that
+mounted it did not, and nothing picked it up — so the only revert left was the "Undo" on the
+toast, which `Toaster` dismisses after four seconds. Every other affordance for it had been
+deleted along with `InvestigatePanel`.
+
+The severity is not the missing convenience. `normal` is the one verdict that changes what
+the tool will show later: it enters `dispositions_hash`, so matching findings are suppressed
+in every subsequent sweep. A misclick therefore narrowed the investigation permanently and
+silently — the same class of quiet, undisclosed filtering the whole rail is built to prevent,
+arrived at from the opposite direction. Worse, the toast copy still read "Manage under
+Windows & normality", naming a surface that no longer opened.
+
+Mounted under **Tools → Scope** rather than in a tab of its own. A verdict and a baseline are
+the same kind of object — both are standing instructions about what a sweep will show — and
+the Scope tab was already the place an analyst goes to change that. A fifth tab would have
+filed the analyst's own decisions under machinery.
+
+`dispositionsApi.stats`, `bulkCreate` and `useTriageCoverage` remain uncalled; that is the
+`TriageBurndown` deletion, still open from the seventh review's notes.
+
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).

@@ -115,11 +115,11 @@ function markFindingsConfirmed(data: AnomaliesResponse, t: DispositionTarget): A
 const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string; hint: string }> = {
   normal: {
     title: (label) => `Marked normal — ${label}`,
-    hint: "Added to the known-normal list — matching findings suppressed in future scans. Manage under Windows & normality.",
+    hint: "Added to the known-normal list — matching findings suppressed in future scans. Take it back any time under Tools → Scope.",
   },
   dismissed: {
     title: (label) => `Dismissed — ${label}`,
-    hint: "Hidden as noise; detectors keep scoring it. Manage under Windows & normality.",
+    hint: "Hidden as noise; detectors keep scoring it. Take it back any time under Tools → Scope.",
   },
   confirmed: {
     title: (label) => `Confirmed — ${label}`,
@@ -320,7 +320,9 @@ export function useDisposition(caseId: string, timelineId: string) {
       };
       // Undo deletes the just-created disposition — the finding resurfaces on
       // the next refetch. Confirm has no undo here: it also persisted a system
-      // annotation, so undoing it is a deliberate act in the dispositions list.
+      // annotation, so undoing it is a deliberate act in the dispositions list
+      // under Tools → Scope. The toast is the *convenient* revert, never the
+      // only one — it lasts four seconds, and every kind is reversible there.
       const undo =
         data.dispositionId !== undefined
           ? {

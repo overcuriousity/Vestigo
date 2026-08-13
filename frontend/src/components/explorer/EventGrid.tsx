@@ -460,7 +460,7 @@ export function DispositionIndicator({ dispositions }: { dispositions: Dispositi
 /** Combined annotation column: anomaly + disposition indicators + tag/comment popovers.
  *
  * Normality/dismissal/confirmation are dispositions (finding_dispositions,
- * managed under Windows & normality), not per-event annotations — the old
+ * managed under Tools → Scope), not per-event annotations — the old
  * per-event `normal` annotation was migrated to event-scoped normal
  * dispositions (migration 0004), and event-scoped rows of any kind are what
  * the DispositionIndicator renders. See docs/ANOMALY_DETECTION.md.

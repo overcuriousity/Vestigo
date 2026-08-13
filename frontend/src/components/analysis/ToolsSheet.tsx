@@ -31,6 +31,7 @@ import { SigmaPanel } from "./SigmaPanel";
 import { PatternsView } from "./PatternsView";
 import { TemplatesView } from "./TemplatesView";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
+import { NormalValuesList } from "./WindowsNormality";
 import { SimilarEvents } from "./SimilarEvents";
 import { baselinesApi } from "@/api/baselines";
 import { useCapabilities } from "@/api/health";
@@ -248,6 +249,23 @@ export function ToolsSheet({
             onRequest={onRequestScopeChange}
             onManage={openBaselineBuilder}
           />
+          {/* Verdicts belong beside the scope for the same reason the baseline
+              does: both decide what a sweep will show. A `normal` verdict is
+              not a note about a finding, it is a standing instruction to
+              suppress matching findings in every later scan — so the analyst
+              needs somewhere to read the instructions they have given and take
+              one back. 1.12.0 shipped without it: the old panel was the only
+              mount of this list, and deleting the panel left a four-second
+              toast as the entire undo path for a detection-affecting decision. */}
+          <div
+            data-testid="dispositions-section"
+            className="mt-4 border-t border-[var(--color-border)] pt-3"
+          >
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)]">
+              Recorded verdicts
+            </h3>
+            <NormalValuesList caseId={caseId} timelineId={timelineId} />
+          </div>
         </section>
       )}
 
