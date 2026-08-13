@@ -211,10 +211,15 @@ instead of rebuilding.
   wrappers; `client.ts` holds the shared base client.
 - `components/` grouped by feature area: `explorer/` (event grid, filters, histogram),
   `analysis/` (the Investigate surface: `InvestigateRail` holds findings grouped by evidence
-  weight and is the *only* fixed-width surface that flow spends; `InvestigateSheet` is one
-  absolutely-positioned overlay in three modes — finding, method, tools — so detail can be
-  wide without ever widening the row; `method-registry.ts` is the single description of all
-  twelve methods, including the prose that used to live in a Method tab; the sheet's method
+  weight and is the only fixed-width surface the *analysis* flow spends — the agent panel is
+  the other panel an analyst may open beside it, deliberately, since reading a finding while
+  asking about it is the intended workflow; `InvestigateSheet` is one absolutely-positioned
+  overlay in three modes — finding, method, tools — so detail can be wide without ever
+  widening the row, and it sizes to its content rather than the viewport so a short finding
+  does not strand its verdict bar a screen below the claim; `method-registry.ts` is the
+  single description of all twelve methods, including the prose that used to live in a
+  Method tab and each method's optional `railFloor`, a presentation-only bar on the ranked
+  feed whose held-back count is always disclosed; the sheet's method
   mode runs a method with the analyst's own knob values, which is what keeps the analysis
   gate advice rather than a lock in the UI as well as the API), `viz/`
   (charts), `agent/`, `stories/`, `cases/`, `timelines/`, `sources/`, `auth/`, `jobs/`,

@@ -204,6 +204,40 @@ describe("InvestigateSheet", () => {
 });
 
 describe("the finding sheet's four surfaces", () => {
+  it("names the value the finding is about", () => {
+    // The verdict sentence says "this value" — the rail row was the only place
+    // the value itself appeared, so recognizing it meant closing the sheet.
+    renderSheet({ mode: "finding", methodId: "interval_periodicity", finding: FINDING, scope: SCOPE });
+    const subject = screen.getByTestId("finding-subject");
+    expect(subject).toHaveTextContent("10.14.9.203");
+    expect(subject).toHaveTextContent(/src_ip/i);
+  });
+
+  it("says what a whole-distribution finding is about instead of naming a value", () => {
+    // Nothing isolated one value here, and printing one would misstate what was
+    // compared.
+    renderSheet({
+      mode: "finding",
+      methodId: "value_distribution_drift",
+      scope: SCOPE,
+      finding: {
+        type: "value_distribution_drift" as const,
+        field: "attr:bytes",
+        test: "ks" as const,
+        direction: "shifted" as const,
+        statistic: 0.31,
+        p_value: 2e-9,
+        q_value: 4e-8,
+        score: 7.4,
+        baseline_n: 4200,
+        window_n: 3100,
+        window_label: "suspect",
+        details: {},
+      },
+    });
+    expect(screen.getByTestId("finding-subject")).toHaveTextContent(/bytes/i);
+  });
+
   it("states the finding as a claim, not only as detector shorthand", () => {
     renderSheet({ mode: "finding", methodId: "interval_periodicity", finding: FINDING, scope: SCOPE });
     const verdict = screen.getByTestId("finding-verdict");

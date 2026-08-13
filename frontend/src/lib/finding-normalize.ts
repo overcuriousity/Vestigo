@@ -11,7 +11,7 @@
  */
 import type { DetectorId, DetectorMeta } from "@/components/analysis/detector-registry";
 import type { AnomalyFinding } from "@/api/types";
-import { anomalyFieldLabel as fieldLabel, truncate } from "@/lib/format";
+import { anomalyFieldLabel as fieldLabel, shortId, truncate } from "@/lib/format";
 
 export interface FeedItem {
   detectorId: DetectorId;
@@ -58,8 +58,11 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       ts = ts ?? f.window_start;
       break;
     case "timestamp_order":
-      title = `Backwards timestamp in ${f.source_id}`;
-      subtitle = `${f.skew_seconds.toFixed(1)}s behind the previous record`;
+      // Not the whole source id: it is ~60 characters of which the first 24 are
+      // identical for every source in the case, so it wrapped over three lines
+      // and buried the one number that is the finding.
+      title = `Backwards timestamp at line ${f.line_number}`;
+      subtitle = `${f.skew_seconds.toFixed(1)}s behind the previous record · source ${shortId(f.source_id)}`;
       ts = ts ?? f.timestamp;
       break;
     case "numeric_range":

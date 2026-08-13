@@ -1,10 +1,66 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-08 (session 166 — PR #262 fourth review: scope provenance made real,
-two gate predicates corrected, and the finding sheet built out to what the design round chose).
+Last updated: 2026-08-13 (session 167 — PR #262 sixth review, the rail read against a real
+7.8M-event case, and the 1.12.0 release).
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
+
+## Session 167 — 2026-08-13: the sixth review, the rail read against real evidence, and 1.12.0
+
+**Sixth review of the branch, five findings.** The `confirmed` dedupe compared the whole
+`analysis_scope` dict while badging narrows to `(frame, baseline_id)` — so a baseline rename,
+or the analyst's own previous verdict moving `dispositions_hash`, made re-confirming one
+finding write a second row and a second system annotation for one claim. `scope_identity`
+now states the narrowing once and the badging path delegates to it, so the two cannot drift.
+The histogram's mark gesture set a pending range and opened the Tools sheet but never opened
+the drawer that is the range's only consumer, so the brushed range vanished and mark mode
+stayed on. The rail's two empty states counted the sweep's global done/total while describing
+a preset-filtered list, so "Changed vs. baseline" with no baseline asserted a clean sweep for
+methods that never ran. The scope-change dialog counted every disposition kind although only
+`confirmed` folds scope into its identity. And the plan endpoint's timestamp probe aggregated
+the offset-corrected expression, which cannot use the sort key — an unbudgeted full read of
+the case on every scope change, from the one handler documented as answering without scanning
+an event; it reads the raw column and widens by the offsets' extremes instead, which can only
+make the gate err open.
+
+**Then the rail was read against a real 7.8M-event case, which is a different exercise.**
+Seven things showed up that no test would have caught. The largest: the finding sheet never
+named the value the finding was about. Its own sentence says "this value of captured_length
+appears in 1 event" — and `56` appeared nowhere on the surface an analyst opens to decide
+whether the finding is real, so recognizing it meant closing the sheet to re-read the row
+underneath. `lib/finding-subject.ts` now derives the subject exhaustively over the same union
+`finding-verdict` covers, and the sheet leads with it. Findings that are not about one value
+say what they *are* about rather than inventing one. The sheet also stretched to the full
+viewport, stranding the verdict bar a screen below the claim it answers; it sizes to its
+content now.
+
+The out-of-band evidence strip drew its marker to scale and then labelled it in a
+`justify-between` row, so a value at 10% of the axis was captioned at 50% — right where the
+band starts, reading as in-band, which is the exact misread the to-scale marker exists to
+prevent. Redrawn in CSS, which also stopped `preserveAspectRatio="none"` from stretching the
+marker into a smear. The timestamp-order row headlined a ~60-character source id whose first
+24 characters repeat across every source in the case; it leads with the record's line now and
+carries the id's distinguishing tail in the subtitle. The routine-collapse chip announced "0
+routine events hidden (0.0% of timeline)".
+
+**One ordering decision, taken deliberately.** Rows rotate method-by-method because scores are
+incomparable across methods, and that is worth keeping — but it put a finding 1.03 band widths
+outside its band above one 46 band widths out. Rather than fabricate a common scale, methods
+whose score is continuous *and* who have no threshold knob of their own (numeric range,
+entropy) gained a `railFloor`: weak rows leave the ranked feed, the group's count still
+includes them, and a row says how many with one click to show them. Frequency has `z_threshold`
+and the two-window methods have their q-cut, so for those the floor stays in the run.
+
+Deliberately not changed: field auto-selection still offers value-shaped methods on
+high-cardinality numeric fields (rare values on `captured_length`, entropy on `tcp_ack`),
+because deciding which fields are meaningful is the analyst's, and pre-filtering risks hiding
+a real finding in a field we guessed was boring. The rail and the agent panel may still be
+open together — reading a finding while asking about it is the intended workflow — so
+`CLAUDE.md`'s "only fixed-width surface" line was corrected to describe what ships.
+
+Released as **1.12.0**: the Investigate rail, the gate, the fingerprint cache and scope
+provenance are features, so a patch would have been wrong.
 
 ## Session 166 — 2026-08-08: PR #262 fourth review, and the sheet the design round asked for
 

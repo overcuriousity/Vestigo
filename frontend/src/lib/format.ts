@@ -72,6 +72,18 @@ export function truncate(value: string, max = 120): string {
   return value.slice(0, max) + "…";
 }
 
+/**
+ * A long generated id, shortened to its distinguishing tail.
+ *
+ * `truncate` keeps the head, which is the wrong half for these: a source id
+ * reads `case_<case>_<sha>_<suffix>`, so the first 24 characters are the same
+ * for every source in the case. Two sources would render identically while a
+ * three-line id ate the row it was labelling.
+ */
+export function shortId(id: string, keep = 10): string {
+  return id.length <= keep + 1 ? id : `…${id.slice(-keep)}`;
+}
+
 /** Turn a parser name slug into a readable label. */
 export function fmtParserName(name: string | null | undefined): string {
   if (!name) return "—";

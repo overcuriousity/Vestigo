@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-08-13
+
+### Added
+
+- **The Investigate surface is now a findings rail plus one overlay sheet.** Findings are
+  grouped by the *kind of claim* they make — named techniques, statistical outliers ("odd,
+  not necessarily bad"), exploration ("leads, not verdicts") — which is the one thing the
+  old panel never said: a Sigma hit and a rare value are not the same assertion. Presets
+  filter the feed by the question being asked rather than by detector. The rail is the only
+  fixed-width surface the analysis flow spends; everything else opens as an absolutely
+  positioned sheet, so detail can be wide without ever narrowing the event grid. The sheet
+  has three modes — a finding, a method, and Tools — and sizes to its content rather than
+  the viewport.
+- **A finding's sheet states the claim in prose, names its subject, and shows the query
+  shape behind it.** Every number in the sentence comes from the payload; the field and
+  value that triggered the finding are the first thing on the surface; the SQL sketch is
+  labeled as a teaching aid rather than a transcript, because the detectors do not return
+  their compiled statement and presenting one anyway would be a claim we cannot point at
+  code for. The method's parameters are editable in place and re-run from there, which is
+  what keeps the analysis gate advice rather than a lock in the UI as well as the API.
+- **An analysis gate.** `GET /api/cases/{id}/timelines/{id}/analysis/plan` answers, per
+  method and without scanning a single event, whether that method *can* produce a finding
+  on this data — from the per-source field-stats cache plus one timestamp-range probe. A
+  method is marked `not_applicable` only when it structurally cannot score, never when it
+  looks unpromising, and it stays runnable on request: the plan is advice plus an audit
+  record. Each verdict carries the arithmetic behind it ("no field parses as numeric (0 of
+  19 sampled)"), so it is a claim an analyst can check and argue with.
+- **A fingerprint-keyed cache for findings.** The key covers every input that can change an
+  answer, and sources are immutable, so a cache hit is proof the answer still holds —
+  deliberately no TTL. It is purged with the source or case it derives from, and is
+  distinct from `DetectorRun`, which remains the forensic diary of what an analyst ran.
+- **Verdicts record the comparison they were reached under.** Dispositions carry an
+  `analysis_scope`, and `confirmed` is the one kind whose identity includes it: escalating a
+  finding against the February baseline and again against March are two claims, not one
+  deduplicated row. Findings badge verdicts reached under the scope on screen and mark
+  verdicts reached elsewhere as such, instead of silently presenting one as the other.
+- **A scope-change dialog that states its consequences in numbers** — how many methods will
+  re-run and how many verdicts were reached under the scope being left — and a baseline
+  builder reachable by marking a range directly on the histogram.
+- **The evtx converter now detects silent parser attrition.** pyevtx-rs skips a damaged
+  record and ends a broken chunk without raising, so counting exceptions reported a clean
+  run over lossy evidence. The converter reconciles scanned record headers against records
+  returned, per chunk, and reports the difference per file and in
+  `vestigo.parse_decisions.scan_unresolved_records`. Detection, not recovery: the missing
+  records are counted, not restored.
+
+### Changed
+
+- **The rail's ranked feed carries a display floor for the two band methods.** Findings
+  rotate method-by-method so every method has a row near the top, which means a value one
+  band width outside its learned band would otherwise sit above one tens of band widths
+  out. Numeric-range and entropy findings below 2× band leave the feed; the group's count
+  still includes them and a row says how many, one click from showing them. Presentation
+  only — the methods still return everything, and methods with a threshold of their own
+  (frequency's z, the q-gated two-window methods) keep it in the run where it belongs.
+- **`sequence_novelty` and `entropy` are no longer gated off where they can still score.**
+  Sequence novelty required three distinct series values; two yield eight distinct trigrams
+  and a rare one scores fine, so every ordinary two-source timeline had quietly lost n-gram
+  novelty. Entropy shared charset's enum-like gate, which only holds for charset.
+
+### Fixed
+
+- A `confirmed` verdict is deduplicated by the comparison it was reached under — frame and
+  baseline id — rather than by the whole scope object, so renaming a baseline no longer
+  splits one claim into two rows with two system annotations.
+- The analysis plan's timestamp probe reads the raw sort-key column and widens its span by
+  the declared clock offsets, instead of aggregating an expression that could not use the
+  index — an unbudgeted full read of the case on every scope change.
+- `delete_source` purges the analysis cache, which held event ids, field values and message
+  templates from the deleted source.
+- A detector's cached answer records the *mode* it ran in (`analysis_mode`), which the
+  runner had been overwriting with the requested method id.
+- The Investigate rail no longer claims "no findings under this scope" for a preset whose
+  methods all need setup and never ran, and the routine-collapse chip no longer announces
+  that zero events are hidden.
+- Out-of-band evidence strips label the value at its marker rather than mid-track, where it
+  read as sitting inside the band — the exact misread the to-scale marker exists to prevent.
+
 ## [1.11.0] — 2026-08-07
 
 ### Added

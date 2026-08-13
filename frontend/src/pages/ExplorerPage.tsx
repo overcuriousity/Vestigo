@@ -1238,7 +1238,12 @@ export function ExplorerPage() {
 
           {/* Right-side actions */}
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-            {collapseRoutine && (
+            {/* Only when something is actually hidden. The chip exists because
+                hiding events may never be silent — at a count of zero it
+                announces nothing and reads as clutter ("0 routine events
+                hidden (0.0% of timeline)"). The collapse toggle beside it
+                still shows the mode is on, so nothing goes undisclosed. */}
+            {collapseRoutine && routineCollapsedCount > 0 && (
               <RoutineCollapseStat
                 count={routineCollapsedCount}
                 timelineTotal={timelineTotal}

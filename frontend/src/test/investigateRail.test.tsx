@@ -247,6 +247,50 @@ describe("InvestigateRail", () => {
     expect(screen.getByText(/No findings under this scope/i)).toBeInTheDocument();
   });
 
+  it("keeps a barely-out-of-band finding out of the ranked feed, and says so", () => {
+    // Rotation puts one row per method near the top, so without a floor a
+    // finding 1.03 band widths out sits above one 46 band widths out. Held
+    // back is not the same as not found: the count has to stay on screen and
+    // the rows have to be one click away.
+    const weak = {
+      type: "entropy" as const,
+      field: "attr:tcp_ack",
+      value: "2212222122",
+      entropy: 0.72,
+      lower: 1.97,
+      upper: 3.18,
+      direction: "below" as const,
+      score: 1.03,
+      count: 1,
+      event_id: "e2",
+      event: null,
+      first_seen: "2026-03-04T02:11:07Z",
+      details: {},
+    };
+    renderRail({
+      byMethod: { entropy: state("entropy", { findings: [weak], total: 1 }) },
+    });
+    expect(screen.queryByText(/2212222122/)).toBeNull();
+    const summary = screen.getByTestId("weak-summary");
+    expect(summary).toHaveTextContent("1 weaker finding");
+    // And it is not an all-clear: the group still counts what it holds.
+    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+
+    fireEvent.click(summary);
+    expect(screen.getByText(/2212222122/)).toBeInTheDocument();
+  });
+
+  it("leaves a method with no floor of its own untouched", () => {
+    // `frequency` carries `z_threshold`, so its floor belongs in the run.
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", { findings: [finding({ score: 0.4 })], total: 1 }),
+      },
+    });
+    expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
+    expect(screen.queryByTestId("weak-summary")).toBeNull();
+  });
+
   it("renders a method's error without hiding the rest of the stream", () => {
     renderRail({
       byMethod: {

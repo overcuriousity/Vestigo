@@ -21,7 +21,7 @@
 import type { AnomalyFinding } from "@/api/types";
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
-import { anomalyFieldLabel as fieldLabel, truncate } from "@/lib/format";
+import { anomalyFieldLabel as fieldLabel, shortId, truncate } from "@/lib/format";
 
 export interface Verdict {
   /** Text before the emphasized span. */
@@ -58,7 +58,7 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
       return {
         lead: "This record's timestamp runs",
         highlight: `${f.skew_seconds.toFixed(1)}s backwards`,
-        tail: `from the record before it in ${f.source_id} (line ${f.line_number}) — a clock-integrity problem in the evidence, not in the behavior it records.`,
+        tail: `from the record before it, at line ${f.line_number} of source ${shortId(f.source_id)} — a clock-integrity problem in the evidence, not in the behavior it records.`,
       };
     case "numeric_range":
       return {

@@ -12,6 +12,7 @@
  * semantics — the one thing in this subsystem that must stay single-sourced.
  */
 import { Filter } from "lucide-react";
+import { Button } from "@/components/ui/Button";
 import { DETECTORS } from "./detector-registry";
 import { FindingRowActions, FindingShell } from "./detector-shared";
 import type { EvidenceClass, MethodId, MethodMeta } from "./method-registry";
@@ -56,6 +57,10 @@ interface Props {
   extraRows?: React.ReactNode;
   /** How many rows `extraRows` renders, for the group's count. */
   extraCount?: number;
+  /** Reveal findings below their method's `railFloor` (see the disclosure row). */
+  showWeak?: boolean;
+  /** Offered only when something is actually held back. */
+  onShowWeak?: () => void;
 }
 
 /** Exported for the method sheet's own results list — see `ScoredRow`. */
@@ -225,6 +230,8 @@ export function FindingGroup({
   onFrequencyDrill,
   extraRows,
   extraCount = 0,
+  showWeak = false,
+  onShowWeak,
 }: Props) {
   const scored = methods.filter((m) => m.id !== "log_template");
   const templates = methods.find((m) => m.id === "log_template");
@@ -232,12 +239,25 @@ export function FindingGroup({
   // Interleave by per-detector rank: scores are incomparable across methods
   // (surprise, |z|, G, −log₁₀ p, seconds of skew), so every method's best
   // finding comes first rather than a fabricated common scale.
+  //
+  // Rotation gives every method a row near the top, which is the point — and
+  // the cost is that a barely-out-of-band finding lands above one tens of band
+  // widths out. `railFloor` answers that where the score is continuous and the
+  // method has no threshold of its own: the weak rows leave the ranked feed,
+  // and the count below says so. The rank each finding keeps is its rank in
+  // the *unfiltered* list, because that is what addresses it in the sheet.
+  let heldBack = 0;
   const lists = scored.map((meta) => {
     const detectorMeta = DETECTOR_BY_API_KEY[meta.id];
     if (!detectorMeta) return [];
-    return (byMethod[meta.id]?.findings ?? [])
+    const all = (byMethod[meta.id]?.findings ?? [])
       .filter((f): f is AnomalyFinding => !isTemplateRow(f))
       .map((f, rank) => normalizeFinding(detectorMeta, f, rank));
+    const floor = meta.railFloor;
+    if (showWeak || floor === undefined) return all;
+    const kept = all.filter((item) => Math.abs(item.scoreRaw) >= floor);
+    heldBack += all.length - kept.length;
+    return kept;
   });
   const items = interleaveByRank(lists);
   // Log templates are shapes to read, not scored findings, so they bypass
@@ -246,7 +266,11 @@ export function FindingGroup({
     isTemplateRow,
   );
 
-  if (items.length === 0 && templateRows.length === 0 && extraCount === 0) return null;
+  // A group whose every row is below the floor still renders: it holds
+  // findings, and dropping the section would hide them without saying so.
+  if (items.length === 0 && templateRows.length === 0 && extraCount === 0 && heldBack === 0) {
+    return null;
+  }
 
   return (
     <section className="mt-3 first:mt-0">
@@ -256,8 +280,11 @@ export function FindingGroup({
       >
         {evidenceClass.label}
         <span className="font-normal normal-case tracking-normal">— {evidenceClass.note}</span>
+        {/* What the group holds, including what the floor is holding back —
+            the count is about the findings, not about how many rows happen to
+            be drawn. The row below names the difference. */}
         <span className="ml-auto font-mono text-[var(--color-fg-disabled)]">
-          {items.length + templateRows.length + extraCount}
+          {items.length + templateRows.length + extraCount + heldBack}
         </span>
       </h4>
       <div className="space-y-1.5">
@@ -282,6 +309,22 @@ export function FindingGroup({
             rows={templateRows}
             onSelect={(rank) => onSelectFinding(templates.id, rank)}
           />
+        )}
+
+        {/* Held back is not the same as not found, and the difference has to be
+            on screen: this rail's whole contract is that nothing it hides is
+            hidden silently. */}
+        {heldBack > 0 && (
+          <Button
+            data-testid="weak-summary"
+            variant="ghost"
+            size="sm"
+            onClick={onShowWeak}
+            className="h-auto w-full justify-start border border-dashed border-[var(--color-border)] px-2 py-1.5 text-left font-normal text-[var(--color-fg-muted)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-fg-secondary)]"
+          >
+            {heldBack} weaker finding{heldBack === 1 ? "" : "s"} below the display floor — show
+            {heldBack === 1 ? " it" : " them"}
+          </Button>
         )}
       </div>
     </section>

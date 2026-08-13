@@ -145,6 +145,11 @@ export function InvestigateRail({
   const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   const { includeDismissed, setIncludeDismissed } = useIncludeDismissed();
   const [preset, setPreset] = useState("all");
+  // Findings below their method's `railFloor` are out of the ranked feed until
+  // asked for. Session state, not persisted: it is a reading choice about this
+  // sweep, and a floor silently still-lifted from last week would be the same
+  // undisclosed filtering it exists to avoid.
+  const [showWeak, setShowWeak] = useState(false);
   // The Named-techniques group's only source. Empty until Sigma is
   // configured *and* a run has completed on this timeline — a rule that has
   // not been run is not a finding about anything.
@@ -325,6 +330,8 @@ export function InvestigateRail({
             ) : null
           }
           extraCount={cls.id === "named" && showSigma ? sigmaFindings.length : 0}
+          showWeak={showWeak}
+          onShowWeak={() => setShowWeak(true)}
         />
       ))}
 

@@ -74,6 +74,21 @@ export interface MethodMeta {
   costClass: "cheap" | "heavy";
   /** Unit for the raw score. Scores are NOT comparable across methods. */
   scoreUnit: string;
+  /**
+   * Minimum raw score for a finding of this method to enter the rail's ranked
+   * feed. Presentation only — the method still returns everything, the sheet
+   * still shows everything, and the rail discloses the held-back count with a
+   * control that reveals them.
+   *
+   * Set only where the score is continuous and the method has no threshold
+   * knob of its own to express "worth looking at" with. `frequency` has
+   * `z_threshold`, the four two-window methods have their q-value cut, and
+   * `charset`'s finding is binary — for those the floor belongs in the run,
+   * not in the rail. What is left is the two band methods, where a value one
+   * band width outside is arithmetically real and, in a feed sorted by
+   * method rotation, sits above findings tens of band widths out.
+   */
+  railFloor?: number;
   /** Replaces MethodologyPanel: what this method does, in the analyst's terms. */
   what: string;
   /**
@@ -148,6 +163,7 @@ export const METHODS: MethodMeta[] = [
     evidenceClass: "statistical",
     costClass: "heavy",
     scoreUnit: "× band",
+    railFloor: 2,
     what: "Learns a band per numeric field from the reference data and reports values outside it, scored by how many band widths out they sit.",
     querySketch: `SELECT toFloat64OrNull(<field>) AS num, count() AS n\nFROM events\nWHERE case_id = {case} AND num IS NOT NULL\nGROUP BY num\n-- band from the reference quantiles; score = excess / band width`,
     knobs: [FIELDS_KNOB],
@@ -175,6 +191,7 @@ export const METHODS: MethodMeta[] = [
     evidenceClass: "statistical",
     costClass: "heavy",
     scoreUnit: "× band",
+    railFloor: 2,
     what: "Measures Shannon entropy per value against a learned per-field band, catching both random-looking payloads and degenerate repeats at the other extreme.",
     querySketch: `SELECT <field> AS value, count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- Shannon entropy per value against the learned per-field band`,
     knobs: [FIELDS_KNOB],

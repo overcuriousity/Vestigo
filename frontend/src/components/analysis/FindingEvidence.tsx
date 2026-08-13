@@ -19,7 +19,6 @@
  * - Labels and values wear text tokens; the mark carries the identity. Every
  *   color is a theme token, so light and dark are the same code.
  */
-import { useId } from "react";
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
 import { truncate } from "@/lib/format";
@@ -97,7 +96,6 @@ function BandStrip({
   value: number;
   unit?: string;
 }) {
-  const clipId = useId();
   const lo = Math.min(lower, value);
   const hi = Math.max(upper, value);
   const pad = (hi - lo) * 0.12 || 1;
@@ -105,30 +103,47 @@ function BandStrip({
   const span = hi + pad - min || 1;
   const x = (n: number) => ((n - min) / span) * 100;
   const fmt = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(2)}${unit ? ` ${unit}` : ""}`;
+  // Kept off the very edge so the centered label cannot be clipped by the
+  // panel. The axis is padded by 12% either side, so a real marker never
+  // reaches this clamp — it exists for degenerate bands, not for the drawing.
+  const labelX = Math.min(Math.max(x(value), 8), 92);
+  const caption = `Learned band ${fmt(lower)} to ${fmt(upper)}; this value ${fmt(value)}`;
 
+  // Laid out in CSS rather than SVG. The marker's label has to sit *at* the
+  // marker: in a `justify-between` row it was pinned to the middle of the
+  // track regardless, so an out-of-band value at 10% was captioned at 50% —
+  // right about where the band starts, which reads as in-band and is the exact
+  // misread the to-scale marker exists to prevent. It also made the row read
+  // as an axis running 1.97 → 0.72 → 3.18, which is not an ordering. Drawing
+  // in CSS additionally keeps the marker round: a `preserveAspectRatio="none"`
+  // SVG stretched it into a smear the width of the panel.
   return (
-    <div>
-      <svg viewBox="0 0 100 18" preserveAspectRatio="none" className="h-5 w-full" role="img">
-        <title>{`Learned band ${fmt(lower)} to ${fmt(upper)}; this value ${fmt(value)}`}</title>
-        <clipPath id={clipId}>
-          <rect x="0" y="0" width="100" height="18" />
-        </clipPath>
-        <g clipPath={`url(#${clipId})`}>
-          <line x1="0" y1="9" x2="100" y2="9" stroke="var(--color-border)" strokeWidth="1" />
-          <rect
-            x={x(lower)}
-            y="5"
-            width={Math.max(x(upper) - x(lower), 0.5)}
-            height="8"
-            fill={REFERENCE}
-            rx="1"
-          />
-          <circle cx={x(value)} cy="9" r="3.5" fill={OBSERVED} />
-        </g>
-      </svg>
+    <div role="img" aria-label={caption} title={caption}>
+      <div className="relative h-4">
+        <span
+          className="absolute -translate-x-1/2 whitespace-nowrap font-mono text-xs text-[var(--color-anomaly,var(--color-warning))]"
+          style={{ left: `${labelX}%` }}
+        >
+          {fmt(value)}
+        </span>
+      </div>
+      <div className="relative h-5">
+        <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--color-border)]" />
+        <div
+          className="absolute top-1/2 h-2 -translate-y-1/2 rounded-sm"
+          style={{
+            left: `${x(lower)}%`,
+            width: `${Math.max(x(upper) - x(lower), 0.5)}%`,
+            background: REFERENCE,
+          }}
+        />
+        <div
+          className="absolute top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full"
+          style={{ left: `${x(value)}%`, background: OBSERVED }}
+        />
+      </div>
       <div className="flex justify-between font-mono text-xs text-[var(--color-fg-muted)]">
         <span>band {fmt(lower)}</span>
-        <span className="text-[var(--color-anomaly,var(--color-warning))]">{fmt(value)}</span>
         <span>{fmt(upper)}</span>
       </div>
     </div>

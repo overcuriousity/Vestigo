@@ -35,6 +35,7 @@ import { DETECTORS } from "./detector-registry";
 import { FindingEvidence } from "./FindingEvidence";
 import { normalizeFinding } from "@/lib/finding-normalize";
 import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
+import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -307,6 +308,28 @@ function FindingBody({
 
   return (
     <>
+      {/* What the finding is about, before anything said about it. The rail row
+          was the only place the subject appeared: the sheet's own claim reads
+          "this value of captured_length…" and never named the value, so
+          recognizing it — the analyst's first move — meant closing the sheet
+          and re-reading the row underneath. Verbatim and selectable, because
+          the value gets pasted into a filter or a report. */}
+      <dl data-testid="finding-subject" className="mb-3">
+        {findingSubject(finding).map((pair) => (
+          <div key={`${pair.label}:${pair.value}`} className="mb-2 last:mb-0">
+            <dt className="font-mono text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
+              {pair.label}
+            </dt>
+            {/* Capped, not truncated: a template or an n-gram can run to
+                paragraphs, and pushing the claim off screen to show all of it
+                trades one missing subject for another. */}
+            <dd className="m-0 max-h-24 select-text overflow-y-auto break-all font-mono text-lg font-bold leading-tight text-[var(--color-fg-primary)]">
+              {pair.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+
       {/* The claim, before the arithmetic. The rail row states the finding in
           the detector's vocabulary, which is right for a list and wrong for the
           surface an analyst opens to decide whether it is real. */}
@@ -466,7 +489,13 @@ export function InvestigateSheet({
       />
       <div
         data-testid="investigate-sheet"
-        className="absolute inset-y-0 z-30 flex flex-col border-l border-[var(--color-border-strong)] bg-[var(--color-bg-overlay)] shadow-lg"
+        // Sized to its content, capped at the viewport — not `inset-y-0`. A
+        // finding body is a few hundred pixels; stretching the panel to full
+        // height stranded the verdict bar an entire screen below the claim it
+        // answers, which is the one control that must stay next to what it
+        // acts on. Long bodies (Tools, a method's results) still fill the
+        // height and scroll inside, so nothing is lost at the other extreme.
+        className="absolute top-0 z-30 flex max-h-full flex-col border-l border-b border-[var(--color-border-strong)] bg-[var(--color-bg-overlay)] shadow-lg"
         style={{
           right: railWidth,
           width: `min(640px, calc(100% - ${railWidth + 24}px))`,
