@@ -85,6 +85,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Out-of-band evidence strips label the value at its marker rather than mid-track, where it
   read as sitting inside the band — the exact misread the to-scale marker exists to prevent.
 
+### Dependencies
+
+- Backend: fastapi 0.140.13 → 0.141.1, uvicorn 0.51.0 → 0.52.2, qdrant-client 1.18.0 →
+  1.19.0, pysigma 1.4.0 → 1.5.0, pydantic-ai-slim 2.19.0 → 2.29.0, typer 0.27.0 → 0.27.1,
+  h2 4.3.0 → 4.4.1, ruff 0.16.0 → 0.16.2.
+- Frontend: vite 8.1.5 → 8.2.0, jsdom 29.1.1 → 30.0.1, oxlint 1.75.0 → 1.77.0,
+  `@tanstack/react-virtual` 3.14.8 → 3.14.9, the Radix checkbox and toast primitives, the
+  React type packages, `@vitejs/plugin-react` 6.0.4 → 6.0.5, and a transitive nanoid
+  advisory (GHSA-2v37-7h3g-55p8). The container's Node base image goes 24-alpine →
+  25-alpine.
+- **`@tanstack/react-table` 8.21.3 → 9.0.0, migrated onto the new feature API** rather
+  than its v8 compatibility shim. `EventGrid` now declares the three features it actually
+  uses — column sizing, column resizing, column visibility — and subscribes to the single
+  state slice it reads instead of to the whole table state. Row selection, sorting,
+  filtering and expansion stay deliberately unregistered: this grid does all four against
+  the server, and enabling the features would keep a second, empty copy of that state
+  beside the real one. Two things moved and would have failed silently: the live resize
+  state is `columnResizing.isResizingColumn` (was `columnSizingInfo`), so a column's width
+  would have stopped being persisted on drag-release, and `ColumnDef`/`Header` take the
+  feature set as their first type argument. `src/test/eventGridResize.test.tsx` covers the
+  resize gesture end to end, since neither failure is visible to a type check.
+
 ## [1.11.0] — 2026-08-07
 
 ### Added

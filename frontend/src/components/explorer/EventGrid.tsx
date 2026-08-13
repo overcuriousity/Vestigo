@@ -12,11 +12,14 @@
  */
 import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
-  useReactTable,
-  getCoreRowModel,
   flexRender,
-  type ColumnDef,
-  type Header,
+  useTable,
+  columnResizingFeature,
+  columnSizingFeature,
+  columnVisibilityFeature,
+  type ColumnDef as TableColumnDef,
+  type Header as TableHeader,
+  type RowData,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -54,6 +57,34 @@ import { cn } from "@/lib/cn";
 import { reorderColumns } from "@/lib/columns";
 import { getAttributeDecoration, hasEnrichmentSiblings } from "@/lib/enrichment";
 
+/**
+ * The table features this grid actually uses, which in react-table 9 is an
+ * explicit, tree-shaken choice rather than the whole stock set:
+ *
+ *   columnSizing     — `getSize`/`getTotalSize`, the widths every cell reads
+ *   columnResizing   — the drag grip and the live `columnResizing` state slice
+ *   columnVisibility — `row.getVisibleCells()`
+ *
+ * Row selection, sorting, filtering and expansion are all deliberately absent:
+ * this grid does those itself against the server (selection is a `Set` of ids
+ * in ExplorerPage, sorting is a query parameter, filtering is ClickHouse), and
+ * enabling the features would put a second, empty copy of that state next to
+ * the real one.
+ */
+const GRID_FEATURES = {
+  columnSizingFeature,
+  columnResizingFeature,
+  columnVisibilityFeature,
+} as const;
+type GridFeatures = typeof GRID_FEATURES;
+
+/** The three generics react-table 9 wants, bound once for this grid. */
+type ColumnDef<TData extends RowData> = TableColumnDef<GridFeatures, TData, unknown>;
+type Header<TData extends RowData> = TableHeader<GridFeatures, TData, unknown>;
+
+/** What the grid selects out of table state — the live resize target, or false. */
+type ResizingColumnId = string | false;
+
 // Keep in sync with --grid-row-height in index.css.
 const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
 const OVERSCAN = 10;
@@ -71,7 +102,7 @@ const HEADER_CELL_CLASS =
 const PINNED_COLUMN_IDS = new Set(["_select", "_annotations", "_expand"]);
 
 /** Width/flex for a header cell — `message` is the one that absorbs slack. */
-function headerCellSize(h: Header<Event, unknown>) {
+function headerCellSize(h: Header<Event>) {
   return {
     width: h.column.id === "message" ? undefined : h.getSize(),
     flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
@@ -80,7 +111,7 @@ function headerCellSize(h: Header<Event, unknown>) {
 
 /** A header cell's label and resize grip, shared by the sortable and the
  *  pinned branch so the two can never drift apart visually. */
-function HeaderCellBody({ h }: { h: Header<Event, unknown> }) {
+function HeaderCellBody({ h }: { h: Header<Event> }) {
   const raw = h.column.columnDef.header;
   const label = typeof raw === "string" ? raw : undefined;
   return (
@@ -111,7 +142,7 @@ function HeaderCellBody({ h }: { h: Header<Event, unknown> }) {
 
 /** One draggable header cell. The pinned grid-internal columns render through
  *  the plain branch in the header map instead of this. */
-function SortableHeaderCell({ h }: { h: Header<Event, unknown> }) {
+function SortableHeaderCell({ h }: { h: Header<Event> }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: h.column.id });
   // KeyboardSensor's activator is this cell's onKeyDown and it does not look at
@@ -791,20 +822,37 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     () => ({ ...columnWidths }),
   );
 
-  const table = useReactTable({
-    data: events,
-    columns,
-    getCoreRowModel: getCoreRowModel(),
-    enableColumnResizing: true,
-    columnResizeMode: "onChange",
-    state: { columnSizing },
-    onColumnSizingChange: setColumnSizing,
-  });
+  // The core row model is built in on react-table 9 — there is no
+  // `getCoreRowModel()` to pass, and the optional models (sorted, filtered,
+  // paginated) are feature slots this grid deliberately does not fill.
+  //
+  // The second argument is the state selector, and it is the point of the
+  // feature API: this component re-renders on the one slice it reads rather
+  // than on every state change the table makes. Widths do not need to be in it
+  // — `columnSizing` is React state we own, so a resize already re-renders
+  // through `setColumnSizing`.
+  const table = useTable<GridFeatures, Event, ResizingColumnId>(
+    {
+      data: events,
+      columns,
+      features: GRID_FEATURES,
+      enableColumnResizing: true,
+      columnResizeMode: "onChange",
+      state: { columnSizing },
+      onColumnSizingChange: setColumnSizing,
+    },
+    (state) => state.columnResizing.isResizingColumn,
+  );
 
   // Persist a column's width once per drag gesture (on release), not per
   // pixel of movement, to avoid hammering localStorage during onChange.
+  //
+  // react-table 9 split the live resize state out of `columnSizingInfo` into
+  // its own `columnResizing` slice; widths stay in `columnSizing`. Reading the
+  // old key would make the gesture never look finished, so the width would
+  // never be persisted.
   const prevResizingColRef = useRef<string | false>(false);
-  const resizingColumnId = table.getState().columnSizingInfo.isResizingColumn;
+  const resizingColumnId = table.state;
   useEffect(() => {
     const wasResizing = prevResizingColRef.current;
     if (wasResizing && !resizingColumnId) {

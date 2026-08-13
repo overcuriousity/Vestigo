@@ -59,6 +59,31 @@ a real finding in a field we guessed was boring. The rail and the agent panel ma
 open together — reading a finding while asking about it is the intended workflow — so
 `CLAUDE.md`'s "only fixed-width surface" line was corrected to describe what ships.
 
+**Nineteen dependabot PRs folded into the release.** All applied locally in one pass —
+both lockfiles regenerated rather than merged nineteen times, which is where the conflicts
+would have been — then verified against the full suites. Two needed attention. A
+transitive nanoid advisory (GHSA-2v37-7h3g-55p8) cleared with `npm audit fix`. And
+`@tanstack/react-table` 9.0.0 is a breaking rewrite around composable features. The first
+attempt took the vendor's `useLegacyTable` shim — the cheap path — and that was the wrong
+call: it leaves the grid on a deprecated adapter and defers a migration that turned out to
+be small. `EventGrid` now declares the three features it uses (column sizing, resizing,
+visibility) and subscribes to the one state slice it reads rather than to all of it. Row
+selection, sorting, filtering and expansion stay unregistered on purpose: this grid does
+all four against the server, and enabling them would keep a second, empty copy of that
+state beside the real one.
+
+Two things moved that no type check would have caught in a looser codebase, and one that
+none catches at all. `ColumnDef`/`Header` take the feature set as their first type
+argument — loud. Live resize state is `columnResizing.isResizingColumn`, not v8's
+`columnSizingInfo` — reading the old key leaves the gesture looking unfinished forever, so
+a resized column's width would never be written back. That one is invisible to types, so
+`src/test/eventGridResize.test.tsx` now drives the whole gesture (mousedown, move,
+release) and asserts exactly one persisted write on release and none mid-drag; pointing
+the subscription at a constant makes it fail, which was checked rather than assumed.
+
+Vite 8.2 also warned that `__dirname` will not survive its native config loader; the
+config uses `import.meta.dirname` now.
+
 Released as **1.12.0**: the Investigate rail, the gate, the fingerprint cache and scope
 provenance are features, so a patch would have been wrong.
 
