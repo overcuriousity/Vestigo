@@ -13,6 +13,8 @@ an excluded field.
 
 from __future__ import annotations
 
+import pytest
+
 from tests.conftest import as_admin
 
 
@@ -78,6 +80,28 @@ def test_unknown_method_is_rejected_rather_than_stored(client, admin_bootstrap):
     resp = _patch(client, case_id, tid, {"numeric_rnage": {"attr:status_code": False}})
     assert resp.status_code == 422
     assert "numeric_rnage" in resp.json()["detail"]
+    assert (
+        client.get(f"/api/cases/{case_id}/timelines/{tid}").json()["timeline"]["field_overrides"]
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    "method", ["frequency", "sequence_novelty", "timestamp_order", "log_template"]
+)
+def test_a_method_that_selects_no_fields_is_rejected(client, admin_bootstrap, method):
+    """Known, but nothing to steer — the same lie a typo tells.
+
+    `frequency` and `sequence_novelty` take a single named `series_field`,
+    `timestamp_order` reads no field, `log_template` clusters the message text.
+    Stored, the declaration would be audited and rendered under "Declared
+    fields" while the detector scanned exactly as before, without a warning.
+    """
+    as_admin(client, admin_bootstrap)
+    case_id, tid = _case_and_timeline(client)
+    resp = _patch(client, case_id, tid, {method: {"attr:user": False}})
+    assert resp.status_code == 422
+    assert method in resp.json()["detail"]
     assert (
         client.get(f"/api/cases/{case_id}/timelines/{tid}").json()["timeline"]["field_overrides"]
         == {}

@@ -22,7 +22,7 @@
  * strip and ExplorerPage already hold, so it costs no extra request and every
  * reader shares one cache.
  */
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { timelinesApi } from "@/api/timelines";
 import { casesApi } from "@/api/cases";
@@ -47,9 +47,38 @@ export interface FieldOverridesHandle {
   /** Whether the caller may change them; false for read-only members. */
   canEdit: boolean;
   isSaving: boolean;
+  /** Set when the last write failed — this is shared state, so silence lies. */
+  saveError: string | null;
 }
 
 const EMPTY: Record<string, boolean> = {};
+
+/**
+ * In-flight write state per timeline, module-level rather than per-hook.
+ *
+ * Two hook instances are mounted at once — the method sheet's field picker and
+ * the Tools sheet's summary — and they write the same object with a
+ * full-replace PATCH. Per-instance refs would serialize each against itself
+ * only: declare a field in the picker, switch to Tools before it lands, hit
+ * Reset, and Tools would build its payload from the still-stale query cache,
+ * dropping the in-flight declaration from the timeline *and* from the audit
+ * row's previous/new pair. Keyed by timeline because that is the scope of the
+ * object being replaced.
+ */
+interface WriteChain {
+  pending: FieldOverrides | null;
+  chain: Promise<unknown>;
+}
+const writeChains = new Map<string, WriteChain>();
+
+function chainFor(key: string): WriteChain {
+  let entry = writeChains.get(key);
+  if (!entry) {
+    entry = { pending: null, chain: Promise.resolve() };
+    writeChains.set(key, entry);
+  }
+  return entry;
+}
 
 export function useFieldOverrides(caseId: string, timelineId: string): FieldOverridesHandle {
   const queryClient = useQueryClient();
@@ -96,30 +125,35 @@ export function useFieldOverrides(caseId: string, timelineId: string): FieldOver
   // would otherwise build on the same pre-mutation snapshot and the second
   // PATCH, a full replace, would drop the first from the timeline *and* from
   // the audit row's previous/new pair. Each edit builds on what is in flight,
-  // and the requests are chained so they cannot land out of order.
-  const pendingRef = useRef<FieldOverrides | null>(null);
-  const chainRef = useRef<Promise<unknown>>(Promise.resolve());
+  // and the requests are chained so they cannot land out of order. Shared
+  // across hook instances (see `writeChains`) because the sheet mounts two.
+  const chainKey = `${caseId}/${timelineId}`;
 
   const write = useCallback(
     (next: FieldOverrides) => {
       if (!canEdit) return;
-      pendingRef.current = next;
-      chainRef.current = chainRef.current
+      const entry = chainFor(chainKey);
+      entry.pending = next;
+      entry.chain = entry.chain
         .catch(() => {})
         .then(() => mutation.mutateAsync(next))
-        .catch(() => {})
+        .catch(() => {
+          // Reported through `saveError` — a rejection here would break the
+          // chain for every later write, and this state is shared and audited,
+          // so it must not fail silently either.
+        })
         .finally(() => {
           // Only the last write in flight hands control back to server state;
           // an earlier one settling must not strand a newer edit's base.
-          if (pendingRef.current === next) pendingRef.current = null;
+          if (entry.pending === next) entry.pending = null;
         });
     },
-    [canEdit, mutation],
+    [canEdit, chainKey, mutation],
   );
 
   const declare = useCallback(
     (id: MethodId, token: string, state: FieldDeclaration) => {
-      const base = pendingRef.current ?? overrides;
+      const base = chainFor(chainKey).pending ?? overrides;
       const forMethod = { ...(base[id] ?? {}) };
       if (state === null) delete forMethod[token];
       else forMethod[token] = state;
@@ -130,18 +164,18 @@ export function useFieldOverrides(caseId: string, timelineId: string): FieldOver
       else next[id] = forMethod;
       write(next);
     },
-    [overrides, write],
+    [chainKey, overrides, write],
   );
 
   const clearMethod = useCallback(
     (id: MethodId) => {
-      const base = pendingRef.current ?? overrides;
+      const base = chainFor(chainKey).pending ?? overrides;
       if (!(id in base)) return;
       const next = { ...base };
       delete next[id];
       write(next);
     },
-    [overrides, write],
+    [chainKey, overrides, write],
   );
 
   return {
@@ -151,5 +185,9 @@ export function useFieldOverrides(caseId: string, timelineId: string): FieldOver
     clearMethod,
     canEdit,
     isSaving: mutation.isPending,
+    // The chip returns to the server's answer on the next render either way,
+    // which on its own reads as "nothing happened" rather than "this was not
+    // saved" — for state the rest of the case inherits, say which.
+    saveError: mutation.error ? ((mutation.error as Error).message ?? "Save failed") : null,
   };
 }

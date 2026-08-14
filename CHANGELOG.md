@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.2] — 2026-08-14
+
+### Fixed
+
+- **The Investigate sheet's field knobs are choices again.** 1.12.0 rendered "which fields
+  to scan" as a free-text box asking the analyst to recall `attr:` token spellings; the
+  picker — this timeline's own columns, ranked, with coverage and cardinality beside each —
+  is back, for every method that takes a field selection.
+- **Which fields a detector reads is now a decision the case keeps.** The recommenders type
+  fields *syntactically*, so an HTTP status code is offered to the range detector and every
+  500 is reported as an outlier forever, and the picker's checkboxes could only correct that
+  for a single run. A field can now be pinned into or held out of a method's automatic
+  selection per timeline (`PATCH …/field-overrides`), shared across the case and audited
+  like a mute. It stays advice and not a lock: naming an excluded field explicitly still
+  scans it, the analysis plan ignores it, and a run that held a field back says so in its
+  warnings. See `docs/ANOMALY_DETECTION.md` §"Analyst-declared fields".
+- A declaration is refused where it could never apply — an unknown method id, an empty field
+  token, or a method that selects no fields at all (`frequency`, `sequence_novelty`,
+  `timestamp_order`, `log_template`) — rather than stored, audited and displayed as a
+  decision that steered nothing.
+- A run's `DetectorRun` diary cites the declaration only where it actually steered the scan,
+  never for a run that named its fields explicitly.
+- `value_distribution_drift` no longer drops a pinned categorical field when the numeric
+  half of its scan fills the shared cap, and the string detectors' "held back" disclosure
+  now counts what the run actually lost rather than every declared field in the timeline.
+- The Fields picker's auto preview no longer shows more checked fields than the charset and
+  entropy scans will read, and a field declaration that fails to save says so instead of
+  silently reverting.
+
 ## [1.12.1] — 2026-08-13
 
 ### Fixed

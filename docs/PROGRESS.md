@@ -1,6 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-14 (session 173 — the field declaration actually reaches the scan).
+Last updated: 2026-08-14 (session 174 — second review of PR #264, released as 1.12.2).
+
+## Session 174 — 2026-08-14: a declaration that steers nothing must not claim to
+
+A second review pass over the same branch. Nothing here breaks a scan; every finding is a
+place where the declaration *described* itself wrongly, which for shared, audited state is
+the same class of bug.
+
+`DetectorRun.params["field_overrides"]` was recorded unconditionally — including for a run
+that named its fields explicitly (which bypasses the declaration in every detector) and for
+methods that never receive it. That is the "auto does not describe what was scanned" problem
+the key was added to fix, pointed the other way: the diary claiming a decision steered a scan
+it never touched. It is now recorded only where it applied.
+
+The PATCH endpoint validated method ids against all twelve, but four select no fields to
+steer: `frequency` and `sequence_novelty` take one named `series_field`, `timestamp_order`
+reads none, `log_template` clusters message text. A declaration against those was accepted,
+audited, and rendered under "Declared fields" while the detector scanned exactly as before.
+`FIELD_OVERRIDE_METHOD_IDS` (`db/analysis_plan.py`) is now the one list, shared by the
+endpoint's 422 and by `_resolve_field_overrides`, which also keeps it out of the cache key.
+
+Two disclosure bugs. `_drift_split_fields` cut its categorical branch by whatever the numeric
+branch consumed, so a timeline with fifteen recommended numeric fields sliced the categorical
+list to `[:0]` and dropped a pinned field with no note — a held-back field indistinguishable
+from one that found nothing, which is the one thing this must never look like. And
+`_auto_string_fields` derived its "held back" count from the whole candidate universe rather
+than from what its quota would have scanned, so excluding a field ranked 22nd of 40 reported
+a narrowing of a scan that was byte-identical to the undeclared one.
+
+Frontend: the picker's identifier branch (charset/entropy) never re-applied the 15-field cap
+after prepending pins, so it previewed 17 checked chips for a run that scans 15. The write
+chain's serialization was per-hook-instance while two instances are mounted at once — the
+method sheet's picker and the Tools summary — so declaring in one and resetting in the other
+before the PATCH landed rebuilt the payload from the stale cache and dropped the in-flight
+declaration from the timeline and the audit pair alike; it is now keyed by timeline at module
+scope. A failed write is surfaced rather than swallowed: the chip returns to the server's
+answer either way, which on its own reads as "nothing happened" rather than "not saved".
+
+Released as 1.12.2.
+
 
 ## Session 173 — 2026-08-14: review of PR #264, the two halves that did nothing
 

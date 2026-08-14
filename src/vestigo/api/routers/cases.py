@@ -38,7 +38,7 @@ from vestigo.core.events_bus import publish_annotation_change
 from vestigo.core.jobs import JobStore, get_job_store
 from vestigo.core.retention import retain_file as _retain_file
 from vestigo.core.retention import retention_path as _retention_path
-from vestigo.db.analysis_plan import METHOD_IDS
+from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS, METHOD_IDS
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import validate_field_mappings
 from vestigo.db.field_stats import (
@@ -1337,6 +1337,13 @@ async def update_timeline_field_overrides(
     held a field back says so in its warnings. So every change owes an audit
     row, and unknown method ids are rejected rather than stored, where they
     would read as a deliberate declaration that never applied to anything.
+
+    A *known* method that selects no fields is rejected for that same reason:
+    ``frequency`` and ``sequence_novelty`` take a single ``series_field``,
+    ``timestamp_order`` reads no field, and ``log_template`` clusters the
+    message text, so a declaration against any of them would be audited and
+    rendered as "declared" while the detector went on scanning exactly as
+    before, without so much as a warning to say so.
     """
     store = get_store()
     timeline = await store.get_timeline(case.id, timeline_id)
@@ -1348,6 +1355,15 @@ async def update_timeline_field_overrides(
         raise HTTPException(
             status_code=422,
             detail=f"Unknown analysis method(s): {', '.join(unknown)}",
+        )
+    fieldless = sorted(set(requested) - FIELD_OVERRIDE_METHOD_IDS)
+    if fieldless:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "These analysis method(s) select no fields, so a field declaration "
+                f"would never apply to them: {', '.join(fieldless)}"
+            ),
         )
     empty_tokens = sorted(
         {m for m, fields in requested.items() for tok in fields if not tok.strip()}

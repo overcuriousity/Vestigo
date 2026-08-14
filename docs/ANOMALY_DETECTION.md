@@ -284,8 +284,8 @@ never learned it had been made.
 `{method_id: {field_token: bool}}`, where `true` pins a field into a method's
 automatic selection and `false` takes it out. It is written through
 `PATCH /api/cases/{case}/timelines/{timeline}/field-overrides` (contribute
-access, unknown method ids and empty tokens rejected with a 422, every change
-audited as `timeline.update_field_overrides`) and, like the mute list, is
+access, every change audited as `timeline.update_field_overrides`) and, like the
+mute list, is
 **shared rather than per-browser** — "status codes are not a range field here"
 is a conclusion about the data the next analyst should inherit.
 
@@ -295,6 +295,15 @@ is meaningless to `numeric_range` and an excellent `value_novelty` field, so
 blocklist of *findings* would record the symptom and have to be repeated for
 every numeric-ish detector added later; this records the decision at the one
 place both the unprompted sweep and the picker's auto default derive from.
+
+A declaration that could never apply is rejected with a 422 rather than stored:
+an empty field token, an unknown method id, and a *known* method that selects no
+fields of its own — `frequency` and `sequence_novelty` take a single named
+`series_field`, `timestamp_order` reads no field, `log_template` clusters the
+message text (`FIELD_OVERRIDE_METHOD_IDS` in `db/analysis_plan.py`). Stored, any
+of those would be audited and rendered under "Declared fields" as an effective
+decision while the detector scanned exactly as before, without a warning to say
+so.
 
 The same "advice, never a lock" contract as the gate and the mute:
 
@@ -309,6 +318,10 @@ The same "advice, never a lock" contract as the gate and the mute:
   scan that found nothing — the exact "checked, clear" misread this surface
   exists to prevent. A pin naming a field the timeline does not have is dropped
   and disclosed the same way, rather than scanned as an always-empty column.
+  The count is what *this run* lost, always measured against the selection an
+  undeclared run would have scanned: excluding a field ranked far below a
+  detector's cap changes nothing, and claiming otherwise would both over-state
+  the narrowing and make the sentence's counts incomparable between detectors.
 - **Pins go first.** They are applied before each detector's `_MAX_AUTO_SCAN_FIELDS`
   slice, since being ranked below the cut is precisely why a field gets pinned —
   including a field the recommender *did* rank: a pin moves it ahead of the cut
@@ -321,12 +334,18 @@ The same "advice, never a lock" contract as the gate and the mute:
   same syntactic numeric probe the explicit-`fields` path uses and lands in the
   branch that probe indicates. The "not present in this timeline" disclosure is
   resolved once against both recommenders' candidates, so the run can never
-  scan a field in one branch and report it missing from the other.
+  scan a field in one branch and report it missing from the other. The two
+  branches split one cap, and the categorical half's budget never falls below
+  its own pins — otherwise a timeline wide enough to fill the cap with numeric
+  fields would drop a pinned categorical field silently.
 - **The declaration is part of a run's diary.** `DetectorRun.params` records the
   method's slice as it stood at run time, next to the windows and the effective
   thresholds: two runs whose `fields` both read `auto` can have scanned
   different sets once the declaration is edited, and an applied pin — unlike an
-  exclusion, which reaches `warnings` — leaves no other trace.
+  exclusion, which reaches `warnings` — leaves no other trace. Recorded only
+  where it steered the run: a run with an explicit `fields` bypasses the
+  declaration, so citing it there would claim a decision shaped a scan it never
+  touched.
 
 Detectors that select their own fields all route through it: `value_novelty`,
 `value_combo`, `numeric_range`, `charset`, `entropy`, `proportion_shift`,

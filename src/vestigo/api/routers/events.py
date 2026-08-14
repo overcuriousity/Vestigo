@@ -30,6 +30,7 @@ from vestigo.api.deps import (
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
+from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS
 from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     CharsetFinding,
@@ -1749,7 +1750,14 @@ async def _resolve_field_overrides(
     named method's slice is returned: a status code that is meaningless to
     ``numeric_range`` is an excellent ``value_novelty`` field, so a declaration
     is never global.
+
+    A method that selects no fields of its own gets ``None`` without a lookup
+    (:data:`FIELD_OVERRIDE_METHOD_IDS`). The PATCH endpoint refuses to store
+    those, so this is belt-and-braces — but it is what keeps the cache key and
+    the ``DetectorRun`` record from naming a declaration that steered nothing.
     """
+    if detector not in FIELD_OVERRIDE_METHOD_IDS:
+        return None
     timeline = await get_store().get_timeline(case_id, timeline_id)
     if timeline is None:
         return None
@@ -1852,7 +1860,18 @@ async def _run_stat_detector(
         # both read "auto" in `DetectorRun.params` can have scanned different
         # fields. An exclusion reaches `warnings` on its own; an applied pin
         # leaves no other trace.
-        "field_overrides": dict(sorted(field_overrides.items())) if field_overrides else None,
+        #
+        # Only where it actually steered the run, though. An explicit `fields`
+        # bypasses the declaration in every detector, so recording it there
+        # would claim a declaration shaped a scan it never touched — the same
+        # "the run does not describe what was scanned" problem this key exists
+        # to fix, pointed the other way. (`_resolve_field_overrides` already
+        # returns None for the methods that select no fields at all.)
+        "field_overrides": (
+            dict(sorted(field_overrides.items()))
+            if field_overrides and _parse_novelty_fields(fields) is None
+            else None
+        ),
     }
 
     if detector == "timestamp_order":

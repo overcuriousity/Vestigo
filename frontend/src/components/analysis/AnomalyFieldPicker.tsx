@@ -23,7 +23,7 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from "@/components/ui/Popover";
-import { selectAutoScanTokens } from "./detector-hooks";
+import { AUTO_SCAN_MAX_FIELDS, selectAutoScanTokens } from "./detector-hooks";
 import { cn } from "@/lib/cn";
 import { anomalyFieldLabel as tokenLabel } from "@/lib/format";
 import type {
@@ -300,7 +300,15 @@ export function AnomalyFieldPicker({
       const ids = allFields
         .filter((f) => f.kind === "identifier" && keep(f.token))
         .map((f) => f.token);
-      return new Set([...pins, ...selectAutoScanTokens(rec, ids)]);
+      // Re-cut after the pins are prepended, the way _auto_string_fields does:
+      // without it the preview would check 17 chips and say "17 fields
+      // selected" for a run that scans 15.
+      return new Set(
+        Array.from(new Set([...pins, ...selectAutoScanTokens(rec, ids)])).slice(
+          0,
+          AUTO_SCAN_MAX_FIELDS,
+        ),
+      );
     }
     const ordered = [...pins, ...rec];
     return new Set(autoCount !== undefined ? ordered.slice(0, autoCount) : ordered);

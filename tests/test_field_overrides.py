@@ -290,6 +290,40 @@ def test_pins_cannot_inflate_the_string_scan_past_its_cap(monkeypatch):
     assert len(picked) == _MAX_AUTO_SCAN_FIELDS
 
 
+def test_an_exclusion_the_quota_never_reached_is_not_claimed_as_held_back(monkeypatch):
+    """The disclosure counts what this run lost, not what the timeline declares.
+
+    Excluding a field ranked far below the cap changes nothing: the scan is
+    byte-identical to the undeclared one. Reporting it anyway over-claims, and
+    makes this sentence's counts incomparable with the same sentence from every
+    other detector, which reports against its own selection.
+    """
+    svc = _svc([])
+
+    class _Rec:
+        def __init__(self, token: str, kind: str) -> None:
+            self.token = token
+            self.kind = kind
+            self.recommended = kind == "categorical"
+
+    tokens = [f"attr:f{i}" for i in range(40)]
+    monkeypatch.setattr(
+        type(svc),
+        "recommend_novelty_fields",
+        lambda self, *a, **k: [_Rec(t, "categorical") for t in tokens],
+    )
+    undeclared, _ = svc._auto_string_fields("c1", ["s1"], 1000, None, None, None, None)
+    picked, notes = svc._auto_string_fields(
+        "c1", ["s1"], 1000, None, None, None, {"attr:f30": False}
+    )
+    assert picked == undeclared
+    assert notes == []
+
+    # A field the quota *did* reach is still disclosed, counted once.
+    _, real = svc._auto_string_fields("c1", ["s1"], 1000, None, None, None, {undeclared[0]: False})
+    assert any(undeclared[0] in n and "1 field(s) held back" in n for n in real)
+
+
 # ---------------------------------------------------------------------------
 # The drift split — one declaration, two branches
 # ---------------------------------------------------------------------------
@@ -358,6 +392,32 @@ def test_a_drift_pin_lands_in_the_branch_its_probe_puts_it_in(monkeypatch):
     assert "attr:latency" in num
     assert "attr:agent" in cat
     # Neither is a field this timeline lacks, so nothing may claim they are.
+    assert notes == []
+
+
+def test_a_categorical_drift_pin_survives_a_numeric_saturated_timeline(monkeypatch):
+    """The two branches share one cap, and the pins must not be what it eats.
+
+    On a timeline wide enough to fill the cap with numeric fields the
+    categorical budget is zero, so a pinned categorical field would be sliced
+    away with no note — a held-back field indistinguishable from one that found
+    nothing, which is the one thing a declaration must never look like.
+    """
+    from vestigo.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS
+
+    numeric = [f"attr:n{i}" for i in range(_MAX_AUTO_SCAN_FIELDS + 3)]
+    svc = _drift_svc(
+        monkeypatch,
+        numeric=numeric,
+        categorical=["attr:host"],
+        ratios={},
+        unrecommended=("attr:host",),
+    )
+    num, cat, notes = svc._drift_split_fields(
+        "c1", ["s1"], None, 1000, None, [], 1000, field_overrides={"attr:host": True}
+    )
+    assert len(num) == _MAX_AUTO_SCAN_FIELDS
+    assert cat == ["attr:host"]
     assert notes == []
 
 

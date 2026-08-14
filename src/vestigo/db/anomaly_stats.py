@@ -3054,10 +3054,15 @@ class StatisticalAnomalyService:
         # backfills the slot, rather than after, which would silently shrink the
         # scan below its own cap. That happens ahead of apply_field_overrides,
         # which would then have nothing left to disclose, so the exclusions are
-        # run through it separately — on the candidate list rather than on the
-        # quota's output, since a field cut here is held back just as much as
-        # one cut from a scan list.
-        _, notes = apply_field_overrides(cats + ids, field_overrides)
+        # run through it separately — against the selection an *undeclared* run
+        # would have scanned, which is exactly the set this run differs from.
+        # Reporting against the whole candidate universe instead would count
+        # fields ranked far below the cap, and claim a scan was narrowed when it
+        # is byte-identical to the one nobody declared anything for. Only the
+        # exclusions are passed: a pin belongs to the note below, and would
+        # otherwise be reported absent against a list it is not in yet.
+        excluded = {t: False for t, on in (field_overrides or {}).items() if not on}
+        _, notes = apply_field_overrides(_select_auto_scan_tokens(cats, ids), excluded or None)
         if field_overrides:
             cats = [t for t in cats if field_overrides.get(t) is not False]
             ids = [t for t in ids if field_overrides.get(t) is not False]
@@ -4860,7 +4865,14 @@ class StatisticalAnomalyService:
             categorical, {**off, **dict.fromkeys(cat_pins, True)}
         )
         numeric = numeric[:_MAX_AUTO_SCAN_FIELDS]
-        categorical = categorical[: _MAX_AUTO_SCAN_FIELDS - len(numeric)]
+        # The categorical branch gets whatever budget the numeric one left —
+        # but never less than its own pins. A timeline wide enough to fill the
+        # cap with numeric fields would otherwise slice this to [:0] and drop a
+        # pinned categorical field without a note, leaving a held-back field
+        # indistinguishable from one that found nothing. Everywhere else a pin
+        # survives the cap because it is prepended; here the budget itself has
+        # to make room for it.
+        categorical = categorical[: max(_MAX_AUTO_SCAN_FIELDS - len(numeric), len(cat_pins))]
         return numeric, categorical, [*notes, *numeric_notes, *cat_notes]
 
     @_gated_scan

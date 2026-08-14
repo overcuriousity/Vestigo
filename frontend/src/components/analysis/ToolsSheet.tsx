@@ -106,7 +106,12 @@ export function ToolsSheet({
   // The timeline's field declarations, summarized here because the control that
   // sets them lives in one method's field picker: a decision the whole case
   // inherits needs somewhere it can be read back and undone in one place.
-  const { overrides, clearMethod, canEdit: canDeclare } = useFieldOverrides(caseId, timelineId);
+  const {
+    overrides,
+    clearMethod,
+    canEdit: canDeclare,
+    saveError: declareError,
+  } = useFieldOverrides(caseId, timelineId);
   const declared = Object.entries(overrides).filter(
     ([id, fields]) => id in METHODS_BY_ID && Object.keys(fields).length > 0,
   ) as [MethodId, Record<string, boolean>][];
@@ -216,6 +221,17 @@ export function ToolsSheet({
                   </div>
                 ))}
               </div>
+              {/* Reset removes a declaration the whole case inherits; a failed
+                  PATCH only makes the row reappear, which reads as a click
+                  that missed rather than as a write that did not land. */}
+              {declareError && (
+                <p
+                  data-testid="field-overrides-error"
+                  className="mt-1.5 text-[var(--color-danger)]"
+                >
+                  Not saved: {declareError}
+                </p>
+              )}
             </div>
           )}
           <div className="space-y-1">

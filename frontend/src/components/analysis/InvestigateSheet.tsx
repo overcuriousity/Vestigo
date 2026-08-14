@@ -205,7 +205,7 @@ function MethodBody({
   // The durable half of the same decision: which fields this method reads at
   // all, declared once for the case. Read-only members see the state and not
   // the control (`canEdit` false → no `onDeclare`), the way muting does.
-  const { forMethod, declare, canEdit } = useFieldOverrides(caseId, timelineId);
+  const { forMethod, declare, canEdit, saveError } = useFieldOverrides(caseId, timelineId);
   const overrides = forMethod(methodId);
 
   return (
@@ -288,6 +288,15 @@ function MethodBody({
       {onRun && blocker && (
         <p data-testid="method-knob-blocker" className="mt-1.5 text-xs text-[var(--color-warning)]">
           {blocker}
+        </p>
+      )}
+      {/* The chip snaps back to the server's answer on the next render, which
+          on its own reads as "nothing happened". A declaration the analyst
+          believes the whole case now inherits has to say when it was not
+          stored. */}
+      {saveError && (
+        <p data-testid="field-declare-error" className="mt-1.5 text-xs text-[var(--color-danger)]">
+          Field declaration not saved: {saveError}
         </p>
       )}
 

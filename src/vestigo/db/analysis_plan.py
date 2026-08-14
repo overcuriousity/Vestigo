@@ -51,6 +51,27 @@ METHOD_IDS: tuple[str, ...] = (
     "log_template",
 )
 
+#: The methods that select fields for themselves, and so the only ones a
+#: timeline's ``field_overrides`` can steer. The other four take no field
+#: selection to steer: ``frequency`` and ``sequence_novelty`` take a single
+#: ``series_field`` the analyst names outright, ``timestamp_order`` reads no
+#: field at all, and ``log_template`` clusters the message text. A declaration
+#: stored against one of those would be audited, rendered as "declared" and
+#: then quietly apply to nothing — which is the same lie an unknown method id
+#: tells, so the field-overrides endpoint rejects both.
+FIELD_OVERRIDE_METHOD_IDS: frozenset[str] = frozenset(
+    {
+        "value_novelty",
+        "value_combo",
+        "numeric_range",
+        "charset",
+        "entropy",
+        "proportion_shift",
+        "value_distribution_drift",
+        "interval_periodicity",
+    }
+)
+
 #: Cost class per method, used only to order the streaming run cheapest-first.
 #: "heavy" means the method takes a ``HEAVY_SCAN_GATE`` slot in
 #: ``db/anomaly_stats.py`` — the gate's width is what makes a full sweep add up

@@ -1856,12 +1856,14 @@ async def timeline_setup(patched_store):
     return patched_store
 
 
-def _call_list_anomalies(persist: bool = True):
+def _call_list_anomalies(
+    persist: bool = True, detector: str = "value_novelty", fields: str | None = None
+):
     return events.list_anomalies(
         "c1",
         "t1",
-        detector="value_novelty",
-        fields=None,
+        detector=detector,
+        fields=fields,
         series_field="artifact",
         z_threshold=None,
         min_skew_seconds=None,
@@ -1922,6 +1924,50 @@ async def test_persisted_run_records_no_declaration_as_none(
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
     response = await _call_list_anomalies()
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_with_explicit_fields_records_no_declaration(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """Naming fields bypasses the declaration, so the run must not cite it.
+
+    The key exists because a run reading "auto" does not say what it scanned.
+    Recording it against a scan it never touched is the same failure pointed
+    the other way: the diary would claim a declaration steered this run.
+    """
+    await timeline_setup.update_timeline_field_overrides(
+        "c1", "t1", {"value_novelty": {"attr:status_code": False}}
+    )
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies(fields="attr:user")
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_detector_that_selects_no_fields_records_no_declaration(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """`frequency` takes one named series field, so a declaration cannot steer it.
+
+    The PATCH endpoint refuses to store one; written straight to the store (as
+    a pre-validation row would have been), it must still not reach the run's
+    diary — a recorded declaration reads as one that applied.
+    """
+    await timeline_setup.update_timeline_field_overrides(
+        "c1", "t1", {"frequency": {"attr:user": False}}
+    )
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies(detector="frequency")
 
     run = await timeline_setup.get_detector_run("c1", response["run_id"])
     assert run.params["field_overrides"] is None
