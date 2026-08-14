@@ -30,6 +30,7 @@ from vestigo.api.routers.events import (
     _apply_confirmations,
     _apply_dismissals,
     _get_stat_anomaly_service,
+    _resolve_field_overrides,
     _resolve_timeline_scope,
     _run_stat_detector,
     _serialize_stat_result,
@@ -589,6 +590,7 @@ async def get_analysis_findings(
 
     scoped = set(source_ids)
     sources = await store.list_timeline_sources(case_id, timeline_id)
+    field_overrides = await _resolve_field_overrides(case_id, timeline_id, method)
     key = fingerprint(
         timeline_id=timeline_id,
         # `or ""` rather than a filter: a source still without its hash is part
@@ -604,6 +606,11 @@ async def get_analysis_findings(
         baseline_config_hash=baseline_config_hash,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
+        # The timeline's field declaration for *this* method: it changes which
+        # fields the detector picks for itself, so a cached answer computed
+        # before an analyst declared a field off is an answer to a different
+        # question. Ignored by log_template, which selects no fields.
+        field_overrides=field_overrides,
         detector_settings=detector_settings_material(cfg),
         method=method,
         # The validated params, not the raw object: `2` and `2.0` are the same
@@ -661,6 +668,9 @@ async def get_analysis_findings(
             # clock-skew correction is silently dropped.
             field_mappings=field_mappings,
             source_offsets=source_offsets,
+            # Already read for the cache key above — handed over so a miss
+            # costs one timeline lookup instead of two.
+            field_overrides=field_overrides,
         )
         body = _serialize_stat_result(result)
         scope = {**scope, "dispositions_hash": resolution.get("dispositions_hash")}

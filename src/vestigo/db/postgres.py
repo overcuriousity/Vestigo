@@ -240,6 +240,20 @@ class Timeline(Base):
     # the rail is required to disclose the count it is holding back.
     muted_methods: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    # Per-method field decisions the analysts on this case have declared for
+    # this timeline: ``{method_id: {field_token: bool}}``, where True pins a
+    # field into that detector's *automatic* field selection and False takes it
+    # out. Shared for the same reason ``muted_methods`` is — "an HTTP status
+    # code is not a range field" is a finding about the data, not a browser
+    # preference, and the recommenders type fields syntactically so they cannot
+    # discover it themselves.
+    #
+    # Advice to the recommenders, never a gate: it applies only where a
+    # detector picks its own fields, an explicit ``fields=[…]`` still runs the
+    # method on an excluded field, the plan endpoint does not consult it, and a
+    # detector that held a field back says so in its warnings.
+    field_overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # --- Embedding state (all nullable; None → not yet embedded) -------------
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -268,6 +282,7 @@ class Timeline(Base):
             "field_mappings": self.field_mappings,
             "recommended_columns": self.recommended_columns,
             "muted_methods": self.muted_methods or [],
+            "field_overrides": self.field_overrides or {},
             "is_embedded": is_embedded,
             "is_stale": is_stale,
             "embedding_model": self.embedding_model,
@@ -3108,6 +3123,46 @@ class PostgresStore:
             if timeline is None:
                 return None
             timeline.muted_methods = sorted(set(muted_methods)) if muted_methods else None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
+    async def update_timeline_field_overrides(
+        self,
+        case_id: str,
+        timeline_id: str,
+        field_overrides: dict[str, dict[str, bool]] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's per-method field overrides (None/empty clears them).
+
+        Methods whose map ends up empty are dropped rather than stored as ``{}``,
+        so "nothing declared for this method" has one representation and the
+        audit trail's before/after compares decisions rather than leftovers.
+        Validation of the method ids against ``METHOD_IDS`` happens at the API
+        layer, where an unknown id can be reported as a 422.
+
+        Returns the updated timeline with sources eagerly loaded, or None if it
+        doesn't exist.
+        """
+        from sqlalchemy import select
+
+        cleaned = {
+            method: {field: bool(state) for field, state in sorted(fields.items())}
+            for method, fields in sorted((field_overrides or {}).items())
+            if fields
+        }
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.field_overrides = cleaned or None
             await session.commit()
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])

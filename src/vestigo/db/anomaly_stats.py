@@ -194,6 +194,7 @@ from __future__ import annotations
 import functools
 import math
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
@@ -1508,6 +1509,66 @@ def _select_auto_scan_tokens(cats: list[str], ids: list[str]) -> list[str]:
     return picked
 
 
+def apply_field_overrides(
+    selected: Sequence[str],
+    overrides: Mapping[str, bool] | None,
+    known: Iterable[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Steer a detector's *automatic* field selection by analyst declaration.
+
+    *overrides* is one method's slice of ``Timeline.field_overrides``:
+    ``{field_token: True}`` pins a field into the scan, ``{field_token: False}``
+    takes it out. It exists because the recommenders type fields syntactically
+    and say so — an HTTP status code parses as a number, so the range detector
+    learns a band over ``{200, 404, 500}`` and reports the 500s forever, and no
+    amount of probing discovers that it is a categorical field wearing digits.
+    Only a human (or an agent reasoning about the field's meaning) knows.
+
+    Pinned fields come first, so they survive the per-detector ``[:cap]`` slice
+    that follows — being ranked below the cut is exactly why an analyst pins
+    one. *known*, when given, is the candidate universe the recommender saw: a
+    pin naming a field this timeline does not have is dropped rather than sent
+    to ClickHouse as a column that is always empty.
+
+    Returns ``(fields, notes)``. *notes* names what the declaration held back or
+    ignored, for the caller's ``warnings`` — a field silently missing from a
+    scan is indistinguishable from a field that produced no finding, which is
+    the one thing an override must never look like. Never applied where the
+    caller named *fields* explicitly: this is advice to the recommenders, not a
+    lock on the detector.
+    """
+    if not overrides:
+        return list(selected), []
+    notes: list[str] = []
+    kept = [t for t in selected if overrides.get(t) is not False]
+    held = [t for t in selected if overrides.get(t) is False]
+    # Every pin, including one the recommender already picked: being ranked
+    # below the cut is exactly why an analyst pins a field it *did* pick, so a
+    # pin the recommender ranked 18th has to move ahead of the [:15] slice, not
+    # keep its rank. Promoted ones leave `kept` below rather than appearing
+    # twice.
+    pins = [t for t, on in sorted(overrides.items()) if on]
+    if known is not None:
+        # A field the caller already selected is present by construction,
+        # whatever the recommender universe says — claiming otherwise would be
+        # a run that scans a field and reports it missing in the same breath.
+        universe = set(known) | set(selected)
+        absent = [t for t in pins if t not in universe]
+        pins = [t for t in pins if t in universe]
+        if absent:
+            notes.append(
+                f"{len(absent)} field(s) this timeline declares for this method are not "
+                f"present in it and were ignored: {', '.join(sorted(absent))}."
+            )
+    if held:
+        notes.append(
+            f"{len(held)} field(s) held back by this timeline's field overrides: "
+            f"{', '.join(sorted(held))}. Naming a field explicitly still scans it."
+        )
+    pinned = set(pins)
+    return pins + [t for t in kept if t not in pinned], notes
+
+
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
@@ -1923,6 +1984,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen values per field, ranked by surprise score.
 
@@ -1958,6 +2020,9 @@ class StatisticalAnomalyService:
         # Total event count for surprise score denominator.
         total_events = self._count_events(case_id, source_ids)
 
+        # Populated only on the auto path: naming fields explicitly bypasses the
+        # timeline's overrides entirely, so there is nothing to disclose.
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
@@ -1974,6 +2039,9 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
             # Plain-attribute fields share one batched map scan below, but the
             # cap still bounds the ARRAY JOIN expansion width / LIMIT BY output
             # (and the residual per-field round-trips for mapped or top-level
@@ -1992,12 +2060,12 @@ class StatisticalAnomalyService:
         # Per-window event totals (surprise denominators) — temporal only.
         baseline_size = total_events
         suspect_totals: list[int] = []
-        run_warnings: list[str] = []
+        run_warnings: list[str] = [*override_notes]
         if windows is not None:
             baseline_size, suspect_totals = self._window_totals(
                 case_id, source_ids, windows, source_offsets
             )
-            run_warnings = _window_size_warnings(windows, suspect_totals)
+            run_warnings += _window_size_warnings(windows, suspect_totals)
 
         all_findings: list[ValueFinding] = []
 
@@ -2352,6 +2420,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen *combinations* of field values.
 
@@ -2394,13 +2463,22 @@ class StatisticalAnomalyService:
 
         # Field resolution (auto mode) issues live queries — only after the
         # empty-corpus short-circuit above.
+        override_notes: list[str] = []
         if fields is not None:
             combo_fields = fields
         else:
             rec = self.recommend_novelty_fields(
                 case_id, source_ids, total=total_events, field_mappings=field_mappings
             )
-            combo_fields = [f.token for f in rec if f.recommended][:2]
+            # Overrides are applied before the pair is cut, not after: a pinned
+            # field the recommender ranked third is pinned precisely so it makes
+            # the pair.
+            combo_fields, override_notes = apply_field_overrides(
+                [f.token for f in rec if f.recommended],
+                field_overrides,
+                [f.token for f in rec],
+            )
+            combo_fields = combo_fields[:2]
 
         if len(combo_fields) < 2:
             if fields is not None:
@@ -2411,6 +2489,7 @@ class StatisticalAnomalyService:
                 detector="value_combo",
                 method=method,
                 baseline_size=total_events,
+                warnings=override_notes,
             )
 
         # Build one expression per field into a single shared params dict —
@@ -2429,12 +2508,12 @@ class StatisticalAnomalyService:
         # Per-window event totals (surprise denominators) — temporal only.
         baseline_size = total_events
         suspect_totals: list[int] = []
-        run_warnings: list[str] = []
+        run_warnings: list[str] = [*override_notes]
         if windows is not None:
             baseline_size, suspect_totals = self._window_totals(
                 case_id, source_ids, windows, source_offsets
             )
-            run_warnings = _window_size_warnings(windows, suspect_totals)
+            run_warnings += _window_size_warnings(windows, suspect_totals)
 
         if windows is None:
             params["floor"] = rarity_floor
@@ -2695,6 +2774,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return numeric values falling outside a field's learned range.
 
@@ -2730,13 +2810,22 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
             rec = self.recommend_numeric_fields(
                 case_id, source_ids, total=total_events, field_mappings=field_mappings
             )
-            scan_fields = [f.token for f in rec if f.recommended][:_MAX_AUTO_SCAN_FIELDS]
+            # The detector this override exists for: a status code parses as a
+            # number, so the recommender offers it and the learned band reports
+            # every 500 forever. Declaring it off is the only way to say so.
+            scan_fields, override_notes = apply_field_overrides(
+                [f.token for f in rec if f.recommended],
+                field_overrides,
+                [f.token for f in rec],
+            )
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         all_findings: list[RangeFinding] = []
         evaluated_fields = 0
@@ -2895,6 +2984,7 @@ class StatisticalAnomalyService:
                 detector="numeric_range",
                 method=method,
                 baseline_size=total_events,
+                warnings=override_notes,
                 windows=windows.payload() if windows is not None else None,
             )
 
@@ -2913,6 +3003,7 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=total_events,
             results=results,
+            warnings=override_notes,
             windows=windows.payload() if windows is not None else None,
             total_findings=len(all_findings),
         )
@@ -2929,7 +3020,8 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None,
         inventory: list[tuple[str, int, int]] | None,
         inventory_total: int | None,
-    ) -> list[str]:
+        field_overrides: dict[str, bool] | None = None,
+    ) -> tuple[list[str], list[str]]:
         """Auto-select string fields for the charset/entropy detectors.
 
         Unlike value_novelty's default (categorical only), identifier-kind
@@ -2958,7 +3050,31 @@ class StatisticalAnomalyService:
             f.token for f in rec if f.kind == "categorical" and f.token not in _SYNTHETIC_FIELDS
         ]
         ids = [f.token for f in rec if f.kind == "identifier" and f.token not in _SYNTHETIC_FIELDS]
-        return _select_auto_scan_tokens(cats, ids)
+        # Excluded fields are dropped *before* the quota so the other kind
+        # backfills the slot, rather than after, which would silently shrink the
+        # scan below its own cap. That happens ahead of apply_field_overrides,
+        # which would then have nothing left to disclose, so the exclusions are
+        # run through it separately — against the selection an *undeclared* run
+        # would have scanned, which is exactly the set this run differs from.
+        # Reporting against the whole candidate universe instead would count
+        # fields ranked far below the cap, and claim a scan was narrowed when it
+        # is byte-identical to the one nobody declared anything for. Only the
+        # exclusions are passed: a pin belongs to the note below, and would
+        # otherwise be reported absent against a list it is not in yet.
+        excluded = {t: False for t, on in (field_overrides or {}).items() if not on}
+        _, notes = apply_field_overrides(_select_auto_scan_tokens(cats, ids), excluded or None)
+        if field_overrides:
+            cats = [t for t in cats if field_overrides.get(t) is not False]
+            ids = [t for t in ids if field_overrides.get(t) is not False]
+        picked, pin_notes = apply_field_overrides(
+            _select_auto_scan_tokens(cats, ids), field_overrides, [f.token for f in rec]
+        )
+        # Re-cut after the pins are prepended, like every other detector does:
+        # the quota bounds this scan at _MAX_AUTO_SCAN_FIELDS heavy per-field
+        # queries under one HEAVY_SCAN_GATE slot, and a stored declaration must
+        # not be able to double that.
+        picked = picked[:_MAX_AUTO_SCAN_FIELDS]
+        return picked, notes + pin_notes
 
     @_gated_scan
     def find_charset_novelty(
@@ -2977,6 +3093,7 @@ class StatisticalAnomalyService:
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
         group_field: str | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values containing characters outside a field's reference charset.
 
@@ -3087,11 +3204,18 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
-            scan_fields = self._auto_string_fields(
-                case_id, source_ids, total_events, field_mappings, inventory, inventory_total
+            scan_fields, override_notes = self._auto_string_fields(
+                case_id,
+                source_ids,
+                total_events,
+                field_mappings,
+                inventory,
+                inventory_total,
+                field_overrides,
             )
 
         def _learn_rare_chars(field: str, *, exclude_suspects: bool, basis: str) -> _CharsetLearn:
@@ -3177,7 +3301,7 @@ class StatisticalAnomalyService:
 
         all_findings: list[CharsetFinding] = []
         evaluated_fields = 0
-        run_warnings: list[str] = []
+        run_warnings: list[str] = [*override_notes]
         # Every way a grouped run can deviate from "each group scored against
         # its own alphabet" is accumulated here and reported in `warnings`, so
         # the run never quietly narrows what it looked at — and never claims to
@@ -3764,6 +3888,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose Shannon character entropy falls outside a learned band.
 
@@ -3811,11 +3936,18 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
-            scan_fields = self._auto_string_fields(
-                case_id, source_ids, total_events, field_mappings, inventory, inventory_total
+            scan_fields, override_notes = self._auto_string_fields(
+                case_id,
+                source_ids,
+                total_events,
+                field_mappings,
+                inventory,
+                inventory_total,
+                field_overrides,
             )
 
         # Shannon character entropy in bits (log2) per distinct value, via
@@ -3985,6 +4117,7 @@ class StatisticalAnomalyService:
             total_events=total_events,
             evaluated_fields=evaluated_fields,
             allowlist=allowlist,
+            warnings=override_notes,
             windows=windows,
             exclude_event_ids=exclude_event_ids,
             limit=limit,
@@ -4013,6 +4146,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose share of events shifted between baseline and suspect windows.
 
@@ -4090,6 +4224,10 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
             scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         # Phase 1: fetch per-(field, value) window counts from ClickHouse.
@@ -4278,6 +4416,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose arrival cadence changed between baseline and suspect windows.
 
@@ -4363,6 +4502,10 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
             scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         # Window durations in seconds — the Poisson-rate test's exposures.
@@ -4624,8 +4767,9 @@ class StatisticalAnomalyService:
         inventory_total: int | None,
         windows: AnalysisWindows | None = None,
         source_offsets: dict[str, int] | None = None,
-    ) -> tuple[list[str], list[str]]:
-        """Return ``(numeric_fields, categorical_fields)`` for the drift scan.
+        field_overrides: dict[str, bool] | None = None,
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Return ``(numeric_fields, categorical_fields, notes)`` for the drift scan.
 
         Explicit *fields* are honored verbatim and branch-classified by one
         :meth:`_numeric_ratio_probe` call (the exact syntactic test the range
@@ -4639,7 +4783,7 @@ class StatisticalAnomalyService:
         if fields is not None:
             scan = [t for t in fields if t]
             if not scan:
-                return [], []
+                return [], [], []
             ratios = self._numeric_ratio_probe(
                 case_id,
                 source_ids,
@@ -4652,40 +4796,84 @@ class StatisticalAnomalyService:
             categorical: list[str] = []
             for tok, ratio in zip(scan, ratios, strict=True):
                 (numeric if ratio >= _MIN_NUMERIC_RATIO else categorical).append(tok)
-            return numeric, categorical
+            return numeric, categorical, []
 
         if inventory is None:
             inventory, inventory_total = self.field_inventory(
                 case_id, source_ids, total_events, field_mappings
             )
-        numeric = [
-            f.token
-            for f in self.recommend_numeric_fields(
+        numeric_rec = self.recommend_numeric_fields(
+            case_id,
+            source_ids,
+            total=inventory_total,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            windows=windows,
+            source_offsets=source_offsets,
+        )
+        novelty_rec = self.recommend_novelty_fields(
+            case_id,
+            source_ids,
+            total=inventory_total,
+            field_mappings=field_mappings,
+            inventory=inventory,
+        )
+        numeric = [f.token for f in numeric_rec if f.recommended]
+        numeric_set = set(numeric)
+        categorical = [f.token for f in novelty_rec if f.recommended and f.token not in numeric_set]
+        # The declaration is resolved against the whole candidate universe once,
+        # not per branch: passing a branch's own selection as its `known` would
+        # make every pin "absent" (a pin is by construction a field the branch
+        # did not select), so pins would never apply and the run would report a
+        # field this timeline does have as missing from it.
+        overrides = field_overrides or {}
+        notes: list[str] = []
+        universe = {f.token for f in numeric_rec} | {f.token for f in novelty_rec}
+        pins = [t for t, on in sorted(overrides.items()) if on]
+        absent = [t for t in pins if t not in universe]
+        pins = [t for t in pins if t in universe]
+        if absent:
+            notes.append(
+                f"{len(absent)} field(s) this timeline declares for this method are not "
+                f"present in it and were ignored: {', '.join(sorted(absent))}."
+            )
+        # A pin the recommenders left out belongs to whichever branch its own
+        # numeric probe puts it in — the same classification the explicit-fields
+        # path above uses, so declaring a field costs one probe, not a guess.
+        cat_set = set(categorical)
+        fresh = [t for t in pins if t not in numeric_set and t not in cat_set]
+        num_pins = [t for t in pins if t in numeric_set]
+        cat_pins = [t for t in pins if t in cat_set]
+        if fresh:
+            ratios = self._numeric_ratio_probe(
                 case_id,
                 source_ids,
-                total=inventory_total,
-                field_mappings=field_mappings,
-                inventory=inventory,
+                fresh,
+                field_mappings,
                 windows=windows,
                 source_offsets=source_offsets,
             )
-            if f.recommended
-        ]
-        numeric_set = set(numeric)
-        categorical = [
-            f.token
-            for f in self.recommend_novelty_fields(
-                case_id,
-                source_ids,
-                total=inventory_total,
-                field_mappings=field_mappings,
-                inventory=inventory,
-            )
-            if f.recommended and f.token not in numeric_set
-        ]
+            for tok, ratio in zip(fresh, ratios, strict=True):
+                (num_pins if ratio >= _MIN_NUMERIC_RATIO else cat_pins).append(tok)
+        # Exclusions apply to both branches: a field declared off is off for the
+        # drift scan whichever test would have taken it.
+        off = {t: False for t, on in overrides.items() if not on}
+        numeric, numeric_notes = apply_field_overrides(
+            numeric, {**off, **dict.fromkeys(num_pins, True)}
+        )
+        categorical, cat_notes = apply_field_overrides(
+            categorical, {**off, **dict.fromkeys(cat_pins, True)}
+        )
         numeric = numeric[:_MAX_AUTO_SCAN_FIELDS]
-        categorical = categorical[: _MAX_AUTO_SCAN_FIELDS - len(numeric)]
-        return numeric, categorical
+        # The categorical branch gets whatever budget the numeric one left —
+        # but never less than its own pins. A timeline wide enough to fill the
+        # cap with numeric fields would otherwise slice this to [:0] and drop a
+        # pinned categorical field without a note, leaving a held-back field
+        # indistinguishable from one that found nothing. Everywhere else a pin
+        # survives the cap because it is prepended; here the budget itself has
+        # to make room for it.
+        categorical = categorical[: max(_MAX_AUTO_SCAN_FIELDS - len(numeric), len(cat_pins))]
+        return numeric, categorical, [*notes, *numeric_notes, *cat_notes]
 
     @_gated_scan
     def find_distribution_drift(
@@ -4705,6 +4893,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return fields whose value distribution drifted between baseline and suspects.
 
@@ -4766,7 +4955,7 @@ class StatisticalAnomalyService:
                 windows=windows.payload(),
             )
 
-        numeric_fields, categorical_fields = self._drift_split_fields(
+        numeric_fields, categorical_fields, override_notes = self._drift_split_fields(
             case_id,
             source_ids,
             fields,
@@ -4776,7 +4965,9 @@ class StatisticalAnomalyService:
             inventory_total,
             windows=windows,
             source_offsets=source_offsets,
+            field_overrides=field_overrides,
         )
+        run_warnings += override_notes
 
         # One pooled test list across both branches; each entry carries what
         # Phase 3 needs to build its finding without re-querying.

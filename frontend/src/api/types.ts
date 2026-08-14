@@ -148,6 +148,14 @@ export interface Timeline {
    * plan ignores it and a muted method still runs when asked for by name.
    */
   muted_methods: string[];
+  /**
+   * Per-method field declarations: `{method_id: {field_token: boolean}}`, where
+   * `true` pins a field into that detector's automatic selection and `false`
+   * takes it out. Shared by everyone with access, and advice rather than a
+   * gate — an explicit `fields` still scans an excluded field, and a run that
+   * held one back says so in its warnings.
+   */
+  field_overrides: Record<string, Record<string, boolean>>;
   created_at: string;
   updated_at: string;
 }

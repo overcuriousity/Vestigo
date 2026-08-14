@@ -30,6 +30,7 @@ from vestigo.api.deps import (
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
+from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS
 from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     CharsetFinding,
@@ -1739,6 +1740,42 @@ async def _resolve_analysis_windows(
     return _windows_from_definition(definition)
 
 
+async def _resolve_field_overrides(
+    case_id: str, timeline_id: str, detector: str
+) -> dict[str, bool] | None:
+    """Return this timeline's field declaration for *detector*, or None.
+
+    ``Timeline.field_overrides`` is ``{method_id: {field_token: bool}}`` — the
+    analysts' answer to a recommender that types fields syntactically. Only the
+    named method's slice is returned: a status code that is meaningless to
+    ``numeric_range`` is an excellent ``value_novelty`` field, so a declaration
+    is never global.
+
+    A method that selects no fields of its own gets ``None`` without a lookup
+    (:data:`FIELD_OVERRIDE_METHOD_IDS`). The PATCH endpoint refuses to store
+    those, so this is belt-and-braces — but it is what keeps the cache key and
+    the ``DetectorRun`` record from naming a declaration that steered nothing.
+    """
+    if detector not in FIELD_OVERRIDE_METHOD_IDS:
+        return None
+    timeline = await get_store().get_timeline(case_id, timeline_id)
+    if timeline is None:
+        return None
+    overrides = (timeline.field_overrides or {}).get(detector)
+    return dict(overrides) if overrides else None
+
+
+#: Sentinel for `_run_stat_detector(field_overrides=...)`: `None` is a real
+#: answer ("this timeline declares nothing for this method"), so a caller that
+#: already resolved the declaration — `/analysis/findings` builds it into its
+#: cache key — needs a way to hand it over rather than pay a second lookup.
+_RESOLVE_OVERRIDES: Any = object()
+
+
+async def _already_resolved(value: dict[str, bool] | None) -> dict[str, bool] | None:
+    return value
+
+
 async def _run_stat_detector(
     case_id: str,
     timeline_id: str,
@@ -1761,6 +1798,7 @@ async def _run_stat_detector(
     max_gap_seconds: int | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
+    field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve analysis windows + normal dispositions, then dispatch to the detector.
 
@@ -1791,7 +1829,19 @@ async def _run_stat_detector(
         detector=detector,
     )
     windows_task = _resolve_analysis_windows(store, case_id, timeline_id, baseline_id)
-    normal_rows, windows = await asyncio.gather(normal_task, windows_task)
+    # Resolved here rather than by each caller: every entry point into a
+    # detector — the sweep, an explicit run, tagging, the agent — must see the
+    # same declaration, and this is the one place all four pass through. A
+    # caller that already read it hands it over instead (see
+    # _RESOLVE_OVERRIDES), so a cache miss costs one timeline read, not two.
+    overrides_task = (
+        _resolve_field_overrides(case_id, timeline_id, detector)
+        if field_overrides is _RESOLVE_OVERRIDES
+        else _already_resolved(field_overrides)
+    )
+    normal_rows, windows, field_overrides = await asyncio.gather(
+        normal_task, windows_task, overrides_task
+    )
     allowlist: set[tuple[str, str]] | None = {
         (d.field, d.value) for d in normal_rows if d.field is not None and d.value is not None
     } or None
@@ -1805,6 +1855,23 @@ async def _run_stat_detector(
         "windows_hash": windows.config_hash() if windows is not None else None,
         "dispositions_hash": dispositions_hash(normal_rows),
         "dispositions_count": len(normal_rows),
+        # Recorded for the same reason the windows and thresholds are: it
+        # changes which fields the detector picked for itself, so two runs that
+        # both read "auto" in `DetectorRun.params` can have scanned different
+        # fields. An exclusion reaches `warnings` on its own; an applied pin
+        # leaves no other trace.
+        #
+        # Only where it actually steered the run, though. An explicit `fields`
+        # bypasses the declaration in every detector, so recording it there
+        # would claim a declaration shaped a scan it never touched — the same
+        # "the run does not describe what was scanned" problem this key exists
+        # to fix, pointed the other way. (`_resolve_field_overrides` already
+        # returns None for the methods that select no fields at all.)
+        "field_overrides": (
+            dict(sorted(field_overrides.items()))
+            if field_overrides and _parse_novelty_fields(fields) is None
+            else None
+        ),
     }
 
     if detector == "timestamp_order":
@@ -1921,6 +1988,7 @@ async def _run_stat_detector(
             exclude_event_ids=exclude_ids,
             allowlist=allowlist,
             field_mappings=field_mappings,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -1948,6 +2016,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                field_overrides=field_overrides,
             )
             return result, resolution
         except ValueError as exc:
@@ -1986,6 +2055,7 @@ async def _run_stat_detector(
                 inventory=inventory,
                 inventory_total=inventory_total,
                 group_field=group_field,
+                field_overrides=field_overrides,
             )
         except ValueError as exc:
             # e.g. a non-string group_field, which would otherwise reach
@@ -2008,6 +2078,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2034,6 +2105,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2067,6 +2139,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2093,6 +2166,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2111,6 +2185,7 @@ async def _run_stat_detector(
         field_mappings=field_mappings,
         inventory=inventory,
         inventory_total=inventory_total,
+        field_overrides=field_overrides,
     )
     return result, resolution
 
@@ -2584,6 +2659,12 @@ async def _persist_detector_run(
             "windows_hash": resolution.get("windows_hash"),
             "dispositions_hash": resolution.get("dispositions_hash"),
             "dispositions_count": resolution.get("dispositions_count"),
+            # The timeline's field declaration for this method at run time
+            # (None when it declared nothing). "auto" alone does not describe
+            # what was scanned: an analyst editing the declaration later gives
+            # the same params a different field set, and a pin that applied
+            # leaves no other trace — an exclusion at least reaches `warnings`.
+            "field_overrides": resolution.get("field_overrides"),
             # W2: the per-source clock-skew offsets applied to this run's
             # windows/timestamps (None when none was active), so the run stays
             # reproducible even if a source's offset is later changed.

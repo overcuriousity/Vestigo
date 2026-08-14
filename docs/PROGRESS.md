@@ -1,6 +1,152 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-13 (session 170 — the disposition list gets a home again, 1.12.1).
+Last updated: 2026-08-14 (session 174 — second review of PR #264, released as 1.12.2).
+
+## Session 174 — 2026-08-14: a declaration that steers nothing must not claim to
+
+A second review pass over the same branch. Nothing here breaks a scan; every finding is a
+place where the declaration *described* itself wrongly, which for shared, audited state is
+the same class of bug.
+
+`DetectorRun.params["field_overrides"]` was recorded unconditionally — including for a run
+that named its fields explicitly (which bypasses the declaration in every detector) and for
+methods that never receive it. That is the "auto does not describe what was scanned" problem
+the key was added to fix, pointed the other way: the diary claiming a decision steered a scan
+it never touched. It is now recorded only where it applied.
+
+The PATCH endpoint validated method ids against all twelve, but four select no fields to
+steer: `frequency` and `sequence_novelty` take one named `series_field`, `timestamp_order`
+reads none, `log_template` clusters message text. A declaration against those was accepted,
+audited, and rendered under "Declared fields" while the detector scanned exactly as before.
+`FIELD_OVERRIDE_METHOD_IDS` (`db/analysis_plan.py`) is now the one list, shared by the
+endpoint's 422 and by `_resolve_field_overrides`, which also keeps it out of the cache key.
+
+Two disclosure bugs. `_drift_split_fields` cut its categorical branch by whatever the numeric
+branch consumed, so a timeline with fifteen recommended numeric fields sliced the categorical
+list to `[:0]` and dropped a pinned field with no note — a held-back field indistinguishable
+from one that found nothing, which is the one thing this must never look like. And
+`_auto_string_fields` derived its "held back" count from the whole candidate universe rather
+than from what its quota would have scanned, so excluding a field ranked 22nd of 40 reported
+a narrowing of a scan that was byte-identical to the undeclared one.
+
+Frontend: the picker's identifier branch (charset/entropy) never re-applied the 15-field cap
+after prepending pins, so it previewed 17 checked chips for a run that scans 15. The write
+chain's serialization was per-hook-instance while two instances are mounted at once — the
+method sheet's picker and the Tools summary — so declaring in one and resetting in the other
+before the PATCH landed rebuilt the payload from the stale cache and dropped the in-flight
+declaration from the timeline and the audit pair alike; it is now keyed by timeline at module
+scope. A failed write is surfaced rather than swallowed: the chip returns to the server's
+answer either way, which on its own reads as "nothing happened" rather than "not saved".
+
+Released as 1.12.2.
+
+
+## Session 173 — 2026-08-14: review of PR #264, the two halves that did nothing
+
+A review of session 172's branch found the pin half broken in two places, both of which made a
+control look present and do nothing — and one of which produced a false forensic claim.
+
+`apply_field_overrides` built its pin list as "declared `true` and *not already selected*", so
+only pins on fields the recommender had left out were promoted. A pin on a field it ranked 18th
+kept rank 18 and was cut by the caller's `[:15]`; for `value_combo`, whose cap is 2, any pin
+below third was cut — the exact case the code's own comment said it existed for. Nothing was
+disclosed, so the field was neither scanned nor mentioned. Pins are now every `true`
+declaration, promoted out of the kept list rather than skipped, and the per-detector cap is
+re-applied afterwards (`charset`/`entropy` never re-cut, so a stored declaration could double
+a heavy scan under one `HEAVY_SCAN_GATE` slot).
+
+`_drift_split_fields` passed each branch's own selection as its `known` universe. A pin is by
+construction a field the branch did not select, so every pin fell into the "not present in this
+timeline" branch: pins never applied, and the numeric branch announced a categorical field as
+absent while the categorical branch scanned it — a run that scans a field and disclaims it in
+the same breath. The declaration is now resolved once against both recommenders' candidates,
+and a pin neither of them selected is classified by the same syntactic numeric probe the
+explicit-`fields` path uses, so it lands in the branch that probe indicates.
+
+Two smaller things: `DetectorRun.params` now records the method's slice as it stood at run
+time — `fields: auto` does not describe what was scanned once a declaration is edited, and an
+applied pin leaves no trace in `warnings` the way an exclusion does — and `/analysis/findings`
+hands the declaration it already read for the cache key to `_run_stat_detector` instead of
+letting it re-read the timeline (24 redundant round-trips per 12-method sweep).
+
+Frontend: `useFieldOverrides.declare` closed over the query-cache snapshot, which only refreshes
+on the mutation's `onSuccess`, so two chip clicks in quick succession both built on the
+pre-mutation state and the second PATCH — a full replace — dropped the first, including from
+the audit row's `previous`/`new` pair. Edits now build on what is in flight and the requests are
+chained so they cannot land out of order.
+
+
+## Session 172 — 2026-08-14: per-timeline, per-method field overrides
+
+Session 171 gave the field knobs back their pickers, which made the correction possible but
+not durable: the picker's selection is per-run React state, so an analyst who takes a field
+away from a detector takes it away again on the next sweep, and the next analyst never learns
+they did.
+
+The miss it leaves is semantic, not statistical. `recommend_numeric_fields` types fields
+syntactically and says so in its own docstring: an HTTP status code parses as a number, so
+`numeric_range` offers it, learns a band over `{200, 404, 500}` and reports the 500s as
+outliers forever. No probe discovers that it is a categorical field wearing digits — only the
+analyst does.
+
+`Timeline.field_overrides` (migration `0029`, nullable) is where they say it:
+`{method_id: {field_token: bool}}` — `true` pins a field into a method's automatic selection,
+`false` takes it out, absent leaves the recommender's answer standing. Per method rather than
+per field, because the same status code is meaningless to `numeric_range` and an excellent
+`value_novelty` field. Written through `PATCH .../timelines/{id}/field-overrides` (contribute
+access, unknown method ids and empty tokens 422, every change audited), shared per timeline on
+`muted_methods`' contract rather than held per browser.
+
+One helper does the work: `apply_field_overrides` sits between a recommender's answer and the
+scan list of all eight detectors that pick their own fields, and returns what it held back for
+the run's `warnings`. That keeps the shape "advice, never a lock" on every axis — an explicit
+`fields=[…]` never reaches the helper and still scans an excluded field, the analysis plan
+does not consult it, a pin naming a field the timeline lacks is dropped rather than scanned as
+an always-empty column, and a held-back field is disclosed rather than silently narrowing a
+scan into something that reads as "clean". Pins are applied before each detector's
+`_MAX_AUTO_SCAN_FIELDS` slice, since being ranked below the cut is why a field gets pinned.
+
+The findings cache key gains the method's slice: an answer computed before a field was
+declared off is an answer to a different question.
+
+In the UI the control is a small pin/exclude button beside each chip in `AnomalyFieldPicker`,
+deliberately separate from the checkbox — scoping this run and deciding what the method reads
+are different questions — and the picker's auto preview applies the declaration exactly as the
+backend does, so the checked set keeps previewing what actually runs. The Tools sheet's Methods
+tab summarizes what a timeline declares and resets it per method.
+
+Not done: the agent has no tool for this. Every agent write today is a proposal an analyst
+confirms, and a direct-write tool would be a new precedent that needs its own argument rather
+than a side effect of this change.
+
+## Session 171 — 2026-08-13: field knobs are choices again, not typing
+
+Reported as a regression in the Investigate panels: the `fields` knob asks the analyst to
+type field names. It does — and the same refactor took the single-field knobs with it.
+
+`cadaa5c` replaced eleven per-detector views with one generic knob renderer that types every
+knob as `<input type="text">`. Eight of those views mounted `AnomalyFieldPicker` (cardinality-
+ranked candidates, Standard vs Dynamic grouping, coverage and distinct counts per chip,
+`value_combo`'s 2–4 floor and ceiling); four more offered `series_field`, `group_field` and the
+log-template `field` as `<select>`s built from the same `/anomalies/fields` inventory. A field
+name is not free text — it is a fixed set of columns plus whatever `attr:` keys the timeline
+happens to carry, and nobody can spell those from memory for a source they ingested an hour
+ago. The knobs were reachable but unusable, which is the worse failure: the sheet's method mode
+is what keeps the analysis gate advice rather than a lock, and that argument only holds if
+running a method with your own parameters is actually possible.
+
+Both controls are back. `kind: "fields"` renders the picker, configured per method from the
+registry with the values the deleted views used (auto counts, `value_combo`'s 2–4, charset and
+entropy's identifier-inclusive auto set, numeric-range's numeric candidate list) — so the
+checked set previews what the backend will really scan. New `kind: "field"` renders
+`MethodFieldSelect`, the single-field counterpart, which merges each knob's standard options
+with this timeline's attribute keys. A picked selection travels as a list, which
+`_FieldsParams._join_fields` already accepted alongside the comma-joined string; an untouched
+picker still sends nothing, so "auto" stays the method's own default rather than an empty
+string dressed up as one.
+
+`MethodFieldSelect` renders only the `<select>` and inherits the labelled chrome from the
+caller, so the fix adds no new arbitrary font size to the design-system budget.
 
 ## Session 170 — 2026-08-13: the undo path 1.12.0 dropped
 

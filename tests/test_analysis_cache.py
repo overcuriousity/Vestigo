@@ -39,6 +39,7 @@ BASE = {
     "baseline_config_hash": "cfg-1",
     "field_mappings": {"user": ["usr", "username"]},
     "source_offsets": {"src-1": 0},
+    "field_overrides": {"attr:status_code": False},
     "detector_settings": {"stat_z_threshold": 2.5},
     "method": "frequency",
     "params": {"z_threshold": 3.0, "bucket_count": 12},
@@ -75,6 +76,9 @@ def test_params_key_order_does_not_change_the_key():
         # field changes what was scanned, an offset shifts every timestamp.
         ("field_mappings", {"user": ["usr"]}),
         ("source_offsets", {"src-1": 3600}),
+        # The method's field declaration decides what a detector scans when it
+        # picks its own fields, so a pre-declaration answer is a different one.
+        ("field_overrides", {"attr:status_code": True}),
         # The runtime-editable thresholds a runner falls back to when a knob is
         # omitted. An admin lowering one in the console changes every answer.
         ("detector_settings", {"stat_z_threshold": 2.0}),
