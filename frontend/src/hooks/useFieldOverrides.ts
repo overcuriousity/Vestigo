@@ -22,7 +22,7 @@
  * strip and ExplorerPage already hold, so it costs no extra request and every
  * reader shares one cache.
  */
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { timelinesApi } from "@/api/timelines";
 import { casesApi } from "@/api/cases";
@@ -91,20 +91,39 @@ export function useFieldOverrides(caseId: string, timelineId: string): FieldOver
 
   const canEdit = case_ ? canContributeToCase(case_) : false;
 
+  // The chip row invites rapid multi-declare — ban one field, then the next.
+  // `overrides` only catches up on the mutation's onSuccess, so both edits
+  // would otherwise build on the same pre-mutation snapshot and the second
+  // PATCH, a full replace, would drop the first from the timeline *and* from
+  // the audit row's previous/new pair. Each edit builds on what is in flight,
+  // and the requests are chained so they cannot land out of order.
+  const pendingRef = useRef<FieldOverrides | null>(null);
+  const chainRef = useRef<Promise<unknown>>(Promise.resolve());
+
   const write = useCallback(
     (next: FieldOverrides) => {
       if (!canEdit) return;
-      mutation.mutate(next);
+      pendingRef.current = next;
+      chainRef.current = chainRef.current
+        .catch(() => {})
+        .then(() => mutation.mutateAsync(next))
+        .catch(() => {})
+        .finally(() => {
+          // Only the last write in flight hands control back to server state;
+          // an earlier one settling must not strand a newer edit's base.
+          if (pendingRef.current === next) pendingRef.current = null;
+        });
     },
     [canEdit, mutation],
   );
 
   const declare = useCallback(
     (id: MethodId, token: string, state: FieldDeclaration) => {
-      const forMethod = { ...(overrides[id] ?? {}) };
+      const base = pendingRef.current ?? overrides;
+      const forMethod = { ...(base[id] ?? {}) };
       if (state === null) delete forMethod[token];
       else forMethod[token] = state;
-      const next = { ...overrides };
+      const next = { ...base };
       // A method with nothing left declared is dropped rather than sent as an
       // empty object, so "undeclared" has one representation in the audit trail.
       if (Object.keys(forMethod).length === 0) delete next[id];
@@ -116,8 +135,9 @@ export function useFieldOverrides(caseId: string, timelineId: string): FieldOver
 
   const clearMethod = useCallback(
     (id: MethodId) => {
-      if (!(id in overrides)) return;
-      const next = { ...overrides };
+      const base = pendingRef.current ?? overrides;
+      if (!(id in base)) return;
+      const next = { ...base };
       delete next[id];
       write(next);
     },

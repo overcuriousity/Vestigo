@@ -310,7 +310,23 @@ The same "advice, never a lock" contract as the gate and the mute:
   exists to prevent. A pin naming a field the timeline does not have is dropped
   and disclosed the same way, rather than scanned as an always-empty column.
 - **Pins go first.** They are applied before each detector's `_MAX_AUTO_SCAN_FIELDS`
-  slice, since being ranked below the cut is precisely why a field gets pinned.
+  slice, since being ranked below the cut is precisely why a field gets pinned —
+  including a field the recommender *did* rank: a pin moves it ahead of the cut
+  rather than leaving it at its rank, or pinning the field an analyst is most
+  likely to pin would do nothing. The slice is re-applied afterwards, so a
+  declaration can reorder a scan but never enlarge it past its own cap.
+- **`value_distribution_drift` classifies a pin before placing it.** Its two
+  branches (KS over numeric fields, G-test over categorical ones) share one
+  declaration, so a pinned field neither recommender selected is put through the
+  same syntactic numeric probe the explicit-`fields` path uses and lands in the
+  branch that probe indicates. The "not present in this timeline" disclosure is
+  resolved once against both recommenders' candidates, so the run can never
+  scan a field in one branch and report it missing from the other.
+- **The declaration is part of a run's diary.** `DetectorRun.params` records the
+  method's slice as it stood at run time, next to the windows and the effective
+  thresholds: two runs whose `fields` both read `auto` can have scanned
+  different sets once the declaration is edited, and an applied pin — unlike an
+  exclusion, which reaches `warnings` — leaves no other trace.
 
 Detectors that select their own fields all route through it: `value_novelty`,
 `value_combo`, `numeric_range`, `charset`, `entropy`, `proportion_shift`,

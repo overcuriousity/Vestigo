@@ -1542,9 +1542,17 @@ def apply_field_overrides(
     notes: list[str] = []
     kept = [t for t in selected if overrides.get(t) is not False]
     held = [t for t in selected if overrides.get(t) is False]
-    pins = [t for t, on in sorted(overrides.items()) if on and t not in kept]
+    # Every pin, including one the recommender already picked: being ranked
+    # below the cut is exactly why an analyst pins a field it *did* pick, so a
+    # pin the recommender ranked 18th has to move ahead of the [:15] slice, not
+    # keep its rank. Promoted ones leave `kept` below rather than appearing
+    # twice.
+    pins = [t for t, on in sorted(overrides.items()) if on]
     if known is not None:
-        universe = set(known)
+        # A field the caller already selected is present by construction,
+        # whatever the recommender universe says — claiming otherwise would be
+        # a run that scans a field and reports it missing in the same breath.
+        universe = set(known) | set(selected)
         absent = [t for t in pins if t not in universe]
         pins = [t for t in pins if t in universe]
         if absent:
@@ -1557,7 +1565,8 @@ def apply_field_overrides(
             f"{len(held)} field(s) held back by this timeline's field overrides: "
             f"{', '.join(sorted(held))}. Naming a field explicitly still scans it."
         )
-    return pins + kept, notes
+    pinned = set(pins)
+    return pins + [t for t in kept if t not in pinned], notes
 
 
 # ---------------------------------------------------------------------------
@@ -3055,6 +3064,11 @@ class StatisticalAnomalyService:
         picked, pin_notes = apply_field_overrides(
             _select_auto_scan_tokens(cats, ids), field_overrides, [f.token for f in rec]
         )
+        # Re-cut after the pins are prepended, like every other detector does:
+        # the quota bounds this scan at _MAX_AUTO_SCAN_FIELDS heavy per-field
+        # queries under one HEAVY_SCAN_GATE slot, and a stored declaration must
+        # not be able to double that.
+        picked = picked[:_MAX_AUTO_SCAN_FIELDS]
         return picked, notes + pin_notes
 
     @_gated_scan
@@ -4783,39 +4797,71 @@ class StatisticalAnomalyService:
             inventory, inventory_total = self.field_inventory(
                 case_id, source_ids, total_events, field_mappings
             )
-        numeric = [
-            f.token
-            for f in self.recommend_numeric_fields(
+        numeric_rec = self.recommend_numeric_fields(
+            case_id,
+            source_ids,
+            total=inventory_total,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            windows=windows,
+            source_offsets=source_offsets,
+        )
+        novelty_rec = self.recommend_novelty_fields(
+            case_id,
+            source_ids,
+            total=inventory_total,
+            field_mappings=field_mappings,
+            inventory=inventory,
+        )
+        numeric = [f.token for f in numeric_rec if f.recommended]
+        numeric_set = set(numeric)
+        categorical = [f.token for f in novelty_rec if f.recommended and f.token not in numeric_set]
+        # The declaration is resolved against the whole candidate universe once,
+        # not per branch: passing a branch's own selection as its `known` would
+        # make every pin "absent" (a pin is by construction a field the branch
+        # did not select), so pins would never apply and the run would report a
+        # field this timeline does have as missing from it.
+        overrides = field_overrides or {}
+        notes: list[str] = []
+        universe = {f.token for f in numeric_rec} | {f.token for f in novelty_rec}
+        pins = [t for t, on in sorted(overrides.items()) if on]
+        absent = [t for t in pins if t not in universe]
+        pins = [t for t in pins if t in universe]
+        if absent:
+            notes.append(
+                f"{len(absent)} field(s) this timeline declares for this method are not "
+                f"present in it and were ignored: {', '.join(sorted(absent))}."
+            )
+        # A pin the recommenders left out belongs to whichever branch its own
+        # numeric probe puts it in — the same classification the explicit-fields
+        # path above uses, so declaring a field costs one probe, not a guess.
+        cat_set = set(categorical)
+        fresh = [t for t in pins if t not in numeric_set and t not in cat_set]
+        num_pins = [t for t in pins if t in numeric_set]
+        cat_pins = [t for t in pins if t in cat_set]
+        if fresh:
+            ratios = self._numeric_ratio_probe(
                 case_id,
                 source_ids,
-                total=inventory_total,
-                field_mappings=field_mappings,
-                inventory=inventory,
+                fresh,
+                field_mappings,
                 windows=windows,
                 source_offsets=source_offsets,
             )
-            if f.recommended
-        ]
-        numeric_set = set(numeric)
-        categorical = [
-            f.token
-            for f in self.recommend_novelty_fields(
-                case_id,
-                source_ids,
-                total=inventory_total,
-                field_mappings=field_mappings,
-                inventory=inventory,
-            )
-            if f.recommended and f.token not in numeric_set
-        ]
-        # Each branch is overridden against the same declaration: a field
-        # declared off is off for the drift scan whichever test would have taken
-        # it, and a pin lands in the branch its own numeric probe put it in.
-        numeric, numeric_notes = apply_field_overrides(numeric, field_overrides, numeric)
-        categorical, cat_notes = apply_field_overrides(categorical, field_overrides, categorical)
+            for tok, ratio in zip(fresh, ratios, strict=True):
+                (num_pins if ratio >= _MIN_NUMERIC_RATIO else cat_pins).append(tok)
+        # Exclusions apply to both branches: a field declared off is off for the
+        # drift scan whichever test would have taken it.
+        off = {t: False for t, on in overrides.items() if not on}
+        numeric, numeric_notes = apply_field_overrides(
+            numeric, {**off, **dict.fromkeys(num_pins, True)}
+        )
+        categorical, cat_notes = apply_field_overrides(
+            categorical, {**off, **dict.fromkeys(cat_pins, True)}
+        )
         numeric = numeric[:_MAX_AUTO_SCAN_FIELDS]
         categorical = categorical[: _MAX_AUTO_SCAN_FIELDS - len(numeric)]
-        return numeric, categorical, [*numeric_notes, *cat_notes]
+        return numeric, categorical, [*notes, *numeric_notes, *cat_notes]
 
     @_gated_scan
     def find_distribution_drift(

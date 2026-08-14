@@ -1,6 +1,41 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-14 (session 172 — which fields a method reads becomes a decision).
+Last updated: 2026-08-14 (session 173 — the field declaration actually reaches the scan).
+
+## Session 173 — 2026-08-14: review of PR #264, the two halves that did nothing
+
+A review of session 172's branch found the pin half broken in two places, both of which made a
+control look present and do nothing — and one of which produced a false forensic claim.
+
+`apply_field_overrides` built its pin list as "declared `true` and *not already selected*", so
+only pins on fields the recommender had left out were promoted. A pin on a field it ranked 18th
+kept rank 18 and was cut by the caller's `[:15]`; for `value_combo`, whose cap is 2, any pin
+below third was cut — the exact case the code's own comment said it existed for. Nothing was
+disclosed, so the field was neither scanned nor mentioned. Pins are now every `true`
+declaration, promoted out of the kept list rather than skipped, and the per-detector cap is
+re-applied afterwards (`charset`/`entropy` never re-cut, so a stored declaration could double
+a heavy scan under one `HEAVY_SCAN_GATE` slot).
+
+`_drift_split_fields` passed each branch's own selection as its `known` universe. A pin is by
+construction a field the branch did not select, so every pin fell into the "not present in this
+timeline" branch: pins never applied, and the numeric branch announced a categorical field as
+absent while the categorical branch scanned it — a run that scans a field and disclaims it in
+the same breath. The declaration is now resolved once against both recommenders' candidates,
+and a pin neither of them selected is classified by the same syntactic numeric probe the
+explicit-`fields` path uses, so it lands in the branch that probe indicates.
+
+Two smaller things: `DetectorRun.params` now records the method's slice as it stood at run
+time — `fields: auto` does not describe what was scanned once a declaration is edited, and an
+applied pin leaves no trace in `warnings` the way an exclusion does — and `/analysis/findings`
+hands the declaration it already read for the cache key to `_run_stat_detector` instead of
+letting it re-read the timeline (24 redundant round-trips per 12-method sweep).
+
+Frontend: `useFieldOverrides.declare` closed over the query-cache snapshot, which only refreshes
+on the mutation's `onSuccess`, so two chip clicks in quick succession both built on the
+pre-mutation state and the second PATCH — a full replace — dropped the first, including from
+the audit row's `previous`/`new` pair. Edits now build on what is in flight and the requests are
+chained so they cannot land out of order.
+
 
 ## Session 172 — 2026-08-14: per-timeline, per-method field overrides
 

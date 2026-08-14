@@ -47,9 +47,19 @@ def test_pinned_field_goes_first_so_the_cap_cannot_cut_it():
     assert fields == ["z", "a", "b"]
 
 
-def test_a_pin_already_in_the_selection_is_not_duplicated():
-    fields, _ = apply_field_overrides(["a", "b"], {"a": True}, known=["a", "b"])
-    assert fields == ["a", "b"]
+def test_a_pin_already_in_the_selection_is_promoted_not_duplicated():
+    # The recommender ranked it, but below the cut the caller is about to make.
+    # A pin that kept its rank would be a control that does nothing for exactly
+    # the field an analyst is most likely to pin — one the recommender knows
+    # about and undervalues.
+    fields, _ = apply_field_overrides(["a", "b", "c"], {"c": True}, known=["a", "b", "c"])
+    assert fields == ["c", "a", "b"]
+
+
+def test_a_pin_survives_the_callers_cap():
+    # What every caller does next: [:cap]. The pin has to be inside it.
+    fields, _ = apply_field_overrides(["a", "b", "c"], {"c": True}, known=["a", "b", "c"])
+    assert "c" in fields[:2]
 
 
 def test_pin_naming_a_field_this_timeline_lacks_is_dropped_and_disclosed():
@@ -62,9 +72,18 @@ def test_pin_naming_a_field_this_timeline_lacks_is_dropped_and_disclosed():
 
 
 def test_declaration_of_an_unrecommended_field_needs_no_known_universe():
-    # Callers whose candidate list *is* the universe (the drift branches) pass
-    # it as both, and nothing is dropped.
-    fields, notes = apply_field_overrides(["a"], {"a": True}, known=None)
+    # Callers that vetted the pins themselves (the drift branches, which have to
+    # place each pin in the numeric or the categorical test) pass no universe.
+    fields, notes = apply_field_overrides(["a"], {"z": True}, known=None)
+    assert fields == ["z", "a"]
+    assert notes == []
+
+
+def test_a_selected_field_is_never_reported_absent():
+    # `known` is the recommender's universe, which a caller may narrow before
+    # passing its selection. Claiming a field is "not present in this timeline"
+    # while scanning it in the same run is a false forensic disclosure.
+    fields, notes = apply_field_overrides(["a"], {"a": True}, known=["b"])
     assert fields == ["a"]
     assert notes == []
 
@@ -241,3 +260,130 @@ def test_the_string_detectors_disclose_a_held_back_field(monkeypatch):
     )
     assert picked == ["attr:host"]
     assert any("attr:msg" in n for n in notes)
+
+
+def test_pins_cannot_inflate_the_string_scan_past_its_cap(monkeypatch):
+    """Each field here is a heavy per-field query under one HEAVY_SCAN_GATE slot.
+
+    The quota bounds the auto scan; prepending pins on top of an already-full
+    selection without re-cutting would let a stored declaration double it.
+    """
+    from vestigo.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS
+
+    svc = _svc([])
+
+    class _Rec:
+        def __init__(self, token: str, kind: str) -> None:
+            self.token = token
+            self.kind = kind
+            self.recommended = kind == "categorical"
+
+    tokens = [f"attr:f{i}" for i in range(40)]
+    monkeypatch.setattr(
+        type(svc),
+        "recommend_novelty_fields",
+        lambda self, *a, **k: [_Rec(t, "categorical") for t in tokens],
+    )
+    picked, _ = svc._auto_string_fields(
+        "c1", ["s1"], 1000, None, None, None, dict.fromkeys(tokens[20:], True)
+    )
+    assert len(picked) == _MAX_AUTO_SCAN_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# The drift split — one declaration, two branches
+# ---------------------------------------------------------------------------
+
+
+def _drift_svc(
+    monkeypatch,
+    numeric: list[str],
+    categorical: list[str],
+    ratios: dict[str, float],
+    unrecommended: tuple[str, ...] = (),
+):
+    """A drift split whose recommenders offer *numeric* / *categorical*.
+
+    Tokens in *unrecommended* are candidates the recommenders saw and declined —
+    exactly what a pin exists to overrule — and *ratios* stands in for the
+    numeric probe that decides which branch such a pin lands in.
+    """
+    svc = _svc([])
+
+    class _Rec:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.recommended = token not in unrecommended
+
+    monkeypatch.setattr(
+        type(svc), "recommend_numeric_fields", lambda self, *a, **k: [_Rec(t) for t in numeric]
+    )
+    monkeypatch.setattr(
+        type(svc),
+        "recommend_novelty_fields",
+        lambda self, *a, **k: [_Rec(t) for t in categorical],
+    )
+    monkeypatch.setattr(
+        type(svc),
+        "_numeric_ratio_probe",
+        lambda self, cid, sids, toks, *a, **k: [ratios.get(t, 0.0) for t in toks],
+    )
+    return svc
+
+
+def test_a_drift_pin_lands_in_the_branch_its_probe_puts_it_in(monkeypatch):
+    """A pin here has to be classified, not assumed into whichever branch asked.
+
+    The two branches share one declaration, and the fields a pin names are by
+    construction fields neither recommender selected — so the same syntactic
+    numeric probe the explicit-fields path uses decides which test takes it.
+    """
+    svc = _drift_svc(
+        monkeypatch,
+        numeric=["attr:bytes"],
+        categorical=["attr:host", "attr:latency", "attr:agent"],
+        ratios={"attr:latency": 1.0, "attr:agent": 0.0},
+        unrecommended=("attr:latency", "attr:agent"),
+    )
+    num, cat, notes = svc._drift_split_fields(
+        "c1",
+        ["s1"],
+        None,
+        1000,
+        None,
+        [],
+        1000,
+        field_overrides={"attr:latency": True, "attr:agent": True},
+    )
+    assert "attr:latency" in num
+    assert "attr:agent" in cat
+    # Neither is a field this timeline lacks, so nothing may claim they are.
+    assert notes == []
+
+
+def test_drift_never_reports_a_present_field_as_absent(monkeypatch):
+    """The failure this guards: a run that scans a field and disclaims it.
+
+    Resolving the declaration against a single branch's own selection makes
+    every pin "absent" from that branch — so the numeric branch would announce
+    a categorical field as missing from the timeline while the categorical
+    branch happily scanned it.
+    """
+    svc = _drift_svc(
+        monkeypatch,
+        numeric=["attr:bytes"],
+        categorical=["attr:host", "attr:agent"],
+        ratios={"attr:agent": 0.0},
+        unrecommended=("attr:agent",),
+    )
+    num, cat, notes = svc._drift_split_fields(
+        "c1", ["s1"], None, 1000, None, [], 1000, field_overrides={"attr:agent": True}
+    )
+    assert "attr:agent" in cat
+    assert not any("not present" in n for n in notes)
+    # A field neither recommender knows *is* absent, and that is still said.
+    _, _, ghost_notes = svc._drift_split_fields(
+        "c1", ["s1"], None, 1000, None, [], 1000, field_overrides={"attr:ghost": True}
+    )
+    assert any("attr:ghost" in n for n in ghost_notes)
+    assert "attr:bytes" in num

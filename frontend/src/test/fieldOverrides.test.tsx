@@ -41,7 +41,11 @@ vi.mock("@/api/anomalies", () => ({
 const timeline = vi.hoisted(() => ({
   overrides: {} as Record<string, Record<string, boolean>>,
 }));
-const patched = vi.hoisted(() => ({ calls: [] as Record<string, Record<string, boolean>>[] }));
+const patched = vi.hoisted(() => ({
+  calls: [] as Record<string, Record<string, boolean>>[],
+  /** Held open by the race test to keep a PATCH in flight across a second click. */
+  gate: null as Promise<void> | null,
+}));
 
 vi.mock("@/api/timelines", () => ({
   timelinesApi: {
@@ -51,6 +55,7 @@ vi.mock("@/api/timelines", () => ({
       _t: string,
       next: Record<string, Record<string, boolean>>,
     ) => {
+      if (patched.gate) await patched.gate;
       patched.calls.push(next);
       timeline.overrides = next;
       return { id: "t1", case_id: "c1", field_overrides: next };
@@ -96,6 +101,27 @@ describe("declaring a field for a method", () => {
   beforeEach(() => {
     timeline.overrides = {};
     patched.calls = [];
+    patched.gate = null;
+  });
+
+  it("keeps a declaration made while the previous one is still in flight", async () => {
+    // The chip row invites exactly this: ban one field, then the next. The
+    // PATCH is a full replace, so a second edit built on the pre-mutation
+    // snapshot would drop the first from the timeline *and* from the audit
+    // row's previous/new pair.
+    let release: () => void = () => {};
+    patched.gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    renderMethod();
+    fireEvent.click(await openPicker());
+    fireEvent.click(screen.getByTestId("declare-attr:src_ip"));
+    release();
+
+    await waitFor(() => expect(patched.calls).toHaveLength(2));
+    expect(patched.calls[1]).toEqual({
+      value_novelty: { "attr:status_code": false, "attr:src_ip": false },
+    });
   });
 
   it("declares a field off for everyone, not just this run", async () => {

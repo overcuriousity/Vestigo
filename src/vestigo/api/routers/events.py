@@ -1757,6 +1757,17 @@ async def _resolve_field_overrides(
     return dict(overrides) if overrides else None
 
 
+#: Sentinel for `_run_stat_detector(field_overrides=...)`: `None` is a real
+#: answer ("this timeline declares nothing for this method"), so a caller that
+#: already resolved the declaration — `/analysis/findings` builds it into its
+#: cache key — needs a way to hand it over rather than pay a second lookup.
+_RESOLVE_OVERRIDES: Any = object()
+
+
+async def _already_resolved(value: dict[str, bool] | None) -> dict[str, bool] | None:
+    return value
+
+
 async def _run_stat_detector(
     case_id: str,
     timeline_id: str,
@@ -1779,6 +1790,7 @@ async def _run_stat_detector(
     max_gap_seconds: int | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
+    field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve analysis windows + normal dispositions, then dispatch to the detector.
 
@@ -1811,8 +1823,14 @@ async def _run_stat_detector(
     windows_task = _resolve_analysis_windows(store, case_id, timeline_id, baseline_id)
     # Resolved here rather than by each caller: every entry point into a
     # detector — the sweep, an explicit run, tagging, the agent — must see the
-    # same declaration, and this is the one place all four pass through.
-    overrides_task = _resolve_field_overrides(case_id, timeline_id, detector)
+    # same declaration, and this is the one place all four pass through. A
+    # caller that already read it hands it over instead (see
+    # _RESOLVE_OVERRIDES), so a cache miss costs one timeline read, not two.
+    overrides_task = (
+        _resolve_field_overrides(case_id, timeline_id, detector)
+        if field_overrides is _RESOLVE_OVERRIDES
+        else _already_resolved(field_overrides)
+    )
     normal_rows, windows, field_overrides = await asyncio.gather(
         normal_task, windows_task, overrides_task
     )
@@ -1829,6 +1847,12 @@ async def _run_stat_detector(
         "windows_hash": windows.config_hash() if windows is not None else None,
         "dispositions_hash": dispositions_hash(normal_rows),
         "dispositions_count": len(normal_rows),
+        # Recorded for the same reason the windows and thresholds are: it
+        # changes which fields the detector picked for itself, so two runs that
+        # both read "auto" in `DetectorRun.params` can have scanned different
+        # fields. An exclusion reaches `warnings` on its own; an applied pin
+        # leaves no other trace.
+        "field_overrides": dict(sorted(field_overrides.items())) if field_overrides else None,
     }
 
     if detector == "timestamp_order":
@@ -2616,6 +2640,12 @@ async def _persist_detector_run(
             "windows_hash": resolution.get("windows_hash"),
             "dispositions_hash": resolution.get("dispositions_hash"),
             "dispositions_count": resolution.get("dispositions_count"),
+            # The timeline's field declaration for this method at run time
+            # (None when it declared nothing). "auto" alone does not describe
+            # what was scanned: an analyst editing the declaration later gives
+            # the same params a different field set, and a pin that applied
+            # leaves no other trace — an exclusion at least reaches `warnings`.
+            "field_overrides": resolution.get("field_overrides"),
             # W2: the per-source clock-skew offsets applied to this run's
             # windows/timestamps (None when none was active), so the run stays
             # reproducible even if a source's offset is later changed.

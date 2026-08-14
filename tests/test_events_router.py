@@ -1892,6 +1892,42 @@ async def test_list_anomalies_persists_run_by_default(
 
 
 @pytest.mark.asyncio
+async def test_persisted_run_records_the_field_declaration(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A run whose params read "auto" does not say which fields were scanned.
+
+    The declaration steers a detector's automatic field selection, so two runs
+    whose params both read "auto" can have scanned different fields once an
+    analyst edits it. An exclusion reaches `warnings`; an applied pin leaves no
+    other trace at all — which makes the run's own diary the only place it can
+    be recorded.
+    """
+    declared = {"attr:status_code": False, "attr:user": True}
+    await timeline_setup.update_timeline_field_overrides("c1", "t1", {"value_novelty": declared})
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies()
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] == declared
+
+
+@pytest.mark.asyncio
+async def test_persisted_run_records_no_declaration_as_none(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies()
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] is None
+
+
+@pytest.mark.asyncio
 async def test_list_anomalies_persist_false_does_not_write_a_run(
     timeline_setup, monkeypatch, stub_field_stats_cache
 ):
