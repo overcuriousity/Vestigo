@@ -99,6 +99,12 @@ class TimelineMutedMethodsUpdate(BaseModel):
     muted_methods: list[str] | None = Field(default=None)
 
 
+class TimelineFieldOverridesUpdate(BaseModel):
+    """Payload to replace a timeline's per-method field overrides (None/{} clears them)."""
+
+    field_overrides: dict[str, dict[str, bool]] | None = Field(default=None)
+
+
 class ViewCreate(BaseModel):
     """Payload to create a saved view."""
 
@@ -1305,6 +1311,63 @@ async def update_timeline_muted_methods(
         target_type="timeline",
         target_id=timeline_id,
         detail={"previous": previous, "new": updated.muted_methods or []},
+    )
+    return {"timeline": updated.to_dict()}
+
+
+@router.patch("/{case_id}/timelines/{timeline_id}/field-overrides")
+async def update_timeline_field_overrides(
+    timeline_id: str,
+    payload: TimelineFieldOverridesUpdate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Replace the per-method field declarations for this timeline.
+
+    ``{method_id: {field_token: bool}}`` — True pins a field into that
+    detector's automatic selection, False takes it out, absent leaves the
+    recommender's own answer standing. It exists because the recommenders type
+    fields *syntactically*: an HTTP status code parses as a number, so the range
+    detector offers it and then reports every 500 as an outlier forever. Which
+    detector reads which field is the analyst's call; the recommenders suggest.
+
+    Like a mute, this is advice and not a gate. It steers only the automatic
+    selection — ``/analysis/findings`` with an explicit ``fields`` still scans
+    an excluded field, the analysis plan does not consult it, and a run that
+    held a field back says so in its warnings. So every change owes an audit
+    row, and unknown method ids are rejected rather than stored, where they
+    would read as a deliberate declaration that never applied to anything.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    requested = payload.field_overrides or {}
+    unknown = sorted(set(requested) - set(METHOD_IDS))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown analysis method(s): {', '.join(unknown)}",
+        )
+    empty_tokens = sorted(
+        {m for m, fields in requested.items() for tok in fields if not tok.strip()}
+    )
+    if empty_tokens:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Empty field token declared for: {', '.join(empty_tokens)}",
+        )
+    previous = timeline.field_overrides or {}
+    updated = await store.update_timeline_field_overrides(case.id, timeline_id, requested)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    await store.record_audit(
+        action="timeline.update_field_overrides",
+        actor=user,
+        case_id=case.id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"previous": previous, "new": updated.field_overrides or {}},
     )
     return {"timeline": updated.to_dict()}
 

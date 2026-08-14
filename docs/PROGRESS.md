@@ -1,6 +1,49 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-13 (session 171 — the field knobs stop being text boxes).
+Last updated: 2026-08-14 (session 172 — which fields a method reads becomes a decision).
+
+## Session 172 — 2026-08-14: per-timeline, per-method field overrides
+
+Session 171 gave the field knobs back their pickers, which made the correction possible but
+not durable: the picker's selection is per-run React state, so an analyst who takes a field
+away from a detector takes it away again on the next sweep, and the next analyst never learns
+they did.
+
+The miss it leaves is semantic, not statistical. `recommend_numeric_fields` types fields
+syntactically and says so in its own docstring: an HTTP status code parses as a number, so
+`numeric_range` offers it, learns a band over `{200, 404, 500}` and reports the 500s as
+outliers forever. No probe discovers that it is a categorical field wearing digits — only the
+analyst does.
+
+`Timeline.field_overrides` (migration `0029`, nullable) is where they say it:
+`{method_id: {field_token: bool}}` — `true` pins a field into a method's automatic selection,
+`false` takes it out, absent leaves the recommender's answer standing. Per method rather than
+per field, because the same status code is meaningless to `numeric_range` and an excellent
+`value_novelty` field. Written through `PATCH .../timelines/{id}/field-overrides` (contribute
+access, unknown method ids and empty tokens 422, every change audited), shared per timeline on
+`muted_methods`' contract rather than held per browser.
+
+One helper does the work: `apply_field_overrides` sits between a recommender's answer and the
+scan list of all eight detectors that pick their own fields, and returns what it held back for
+the run's `warnings`. That keeps the shape "advice, never a lock" on every axis — an explicit
+`fields=[…]` never reaches the helper and still scans an excluded field, the analysis plan
+does not consult it, a pin naming a field the timeline lacks is dropped rather than scanned as
+an always-empty column, and a held-back field is disclosed rather than silently narrowing a
+scan into something that reads as "clean". Pins are applied before each detector's
+`_MAX_AUTO_SCAN_FIELDS` slice, since being ranked below the cut is why a field gets pinned.
+
+The findings cache key gains the method's slice: an answer computed before a field was
+declared off is an answer to a different question.
+
+In the UI the control is a small pin/exclude button beside each chip in `AnomalyFieldPicker`,
+deliberately separate from the checkbox — scoping this run and deciding what the method reads
+are different questions — and the picker's auto preview applies the declaration exactly as the
+backend does, so the checked set keeps previewing what actually runs. The Tools sheet's Methods
+tab summarizes what a timeline declares and resets it per method.
+
+Not done: the agent has no tool for this. Every agent write today is a proposal an analyst
+confirms, and a direct-write tool would be a new precedent that needs its own argument rather
+than a side effect of this change.
 
 ## Session 171 — 2026-08-13: field knobs are choices again, not typing
 

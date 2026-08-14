@@ -152,13 +152,17 @@ const fieldsKnob = (picker: FieldPickerConfig): MethodKnob => ({ ...FIELDS_KNOB,
 /**
  * Series fields: the standard columns an event can be partitioned by. Attribute
  * keys are appended per timeline by `MethodFieldSelect`.
+ *
+ * `source_file` is deliberately not among them, though it is a real event
+ * column: partitioning by it yields one series per ingested file, which is a
+ * property of how the case was loaded rather than of the logs, and gives the
+ * cadence and n-gram methods series that cannot be compared to each other.
  */
 const SERIES_FIELD_OPTIONS = [
   { value: "artifact", label: "Artifact type" },
   { value: "timestamp_desc", label: "Event category" },
   { value: "display_name", label: "Display name" },
   { value: "parser_name", label: "Parser" },
-  { value: "source_file", label: "Source file" },
 ];
 const SERIES_KNOB: MethodKnob = {
   param: "series_field",
@@ -239,7 +243,7 @@ export const METHODS: MethodMeta[] = [
         placeholder: "(none)",
         // Learn one alphabet per value of this field (per host, say) instead of
         // one merged alphabet over the whole scope.
-        fieldOptions: SERIES_FIELD_OPTIONS.filter((o) => o.value !== "source_file"),
+        fieldOptions: SERIES_FIELD_OPTIONS,
         noneLabel: "Whole scope",
       },
     ],

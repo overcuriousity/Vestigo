@@ -1739,6 +1739,24 @@ async def _resolve_analysis_windows(
     return _windows_from_definition(definition)
 
 
+async def _resolve_field_overrides(
+    case_id: str, timeline_id: str, detector: str
+) -> dict[str, bool] | None:
+    """Return this timeline's field declaration for *detector*, or None.
+
+    ``Timeline.field_overrides`` is ``{method_id: {field_token: bool}}`` — the
+    analysts' answer to a recommender that types fields syntactically. Only the
+    named method's slice is returned: a status code that is meaningless to
+    ``numeric_range`` is an excellent ``value_novelty`` field, so a declaration
+    is never global.
+    """
+    timeline = await get_store().get_timeline(case_id, timeline_id)
+    if timeline is None:
+        return None
+    overrides = (timeline.field_overrides or {}).get(detector)
+    return dict(overrides) if overrides else None
+
+
 async def _run_stat_detector(
     case_id: str,
     timeline_id: str,
@@ -1791,7 +1809,13 @@ async def _run_stat_detector(
         detector=detector,
     )
     windows_task = _resolve_analysis_windows(store, case_id, timeline_id, baseline_id)
-    normal_rows, windows = await asyncio.gather(normal_task, windows_task)
+    # Resolved here rather than by each caller: every entry point into a
+    # detector — the sweep, an explicit run, tagging, the agent — must see the
+    # same declaration, and this is the one place all four pass through.
+    overrides_task = _resolve_field_overrides(case_id, timeline_id, detector)
+    normal_rows, windows, field_overrides = await asyncio.gather(
+        normal_task, windows_task, overrides_task
+    )
     allowlist: set[tuple[str, str]] | None = {
         (d.field, d.value) for d in normal_rows if d.field is not None and d.value is not None
     } or None
@@ -1921,6 +1945,7 @@ async def _run_stat_detector(
             exclude_event_ids=exclude_ids,
             allowlist=allowlist,
             field_mappings=field_mappings,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -1948,6 +1973,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                field_overrides=field_overrides,
             )
             return result, resolution
         except ValueError as exc:
@@ -1986,6 +2012,7 @@ async def _run_stat_detector(
                 inventory=inventory,
                 inventory_total=inventory_total,
                 group_field=group_field,
+                field_overrides=field_overrides,
             )
         except ValueError as exc:
             # e.g. a non-string group_field, which would otherwise reach
@@ -2008,6 +2035,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2034,6 +2062,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2067,6 +2096,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2093,6 +2123,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2111,6 +2142,7 @@ async def _run_stat_detector(
         field_mappings=field_mappings,
         inventory=inventory,
         inventory_total=inventory_total,
+        field_overrides=field_overrides,
     )
     return result, resolution
 

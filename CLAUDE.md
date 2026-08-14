@@ -161,7 +161,11 @@ instead of rebuilding.
   dispositions. `docs/ANOMALY_DETECTION.md` is the contract for all of them — update it in the
   same commit as any detector change. Read the module docstring before changing bucket math or
   scan-cost machinery (`HEAVY_SCAN_SETTINGS`, `HEAVY_SCAN_GATE`); it deliberately does **not**
-  reuse the events-view filters that `QueryService.histogram` applies.
+  reuse the events-view filters that `QueryService.histogram` applies. Which fields a
+  self-selecting detector scans is the analyst's call, not the recommenders': every auto path
+  runs its recommendation through `apply_field_overrides` against the timeline's
+  `field_overrides` (per method, shared, audited, never a lock — an explicit `fields=[…]`
+  bypasses it and a held-back field is disclosed in `warnings`).
 - `db/analysis_plan.py` — the analysis gate: pure predicates deciding, per method and
   without scanning an event, whether it *can* produce a finding on this data. A method is
   gated off only when it structurally cannot, never when it looks unpromising, and a gated

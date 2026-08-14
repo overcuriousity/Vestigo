@@ -59,6 +59,23 @@ export const timelinesApi = {
       { muted_methods: mutedMethods },
     ).then((r) => r.timeline),
 
+  /**
+   * Replace the per-method field declarations for this timeline.
+   *
+   * `{method_id: {field_token: boolean}}` — true pins a field into a detector's
+   * automatic selection, false takes it out. Shared state like the mute list:
+   * the next analyst inherits it and every change is audited.
+   */
+  patchFieldOverrides: (
+    caseId: string,
+    timelineId: string,
+    fieldOverrides: Record<string, Record<string, boolean>>,
+  ) =>
+    patch<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/field-overrides`,
+      { field_overrides: fieldOverrides },
+    ).then((r) => r.timeline),
+
   /** Per-raw-field coverage across sources, for the wizard's aggregation step. */
   fieldCoverage: (caseId: string, sourceIds: string[]) =>
     get<FieldCoverageResponse>(

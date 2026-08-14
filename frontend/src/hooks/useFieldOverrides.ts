@@ -1,0 +1,135 @@
+/**
+ * useFieldOverrides — which fields a detector reads on this timeline, declared.
+ *
+ * The recommenders behind every method's "auto" mode type fields
+ * *syntactically* and say so: an HTTP status code parses as a number, so the
+ * numeric-range detector offers it, learns a band over {200, 404, 500} and
+ * reports the 500s as outliers forever. No amount of probing discovers that it
+ * is a categorical field wearing digits — only the analyst knows. This is where
+ * they say it, per method: the same field is meaningless to `numeric_range` and
+ * excellent for `value_novelty`, so a declaration is never global.
+ *
+ * Shared server state on the Timeline for the same reason `muted_methods` is —
+ * "status codes are not a range field" is a finding about the data that the
+ * next analyst inherits, and every change is audited.
+ *
+ * Advice to the recommenders, never a gate: it steers only a detector's
+ * *automatic* field selection. Naming the field explicitly still scans it, the
+ * analysis plan does not consult it, and a run that held a field back discloses
+ * it in its warnings.
+ *
+ * Reads through the same `["timeline", caseId, timelineId]` query the mute
+ * strip and ExplorerPage already hold, so it costs no extra request and every
+ * reader shares one cache.
+ */
+import { useCallback, useMemo } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { timelinesApi } from "@/api/timelines";
+import { casesApi } from "@/api/cases";
+import { canContributeToCase } from "@/lib/caseAccess";
+import type { MethodId } from "@/components/analysis/method-registry";
+import type { Timeline } from "@/api/types";
+
+/** A field's declared state for one method. `null` = undeclared. */
+export type FieldDeclaration = boolean | null;
+
+export type FieldOverrides = Record<string, Record<string, boolean>>;
+
+export interface FieldOverridesHandle {
+  /** The whole timeline's declarations, method id -> field token -> on/off. */
+  overrides: FieldOverrides;
+  /** One method's slice; `{}` when it declares nothing. */
+  forMethod: (id: MethodId) => Record<string, boolean>;
+  /** Declare a field on/off for a method, or `null` to hand it back to the recommender. */
+  declare: (id: MethodId, token: string, state: FieldDeclaration) => void;
+  /** Drop every declaration for one method. */
+  clearMethod: (id: MethodId) => void;
+  /** Whether the caller may change them; false for read-only members. */
+  canEdit: boolean;
+  isSaving: boolean;
+}
+
+const EMPTY: Record<string, boolean> = {};
+
+export function useFieldOverrides(caseId: string, timelineId: string): FieldOverridesHandle {
+  const queryClient = useQueryClient();
+  const timelineKey = ["timeline", caseId, timelineId];
+
+  const { data: timeline } = useQuery({
+    queryKey: timelineKey,
+    queryFn: () => timelinesApi.get(caseId, timelineId),
+    enabled: Boolean(caseId && timelineId),
+  });
+  const { data: case_ } = useQuery({
+    queryKey: ["case", caseId],
+    queryFn: () => casesApi.get(caseId),
+    enabled: Boolean(caseId),
+  });
+
+  const overrides = useMemo<FieldOverrides>(
+    () => timeline?.field_overrides ?? {},
+    [timeline?.field_overrides],
+  );
+
+  const mutation = useMutation({
+    mutationFn: (next: FieldOverrides) =>
+      timelinesApi.patchFieldOverrides(caseId, timelineId, next),
+    // Written into the timeline cache rather than invalidated, like the mute
+    // list: what runs keys off this, so a refetch round-trip would leave every
+    // toggle looking dead for the length of a request.
+    onSuccess: (updated: Timeline) => {
+      queryClient.setQueryData(timelineKey, updated);
+      queryClient.invalidateQueries({ queryKey: ["timelines", caseId] });
+      // The declaration changes which fields a detector picks for itself, so
+      // every finding held from before it is an answer to a different question.
+      // The server's own cache key covers it; these drop the client's — both
+      // the per-method findings and the sweep that feeds the rail.
+      queryClient.invalidateQueries({ queryKey: ["anomalies", caseId, timelineId] });
+      queryClient.invalidateQueries({ queryKey: ["detector-sweep-v2", caseId, timelineId] });
+    },
+  });
+
+  const canEdit = case_ ? canContributeToCase(case_) : false;
+
+  const write = useCallback(
+    (next: FieldOverrides) => {
+      if (!canEdit) return;
+      mutation.mutate(next);
+    },
+    [canEdit, mutation],
+  );
+
+  const declare = useCallback(
+    (id: MethodId, token: string, state: FieldDeclaration) => {
+      const forMethod = { ...(overrides[id] ?? {}) };
+      if (state === null) delete forMethod[token];
+      else forMethod[token] = state;
+      const next = { ...overrides };
+      // A method with nothing left declared is dropped rather than sent as an
+      // empty object, so "undeclared" has one representation in the audit trail.
+      if (Object.keys(forMethod).length === 0) delete next[id];
+      else next[id] = forMethod;
+      write(next);
+    },
+    [overrides, write],
+  );
+
+  const clearMethod = useCallback(
+    (id: MethodId) => {
+      if (!(id in overrides)) return;
+      const next = { ...overrides };
+      delete next[id];
+      write(next);
+    },
+    [overrides, write],
+  );
+
+  return {
+    overrides,
+    forMethod: useCallback((id: MethodId) => overrides[id] ?? EMPTY, [overrides]),
+    declare,
+    clearMethod,
+    canEdit,
+    isSaving: mutation.isPending,
+  };
+}

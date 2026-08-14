@@ -225,6 +225,38 @@ describe("InvestigateSheet", () => {
     expect(await screen.findByText(/Pick 2–4 fields/i)).toBeInTheDocument();
   });
 
+  /**
+   * The picker only warns below its floor — refusing the run is this caller's
+   * half of that pair. Without it the request 422s and the sheet can only say
+   * "this method failed to run", which names neither the cause nor the fix.
+   */
+  it("refuses to run value_combo below the two fields it can combine", async () => {
+    const onRun = vi.fn();
+    renderSheet({ mode: "method", methodId: "value_combo", onRun, query: idleQuery() });
+    fireEvent.click(screen.getByRole("button", { name: /fields/i }));
+    // Both start checked (auto = top 2); dropping one puts the pick under the floor.
+    fireEvent.click(await screen.findByText("src_ip"));
+    expect(await screen.findByTestId("method-knob-blocker")).toHaveTextContent(/at least 2 fields/i);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    expect(onRun).not.toHaveBeenCalled();
+  });
+
+  /**
+   * An empty pick is a scan over nothing, which returns an empty result set —
+   * indistinguishable, once rendered, from "the data is clean".
+   */
+  it("refuses to run a scan over no fields at all", async () => {
+    const onRun = vi.fn();
+    renderSheet({ mode: "method", methodId: "value_novelty", onRun, query: idleQuery() });
+    fireEvent.click(screen.getByRole("button", { name: /fields/i }));
+    fireEvent.click(await screen.findByText("src_ip"));
+    expect(await screen.findByTestId("method-knob-blocker")).toHaveTextContent(
+      /at least one field/i,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    expect(onRun).not.toHaveBeenCalled();
+  });
+
   it("sends a numeric knob as a number, not the analyst's typing", () => {
     const onRun = vi.fn();
     renderSheet({ mode: "method", methodId: "sequence_novelty", onRun, query: idleQuery() });

@@ -42,6 +42,7 @@ def fingerprint(
     baseline_config_hash: str | None,
     field_mappings: dict[str, list[str]] | None,
     source_offsets: dict[str, int] | None,
+    field_overrides: dict[str, bool] | None,
     detector_settings: dict[str, Any],
     method: str,
     params: dict[str, Any],
@@ -58,7 +59,7 @@ def fingerprint(
     computed at 50 rows is not the answer to a request for 500, and serving it
     as a hit would assert a completeness it does not have.
 
-    Four inputs are here for the same reason and are easy to forget, because
+    Five inputs are here for the same reason and are easy to forget, because
     none of them is a request parameter:
 
     - ``baseline_config_hash`` — a definition is edited *in place*, keeping its
@@ -68,6 +69,10 @@ def fingerprint(
       through them, so remapping a field changes what was scanned.
     - ``source_offsets`` — a declared per-source clock-skew correction shifts
       every timestamp the temporal detectors bucket by.
+    - ``field_overrides`` — this method's slice of the timeline's field
+      declarations, which decides what the detector scans when it picks its own
+      fields. An answer computed before a field was declared off is an answer to
+      a different question.
     - ``detector_settings`` — the runtime-editable thresholds the runners fall
       back to whenever a knob is omitted. An admin lowering ``stat_z_threshold``
       in the console changes every default-parameter answer in the system.
@@ -82,6 +87,7 @@ def fingerprint(
             "baseline_config_hash": baseline_config_hash,
             "field_mappings": {k: sorted(v) for k, v in sorted((field_mappings or {}).items())},
             "source_offsets": dict(sorted((source_offsets or {}).items())),
+            "field_overrides": dict(sorted((field_overrides or {}).items())),
             "detector_settings": detector_settings,
             "method": method,
             "params": params,

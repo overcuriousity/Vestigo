@@ -30,6 +30,7 @@ from vestigo.api.routers.events import (
     _apply_confirmations,
     _apply_dismissals,
     _get_stat_anomaly_service,
+    _resolve_field_overrides,
     _resolve_timeline_scope,
     _run_stat_detector,
     _serialize_stat_result,
@@ -604,6 +605,11 @@ async def get_analysis_findings(
         baseline_config_hash=baseline_config_hash,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
+        # The timeline's field declaration for *this* method: it changes which
+        # fields the detector picks for itself, so a cached answer computed
+        # before an analyst declared a field off is an answer to a different
+        # question. Ignored by log_template, which selects no fields.
+        field_overrides=await _resolve_field_overrides(case_id, timeline_id, method),
         detector_settings=detector_settings_material(cfg),
         method=method,
         # The validated params, not the raw object: `2` and `2.0` are the same

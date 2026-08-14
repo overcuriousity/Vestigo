@@ -39,6 +39,7 @@ import { normalizeFinding } from "@/lib/finding-normalize";
 import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
 import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
+import { useFieldOverrides } from "@/hooks/useFieldOverrides";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
@@ -115,7 +116,9 @@ function Subhead({ children }: { children: React.ReactNode }) {
  *
  * A `fields` selection is sent as a list, which `_FieldsParams._join_fields`
  * accepts alongside the comma-joined string. `null` there is the picker's "auto"
- * — the same untouched-knob case, so it is omitted for the same reason.
+ * — the same untouched-knob case, so it is omitted for the same reason. An
+ * empty list never reaches here: `knobBlocker` refuses the run, because a scan
+ * over no fields comes back as an empty result set and reads as "clean".
  */
 function buildParams(
   meta: MethodMeta,
@@ -134,6 +137,34 @@ function buildParams(
     out[knob.param] = knob.kind === "number" ? Number(value) : value;
   }
   return out;
+}
+
+/**
+ * Why the knobs as they stand cannot be run, or `null` if they can.
+ *
+ * `AnomalyFieldPicker` lets a selection fall below its own floor on purpose —
+ * unchecking down to one chip on the way to a different pair is a normal thing
+ * to do — and only warns; disabling the run is the caller's half of that pair,
+ * and without it `value_combo` sends one field and comes back as a 422 the
+ * sheet can only render as "this method failed to run".
+ *
+ * The floor is at least one field even where the method declares none: an
+ * explicit empty selection is "scan nothing", which returns an empty result set
+ * indistinguishable from "the data is clean". `null` — the picker's auto — is
+ * always runnable, since the method chooses its own fields there.
+ */
+function knobBlocker(meta: MethodMeta, fields: Record<string, string[] | null>): string | null {
+  for (const knob of meta.knobs) {
+    if (knob.kind !== "fields") continue;
+    const selected = fields[knob.param];
+    if (!selected) continue;
+    const floor = Math.max(1, knob.picker?.minSelected ?? 1);
+    if (selected.length >= floor) continue;
+    return floor > 1
+      ? `Pick at least ${floor} fields to combine, or reset to auto.`
+      : "Pick at least one field to scan, or reset to auto.";
+  }
+  return null;
 }
 
 function MethodBody({
@@ -170,6 +201,13 @@ function MethodBody({
     setFields({});
   }, [methodId]);
 
+  const blocker = knobBlocker(meta, fields);
+  // The durable half of the same decision: which fields this method reads at
+  // all, declared once for the case. Read-only members see the state and not
+  // the control (`canEdit` false → no `onDeclare`), the way muting does.
+  const { forMethod, declare, canEdit } = useFieldOverrides(caseId, timelineId);
+  const overrides = forMethod(methodId);
+
   return (
     <>
       <Subhead>How this method works</Subhead>
@@ -180,6 +218,9 @@ function MethodBody({
         className="flex flex-wrap items-center gap-2"
         onSubmit={(e) => {
           e.preventDefault();
+          // Guarded here too, not only on the button: implicit submission from a
+          // knob input is a second way into the same run.
+          if (blocker) return;
           onRun?.(buildParams(meta, values, fields));
         }}
       >
@@ -201,6 +242,10 @@ function MethodBody({
               autoIncludesIdentifiers={knob.picker?.autoIncludesIdentifiers}
               autoLabel={knob.picker?.autoLabel}
               numeric={knob.picker?.numeric}
+              overrides={overrides}
+              onDeclare={
+                canEdit ? (token, state) => declare(methodId, token, state) : undefined
+              }
             />
           ) : (
             <label
@@ -234,12 +279,17 @@ function MethodBody({
           ),
         )}
         {onRun && (
-          <Button type="submit" variant="outline" size="sm" disabled={running}>
+          <Button type="submit" variant="outline" size="sm" disabled={running || blocker !== null}>
             <Play size={11} />
             {running ? "Running…" : runLabel}
           </Button>
         )}
       </form>
+      {onRun && blocker && (
+        <p data-testid="method-knob-blocker" className="mt-1.5 text-xs text-[var(--color-warning)]">
+          {blocker}
+        </p>
+      )}
 
       <Subhead>Query shape</Subhead>
       <pre className="overflow-x-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2 font-mono text-xs text-[var(--color-fg-secondary)]">

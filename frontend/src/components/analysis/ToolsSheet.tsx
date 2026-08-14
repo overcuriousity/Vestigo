@@ -24,7 +24,7 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Layers, ScanLine } from "lucide-react";
-import { METHODS, type MethodId } from "./method-registry";
+import { METHODS, METHODS_BY_ID, type MethodId } from "./method-registry";
 import { MethodRow } from "./MethodRow";
 import { useStreamingSweep } from "@/hooks/useMethodFindings";
 import { SigmaPanel } from "./SigmaPanel";
@@ -36,10 +36,13 @@ import { SimilarEvents } from "./SimilarEvents";
 import { baselinesApi } from "@/api/baselines";
 import { useCapabilities } from "@/api/health";
 import { useMutedMethods } from "@/hooks/useMutedMethods";
+import { useFieldOverrides } from "@/hooks/useFieldOverrides";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { useBaselineStore } from "@/stores/baseline";
 import { useUiStore } from "@/stores/ui";
+import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
+import { anomalyFieldLabel } from "@/lib/format";
 import type { AnalysisScope } from "@/api/analysis";
 import type { Event } from "@/api/types";
 
@@ -100,6 +103,13 @@ export function ToolsSheet({
   const { embeddings, sigma } = useCapabilities();
   const { nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   const mute = useMutedMethods(caseId, timelineId);
+  // The timeline's field declarations, summarized here because the control that
+  // sets them lives in one method's field picker: a decision the whole case
+  // inherits needs somewhere it can be read back and undone in one place.
+  const { overrides, clearMethod, canEdit: canDeclare } = useFieldOverrides(caseId, timelineId);
+  const declared = Object.entries(overrides).filter(
+    ([id, fields]) => id in METHODS_BY_ID && Object.keys(fields).length > 0,
+  ) as [MethodId, Record<string, boolean>][];
   const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
 
   // Absent, not disabled, when Sigma is unconfigured — and absent on an empty
@@ -173,6 +183,41 @@ export function ToolsSheet({
               <span className="text-[var(--color-warning)]"> · {muteCount} muted</span>
             )}
           </p>
+          {declared.length > 0 && (
+            <div
+              data-testid="field-overrides-summary"
+              className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2 text-xs"
+            >
+              <p className="font-semibold text-[var(--color-fg-secondary)]">Declared fields</p>
+              <p className="mt-0.5 text-[var(--color-fg-muted)]">
+                Which fields these methods read when they pick for themselves. Naming a field
+                explicitly still scans it, and a run that held one back says so.
+              </p>
+              <div className="mt-1.5 space-y-1">
+                {declared.map(([id, fields]) => (
+                  <div key={id} className="flex items-start justify-between gap-2">
+                    <span className="text-[var(--color-fg-secondary)]">
+                      {METHODS_BY_ID[id].label}:{" "}
+                      {Object.entries(fields)
+                        .map(([token, on]) => `${on ? "+" : "−"}${anomalyFieldLabel(token)}`)
+                        .join(", ")}
+                    </span>
+                    {canDeclare && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        data-testid={`clear-overrides-${id}`}
+                        onClick={() => clearMethod(id)}
+                        className="h-auto shrink-0 px-1 py-0 text-[var(--color-fg-muted)]"
+                      >
+                        Reset
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="space-y-1">
             {METHODS.map((meta) =>
               byMethod[meta.id] ? (

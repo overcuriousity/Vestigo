@@ -171,40 +171,6 @@ and the migration is done when the file is `{}`.
   Tools sections) rather than one tab away, and evidence-class notes carry some of what step 2
   used to. The placement complaint above still stands.
 
-- [ ] **Analyst-declared field semantics, so a field's type is a decision and not a guess.**
-  Which detector runs on which fields is the **analyst's** call (or the agent's, acting for
-  them) — the recommenders only ever *suggest*, exactly as the analysis gate only advises.
-  Today the suggestion is the only durable answer there is: the picker's selection is per-run
-  React state, so an analyst who corrects it corrects it again on the next sweep, and the next
-  analyst never learns they did.
-
-  The concrete miss is semantic, not statistical. `recommend_numeric_fields` types fields
-  syntactically and says so in its own docstring (`db/anomaly_stats.py:2639`): an HTTP status
-  code parses as a number, so numeric range learns a band over `{200, 301, 404, 500}` and
-  reports the 500s as outliers forever. It is a categorical field wearing digits, and no
-  amount of probing will discover that — only a human (or an agent reasoning about the field's
-  meaning) knows it.
-
-  Proposed shape: a per-timeline field-semantics override — `attr:status_code` **is
-  categorical** — asserted once and inherited by everyone on the case. Prefer this over a
-  per-(method, field) blocklist: the blocklist records the symptom and has to be repeated for
-  every numeric-ish detector added later, while the override records the fact and lets each
-  recommender ask "is this numeric?" and get the right answer. `numeric_range` then drops the
-  field while `value_novelty` keeps it, which is the correct outcome — a status code is an
-  excellent rare-value field and a meaningless range field. Plugs in at the recommenders, which
-  is the single place both the unprompted sweep and the picker's auto default derive from, so
-  the picker's checked set keeps previewing what actually runs.
-
-  Contract, copied from `Timeline.muted_methods` deliberately: shared per timeline (this is a
-  finding about the data, not a browser preference), audited, and **never a lock** — an
-  explicit `fields=[…]` still runs the method on the excluded field, the analysis plan does not
-  consult it, and any field the sweep skipped because of it is disclosed with a count. Sits
-  beside `Timeline.field_mappings`, which is already per-timeline field metadata applied at
-  query time with the events never rewritten. Open question: whether the vocabulary is the
-  three kinds the recommenders already use (categorical / numeric / identifier) or a narrower
-  "not numeric" assertion. Also give the agent the same control — deciding a field's kind is
-  reasoning about meaning, which is what it is for.
-
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand store,
   so it is per-browser: an analyst who folds a panel away at their desk meets it again on a
   second machine, and vice versa. The backend half already exists — `User.preferences` (JSON,

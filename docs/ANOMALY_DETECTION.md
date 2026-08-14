@@ -268,6 +268,60 @@ count for a muted row — its query never ran, so a `0` there would assert the
 "checked, clear" misread this whole surface exists to prevent — and every mute
 is reversible from either surface.
 
+### Declaring which fields a method reads
+
+A method that picks its own fields picks them from a recommender, and the
+recommenders type fields **syntactically** — they say so in their own
+docstrings. An HTTP status code parses as a number, so `numeric_range` offers
+it, learns a band over `{200, 301, 404, 500}` and reports the 500s as outliers
+forever. It is a categorical field wearing digits, and no amount of probing
+discovers that: only an analyst (or an agent reasoning about the field's
+meaning) knows what the field *is*. The Fields picker could correct it for one
+run, but the correction died with the component's state and the next analyst
+never learned it had been made.
+
+`Timeline.field_overrides` is where that correction becomes durable:
+`{method_id: {field_token: bool}}`, where `true` pins a field into a method's
+automatic selection and `false` takes it out. It is written through
+`PATCH /api/cases/{case}/timelines/{timeline}/field-overrides` (contribute
+access, unknown method ids and empty tokens rejected with a 422, every change
+audited as `timeline.update_field_overrides`) and, like the mute list, is
+**shared rather than per-browser** — "status codes are not a range field here"
+is a conclusion about the data the next analyst should inherit.
+
+It is **per method**, not per field, and that is the point: the same status code
+is meaningless to `numeric_range` and an excellent `value_novelty` field, so
+`numeric_range` drops it while `value_novelty` keeps it. A per-(method, field)
+blocklist of *findings* would record the symptom and have to be repeated for
+every numeric-ish detector added later; this records the decision at the one
+place both the unprompted sweep and the picker's auto default derive from.
+
+The same "advice, never a lock" contract as the gate and the mute:
+
+- **It applies only to automatic selection.** `apply_field_overrides`
+  (`db/anomaly_stats.py`) sits between a recommender's answer and the detector's
+  scan list; an explicit `fields=[…]` never reaches it, so naming an excluded
+  field still scans it.
+- **The plan does not consult it.** A declaration is not a claim that the method
+  cannot produce a finding here.
+- **A held-back field is disclosed.** Every detector that dropped one names it
+  in `warnings`, because a silently narrower scan is indistinguishable from a
+  scan that found nothing — the exact "checked, clear" misread this surface
+  exists to prevent. A pin naming a field the timeline does not have is dropped
+  and disclosed the same way, rather than scanned as an always-empty column.
+- **Pins go first.** They are applied before each detector's `_MAX_AUTO_SCAN_FIELDS`
+  slice, since being ranked below the cut is precisely why a field gets pinned.
+
+Detectors that select their own fields all route through it: `value_novelty`,
+`value_combo`, `numeric_range`, `charset`, `entropy`, `proportion_shift`,
+`interval_periodicity` and `value_distribution_drift`. In the UI the control is
+the small pin/exclude button beside each chip in the Fields picker (the checkbox
+still scopes the single run — two different questions, two different controls),
+the picker's auto preview applies the declaration exactly as the backend does,
+and the Tools sheet's Methods tab summarizes and resets what a timeline
+declares. Pinned by `tests/test_field_overrides.py` and
+`tests/test_timeline_field_overrides_api.py`.
+
 ### The analysis cache
 
 `GET .../analysis/findings` is memoized in `analysis_cache` (`db/analysis_cache.py`),
@@ -276,7 +330,7 @@ sorted set of source content hashes, the enrichment generation, the frame and
 baseline, the method, its canonical params, the row `limit`, and
 `dispositions_hash`.
 
-Four of those inputs are not request parameters, and each closes a way of
+Five of those inputs are not request parameters, and each closes a way of
 being served a wrong answer as proof:
 
 - **the baseline definition's content hash**, not just its id. `PUT
@@ -287,6 +341,9 @@ being served a wrong answer as proof:
   field aliases through. Remapping a field changes what was scanned.
 - **the per-source `time_offset_seconds`**, the declared clock-skew correction
   the temporal detectors bucket against.
+- **this method's slice of `field_overrides`**, which decides what the detector
+  scans when it picks its own fields. An answer computed before a field was
+  declared off is an answer to a different question.
 - **the runtime-editable `stat_*` settings**, the thresholds every runner falls
   back to when a knob is omitted. An admin lowering `stat_z_threshold` in the
   console changes every default-parameter answer in the system. Taken as a
