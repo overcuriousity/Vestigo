@@ -172,7 +172,11 @@ async def list_case_converters(case: Case = Depends(require_case_read)) -> dict[
     store = get_store()
     counts = await store.count_sources_by_converter(case.id)
     rows = await store.list_converter_scripts(case.id)
-    return {"scripts": [{**r.to_dict(), "sources_produced": counts.get(r.id, 0)} for r in rows]}
+    return {
+        "scripts": [{**r.to_dict(), "sources_produced": counts.get(r.id, 0)} for r in rows],
+        # What the upload dialog's disclosure quotes: the excerpt budget.
+        "sample_bytes": get_settings().converter_sample_bytes,
+    }
 
 
 @case_router.get("/{script_id}")
