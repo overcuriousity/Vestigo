@@ -24,5 +24,8 @@ export interface ConverterManifest {
 export const convertersApi = {
   list: () => get<ConverterManifest>("/converters"),
 
+  /** Copy-paste LLM prompts, rendered server-side from the data contract. */
+  prompts: () => get<{ parquet: string; csv: string }>("/converters/prompt"),
+
   downloadUrl: (name: string) => `${BASE}/converters/${name}`,
 };

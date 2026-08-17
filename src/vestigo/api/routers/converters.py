@@ -34,6 +34,17 @@ async def list_converters(user: User = Depends(get_current_user)) -> dict[str, A
     return _manifest()
 
 
+@router.get("/prompt")
+async def converter_prompts(user: User = Depends(get_current_user)) -> dict[str, str]:
+    """The copy-paste LLM prompts, rendered from the data contract on the server.
+
+    Declared before ``/{name}`` so the literal path wins the match.
+    """
+    from vestigo.converters.prompt import render_human_prompt_csv, render_human_prompt_parquet
+
+    return {"parquet": render_human_prompt_parquet(), "csv": render_human_prompt_csv()}
+
+
 @router.get("/{name}")
 async def download_converter(name: str, user: User = Depends(get_current_user)) -> FileResponse:
     """Download one converter script by manifest name."""
