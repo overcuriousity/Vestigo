@@ -147,3 +147,34 @@ def test_disabling_transfer_hides_and_refuses_it(client, admin_bootstrap):
     export = client.post(f"/api/cases/{case_id}/export")
     assert export.status_code == 503
     assert "disabled" in export.json()["detail"].lower()
+
+
+def test_converter_generation_capability_needs_switch_and_model(
+    client, admin_bootstrap, monkeypatch
+):
+    """Off by default; on only when the switch is set AND the agent probe passes."""
+    from vestigo.agent import availability
+
+    as_admin(client, admin_bootstrap)
+    caps = client.get("/api/health").json()["capabilities"]
+    assert caps["converter_generation"] is False
+
+    monkeypatch.setenv("VESTIGO_CONVERTER_GENERATION_ENABLED", "1")
+    get_settings.cache_clear()
+    caps = client.get("/api/health").json()["capabilities"]
+    assert caps["converter_generation"] is False  # no model configured
+
+    async def probe_ok(config):
+        return True
+
+    monkeypatch.setenv("VESTIGO_AGENT_MODEL", "test-model")
+    monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "http://localhost:9/v1")
+    get_settings.cache_clear()
+    monkeypatch.setattr(availability, "_probe", probe_ok)
+    availability.reset_probe_cache()
+    try:
+        caps = client.get("/api/health").json()["capabilities"]
+        assert caps["converter_generation"] is True
+    finally:
+        availability.reset_probe_cache()
+        get_settings.cache_clear()

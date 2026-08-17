@@ -37,6 +37,8 @@ const ASSUME_AVAILABLE: Capabilities = {
   // Like the agent: stays hidden until probed. Offering to load a demo case
   // is only honest once health confirms the instance will actually seed one.
   demo_case: false,
+  // Hidden until probed: it depends on the agent, which is also hidden until probed.
+  converter_generation: false,
 };
 
 /**

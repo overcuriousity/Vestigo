@@ -1055,6 +1055,8 @@ export interface Capabilities {
   transfer: boolean;
   /** Demo-case seeding is enabled on this instance. */
   demo_case: boolean;
+  /** The model may write converter scripts for plain-text uploads. */
+  converter_generation: boolean;
 }
 
 /**

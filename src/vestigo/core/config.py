@@ -424,6 +424,22 @@ class Settings(BaseSettings):
     # MCP needs no LLM endpoint).
     mcp_enabled: bool = False
 
+    # ── Generated converters (docs/INPUT_FORMATS.md §"Generated converters") ──
+    # Off by default: enabling it lets LLM-authored Python run in a guarded
+    # subprocess on this host. Needs a configured, reachable agent endpoint too.
+    converter_generation_enabled: bool = False
+    # Generation + repair rounds on the sample before giving up.
+    converter_max_attempts: int = Field(default=4, ge=1, le=10)
+    # Bytes of the raw file sent to the model (head/middle/tail excerpt).
+    converter_sample_bytes: int = Field(default=65536, ge=4096, le=1048576)
+    # Wall clock for the full-file conversion run; the sample run gets min(60, this).
+    converter_run_timeout_seconds: int = Field(default=600, ge=30, le=7200)
+    # RLIMIT_AS for the converter subprocess. Floor measured 2026-08-17: pyarrow
+    # imports at 2048 MB and fails at 1024 (OpenBLAS refuses to allocate).
+    converter_run_memory_mb: int = Field(default=2048, ge=2048, le=65536)
+    # RLIMIT_FSIZE for the subprocess: the produced Parquet cannot grow past this.
+    converter_run_output_mb: int = Field(default=4096, ge=64, le=1048576)
+
 
 @lru_cache
 def get_base_settings() -> Settings:

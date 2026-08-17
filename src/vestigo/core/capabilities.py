@@ -31,6 +31,7 @@ CAPABILITY_KEYS: tuple[str, ...] = (
     "sigma",
     "transfer",
     "demo_case",
+    "converter_generation",
 )
 
 
@@ -74,9 +75,10 @@ async def get_capabilities() -> dict[str, bool]:
     from vestigo.models.embeddings import embeddings_available
 
     settings = get_settings()
+    agent = await agent_available()
     return {
         "embeddings": embeddings_available(),
-        "agent": await agent_available(),
+        "agent": agent,
         "mcp": settings.mcp_enabled,
         "oidc": _oidc_available(settings),
         "enrichers": await _enrichers_available(),
@@ -89,4 +91,6 @@ async def get_capabilities() -> dict[str, bool]:
         # ships with the app. The key exists so the frontend gates every
         # subsystem the same way.
         "demo_case": settings.demo_case_enabled,
+        # Model-written converters need the switch *and* a reachable model.
+        "converter_generation": bool(settings.converter_generation_enabled and agent),
     }

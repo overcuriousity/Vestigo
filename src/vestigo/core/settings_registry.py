@@ -98,6 +98,11 @@ GROUPS: tuple[SettingGroup, ...] = (
     SettingGroup("stories", "Stories", "Report export and block size ceilings."),
     SettingGroup("transfer", "Case transfer", "Export/import archive limits."),
     SettingGroup("agent", "AI agent", "LLM endpoint and tool policy."),
+    SettingGroup(
+        "converters",
+        "Generated converters",
+        "Let the configured model write converter scripts for plain-text logs.",
+    ),
     SettingGroup("onboarding", "Onboarding", "What new users find the first time they log in."),
 )
 
@@ -835,6 +840,53 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Admin hard-deny list applied to the in-app agent and /mcp alike.",
         managed_by="agent",
         subsystem="agent",
+    ),
+    # ── Generated converters ─────────────────────────────────────────────
+    SettingSpec(
+        "converter_generation_enabled",
+        "converters",
+        "Generate converters with the AI model",
+        "When on and an agent endpoint is configured, the upload dialog can send a sample "
+        "of a plain-text log to the model, run the script it writes in a guarded "
+        "subprocess on this host, and ingest the result. Off by default because it "
+        "executes model-written code here (docs/DEPLOYMENT.md).",
+        subsystem="converter_generation",
+    ),
+    SettingSpec(
+        "converter_max_attempts",
+        "converters",
+        "Generation attempts",
+        "How many times the model may rewrite the script after a failed sample run.",
+        subsystem="converter_generation",
+    ),
+    SettingSpec(
+        "converter_sample_bytes",
+        "converters",
+        "Sample size sent to the model (bytes)",
+        "Head, middle and tail of the raw file, up to this many bytes, are the only "
+        "evidence that leaves this host.",
+        subsystem="converter_generation",
+    ),
+    SettingSpec(
+        "converter_run_timeout_seconds",
+        "converters",
+        "Conversion timeout (seconds)",
+        "Wall-clock ceiling for one full-file conversion run.",
+        subsystem="converter_generation",
+    ),
+    SettingSpec(
+        "converter_run_memory_mb",
+        "converters",
+        "Conversion memory ceiling (MB)",
+        "Address-space limit for the converter subprocess. pyarrow needs at least 2048.",
+        subsystem="converter_generation",
+    ),
+    SettingSpec(
+        "converter_run_output_mb",
+        "converters",
+        "Conversion output ceiling (MB)",
+        "Largest Parquet file a converter run may write.",
+        subsystem="converter_generation",
     ),
     # ── Onboarding ───────────────────────────────────────────────────────
     SettingSpec(
