@@ -444,3 +444,85 @@ If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write 
 described above and re-emits them as an interchange Parquet file, so a very large existing
 timeline can be uploaded as a single fast columnar file instead of parsed row-by-row server
 side.
+
+## Generated converters (the model writes the script)
+
+When an operator has switched on `converter_generation_enabled` **and** an agent endpoint is
+configured and reachable (`docs/AGENT.md`), the upload dialog gains a second mode — *Let AI
+write the converter* — and the CLI a matching `vestigo convert-ingest <path> -c <case>`. Both
+run the same job (`src/vestigo/converters/job.py`): the analyst uploads any plain-text,
+time-annotated file, and Vestigo has the configured model write a converter to the Parquet
+contract above, runs it in a guarded subprocess on the server, validates the output, repairs
+on failure, and ingests the resulting Parquet through the normal path. Nothing in the data
+model changes: **the produced Parquet is the source**, with `parser = <name>@<version>` from
+its footer, retained and deduplicated exactly like a Parquet the analyst converted locally.
+The only difference is `sources.converter_script_id`, which points at the script.
+
+### What leaves the host
+
+Exactly this, and the dialog says so before the analyst confirms: a bounded excerpt of the raw
+file (`converter_sample_bytes`, default 64 KiB — the head, a middle window and the tail, with
+absolute line numbers), the filename, its size, line count and mtime, the version the script
+must declare, and the analyst's optional hint. No case, source, timeline or user identifier,
+no key, no host name. Reusing a saved converter sends nothing. `tests/test_converter_prompt.py`
+asserts the rendered prompt against this list.
+
+### The loop
+
+1. **Sample.** Binary files are refused up front (NUL bytes / mostly non-printable).
+2. **Generate.** One typed model call (`converters/generator.py`) returns `{name, artifact,
+   script}`. The system prompt is rendered from `ingestion/parquet_format.py`
+   (`converters/prompt.py`), so it cannot drift from the contract, and it states what the
+   harness enforces so the model optimises for the checks that actually run.
+3. **Static check.** `converters/runner.py::check_script` rejects imports of `socket`,
+   `subprocess`, `multiprocessing`, `ctypes`, `http`, `urllib`, `importlib`, `threading`,
+   `shutil`, `tempfile` and friends, `exec`/`eval`/`compile`/`__import__`, and the destructive
+   or process-spawning `os.*` calls. A violation costs an attempt.
+4. **Sample run.** The script runs on the head excerpt (written under the original filename)
+   with `python -I`, a scrubbed environment, a private working directory, `RLIMIT_AS`
+   (`converter_run_memory_mb`, ≥ 2048 — pyarrow's floor), `RLIMIT_CPU`, `RLIMIT_FSIZE`
+   (`converter_run_output_mb`), `RLIMIT_NOFILE`, and a 60 s wall clock.
+5. **Validate** (`converters/validate.py`). Enforced: schema and required footer keys
+   (`validate_parquet_source`), `converter_version == "<n>.0.0"` for the version the task named,
+   `original_files[0].sha256` equal to the harness's own hash of the input, ≥ 1 row, no null
+   in the four provenance columns, ≥ 50 % of rows not marked `attributes.parse_status =
+   "unparsed"`, ≥ 50 % of rows with a timestamp. Reported only: the time range and whether
+   `byte_offset` is monotonic per file.
+6. **Repair.** On failure the model gets the previous script, the structured report (failed
+   checks with three offending rows each) and the stderr tail, and is asked for a complete
+   replacement. Up to `converter_max_attempts` rounds (default 4).
+7. **Full run** on the whole retained raw file with `converter_run_timeout_seconds` (default
+   600) — no repair here: a script that passed the sample and fails the whole file met a
+   format change the sample did not show, and sending more evidence than disclosed is not
+   the harness's call. The analyst regenerates with a hint instead.
+8. **Ingest.** The Parquet goes through `register_source_for_ingest` and the same ingestion
+   job as an upload.
+
+### What is kept
+
+`converter_scripts` (one row per script; case-bound; a regeneration is a new row with
+`parent_id`, never an edit): the name and version, the status (`generating` · `working` ·
+`failed`), the source code, the model and endpoint used, `prompt_hash` (sha256 of exactly what
+was sent, plus the system-prompt version), the sample's hash **and** the sample text itself,
+the raw file's hash (it is retained content-addressed like any source so regeneration needs no
+re-upload), the hint, and `attempts` — every generation, sample run and full run with elapsed
+time, exit code, stderr tail, the validation report and the script's hash. Audit rows:
+`converter.generate`, `converter.run`, `converter.regenerate`. Case export carries the rows and
+the raw files (`transfer/`); an archive from an older version simply has none.
+
+A downloaded script (`GET /api/cases/{id}/converters/{sid}/download`, or the panel's Download)
+is prefixed with a comment header naming the case, version, status, model, prompt and sample
+hashes and the raw input, so provenance travels with the file. Scripts remain listable and
+downloadable after the switch is turned off; only starting new work is refused (503).
+
+### Reuse and regeneration
+
+The upload dialog offers every `working` script in the case under *Reuse a converter*: the
+saved script runs on the new file with no model call. *Regenerate* (panel or
+`POST …/regenerate`) writes version *n+1* from the retained raw file plus a hint — for the
+"almost right" case. Editing in the browser is deliberately not offered: download, fix
+locally, and upload the Parquet is the path for anything a hint cannot express.
+
+The copy-paste prompts in the downloads panel are rendered by the same module
+(`GET /api/converters/prompt`), so a hand-run converter is written to the same contract.
+

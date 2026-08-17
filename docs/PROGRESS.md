@@ -1,6 +1,50 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-14 (session 174 — second review of PR #264, released as 1.12.2).
+Last updated: 2026-08-17 (session 175 — generated converters, towards 1.13).
+
+## Session 175 — 2026-08-17: generated converters — the model writes the script, the harness runs it
+
+The upload dialog gains *Let AI write the converter* (and the CLI `vestigo convert-ingest`):
+an analyst uploads any plain-text, time-annotated log, the configured model writes a
+converter to the Parquet contract, the server runs it in a guarded subprocess, validates the
+output, repairs on failure, and ingests the result — the produced Parquet *is* the source, so
+nothing downstream changes. Scripts are case-bound rows (`converter_scripts`) the analyst can
+download (with a provenance header), reuse on later uploads (no model call) and regenerate
+with a hint (a new version, never an edit). Spec:
+`docs/superpowers/specs/2026-08-17-generated-converters-design.md`; plan:
+`docs/superpowers/plans/2026-08-17-generated-converters.md`.
+
+Decisions worth remembering:
+
+- **Off by default, gated twice.** `converter_generation_enabled` plus the agent probe; the
+  capability hides the UI, `convert`/`regenerate` answer 503 (house style, not the 404 the
+  spec first said), list/download stay available because rows are records.
+- **Guard is stdlib only** (no bwrap/containers, so uv and image deployments are unchanged):
+  AST deny-list, `python -I`, scrubbed env, private cwd, `RLIMIT_AS/CPU/FSIZE/NOFILE`, own
+  session. Measured: pyarrow imports at 2048 MB `RLIMIT_AS` and fails at 1024, so the setting
+  floors at 2048. `RLIMIT_NPROC` was dropped — on Linux it counts the *user's* processes and
+  starved OpenBLAS thread creation on a busy host; `OPENBLAS_NUM_THREADS=1` in the child env
+  instead. What the guard does not stop is written down in `docs/DEPLOYMENT.md`.
+- **The prompt is data.** `converters/prompt.py` renders the generation, repair and human
+  copy-paste prompts from `ingestion/parquet_format.py`; the frontend now fetches the
+  copy-paste text from `GET /api/converters/prompt` (the drift bug #204 cannot recur), and
+  the assertions moved from `guidancePrompts.test.ts` to `test_converter_prompt.py`.
+- **Egress is exactly** the head/middle/tail excerpt, filename, size, line count, mtime,
+  version to declare and hint; the dialog names the model, endpoint host and byte count.
+- **No repair on the full-file run** — a script that passed the sample and fails the whole
+  file met a format change the sample did not show; regenerate with a hint instead of the
+  harness sending more evidence than disclosed.
+- **No job cancellation** (`JobStore` has none); timeouts bound every subprocess.
+- `upload_source` lost ~120 lines to `register_source_for_ingest`, which the job reuses so
+  both register a file identically (dedup, format detection, footer validation, retention,
+  the row, the default timeline).
+- Transfer carries `converter_scripts.ndjson` and the raw inputs as blobs; an older archive
+  without the stem imports fine (`_OPTIONAL_STEMS`).
+
+Tests: `test_converter_{prompt,sample,validate,runner,generator,scripts_store,scripts_api}.py`,
+`test_converter_job_clickhouse.py` (real subprocess + real ingest with a fake model: happy
+path, repair round, exhausted attempts, denied import, reuse, regenerate), transfer round
+trip, CLI, plus `uploadDialogGenerate` and `generatedConvertersPanel` on the frontend.
 
 ## Session 174 — 2026-08-14: a declaration that steers nothing must not claim to
 

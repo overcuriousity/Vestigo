@@ -507,6 +507,12 @@ timeline and a webserver-log timeline filter identically. N2 stopped at the fiel
 
 Decisions, not work items — each stays as decided unless its trigger fires.
 
+- **Generated-converter guard stays stdlib-only.** The subprocess that runs a model-written
+  converter is bounded by `resource` rlimits, `python -I`, a scrubbed environment, a private
+  cwd and an AST deny-list — no bwrap/firejail/container, so the reference uv and image
+  deployments keep working unchanged (decided 2026-08-17; `docs/DEPLOYMENT.md`). Trigger: a
+  report of a generated script escaping the guard in a way rlimits and the deny-list could
+  not have stopped.
 - **Persistent job store** — in-memory is a deliberate choice for the single-process
   deployment model ([Operational scale](./DEPLOYMENT.md#operational-scale)), not an
   oversight. Trigger: multi-process scale-out, which needs it moved to a shared backend

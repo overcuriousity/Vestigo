@@ -198,6 +198,15 @@ instead of rebuilding.
   to False and only the "Suggest with AI" endpoint sets it, so every automatic trigger
   scores locally; the analyst answers once per timeline — yes or no, both recorded — after a
   disclosure naming what is sent.
+- `converters/` — generated converters (1.13): the prompt rendered from the Parquet
+  contract (`prompt.py`), the head/middle/tail sample (`sample.py`), the stdlib-only guarded
+  runner (`runner.py`: AST deny-list + `python -I` + rlimits), the output validator
+  (`validate.py`), the one-shot typed generator on the agent plumbing (`generator.py`), and
+  the convert-and-ingest job (`job.py`) that hands the Parquet to
+  `api/routers/cases.py::register_source_for_ingest`. Off by default
+  (`converter_generation_enabled`); the produced Parquet *is* the source. See
+  `docs/INPUT_FORMATS.md` §"Generated converters" and `docs/AGENT.md` §"Outside the agent
+  loop".
 - `sigma/` — Sigma rule loader/compiler/router (`docs/ANOMALY_DETECTION.md` §13).
 - `stories/` — the Stories subsystem (blocks, snapshots, export). See `docs/STORIES.md`.
 - `transfer/` — case export/import (`.vestigo` archive).
