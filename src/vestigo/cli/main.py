@@ -350,10 +350,6 @@ def embed(
     asyncio.run(_run())
 
 
-if __name__ == "__main__":
-    app()
-
-
 # ── Generated converters ─────────────────────────────────────────────────
 
 converters_app = typer.Typer(help="Generated converter scripts (per case).")
@@ -403,7 +399,8 @@ def convert_ingest(
         if case_obj is None:
             typer.echo(f"ERROR: No case with id '{case}'.", err=True)
             raise typer.Exit(code=1)
-        tmp = Path(tempfile.mkdtemp(prefix="vestigo-cli-conv-")) / path_obj.name
+        tmp_dir = Path(tempfile.mkdtemp(prefix="vestigo-cli-conv-"))
+        tmp = tmp_dir / path_obj.name
         shutil.copy2(path_obj, tmp)
         jobs = JobStore()
         job = jobs.create(kind="convert_ingest", case_id=case_obj.id, created_by=actor.id)
@@ -416,6 +413,7 @@ def convert_ingest(
             filename=path_obj.name,
             hint=hint,
             reuse_script_id=converter,
+            raw_tmp_dir=tmp_dir,
         )
         task = asyncio.create_task(run_convert_ingest_job(job.id, inputs, job_store=jobs))
         last: str | None = None
@@ -477,3 +475,7 @@ def converters_download(
         typer.echo(f"wrote {output}")
 
     asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    app()

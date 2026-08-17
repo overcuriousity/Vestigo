@@ -16,7 +16,6 @@ import ast
 import contextlib
 import os
 import re
-import resource
 import selectors
 import shutil
 import subprocess
@@ -50,6 +49,13 @@ DENIED_MODULES = frozenset(
         "_thread",
         "webbrowser",
         "pty",
+        # The private modules the public ones above are built on — a script that
+        # imports ``_socket`` or ``_posixsubprocess`` directly gets the same answer.
+        "posix",
+        "_socket",
+        "_ssl",
+        "_posixsubprocess",
+        "_multiprocessing",
     }
 )
 DENIED_CALLS = frozenset({"exec", "eval", "compile", "__import__"})
@@ -140,20 +146,29 @@ class RunResult:
     killed_reason: str | None
 
 
-def _preexec(memory_mb: int, cpu_s: int, output_mb: int) -> Callable[[], None]:
-    def _apply() -> None:
-        os.setsid()
-        mem = memory_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s + 5))
-        out = output_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_FSIZE, (out, out))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+def _bootstrap(memory_mb: int, cpu_s: int, output_mb: int) -> str:
+    """Source of the ``-c`` stub that applies the rlimits *inside* the child, then execs.
+
+    Not ``preexec_fn``: that runs Python between fork and exec in a process
+    that may hold another thread's locks — documented unsafe, and this runner
+    is called from ``asyncio.to_thread`` inside a threaded uvicorn. The stub
+    runs after exec in a clean interpreter, sets the limits on itself, and
+    execs the real command; limits survive ``execv``. ``start_new_session``
+    on the ``Popen`` puts the whole tree in one killable group.
+    """
+    mem = memory_mb * 1024 * 1024
+    out = output_mb * 1024 * 1024
+    return (
+        "import os, resource, sys\n"
+        f"resource.setrlimit(resource.RLIMIT_AS, ({mem}, {mem}))\n"
+        f"resource.setrlimit(resource.RLIMIT_CPU, ({cpu_s}, {cpu_s + 5}))\n"
+        f"resource.setrlimit(resource.RLIMIT_FSIZE, ({out}, {out}))\n"
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))\n"
         # No RLIMIT_NPROC: on Linux it counts the *user's* processes, so any
         # useful value starves pyarrow's BLAS thread pool on a busy host while
         # stopping nothing a deny-listed `os.fork` did not already stop.
-
-    return _apply
+        "os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n"
+    )
 
 
 def run_converter(
@@ -165,9 +180,14 @@ def run_converter(
     memory_mb: int,
     output_mb: int,
     on_progress: Callable[[int], None] | None = None,
+    input_name: str | None = None,
 ) -> RunResult:
     """Run ``script`` on ``input_path`` writing ``output_path``; blocking.
 
+    The input is staged read-only under ``input_name`` (default: the path's own
+    basename) — pass the evidence file's real name when ``input_path`` is a
+    content-addressed retention copy, so the script's ``-i`` and therefore the
+    ``source_file``/``original_files`` it records name the evidence, not a hash.
     ``on_progress(n)`` fires for each stderr line ``progress <n>``.
     """
     workdir = Path(tempfile.mkdtemp(prefix="vestigo-conv-"))
@@ -177,7 +197,7 @@ def run_converter(
         script_path.chmod(0o400)
         in_dir = workdir / "input"
         in_dir.mkdir()
-        staged = in_dir / input_path.name
+        staged = in_dir / Path(input_name or input_path.name).name
         try:
             os.link(input_path, staged)
         except OSError:
@@ -202,6 +222,10 @@ def run_converter(
             sys.executable,
             "-I",
             "-B",
+            "-c",
+            _bootstrap(memory_mb, int(timeout_s), output_mb),
+            "-I",
+            "-B",
             str(script_path),
             "-i",
             str(staged),
@@ -217,7 +241,7 @@ def run_converter(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            preexec_fn=_preexec(memory_mb, int(timeout_s), output_mb),
+            start_new_session=True,
         )
         if proc.stderr is None:  # pragma: no cover — Popen(stderr=PIPE) guarantees it
             raise RuntimeError("stderr pipe missing")
@@ -251,6 +275,14 @@ def run_converter(
                     break
         finally:
             sel.close()
+        if not timed_out:
+            # stderr hit EOF (or the process exited): wait out the *remaining*
+            # deadline, not a fixed grace — a script that closed its stderr and
+            # kept running must still be reaped, and killed, on the same clock.
+            try:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
+            except subprocess.TimeoutExpired:
+                timed_out = True
         if timed_out:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, 9)

@@ -364,7 +364,10 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
 
 
 #: Stems added after the archive format shipped. An archive from an older
-#: version simply has no such member; that is not a malformed archive.
+#: version simply has no such member; that is not a malformed archive. Every
+#: other stem the exporter always writes, so its absence is a truncated or
+#: hand-edited archive and the import fails rather than restoring a case with,
+#: say, no annotations and reporting success (``tests/test_transfer_api.py``).
 _OPTIONAL_STEMS = frozenset({"converter_scripts"})
 
 

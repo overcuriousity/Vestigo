@@ -203,3 +203,113 @@ async def test_regenerate_bumps_version_and_enforces_footer(
     assert len(calls) == 2 and '"2.0.0"' in calls[1]
     for j in (j1, j2):
         clickhouse.delete_source_events(case.id, j.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_gz_upload_sees_the_same_name_in_both_phases(
+    store, clickhouse, tmp_path, monkeypatch
+):
+    import gzip
+
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+    case = await store.create_case("c", "d")
+    raw = tmp_path / "auth.log.gz"
+    raw.write_bytes(gzip.compress((FIX / "sample.syslog").read_bytes()))
+    inp = ConvertJobInputs(
+        case_id=case.id,
+        user=_fake_user(),
+        raw_tmp_path=raw,
+        raw_hash=hash_file(raw),
+        raw_size=raw.stat().st_size,
+        filename="auth.log.gz",
+    )
+    job = await _run(store, case.id, inp)
+    # The fixture handles .gz by suffix; one draft passes both the sample and
+    # the full run only if both phases stage the file as auth.log.gz.
+    assert job.status == "completed", job.error
+    assert len(calls) == 1
+    sid = job.result["source_id"]
+    rows, _ = clickhouse.list_events(case.id, sid, limit=5)
+    # source_file names the evidence file, not the retention hash.
+    assert rows and all(r["source_file"] == "auth.log.gz" for r in rows)
+    clickhouse.delete_source_events(case.id, sid)
+
+
+@pytest.mark.asyncio
+async def test_footer_name_must_match_the_row(store, clickhouse, tmp_path, monkeypatch):
+    renamed = GOOD.replace('CONVERTER_NAME = "syslog2vestigo"', 'CONVERTER_NAME = "other2vestigo"')
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([renamed, GOOD], calls))
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "completed", job.error
+    assert len(calls) == 2 and "converter_name" in calls[1]
+    src = await store.get_source(case.id, job.result["source_id"])
+    assert src.parser == "syslog2vestigo@1.0.0"
+    clickhouse.delete_source_events(case.id, job.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_fresh_generation_of_an_existing_name_redrafts_with_the_real_version(
+    store, clickhouse, tmp_path, monkeypatch
+):
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+    case = await store.create_case("c", "d")
+    j1 = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert j1.status == "completed", j1.error
+    raw2 = tmp_path / "auth2.log"
+    raw2.write_text((FIX / "sample.syslog").read_text().replace("web01", "web02"))
+    inp = ConvertJobInputs(
+        case_id=case.id,
+        user=_fake_user(),
+        raw_tmp_path=raw2,
+        raw_hash=hash_file(raw2),
+        raw_size=raw2.stat().st_size,
+        filename="auth2.log",
+    )
+    j2 = await _run(store, case.id, inp)
+    assert j2.status == "completed", j2.error
+    # First draft declared 1.0.0 (name unknown), the redraft was told v2 by name.
+    assert len(calls) == 3 and '"2.0.0"' in calls[2] and "syslog2vestigo" in calls[2]
+    s2 = await store.get_converter_script(case.id, j2.result["converter_script_id"])
+    assert s2.version == 2 and s2.status == "working"
+    # The discarded draft is on the record and did not cost an attempt.
+    assert [a["phase"] for a in s2.attempts] == ["generate", "sample", "full"]
+    assert "regenerating" in s2.attempts[0]["error"]
+    for j in (j1, j2):
+        clickhouse.delete_source_events(case.id, j.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_ingest_failure_is_on_the_converter_trail(store, tmp_path, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+    from vestigo.ingestion import pipeline as P
+
+    def boom(self, *a, **k):
+        raise RuntimeError("clickhouse is down")
+
+    monkeypatch.setattr(P.IngestionPipeline, "run", boom)
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "failed" and "clickhouse is down" in (job.error or "")
+    script = await store.get_converter_script(case.id, job.progress["converter_script_id"])
+    # The converter itself passed; the trail says its product never landed.
+    assert script.status == "working"
+    assert [a["phase"] for a in script.attempts] == ["sample", "full", "ingest"]
+    assert "clickhouse is down" in script.attempts[-1]["error"]
+    assert await store.list_sources(case.id) == []
+
+
+def test_traversal_filename_is_reduced_to_a_basename(tmp_path):
+    inp = ConvertJobInputs(
+        case_id="c",
+        user=_fake_user(),
+        raw_tmp_path=tmp_path / "x",
+        raw_hash="0" * 64,
+        raw_size=1,
+        filename="../../../../home/app/.bashrc",
+    )
+    assert inp.filename == ".bashrc"

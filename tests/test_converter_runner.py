@@ -121,3 +121,37 @@ def test_input_is_staged_read_only_and_args_are_passed(tmp_path):
     )
     r = _run(tmp_path, script)
     assert r.exit_code == 0, r.stderr_tail
+
+
+def test_closed_stderr_does_not_orphan_a_running_child(tmp_path):
+    # EOF on the stderr pipe while the child keeps running must still hit the
+    # deadline and kill the group — not escape as an uncaught TimeoutExpired.
+    r = _run(tmp_path, "import os, time\nos.close(2)\ntime.sleep(30)\n", timeout=2)
+    assert r.timed_out and r.exit_code != 0 and r.killed_reason == "timeout"
+    assert r.elapsed_ms < 10_000
+
+
+def test_input_is_staged_under_the_given_name(tmp_path):
+    # A retention copy is named by hash; the script must still see the evidence name.
+    inp = tmp_path / ("a" * 64)
+    inp.write_text("x\n")
+    script = (
+        "import sys, os\n"
+        "i = sys.argv[sys.argv.index('-i') + 1]\n"
+        "assert os.path.basename(i) == 'auth.log.gz', i\n"
+    )
+    r = run_converter(
+        script,
+        inp,
+        output_path=tmp_path / "out" / "out.parquet",
+        timeout_s=20,
+        memory_mb=2048,
+        output_mb=64,
+        input_name="../auth.log.gz",
+    )
+    assert r.exit_code == 0, r.stderr_tail
+
+
+def test_private_network_modules_are_denied():
+    for mod in ("_socket", "_posixsubprocess", "posix"):
+        assert check_script(f"import {mod}\n"), mod

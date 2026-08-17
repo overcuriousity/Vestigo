@@ -462,8 +462,8 @@ The only difference is `sources.converter_script_id`, which points at the script
 
 Exactly this, and the dialog says so before the analyst confirms: a bounded excerpt of the raw
 file (`converter_sample_bytes`, default 64 KiB — the head, a middle window and the tail, with
-absolute line numbers), the filename, its size, line count and mtime, the version the script
-must declare, and the analyst's optional hint. No case, source, timeline or user identifier,
+absolute line numbers), the filename, its size, line count and mtime, the version — and,
+once known, the name — the script must declare, and the analyst's optional hint. No case, source, timeline or user identifier,
 no key, no host name. Reusing a saved converter sends nothing. `tests/test_converter_prompt.py`
 asserts the rendered prompt against this list.
 
@@ -478,16 +478,25 @@ asserts the rendered prompt against this list.
    `subprocess`, `multiprocessing`, `ctypes`, `http`, `urllib`, `importlib`, `threading`,
    `shutil`, `tempfile` and friends, `exec`/`eval`/`compile`/`__import__`, and the destructive
    or process-spawning `os.*` calls. A violation costs an attempt.
-4. **Sample run.** The script runs on the head excerpt (written under the original filename)
-   with `python -I`, a scrubbed environment, a private working directory, `RLIMIT_AS`
+4. **Sample run.** The script runs on the head excerpt, staged under the upload's own
+   basename and — for a `.gz` upload — re-gzipped, so `-i` looks exactly as it will in the
+   full run (a script that handles `.gz` by suffix behaves the same in both phases, and the
+   `source_file` it records is the evidence file's name, never the retention hash). The
+   uploaded filename is reduced to a basename before it touches any path. The run is
+   `python -I` with a scrubbed environment, a private working directory, `RLIMIT_AS`
    (`converter_run_memory_mb`, ≥ 2048 — pyarrow's floor), `RLIMIT_CPU`, `RLIMIT_FSIZE`
-   (`converter_run_output_mb`), `RLIMIT_NOFILE`, and a 60 s wall clock.
+   (`converter_run_output_mb`) and `RLIMIT_NOFILE` — applied by a bootstrap *inside* the
+   child before it execs the script, not by `preexec_fn` — in its own session, and a 60 s
+   wall clock; the group is killed on the deadline even if the script closed its stderr.
 5. **Validate** (`converters/validate.py`). Enforced: schema and required footer keys
    (`validate_parquet_source`), `converter_version == "<n>.0.0"` for the version the task named,
-   `original_files[0].sha256` equal to the harness's own hash of the input, ≥ 1 row, no null
+   `converter_name` equal to the script row's name (so the footer identity that becomes
+   `Source.parser` cannot drift from the row), `original_files[0].sha256` equal to the
+   harness's own hash of the input, ≥ 1 row, no null
    in the four provenance columns, ≥ 50 % of rows not marked `attributes.parse_status =
    "unparsed"`, ≥ 50 % of rows with a timestamp. Reported only: the time range and whether
-   `byte_offset` is monotonic per file.
+   `byte_offset` is monotonic per file. The validator streams the Parquet in Arrow batches —
+   memory stays bounded however large the converter's output is.
 6. **Repair.** On failure the model gets the previous script, the structured report (failed
    checks with three offending rows each) and the stderr tail, and is asked for a complete
    replacement. Up to `converter_max_attempts` rounds (default 4).
@@ -496,7 +505,9 @@ asserts the rendered prompt against this list.
    format change the sample did not show, and sending more evidence than disclosed is not
    the harness's call. The analyst regenerates with a hint instead.
 8. **Ingest.** The Parquet goes through `register_source_for_ingest` and the same ingestion
-   job as an upload.
+   job as an upload. If that ingest fails, the script keeps its `working` status (its output
+   validated) but the failure is recorded as an `ingest` attempt and a `converter.run` audit
+   row, so the trail never asserts a conversion whose source does not exist.
 
 ### What is kept
 
@@ -505,8 +516,10 @@ asserts the rendered prompt against this list.
 `failed`), the source code, the model and endpoint used, `prompt_hash` (sha256 of exactly what
 was sent, plus the system-prompt version), the sample's hash **and** the sample text itself,
 the raw file's hash (it is retained content-addressed like any source so regeneration needs no
-re-upload), the hint, and `attempts` — every generation, sample run and full run with elapsed
-time, exit code, stderr tail, the validation report and the script's hash. Audit rows:
+re-upload), the hint, and `attempts` — every generation (including a first draft discarded
+because its proposed name already existed at a higher version), sample run, full run and
+ingest failure with elapsed time, exit code, stderr tail, the validation report and the
+script's hash. Audit rows:
 `converter.generate`, `converter.run`, `converter.regenerate`. Case export carries the rows and
 the raw files (`transfer/`); an archive from an older version simply has none.
 

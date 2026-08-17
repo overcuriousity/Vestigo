@@ -866,10 +866,26 @@ async def register_source_for_ingest(
             duplicate_of=existing_source,
         )
 
-    # Auto-add the new source to the case's default timeline.
-    default_timeline = await store.get_default_timeline(case_id)
-    if default_timeline is not None:
-        await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
+    # Auto-add the new source to the case's default timeline. From here on the
+    # row exists with status="ingesting", and nothing else will ever flip it:
+    # a failure must take the row (and an unshared retention copy) back out,
+    # or every re-upload of these bytes reads as "duplicate, still ingesting".
+    try:
+        default_timeline = await store.get_default_timeline(case_id)
+        if default_timeline is not None:
+            await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
+    except Exception:
+        try:
+            await store.delete_source(case_id, source_id)
+            if not await store.source_hash_in_use(file_hash, exclude_source_id=source_id):
+                retention_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 — the original error is the one to surface
+            logger.exception(
+                "Registration rollback: failed to remove source row %s (case %s)",
+                source_id,
+                case_id,
+            )
+        raise
 
     return RegisteredSource(source_id=source_id, parser=source_parser, fmt=fmt)
 

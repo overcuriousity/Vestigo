@@ -44,7 +44,6 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-import httpx
 from pydantic import BaseModel, Field
 
 from vestigo.columns.recommend import ColumnCandidate
@@ -168,11 +167,10 @@ async def rank_columns_with_llm(
     # Imported here, not at module scope: pydantic-ai and the agent runtime are
     # a heavy import chain, and this module is reachable from the CLI ingest
     # path where the LLM is usually not configured at all.
-    from vestigo.agent.availability import agent_available, probe_headers
+    from vestigo.agent.availability import agent_available
     from vestigo.agent.config import resolve_agent_config
-    from vestigo.agent.runtime import build_model, effort_model_settings
+    from vestigo.agent.oneshot import typed_completion
 
-    http_client: httpx.AsyncClient | None = None
     try:
         # One budget for the whole call. An endpoint that accepts a connection
         # and then stalls can hold the availability probe or config resolution
@@ -190,24 +188,13 @@ async def rank_columns_with_llm(
             prompt = _INSTRUCTIONS.format(
                 k_min=k_min, k_max=k_max, candidates=_format_candidates(shown)
             )
-
-            from pydantic_ai import Agent
-
-            http_client = httpx.AsyncClient(
-                headers=probe_headers(config), timeout=ADVISOR_TIMEOUT_SECONDS
-            )
-            model = build_model(config, http_client)
             # No toolsets and no system prompt beyond the instruction: this
             # call has nothing to call and nothing to remember.
-            agent = Agent(
-                model,
-                output_type=ColumnChoice,
-                toolsets=[],
-                model_settings=effort_model_settings(config),
+            output = await typed_completion(
+                config, prompt, output_type=ColumnChoice, timeout_s=ADVISOR_TIMEOUT_SECONDS
             )
-            result = await agent.run(prompt)
 
-        validated = _validate(result.output, shown, k_min=k_min, k_max=k_max)
+        validated = _validate(output, shown, k_min=k_min, k_max=k_max)
         if validated is None:
             logger.info("Column advisor response did not survive validation; keeping heuristic")
             return None
@@ -216,6 +203,3 @@ async def rank_columns_with_llm(
     except Exception:  # noqa: BLE001 — advisory call: degrade, never fail the job
         logger.warning("Column advisor call failed; keeping heuristic ranking", exc_info=True)
         return None
-    finally:
-        if http_client is not None:
-            await http_client.aclose()

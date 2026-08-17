@@ -16,9 +16,9 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import httpx
 from pydantic import BaseModel, Field
 
+from vestigo.agent.oneshot import typed_completion
 from vestigo.converters.prompt import SYSTEM_PROMPT_VERSION
 
 if TYPE_CHECKING:
@@ -74,23 +74,10 @@ def _strip_fences(script: str) -> str:
 
 
 async def _complete(config: AgentConfig, system: str, task: str, timeout_s: float) -> ScriptDraft:
-    """The wire call; tests replace this."""
-    from pydantic_ai import Agent
-
-    from vestigo.agent.availability import probe_headers
-    from vestigo.agent.runtime import build_model, effort_model_settings
-
-    async with httpx.AsyncClient(headers=probe_headers(config), timeout=timeout_s) as http_client:
-        model = build_model(config, http_client)
-        agent = Agent(
-            model,
-            output_type=ScriptDraft,
-            toolsets=[],
-            instructions=system,
-            model_settings=effort_model_settings(config),
-        )
-        result = await agent.run(task)
-        return result.output
+    """The wire call (:func:`vestigo.agent.oneshot.typed_completion`); tests replace this."""
+    return await typed_completion(
+        config, task, output_type=ScriptDraft, instructions=system, timeout_s=timeout_s
+    )
 
 
 async def generate_script(system: str, task: str, *, timeout_s: float = 180.0) -> GeneratedScript:

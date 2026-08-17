@@ -9,7 +9,7 @@ import type { Job } from "@/api/types";
 export interface TrackedJob extends Job {
   label: string;
   dismissed: boolean;
-  /** TanStack Query keys to invalidate when the job completes — e.g.
+  /** TanStack Query keys to invalidate when the job reaches a terminal state — e.g.
    * `[["sources", caseId]]` for an ingest job so the source list refreshes
    * with the final event count. */
   invalidate?: unknown[][];

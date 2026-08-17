@@ -1135,7 +1135,8 @@ class TestConverterScripts:
             scripts = await store.list_converter_scripts(result.case_id)
             by_version = {s.version: s for s in scripts}
             assert set(by_version) == {1, 2}
-            new_child = by_version[2]
+            new_child = await store.get_converter_script(result.case_id, by_version[2].id)
+            assert new_child is not None
             assert new_child.id != child.id and new_child.parent_id == by_version[1].id
             assert new_child.source_code == "print(2)\n"
             assert new_child.attempts == [{"n": 1, "phase": "sample"}]

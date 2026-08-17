@@ -21,7 +21,10 @@ function JobRow({ job }: { job: TrackedJob }) {
     queryFn: async () => {
       const j = await jobsApi.get(job.id);
       updateJob(j);
-      if (j.status === "completed") {
+      // Refresh on either terminal state: a failed AI conversion still leaves
+      // a script row (status "failed") the converters panel must stop showing
+      // as "generating".
+      if (j.status === "completed" || j.status === "failed") {
         for (const key of job.invalidate ?? []) {
           qc.invalidateQueries({ queryKey: key });
         }

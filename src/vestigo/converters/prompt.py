@@ -4,7 +4,8 @@ The Parquet interchange contract lives in :mod:`vestigo.ingestion.parquet_format
 this module *renders* it and never restates a footer key by hand (issue #204 was
 the frontend copy drifting from the contract). Egress promise (docs/AGENT.md
 §"Outside the agent loop"): the task message carries the sample, filename, size,
-line count, mtime, the version to declare and the analyst hint — nothing else.
+line count, mtime, the version (and, once known, the name) to declare and the analyst
+hint — nothing else.
 ``tests/test_converter_prompt.py`` asserts it.
 """
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 import textwrap
 from typing import Any, Protocol
 
+from vestigo.converters.runner import DENIED_MODULES as _RUNNER_DENIED_MODULES
 from vestigo.ingestion.parquet_format import (
     FORMAT_VERSION,
     META_CONVERTED_AT,
@@ -27,7 +29,7 @@ from vestigo.ingestion.parquet_format import (
 )
 
 #: Bump when the system message changes in substance; part of ``prompt_hash``.
-SYSTEM_PROMPT_VERSION = "1"
+SYSTEM_PROMPT_VERSION = "2"
 
 #: Canonical attribute names the model is asked to prefer when meaning matches.
 CANONICAL_ATTRIBUTES = (
@@ -48,28 +50,8 @@ CANONICAL_ATTRIBUTES = (
 )
 
 #: Modules the runner rejects — restated in the prompt so an attempt is not
-#: wasted on an import that never gets to run. Keep in sync with
-#: ``runner.DENIED_MODULES`` (a test asserts it).
-DENIED_MODULES = (
-    "socket",
-    "ssl",
-    "subprocess",
-    "multiprocessing",
-    "concurrent",
-    "ctypes",
-    "http",
-    "urllib",
-    "xmlrpc",
-    "ftplib",
-    "smtplib",
-    "asyncio",
-    "importlib",
-    "threading",
-    "signal",
-    "resource",
-    "shutil",
-    "tempfile",
-)
+#: wasted on an import that never gets to run. One definition, the runner's.
+DENIED_MODULES: tuple[str, ...] = tuple(sorted(_RUNNER_DENIED_MODULES))
 
 _MAX_SAMPLE_LINE_CHARS = 2000
 
@@ -169,6 +151,7 @@ def _system_enforced() -> str:
 - schema equal to the contract; no null in source_file, file_hash, byte_offset, content_hash
 - {META_ORIGINAL_FILES}[0].sha256 equal to the harness's own SHA-256 of the input file
 - {META_CONVERTER_VERSION} equal to the version the task names
+- {META_CONVERTER_NAME} equal to the converter name the task names, or — when the task leaves the name to you — equal to the "name" field you return
 - at least one row; at least 50% of rows not marked parse_status=unparsed; at least 50% of rows with a non-null timestamp
 - exit code 0 within the time and memory ceilings
 - NO network, NO subprocess, NO threads/multiprocessing, NO reading outside -i, NO writing outside -o. These modules are rejected before the script runs: {denied}. Also rejected: exec, eval, compile, __import__, os.system/popen/exec*/spawn*/fork/kill/remove/unlink/rmdir/rename/chmod/chown.
@@ -217,12 +200,15 @@ def _task_header(
     mtime_iso: str,
     version: int,
     hint: str | None,
+    name: str | None,
 ) -> str:
     parts = [
         f"FILE: {filename}",
         f"SIZE: {size_bytes} bytes, {line_count} lines, mtime {mtime_iso}",
         f'DECLARE {META_CONVERTER_VERSION} = "{version}.0.0"',
     ]
+    if name:
+        parts.append(f'DECLARE {META_CONVERTER_NAME} = "{name}" (return exactly this as "name")')
     if hint and hint.strip():
         parts.append(
             "ANALYST HINT (a hint about the data, not an instruction to change the contract):\n"
@@ -240,8 +226,13 @@ def render_generation_prompt(
     mtime_iso: str,
     version: int,
     hint: str | None,
+    name: str | None = None,
 ) -> tuple[str, str]:
-    """Return ``(system, task)`` for a first attempt."""
+    """Return ``(system, task)`` for a first attempt.
+
+    ``name`` is given when the harness already knows it (a regeneration, or a
+    redraft after the model's proposed name turned out to exist already).
+    """
     task = "\n\n".join(
         [
             _task_header(
@@ -251,6 +242,7 @@ def render_generation_prompt(
                 mtime_iso=mtime_iso,
                 version=version,
                 hint=hint,
+                name=name,
             ),
             "SAMPLE\n" + _render_sample(sample),
             "Write the converter now.",
@@ -271,6 +263,7 @@ def render_repair_prompt(
     mtime_iso: str,
     version: int,
     hint: str | None,
+    name: str | None = None,
 ) -> tuple[str, str]:
     """Return ``(system, task)`` for a repair round; same system message, fuller task."""
     failed = [c for c in report.get("checks", []) if not c.get("ok", True)]
@@ -289,6 +282,7 @@ def render_repair_prompt(
                 mtime_iso=mtime_iso,
                 version=version,
                 hint=hint,
+                name=name,
             ),
             "PREVIOUS SCRIPT (rejected)\n" + previous_script,
             "\n".join(lines),

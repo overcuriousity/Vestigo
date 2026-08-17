@@ -33,7 +33,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    defer,
+    mapped_column,
+    relationship,
+    selectinload,
+)
 
 from vestigo.core.config import get_settings
 
@@ -2390,10 +2397,16 @@ class PostgresStore:
             return row if row is not None and row.case_id == case_id else None
 
     async def list_converter_scripts(self, case_id: str) -> list[ConverterScript]:
-        """Newest first."""
+        """Newest first, without the two large Text columns the list surfaces never show.
+
+        ``source_code`` and ``sample_excerpt`` are deferred; the rows come from a
+        closed session, so reading either on a listed row is a programming error
+        — use :meth:`get_converter_script` for one script with its code.
+        """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(ConverterScript)
+                .options(defer(ConverterScript.source_code), defer(ConverterScript.sample_excerpt))
                 .where(ConverterScript.case_id == case_id)
                 .order_by(ConverterScript.created_at.desc())
             )

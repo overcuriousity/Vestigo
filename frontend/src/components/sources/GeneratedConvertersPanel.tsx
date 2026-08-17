@@ -9,7 +9,7 @@
  * the exact sample that was sent to the model. Renders nothing when the
  * feature is off *and* the case has no scripts; scripts outlive the switch.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { Download, RefreshCw, Wand2 } from "lucide-react";
@@ -22,6 +22,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/Dialog";
 import { Input } from "@/components/ui/Input";
+import { fmtTimestamp } from "@/lib/time";
 
 interface Props {
   caseId: string;
@@ -31,12 +32,6 @@ function statusVariant(status: ConverterScript["status"]): "success" | "danger" 
   if (status === "working") return "success";
   if (status === "failed") return "danger";
   return "default";
-}
-
-function fmtWhen(iso: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
 }
 
 function AttemptRow({ a }: { a: ConverterAttempt }) {
@@ -210,7 +205,13 @@ function RegenerateDialog({
 export function GeneratedConvertersPanel({ caseId }: Props) {
   const caps = useCapabilities();
   const [params] = useSearchParams();
-  const [expanded, setExpanded] = useState<string | null>(params.get("converter"));
+  const linked = params.get("converter");
+  const [expanded, setExpanded] = useState<string | null>(linked);
+  // The job tray's "View converter attempts" link only changes the search
+  // param while this panel stays mounted, so follow it — not just seed from it.
+  useEffect(() => {
+    if (linked) setExpanded(linked);
+  }, [linked]);
   const [regen, setRegen] = useState<ConverterScript | null>(null);
   const { data } = useQuery({
     queryKey: ["converters", caseId],
@@ -254,7 +255,7 @@ export function GeneratedConvertersPanel({ caseId }: Props) {
                     </div>
                     <p className="mt-0.5 truncate text-xs text-[var(--color-fg-muted)]">
                       {s.model ?? "?"} · {s.sources_produced ?? 0} source
-                      {(s.sources_produced ?? 0) === 1 ? "" : "s"} · {fmtWhen(s.created_at)}
+                      {(s.sources_produced ?? 0) === 1 ? "" : "s"} · {fmtTimestamp(s.created_at)}
                     </p>
                   </Button>
                   <div className="flex shrink-0 items-center gap-0.5">

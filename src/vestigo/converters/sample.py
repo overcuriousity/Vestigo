@@ -92,17 +92,23 @@ def build_sample(path: Path, budget_bytes: int) -> Sample:
         tail_b = budget_bytes - head_b - mid_b
         head_text = read_lines(0, head_b)
         head_lines = head_text.count("\n") + 1
+        blocks = [("head", 1, head_text)]
+        # Every index below is clamped to the lines that exist: a file that is
+        # one enormous line (minified JSON, CR-only endings) has line_count == 1
+        # and must not index past it. Blocks that would repeat the head are
+        # dropped rather than duplicated.
+        next_idx = head_lines
         mid_idx = max(_index_at_byte(offsets, total // 2), head_lines)
-        mid_text = read_lines(mid_idx, mid_b)
-        mid_lines = mid_text.count("\n") + 1
-        tail_idx = max(_index_at_byte(offsets, max(total - tail_b, 0)), mid_idx + mid_lines)
-        tail_idx = min(tail_idx, line_count - 1)
-        tail_text = read_lines(tail_idx, total - offsets[tail_idx])
-        blocks = [
-            ("head", 1, head_text),
-            ("middle", mid_idx + 1, mid_text),
-            ("tail", tail_idx + 1, tail_text),
-        ]
+        if mid_idx < line_count:
+            mid_text = read_lines(mid_idx, mid_b)
+            blocks.append(("middle", mid_idx + 1, mid_text))
+            next_idx = mid_idx + mid_text.count("\n") + 1
+        # Tail: whole lines that start inside the last ``tail_b`` bytes, capped
+        # at the budget so one huge last line cannot blow the disclosed size.
+        tail_idx = max(bisect.bisect_left(offsets, max(total - tail_b, 0)), next_idx)
+        if tail_idx < line_count:
+            tail_text = read_lines(tail_idx, min(total - offsets[tail_idx], tail_b))
+            blocks.append(("tail", tail_idx + 1, tail_text))
     text = "\n".join(b[2] for b in blocks)
     return Sample(
         blocks=blocks,
@@ -114,9 +120,31 @@ def build_sample(path: Path, budget_bytes: int) -> Sample:
     )
 
 
+def safe_filename(name: str | None, default: str = "input.log") -> str:
+    """Reduce a client-supplied filename to a plain basename.
+
+    The multipart ``filename`` is attacker-controlled and is joined onto
+    temporary directories (the sample-phase input, the regenerate copy), so it
+    must never carry a directory component; ``..``/``.``/empty fall back to
+    *default*.
+    """
+    base = Path((name or "").replace("\\", "/")).name.strip()
+    if base in {"", ".", ".."}:
+        return default
+    return base
+
+
 def sample_as_file(sample: Sample, dest_dir: Path, filename: str) -> Path:
-    """Write the head block as ``dest_dir/filename`` (the sample-phase input file)."""
+    """Write the head block as ``dest_dir/<basename(filename)>`` — the sample-phase input.
+
+    The sample file must look to the script exactly like the full file will:
+    same name and, for a ``.gz`` upload, gzip bytes — so a converter that
+    handles ``.gz`` by suffix behaves the same in both phases.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    out = dest_dir / filename
-    out.write_text(sample.blocks[0][2] + "\n", encoding="utf-8")
+    out = dest_dir / safe_filename(filename)
+    data = (sample.blocks[0][2] + "\n").encode("utf-8")
+    if out.suffix == ".gz":
+        data = gzip.compress(data, mtime=0)
+    out.write_bytes(data)
     return out

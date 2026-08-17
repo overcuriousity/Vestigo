@@ -156,3 +156,49 @@ def test_convert_requires_contribute(client, admin_bootstrap, enabled, stub_job)
     client.post("/api/auth/logout")
     r = client.post(f"/api/cases/{cid}/converters/convert", files={"file": ("a.log", b"x\n")})
     assert r.status_code == 401
+
+
+def test_upload_filename_cannot_carry_a_path(client, admin_bootstrap, enabled, stub_job):
+    as_admin(client, admin_bootstrap)
+    cid = _case(client)
+    r = client.post(
+        f"/api/cases/{cid}/converters/convert",
+        files={"file": ("../../../../home/app/.bashrc", b"Jan  5 10:00:01 h p: m\n")},
+    )
+    assert r.status_code == 202, r.text
+    assert stub_job[-1].filename == ".bashrc"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_uses_a_basename_and_a_private_dir(
+    client, admin_bootstrap, enabled, stub_job, store
+):
+    admin = as_admin(client, admin_bootstrap)
+    cid = _case(client)
+    row = await store.create_converter_script(
+        case_id=cid,
+        name="x2vestigo",
+        version=1,
+        raw_file_hash="b" * 64,
+        raw_filename="../../../../etc/evil.log",
+        model="m",
+        provider_endpoint="e",
+        prompt_hash="p",
+        sample_hash="s",
+        sample_excerpt="SAMPLE",
+        hint=None,
+        created_by=admin["id"],
+        status="working",
+    )
+    p = retention_path("b" * 64)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("Jan  5 10:00:01 h p: m\n")
+    try:
+        r = client.post(f"/api/cases/{cid}/converters/{row.id}/regenerate", json={})
+    finally:
+        p.unlink(missing_ok=True)
+    assert r.status_code == 202, r.text
+    last = stub_job[-1]
+    assert last.filename == "evil.log"
+    assert last.raw_tmp_dir is not None and last.raw_tmp_path.parent == last.raw_tmp_dir
+    assert last.raw_tmp_dir.name.startswith("vestigo-regen-")

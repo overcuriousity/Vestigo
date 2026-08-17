@@ -42,7 +42,7 @@ from vestigo.api.deps import (
 )
 from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.converters.job import ConvertJobInputs, run_convert_ingest_job
-from vestigo.converters.sample import NotTextError, assert_text_file
+from vestigo.converters.sample import NotTextError, assert_text_file, safe_filename
 from vestigo.core.config import get_settings
 from vestigo.core.jobs import get_job_store
 from vestigo.core.retention import retain_file, retention_path
@@ -240,7 +240,8 @@ async def regenerate_case_converter(
             detail="The raw file this converter was written from is no longer retained",
         )
     # The job unlinks its raw_tmp_path when done, so hand it a private link/copy.
-    tmp = Path(tempfile.mkdtemp(prefix="vestigo-regen-")) / (row.raw_filename or "input.log")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="vestigo-regen-"))
+    tmp = tmp_dir / safe_filename(row.raw_filename)
     await run_in_threadpool(retain_file, raw, tmp)
     job_store = get_job_store()
     job = job_store.create(
@@ -256,10 +257,11 @@ async def regenerate_case_converter(
         raw_tmp_path=tmp,
         raw_hash=row.raw_file_hash,
         raw_size=raw.stat().st_size,
-        filename=row.raw_filename or tmp.name,
+        filename=tmp.name,
         hint=hint,
         parent_id=row.id,
         name_hint=row.name,
+        raw_tmp_dir=tmp_dir,
     )
     await store.record_audit(
         action="converter.regenerate",

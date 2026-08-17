@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 
 from vestigo.converters.generator import GeneratedScript, GenerationUnavailable, generate_script
 from vestigo.converters.prompt import render_generation_prompt, render_repair_prompt
 from vestigo.converters.runner import RunResult, check_script, run_converter
-from vestigo.converters.sample import Sample, build_sample, sample_as_file
+from vestigo.converters.sample import Sample, build_sample, safe_filename, sample_as_file
 from vestigo.converters.validate import Check, ValidationReport, validate_output
 from vestigo.core.config import get_settings
 from vestigo.core.jobs import JobStore
@@ -54,6 +55,14 @@ class ConvertJobInputs:
     #: Regeneration: keep the parent's name so the version is known before the
     #: first prompt (a fresh generation learns the name from the model).
     name_hint: str | None = None
+    #: A private scratch directory the caller made for ``raw_tmp_path`` (the
+    #: regenerate route and the CLI do); the job removes it when done.
+    raw_tmp_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        # The upload's filename is client-controlled and gets joined onto temp
+        # directories (sample file, staged input) — a bare basename, always.
+        self.filename = safe_filename(self.filename)
 
 
 class _Attempts:
@@ -115,10 +124,17 @@ async def _run_and_validate(
     *,
     raw_sha256: str,
     version: int,
+    name: str | None,
+    input_name: str,
     timeout_s: float,
     on_progress: Any = None,
 ) -> tuple[RunResult, ValidationReport, Path]:
-    """Run the script and validate what it wrote; the report is never ``None``."""
+    """Run the script and validate what it wrote; the report is never ``None``.
+
+    ``input_name`` is what the script sees as ``-i`` — the evidence file's real
+    name in both the sample and the full run, so a ``.gz``-by-suffix script and
+    the recorded ``source_file`` behave the same in both phases.
+    """
     s = get_settings()
     out_dir = Path(tempfile.mkdtemp(prefix="vestigo-conv-out-"))
     out = out_dir / "events.parquet"
@@ -131,17 +147,24 @@ async def _run_and_validate(
         memory_mb=s.converter_run_memory_mb,
         output_mb=s.converter_run_output_mb,
         on_progress=on_progress,
+        input_name=input_name,
     )
     if result.exit_code == 0 and out.exists():
         report = await asyncio.to_thread(
-            validate_output, out, raw_sha256=raw_sha256, expected_version=version
+            validate_output,
+            out,
+            raw_sha256=raw_sha256,
+            expected_version=version,
+            expected_name=name,
         )
     else:
         report = _run_failure_report(result)
     return result, report, out
 
 
-def _prompt_kwargs(inputs: ConvertJobInputs, sample: Sample, version: int) -> dict[str, Any]:
+def _prompt_kwargs(
+    inputs: ConvertJobInputs, sample: Sample, version: int, name: str | None
+) -> dict[str, Any]:
     return {
         "sample": sample,
         "filename": inputs.filename,
@@ -150,7 +173,47 @@ def _prompt_kwargs(inputs: ConvertJobInputs, sample: Sample, version: int) -> di
         "mtime_iso": sample.mtime_iso,
         "version": version,
         "hint": inputs.hint,
+        "name": name,
     }
+
+
+async def _create_row(
+    store: PostgresStore,
+    inputs: ConvertJobInputs,
+    sample: Sample,
+    gen: GeneratedScript,
+    *,
+    name: str,
+    version: int,
+) -> tuple[Any, int]:
+    """Insert the script row, walking the version forward on a lost race.
+
+    ``next_converter_version`` is a plain read; two concurrent generations that
+    propose the same name both compute the same number and the second insert
+    hits the ``(case, name, version)`` unique index. Retry with the next free
+    version rather than dying — the caller re-prompts if the number moved.
+    """
+    for _ in range(8):
+        try:
+            row = await store.create_converter_script(
+                case_id=inputs.case_id,
+                name=name,
+                version=version,
+                raw_file_hash=inputs.raw_hash,
+                raw_filename=inputs.filename,
+                model=gen.model,
+                provider_endpoint=gen.provider_endpoint,
+                prompt_hash=gen.prompt_hash,
+                sample_hash=sample.sha256,
+                sample_excerpt=sample.text,
+                hint=inputs.hint,
+                created_by=inputs.user.id,
+                parent_id=inputs.parent_id,
+            )
+            return row, version
+        except IntegrityError:
+            version = await store.next_converter_version(inputs.case_id, name)
+    raise RuntimeError(f"could not allocate a version for converter {name!r}")
 
 
 async def _generate_loop(
@@ -176,11 +239,14 @@ async def _generate_loop(
     report: ValidationReport | None = None
     stderr_tail = ""
     gen: GeneratedScript | None = None
+    fresh = True  # next prompt is a generation prompt (not a repair of ``script``)
+    n = 0
     sample_dir = Path(tempfile.mkdtemp(prefix="vestigo-conv-sample-"))
     try:
         sample_file = sample_as_file(sample, sample_dir, inputs.filename)
         sample_sha = hash_file(sample_file)
-        for n in range(1, max_attempts + 1):
+        while n < max_attempts:
+            n += 1
             _phase(
                 job_store,
                 job_id,
@@ -189,14 +255,16 @@ async def _generate_loop(
                 max_attempts=max_attempts,
                 converter_script_id=script_id,
             )
-            if n == 1:
-                system, task = render_generation_prompt(**_prompt_kwargs(inputs, sample, version))
+            if fresh:
+                system, task = render_generation_prompt(
+                    **_prompt_kwargs(inputs, sample, version, name)
+                )
             else:
                 system, task = render_repair_prompt(
                     previous_script=script,
                     report=report.to_dict() if report else {"ok": False, "checks": []},
                     stderr_tail=stderr_tail,
-                    **_prompt_kwargs(inputs, sample, version),
+                    **_prompt_kwargs(inputs, sample, version, name),
                 )
             try:
                 gen = await generate_script(system, task)
@@ -216,35 +284,37 @@ async def _generate_loop(
                     )
                 continue
             if script_id is None:
+                declared = version
                 if name is None:
                     name = gen.name
                     version = await store.next_converter_version(inputs.case_id, name)
-                    if version != 1:
-                        # The task named 1.0.0 and the footer check would fail;
-                        # ask once more with the real version (rare: a fresh
-                        # generation whose proposed name already exists).
-                        system, task = render_generation_prompt(
-                            **_prompt_kwargs(inputs, sample, version)
-                        )
-                        gen = await generate_script(system, task)
-                row = await store.create_converter_script(
-                    case_id=inputs.case_id,
-                    name=name,
-                    version=version,
-                    raw_file_hash=inputs.raw_hash,
-                    raw_filename=inputs.filename,
-                    model=gen.model,
-                    provider_endpoint=gen.provider_endpoint,
-                    prompt_hash=gen.prompt_hash,
-                    sample_hash=sample.sha256,
-                    sample_excerpt=sample.text,
-                    hint=inputs.hint,
-                    created_by=inputs.user.id,
-                    parent_id=inputs.parent_id,
+                row, version = await _create_row(
+                    store, inputs, sample, gen, name=name, version=version
                 )
                 script_id = row.id
                 attempts = _Attempts(store, script_id, None)
                 job_store.update(job_id, progress={"converter_script_id": script_id})
+                if version != declared:
+                    # The draft declared a version the harness would reject
+                    # (a fresh generation whose proposed name already exists,
+                    # or a lost race for the number). Record the draft and ask
+                    # again with the real name and version; not counted as an
+                    # attempt — the model did nothing wrong.
+                    await attempts.record(
+                        "generate",
+                        model=gen.model,
+                        result=None,
+                        report=None,
+                        script=gen.script,
+                        error=(
+                            f"draft declared version {declared}.0.0 but {name} is at "
+                            f"v{version}; regenerating with the real name and version"
+                        ),
+                    )
+                    n -= 1
+                    fresh = True
+                    continue
+            fresh = False
             assert attempts is not None  # noqa: S101 — set together with script_id
             script = gen.script
             violations = check_script(script)
@@ -268,6 +338,8 @@ async def _generate_loop(
                 sample_file,
                 raw_sha256=sample_sha,
                 version=version,
+                name=name,
+                input_name=inputs.filename,
                 timeout_s=min(SAMPLE_RUN_TIMEOUT_S, settings.converter_run_timeout_seconds),
             )
             shutil.rmtree(out.parent, ignore_errors=True)
@@ -343,11 +415,11 @@ async def run_convert_ingest_job(
             row = await store.get_converter_script(inputs.case_id, inputs.reuse_script_id)
             if row is None or row.status != "working" or not row.source_code:
                 raise RuntimeError("converter script is not reusable (missing or not working)")
-            script_id, script, version = row.id, row.source_code, row.version
+            script_id, script, version, name = row.id, row.source_code, row.version, row.name
             attempts = _Attempts(store, script_id, row.attempts)
             job_store.update(job_id, progress={"converter_script_id": script_id})
         else:
-            script_id, script, version, _name, attempts = await _generate_loop(
+            script_id, script, version, name, attempts = await _generate_loop(
                 store=store, job_store=job_store, job_id=job_id, inputs=inputs, sample=sample
             )
 
@@ -369,6 +441,8 @@ async def run_convert_ingest_job(
             retention_path(inputs.raw_hash),
             raw_sha256=inputs.raw_hash,
             version=version,
+            name=name,
+            input_name=inputs.filename,
             timeout_s=settings.converter_run_timeout_seconds,
             on_progress=on_progress,
         )
@@ -413,7 +487,8 @@ async def run_convert_ingest_job(
         except HTTPException as exc:
             raise RuntimeError(f"produced Parquet was rejected: {exc.detail}") from exc
         if reg.duplicate_of is not None:
-            parquet_out = None  # the helper unlinked it
+            shutil.rmtree(parquet_out.parent, ignore_errors=True)  # the helper unlinked the file
+            parquet_out = None
             job_store.update(
                 job_id,
                 status="completed",
@@ -445,6 +520,24 @@ async def run_convert_ingest_job(
             job_store.update(
                 job_id, result={**(job.result or {}), "converter_script_id": script_id}
             )
+        else:
+            # _run_ingestion_job swallowed the failure (marked the job, deleted
+            # the source). The converter itself passed — its status stays — but
+            # the trail must say its product never landed, or the last attempt
+            # would assert a successful conversion whose source does not exist.
+            ingest_error = (job.error if job else None) or "ingest failed"
+            await attempts.record(
+                "ingest", model=None, result=None, report=None, script=None, error=ingest_error
+            )
+            await store.record_audit(
+                action="converter.run",
+                actor=inputs.user,
+                case_id=inputs.case_id,
+                target_type="converter_script",
+                target_id=script_id,
+                detail={"phase": "ingest", "ok": False, "error": ingest_error},
+            )
+            raise RuntimeError(f"ingest of the produced Parquet failed: {ingest_error}")
     except Exception as exc:  # noqa: BLE001 — every failure lands on the job
         logger.warning("convert_ingest job %s failed: %s", job_id, exc, exc_info=True)
         # The generate loop already published the script id on the job before
@@ -461,5 +554,7 @@ async def run_convert_ingest_job(
         )
     finally:
         inputs.raw_tmp_path.unlink(missing_ok=True)
+        if inputs.raw_tmp_dir is not None:
+            shutil.rmtree(inputs.raw_tmp_dir, ignore_errors=True)
         if parquet_out is not None:
             shutil.rmtree(parquet_out.parent, ignore_errors=True)

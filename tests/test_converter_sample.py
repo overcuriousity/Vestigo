@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from vestigo.converters.sample import NotTextError, assert_text_file, build_sample, sample_as_file
+from vestigo.converters.sample import (
+    NotTextError,
+    assert_text_file,
+    build_sample,
+    safe_filename,
+    sample_as_file,
+)
 
 
 def _write(tmp_path: Path, n: int, name: str = "a.log") -> Path:
@@ -69,3 +75,51 @@ def test_sample_as_file_writes_head_under_original_name(tmp_path):
     s = build_sample(p, budget_bytes=2048)
     out = sample_as_file(s, tmp_path / "in", "app.log")
     assert out.name == "app.log" and out.read_text() == s.blocks[0][2] + "\n"
+
+
+def test_single_huge_line_does_not_crash_and_stays_in_budget(tmp_path):
+    # One 100 KB line, no newline at all (a minified JSON blob): line_count == 1
+    # and no index may run past it; the excerpt must respect the budget too.
+    p = tmp_path / "blob.json"
+    p.write_bytes(b"x" * 100_000)
+    s = build_sample(p, budget_bytes=65536)
+    assert s.line_count == 1 and [b[0] for b in s.blocks] == ["head"]
+    assert len(s.text.encode()) <= 65536
+
+
+def test_huge_last_line_cannot_blow_the_budget(tmp_path):
+    p = tmp_path / "a.log"
+    p.write_bytes(b"".join(b"line %05d\n" % i for i in range(5000)) + b"y" * 500_000)
+    s = build_sample(p, budget_bytes=65536)
+    assert len(s.text.encode()) <= 65536 + 3 * 200
+    for _label, first, text in s.blocks:
+        assert 1 <= first <= 5001 and text
+
+
+def test_safe_filename_strips_directories():
+    assert safe_filename("../../../../home/app/.bashrc") == ".bashrc"
+    assert safe_filename("/etc/passwd") == "passwd"
+    assert safe_filename("C:\\evil\\x.log") == "x.log"
+    assert safe_filename("..") == "input.log"
+    assert safe_filename("") == "input.log"
+    assert safe_filename(None) == "input.log"
+    assert safe_filename("auth.log.gz") == "auth.log.gz"
+
+
+def test_sample_as_file_never_leaves_dest_dir(tmp_path):
+    p = _write(tmp_path, 3)
+    s = build_sample(p, budget_bytes=2048)
+    out = sample_as_file(s, tmp_path / "in", "../../escape.log")
+    assert out.parent == tmp_path / "in" and out.name == "escape.log"
+
+
+def test_sample_as_file_keeps_gz_encoding_for_gz_uploads(tmp_path):
+    raw = "".join(f"l{i}\n" for i in range(50)).encode()
+    p = tmp_path / "a.log.gz"
+    p.write_bytes(gzip.compress(raw))
+    s = build_sample(p, budget_bytes=65536)
+    out = sample_as_file(s, tmp_path / "in", "a.log.gz")
+    # Same name and same encoding as the full file: a script that handles .gz
+    # by suffix behaves identically in the sample and the full run.
+    assert out.name == "a.log.gz"
+    assert gzip.decompress(out.read_bytes()) == s.blocks[0][2].encode() + b"\n"

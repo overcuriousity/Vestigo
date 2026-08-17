@@ -1,6 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-17 (session 175 — generated converters, towards 1.13).
+Last updated: 2026-08-17 (session 176 — PR #277 review fixes for generated converters).
+
+## Session 176 — 2026-08-17: PR #277 review — every finding fixed
+
+`/code-review 277` on the generated-converters branch; all findings addressed in one pass
+(`docs/archive/PR277_REVIEW_FINDINGS.md` has the full set):
+
+- **Path traversal via the multipart filename** — the upload's `filename` was joined onto
+  temp dirs unsanitised (sample file, regenerate copy, later `unlink()`). `sample.safe_filename`
+  reduces it to a basename everywhere it is used; `ConvertJobInputs` applies it on construction.
+- **Sample and full run now see the same file** — the runner stages the retention copy under
+  the evidence filename (`input_name`), and a `.gz` upload's head sample is re-gzipped, so a
+  suffix-driven script behaves identically in both phases and `source_file` names the
+  evidence, not the hash.
+- **`build_sample` on a one-line file** no longer indexes past `line_count`; the tail block is
+  capped at its budget so one huge last line cannot exceed the disclosed size.
+- **`register_source_for_ingest` rolls back** the freshly created `ingesting` row (and an
+  unshared retention copy) when the timeline add fails, closing the orphan-row gap for both
+  the upload endpoint and the converter job.
+- **`validate_output` streams** the Parquet in Arrow batches (`map_lookup` for the unparsed
+  flag, per-batch null counts, an offset-order tracker) — bounded memory in the API process.
+- **Generation loop** — the "name already exists at v>1" redraft moved inside the loop and is
+  recorded as a `generate` attempt without costing one; a lost `(case, name, version)` race
+  retries with the next version instead of an unhandled `IntegrityError`.
+- **Ingest failure after a valid conversion** is recorded as an `ingest` attempt plus a
+  `converter.run` audit row and fails the job with the reason.
+- **Runner**: rlimits are applied by a `-c` bootstrap inside the child (no `preexec_fn`
+  from a threaded process); stderr EOF while the child runs now waits out the deadline and
+  kills the group; `posix`/`_socket`/`_ssl`/`_posixsubprocess`/`_multiprocessing` denied,
+  and the prompt reads the runner's list rather than a hand copy (system prompt v2).
+- **Converter name is enforced**: the task header declares it once known, and
+  `validate_output` checks the footer's `converter_name` against the row.
+- **UI**: the tray's "View converter attempts" link is followed while the panel is mounted;
+  invalidation fires on `failed` too; timestamps render in UTC like the rest of the app.
+- Cleanups: `typed_completion` (`agent/oneshot.py`) shared by the column advisor and the
+  generator; list endpoint defers the two large Text columns; scratch dirs removed on every
+  path; CLI commands registered before the `__main__` guard; duplicate TS interfaces gone.
+  One suggested cleanup was declined: generalising the importer's missing-stem rule would
+  let a truncated archive restore silently (`test_incomplete_archive_fails_the_job`), so
+  `_OPTIONAL_STEMS` stays explicit, now with the reason on it.
 
 ## Session 175 — 2026-08-17: generated converters — the model writes the script, the harness runs it
 
