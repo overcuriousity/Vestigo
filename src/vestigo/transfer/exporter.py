@@ -37,6 +37,7 @@ from vestigo.db.postgres import (
     AuditLog,
     BaselineDefinition,
     Case,
+    ConverterScript,
     DetectorRun,
     FindingDisposition,
     PostgresStore,
@@ -58,6 +59,7 @@ from vestigo.transfer.archive import FORMAT_VERSION, ArchiveWriter, cap_warnings
 # WHERE timeline_id IN (case's timelines), "conversation" = WHERE
 # conversation_id IN (case's conversations). Insertion order = export order.
 _EXPORT_ENTITIES: list[tuple[str, type, str]] = [
+    ("converter_scripts", ConverterScript, "case"),
     ("sources", Source, "case"),
     ("timelines", Timeline, "case"),
     ("timeline_sources", TimelineSource, "timeline"),
@@ -356,6 +358,12 @@ async def export_case(
             source_by_hash: dict[str, dict[str, Any]] = {}
             for s in sources:
                 source_by_hash.setdefault(s["file_hash"], s)
+            # Generated converters reference the raw file they were written
+            # from; it travels too so a regeneration works after import.
+            for c in stems.get("converter_scripts", []):
+                source_by_hash.setdefault(
+                    c["raw_file_hash"], {"name": f"raw input of {c['name']} v{c['version']}"}
+                )
             blob_hashes = list(source_by_hash)
             _progress("blobs", total=len(blob_hashes))
             for done, file_hash in enumerate(blob_hashes, start=1):

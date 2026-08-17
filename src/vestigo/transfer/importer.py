@@ -50,6 +50,7 @@ from vestigo.db.postgres import (
     Annotation,
     AuditLog,
     BaselineDefinition,
+    ConverterScript,
     DetectorRun,
     FindingDisposition,
     PostgresStore,
@@ -76,7 +77,16 @@ _USER_LOOKUP_BATCH = 1000
 
 # Insertion order = dependency order. Refs map column → remap kind.
 _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
-    ("sources", Source, {"id": "source", "case_id": "case"}),
+    (
+        "converter_scripts",
+        ConverterScript,
+        {"id": "converter_script", "case_id": "case", "parent_id": "converter_script"},
+    ),
+    (
+        "sources",
+        Source,
+        {"id": "source", "case_id": "case", "converter_script_id": "converter_script"},
+    ),
     ("timelines", Timeline, {"id": "timeline", "case_id": "case"}),
     ("timeline_sources", TimelineSource, {"timeline_id": "timeline", "source_id": "source"}),
     (
@@ -278,6 +288,8 @@ def _prescan_ids(reader: ArchiveReader, idmap: _IdMap) -> None:
     pairs: list[tuple[str, str]] = []
     old_ids: set[str] = set()
     for stem, _model, refs in _IMPORT_SPECS:
+        if _stem_absent(reader, stem):
+            continue
         for row in reader.iter_ndjson(f"postgres/{stem}.ndjson"):
             for column, kind in refs.items():
                 value = row.get(column)
@@ -349,6 +361,16 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
                 value = datetime.fromisoformat(value)
         values[col.name] = value
     return model(**values)
+
+
+#: Stems added after the archive format shipped. An archive from an older
+#: version simply has no such member; that is not a malformed archive.
+_OPTIONAL_STEMS = frozenset({"converter_scripts"})
+
+
+def _stem_absent(reader: ArchiveReader, stem: str) -> bool:
+    """True when an *optional* stem's member is not in the (verified) archive."""
+    return stem in _OPTIONAL_STEMS and f"postgres/{stem}.ndjson" not in reader.verified_names
 
 
 def _source_ref(row: dict[str, Any]) -> tuple[str, str]:
@@ -520,12 +542,20 @@ async def import_case(
             # collected while this loop already has the stem open rather than
             # by re-parsing sources.ndjson a third time.
             source_refs: list[tuple[str, str]] = []
+            # Raw inputs of generated converters: blobs an archive may carry
+            # that no source row claims.
+            converter_raw_hashes: set[str] = set()
             for stem, model, refs in _IMPORT_SPECS:
                 rows_seen = 0
+                if _stem_absent(reader, stem):
+                    counts[stem] = 0
+                    continue
                 for row in reader.iter_ndjson(f"postgres/{stem}.ndjson"):
                     rows_seen += 1
                     if stem == "sources":
                         source_refs.append(_source_ref(row))
+                    elif stem == "converter_scripts" and row.get("raw_file_hash"):
+                        converter_raw_hashes.add(str(row["raw_file_hash"]))
                     obj = _revive(model, row, idmap, refs)
                     if isinstance(obj, Timeline):
                         if row.get("embedding_config_hash"):
@@ -593,7 +623,7 @@ async def import_case(
         # source actually claims may land in it. Content is verified against
         # the member name below, which stops an existing blob being poisoned;
         # this stops an archive planting unrelated files there at all.
-        referenced = {file_hash for _sid, file_hash in source_refs}
+        referenced = {file_hash for _sid, file_hash in source_refs} | converter_raw_hashes
         for done, arcname in enumerate(blob_members, start=1):
             sha = arcname.removeprefix("blobs/")
             if not _SHA256_RE.fullmatch(sha):
