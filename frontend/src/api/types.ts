@@ -117,6 +117,8 @@ export interface Source {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  /** Generated converter that produced this Parquet source, when one did. */
+  converter_script_id?: string | null;
 }
 
 export interface Timeline {
@@ -320,6 +322,11 @@ export interface Job {
          * opposite directions in the two, so always resolve copy through
          * `lib/jobPhases.ts` keyed on `kind`. */
         phase?: string;
+        /** `convert_ingest`: generation round counters and the script the job
+         * produced (also present on failure, so the tray can link to it). */
+        attempt?: number;
+        max_attempts?: number;
+        converter_script_id?: string | null;
         /** Size of the received archive (`case_import` only, set at job
          * creation). Note `JobStore.update` *merges* progress dicts
          * (core/jobs.py), so this survives every later phase write. */

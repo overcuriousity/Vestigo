@@ -18,6 +18,7 @@ const KIND_LABELS: Record<string, string> = {
   case_export: "Case export",
   case_import: "Case import",
   column_recommend: "Column suggestion",
+  convert_ingest: "AI conversion",
 };
 
 interface Props {
