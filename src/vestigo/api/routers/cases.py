@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ from vestigo.db.postgres import (
     Case,
     EnrichmentJobRun,
     PostgresStore,
+    Source,
     Timeline,
     User,
     generate_id,
@@ -741,6 +743,137 @@ async def _run_ingestion_job(
         tmp_path.unlink(missing_ok=True)
 
 
+@dataclass
+class RegisteredSource:
+    """What :func:`register_source_for_ingest` produced.
+
+    ``duplicate_of`` set means nothing was created: the bytes already exist as
+    that source in this case (pre-check or lost race) and the caller answers
+    with it.
+    """
+
+    source_id: str
+    parser: str
+    fmt: str
+    duplicate_of: Source | None = None
+
+
+async def register_source_for_ingest(
+    *,
+    store: PostgresStore,
+    case_id: str,
+    tmp_path: Path,
+    file_hash: str,
+    size_bytes: int,
+    filename: str | None,
+    name: str | None,
+    parser: str | None,
+    user: User,
+    converter_script_id: str | None = None,
+) -> RegisteredSource:
+    """Dedup, detect the format, validate a Parquet footer, retain, create the row.
+
+    Shared by the upload endpoint and the generated-converter job so both
+    register a file the same way. Raises ``HTTPException`` (400) for an
+    undetectable format or an invalid Parquet footer; the caller keeps
+    ownership of ``tmp_path`` on every path except the duplicate ones, where
+    it is unlinked here.
+    """
+    existing_source = await store.get_source_by_hash(case_id, file_hash)
+    if existing_source is not None:
+        tmp_path.unlink(missing_ok=True)
+        return RegisteredSource(
+            source_id=existing_source.id,
+            parser=existing_source.parser or "auto",
+            fmt=existing_source.parser or "auto",
+            duplicate_of=existing_source,
+        )
+
+    fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
+    if fmt is None:
+        try:
+            fmt = detect_format(tmp_path)
+        except ValueError as exc:
+            # Unknown extension is a client problem, not a server crash.
+            # detect_format's own message names the server-side temp file,
+            # which is useless (and mildly leaky) for the client.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot detect parser format for {filename!r}; "
+                    "pass an explicit parser (e.g. jsonl, timesketch_csv, "
+                    "vestigo_parquet)."
+                ),
+            ) from exc
+    source_id = generate_id(f"{case_id}:{file_hash}")
+    source_name = name or filename or tmp_path.name
+
+    # For interchange Parquet uploads, validate the footer now (a broken
+    # file should 400 here, not fail the background job) and record the
+    # embedded converter identity as the source's parser — that is the
+    # real provenance, not the generic format string.
+    source_parser = fmt
+    if fmt in {"vestigo_parquet", "parquet"}:
+        from vestigo.ingestion.parquet_reader import ParquetEventsParser
+
+        # The ParserConfig here is a throwaway: read_source_meta only reads
+        # the file's footer, and the real parser identity is taken from that
+        # footer below (source_parser). This placeholder config is never
+        # persisted or hashed.
+        reader = ParquetEventsParser(case_id, source_id, ParserConfig(name=fmt, version="0.1.0"))
+        try:
+            parquet_meta = await run_in_threadpool(reader.read_source_meta, tmp_path)
+        except ValueError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        source_parser = f"{parquet_meta.converter_name}@{parquet_meta.converter_version}"
+
+    # Retain the original file content-addressed by hash (hardlink fast
+    # path; copy only across filesystems). Threadpool because the copy
+    # fallback is a full I/O pass over the upload.
+    retention_path = _retention_path(file_hash)
+    await run_in_threadpool(_retain_file, tmp_path, retention_path)
+
+    # Create the source row up front (event_count=0) so a re-upload of
+    # the same bytes is rejected as a duplicate while ingestion runs.
+    try:
+        await store.create_source(
+            case_id=case_id,
+            source_id=source_id,
+            name=source_name,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            filename=filename,
+            parser=source_parser,
+            event_count=0,
+            created_by=user.id,
+            # Excluded from timeline queries/detectors/embedding until
+            # the background job flips it to "ready".
+            status="ingesting",
+            converter_script_id=converter_script_id,
+        )
+    except IntegrityError:
+        # Lost a race against a concurrent upload of the same bytes:
+        # treat it the same as the pre-check duplicate response.
+        existing_source = await store.get_source_by_hash(case_id, file_hash)
+        if existing_source is None:
+            raise
+        tmp_path.unlink(missing_ok=True)
+        return RegisteredSource(
+            source_id=existing_source.id,
+            parser=existing_source.parser or "auto",
+            fmt=fmt,
+            duplicate_of=existing_source,
+        )
+
+    # Auto-add the new source to the case's default timeline.
+    default_timeline = await store.get_default_timeline(case_id)
+    if default_timeline is not None:
+        await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
+
+    return RegisteredSource(source_id=source_id, parser=source_parser, fmt=fmt)
+
+
 @router.post("/{case_id}/sources")
 async def upload_source(
     background_tasks: BackgroundTasks,
@@ -783,9 +916,23 @@ async def upload_source(
         file, max_bytes=max_bytes, suffix=suffix
     )
 
-    existing_source = await store.get_source_by_hash(case_id, file_hash)
-    if existing_source is not None:
+    try:
+        reg = await register_source_for_ingest(
+            store=store,
+            case_id=case_id,
+            tmp_path=tmp_path,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            filename=file.filename,
+            name=name,
+            parser=parser,
+            user=user,
+        )
+    except Exception:
         tmp_path.unlink(missing_ok=True)
+        raise
+    if reg.duplicate_of is not None:
+        existing_source = reg.duplicate_of
         return SourceUploadResponse(
             source_id=existing_source.id,
             events_parsed=existing_source.event_count,
@@ -794,95 +941,9 @@ async def upload_source(
             duplicate=True,
             status=existing_source.status,
         )
+    source_id, source_parser = reg.source_id, reg.parser
 
-    source_created = False
     try:
-        fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
-        if fmt is None:
-            try:
-                fmt = detect_format(tmp_path)
-            except ValueError as exc:
-                # Unknown extension is a client problem, not a server crash.
-                # detect_format's own message names the server-side temp file,
-                # which is useless (and mildly leaky) for the client.
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Cannot detect parser format for {file.filename!r}; "
-                        "pass an explicit parser (e.g. jsonl, timesketch_csv, "
-                        "vestigo_parquet)."
-                    ),
-                ) from exc
-        source_id = generate_id(f"{case_id}:{file_hash}")
-        source_name = name or file.filename or tmp_path.name
-
-        # For interchange Parquet uploads, validate the footer now (a broken
-        # file should 400 here, not fail the background job) and record the
-        # embedded converter identity as the source's parser — that is the
-        # real provenance, not the generic format string.
-        source_parser = fmt
-        if fmt in {"vestigo_parquet", "parquet"}:
-            from vestigo.ingestion.parquet_reader import ParquetEventsParser
-
-            # The ParserConfig here is a throwaway: read_source_meta only reads
-            # the file's footer, and the real parser identity is taken from that
-            # footer below (source_parser). This placeholder config is never
-            # persisted or hashed.
-            reader = ParquetEventsParser(
-                case_id, source_id, ParserConfig(name=fmt, version="0.1.0")
-            )
-            try:
-                parquet_meta = await run_in_threadpool(reader.read_source_meta, tmp_path)
-            except ValueError as exc:
-                tmp_path.unlink(missing_ok=True)
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            source_parser = f"{parquet_meta.converter_name}@{parquet_meta.converter_version}"
-
-        # Retain the original file content-addressed by hash (hardlink fast
-        # path; copy only across filesystems). Threadpool because the copy
-        # fallback is a full I/O pass over the upload.
-        retention_path = _retention_path(file_hash)
-        await run_in_threadpool(_retain_file, tmp_path, retention_path)
-
-        # Create the source row up front (event_count=0) so a re-upload of
-        # the same bytes is rejected as a duplicate while ingestion runs.
-        try:
-            await store.create_source(
-                case_id=case_id,
-                source_id=source_id,
-                name=source_name,
-                file_hash=file_hash,
-                size_bytes=size_bytes,
-                filename=file.filename,
-                parser=source_parser,
-                event_count=0,
-                created_by=user.id,
-                # Excluded from timeline queries/detectors/embedding until
-                # the background job flips it to "ready".
-                status="ingesting",
-            )
-            source_created = True
-        except IntegrityError:
-            # Lost a race against a concurrent upload of the same bytes:
-            # treat it the same as the pre-check duplicate response.
-            existing_source = await store.get_source_by_hash(case_id, file_hash)
-            if existing_source is None:
-                raise
-            tmp_path.unlink(missing_ok=True)
-            return SourceUploadResponse(
-                source_id=existing_source.id,
-                events_parsed=existing_source.event_count,
-                events_inserted=0,
-                parser=parser or existing_source.parser or "auto",
-                duplicate=True,
-                status=existing_source.status,
-            )
-
-        # Auto-add the new source to the case's default timeline.
-        default_timeline = await store.get_default_timeline(case_id)
-        if default_timeline is not None:
-            await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
-
         job_store = get_job_store()
         job = job_store.create(
             kind="ingest",
@@ -896,7 +957,7 @@ async def upload_source(
             case_id,
             source_id,
             tmp_path,
-            fmt,
+            reg.fmt,
             file_hash,
             file.filename or tmp_path.name,
             file.filename,
@@ -905,8 +966,7 @@ async def upload_source(
             job_store,
         )
     except Exception:
-        if source_created:
-            await store.delete_source(case_id, source_id)
+        await store.delete_source(case_id, source_id)
         tmp_path.unlink(missing_ok=True)
         raise
 
