@@ -135,6 +135,10 @@ class Source(Base):
     time_offset_seconds: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    # The generated converter that produced this Parquet source, when one did.
+    # Plain id, no FK (house style): the script row is a record and outlives
+    # the source; the transfer importer remaps it through the id map.
+    converter_script_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     @property
     def is_ready(self) -> bool:
@@ -178,10 +182,82 @@ class Source(Base):
             "vector_count": self.vector_count,
             "status": self.status,
             "time_offset_seconds": self.time_offset_seconds,
+            "converter_script_id": self.converter_script_id,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class ConverterScript(Base):
+    """A converter script the configured model wrote for one case.
+
+    Case-bound and append-only in spirit: a regeneration is a new row with
+    ``parent_id`` set, never an edit of ``source_code`` after ``status`` has
+    reached ``working``. ``sample_excerpt`` is the exact text sent to the
+    model, ``attempts`` every generation/repair/run — together with
+    ``prompt_hash`` and ``model`` that is what makes "how did this script come
+    to be" answerable later (docs/INPUT_FORMATS.md §"Generated converters").
+    """
+
+    __tablename__ = "converter_scripts"
+    __table_args__ = (
+        Index("ix_converter_scripts_case_name_version", "case_id", "name", "version", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # generating | working | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="generating")
+    source_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, *, include_code: bool = False) -> dict[str, Any]:
+        """Serialize; ``source_code``/``sample_excerpt`` only on request (they are large)."""
+        d: dict[str, Any] = {
+            "id": self.id,
+            "case_id": self.case_id,
+            "name": self.name,
+            "version": self.version,
+            "parent_id": self.parent_id,
+            "status": self.status,
+            "model": self.model,
+            "provider_endpoint": self.provider_endpoint,
+            "prompt_hash": self.prompt_hash,
+            "sample_hash": self.sample_hash,
+            "raw_file_hash": self.raw_file_hash,
+            "raw_filename": self.raw_filename,
+            "hint": self.hint,
+            "attempts": self.attempts or [],
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_code:
+            d["source_code"] = self.source_code
+            d["sample_excerpt"] = self.sample_excerpt
+        return d
 
 
 class Timeline(Base):
@@ -2125,6 +2201,7 @@ class PostgresStore:
         event_count: int = 0,
         created_by: str | None = None,
         status: str = "ready",
+        converter_script_id: str | None = None,
     ) -> Source:
         """Create a new source record within a case.
 
@@ -2144,6 +2221,7 @@ class PostgresStore:
             event_count=event_count,
             created_by=created_by,
             status=status,
+            converter_script_id=converter_script_id,
         )
         async with self.session_factory() as session:
             session.add(source)
@@ -2230,6 +2308,117 @@ class PostgresStore:
                 )
             )
             return result.scalar_one_or_none() is not None
+
+    # ── Converter scripts ────────────────────────────────────────────────
+
+    async def create_converter_script(
+        self,
+        *,
+        case_id: str,
+        name: str,
+        version: int,
+        raw_file_hash: str,
+        raw_filename: str | None,
+        model: str | None,
+        provider_endpoint: str | None,
+        prompt_hash: str | None,
+        sample_hash: str | None,
+        sample_excerpt: str | None,
+        hint: str | None,
+        created_by: str | None,
+        parent_id: str | None = None,
+        status: str = "generating",
+    ) -> ConverterScript:
+        """Insert a converter-script row (docs/INPUT_FORMATS.md §"Generated converters")."""
+        row = ConverterScript(
+            id=generate_id(f"conv_{case_id}_{name}"),
+            case_id=case_id,
+            name=name,
+            version=version,
+            parent_id=parent_id,
+            status=status,
+            model=model,
+            provider_endpoint=provider_endpoint,
+            prompt_hash=prompt_hash,
+            sample_hash=sample_hash,
+            sample_excerpt=sample_excerpt,
+            raw_file_hash=raw_file_hash,
+            raw_filename=raw_filename,
+            hint=hint,
+            attempts=[],
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def update_converter_script(
+        self,
+        script_id: str,
+        *,
+        status: str | None = None,
+        source_code: str | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        prompt_hash: str | None = None,
+    ) -> ConverterScript | None:
+        """Update mutable fields; ``attempts`` replaces the list wholesale."""
+        async with self.session_factory() as session:
+            row = await session.get(ConverterScript, script_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if source_code is not None:
+                row.source_code = source_code
+            if attempts is not None:
+                row.attempts = list(attempts)
+            if model is not None:
+                row.model = model
+            if prompt_hash is not None:
+                row.prompt_hash = prompt_hash
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_converter_script(self, case_id: str, script_id: str) -> ConverterScript | None:
+        """Return the row when it exists *and* belongs to ``case_id``."""
+        async with self.session_factory() as session:
+            row = await session.get(ConverterScript, script_id)
+            return row if row is not None and row.case_id == case_id else None
+
+    async def list_converter_scripts(self, case_id: str) -> list[ConverterScript]:
+        """Newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript)
+                .where(ConverterScript.case_id == case_id)
+                .order_by(ConverterScript.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def next_converter_version(self, case_id: str, name: str) -> int:
+        """1 for a new name in this case, else max(version) + 1."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(func.max(ConverterScript.version)).where(
+                    ConverterScript.case_id == case_id, ConverterScript.name == name
+                )
+            )
+            current = result.scalar_one_or_none()
+            return (current or 0) + 1
+
+    async def count_sources_by_converter(self, case_id: str) -> dict[str, int]:
+        """``{converter_script_id: number of sources it produced}`` within a case."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source.converter_script_id, func.count())
+                .where(Source.case_id == case_id, Source.converter_script_id.is_not(None))
+                .group_by(Source.converter_script_id)
+            )
+            return {sid: int(n) for sid, n in result.all()}
 
     async def list_ingesting_sources(self) -> list[Source]:
         """Return every source still marked "ingesting", across all cases.
