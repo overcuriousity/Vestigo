@@ -296,3 +296,88 @@ def test_bytes_progress_printer_advances_without_crashing():
     # No exception, and the meter picked up a rate estimate.
     assert printer._latest is not None
     assert printer._latest.rate_bps is not None
+
+
+# --------------------------------------------------------------------------
+# vestigo convert-ingest / converters — generated converters
+# --------------------------------------------------------------------------
+
+
+def test_convert_ingest_refuses_when_disabled(store, tmp_path, monkeypatch):
+    monkeypatch.delenv("VESTIGO_CONVERTER_GENERATION_ENABLED", raising=False)
+    from vestigo.core.config import get_settings
+
+    get_settings.cache_clear()
+    admin = _make_admin(store)
+    case = _make_case(store, owner_id=admin.id)
+    log = tmp_path / "a.log"
+    log.write_text("x\n")
+    result = runner.invoke(cli_main.app, ["convert-ingest", str(log), "--case", case.id])
+    assert result.exit_code == 1
+    assert "disabled" in result.output
+
+
+def test_convert_ingest_runs_job_and_reports(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("VESTIGO_CONVERTER_GENERATION_ENABLED", "1")
+    from vestigo.core.config import get_settings
+
+    get_settings.cache_clear()
+    admin = _make_admin(store)
+    case = _make_case(store, owner_id=admin.id)
+    log = tmp_path / "a.log"
+    log.write_text("x\n")
+    seen = {}
+
+    async def fake_job(job_id, inputs, *, job_store):
+        seen["inputs"] = inputs
+        job_store.update(job_id, status="running", progress={"phase": "generating"})
+        job_store.update(
+            job_id, status="completed", result={"source_id": "s1", "converter_script_id": "c1"}
+        )
+
+    monkeypatch.setattr("vestigo.converters.job.run_convert_ingest_job", fake_job)
+    try:
+        result = runner.invoke(
+            cli_main.app,
+            ["convert-ingest", str(log), "--case", case.id, "--hint", "utc", "--converter", "c0"],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.output
+    assert "source s1 ingested; converter script c1" in result.output
+    assert seen["inputs"].hint == "utc" and seen["inputs"].reuse_script_id == "c0"
+    assert seen["inputs"].filename == "a.log" and seen["inputs"].user.id == admin.id
+
+
+def test_converters_list_and_download(store, tmp_path):
+    admin = _make_admin(store)
+    case = _make_case(store, owner_id=admin.id)
+    row = run_async(
+        store.create_converter_script(
+            case_id=case.id,
+            name="x2vestigo",
+            version=1,
+            raw_file_hash="a" * 64,
+            raw_filename="x.log",
+            model="m",
+            provider_endpoint="e",
+            prompt_hash="p",
+            sample_hash="s",
+            sample_excerpt="S",
+            hint=None,
+            created_by=admin.id,
+            status="working",
+        )
+    )
+    run_async(store.update_converter_script(row.id, source_code="print('cli')\n"))
+    result = runner.invoke(cli_main.app, ["converters", "list", "--case", case.id])
+    assert result.exit_code == 0 and "x2vestigo\tv1\tworking" in result.output
+    out = tmp_path / "x.py"
+    result = runner.invoke(
+        cli_main.app, ["converters", "download", row.id, "--case", case.id, "-o", str(out)]
+    )
+    assert result.exit_code == 0 and out.read_text() == "print('cli')\n"
+    result = runner.invoke(
+        cli_main.app, ["converters", "download", "nope", "--case", case.id, "-o", str(out)]
+    )
+    assert result.exit_code == 1
