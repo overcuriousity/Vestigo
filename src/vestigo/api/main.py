@@ -687,6 +687,7 @@ def create_app() -> FastAPI:
     app.include_router(stories.router)
     app.include_router(stream.router)
     app.include_router(converters.router)
+    app.include_router(converters.case_router)
     app.include_router(agent.router)
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)
