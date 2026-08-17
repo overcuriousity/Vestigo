@@ -3,6 +3,7 @@
  * jobs) and CaseJobsPanel (shared, case-scoped job visibility) — the two
  * differ in data source and lifecycle, not in how a job's status renders.
  */
+import type { ReactNode } from "react";
 import { Loader2, CheckCircle, XCircle, X } from "lucide-react";
 import type { Job } from "@/api/types";
 import { ProgressMeter } from "@/components/ui/ProgressMeter";
@@ -17,6 +18,8 @@ interface Props {
   /** Resolved human phase copy (see `lib/jobPhases.ts`), shown after the
    * status word. This row stays presentational — callers resolve the text. */
   detail?: string | null;
+  /** Optional slot under the error line — e.g. a link to what a failed job left behind. */
+  footer?: ReactNode;
   onDismiss?: () => void;
   className?: string;
 }
@@ -27,6 +30,7 @@ export function JobStatusRow({
   progress,
   error,
   detail,
+  footer,
   onDismiss,
   className,
 }: Props) {
@@ -73,6 +77,7 @@ export function JobStatusRow({
           barHidden={status === "failed"}
         />
         {error && <div className="mt-1 text-[var(--color-danger)] line-clamp-2 break-all">{error}</div>}
+        {footer}
       </div>
       {isTerminal && onDismiss && (
         <button
