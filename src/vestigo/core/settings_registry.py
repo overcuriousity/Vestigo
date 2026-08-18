@@ -739,6 +739,22 @@ _SPECS: tuple[SettingSpec, ...] = (
         subsystem="agent",
     ),
     SettingSpec(
+        "agent_request_timeout_seconds",
+        "agent",
+        "Model request timeout (seconds)",
+        "Wall-clock ceiling for one model request inside an agent turn. Raise it for a "
+        "slow local endpoint; the stranded-turn sweep scales with it automatically.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "column_advisor_timeout_seconds",
+        "agent",
+        "Column suggestion timeout (seconds)",
+        "Ceiling for the one-shot 'suggest columns with AI' call, probe and all. On "
+        "expiry the timeline keeps the locally scored columns.",
+        subsystem="agent",
+    ),
+    SettingSpec(
         "mcp_enabled",
         "agent",
         "External MCP endpoint",
@@ -865,6 +881,15 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Sample size sent to the model (bytes)",
         "Head, middle and tail of the raw file, up to this many bytes, are the only "
         "evidence that leaves this host.",
+        subsystem="converter_generation",
+    ),
+    SettingSpec(
+        "converter_generation_timeout_seconds",
+        "converters",
+        "Generation timeout (seconds)",
+        "Ceiling for one generation or repair round, including the availability probe. "
+        "A model too slow to write a script within it fails every attempt — raise it "
+        "for a large local model rather than lowering the attempt count.",
         subsystem="converter_generation",
     ),
     SettingSpec(

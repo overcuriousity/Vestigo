@@ -968,7 +968,7 @@ def test_stranded_turn_reservation_expires(client, admin_bootstrap, agent_on):
     ).json()
     url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}"
 
-    _reserve_turn(agent_router, conversation["id"], age=agent_router._TURN_STALE_AFTER + 1)
+    _reserve_turn(agent_router, conversation["id"], age=agent_router._turn_stale_after() + 1)
     try:
         assert client.get(url).json()["active"] is False
         # ...and the entry is pruned, so the conversation is usable again.

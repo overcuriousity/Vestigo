@@ -47,13 +47,15 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from vestigo.columns.recommend import ColumnCandidate
+from vestigo.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-#: Hard ceiling on the whole call — the availability probe and config
+#: Fallback ceiling for the whole call — the availability probe and config
 #: resolution included, not just the model request. A column suggestion is a
-#: nicety; it must never hold an ingest-triggered job open the way the agent's
-#: 300s turn timeout would.
+#: nicety; it must never hold an ingest-triggered job open the way an agent
+#: turn may. The operator's ``column_advisor_timeout_seconds`` is what
+#: actually applies; this is only what a caller with no settings would get.
 ADVISOR_TIMEOUT_SECONDS = 45.0
 
 #: Candidates shown to the model. Enough for a real choice, small enough that
@@ -176,7 +178,8 @@ async def rank_columns_with_llm(
         # and then stalls can hold the availability probe or config resolution
         # open just as long as a completion, and the post-ingest job that owns
         # this coroutine has no reason to wait for either.
-        async with asyncio.timeout(ADVISOR_TIMEOUT_SECONDS):
+        budget = get_settings().column_advisor_timeout_seconds
+        async with asyncio.timeout(budget):
             if not await agent_available():
                 return None
 
@@ -191,7 +194,7 @@ async def rank_columns_with_llm(
             # No toolsets and no system prompt beyond the instruction: this
             # call has nothing to call and nothing to remember.
             output = await typed_completion(
-                config, prompt, output_type=ColumnChoice, timeout_s=ADVISOR_TIMEOUT_SECONDS
+                config, prompt, output_type=ColumnChoice, timeout_s=budget
             )
 
         validated = _validate(output, shown, k_min=k_min, k_max=k_max)

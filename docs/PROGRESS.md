@@ -1,6 +1,27 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-18 (session 179 — 1.13.0 release).
+Last updated: 2026-08-18 (session 180 — LLM timeouts became settings).
+
+## Session 180 — 2026-08-18: every LLM wall clock is an operator setting
+
+A converter job on a slow local endpoint failed all four attempts with
+`model call failed: ` — an empty reason, because a bare `TimeoutError` (and httpx's)
+stringifies to `""` and `job.py` interpolated only `{exc}`. Behind it: three hardcoded
+model timeouts nobody could reach from the admin console.
+
+- **`converter_generation_timeout_seconds`** (default 180, was `generate_script`'s parameter
+  default that the single call site never overrode). `timeout_s` is now a required keyword —
+  a default there is a ceiling no operator can turn.
+- **`agent_request_timeout_seconds`** (default 300, was `runtime.LLM_TIMEOUT`). The
+  stranded-turn bound in `api/routers/agent.py` became `_turn_stale_after()`, computed per
+  call, so an edited timeout does not need a restart to be respected by the sweep.
+- **`column_advisor_timeout_seconds`** (default 45, was `ADVISOR_TIMEOUT_SECONDS`). The
+  constant stays as the no-settings fallback.
+- **Attempt errors name the exception type** (`model call failed: TimeoutError`). An
+  attempt trail that cannot distinguish "refused" from "stalled" is not a forensic record.
+
+`.env.example`, `docs/INPUT_FORMATS.md` §"Generated converters" step 2 and the settings
+registry follow; the console renders all three with no frontend change.
 
 ## Session 179 — 2026-08-18: fourth review pass, the dependabot batch, 1.13.0
 

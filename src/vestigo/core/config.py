@@ -403,6 +403,14 @@ class Settings(BaseSettings):
     agent_reasoning_effort: str | None = Field(default=None, pattern="^(off|low|medium|high|max)$")
     # Seconds an availability probe result is cached before re-probing.
     agent_probe_ttl_seconds: float = Field(default=60.0, gt=0)
+    # Wall clock for one model request inside an agent turn. A local model on
+    # modest hardware is the case that needs this raised; the stranded-turn
+    # sweep derives its own bound from this value times agent_max_turns.
+    agent_request_timeout_seconds: float = Field(default=300.0, ge=10.0, le=3600.0)
+    # Wall clock for the one-shot column suggestion (probe + resolve + request
+    # together). Deliberately short: it is an advisory call on an ingest job's
+    # critical path and degrades to the local scorer when it expires.
+    column_advisor_timeout_seconds: float = Field(default=45.0, ge=5.0, le=600.0)
     # Model context window in tokens. Unset = no proactive sliding window
     # (the right number is model-specific, so it's an explicit opt-in; an
     # overflow still enables the window reactively for one retry).
@@ -432,6 +440,12 @@ class Settings(BaseSettings):
     converter_max_attempts: int = Field(default=4, ge=1, le=10)
     # Bytes of the raw file sent to the model (head/middle/tail excerpt).
     converter_sample_bytes: int = Field(default=65536, ge=4096, le=1048576)
+    # Wall clock for one generation or repair round — availability probe,
+    # config resolution and the model request together, not just the request.
+    # A local model writing a whole converter script is the slow case: when
+    # every attempt dies here the job reports "no working converter" with no
+    # draft to show, so this is the knob that has to be reachable.
+    converter_generation_timeout_seconds: int = Field(default=180, ge=30, le=3600)
     # Wall clock for the full-file conversion run; the sample run gets min(60, this).
     converter_run_timeout_seconds: int = Field(default=600, ge=30, le=7200)
     # RLIMIT_AS for the converter subprocess. Floor measured 2026-08-17: pyarrow

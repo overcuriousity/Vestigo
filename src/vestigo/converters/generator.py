@@ -80,8 +80,13 @@ async def _complete(config: AgentConfig, system: str, task: str, timeout_s: floa
     )
 
 
-async def generate_script(system: str, task: str, *, timeout_s: float = 180.0) -> GeneratedScript:
-    """Ask the configured model for a converter. Raises on any failure; never degrades silently."""
+async def generate_script(system: str, task: str, *, timeout_s: float) -> GeneratedScript:
+    """Ask the configured model for a converter. Raises on any failure; never degrades silently.
+
+    ``timeout_s`` is required on purpose: it is the operator's
+    ``converter_generation_timeout_seconds``, and a default here would be a
+    ceiling nobody can reach from the admin console.
+    """
     from vestigo.agent.availability import agent_available
     from vestigo.agent.config import resolve_agent_config
 

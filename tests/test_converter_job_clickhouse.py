@@ -528,3 +528,46 @@ async def test_mtime_is_the_evidence_files_or_unknown(store, clickhouse, tmp_pat
     assert job.status == "completed", job.error
     assert "mtime unknown" in calls[1]
     clickhouse.delete_source_events(case.id, job.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_generation_timeout_is_the_operator_setting(store, clickhouse, tmp_path, monkeypatch):
+    """The per-attempt model budget comes from settings, not from a constant.
+
+    Regression: ``generate_script`` carried a hardcoded 180s default and the
+    job never passed one, so a slow local endpoint failed every attempt with
+    nothing an admin could turn.
+    """
+    monkeypatch.setenv("VESTIGO_CONVERTER_GENERATION_TIMEOUT_SECONDS", "900")
+    get_settings.cache_clear()
+    seen: list[float] = []
+    calls: list[str] = []
+    inner = _fake_generator([GOOD], calls)
+
+    async def gen(system, task, *, timeout_s):
+        seen.append(timeout_s)
+        return await inner(system, task, timeout_s=timeout_s)
+
+    monkeypatch.setattr(J, "generate_script", gen)
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "completed", job.error
+    assert seen == [900]
+    clickhouse.delete_source_events(case.id, job.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_timeout_attempt_names_the_exception_type(store, tmp_path, monkeypatch):
+    """A bare timeout stringifies to '' — the trail must still say what happened."""
+
+    async def stalled(system, task, *, timeout_s):
+        raise TimeoutError
+
+    monkeypatch.setattr(J, "generate_script", stalled)
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "failed"
+    assert "TimeoutError" in (job.error or "")
+    rows = await store.list_converter_scripts(case.id)
+    row = await store.get_converter_script(case.id, rows[0].id)
+    assert all(a["error"] == "model call failed: TimeoutError" for a in row.attempts)

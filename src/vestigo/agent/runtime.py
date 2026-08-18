@@ -71,7 +71,17 @@ from vestigo.agent.window import CHARS_PER_TOKEN_DEFAULT, WindowStats, make_wind
 
 logger = logging.getLogger(__name__)
 
+#: Fallback ceiling for one model request in a turn, used only when settings
+#: are unreachable. ``llm_timeout()`` is what callers should ask.
 LLM_TIMEOUT = 300.0
+
+
+def llm_timeout() -> float:
+    """Operator-configured wall clock for one model request in an agent turn."""
+    from vestigo.core.config import get_settings
+
+    return get_settings().agent_request_timeout_seconds
+
 
 #: Fraction of the token budget one model request's tool returns may occupy
 #: before the request guard starts reducing them. The sliding window reserves
@@ -566,7 +576,7 @@ async def stream_turn(
     # must be closed when the stream ends — see build_model's docstring.
     http_client: httpx.AsyncClient | None = None
     if model is None:
-        http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=LLM_TIMEOUT)
+        http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=llm_timeout())
         model = build_model(config, http_client)
     try:
         server = build_tool_server(scope)
