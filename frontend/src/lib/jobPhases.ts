@@ -35,10 +35,21 @@ const COLUMN_RECOMMEND_PHASES: Record<string, string> = {
   model: "Asking the model to choose",
 };
 
+/** Source: `src/vestigo/converters/job.py`. */
+const CONVERT_INGEST_PHASES: Record<string, string> = {
+  queued: "Queued",
+  sampling: "Reading a sample of the file",
+  generating: "Asking the model to write the converter",
+  sample_run: "Trying the converter on the sample",
+  converting: "Converting the whole file",
+  ingesting: "Ingesting",
+};
+
 const PHASES_BY_KIND: Record<string, Record<string, string>> = {
   case_export: EXPORT_PHASES,
   case_import: IMPORT_PHASES,
   column_recommend: COLUMN_RECOMMEND_PHASES,
+  convert_ingest: CONVERT_INGEST_PHASES,
 };
 
 /**
@@ -52,5 +63,31 @@ export function jobPhaseLabel(
 ): string | null {
   const phase = progress?.phase;
   if (!kind || !phase) return null;
-  return PHASES_BY_KIND[kind]?.[phase] ?? null;
+  const label = PHASES_BY_KIND[kind]?.[phase] ?? null;
+  if (!label) return null;
+  // Generation rounds are worth showing: "attempt 2/4" tells the analyst the
+  // first draft failed validation and the model is repairing it.
+  if (
+    kind === "convert_ingest" &&
+    (phase === "generating" || phase === "sample_run") &&
+    progress?.attempt != null &&
+    progress?.max_attempts != null
+  ) {
+    return `${label} (attempt ${progress.attempt}/${progress.max_attempts})`;
+  }
+  return label;
+}
+
+/**
+ * A completed job's outcome that "Completed" alone would misreport, or null.
+ * An AI conversion whose produced file matched a source that already exists
+ * completes without adding anything — silently, unless said here.
+ */
+export function jobOutcomeNote(kind: string | undefined, result: unknown): string | null {
+  if (kind !== "convert_ingest" || !result || typeof result !== "object") return null;
+  const r = result as { duplicate?: unknown };
+  if (r.duplicate === true) {
+    return "The converted file matched a source this case already has — nothing new was added.";
+  }
+  return null;
 }

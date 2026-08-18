@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { jobPhaseLabel } from "@/lib/jobPhases";
+import { jobOutcomeNote, jobPhaseLabel } from "@/lib/jobPhases";
 
 describe("jobPhaseLabel", () => {
   it("reads the same phase token in opposite directions per job kind", () => {
@@ -31,5 +31,20 @@ describe("jobPhaseLabel", () => {
   it("returns null when there is no phase to describe", () => {
     expect(jobPhaseLabel("case_import", null)).toBeNull();
     expect(jobPhaseLabel("case_import", { total: 5, processed: 1 })).toBeNull();
+  });
+});
+
+describe("jobOutcomeNote", () => {
+  it("names a duplicate outcome of an AI conversion", () => {
+    expect(jobOutcomeNote("convert_ingest", { source_id: "s", duplicate: true })).toMatch(
+      /already has/,
+    );
+  });
+
+  it("is silent for ordinary completions and other kinds", () => {
+    expect(jobOutcomeNote("convert_ingest", { source_id: "s" })).toBeNull();
+    expect(jobOutcomeNote("convert_ingest", null)).toBeNull();
+    expect(jobOutcomeNote("ingest", { duplicate: true })).toBeNull();
+    expect(jobOutcomeNote(undefined, undefined)).toBeNull();
   });
 });

@@ -471,6 +471,28 @@ opt-in governs who *causes* egress, not who may read the result afterwards, and
 the audit row names the analyst who triggered it. See
 `vestigo/columns/__init__.py` for the layering.
 
+### The converter generator
+
+The second non-agent use of the endpoint (1.13): `src/vestigo/converters/generator.py`
+writes a converter script for a plain-text log the analyst uploaded, and
+`converters/job.py` runs, validates, repairs and ingests it —
+`docs/INPUT_FORMATS.md` §"Generated converters" is the full description. Same
+shape as the column advisor — one typed request per attempt, no tools, no
+history — and the same wire call: both go through
+`src/vestigo/agent/oneshot.py::typed_completion`. Two things differ. It is gated on its own operator switch
+(`converter_generation_enabled`, off by default) *in addition to* the agent
+probe, because it executes model-written code on the host; and it does not
+degrade silently — a script that could not be written is a failed attempt the
+analyst sees, not a heuristic fallback.
+
+| Invariant | How it holds here |
+|---|---|
+| Invisible unless configured | Capability `converter_generation` = switch **and** `agent_available()`. Off ⇒ no "Let AI write the converter" mode, no regenerate button; generation and `regenerate` answer 503. Re-running a *saved* script sends nothing, so it hangs off `converter_reuse` = switch alone: with the model down or never configured the dialog offers *Use a saved converter* only, and `convert` with a `converter_script_id` still runs. Listing and downloading existing scripts stay available — they are records. |
+| Scope safety | The task message carries a bounded head/middle/tail excerpt of the raw file, its name, size, line count, mtime, the version to declare and the analyst's hint. No case/source/timeline/user id, key or host name. `tests/test_converter_prompt.py` asserts it; the dialog names the model, endpoint host and byte count before the analyst confirms. Reusing a saved script sends nothing. |
+| Sandbox + apply | The script runs under `python -I` in a private working directory with a scrubbed environment and `RLIMIT_AS`/`CPU`/`FSIZE`/`NOFILE` (set by a bootstrap inside the child, never `preexec_fn`), after a best-effort static guard (`runner.check_script`: import allow-list, module aliases usable only as `module.<attr>`, dynamic-lookup and object-graph dunders refused — `docs/INPUT_FORMATS.md` §"The loop" lists it). Its output is *validated* before anything is ingested, and the ingest itself is the ordinary Parquet path — the model never touches ClickHouse or Postgres. |
+| Forensic reproducibility | Every attempt (generation — including model errors before a row exists — sample run, full run, and any failure after the converter passed) is on `converter_scripts.attempts` with the report, stderr tail, script hash and the hash of the prompt that round sent; the row keeps the exact sample text, the evidence file's mtime as stated to the model, and `prompt_hash`/`model` of the attempt that produced its stored code. Audit: `converter.generate`, `converter.run`, `converter.regenerate`. The Parquet carries the usual per-row provenance, so the *ingest* is reproducible from the raw file and the script even though the model's output is not. |
+| Bounded trust | Validation is what the harness checks, not what the model claims: schema, footer, the raw file's real hash, non-null provenance, parse and timestamp floors. Attempts are capped (`converter_max_attempts`), each run is time- and memory-limited, and the model's proposed name is sanitized to `^[a-z0-9_]+2vestigo$`. |
+
 ## Configuration
 
 | Variable | Meaning |

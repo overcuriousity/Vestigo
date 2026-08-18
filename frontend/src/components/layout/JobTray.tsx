@@ -4,10 +4,11 @@
  * Polls /api/jobs/{id} for each active job, updates store on completion.
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { jobsApi } from "@/api/jobs";
 import { useJobsStore, type TrackedJob } from "@/stores/jobs";
 import { JobStatusRow } from "@/components/ui/JobStatusRow";
-import { jobPhaseLabel } from "@/lib/jobPhases";
+import { jobOutcomeNote, jobPhaseLabel } from "@/lib/jobPhases";
 
 function JobRow({ job }: { job: TrackedJob }) {
   const { updateJob, dismiss } = useJobsStore();
@@ -20,7 +21,10 @@ function JobRow({ job }: { job: TrackedJob }) {
     queryFn: async () => {
       const j = await jobsApi.get(job.id);
       updateJob(j);
-      if (j.status === "completed") {
+      // Refresh on either terminal state: a failed AI conversion still leaves
+      // a script row (status "failed") the converters panel must stop showing
+      // as "generating".
+      if (j.status === "completed" || j.status === "failed") {
         for (const key of job.invalidate ?? []) {
           qc.invalidateQueries({ queryKey: key });
         }
@@ -39,6 +43,22 @@ function JobRow({ job }: { job: TrackedJob }) {
     refetchIntervalInBackground: false,
   });
 
+  // A failed AI conversion leaves its draft script behind; the panel on the
+  // case page shows every attempt, so point at it rather than only the error.
+  const scriptId = job.progress?.converter_script_id;
+  const outcome = job.status === "completed" ? jobOutcomeNote(job.kind, job.result) : null;
+  const footer =
+    job.kind === "convert_ingest" && job.status === "failed" && scriptId && job.case_id ? (
+      <Link
+        to={`/cases/${job.case_id}?converter=${encodeURIComponent(scriptId)}`}
+        className="mt-1 inline-block text-[var(--color-accent)] hover:underline"
+      >
+        View converter attempts
+      </Link>
+    ) : outcome ? (
+      <div className="mt-1 text-[var(--color-warning)]">{outcome}</div>
+    ) : null;
+
   return (
     <JobStatusRow
       label={job.label}
@@ -46,6 +66,7 @@ function JobRow({ job }: { job: TrackedJob }) {
       progress={job.progress}
       error={job.error}
       detail={jobPhaseLabel(job.kind, job.progress)}
+      footer={footer}
       className="w-72"
       onDismiss={isTerminal ? () => dismiss(job.id) : undefined}
     />

@@ -1,6 +1,165 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-14 (session 174 — second review of PR #264, released as 1.12.2).
+Last updated: 2026-08-18 (session 179 — 1.13.0 release).
+
+## Session 179 — 2026-08-18: fourth review pass, the dependabot batch, 1.13.0
+
+- **Two findings from a fourth `/code-review 277`.** `source_hash_in_use` asked
+  `scalar_one_or_none()` of the converter-script lookup, so it raised as soon as two scripts
+  shared a raw file — which is what every *regeneration* produces. All four callers swallow the
+  exception, so the damage was silent and wrong rather than loud: an ingest rollback reported
+  "source-row removal failed" after removing the row, startup reconciliation skipped its
+  `source.ingest_interrupted` audit row and logged a retry that never comes, and retained blobs
+  leaked. Second: the AST guard flagged `input`/`help` in *any* context, so `input = args.input`
+  — the spelling the prompt's own `-i/--input` mandate invites — was rejected before the script
+  ran and cost one of four attempts, with the enforced-constraints paragraph never naming them.
+  They are now a separate shadowable set, refused only where the script never binds the name.
+- **Eleven dependabot PRs merged** (numpy, pyarrow, alembic, pydantic-settings,
+  sentence-transformers, pydantic-ai-slim → 2.31.1, and the frontend's Radix/lucide/
+  `@types/node`/jest-dom). `mcp` 2.0.0 (#269) is **not** takeable and was left open: every
+  `pydantic-ai-slim[mcp]` release pins `mcp>=1.24.0,<2.0`, so the bump makes the requirements
+  unsatisfiable. Full suite green at 2681 with the embeddings extra installed.
+- **1.13.0 released** — generated converters is the headline; see `CHANGELOG.md`.
+
+## Session 178 — 2026-08-18: PR #277 third review — every finding fixed, minor ones included
+
+A third `/code-review 277` (ten ranked findings, three cut by the cap, four cleanups); all
+fixed (`docs/archive/PR277_REVIEW_FINDINGS.md` §"Third pass" has each with its reasoning).
+What changed shape:
+
+- **The static guard closes dynamic lookup and rebinding.** `pydoc.locate`, `__builtins__[…]`,
+  `f = eval`, `os.__dict__[…]`, `x = os`, `f(os)`, `sys.path.insert`, `().__class__.__base__
+  .__subclasses__()` all passed before. Now an imported module may only be the receiver of an
+  attribute access, the object-graph dunders are refused on every receiver, and the deny-list
+  covers import-by-string, deserialisers and `gc`/`inspect`. Docs call it best-effort, which it is.
+- **The trail is complete.** Attempts append under a row lock (`append_converter_attempt`;
+  two reuse jobs no longer clobber each other), model errors before a row exists are buffered
+  and land on the row (or on a `failed` row named from the file when no draft ever arrived),
+  a failure after the full run passed is an `ingest` attempt + audit, and every entry that
+  sent a prompt carries that prompt's hash — the row's `prompt_hash`/`model` follow the draft
+  that became the code.
+- **Retention is lazy and reclaimed.** The raw file is kept only once a row is about to
+  reference it; a job that fails before that takes its copy back; `source_hash_in_use`
+  counts `converter_input_hash`.
+- **Duplicate conversion is refused everywhere**: the job pre-checks (CLI, concurrent
+  submits), registration re-checks, and migration 0032 makes the index a partial unique
+  index. 0032 also adds `converter_scripts.raw_mtime`: the evidence file's own mtime (browser
+  `lastModified`, CLI `stat`) is what the model is told and what the script sees on `-i`;
+  absent, the model is told "unknown".
+- **Reuse needs only the switch** (`converter_reuse` capability): saved converters run with
+  the model down or never configured; the dialog offers *Use a saved converter* alone then.
+- Startup reconciliation of `generating` rows runs before the lifespan yields; the upload
+  dialog freezes its mode switch mid-transfer and its progress row follows the running
+  transfer; the converters panel disables Regenerate while its job runs and polls the list;
+  the prompts panel explains a failed load with a Retry.
+
+## Session 177 — 2026-08-18: PR #277 second review — ten more findings fixed
+
+A second `/code-review 277` on the branch after session 176; all ten findings addressed
+(`docs/archive/PR277_REVIEW_FINDINGS.md` §"Second pass" has each with its reasoning). The
+ones that changed shape rather than just code:
+
+- **The script only ever sees a private copy of its input.** The runner hardlinked the
+  retention copy into the workdir, so its `chmod` and any script writing to `-i` reached
+  the evidence itself. `shutil.copyfile` now — a large log is copied per run, deliberately.
+- **`check_script` is an allow-list.** Stdlib (minus the deny-list) plus `pyarrow`/`numpy`,
+  import aliases resolved, `from x import *` refused, `sys.modules`/`getattr(module, …)`
+  refused, destructive method names refused on any receiver (`Path.unlink`/`.chmod`
+  included). Prompt and docs restate it.
+- **The retention store knows converter rows own blobs** (`source_hash_in_use` unions
+  `converter_scripts.raw_file_hash`), and `delete_case` cascades the rows.
+- **No row stays `generating`**: the job's catch-all fails a row it created; startup
+  reconciliation (`_reconcile_stale_converter_generations`) fails rows a restart orphaned
+  and records the interruption as an attempt.
+- **Same saved script over the same raw file is refused** (409 naming the existing source)
+  via the new `sources.converter_input_hash` (migration 0031); a duplicate Parquet outcome
+  is now said in the tray and the case jobs panel.
+- `build_sample` streams (no per-line offset list; `count_lines` for the reuse path), the
+  stderr partial-line buffer is capped, a non-gzip `.gz` upload is a 400 not a 500, and the
+  disclosure copy names head/middle/tail rather than "the first N bytes".
+
+## Session 176 — 2026-08-17: PR #277 review — every finding fixed
+
+`/code-review 277` on the generated-converters branch; all findings addressed in one pass
+(`docs/archive/PR277_REVIEW_FINDINGS.md` has the full set):
+
+- **Path traversal via the multipart filename** — the upload's `filename` was joined onto
+  temp dirs unsanitised (sample file, regenerate copy, later `unlink()`). `sample.safe_filename`
+  reduces it to a basename everywhere it is used; `ConvertJobInputs` applies it on construction.
+- **Sample and full run now see the same file** — the runner stages the retention copy under
+  the evidence filename (`input_name`), and a `.gz` upload's head sample is re-gzipped, so a
+  suffix-driven script behaves identically in both phases and `source_file` names the
+  evidence, not the hash.
+- **`build_sample` on a one-line file** no longer indexes past `line_count`; the tail block is
+  capped at its budget so one huge last line cannot exceed the disclosed size.
+- **`register_source_for_ingest` rolls back** the freshly created `ingesting` row (and an
+  unshared retention copy) when the timeline add fails, closing the orphan-row gap for both
+  the upload endpoint and the converter job.
+- **`validate_output` streams** the Parquet in Arrow batches (`map_lookup` for the unparsed
+  flag, per-batch null counts, an offset-order tracker) — bounded memory in the API process.
+- **Generation loop** — the "name already exists at v>1" redraft moved inside the loop and is
+  recorded as a `generate` attempt without costing one; a lost `(case, name, version)` race
+  retries with the next version instead of an unhandled `IntegrityError`.
+- **Ingest failure after a valid conversion** is recorded as an `ingest` attempt plus a
+  `converter.run` audit row and fails the job with the reason.
+- **Runner**: rlimits are applied by a `-c` bootstrap inside the child (no `preexec_fn`
+  from a threaded process); stderr EOF while the child runs now waits out the deadline and
+  kills the group; `posix`/`_socket`/`_ssl`/`_posixsubprocess`/`_multiprocessing` denied,
+  and the prompt reads the runner's list rather than a hand copy (system prompt v2).
+- **Converter name is enforced**: the task header declares it once known, and
+  `validate_output` checks the footer's `converter_name` against the row.
+- **UI**: the tray's "View converter attempts" link is followed while the panel is mounted;
+  invalidation fires on `failed` too; timestamps render in UTC like the rest of the app.
+- Cleanups: `typed_completion` (`agent/oneshot.py`) shared by the column advisor and the
+  generator; list endpoint defers the two large Text columns; scratch dirs removed on every
+  path; CLI commands registered before the `__main__` guard; duplicate TS interfaces gone.
+  One suggested cleanup was declined: generalising the importer's missing-stem rule would
+  let a truncated archive restore silently (`test_incomplete_archive_fails_the_job`), so
+  `_OPTIONAL_STEMS` stays explicit, now with the reason on it.
+
+## Session 175 — 2026-08-17: generated converters — the model writes the script, the harness runs it
+
+The upload dialog gains *Let AI write the converter* (and the CLI `vestigo convert-ingest`):
+an analyst uploads any plain-text, time-annotated log, the configured model writes a
+converter to the Parquet contract, the server runs it in a guarded subprocess, validates the
+output, repairs on failure, and ingests the result — the produced Parquet *is* the source, so
+nothing downstream changes. Scripts are case-bound rows (`converter_scripts`) the analyst can
+download (with a provenance header), reuse on later uploads (no model call) and regenerate
+with a hint (a new version, never an edit). Spec:
+`docs/superpowers/specs/2026-08-17-generated-converters-design.md`; plan:
+`docs/superpowers/plans/2026-08-17-generated-converters.md`.
+
+Decisions worth remembering:
+
+- **Off by default, gated twice.** `converter_generation_enabled` plus the agent probe; the
+  capability hides the UI, `convert`/`regenerate` answer 503 (house style, not the 404 the
+  spec first said), list/download stay available because rows are records.
+- **Guard is stdlib only** (no bwrap/containers, so uv and image deployments are unchanged):
+  AST deny-list, `python -I`, scrubbed env, private cwd, `RLIMIT_AS/CPU/FSIZE/NOFILE`, own
+  session. Measured: pyarrow imports at 2048 MB `RLIMIT_AS` and fails at 1024, so the setting
+  floors at 2048. `RLIMIT_NPROC` was dropped — on Linux it counts the *user's* processes and
+  starved OpenBLAS thread creation on a busy host; `OPENBLAS_NUM_THREADS=1` in the child env
+  instead. What the guard does not stop is written down in `docs/DEPLOYMENT.md`.
+- **The prompt is data.** `converters/prompt.py` renders the generation, repair and human
+  copy-paste prompts from `ingestion/parquet_format.py`; the frontend now fetches the
+  copy-paste text from `GET /api/converters/prompt` (the drift bug #204 cannot recur), and
+  the assertions moved from `guidancePrompts.test.ts` to `test_converter_prompt.py`.
+- **Egress is exactly** the head/middle/tail excerpt, filename, size, line count, mtime,
+  version to declare and hint; the dialog names the model, endpoint host and byte count.
+- **No repair on the full-file run** — a script that passed the sample and fails the whole
+  file met a format change the sample did not show; regenerate with a hint instead of the
+  harness sending more evidence than disclosed.
+- **No job cancellation** (`JobStore` has none); timeouts bound every subprocess.
+- `upload_source` lost ~120 lines to `register_source_for_ingest`, which the job reuses so
+  both register a file identically (dedup, format detection, footer validation, retention,
+  the row, the default timeline).
+- Transfer carries `converter_scripts.ndjson` and the raw inputs as blobs; an older archive
+  without the stem imports fine (`_OPTIONAL_STEMS`).
+
+Tests: `test_converter_{prompt,sample,validate,runner,generator,scripts_store,scripts_api}.py`,
+`test_converter_job_clickhouse.py` (real subprocess + real ingest with a fake model: happy
+path, repair round, exhausted attempts, denied import, reuse, regenerate), transfer round
+trip, CLI, plus `uploadDialogGenerate` and `generatedConvertersPanel` on the frontend.
 
 ## Session 174 — 2026-08-14: a declaration that steers nothing must not claim to
 

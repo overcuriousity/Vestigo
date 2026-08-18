@@ -66,7 +66,8 @@ default. The CLI (`vestigo ingest`, `vestigo embed`) reads the same layer at sta
 console-tuned values apply to scripted runs too.
 
 **Optional subsystems are hidden when unconfigured.** `/api/health` reports a
-`capabilities` map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer);
+`capabilities` map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer,
+demo case, converter generation);
 a subsystem that is off or unconfigured renders no entry point in the UI and — for the
 AI agent — its tools are not advertised to the model at all. The endpoints refuse
 independently, so hiding is never the only enforcement.
@@ -78,6 +79,38 @@ independently": with `VESTIGO_TRANSFER_ENABLED=false`, starting an export or imp
 refused with 503, but an archive an earlier export already produced can still be
 downloaded — it is single-use and swept from disk shortly after, so refusing it would
 only strand a legitimate export.
+
+## Generated converters (optional; executes model-written code)
+
+`converter_generation_enabled` (default **off**; group *Generated converters* in the console)
+lets an analyst upload a plain-text log and have the configured AI model write the converter
+server-side (`docs/INPUT_FORMATS.md` §"Generated converters"). It needs the agent endpoint
+configured and reachable; the capability on `/api/health` is false otherwise. Companion
+tunables: `converter_max_attempts` (4), `converter_sample_bytes` (64 KiB sent to the model),
+`converter_run_timeout_seconds` (600 for the full-file run), `converter_run_memory_mb` (2048;
+pyarrow does not import below that), `converter_run_output_mb` (4096).
+
+**What the run isolates — and what it does not.** The script runs as a child of the app
+process with `python -I` (no user site, no cwd on `sys.path`), in a private temporary working
+directory holding only the script and a read-only copy of the input, with an environment
+reduced to `PATH`/`HOME`/`TMPDIR`/`LANG` and Python flags (no `VESTIGO_*`, no proxies, no
+credentials), under `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, in its own
+session so a timeout kills the whole group; before it runs, an AST scan allow-lists imports
+(standard library plus `pyarrow`/`numpy`, minus network, subprocess, threading, `ctypes`,
+`importlib`, `builtins`, `runpy`, `pydoc`, `pickle`, `marshal`, `gc`, `inspect` and friends),
+resolves import aliases, allows an imported module only as `module.<attribute>` (no `x = os`,
+no `f(os)`), and rejects `exec`/`eval`/`globals`/`vars` wherever named, `sys.modules`/
+`sys.path`, `getattr` on a module or with a dunder string, the object-graph dunders
+(`__dict__`, `__subclasses__`, `__globals__`, …) and destructive `os.*`/`Path.*` attributes.
+This is the guard the standard library affords, and it is **best-effort static analysis**,
+not a sandbox — deliberately no bwrap, no container-in-container, so the reference uv and
+image deployments keep working. It does **not** stop a script from writing anywhere the app
+user can write, nor from reaching the network if it finds a path the scan does not cover.
+Run the app as a dedicated unprivileged user (the container image already does),
+keep the switch off on hosts where model-written code must not run, and remember that a log
+line is untrusted input to the model: the harness validates the *output* against the data
+contract and records every attempt, which is the mitigation for a script that mis-parses on
+purpose.
 
 ## OIDC single sign-on (optional)
 

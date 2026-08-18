@@ -199,6 +199,38 @@ async def _sweep_stale_transfer_archives() -> None:
         logger.exception("Transfer archive sweep failed; leftover export archives remain.")
 
 
+async def _reconcile_stale_converter_generations(store: PostgresStore) -> None:
+    """Fail every converter script still ``generating`` — its job did not survive the restart.
+
+    Same reasoning as the ingest reconciliation above: the JobStore is
+    in-memory, so a row in this state on boot has nothing left to finish it,
+    and it would sit in the panel as "generating" forever, neither reusable
+    nor regenerable as a failed draft. The row and its attempts stay; only the
+    status flips, and the trail records why.
+
+    Runs *before* the lifespan yields, like
+    ``_settle_orphaned_column_recommendations`` and for the same two reasons:
+    it is one fast Postgres statement that touches no external service, and it
+    fails *every* ``generating`` row — so it must run before the app can
+    accept a conversion, or (queued behind a slow ClickHouse sweep in
+    ``_startup_recovery``) it would flip a live generation to ``failed`` and
+    plant a bogus "interrupted by a server restart" attempt on it.
+    """
+    try:
+        rows = await store.fail_stale_converter_generations()
+    except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        logger.exception("Converter generation reconciliation failed")
+        return
+    for row in rows:
+        logger.warning(
+            "Marked converter script %s (%s v%s, case %s) failed: still generating on startup",
+            row.id,
+            row.name,
+            row.version,
+            row.case_id,
+        )
+
+
 async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
     """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
 
@@ -433,6 +465,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _seed_admin()
     await _refresh_enricher_availability()
     await _settle_orphaned_column_recommendations(store)
+    await _reconcile_stale_converter_generations(store)
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
     try:
@@ -687,6 +720,7 @@ def create_app() -> FastAPI:
     app.include_router(stories.router)
     app.include_router(stream.router)
     app.include_router(converters.router)
+    app.include_router(converters.case_router)
     app.include_router(agent.router)
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)

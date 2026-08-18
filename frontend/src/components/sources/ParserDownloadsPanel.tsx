@@ -14,7 +14,15 @@ import { Input } from "@/components/ui/Input";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { fmtBytes } from "@/lib/format";
 
-function CopyPromptButton({ prompt, label }: { prompt: string; label: string }) {
+function CopyPromptButton({
+  prompt,
+  label,
+  disabled,
+}: {
+  prompt: string;
+  label: string;
+  disabled?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -28,7 +36,7 @@ function CopyPromptButton({ prompt, label }: { prompt: string; label: string }) 
   };
 
   return (
-    <Button variant="outline" size="sm" onClick={copy}>
+    <Button variant="outline" size="sm" onClick={copy} disabled={disabled}>
       {copied ? <Check size={13} /> : <Clipboard size={13} />}
       {copied ? "Copied" : label}
     </Button>
@@ -57,6 +65,11 @@ export function ParserDownloadsPanel() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["converters"],
     queryFn: convertersApi.list,
+    staleTime: Infinity,
+  });
+  const prompts = useQuery({
+    queryKey: ["converter-prompts"],
+    queryFn: convertersApi.prompts,
     staleTime: Infinity,
   });
 
@@ -160,14 +173,27 @@ export function ParserDownloadsPanel() {
             </p>
             {mode === "optimized" ? (
               <CopyPromptButton
-                prompt={converterCopy.llmPromptParquet}
+                prompt={prompts.data?.parquet ?? ""}
                 label="Copy LLM prompt (Parquet)"
+                disabled={!prompts.data}
               />
             ) : (
               <CopyPromptButton
-                prompt={converterCopy.llmPromptCsv}
+                prompt={prompts.data?.csv ?? ""}
                 label="Copy LLM prompt (CSV/JSONL)"
+                disabled={!prompts.data}
               />
+            )}
+            {prompts.error && (
+              // The query never refetches on its own (staleTime Infinity,
+              // no focus refetch), so a failed load would leave the buttons
+              // disabled forever with no explanation — say why and offer a retry.
+              <p className="flex flex-wrap items-center gap-1 text-xs text-[var(--color-danger)]">
+                Could not load the prompts: {(prompts.error as Error).message}
+                <Button variant="ghost" size="sm" onClick={() => prompts.refetch()}>
+                  Retry
+                </Button>
+              </p>
             )}
           </div>
         </div>

@@ -187,6 +187,34 @@ async def test_source_added_to_default_timeline(
 
 
 @pytest.mark.asyncio
+async def test_registration_failure_after_row_creation_rolls_the_row_back(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure between create_source and the timeline add must not leave an
+    orphaned status='ingesting' row that every re-upload sees as a duplicate."""
+
+    original = store.add_source_to_timeline
+    fail = True
+
+    async def flaky(*a, **k):
+        if fail:
+            raise RuntimeError("transient db error")
+        return await original(*a, **k)
+
+    monkeypatch.setattr(store, "add_source_to_timeline", flaky)
+    case_obj = await store.get_case(case)
+    with pytest.raises(RuntimeError, match="transient"):
+        await _upload(case_obj, "events.jsonl", b'{"message":"x"}\n')
+    assert await store.list_sources(case) == []
+    fail = False
+    # The same bytes now upload as new — not "duplicate, still ingesting".
+    response = await _upload(case_obj, "events.jsonl", b'{"message":"x"}\n')
+    assert response.duplicate is False and response.status == "ingesting"
+
+
+@pytest.mark.asyncio
 async def test_failed_ingestion_marks_job_failed_and_removes_source(
     store: PostgresStore,
     case: str,

@@ -5,6 +5,7 @@ import { sourcesApi } from "@/api/sources";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
 import { StoriesPanel } from "@/components/stories/StoriesPanel";
+import { GeneratedConvertersPanel } from "@/components/sources/GeneratedConvertersPanel";
 import { ParserDownloadsPanel } from "@/components/sources/ParserDownloadsPanel";
 import { CaseJobsPanel } from "@/components/jobs/CaseJobsPanel";
 import { Spinner } from "@/components/ui/Spinner";
@@ -93,8 +94,9 @@ export function CaseOverviewPage() {
         </div>
 
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-[300px_minmax(0,1fr)_300px]">
-          <div className="order-2 lg:order-1">
+          <div className="order-2 space-y-6 lg:order-1">
             <ParserDownloadsPanel />
+            <GeneratedConvertersPanel caseId={caseId!} />
           </div>
 
           <div className="order-1 space-y-8 lg:order-2">

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from pathlib import Path
 
 import typer
 
 from vestigo import __version__
 from vestigo.cli.progress import BytesProgressPrinter
+from vestigo.core.config import get_settings
 from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.db.postgres import PostgresStore, User, generate_id
-from vestigo.ingestion.files import hash_file
+from vestigo.ingestion.files import copy_and_hash, hash_file
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
 app = typer.Typer(
@@ -343,6 +345,138 @@ def embed(
             for error in result.errors:
                 typer.echo(f"ERROR: {error}", err=True)
             raise typer.Exit(code=1)
+
+    asyncio.run(_run())
+
+
+# ── Generated converters ─────────────────────────────────────────────────
+
+converters_app = typer.Typer(help="Generated converter scripts (per case).")
+app.add_typer(converters_app, name="converters")
+
+
+@app.command("convert-ingest")
+def convert_ingest(
+    path: str = typer.Argument(..., help="Plain-text log file."),
+    case: str = typer.Option(..., "--case", "-c", help="Target case ID."),
+    hint: str | None = typer.Option(None, "--hint", help="Hint for the model about the data."),
+    converter: str | None = typer.Option(
+        None, "--converter", help="Reuse a saved converter script id instead of generating."
+    ),
+    user: str | None = typer.Option(
+        None,
+        "--user",
+        "-u",
+        help="Username to attribute this ingest to (default: the sole active admin, if unambiguous).",
+    ),
+) -> None:
+    """Let the configured model write a converter for PATH, run it, and ingest the result.
+
+    Same job the web upload dialog runs (docs/INPUT_FORMATS.md §"Generated
+    converters"); needs VESTIGO_CONVERTER_GENERATION_ENABLED and a reachable
+    agent endpoint.
+    """
+    from vestigo.converters.job import ConvertJobInputs, run_convert_ingest_job
+    from vestigo.core.jobs import JobStore
+
+    path_obj = Path(path).resolve()
+    if not path_obj.is_file():
+        typer.echo(f"ERROR: not a file: {path}", err=True)
+        raise typer.Exit(code=1)
+    store = _get_store()
+
+    async def _run() -> None:
+        await _bootstrap(store)
+        if not get_settings().converter_generation_enabled:
+            typer.echo(
+                "ERROR: converter generation is disabled (VESTIGO_CONVERTER_GENERATION_ENABLED).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        actor = await _resolve_actor(store, user)
+        case_obj = await store.get_case(case)
+        if case_obj is None:
+            typer.echo(f"ERROR: No case with id '{case}'.", err=True)
+            raise typer.Exit(code=1)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="vestigo-cli-conv-"))
+        tmp = tmp_dir / path_obj.name
+        # One pass: copy and hash together (the upload endpoint does the same).
+        with path_obj.open("rb") as src, tmp.open("wb") as dst:
+            raw_hash, raw_size = copy_and_hash(src, dst)
+        jobs = JobStore()
+        job = jobs.create(kind="convert_ingest", case_id=case_obj.id, created_by=actor.id)
+        inputs = ConvertJobInputs(
+            case_id=case_obj.id,
+            user=actor,
+            raw_tmp_path=tmp,
+            raw_hash=raw_hash,
+            raw_size=raw_size,
+            filename=path_obj.name,
+            hint=hint,
+            reuse_script_id=converter,
+            raw_tmp_dir=tmp_dir,
+            # The evidence file's own mtime — the CLI is the one caller that
+            # has the real one; the model may take a missing year from it.
+            raw_mtime=path_obj.stat().st_mtime,
+        )
+        task = asyncio.create_task(run_convert_ingest_job(job.id, inputs, job_store=jobs))
+        last: str | None = None
+        while not task.done():
+            j = jobs.get(job.id)
+            phase = (j.progress or {}).get("phase") if j else None
+            if phase and phase != last:
+                typer.echo(f"… {phase}", err=True)
+                last = phase
+            await asyncio.sleep(0.5)
+        await task
+        j = jobs.get(job.id)
+        assert j is not None  # noqa: S101 — created above in this process
+        if j.status != "completed":
+            typer.echo(f"ERROR: {j.error}", err=True)
+            sid = (j.progress or {}).get("converter_script_id")
+            if sid:
+                typer.echo(f"converter script (failed draft): {sid}", err=True)
+            raise typer.Exit(code=1)
+        result = j.result or {}
+        typer.echo(
+            f"source {result.get('source_id')} ingested; "
+            f"converter script {result.get('converter_script_id')}"
+        )
+
+    asyncio.run(_run())
+
+
+@converters_app.command("list")
+def converters_list(case: str = typer.Option(..., "--case", "-c", help="Case ID.")) -> None:
+    """List generated converter scripts in a case."""
+    store = _get_store()
+
+    async def _run() -> None:
+        await _bootstrap(store)
+        for r in await store.list_converter_scripts(case):
+            created = r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "?"
+            typer.echo(f"{r.id}\t{r.name}\tv{r.version}\t{r.status}\t{r.model}\t{created}")
+
+    asyncio.run(_run())
+
+
+@converters_app.command("download")
+def converters_download(
+    script_id: str = typer.Argument(..., help="Converter script ID."),
+    case: str = typer.Option(..., "--case", "-c", help="Case ID."),
+    output: str = typer.Option(..., "--output", "-o", help="Destination .py path."),
+) -> None:
+    """Write a converter script to OUTPUT."""
+    store = _get_store()
+
+    async def _run() -> None:
+        await _bootstrap(store)
+        r = await store.get_converter_script(case, script_id)
+        if r is None or not r.source_code:
+            typer.echo("ERROR: converter script not found", err=True)
+            raise typer.Exit(code=1)
+        Path(output).write_text(r.source_code, encoding="utf-8")
+        typer.echo(f"wrote {output}")
 
     asyncio.run(_run())
 

@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] — 2026-08-18
+
+### Added
+
+- **Generated converters — the model writes the script, the harness runs it.** An analyst can
+  upload any plain-text, time-annotated log and have the configured model write a converter to
+  Vestigo's Parquet interchange contract; Vestigo runs it in a guarded subprocess, validates the
+  output against the contract, repairs on failure and ingests the result through the normal
+  path. Off by default: it needs an agent endpoint *and* `converter_generation_enabled`, and
+  without both the UI shows no entry point and the endpoints refuse. See
+  `docs/INPUT_FORMATS.md` §"Generated converters".
+- **The produced Parquet is the source.** `parser = <name>@<version>`, retention and dedup
+  unchanged; the only new columns are `sources.converter_script_id` and
+  `sources.converter_input_hash`. Nothing downstream of ingestion learns a new case.
+- **Scripts are case-bound records, not throwaways.** Every generation, sample run and full run
+  is kept with its validation report, stderr tail and script hash; the exact sample text, prompt
+  hash, model and endpoint are stored, because a model's output is not reproducible and an
+  examiner has to be able to explain where the script came from. Scripts are downloadable with
+  a provenance header, reusable on a later upload without a model call, and regenerable with a
+  hint — always as a new version, never an edit. Audit rows `converter.generate`,
+  `converter.run`, `converter.regenerate`.
+- **A disclosure before anything leaves the host.** The dialog names the model, the endpoint
+  host and the byte count, and what is sent is bounded and enumerated: a head/middle/tail
+  excerpt of the raw file (`converter_sample_bytes`, default 64 KiB), the filename, size, line
+  count and mtime, the version and name the script must declare, and the analyst's optional
+  hint — no case, source, timeline or user identifier, no key, no host name. Reusing a saved
+  converter sends nothing.
+- **The runner is stdlib-only and guarded in depth**: an AST deny-list over imports, reflection
+  and the dunder attributes that walk back to the builtins, then `python -I` under rlimits with
+  a scrubbed environment and a private copy of the input. `docs/DEPLOYMENT.md` says plainly what
+  that guard does and does not isolate.
+- Case transfer archives carry generated converter scripts and their raw inputs; older archives
+  without the stem import unchanged. CLI: `vestigo convert-ingest`, `vestigo converters
+  list/download`.
+- The copy-paste conversion prompts are now rendered from the Parquet contract itself and served
+  from `GET /api/converters/prompt`, so the documented prompt and the enforced schema cannot
+  drift apart again.
+
+### Changed
+
+- Dependencies: numpy 2.5.2, pyarrow 25.0.1, alembic 1.19.1, pydantic-settings 2.15.0,
+  sentence-transformers 5.7.0, pydantic-ai-slim 2.31.1, and the frontend's Radix, lucide,
+  `@types/node` and jest-dom bumps. `mcp` stays on 1.x: every `pydantic-ai-slim[mcp]` release
+  still pins `mcp<2.0`.
+
+### Database
+
+- Migration `0030` adds `converter_scripts` and the nullable `sources.converter_script_id` /
+  `sources.converter_input_hash`. Applied on startup like every other revision.
+
 ## [1.12.2] — 2026-08-14
 
 ### Fixed

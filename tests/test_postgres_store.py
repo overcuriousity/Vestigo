@@ -248,6 +248,14 @@ async def test_init_schema_adopts_pre_alembic_db(blank_pg_database):
         await conn.execute(text("DROP TABLE app_settings"))
         # 0026 adds the analysis result cache and the verdict's analysis scope.
         await conn.execute(text("DROP TABLE analysis_cache"))
+        # 0031 adds the raw-input hash a generated converter was run over (0032 makes its
+        # index unique; it also names converter_script_id, so it goes before 0030's column).
+        await conn.execute(text("DROP INDEX ix_sources_converter_input"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN converter_input_hash"))
+        # 0030 adds the generated-converter scripts and the source back-reference.
+        await conn.execute(text("DROP TABLE converter_scripts"))
+        await conn.execute(text("DROP INDEX ix_sources_converter_script_id"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN converter_script_id"))
         # 0016 adds the Stories tables.
         await conn.execute(text("DROP TABLE stories"))
         await conn.execute(text("DROP TABLE story_blocks"))

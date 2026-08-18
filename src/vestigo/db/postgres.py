@@ -33,7 +33,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    defer,
+    mapped_column,
+    relationship,
+    selectinload,
+)
 
 from vestigo.core.config import get_settings
 
@@ -100,7 +107,24 @@ class Source(Base):
     """
 
     __tablename__ = "sources"
-    __table_args__ = (Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),)
+    __table_args__ = (
+        Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
+        # One source per (saved script, raw file) per case: the Parquet a
+        # converter writes is not byte-stable across runs, so ``file_hash``
+        # cannot catch the same evidence being converted twice by the same
+        # script — this index does, as the backstop behind the pre-checks in
+        # the endpoint and the job (migration 0032).
+        Index(
+            "ix_sources_converter_input",
+            "case_id",
+            "converter_script_id",
+            "converter_input_hash",
+            unique=True,
+            postgresql_where=text(
+                "converter_script_id IS NOT NULL AND converter_input_hash IS NOT NULL"
+            ),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -135,6 +159,14 @@ class Source(Base):
     time_offset_seconds: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    # The generated converter that produced this Parquet source, when one did.
+    # Plain id, no FK (house style): the script row is a record and outlives
+    # the source; the transfer importer remaps it through the id map.
+    converter_script_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # SHA-256 of the raw file that converter was run over. The Parquet's own
+    # ``file_hash`` is not stable across runs (converters stamp ``converted_at``),
+    # so this is what "already converted with this script" is keyed on.
+    converter_input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     @property
     def is_ready(self) -> bool:
@@ -178,10 +210,123 @@ class Source(Base):
             "vector_count": self.vector_count,
             "status": self.status,
             "time_offset_seconds": self.time_offset_seconds,
+            "converter_script_id": self.converter_script_id,
+            "converter_input_hash": self.converter_input_hash,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+def converter_attempt_entry(
+    n: int,
+    phase: str,
+    *,
+    model: str | None = None,
+    elapsed_ms: int = 0,
+    exit_code: int | None = None,
+    stderr_tail: str = "",
+    validation: dict[str, Any] | None = None,
+    script_hash: str | None = None,
+    prompt_hash: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """One ``converter_scripts.attempts`` entry — the single place its shape is defined.
+
+    Built here for the job (``converters/job.py``) and for startup
+    reconciliation alike, so the two can never disagree about a key.
+    ``prompt_hash`` is set on the entries that sent a prompt (``generate``
+    and the ``sample`` run of the script that prompt produced), which is what
+    lets the row name the prompt that produced its *stored* code.
+    """
+    return {
+        "n": n,
+        "phase": phase,
+        "model": model,
+        "elapsed_ms": elapsed_ms,
+        "exit_code": exit_code,
+        "stderr_tail": stderr_tail[-4096:],
+        "validation": validation,
+        "script_hash": script_hash,
+        "prompt_hash": prompt_hash,
+        "error": error,
+    }
+
+
+class ConverterScript(Base):
+    """A converter script the configured model wrote for one case.
+
+    Case-bound and append-only in spirit: a regeneration is a new row with
+    ``parent_id`` set, never an edit of ``source_code`` after ``status`` has
+    reached ``working``. ``sample_excerpt`` is the exact text sent to the
+    model, ``attempts`` every generation/repair/run — together with
+    ``prompt_hash`` and ``model`` that is what makes "how did this script come
+    to be" answerable later (docs/INPUT_FORMATS.md §"Generated converters").
+    """
+
+    __tablename__ = "converter_scripts"
+    __table_args__ = (
+        Index("ix_converter_scripts_case_name_version", "case_id", "name", "version", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # generating | working | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="generating")
+    source_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: The evidence file's own mtime as the uploader knew it (browser
+    #: ``lastModified``, CLI ``stat``) — what the prompt stated; ``None`` when
+    #: the model was told the mtime is unknown. Regeneration replays it.
+    raw_mtime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, *, include_code: bool = False) -> dict[str, Any]:
+        """Serialize; ``source_code``/``sample_excerpt`` only on request (they are large)."""
+        d: dict[str, Any] = {
+            "id": self.id,
+            "case_id": self.case_id,
+            "name": self.name,
+            "version": self.version,
+            "parent_id": self.parent_id,
+            "status": self.status,
+            "model": self.model,
+            "provider_endpoint": self.provider_endpoint,
+            "prompt_hash": self.prompt_hash,
+            "sample_hash": self.sample_hash,
+            "raw_file_hash": self.raw_file_hash,
+            "raw_filename": self.raw_filename,
+            "raw_mtime": self.raw_mtime.isoformat() if self.raw_mtime else None,
+            "hint": self.hint,
+            "attempts": self.attempts or [],
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_code:
+            d["source_code"] = self.source_code
+            d["sample_excerpt"] = self.sample_excerpt
+        return d
 
 
 class Timeline(Base):
@@ -2125,6 +2270,8 @@ class PostgresStore:
         event_count: int = 0,
         created_by: str | None = None,
         status: str = "ready",
+        converter_script_id: str | None = None,
+        converter_input_hash: str | None = None,
     ) -> Source:
         """Create a new source record within a case.
 
@@ -2144,6 +2291,8 @@ class PostgresStore:
             event_count=event_count,
             created_by=created_by,
             status=status,
+            converter_script_id=converter_script_id,
+            converter_input_hash=converter_input_hash,
         )
         async with self.session_factory() as session:
             session.add(source)
@@ -2216,20 +2365,251 @@ class PostgresStore:
             return source
 
     async def source_hash_in_use(self, file_hash: str, *, exclude_source_id: str) -> bool:
-        """Whether any *other* source row (in any case) still has this file hash.
+        """Whether any *other* row (in any case) still references this retained hash.
 
         Retention storage is content-addressed by hash alone (not per-case),
         so a file uploaded into multiple cases shares one retained copy —
         callers must check this before deleting a retained file for a source
-        being removed, or they'd delete a copy another case still needs.
+        being removed, or they'd delete a copy another case still needs. A
+        generated converter's ``raw_file_hash`` is a reference too: the raw
+        log it was written from is retained under the same store (regenerate
+        and export read it back), and it is never a source of its own — and so
+        is a converted source's ``converter_input_hash``, the raw evidence a
+        saved script was re-run over. ``exclude_source_id`` may be ``""`` to
+        ask "does anything at all reference this hash".
         """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Source.id).where(
-                    Source.file_hash == file_hash, Source.id != exclude_source_id
+                    or_(Source.file_hash == file_hash, Source.converter_input_hash == file_hash),
+                    Source.id != exclude_source_id,
                 )
             )
-            return result.scalar_one_or_none() is not None
+            if result.first() is not None:
+                return True
+            result = await session.execute(
+                select(ConverterScript.id).where(ConverterScript.raw_file_hash == file_hash)
+            )
+            # ``first()``, not ``scalar_one_or_none()``: several scripts legitimately
+            # share one raw file — every regeneration adds a row against the same hash.
+            return result.first() is not None
+
+    # ── Converter scripts ────────────────────────────────────────────────
+
+    async def create_converter_script(
+        self,
+        *,
+        case_id: str,
+        name: str,
+        version: int,
+        raw_file_hash: str,
+        raw_filename: str | None,
+        model: str | None,
+        raw_mtime: datetime | None = None,
+        provider_endpoint: str | None,
+        prompt_hash: str | None,
+        sample_hash: str | None,
+        sample_excerpt: str | None,
+        hint: str | None,
+        created_by: str | None,
+        parent_id: str | None = None,
+        status: str = "generating",
+    ) -> ConverterScript:
+        """Insert a converter-script row (docs/INPUT_FORMATS.md §"Generated converters")."""
+        row = ConverterScript(
+            id=generate_id(f"conv_{case_id}_{name}"),
+            case_id=case_id,
+            name=name,
+            version=version,
+            parent_id=parent_id,
+            status=status,
+            model=model,
+            provider_endpoint=provider_endpoint,
+            prompt_hash=prompt_hash,
+            sample_hash=sample_hash,
+            sample_excerpt=sample_excerpt,
+            raw_file_hash=raw_file_hash,
+            raw_filename=raw_filename,
+            raw_mtime=raw_mtime,
+            hint=hint,
+            attempts=[],
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def update_converter_script(
+        self,
+        script_id: str,
+        *,
+        status: str | None = None,
+        source_code: str | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        prompt_hash: str | None = None,
+    ) -> ConverterScript | None:
+        """Update mutable fields; ``attempts`` replaces the list wholesale."""
+        async with self.session_factory() as session:
+            row = await session.get(ConverterScript, script_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if source_code is not None:
+                row.source_code = source_code
+            if attempts is not None:
+                row.attempts = list(attempts)
+            if model is not None:
+                row.model = model
+            if prompt_hash is not None:
+                row.prompt_hash = prompt_hash
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def append_converter_attempt(
+        self,
+        script_id: str,
+        phase: str,
+        *,
+        model: str | None = None,
+        elapsed_ms: int = 0,
+        exit_code: int | None = None,
+        stderr_tail: str = "",
+        validation: dict[str, Any] | None = None,
+        script_hash: str | None = None,
+        prompt_hash: str | None = None,
+        error: str | None = None,
+        row_updates: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Append one attempt under a row lock and return the new list.
+
+        Two jobs may run the same ``working`` script over different raw files
+        at once; each must add its own entries without overwriting the
+        other's, so this is a ``SELECT ... FOR UPDATE`` + append + commit,
+        never a client-side snapshot written back wholesale. ``n`` is
+        assigned here from the locked row. Any ``row_updates`` (``status``,
+        ``source_code``, ``model``, ``prompt_hash``) land in the same
+        transaction. Returns ``[]`` when the row is gone.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript).where(ConverterScript.id == script_id).with_for_update()
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return []
+            entries = list(row.attempts or [])
+            entries.append(
+                converter_attempt_entry(
+                    len(entries) + 1,
+                    phase,
+                    model=model,
+                    elapsed_ms=elapsed_ms,
+                    exit_code=exit_code,
+                    stderr_tail=stderr_tail,
+                    validation=validation,
+                    script_hash=script_hash,
+                    prompt_hash=prompt_hash,
+                    error=error,
+                )
+            )
+            row.attempts = entries
+            for key, value in (row_updates or {}).items():
+                if value is not None:
+                    setattr(row, key, value)
+            await session.commit()
+            return entries
+
+    async def get_converter_script(self, case_id: str, script_id: str) -> ConverterScript | None:
+        """Return the row when it exists *and* belongs to ``case_id``."""
+        async with self.session_factory() as session:
+            row = await session.get(ConverterScript, script_id)
+            return row if row is not None and row.case_id == case_id else None
+
+    async def list_converter_scripts(self, case_id: str) -> list[ConverterScript]:
+        """Newest first, without the two large Text columns the list surfaces never show.
+
+        ``source_code`` and ``sample_excerpt`` are deferred; the rows come from a
+        closed session, so reading either on a listed row is a programming error
+        — use :meth:`get_converter_script` for one script with its code.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript)
+                .options(defer(ConverterScript.source_code), defer(ConverterScript.sample_excerpt))
+                .where(ConverterScript.case_id == case_id)
+                .order_by(ConverterScript.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def next_converter_version(self, case_id: str, name: str) -> int:
+        """1 for a new name in this case, else max(version) + 1."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(func.max(ConverterScript.version)).where(
+                    ConverterScript.case_id == case_id, ConverterScript.name == name
+                )
+            )
+            current = result.scalar_one_or_none()
+            return (current or 0) + 1
+
+    async def count_sources_by_converter(self, case_id: str) -> dict[str, int]:
+        """``{converter_script_id: number of sources it produced}`` within a case."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source.converter_script_id, func.count())
+                .where(Source.case_id == case_id, Source.converter_script_id.is_not(None))
+                .group_by(Source.converter_script_id)
+            )
+            return {sid: int(n) for sid, n in result.all()}
+
+    async def get_source_by_converter_input(
+        self, case_id: str, script_id: str, raw_hash: str
+    ) -> Source | None:
+        """The source this script already produced from this raw file in this case, if any."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source).where(
+                    Source.case_id == case_id,
+                    Source.converter_script_id == script_id,
+                    Source.converter_input_hash == raw_hash,
+                )
+            )
+            return result.scalars().first()
+
+    async def fail_stale_converter_generations(self) -> list[ConverterScript]:
+        """Mark every ``generating`` script row ``failed`` and return them.
+
+        Startup reconciliation: the job that owns a generation lives in the
+        in-memory JobStore, so a row still ``generating`` on a fresh boot has
+        no job left to finish it — it would show as generating forever and
+        never become reusable or regenerable.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript)
+                .options(defer(ConverterScript.source_code), defer(ConverterScript.sample_excerpt))
+                .where(ConverterScript.status == "generating")
+            )
+            rows = list(result.scalars().all())
+            for row in rows:
+                row.status = "failed"
+                row.attempts = [
+                    *(row.attempts or []),
+                    converter_attempt_entry(
+                        len(row.attempts or []) + 1,
+                        "generate",
+                        error="generation interrupted by a server restart",
+                    ),
+                ]
+            await session.commit()
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     async def list_ingesting_sources(self) -> list[Source]:
         """Return every source still marked "ingesting", across all cases.
@@ -3328,10 +3708,11 @@ class PostgresStore:
         ``StoryBlock``, ``StoryExport`` — the last of which holds frozen event
         data the operator believes went with the case), and the enrichment
         tables (``SourceEnrichment``, ``EnrichmentResultStaging``,
-        ``EnrichmentJobRun``) and ``AnalysisCache`` (derived, but its payloads
+        ``EnrichmentJobRun``), ``AnalysisCache`` (derived, but its payloads
         hold event ids, field values and message templates, and its eviction
         only ever runs on a write for the same case — so a row left here would
-        never be reclaimed) are case-scoped by a plain ``case_id`` column
+        never be reclaimed) and ``ConverterScript`` (whose ``sample_excerpt``
+        is a verbatim slice of the evidence log) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
         ``cases.id``), so they must be deleted explicitly here alongside
         ``Timeline``/``Source`` or they'd silently orphan on every case delete
@@ -3376,6 +3757,7 @@ class PostgresStore:
             )
             await session.execute(delete(StoryExport).where(StoryExport.case_id == case_id))
             await session.execute(delete(Story).where(Story.case_id == case_id))
+            await session.execute(delete(ConverterScript).where(ConverterScript.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True
@@ -5570,7 +5952,7 @@ class PostgresStore:
                 .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
                 .limit(1)
             )
-            return result.first() is not None
+            return result.scalar_one_or_none() is not None
 
     # ------------------------------------------------------------------
     # Users
