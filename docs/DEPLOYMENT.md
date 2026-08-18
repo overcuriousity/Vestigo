@@ -95,8 +95,10 @@ process with `python -I` (no user site, no cwd on `sys.path`), in a private temp
 directory holding only the script and a read-only copy of the input, with an environment
 reduced to `PATH`/`HOME`/`TMPDIR`/`LANG` and Python flags (no `VESTIGO_*`, no proxies, no
 credentials), under `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, in its own
-session so a timeout kills the whole group; before it runs, an AST scan rejects network,
-subprocess, threading, `ctypes`, `importlib`, `exec`/`eval` and destructive `os.*` calls. This
+session so a timeout kills the whole group; before it runs, an AST scan allow-lists imports
+(standard library plus `pyarrow`/`numpy`, minus network, subprocess, threading, `ctypes`,
+`importlib`, `builtins`, `runpy`), resolves import aliases and rejects `exec`/`eval`,
+`sys.modules` and destructive `os.*`/`Path.*` calls. This
 is the guard the standard library affords — deliberately no bwrap, no container-in-container,
 so the reference uv and image deployments keep working. It does **not** stop a script from
 writing anywhere the app user can write, nor from reaching the network if it evades the

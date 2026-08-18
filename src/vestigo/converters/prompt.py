@@ -29,7 +29,7 @@ from vestigo.ingestion.parquet_format import (
 )
 
 #: Bump when the system message changes in substance; part of ``prompt_hash``.
-SYSTEM_PROMPT_VERSION = "2"
+SYSTEM_PROMPT_VERSION = "3"
 
 #: Canonical attribute names the model is asked to prefer when meaning matches.
 CANONICAL_ATTRIBUTES = (
@@ -154,7 +154,7 @@ def _system_enforced() -> str:
 - {META_CONVERTER_NAME} equal to the converter name the task names, or — when the task leaves the name to you — equal to the "name" field you return
 - at least one row; at least 50% of rows not marked parse_status=unparsed; at least 50% of rows with a non-null timestamp
 - exit code 0 within the time and memory ceilings
-- NO network, NO subprocess, NO threads/multiprocessing, NO reading outside -i, NO writing outside -o. These modules are rejected before the script runs: {denied}. Also rejected: exec, eval, compile, __import__, os.system/popen/exec*/spawn*/fork/kill/remove/unlink/rmdir/rename/chmod/chown.
+- NO network, NO subprocess, NO threads/multiprocessing, NO reading outside -i, NO writing outside -o. Only the standard library, pyarrow and numpy may be imported; these stdlib modules are rejected before the script runs: {denied}. Also rejected: exec, eval, compile, __import__, sys.modules, `from x import *`, getattr on a module, os.system/popen/exec*/spawn*/fork/kill/remove/rename/replace, and unlink/rmdir/chmod/chown on anything (pathlib.Path included).
 """
 
 

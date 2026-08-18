@@ -770,6 +770,7 @@ async def register_source_for_ingest(
     parser: str | None,
     user: User,
     converter_script_id: str | None = None,
+    converter_input_hash: str | None = None,
 ) -> RegisteredSource:
     """Dedup, detect the format, validate a Parquet footer, retain, create the row.
 
@@ -851,6 +852,7 @@ async def register_source_for_ingest(
             # the background job flips it to "ready".
             status="ingesting",
             converter_script_id=converter_script_id,
+            converter_input_hash=converter_input_hash,
         )
     except IntegrityError:
         # Lost a race against a concurrent upload of the same bytes:

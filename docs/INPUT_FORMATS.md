@@ -456,7 +456,14 @@ contract above, runs it in a guarded subprocess on the server, validates the out
 on failure, and ingests the resulting Parquet through the normal path. Nothing in the data
 model changes: **the produced Parquet is the source**, with `parser = <name>@<version>` from
 its footer, retained and deduplicated exactly like a Parquet the analyst converted locally.
-The only difference is `sources.converter_script_id`, which points at the script.
+The differences are `sources.converter_script_id`, which points at the script, and
+`sources.converter_input_hash`, the raw file's SHA-256 — a converter's Parquet is not
+byte-stable across runs (it stamps `converted_at`), so the source-level hash check cannot see
+a repeat; the convert endpoint refuses the *same saved script over the same raw file* with a
+409 that names the source it already produced, before any work happens. Another script, or a
+fresh generation, over the same raw file is allowed. When a run's Parquet nevertheless
+matches an existing source byte for byte, the job completes as a duplicate and the job tray
+says so instead of a bare "completed".
 
 ### What leaves the host
 
@@ -474,10 +481,18 @@ asserts the rendered prompt against this list.
    script}`. The system prompt is rendered from `ingestion/parquet_format.py`
    (`converters/prompt.py`), so it cannot drift from the contract, and it states what the
    harness enforces so the model optimises for the checks that actually run.
-3. **Static check.** `converters/runner.py::check_script` rejects imports of `socket`,
-   `subprocess`, `multiprocessing`, `ctypes`, `http`, `urllib`, `importlib`, `threading`,
-   `shutil`, `tempfile` and friends, `exec`/`eval`/`compile`/`__import__`, and the destructive
-   or process-spawning `os.*` calls. A violation costs an attempt.
+3. **Static check.** `converters/runner.py::check_script` allow-lists imports — the
+   standard library minus a deny-list (`socket`, `subprocess`, `multiprocessing`, `ctypes`,
+   `http`, `urllib`, `importlib`, `threading`, `shutil`, `tempfile`, `builtins`, `runpy` and
+   friends) plus `pyarrow`/`numpy`, which is the prompt's own "pyarrow + stdlib" contract
+   enforced — resolves import aliases (`import os as o; o.system(...)` reads as
+   `os.system`), refuses `from <module> import *`, and rejects `exec`/`eval`/`compile`/
+   `__import__`, `sys.modules`, `getattr()` on a module, and the destructive or
+   process-spawning calls (`os.system/popen/exec*/spawn*/fork/kill/remove/rename/...`, and
+   `unlink`/`rmdir`/`chmod`/`chown` on any receiver, `pathlib.Path` included). A violation
+   costs an attempt. Still a static guard: what stands behind it is the runner (below), the
+   fact that the script only ever sees a private *copy* of its input, and the dedicated app
+   user.
 4. **Sample run.** The script runs on the head excerpt, staged under the upload's own
    basename and — for a `.gz` upload — re-gzipped, so `-i` looks exactly as it will in the
    full run (a script that handles `.gz` by suffix behaves the same in both phases, and the
@@ -503,7 +518,10 @@ asserts the rendered prompt against this list.
 7. **Full run** on the whole retained raw file with `converter_run_timeout_seconds` (default
    600) — no repair here: a script that passed the sample and fails the whole file met a
    format change the sample did not show, and sending more evidence than disclosed is not
-   the harness's call. The analyst regenerates with a hint instead.
+   the harness's call. The analyst regenerates with a hint instead. In both phases the
+   script sees a private read-only *copy* of its input, never a link to the retained
+   evidence: a script that reopens `-i` for writing alters only its own copy, and the
+   retention file's mode and bytes stay what its hash says.
 8. **Ingest.** The Parquet goes through `register_source_for_ingest` and the same ingestion
    job as an upload. If that ingest fails, the script keeps its `working` status (its output
    validated) but the failure is recorded as an `ingest` attempt and a `converter.run` audit
@@ -516,10 +534,14 @@ asserts the rendered prompt against this list.
 `failed`), the source code, the model and endpoint used, `prompt_hash` (sha256 of exactly what
 was sent, plus the system-prompt version), the sample's hash **and** the sample text itself,
 the raw file's hash (it is retained content-addressed like any source so regeneration needs no
-re-upload), the hint, and `attempts` — every generation (including a first draft discarded
-because its proposed name already existed at a higher version), sample run, full run and
-ingest failure with elapsed time, exit code, stderr tail, the validation report and the
-script's hash. Audit rows:
+re-upload — and the retention store counts that row as an owner, so an unrelated source's
+rollback never unlinks a converter's raw input), the hint, and `attempts` — every generation
+(including a first draft discarded because its proposed name already existed at a higher
+version), sample run, full run and ingest failure with elapsed time, exit code, stderr tail,
+the validation report and the script's hash. A row is `generating` only while its job runs:
+any failure the job sees flips it to `failed`, and startup reconciliation does the same for a
+row a restart orphaned (jobs are in-memory), recording the interruption as an attempt — a
+script never shows as generating forever. Deleting the case deletes its scripts. Audit rows:
 `converter.generate`, `converter.run`, `converter.regenerate`. Case export carries the rows and
 the raw files (`transfer/`); an archive from an older version simply has none.
 

@@ -49,6 +49,13 @@ DENIED_MODULES = frozenset(
         "_thread",
         "webbrowser",
         "pty",
+        # Ways back to the interpreter's own machinery: import-by-string,
+        # module runners, the builtins namespace and the debugger REPL.
+        "builtins",
+        "runpy",
+        "code",
+        "codeop",
+        "pdb",
         # The private modules the public ones above are built on — a script that
         # imports ``_socket`` or ``_posixsubprocess`` directly gets the same answer.
         "posix",
@@ -58,6 +65,11 @@ DENIED_MODULES = frozenset(
         "_multiprocessing",
     }
 )
+#: What a converter may import at all: the standard library (minus the
+#: deny-list) and the columnar stack the contract is written against. This is
+#: the prompt's own "pyarrow + stdlib" promise, enforced — a third-party
+#: import the operator never installed is rejected before the script runs.
+ALLOWED_THIRD_PARTY = frozenset({"pyarrow", "numpy"})
 DENIED_CALLS = frozenset({"exec", "eval", "compile", "__import__"})
 DENIED_OS_ATTRS = frozenset(
     {
@@ -96,42 +108,94 @@ DENIED_OS_ATTRS = frozenset(
         "posix_spawnp",
     }
 )
+#: Denied as a method call on *any* receiver: none of these has a benign
+#: homonym a converter would call on a string, list or table (unlike
+#: ``replace``/``remove``), and ``pathlib.Path`` exposes several of them
+#: without ``os`` ever appearing in the source.
+DENIED_ANY_ATTRS = frozenset(
+    DENIED_OS_ATTRS - {"remove", "rename", "renames", "replace"} | {"lchmod", "lchown"}
+)
+#: Attribute reads on ``sys`` that hand back the import machinery.
+DENIED_SYS_ATTRS = frozenset({"modules"})
 _STDERR_TAIL = 4096
 _PROGRESS_RE = re.compile(rb"^progress\s+(\d+)")
 
 
+def _import_allowed(root: str) -> bool:
+    return root not in DENIED_MODULES and (
+        root in sys.stdlib_module_names or root in ALLOWED_THIRD_PARTY
+    )
+
+
 def check_script(script: str) -> list[str]:
-    """Return violations (empty when the script may run). Best-effort static guard."""
+    """Return violations (empty when the script may run). Best-effort static guard.
+
+    Imports are allow-listed (stdlib minus the deny-list, plus pyarrow/numpy)
+    and their aliases resolved, so ``import os as o; o.system(...)`` reads as
+    ``os.system``; ``from os import *`` is refused outright since it makes every
+    later bare name unresolvable. Still static — a determined script can reach
+    the same calls through the object graph; the runner's rlimits, the private
+    input copy and the dedicated app user are what stand behind this.
+    """
     try:
         tree = ast.parse(script)
     except SyntaxError as exc:
         return [f"syntax error at line {exc.lineno}: {exc.msg}"]
     problems: list[str] = []
+    aliases: dict[str, str] = {}  # local name -> module root it is bound to
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
                 root = a.name.split(".")[0]
-                if root in DENIED_MODULES:
+                if not _import_allowed(root):
                     problems.append(f"line {node.lineno}: import of {a.name!r} is not allowed")
+                aliases[a.asname or root] = root
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
-            if root in DENIED_MODULES:
+            if node.level:
+                problems.append(f"line {node.lineno}: relative imports are not allowed")
+                continue
+            if not _import_allowed(root):
                 problems.append(f"line {node.lineno}: import from {node.module!r} is not allowed")
-            if root == "os":
-                for a in node.names:
-                    if a.name in DENIED_OS_ATTRS:
-                        problems.append(f"line {node.lineno}: os.{a.name} is not allowed")
+            for a in node.names:
+                if a.name == "*":
+                    problems.append(f"line {node.lineno}: 'from {root} import *' is not allowed")
+                elif root == "os" and a.name in DENIED_OS_ATTRS:
+                    problems.append(f"line {node.lineno}: os.{a.name} is not allowed")
+                elif root == "sys" and a.name in DENIED_SYS_ATTRS:
+                    problems.append(f"line {node.lineno}: sys.{a.name} is not allowed")
+                elif root == "builtins" or a.name in DENIED_CALLS:
+                    problems.append(f"line {node.lineno}: importing {a.name!r} is not allowed")
+                elif "." not in (node.module or ""):
+                    # ``from os import path as p`` binds a submodule; remember it
+                    # so ``p.<attr>`` resolves back to ``os``.
+                    aliases[a.asname or a.name] = root
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            root = aliases.get(node.value.id)
+            if root == "sys" and node.attr in DENIED_SYS_ATTRS:
+                problems.append(f"line {node.lineno}: sys.{node.attr} is not allowed")
         elif isinstance(node, ast.Call):
             fn = node.func
-            if isinstance(fn, ast.Name) and fn.id in DENIED_CALLS:
-                problems.append(f"line {node.lineno}: call to {fn.id}() is not allowed")
-            elif (
-                isinstance(fn, ast.Attribute)
-                and isinstance(fn.value, ast.Name)
-                and fn.value.id == "os"
-                and fn.attr in DENIED_OS_ATTRS
-            ):
-                problems.append(f"line {node.lineno}: os.{fn.attr}() is not allowed")
+            if isinstance(fn, ast.Name):
+                if fn.id in DENIED_CALLS:
+                    problems.append(f"line {node.lineno}: call to {fn.id}() is not allowed")
+                elif (
+                    fn.id in {"getattr", "setattr", "delattr", "vars"}
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in aliases
+                ):
+                    problems.append(
+                        f"line {node.lineno}: {fn.id}() on module {node.args[0].id!r} is not allowed"
+                    )
+            elif isinstance(fn, ast.Attribute):
+                receiver = fn.value.id if isinstance(fn.value, ast.Name) else None
+                root = aliases.get(receiver) if receiver else None
+                if root == "os" and fn.attr in DENIED_OS_ATTRS:
+                    problems.append(f"line {node.lineno}: os.{fn.attr}() is not allowed")
+                elif fn.attr in DENIED_ANY_ATTRS:
+                    problems.append(f"line {node.lineno}: .{fn.attr}() is not allowed")
     return problems
 
 
@@ -198,10 +262,13 @@ def run_converter(
         in_dir = workdir / "input"
         in_dir.mkdir()
         staged = in_dir / Path(input_name or input_path.name).name
-        try:
-            os.link(input_path, staged)
-        except OSError:
-            shutil.copy2(input_path, staged)
+        # A private *copy*, never a hardlink: the full run stages the
+        # content-addressed retention copy of the evidence, and a link would
+        # share its inode — the chmod below would land on the retained file
+        # and a script that opens its input for append (or chmods it back)
+        # would rewrite the evidence under its own hash. Copying a large log
+        # once per run is the price of that guarantee.
+        shutil.copyfile(input_path, staged)
         staged.chmod(0o400)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         env = {
@@ -264,6 +331,10 @@ def run_converter(
                         break
                     buf += chunk
                     *lines, buf = buf.split(b"\n")
+                    if len(buf) > _STDERR_TAIL:
+                        # A partial line is not covered by RLIMIT_FSIZE (pipes
+                        # are not files); keep only what the tail could show.
+                        buf = buf[-_STDERR_TAIL:]
                     for line in lines:
                         m = _PROGRESS_RE.match(line.strip())
                         if m and on_progress is not None:

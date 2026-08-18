@@ -155,3 +155,69 @@ def test_input_is_staged_under_the_given_name(tmp_path):
 def test_private_network_modules_are_denied():
     for mod in ("_socket", "_posixsubprocess", "posix"):
         assert check_script(f"import {mod}\n"), mod
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "import os as o\no.system('id')",
+        "from os import *\nsystem('id')",
+        "import os as o\nfrom o import unlink",
+        "import builtins\nbuiltins.__import__('socket')",
+        "import sys\nsys.modules['os'].system('id')",
+        "import sys as s\ns.modules['os']",
+        "import runpy",
+        "import pandas",
+        "from urllib import request as r",
+        "import os as o\ngetattr(o, 'sys' + 'tem')('id')",
+        "from pathlib import Path\nPath('x').chmod(0o644)",
+        "from pathlib import Path\nPath('x').unlink()",
+        "import os.path as p\nfrom os import path\nos.chmod('x', 0)",
+    ],
+)
+def test_check_script_rejects_evasions(bad):
+    assert check_script(GOOD + bad + "\n"), bad
+
+
+def test_check_script_allows_stdlib_and_pyarrow_aliases():
+    ok = (
+        "import argparse as ap, json as j\nimport pyarrow.parquet as pq\nimport numpy as np\n"
+        "from datetime import datetime as dt\nfrom os import path as osp\n"
+        "s = 'a'.replace('a', 'b'); l = [1]; l.remove(1)\n"
+    )
+    assert check_script(ok) == []
+
+
+def test_staged_input_is_a_private_copy(tmp_path):
+    # A script that chmods and appends to its input must not touch the original:
+    # the full run stages the content-addressed retention copy of the evidence.
+    inp = tmp_path / "in.log"
+    inp.write_text("x\n")
+    inp.chmod(0o644)
+    before = inp.stat().st_mode
+    script = (
+        "import sys, pathlib\n"
+        "p = pathlib.Path(sys.argv[sys.argv.index('-i') + 1])\n"
+        "p.chmod(0o644)\n"
+        "open(p, 'a').write('TAMPERED')\n"
+    )
+    r = run_converter(
+        script,
+        inp,
+        output_path=tmp_path / "out" / "out.parquet",
+        timeout_s=20,
+        memory_mb=2048,
+        output_mb=64,
+    )
+    assert r.exit_code == 0, r.stderr_tail
+    assert inp.read_text() == "x\n"
+    assert inp.stat().st_mode == before
+
+
+def test_stderr_without_newlines_is_bounded(tmp_path):
+    # RLIMIT_FSIZE does not cover pipes; a partial line must not grow without
+    # bound in the API process. 8 MiB of no-newline stderr → a 4 KiB tail.
+    script = "import sys\nsys.stderr.write('x' * (8 * 1024 * 1024))\nsys.stderr.flush()\n"
+    r = _run(tmp_path, script)
+    assert r.exit_code == 0
+    assert len(r.stderr_tail) <= 4096 and r.stderr_tail.endswith("x")

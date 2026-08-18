@@ -1,6 +1,31 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-17 (session 176 — PR #277 review fixes for generated converters).
+Last updated: 2026-08-18 (session 177 — PR #277 second review pass).
+
+## Session 177 — 2026-08-18: PR #277 second review — ten more findings fixed
+
+A second `/code-review 277` on the branch after session 176; all ten findings addressed
+(`docs/archive/PR277_REVIEW_FINDINGS.md` §"Second pass" has each with its reasoning). The
+ones that changed shape rather than just code:
+
+- **The script only ever sees a private copy of its input.** The runner hardlinked the
+  retention copy into the workdir, so its `chmod` and any script writing to `-i` reached
+  the evidence itself. `shutil.copyfile` now — a large log is copied per run, deliberately.
+- **`check_script` is an allow-list.** Stdlib (minus the deny-list) plus `pyarrow`/`numpy`,
+  import aliases resolved, `from x import *` refused, `sys.modules`/`getattr(module, …)`
+  refused, destructive method names refused on any receiver (`Path.unlink`/`.chmod`
+  included). Prompt and docs restate it.
+- **The retention store knows converter rows own blobs** (`source_hash_in_use` unions
+  `converter_scripts.raw_file_hash`), and `delete_case` cascades the rows.
+- **No row stays `generating`**: the job's catch-all fails a row it created; startup
+  reconciliation (`_reconcile_stale_converter_generations`) fails rows a restart orphaned
+  and records the interruption as an attempt.
+- **Same saved script over the same raw file is refused** (409 naming the existing source)
+  via the new `sources.converter_input_hash` (migration 0031); a duplicate Parquet outcome
+  is now said in the tray and the case jobs panel.
+- `build_sample` streams (no per-line offset list; `count_lines` for the reuse path), the
+  stderr partial-line buffer is capped, a non-gzip `.gz` upload is a 400 not a 500, and the
+  disclosure copy names head/middle/tail rather than "the first N bytes".
 
 ## Session 176 — 2026-08-17: PR #277 review — every finding fixed
 

@@ -130,7 +130,15 @@ async def convert_upload(
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Upload a plain-text log; the model writes (or a saved script re-runs) the converter."""
+    """Upload a plain-text log; the model writes (or a saved script re-runs) the converter.
+
+    Re-running the *same* saved script over the *same* raw file is refused
+    (409 naming the source it already produced) — the Parquet a converter
+    writes is not byte-stable across runs, so the source-level duplicate check
+    would not catch it and the evidence would land twice. A fresh generation,
+    or another script, over the same raw file is a different question and
+    stays allowed.
+    """
     await _require_generation_enabled()
     store = get_store()
     if converter_script_id:
@@ -145,6 +153,22 @@ async def convert_upload(
     except NotTextError as exc:
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Not a text file: {exc}") from exc
+    except (OSError, EOFError) as exc:
+        # A ``.gz``-named upload that is not (or is a truncated) gzip stream:
+        # ``gzip.BadGzipFile`` is an OSError, a truncated member raises EOFError.
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Cannot read the upload: {exc}") from exc
+    if converter_script_id:
+        already = await store.get_source_by_converter_input(case.id, converter_script_id, raw_hash)
+        if already is not None:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This file was already converted with this script as source "
+                    f"{already.name!r} ({already.id})"
+                ),
+            )
     job_store = get_job_store()
     job = job_store.create(
         kind="convert_ingest",

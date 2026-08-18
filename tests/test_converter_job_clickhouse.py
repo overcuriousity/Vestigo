@@ -178,6 +178,11 @@ async def test_reuse_skips_the_model(store, clickhouse, tmp_path, monkeypatch):
     assert j2.status == "completed", j2.error
     assert j2.result["converter_script_id"] == sid
     assert (await store.count_sources_by_converter(case.id))[sid] == 2
+    # The raw input's hash is on the source, so a repeat of this exact
+    # (script, raw file) pair is refusable before any work.
+    src2 = await store.get_source(case.id, j2.result["source_id"])
+    assert src2.converter_input_hash == inp.raw_hash
+    assert (await store.get_source_by_converter_input(case.id, sid, inp.raw_hash)).id == src2.id
     for j in (j1, j2):
         clickhouse.delete_source_events(case.id, j.result["source_id"])
 
@@ -313,3 +318,24 @@ def test_traversal_filename_is_reduced_to_a_basename(tmp_path):
         filename="../../../../home/app/.bashrc",
     )
     assert inp.filename == ".bashrc"
+
+
+@pytest.mark.asyncio
+async def test_model_going_away_mid_loop_marks_the_row_failed(store, tmp_path, monkeypatch):
+    # Attempt 1 creates the row and fails its sample run; attempt 2 finds the
+    # endpoint gone. GenerationUnavailable is re-raised past the exhaustion
+    # branch — the row must still not stay 'generating' forever.
+    calls: list[str] = []
+    first = _fake_generator(["import sys\nsys.exit(1)\n"], calls)
+
+    async def gen(system, task, *, timeout_s=180.0):
+        if calls:
+            raise G.GenerationUnavailable("endpoint down")
+        return await first(system, task, timeout_s=timeout_s)
+
+    monkeypatch.setattr(J, "generate_script", gen)
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "failed" and "endpoint down" in (job.error or "")
+    script = await store.get_converter_script(case.id, job.progress["converter_script_id"])
+    assert script.status == "failed"

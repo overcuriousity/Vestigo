@@ -202,3 +202,59 @@ async def test_regenerate_uses_a_basename_and_a_private_dir(
     assert last.filename == "evil.log"
     assert last.raw_tmp_dir is not None and last.raw_tmp_path.parent == last.raw_tmp_dir
     assert last.raw_tmp_dir.name.startswith("vestigo-regen-")
+
+
+def test_gz_named_upload_that_is_not_gzip_is_a_400(client, admin_bootstrap, enabled, stub_job):
+    as_admin(client, admin_bootstrap)
+    cid = _case(client)
+    r = client.post(
+        f"/api/cases/{cid}/converters/convert",
+        files={"file": ("a.log.gz", b"Jan  5 10:00:01 h p: m\n")},
+    )
+    assert r.status_code == 400, r.text
+    assert "gzip" in r.json()["detail"].lower()
+    assert stub_job == []
+
+
+@pytest.mark.asyncio
+async def test_same_script_same_raw_is_refused(client, admin_bootstrap, enabled, stub_job, store):
+    admin = as_admin(client, admin_bootstrap)
+    cid = _case(client)
+    row = await store.create_converter_script(
+        case_id=cid,
+        name="x2vestigo",
+        version=1,
+        raw_file_hash="a" * 64,
+        raw_filename="x.log",
+        model="m",
+        provider_endpoint="e",
+        prompt_hash="p",
+        sample_hash="s",
+        sample_excerpt="SAMPLE",
+        hint=None,
+        created_by=admin["id"],
+        status="working",
+    )
+    raw = b"Jan  5 10:00:01 h p: m\n"
+    import hashlib
+
+    await store.create_source(
+        case_id=cid,
+        source_id="src1",
+        name="already.log",
+        file_hash="c" * 64,
+        size_bytes=1,
+        converter_script_id=row.id,
+        converter_input_hash=hashlib.sha256(raw).hexdigest(),
+    )
+    r = client.post(
+        f"/api/cases/{cid}/converters/convert",
+        files={"file": ("again.log", raw)},
+        data={"converter_script_id": row.id},
+    )
+    assert r.status_code == 409, r.text
+    assert "already.log" in r.json()["detail"] and "src1" in r.json()["detail"]
+    assert stub_job == []
+    # A fresh generation over the same raw file is a different question.
+    r = client.post(f"/api/cases/{cid}/converters/convert", files={"file": ("again.log", raw)})
+    assert r.status_code == 202, r.text

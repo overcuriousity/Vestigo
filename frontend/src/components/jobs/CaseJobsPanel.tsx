@@ -8,7 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import { jobsApi } from "@/api/jobs";
 import { JobStatusRow } from "@/components/ui/JobStatusRow";
 import { Spinner } from "@/components/ui/Spinner";
-import { jobPhaseLabel } from "@/lib/jobPhases";
+import { jobOutcomeNote, jobPhaseLabel } from "@/lib/jobPhases";
 
 const KIND_LABELS: Record<string, string> = {
   ingest: "Ingest",
@@ -63,6 +63,13 @@ export function CaseJobsPanel({ caseId }: Props) {
               progress={job.progress}
               error={job.error}
               detail={jobPhaseLabel(job.kind, job.progress)}
+              footer={
+                job.status === "completed" && jobOutcomeNote(job.kind, job.result) ? (
+                  <div className="mt-1 text-[var(--color-warning)]">
+                    {jobOutcomeNote(job.kind, job.result)}
+                  </div>
+                ) : null
+              }
             />
           ))}
         </div>

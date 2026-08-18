@@ -107,7 +107,12 @@ class Source(Base):
     """
 
     __tablename__ = "sources"
-    __table_args__ = (Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),)
+    __table_args__ = (
+        Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
+        Index(
+            "ix_sources_converter_input", "case_id", "converter_script_id", "converter_input_hash"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -146,6 +151,10 @@ class Source(Base):
     # Plain id, no FK (house style): the script row is a record and outlives
     # the source; the transfer importer remaps it through the id map.
     converter_script_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # SHA-256 of the raw file that converter was run over. The Parquet's own
+    # ``file_hash`` is not stable across runs (converters stamp ``converted_at``),
+    # so this is what "already converted with this script" is keyed on.
+    converter_input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     @property
     def is_ready(self) -> bool:
@@ -190,6 +199,7 @@ class Source(Base):
             "status": self.status,
             "time_offset_seconds": self.time_offset_seconds,
             "converter_script_id": self.converter_script_id,
+            "converter_input_hash": self.converter_input_hash,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -2209,6 +2219,7 @@ class PostgresStore:
         created_by: str | None = None,
         status: str = "ready",
         converter_script_id: str | None = None,
+        converter_input_hash: str | None = None,
     ) -> Source:
         """Create a new source record within a case.
 
@@ -2229,6 +2240,7 @@ class PostgresStore:
             created_by=created_by,
             status=status,
             converter_script_id=converter_script_id,
+            converter_input_hash=converter_input_hash,
         )
         async with self.session_factory() as session:
             session.add(source)
@@ -2301,18 +2313,26 @@ class PostgresStore:
             return source
 
     async def source_hash_in_use(self, file_hash: str, *, exclude_source_id: str) -> bool:
-        """Whether any *other* source row (in any case) still has this file hash.
+        """Whether any *other* row (in any case) still references this retained hash.
 
         Retention storage is content-addressed by hash alone (not per-case),
         so a file uploaded into multiple cases shares one retained copy —
         callers must check this before deleting a retained file for a source
-        being removed, or they'd delete a copy another case still needs.
+        being removed, or they'd delete a copy another case still needs. A
+        generated converter's ``raw_file_hash`` is a reference too: the raw
+        log it was written from is retained under the same store (regenerate
+        and export read it back), and it is never a source of its own.
         """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Source.id).where(
                     Source.file_hash == file_hash, Source.id != exclude_source_id
                 )
+            )
+            if result.scalar_one_or_none() is not None:
+                return True
+            result = await session.execute(
+                select(ConverterScript.id).where(ConverterScript.raw_file_hash == file_hash)
             )
             return result.scalar_one_or_none() is not None
 
@@ -2432,6 +2452,56 @@ class PostgresStore:
                 .group_by(Source.converter_script_id)
             )
             return {sid: int(n) for sid, n in result.all()}
+
+    async def get_source_by_converter_input(
+        self, case_id: str, script_id: str, raw_hash: str
+    ) -> Source | None:
+        """The source this script already produced from this raw file in this case, if any."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source).where(
+                    Source.case_id == case_id,
+                    Source.converter_script_id == script_id,
+                    Source.converter_input_hash == raw_hash,
+                )
+            )
+            return result.scalars().first()
+
+    async def fail_stale_converter_generations(self) -> list[ConverterScript]:
+        """Mark every ``generating`` script row ``failed`` and return them.
+
+        Startup reconciliation: the job that owns a generation lives in the
+        in-memory JobStore, so a row still ``generating`` on a fresh boot has
+        no job left to finish it — it would show as generating forever and
+        never become reusable or regenerable.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript)
+                .options(defer(ConverterScript.source_code), defer(ConverterScript.sample_excerpt))
+                .where(ConverterScript.status == "generating")
+            )
+            rows = list(result.scalars().all())
+            for row in rows:
+                row.status = "failed"
+                row.attempts = [
+                    *(row.attempts or []),
+                    {
+                        "n": len(row.attempts or []) + 1,
+                        "phase": "generate",
+                        "model": None,
+                        "elapsed_ms": 0,
+                        "exit_code": None,
+                        "stderr_tail": "",
+                        "validation": None,
+                        "script_hash": None,
+                        "error": "generation interrupted by a server restart",
+                    },
+                ]
+            await session.commit()
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     async def list_ingesting_sources(self) -> list[Source]:
         """Return every source still marked "ingesting", across all cases.
@@ -3530,10 +3600,11 @@ class PostgresStore:
         ``StoryBlock``, ``StoryExport`` — the last of which holds frozen event
         data the operator believes went with the case), and the enrichment
         tables (``SourceEnrichment``, ``EnrichmentResultStaging``,
-        ``EnrichmentJobRun``) and ``AnalysisCache`` (derived, but its payloads
+        ``EnrichmentJobRun``), ``AnalysisCache`` (derived, but its payloads
         hold event ids, field values and message templates, and its eviction
         only ever runs on a write for the same case — so a row left here would
-        never be reclaimed) are case-scoped by a plain ``case_id`` column
+        never be reclaimed) and ``ConverterScript`` (whose ``sample_excerpt``
+        is a verbatim slice of the evidence log) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
         ``cases.id``), so they must be deleted explicitly here alongside
         ``Timeline``/``Source`` or they'd silently orphan on every case delete
@@ -3578,6 +3649,7 @@ class PostgresStore:
             )
             await session.execute(delete(StoryExport).where(StoryExport.case_id == case_id))
             await session.execute(delete(Story).where(Story.case_id == case_id))
+            await session.execute(delete(ConverterScript).where(ConverterScript.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True

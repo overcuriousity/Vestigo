@@ -78,3 +78,17 @@ export function jobPhaseLabel(
   }
   return label;
 }
+
+/**
+ * A completed job's outcome that "Completed" alone would misreport, or null.
+ * An AI conversion whose produced file matched a source that already exists
+ * completes without adding anything — silently, unless said here.
+ */
+export function jobOutcomeNote(kind: string | undefined, result: unknown): string | null {
+  if (kind !== "convert_ingest" || !result || typeof result !== "object") return null;
+  const r = result as { duplicate?: unknown };
+  if (r.duplicate === true) {
+    return "The converted file matched a source this case already has — nothing new was added.";
+  }
+  return null;
+}

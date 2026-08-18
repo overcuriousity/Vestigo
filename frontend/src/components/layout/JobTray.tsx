@@ -8,7 +8,7 @@ import { Link } from "react-router-dom";
 import { jobsApi } from "@/api/jobs";
 import { useJobsStore, type TrackedJob } from "@/stores/jobs";
 import { JobStatusRow } from "@/components/ui/JobStatusRow";
-import { jobPhaseLabel } from "@/lib/jobPhases";
+import { jobOutcomeNote, jobPhaseLabel } from "@/lib/jobPhases";
 
 function JobRow({ job }: { job: TrackedJob }) {
   const { updateJob, dismiss } = useJobsStore();
@@ -46,6 +46,7 @@ function JobRow({ job }: { job: TrackedJob }) {
   // A failed AI conversion leaves its draft script behind; the panel on the
   // case page shows every attempt, so point at it rather than only the error.
   const scriptId = job.progress?.converter_script_id;
+  const outcome = job.status === "completed" ? jobOutcomeNote(job.kind, job.result) : null;
   const footer =
     job.kind === "convert_ingest" && job.status === "failed" && scriptId && job.case_id ? (
       <Link
@@ -54,6 +55,8 @@ function JobRow({ job }: { job: TrackedJob }) {
       >
         View converter attempts
       </Link>
+    ) : outcome ? (
+      <div className="mt-1 text-[var(--color-warning)]">{outcome}</div>
     ) : null;
 
   return (

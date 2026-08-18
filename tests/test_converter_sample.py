@@ -123,3 +123,70 @@ def test_sample_as_file_keeps_gz_encoding_for_gz_uploads(tmp_path):
     # by suffix behaves identically in the sample and the full run.
     assert out.name == "a.log.gz"
     assert gzip.decompress(out.read_bytes()) == s.blocks[0][2].encode() + b"\n"
+
+
+def _reference_blocks(path: Path, budget_bytes: int) -> list[tuple[str, int, str]]:
+    """The original per-line-offset algorithm, kept as the oracle for the streaming one."""
+    import bisect
+
+    from vestigo.converters.sample import _open
+
+    offsets: list[int] = []
+    pos = 0
+    with _open(path) as fh:
+        for line in fh:
+            offsets.append(pos)
+            pos += len(line)
+    total, line_count = pos, len(offsets)
+
+    def read_lines(start_idx: int, byte_budget: int) -> str:
+        with _open(path) as fh:
+            fh.seek(offsets[start_idx])
+            chunk = fh.read(byte_budget)
+        text = chunk.decode("utf-8", errors="replace")
+        if not text.endswith("\n") and offsets[start_idx] + len(chunk) < total and "\n" in text:
+            text = text[: text.rfind("\n") + 1]
+        return text.rstrip("\n")
+
+    if total <= budget_bytes:
+        return [("head", 1, read_lines(0, total) if line_count else "")]
+    head_b = int(budget_bytes * 0.70)
+    mid_b = int(budget_bytes * 0.15)
+    tail_b = budget_bytes - head_b - mid_b
+    head_text = read_lines(0, head_b)
+    head_lines = head_text.count("\n") + 1
+    blocks = [("head", 1, head_text)]
+    next_idx = head_lines
+    mid_idx = max(max(bisect.bisect_right(offsets, total // 2) - 1, 0), head_lines)
+    if mid_idx < line_count:
+        mid_text = read_lines(mid_idx, mid_b)
+        blocks.append(("middle", mid_idx + 1, mid_text))
+        next_idx = mid_idx + mid_text.count("\n") + 1
+    tail_idx = max(bisect.bisect_left(offsets, max(total - tail_b, 0)), next_idx)
+    if tail_idx < line_count:
+        tail_text = read_lines(tail_idx, min(total - offsets[tail_idx], tail_b))
+        blocks.append(("tail", tail_idx + 1, tail_text))
+    return blocks
+
+
+@pytest.mark.parametrize(
+    "content,gz",
+    [
+        ("".join(f"line {i:05d} payload\n" for i in range(1, 5001)), False),
+        ("".join(f"line {i:05d} payload\n" for i in range(1, 5001)), True),
+        ("".join(f"l{i}\n" for i in range(3000)) + "no trailing newline", False),
+        ("".join(f"line {i}\r\n" for i in range(3000)), False),
+        ("x" * 20000 + "\n" + "".join(f"m{i}\n" for i in range(500)) + "y" * 9000, False),
+        ("a" * 50000, False),
+        ("".join(f"é{i} ünïcode\n" for i in range(4000)), False),
+        ("".join(f"l{i}\n" for i in range(40)), False),
+    ],
+)
+@pytest.mark.parametrize("budget", [1024, 4096, 65536])
+def test_streaming_scan_matches_reference(tmp_path, content, gz, budget):
+    p = tmp_path / ("a.log.gz" if gz else "a.log")
+    data = content.encode()
+    p.write_bytes(gzip.compress(data) if gz else data)
+    s = build_sample(p, budget_bytes=budget)
+    assert s.blocks == _reference_blocks(p, budget)
+    assert s.line_count == len(data.splitlines()) if data else 0

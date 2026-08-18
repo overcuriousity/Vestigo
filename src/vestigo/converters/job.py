@@ -24,7 +24,13 @@ from sqlalchemy.exc import IntegrityError
 from vestigo.converters.generator import GeneratedScript, GenerationUnavailable, generate_script
 from vestigo.converters.prompt import render_generation_prompt, render_repair_prompt
 from vestigo.converters.runner import RunResult, check_script, run_converter
-from vestigo.converters.sample import Sample, build_sample, safe_filename, sample_as_file
+from vestigo.converters.sample import (
+    Sample,
+    build_sample,
+    count_lines,
+    safe_filename,
+    sample_as_file,
+)
 from vestigo.converters.validate import Check, ValidationReport, validate_output
 from vestigo.core.config import get_settings
 from vestigo.core.jobs import JobStore
@@ -403,11 +409,10 @@ async def run_convert_ingest_job(
     script_id: str | None = None
     parquet_out: Path | None = None
     try:
-        # 1. Sample + retain the raw file (always — the row references it).
+        # 1. Retain the raw file (always — the row references it), then either
+        #    count its lines (a re-run only needs the progress total) or build
+        #    the excerpt the model will see.
         _phase(job_store, job_id, "sampling")
-        sample = await asyncio.to_thread(
-            build_sample, inputs.raw_tmp_path, settings.converter_sample_bytes
-        )
         await asyncio.to_thread(retain_file, inputs.raw_tmp_path, retention_path(inputs.raw_hash))
 
         # 2. Script: reuse or generate.
@@ -418,7 +423,12 @@ async def run_convert_ingest_job(
             script_id, script, version, name = row.id, row.source_code, row.version, row.name
             attempts = _Attempts(store, script_id, row.attempts)
             job_store.update(job_id, progress={"converter_script_id": script_id})
+            line_count = await asyncio.to_thread(count_lines, inputs.raw_tmp_path)
         else:
+            sample = await asyncio.to_thread(
+                build_sample, inputs.raw_tmp_path, settings.converter_sample_bytes
+            )
+            line_count = sample.line_count
             script_id, script, version, name, attempts = await _generate_loop(
                 store=store, job_store=job_store, job_id=job_id, inputs=inputs, sample=sample
             )
@@ -429,12 +439,12 @@ async def run_convert_ingest_job(
             job_id,
             "converting",
             processed=0,
-            total=sample.line_count,
+            total=line_count,
             converter_script_id=script_id,
         )
 
         def on_progress(n: int) -> None:
-            job_store.update(job_id, progress={"processed": min(n, sample.line_count)})
+            job_store.update(job_id, progress={"processed": min(n, line_count)})
 
         result, report, parquet_out = await _run_and_validate(
             script,
@@ -483,6 +493,7 @@ async def run_convert_ingest_job(
                 parser="vestigo_parquet",
                 user=inputs.user,
                 converter_script_id=script_id,
+                converter_input_hash=inputs.raw_hash,
             )
         except HTTPException as exc:
             raise RuntimeError(f"produced Parquet was rejected: {exc.detail}") from exc
@@ -552,6 +563,18 @@ async def run_convert_ingest_job(
             error=str(exc),
             progress={"converter_script_id": known},
         )
+        # Whatever raised — the model endpoint going away mid-loop, the runner,
+        # the validator, the database — a row this job created must not stay
+        # ``generating``: nothing else will ever finish it, and the panel would
+        # show a spinner forever on a script that is neither reusable nor
+        # regenerable as a failed draft. A reused script is not this job's row.
+        if known and not inputs.reuse_script_id:
+            try:
+                row = await store.get_converter_script(inputs.case_id, known)
+                if row is not None and row.status == "generating":
+                    await store.update_converter_script(known, status="failed")
+            except Exception:  # noqa: BLE001 — the job's own error is the one to keep
+                logger.exception("could not mark converter script %s failed", known)
     finally:
         inputs.raw_tmp_path.unlink(missing_ok=True)
         if inputs.raw_tmp_dir is not None:

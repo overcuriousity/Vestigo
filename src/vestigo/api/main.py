@@ -199,6 +199,33 @@ async def _sweep_stale_transfer_archives() -> None:
         logger.exception("Transfer archive sweep failed; leftover export archives remain.")
 
 
+async def _reconcile_stale_converter_generations() -> None:
+    """Fail every converter script still ``generating`` — its job did not survive the restart.
+
+    Same reasoning as the ingest reconciliation above: the JobStore is
+    in-memory, so a row in this state on boot has nothing left to finish it,
+    and it would sit in the panel as "generating" forever, neither reusable
+    nor regenerable as a failed draft. The row and its attempts stay; only the
+    status flips, and the trail records why.
+    """
+    from vestigo.api.deps import get_store
+
+    store = get_store()
+    try:
+        rows = await store.fail_stale_converter_generations()
+    except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        logger.exception("Converter generation reconciliation failed")
+        return
+    for row in rows:
+        logger.warning(
+            "Marked converter script %s (%s v%s, case %s) failed: still generating on startup",
+            row.id,
+            row.name,
+            row.version,
+            row.case_id,
+        )
+
+
 async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
     """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
 
@@ -390,6 +417,7 @@ async def _startup_recovery(store: PostgresStore) -> None:
     try:
         await _sweep_stale_transfer_archives()
         await _reconcile_orphaned_ingests()
+        await _reconcile_stale_converter_generations()
         enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
 
         from vestigo.enrichers.registry import refresh_availability
