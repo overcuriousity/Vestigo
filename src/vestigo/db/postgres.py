@@ -2390,7 +2390,9 @@ class PostgresStore:
             result = await session.execute(
                 select(ConverterScript.id).where(ConverterScript.raw_file_hash == file_hash)
             )
-            return result.scalar_one_or_none() is not None
+            # ``first()``, not ``scalar_one_or_none()``: several scripts legitimately
+            # share one raw file — every regeneration adds a row against the same hash.
+            return result.first() is not None
 
     # ── Converter scripts ────────────────────────────────────────────────
 
@@ -5950,7 +5952,7 @@ class PostgresStore:
                 .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
                 .limit(1)
             )
-            return result.first() is not None
+            return result.scalar_one_or_none() is not None
 
     # ------------------------------------------------------------------
     # Users

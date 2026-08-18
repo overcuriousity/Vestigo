@@ -111,6 +111,10 @@ async def test_converter_raw_hash_counts_as_retention_in_use(store: PostgresStor
     assert await store.source_hash_in_use("e" * 64, exclude_source_id="none") is False
     await _script(store, case.id, raw="e" * 64)
     assert await store.source_hash_in_use("e" * 64, exclude_source_id="none") is True
+    # A regeneration writes a second script against the same retained raw file;
+    # the ownership question is still "any", never "exactly one".
+    await _script(store, case.id, raw="e" * 64, name="x2vestigo_v2")
+    assert await store.source_hash_in_use("e" * 64, exclude_source_id="none") is True
 
 
 @pytest.mark.asyncio

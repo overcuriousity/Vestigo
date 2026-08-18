@@ -203,6 +203,28 @@ def test_check_script_rejects_evasions(bad):
     assert check_script(GOOD + bad + "\n"), bad
 
 
+def test_check_script_allows_shadowed_builtin_names():
+    # The prompt mandates argparse with -i/--input, so `input = args.input` is the
+    # natural spelling; a script that binds the name means its own local, not the
+    # builtin, and must not lose an attempt over it.
+    ok = (
+        "import argparse\n"
+        "def convert(input, help=None):\n"
+        "    return input\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('-i', '--input', help='in')\n"
+        "args = p.parse_args()\n"
+        "input = args.input\n"
+        "convert(input)\n"
+    )
+    assert check_script(ok) == []
+
+
+@pytest.mark.parametrize("bad", ["x = input()", "help(json)", "f = input"])
+def test_check_script_rejects_unbound_interactive_builtins(bad):
+    assert check_script(GOOD + bad + "\n"), bad
+
+
 def test_check_script_allows_stdlib_and_pyarrow_aliases():
     ok = (
         "import argparse as ap, json as j\nimport pyarrow.parquet as pq\nimport numpy as np\n"

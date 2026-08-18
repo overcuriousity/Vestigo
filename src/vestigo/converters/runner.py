@@ -111,13 +111,17 @@ DENIED_NAMES = frozenset(
         "locals",
         "vars",
         "breakpoint",
-        "help",
-        "input",
         "__builtins__",
         "__loader__",
         "__spec__",
     }
 )
+#: Refused as *builtins* only. Neither is a boundary — ``input`` reads a stdin
+#: the runner has already closed, ``help`` writes to stdout — they are here so a
+#: converter cannot stall on a prompt. Both are ordinary variable names, and a
+#: script that binds one (``input = args.input``) means its own local, so these
+#: are flagged only where the script never binds them.
+SHADOWABLE_BUILTINS = frozenset({"help", "input"})
 #: The reflection family: refused on a module alias (``getattr(os, name)``) and
 #: with a dunder-name string argument on anything.
 REFLECTION_CALLS = frozenset(
@@ -316,9 +320,21 @@ def check_script(script: str) -> list[str]:
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
             parents[child] = parent
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            bound.add(node.name)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
-            if node.id in DENIED_NAMES:
+            if node.id in DENIED_NAMES or (
+                node.id in SHADOWABLE_BUILTINS
+                and node.id not in bound
+                and isinstance(node.ctx, ast.Load)
+            ):
                 problems.append(f"line {node.lineno}: {node.id} is not allowed")
             elif node.id in modules and isinstance(node.ctx, ast.Load):
                 parent = parents.get(node)
