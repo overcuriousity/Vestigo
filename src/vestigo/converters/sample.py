@@ -29,7 +29,10 @@ class Sample:
     text: str
     size_bytes: int
     line_count: int
-    mtime_iso: str
+    #: The evidence file's own mtime as ISO-8601 UTC, or ``None`` when the
+    #: caller could not learn it (a raw API upload carries none) — never the
+    #: staging copy's, which is just the upload time.
+    mtime_iso: str | None
     sha256: str
 
 
@@ -145,8 +148,21 @@ def count_lines(path: Path) -> int:
     return _scan(path).line_count
 
 
-def build_sample(path: Path, budget_bytes: int) -> Sample:
-    """Return the excerpt sent to the model; raises :class:`NotTextError` for binary."""
+def mtime_to_iso(mtime: float | None) -> str | None:
+    """``None`` stays ``None``; a POSIX timestamp becomes ``YYYY-MM-DDTHH:MM:SSZ``."""
+    if mtime is None:
+        return None
+    return datetime.fromtimestamp(mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_sample(path: Path, budget_bytes: int, *, mtime: float | None = None) -> Sample:
+    """Return the excerpt sent to the model; raises :class:`NotTextError` for binary.
+
+    ``mtime`` is the evidence file's modification time as the uploader knew it
+    (``File.lastModified`` in the browser, ``stat`` on the CLI). It is *not*
+    read from ``path``: that is a staging copy whose mtime is the upload time,
+    and the prompt tells the model to take a missing year from the mtime.
+    """
     assert_text_file(path)
     head_b = int(budget_bytes * 0.70)
     mid_b = int(budget_bytes * 0.15)
@@ -161,7 +177,7 @@ def build_sample(path: Path, budget_bytes: int) -> Sample:
     else:
         scan = None
         line_count = first.line_count if first else count_lines(path)
-    mtime_iso = datetime.fromtimestamp(path.stat().st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    mtime_iso = mtime_to_iso(mtime)
 
     def read_lines(offset: int, byte_budget: int) -> tuple[str, int | None]:
         """Whole lines from ``offset``: the text and where the line after them starts.

@@ -37,6 +37,9 @@ export interface ConverterAttempt {
   exit_code: number | null;
   stderr_tail: string;
   error?: string | null;
+  /** Hash of the prompt this round sent (generate/sample entries), so the trail
+   * names the exact prompt behind each draft. */
+  prompt_hash?: string | null;
   validation: { ok: boolean; rows: number; checks: ConverterCheck[] } | null;
 }
 
@@ -55,6 +58,8 @@ export interface ConverterScript {
   sample_hash: string | null;
   raw_file_hash: string;
   raw_filename: string | null;
+  /** The evidence file's own mtime as stated to the model, or null ("unknown"). */
+  raw_mtime?: string | null;
   hint: string | null;
   attempts: ConverterAttempt[];
   created_by: string | null;
@@ -108,6 +113,10 @@ export const convertersApi = {
     form.append("file", file);
     if (opts.hint) form.append("hint", opts.hint);
     if (opts.converterScriptId) form.append("converter_script_id", opts.converterScriptId);
+    // The evidence file's own mtime: what the model is told and what the
+    // script sees on its input. Without it the server's copy would only
+    // know the upload time.
+    if (file.lastModified > 0) form.append("mtime", String(file.lastModified / 1000));
     return postForm<ConvertStartResult>(`/cases/${caseId}/converters/convert`, form, xfer);
   },
 

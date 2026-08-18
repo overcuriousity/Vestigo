@@ -41,7 +41,6 @@ const CONVERT_INGEST_PHASES: Record<string, string> = {
   sampling: "Reading a sample of the file",
   generating: "Asking the model to write the converter",
   sample_run: "Trying the converter on the sample",
-  validating: "Checking the sample output",
   converting: "Converting the whole file",
   ingesting: "Ingesting",
 };

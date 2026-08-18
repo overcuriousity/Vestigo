@@ -199,7 +199,7 @@ async def _sweep_stale_transfer_archives() -> None:
         logger.exception("Transfer archive sweep failed; leftover export archives remain.")
 
 
-async def _reconcile_stale_converter_generations() -> None:
+async def _reconcile_stale_converter_generations(store: PostgresStore) -> None:
     """Fail every converter script still ``generating`` — its job did not survive the restart.
 
     Same reasoning as the ingest reconciliation above: the JobStore is
@@ -207,10 +207,15 @@ async def _reconcile_stale_converter_generations() -> None:
     and it would sit in the panel as "generating" forever, neither reusable
     nor regenerable as a failed draft. The row and its attempts stay; only the
     status flips, and the trail records why.
-    """
-    from vestigo.api.deps import get_store
 
-    store = get_store()
+    Runs *before* the lifespan yields, like
+    ``_settle_orphaned_column_recommendations`` and for the same two reasons:
+    it is one fast Postgres statement that touches no external service, and it
+    fails *every* ``generating`` row — so it must run before the app can
+    accept a conversion, or (queued behind a slow ClickHouse sweep in
+    ``_startup_recovery``) it would flip a live generation to ``failed`` and
+    plant a bogus "interrupted by a server restart" attempt on it.
+    """
     try:
         rows = await store.fail_stale_converter_generations()
     except Exception:  # noqa: BLE001 — reconciliation must never block startup
@@ -417,7 +422,6 @@ async def _startup_recovery(store: PostgresStore) -> None:
     try:
         await _sweep_stale_transfer_archives()
         await _reconcile_orphaned_ingests()
-        await _reconcile_stale_converter_generations()
         enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
 
         from vestigo.enrichers.registry import refresh_availability
@@ -461,6 +465,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _seed_admin()
     await _refresh_enricher_availability()
     await _settle_orphaned_column_recommendations(store)
+    await _reconcile_stale_converter_generations(store)
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
     try:

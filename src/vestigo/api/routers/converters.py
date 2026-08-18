@@ -99,18 +99,29 @@ class RegenerateBody(BaseModel):
     hint: str | None = None
 
 
+def _require_switch() -> None:
+    """The operator switch alone: what re-running a saved script needs.
+
+    Paired with the ``converter_reuse`` capability on ``/api/health``. A
+    saved script sends nothing to the model, so a model endpoint that is down
+    or was never configured (an airgapped site that imported a case with
+    vetted converters) must not stop it from running.
+    """
+    if not get_settings().converter_generation_enabled:
+        raise HTTPException(
+            status_code=503, detail="Converter generation is disabled on this instance."
+        )
+
+
 async def _require_generation_enabled() -> None:
-    """Refuse to *start* work when the subsystem is off or the model is down.
+    """Refuse to *start* model work when the subsystem is off or the model is down.
 
     Paired with the ``converter_generation`` capability on ``/api/health``,
     which is what hides the UI entry points — this is the enforcement behind it.
     """
     from vestigo.agent.availability import agent_available
 
-    if not get_settings().converter_generation_enabled:
-        raise HTTPException(
-            status_code=503, detail="Converter generation is disabled on this instance."
-        )
+    _require_switch()
     if not await agent_available():
         raise HTTPException(
             status_code=503,
@@ -127,6 +138,7 @@ async def convert_upload(
     file: UploadFile = File(...),  # noqa: B008
     hint: str | None = Form(default=None),
     converter_script_id: str | None = Form(default=None),
+    mtime: float | None = Form(default=None),
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
@@ -137,9 +149,18 @@ async def convert_upload(
     writes is not byte-stable across runs, so the source-level duplicate check
     would not catch it and the evidence would land twice. A fresh generation,
     or another script, over the same raw file is a different question and
-    stays allowed.
+    stays allowed. Reuse needs only the operator switch; generation also
+    needs a reachable model.
+
+    ``mtime`` is the evidence file's own modification time (POSIX seconds —
+    the browser's ``File.lastModified``); it is what the model is told and
+    what the script sees on its input. Omitted, the model is told the mtime
+    is unknown rather than handed the upload time as a fact.
     """
-    await _require_generation_enabled()
+    if converter_script_id:
+        _require_switch()
+    else:
+        await _require_generation_enabled()
     store = get_store()
     if converter_script_id:
         row = await store.get_converter_script(case.id, converter_script_id)
@@ -185,6 +206,7 @@ async def convert_upload(
         filename=file.filename or tmp_path.name,
         hint=hint or None,
         reuse_script_id=converter_script_id or None,
+        raw_mtime=mtime if mtime and mtime > 0 else None,
     )
     background_tasks.add_task(run_convert_ingest_job, job.id, inputs, job_store=job_store)
     return {"job_id": job.id, "converter_script_id": converter_script_id or None}
@@ -286,6 +308,7 @@ async def regenerate_case_converter(
         parent_id=row.id,
         name_hint=row.name,
         raw_tmp_dir=tmp_dir,
+        raw_mtime=row.raw_mtime.timestamp() if row.raw_mtime else None,
     )
     await store.record_audit(
         action="converter.regenerate",

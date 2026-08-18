@@ -105,3 +105,93 @@ A second `/code-review 277` after the fixes above; every finding fixed in sessio
     endpoint 409s a repeat of the same saved script over the same raw file naming the
     existing source (a fresh generation or another script stays allowed); the tray and the
     case jobs panel render `result.duplicate` (`jobOutcomeNote`).
+
+## Third pass — 2026-08-18
+
+A third `/code-review 277` after the second pass; every finding — including the ones the
+report cut for its cap and the cleanups — fixed in session 178.
+
+1. **`check_script` bypassed by dynamic lookup and rebinding.** `pydoc.locate('os.system')`,
+   `__builtins__['eval']`, `f = eval; f(…)`, `os.__dict__['system']`, `x = os; x.remove(p)`,
+   `def g(m): m.system(…); g(os)`, `f = os.system`, `import _ctypes`, `pickle.loads`,
+   `marshal`, `sys.path.insert(0, '.')` (a written file shadowing a stdlib module on the
+   next import), `().__class__.__base__.__subclasses__()`, `attrgetter('__subclasses__')`
+   all returned `[]`. Now: the deny-list adds `pydoc pkgutil zipimport ensurepip venv site
+   gc inspect unittest pickle _pickle marshal shelve dbm _ctypes imaplib poplib nntplib
+   telnetlib socketserver wsgiref antigravity` and the submodules `logging.config`
+   (imports `()` factory strings) and `unittest.mock`; a name bound by `import` may only be
+   the receiver of an attribute access (`x = os`, `f(os)`, `[os]` refused — this is what
+   closes the rebinding family without tracking data flow); `exec eval compile __import__
+   globals locals vars breakpoint help input __builtins__ __loader__ __spec__` are refused
+   wherever *named*; the object-graph dunders (`__dict__ __subclasses__ __bases__ __mro__
+   __globals__ __code__ __closure__ __self__ __func__ __wrapped__ __reduce__ …`, frame and
+   traceback attributes) are refused on every receiver; `sys.path/meta_path/path_hooks/
+   _getframe/settrace/…` join `sys.modules`; `getattr/setattr/delattr/hasattr/attrgetter/
+   methodcaller` are refused on a module alias or with a dunder-name string; the
+   `os`/`Path` destructive attributes are refused as *reads*, not only calls; `CodeType`/
+   `FunctionType`/`get_type_hints` join the any-receiver list. Prompt, `INPUT_FORMATS.md`,
+   `DEPLOYMENT.md` and `AGENT.md` now call it a best-effort static guard, which it is.
+   Twenty-three new evasion cases in `test_converter_runner.py`; the fixture converter and
+   the legitimate-alias case still pass.
+2. **Same-script-same-file refusal lived only in the HTTP handler.** The CLI's `--converter`
+   and a concurrent submit reached the job directly, and the source row that would read as a
+   duplicate exists only after the multi-minute conversion. Now the job checks
+   `get_source_by_converter_input` before any work (`DuplicateConversion`),
+   `register_source_for_ingest` checks it again as a pre-check and after an `IntegrityError`,
+   and migration 0032 makes `ix_sources_converter_input` a partial unique index — the
+   backstop under all three.
+3. **Raw evidence retained before any row referenced it, never released.** A job failing in
+   seconds (endpoint down, mistyped script id) left a plaintext copy under
+   `data/sources/<hash>` nothing named; in reuse mode the only reference,
+   `sources.converter_input_hash`, was invisible to `source_hash_in_use`. Now `_Retention`
+   retains lazily — right before `_create_row` and before `register_source_for_ingest` —
+   and on failure unlinks the copy *this job* created when nothing references it;
+   `source_hash_in_use` counts `converter_input_hash`. The full run reads the job's private
+   copy, not the retention path.
+4. **Startup reconciliation could fail a live generation.** It ran in `_startup_recovery`
+   after `yield`, queued behind ClickHouse-touching sweeps, and failed *every* `generating`
+   row. Moved before `yield` next to `_settle_orphaned_column_recommendations` (one fast
+   Postgres statement) — no request can be accepted before it has run. Test:
+   `test_generating_rows_are_failed_before_the_app_serves` (a row created while serving is
+   left alone).
+5. **Concurrent reuse jobs clobbered each other's attempts.** `_Attempts` snapshotted the list
+   and wrote it wholesale. New `PostgresStore.append_converter_attempt`: `SELECT … FOR
+   UPDATE`, append, `n` assigned from the locked row, row updates in the same transaction.
+   The attempt-entry dict is built in one place (`converter_attempt_entry`) for the job and
+   for reconciliation. Test: `test_concurrent_reuse_jobs_keep_both_trails`.
+6. **Two failure paths left no trail.** (a) After `status='working'`, a failure in
+   `hash_file`/`stat`/`register_source_for_ingest` recorded nothing — now the catch-all
+   appends an attempt for the phase that died (`generate`/`full`/`ingest`) plus the matching
+   audit row unless the raising code already did (`_Failed`). (b) Model errors before a row
+   exists are buffered on `_Trail` and flushed onto the row when it appears; if every attempt
+   died after the excerpt was sent, a `failed` row named from the file
+   (`auth_log2vestigo`) carries them and is regenerable; if the endpoint was unreachable
+   before the first prompt, only an audit row (`outcome: unavailable`) — nothing left the
+   host, no row is worth an analyst's attention, no blob is retained.
+7. **`prompt_hash`/`model` frozen at the first draft.** A repair round's prompt necessarily
+   differs, so the download header named a prompt that did not produce the code. Now every
+   `generate`/`sample` entry carries its prompt's hash, and the `sample` record of a draft
+   sets the row's `source_code`, `prompt_hash` and `model` together.
+8. **The "file mtime" was the staging copy's.** The prompt says "missing year: take it from
+   the file mtime", and the value was the upload time. Now the browser sends
+   `File.lastModified`, the CLI its `stat`, a regeneration the stored
+   `converter_scripts.raw_mtime` (migration 0032); the runner `os.utime`s the staged copy;
+   with none the header says "mtime unknown" and the prompt says what to fall back to and
+   to record it in `timezone_assumption`.
+9. **Reuse gated on a reachable model.** `_require_switch` (switch only) for
+   `converter_script_id` reuse; `_require_generation_enabled` (switch + model) for
+   generation and regenerate. New capability `converter_reuse`; the dialog offers *Use a
+   saved converter* alone when only that is on, hides the mode when the case has no working
+   script, and the reuse-only select has no "generate a new one" entry.
+10. **Mode switch mid-transfer unmounted the progress row.** `SegmentedControl` gained
+    `disabled`; the dialog freezes it while a transfer is active, and the progress row's
+    state/cancel follow whichever transfer is running rather than the current mode. The AI
+    path's `onSuccess` now fires `tourEvent("source-uploaded")`.
+
+Cut-by-the-cap findings and cleanups, all applied: `ScriptDetail`'s query key is
+`["converters", caseId, "detail", id]` so the tray's terminal invalidation reaches an
+expanded row; the panel tracks regenerate jobs it started (button disabled + spinner until
+terminal, list polled every 2 s while one is in flight, no pointless invalidation at submit);
+`ParserDownloadsPanel` shows the prompt-load error with a Retry; `jobPhases.ts` drops the
+`validating` phase the job never emits; `_take_examples` skips the whole-batch filter when
+the mask selects nothing; the CLI copies and hashes the log in one pass (`copy_and_hash`).

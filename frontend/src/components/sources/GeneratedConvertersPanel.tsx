@@ -9,8 +9,8 @@
  * the exact sample that was sent to the model. Renders nothing when the
  * feature is off *and* the case has no scripts; scripts outlive the switch.
  */
-import { useEffect, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { Download, RefreshCw, Wand2 } from "lucide-react";
 import { agentApi } from "@/api/agent";
@@ -71,8 +71,11 @@ function AttemptRow({ a }: { a: ConverterAttempt }) {
 }
 
 function ScriptDetail({ caseId, id }: { caseId: string; id: string }) {
+  // Under the list's key prefix on purpose: the job tray's terminal
+  // invalidation of ["converters", caseId] must refetch an expanded row's
+  // attempts too, or a saved script re-run keeps showing its pre-job trail.
   const { data, isLoading } = useQuery({
-    queryKey: ["converter", caseId, id],
+    queryKey: ["converters", caseId, "detail", id],
     queryFn: () => convertersApi.getForCase(caseId, id),
   });
   if (isLoading || !data) {
@@ -117,17 +120,18 @@ function RegenerateDialog({
   script,
   open,
   onOpenChange,
+  onStarted,
 }: {
   caseId: string;
   script: ConverterScript;
   open: boolean;
   onOpenChange: (o: boolean) => void;
+  onStarted: (jobId: string) => void;
 }) {
   const [hint, setHint] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const addJob = useJobsStore((s) => s.addJob);
-  const qc = useQueryClient();
   const { data: info } = useQuery({
     queryKey: ["agent-info"],
     queryFn: agentApi.getInfo,
@@ -148,7 +152,10 @@ function RegenerateDialog({
           ["timelines", caseId],
         ],
       );
-      qc.invalidateQueries({ queryKey: ["converters", caseId] });
+      // No list invalidation here: the new row is inserted only after the
+      // model's first reply, so a refetch now would find nothing changed. The
+      // panel polls the list while it knows a job is in flight instead.
+      onStarted(r.job_id);
       onOpenChange(false);
       setHint("");
     } catch (e) {
@@ -213,9 +220,36 @@ export function GeneratedConvertersPanel({ caseId }: Props) {
     if (linked) setExpanded(linked);
   }, [linked]);
   const [regen, setRegen] = useState<ConverterScript | null>(null);
+  // Regenerations this panel started, by parent script id, until their job
+  // reaches a terminal state: the Regenerate button is disabled for that
+  // script (a second click would start a second job) and the list is polled
+  // so the new "generating" row shows up while the job runs — the tray only
+  // invalidates on completion, and the row does not exist at submit time.
+  const [regenJobs, setRegenJobs] = useState<Record<string, string>>({});
+  const jobs = useJobsStore((s) => s.jobs);
+  const inFlight = useMemo(() => {
+    const out = new Set<string>();
+    for (const [scriptId, jobId] of Object.entries(regenJobs)) {
+      const j = jobs[jobId];
+      if (!j || (j.status !== "completed" && j.status !== "failed")) out.add(scriptId);
+    }
+    return out;
+  }, [regenJobs, jobs]);
+  useEffect(() => {
+    // Forget finished jobs so the map cannot grow across a long session.
+    const done = Object.keys(regenJobs).filter((id) => !inFlight.has(id));
+    if (done.length) {
+      setRegenJobs((m) => {
+        const next = { ...m };
+        for (const id of done) delete next[id];
+        return next;
+      });
+    }
+  }, [inFlight, regenJobs]);
   const { data } = useQuery({
     queryKey: ["converters", caseId],
     queryFn: () => convertersApi.listForCase(caseId),
+    refetchInterval: inFlight.size > 0 ? 2000 : false,
   });
   const scripts = data?.scripts ?? [];
   if (!caps.converter_generation && scripts.length === 0) return null;
@@ -272,11 +306,12 @@ export function GeneratedConvertersPanel({ caseId }: Props) {
                       <Button
                         variant="ghost"
                         size="icon"
-                        title="Regenerate"
+                        title={inFlight.has(s.id) ? "Regenerating…" : "Regenerate"}
                         aria-label={`Regenerate ${s.name}`}
+                        disabled={inFlight.has(s.id) || s.status === "generating"}
                         onClick={() => setRegen(s)}
                       >
-                        <RefreshCw size={13} />
+                        <RefreshCw size={13} className={inFlight.has(s.id) ? "animate-spin" : ""} />
                       </Button>
                     )}
                   </div>
@@ -299,6 +334,7 @@ export function GeneratedConvertersPanel({ caseId }: Props) {
           onOpenChange={(o) => {
             if (!o) setRegen(null);
           }}
+          onStarted={(jobId) => setRegenJobs((m) => ({ ...m, [regen.id]: jobId }))}
         />
       )}
     </div>

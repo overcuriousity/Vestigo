@@ -4,22 +4,24 @@
  * the feature is off and the case has no scripts.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { GeneratedConvertersPanel } from "@/components/sources/GeneratedConvertersPanel";
 import { TooltipProvider } from "@/components/ui/Tooltip";
+import { useJobsStore } from "@/stores/jobs";
 
 const listMock = vi.fn();
 const getMock = vi.fn();
 const capsMock = vi.fn();
+const regenMock = vi.fn();
 
 vi.mock("@/api/converters", () => ({
   convertersApi: {
     listForCase: (...a: unknown[]) => listMock(...a),
     getForCase: (...a: unknown[]) => getMock(...a),
     caseDownloadUrl: (c: string, id: string) => `/api/cases/${c}/converters/${id}/download`,
-    regenerate: vi.fn(),
+    regenerate: (...a: unknown[]) => regenMock(...a),
   },
 }));
 vi.mock("@/api/agent", () => ({
@@ -69,6 +71,8 @@ beforeEach(() => {
   listMock.mockReset();
   getMock.mockReset();
   capsMock.mockReset();
+  regenMock.mockReset();
+  useJobsStore.setState({ jobs: {} });
 });
 
 describe("GeneratedConvertersPanel", () => {
@@ -124,5 +128,64 @@ describe("GeneratedConvertersPanel", () => {
     expect(screen.getByText(/Traceback: boom/)).toBeTruthy();
     expect(screen.getByText(/line two/)).toBeTruthy();
     expect(getMock).toHaveBeenCalledWith("c1", "s2");
+  });
+
+  it("disables Regenerate for a script whose job is in flight and polls the list", async () => {
+    capsMock.mockReturnValue({ converter_generation: true });
+    listMock.mockResolvedValue({ scripts: SCRIPTS, sample_bytes: 65536 });
+    regenMock.mockResolvedValue({ job_id: "job-7" });
+    renderPanel();
+    const btn = (await screen.findByLabelText(/Regenerate syslog2vestigo/)) as HTMLButtonElement;
+    fireEvent.click(btn);
+    fireEvent.click(await screen.findByRole("button", { name: "Regenerate" }));
+    await waitFor(() => expect(regenMock).toHaveBeenCalledWith("c1", "s1", undefined));
+    // The row does not exist until the model's first reply, so the panel keeps
+    // asking for the list instead of trusting a one-off invalidation…
+    await waitFor(() => expect(useJobsStore.getState().jobs["job-7"]).toBeTruthy());
+    expect((screen.getByLabelText(/Regenerate syslog2vestigo/) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    // …and a second click cannot start a second job.
+    fireEvent.click(screen.getByLabelText(/Regenerate syslog2vestigo/));
+    expect(regenMock).toHaveBeenCalledTimes(1);
+    // The other script's button is untouched.
+    expect((screen.getByLabelText(/Regenerate weird2vestigo/) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+    // Once the job is terminal the button comes back.
+    useJobsStore.getState().updateJob({
+      id: "job-7",
+      kind: "convert_ingest",
+      status: "completed",
+      progress: null,
+      result: null,
+      error: null,
+    });
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText(/Regenerate syslog2vestigo/) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+  });
+
+  it("keeps an expanded row's attempts under the list's query key so a refresh reaches them", async () => {
+    capsMock.mockReturnValue({ converter_generation: true });
+    listMock.mockResolvedValue({ scripts: SCRIPTS, sample_bytes: 65536 });
+    getMock.mockResolvedValue({ ...SCRIPTS[0], attempts: [], sample_excerpt: "x" });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter>
+            <GeneratedConvertersPanel caseId="c1" />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("syslog2vestigo v2"));
+    await waitFor(() => expect(getMock).toHaveBeenCalledTimes(1));
+    // What the job tray does on a terminal convert job.
+    await qc.invalidateQueries({ queryKey: ["converters", "c1"] });
+    await waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
   });
 });

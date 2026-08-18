@@ -35,28 +35,39 @@ export function UploadDialog({ caseId }: Props) {
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
   const caps = useCapabilities();
+  // Two capabilities, deliberately: generation needs the switch *and* a
+  // reachable model; re-running a saved script sends nothing and needs the
+  // switch only — an airgapped site with imported, vetted converters and no
+  // model can still convert with them.
   const canGenerate = caps.converter_generation;
-  const generating = mode === "generate" && canGenerate;
-
-  // Only fetched while the AI mode is open: what the disclosure names (the
-  // endpoint and model, from the same source the agent panel uses) and the
-  // case's saved converters plus the sample budget the server will send.
-  const { data: agentInfo } = useQuery({
-    queryKey: ["agent-info"],
-    queryFn: agentApi.getInfo,
-    staleTime: 60_000,
-    enabled: open && generating,
-  });
+  const canReuse = caps.converter_reuse || canGenerate;
+  // Fetched whenever the dialog is open and the feature is on at all: the
+  // saved converters decide whether the converter mode is worth offering
+  // when only reuse is possible, plus the sample budget the server will send.
   const { data: caseConverters } = useQuery({
     queryKey: ["converters", caseId],
     queryFn: () => convertersApi.listForCase(caseId),
-    enabled: open && generating,
+    enabled: open && canReuse,
   });
   const reusable = useMemo(
     () => (caseConverters?.scripts ?? []).filter((c) => c.status === "working"),
     [caseConverters],
   );
   const sampleBytes = caseConverters?.sample_bytes ?? 65536;
+  const converterMode = canGenerate || (canReuse && reusable.length > 0);
+  const generating = mode === "generate" && converterMode;
+  // Reuse-only: the select has no "generate a new one" entry, so a script must
+  // be chosen before there is anything to submit.
+  const needsReuseChoice = generating && !canGenerate && !reuseId;
+
+  // Only fetched while the AI mode is open: what the disclosure names (the
+  // endpoint and model, from the same source the agent panel uses).
+  const { data: agentInfo } = useQuery({
+    queryKey: ["agent-info"],
+    queryFn: agentApi.getInfo,
+    staleTime: 60_000,
+    enabled: open && generating && canGenerate,
+  });
 
   // The app's largest routine transfer: the server takes up to 10 GiB and the
   // ingest job the tray polls does not exist until the whole body has landed,
@@ -109,6 +120,9 @@ export function UploadDialog({ caseId }: Props) {
         o,
       ),
     onSuccess: (result) => {
+      // The upload happened — the tour's "upload the file" step must not
+      // strand an analyst who chose the converter path.
+      tourEvent("source-uploaded");
       addJob(
         result.job_id,
         reuseId
@@ -171,21 +185,31 @@ export function UploadDialog({ caseId }: Props) {
         description="Uploading creates a new Source and adds it to the default timeline. Supported formats: Timesketch CSV, JSONL, Vestigo Parquet (from a converter script). Parser auto-detected if omitted."
       >
         <div className="space-y-4">
-          {canGenerate && (
+          {converterMode && (
             <SegmentedControl<Mode>
               value={mode}
+              // Frozen while a transfer is in flight: switching would unmount
+              // the progress row (and its Cancel) while the bytes keep moving.
+              disabled={active}
               onChange={(m) => {
                 setMode(m);
                 setFile(null);
               }}
               options={[
                 { id: "file", label: "Upload timeline", icon: Upload },
-                {
-                  id: "generate",
-                  label: "Let AI write the converter",
-                  icon: Wand2,
-                  hint: "For plain-text logs no converter covers: a sample goes to the configured model, the script it writes runs here, and the result is ingested.",
-                },
+                canGenerate
+                  ? {
+                      id: "generate",
+                      label: "Let AI write the converter",
+                      icon: Wand2,
+                      hint: "For plain-text logs no converter covers: a sample goes to the configured model, the script it writes runs here, and the result is ingested.",
+                    }
+                  : {
+                      id: "generate",
+                      label: "Use a saved converter",
+                      icon: Wand2,
+                      hint: "Re-run one of this case's converter scripts on a new plain-text log. Nothing is sent to a model.",
+                    },
               ]}
             />
           )}
@@ -212,15 +236,17 @@ export function UploadDialog({ caseId }: Props) {
             </p>
           )}
 
-          {(upload.active || convert.active) && file && (
+          {active && file && (
             <TransferProgressRow
               label={`Uploading ${file.name}`}
-              state={generating ? convert.state : upload.state}
+              // Driven by whichever transfer is actually running, not by the
+              // current mode — the two must not be able to disagree.
+              state={convert.active ? convert.state : upload.state}
               fallbackTotal={file.size}
               // Safe: the server streams the body to a temp file and only
               // creates the Source row and ingest job once all of it has
               // landed, so a cancelled upload leaves nothing behind.
-              onCancel={generating ? convert.cancel : upload.cancel}
+              onCancel={convert.active ? convert.cancel : upload.cancel}
               cancelLabel="Cancel upload"
             />
           )}
@@ -241,7 +267,9 @@ export function UploadDialog({ caseId }: Props) {
                     value={reuseId}
                     onChange={(e) => setReuseId(e.target.value)}
                   >
-                    <option value="">Generate a new one</option>
+                    <option value="">
+                      {canGenerate ? "Generate a new one" : "Choose a saved converter…"}
+                    </option>
                     {reusable.map((c) => (
                       <option key={c.id} value={c.id}>
                         {c.name} v{c.version}
@@ -251,12 +279,14 @@ export function UploadDialog({ caseId }: Props) {
                 </div>
               )}
 
-              {reuseId ? (
+              {reuseId || !canGenerate ? (
                 <p
                   role="note"
                   className="rounded border border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-fg-muted)]"
                 >
-                  Nothing is sent to the model — the saved converter runs on this server.
+                  {reuseId
+                    ? "Nothing is sent to the model — the saved converter runs on this server."
+                    : "No model is reachable, so only saved converters can run here."}
                 </p>
               ) : (
                 <div
@@ -275,7 +305,7 @@ export function UploadDialog({ caseId }: Props) {
                 </div>
               )}
 
-              {!reuseId && (
+              {!reuseId && canGenerate && (
                 <div>
                   <label
                     htmlFor="upload-converter-hint"
@@ -335,7 +365,7 @@ export function UploadDialog({ caseId }: Props) {
                 variant="accent"
                 size="sm"
                 data-tour="upload-submit"
-                disabled={!file || active}
+                disabled={!file || active || needsReuseChoice}
                 onClick={() => convert.submit()}
               >
                 {convert.active

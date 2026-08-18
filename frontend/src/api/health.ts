@@ -39,6 +39,7 @@ const ASSUME_AVAILABLE: Capabilities = {
   demo_case: false,
   // Hidden until probed: it depends on the agent, which is also hidden until probed.
   converter_generation: false,
+  converter_reuse: false,
 };
 
 /**

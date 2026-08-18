@@ -32,6 +32,7 @@ CAPABILITY_KEYS: tuple[str, ...] = (
     "transfer",
     "demo_case",
     "converter_generation",
+    "converter_reuse",
 )
 
 
@@ -91,6 +92,9 @@ async def get_capabilities() -> dict[str, bool]:
         # ships with the app. The key exists so the frontend gates every
         # subsystem the same way.
         "demo_case": settings.demo_case_enabled,
-        # Model-written converters need the switch *and* a reachable model.
+        # Model-written converters need the switch *and* a reachable model;
+        # re-running a saved script sends nothing, so it needs the switch only
+        # (an airgapped site with imported, vetted converters and no model).
         "converter_generation": bool(settings.converter_generation_enabled and agent),
+        "converter_reuse": bool(settings.converter_generation_enabled),
     }

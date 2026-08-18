@@ -1,6 +1,38 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-18 (session 177 — PR #277 second review pass).
+Last updated: 2026-08-18 (session 178 — PR #277 third review pass).
+
+## Session 178 — 2026-08-18: PR #277 third review — every finding fixed, minor ones included
+
+A third `/code-review 277` (ten ranked findings, three cut by the cap, four cleanups); all
+fixed (`docs/archive/PR277_REVIEW_FINDINGS.md` §"Third pass" has each with its reasoning).
+What changed shape:
+
+- **The static guard closes dynamic lookup and rebinding.** `pydoc.locate`, `__builtins__[…]`,
+  `f = eval`, `os.__dict__[…]`, `x = os`, `f(os)`, `sys.path.insert`, `().__class__.__base__
+  .__subclasses__()` all passed before. Now an imported module may only be the receiver of an
+  attribute access, the object-graph dunders are refused on every receiver, and the deny-list
+  covers import-by-string, deserialisers and `gc`/`inspect`. Docs call it best-effort, which it is.
+- **The trail is complete.** Attempts append under a row lock (`append_converter_attempt`;
+  two reuse jobs no longer clobber each other), model errors before a row exists are buffered
+  and land on the row (or on a `failed` row named from the file when no draft ever arrived),
+  a failure after the full run passed is an `ingest` attempt + audit, and every entry that
+  sent a prompt carries that prompt's hash — the row's `prompt_hash`/`model` follow the draft
+  that became the code.
+- **Retention is lazy and reclaimed.** The raw file is kept only once a row is about to
+  reference it; a job that fails before that takes its copy back; `source_hash_in_use`
+  counts `converter_input_hash`.
+- **Duplicate conversion is refused everywhere**: the job pre-checks (CLI, concurrent
+  submits), registration re-checks, and migration 0032 makes the index a partial unique
+  index. 0032 also adds `converter_scripts.raw_mtime`: the evidence file's own mtime (browser
+  `lastModified`, CLI `stat`) is what the model is told and what the script sees on `-i`;
+  absent, the model is told "unknown".
+- **Reuse needs only the switch** (`converter_reuse` capability): saved converters run with
+  the model down or never configured; the dialog offers *Use a saved converter* alone then.
+- Startup reconciliation of `generating` rows runs before the lifespan yields; the upload
+  dialog freezes its mode switch mid-transfer and its progress row follows the running
+  transfer; the converters panel disables Regenerate while its job runs and polls the list;
+  the prompts panel explains a failed load with a Retry.
 
 ## Session 177 — 2026-08-18: PR #277 second review — ten more findings fixed
 

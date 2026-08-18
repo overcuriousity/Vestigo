@@ -173,6 +173,30 @@ def test_private_network_modules_are_denied():
         "from pathlib import Path\nPath('x').chmod(0o644)",
         "from pathlib import Path\nPath('x').unlink()",
         "import os.path as p\nfrom os import path\nos.chmod('x', 0)",
+        # Dynamic lookup primitives and the object graph (PR #277, third pass).
+        "import pydoc\npydoc.locate('os.system')('id')",
+        "__builtins__['eval']('1')",
+        "f = eval\nf('1')",
+        "os.__dict__['system']('id')",
+        "x = os\nx.remove('p')",
+        "def g(m): m.system('id')\ng(os)",
+        "f = os.system\nf('id')",
+        "import _ctypes",
+        "import pickle\npickle.loads(b'')",
+        "import marshal",
+        "import gc",
+        "import inspect",
+        "sys.path.insert(0, '.')",
+        "().__class__.__base__.__subclasses__()",
+        "import operator\noperator.attrgetter('__subclasses__')(int)",
+        "getattr(int, '__subclasses__')()",
+        "import logging.config",
+        "from logging import config",
+        "import unittest.mock",
+        "import types\ntypes.CodeType",
+        "globals()['__builtins__']",
+        "vars(json)",
+        "from pathlib import Path\nu = Path.unlink",
     ],
 )
 def test_check_script_rejects_evasions(bad):
@@ -184,6 +208,9 @@ def test_check_script_allows_stdlib_and_pyarrow_aliases():
         "import argparse as ap, json as j\nimport pyarrow.parquet as pq\nimport numpy as np\n"
         "from datetime import datetime as dt\nfrom os import path as osp\n"
         "s = 'a'.replace('a', 'b'); l = [1]; l.remove(1)\n"
+        "print(type(s).__name__, s.__class__.__name__, file=sys.stderr)\n"
+        "handlers = {'a': str.upper}; handlers['a']('x')\n"
+        "if __name__ == '__main__': pass\n"
     )
     assert check_script(ok) == []
 
@@ -221,3 +248,25 @@ def test_stderr_without_newlines_is_bounded(tmp_path):
     r = _run(tmp_path, script)
     assert r.exit_code == 0
     assert len(r.stderr_tail) <= 4096 and r.stderr_tail.endswith("x")
+
+
+def test_staged_input_carries_the_evidence_mtime(tmp_path):
+    # The staging copy's own mtime is the upload time; the script must see the
+    # evidence file's, since the prompt lets it take a missing year from it.
+    inp = tmp_path / "in.log"
+    inp.write_text("x\n")
+    script = (
+        "import sys, os\n"
+        "i = sys.argv[sys.argv.index('-i') + 1]\n"
+        "assert int(os.stat(i).st_mtime) == 1700000000, os.stat(i).st_mtime\n"
+    )
+    r = run_converter(
+        script,
+        inp,
+        output_path=tmp_path / "out" / "o.parquet",
+        timeout_s=20,
+        memory_mb=512,
+        output_mb=16,
+        input_mtime=1_700_000_000.0,
+    )
+    assert r.exit_code == 0, r.stderr_tail

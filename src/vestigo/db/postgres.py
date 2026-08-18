@@ -109,8 +109,20 @@ class Source(Base):
     __tablename__ = "sources"
     __table_args__ = (
         Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
+        # One source per (saved script, raw file) per case: the Parquet a
+        # converter writes is not byte-stable across runs, so ``file_hash``
+        # cannot catch the same evidence being converted twice by the same
+        # script — this index does, as the backstop behind the pre-checks in
+        # the endpoint and the job (migration 0032).
         Index(
-            "ix_sources_converter_input", "case_id", "converter_script_id", "converter_input_hash"
+            "ix_sources_converter_input",
+            "case_id",
+            "converter_script_id",
+            "converter_input_hash",
+            unique=True,
+            postgresql_where=text(
+                "converter_script_id IS NOT NULL AND converter_input_hash IS NOT NULL"
+            ),
         ),
     )
 
@@ -206,6 +218,41 @@ class Source(Base):
         }
 
 
+def converter_attempt_entry(
+    n: int,
+    phase: str,
+    *,
+    model: str | None = None,
+    elapsed_ms: int = 0,
+    exit_code: int | None = None,
+    stderr_tail: str = "",
+    validation: dict[str, Any] | None = None,
+    script_hash: str | None = None,
+    prompt_hash: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """One ``converter_scripts.attempts`` entry — the single place its shape is defined.
+
+    Built here for the job (``converters/job.py``) and for startup
+    reconciliation alike, so the two can never disagree about a key.
+    ``prompt_hash`` is set on the entries that sent a prompt (``generate``
+    and the ``sample`` run of the script that prompt produced), which is what
+    lets the row name the prompt that produced its *stored* code.
+    """
+    return {
+        "n": n,
+        "phase": phase,
+        "model": model,
+        "elapsed_ms": elapsed_ms,
+        "exit_code": exit_code,
+        "stderr_tail": stderr_tail[-4096:],
+        "validation": validation,
+        "script_hash": script_hash,
+        "prompt_hash": prompt_hash,
+        "error": error,
+    }
+
+
 class ConverterScript(Base):
     """A converter script the configured model wrote for one case.
 
@@ -237,6 +284,10 @@ class ConverterScript(Base):
     sample_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     raw_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: The evidence file's own mtime as the uploader knew it (browser
+    #: ``lastModified``, CLI ``stat``) — what the prompt stated; ``None`` when
+    #: the model was told the mtime is unknown. Regeneration replays it.
+    raw_mtime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     hint: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -265,6 +316,7 @@ class ConverterScript(Base):
             "sample_hash": self.sample_hash,
             "raw_file_hash": self.raw_file_hash,
             "raw_filename": self.raw_filename,
+            "raw_mtime": self.raw_mtime.isoformat() if self.raw_mtime else None,
             "hint": self.hint,
             "attempts": self.attempts or [],
             "created_by": self.created_by,
@@ -2321,15 +2373,19 @@ class PostgresStore:
         being removed, or they'd delete a copy another case still needs. A
         generated converter's ``raw_file_hash`` is a reference too: the raw
         log it was written from is retained under the same store (regenerate
-        and export read it back), and it is never a source of its own.
+        and export read it back), and it is never a source of its own — and so
+        is a converted source's ``converter_input_hash``, the raw evidence a
+        saved script was re-run over. ``exclude_source_id`` may be ``""`` to
+        ask "does anything at all reference this hash".
         """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Source.id).where(
-                    Source.file_hash == file_hash, Source.id != exclude_source_id
+                    or_(Source.file_hash == file_hash, Source.converter_input_hash == file_hash),
+                    Source.id != exclude_source_id,
                 )
             )
-            if result.scalar_one_or_none() is not None:
+            if result.first() is not None:
                 return True
             result = await session.execute(
                 select(ConverterScript.id).where(ConverterScript.raw_file_hash == file_hash)
@@ -2347,6 +2403,7 @@ class PostgresStore:
         raw_file_hash: str,
         raw_filename: str | None,
         model: str | None,
+        raw_mtime: datetime | None = None,
         provider_endpoint: str | None,
         prompt_hash: str | None,
         sample_hash: str | None,
@@ -2371,6 +2428,7 @@ class PostgresStore:
             sample_excerpt=sample_excerpt,
             raw_file_hash=raw_file_hash,
             raw_filename=raw_filename,
+            raw_mtime=raw_mtime,
             hint=hint,
             attempts=[],
             created_by=created_by,
@@ -2409,6 +2467,60 @@ class PostgresStore:
             await session.commit()
             await session.refresh(row)
             return row
+
+    async def append_converter_attempt(
+        self,
+        script_id: str,
+        phase: str,
+        *,
+        model: str | None = None,
+        elapsed_ms: int = 0,
+        exit_code: int | None = None,
+        stderr_tail: str = "",
+        validation: dict[str, Any] | None = None,
+        script_hash: str | None = None,
+        prompt_hash: str | None = None,
+        error: str | None = None,
+        row_updates: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Append one attempt under a row lock and return the new list.
+
+        Two jobs may run the same ``working`` script over different raw files
+        at once; each must add its own entries without overwriting the
+        other's, so this is a ``SELECT ... FOR UPDATE`` + append + commit,
+        never a client-side snapshot written back wholesale. ``n`` is
+        assigned here from the locked row. Any ``row_updates`` (``status``,
+        ``source_code``, ``model``, ``prompt_hash``) land in the same
+        transaction. Returns ``[]`` when the row is gone.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript).where(ConverterScript.id == script_id).with_for_update()
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return []
+            entries = list(row.attempts or [])
+            entries.append(
+                converter_attempt_entry(
+                    len(entries) + 1,
+                    phase,
+                    model=model,
+                    elapsed_ms=elapsed_ms,
+                    exit_code=exit_code,
+                    stderr_tail=stderr_tail,
+                    validation=validation,
+                    script_hash=script_hash,
+                    prompt_hash=prompt_hash,
+                    error=error,
+                )
+            )
+            row.attempts = entries
+            for key, value in (row_updates or {}).items():
+                if value is not None:
+                    setattr(row, key, value)
+            await session.commit()
+            return entries
 
     async def get_converter_script(self, case_id: str, script_id: str) -> ConverterScript | None:
         """Return the row when it exists *and* belongs to ``case_id``."""
@@ -2486,17 +2598,11 @@ class PostgresStore:
                 row.status = "failed"
                 row.attempts = [
                     *(row.attempts or []),
-                    {
-                        "n": len(row.attempts or []) + 1,
-                        "phase": "generate",
-                        "model": None,
-                        "elapsed_ms": 0,
-                        "exit_code": None,
-                        "stderr_tail": "",
-                        "validation": None,
-                        "script_hash": None,
-                        "error": "generation interrupted by a server restart",
-                    },
+                    converter_attempt_entry(
+                        len(row.attempts or []) + 1,
+                        "generate",
+                        error="generation interrupted by a server restart",
+                    ),
                 ]
             await session.commit()
             for row in rows:

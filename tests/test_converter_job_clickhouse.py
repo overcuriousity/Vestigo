@@ -60,7 +60,7 @@ def _fake_generator(scripts: list[str], calls: list):
             script=script.replace("__CONVERTER_VERSION__", f"{version}.0.0"),
             model="test-model",
             provider_endpoint="http://x/v1",
-            prompt_hash="ph",
+            prompt_hash=f"ph{len(calls)}",
         )
 
     return gen
@@ -339,3 +339,192 @@ async def test_model_going_away_mid_loop_marks_the_row_failed(store, tmp_path, m
     assert job.status == "failed" and "endpoint down" in (job.error or "")
     script = await store.get_converter_script(case.id, job.progress["converter_script_id"])
     assert script.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_row_prompt_hash_follows_the_draft_that_became_the_code(
+    store, clickhouse, tmp_path, monkeypatch
+):
+    """A repair round's prompt differs from the first; the row names the one that produced the code."""
+    bad = GOOD.replace('"vestigo.format_version": "1",', "")
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([bad, GOOD], calls))
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "completed", job.error
+    script = await store.get_converter_script(case.id, job.result["converter_script_id"])
+    assert [a["prompt_hash"] for a in script.attempts] == ["ph1", "ph2", None]
+    assert script.prompt_hash == "ph2" and script.model == "test-model"
+    clickhouse.delete_source_events(case.id, job.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_same_script_same_raw_is_refused_by_the_job(store, clickhouse, tmp_path, monkeypatch):
+    """The CLI and a concurrent submit reach the job without the endpoint's check."""
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+    case = await store.create_case("c", "d")
+    j1 = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert j1.status == "completed", j1.error
+    sid = j1.result["converter_script_id"]
+    inp = _inputs(case.id, tmp_path)
+    inp.reuse_script_id = sid
+    j2 = await _run(store, case.id, inp)
+    assert j2.status == "failed" and "already converted" in (j2.error or "")
+    assert (await store.count_sources_by_converter(case.id))[sid] == 1
+    # The backstop under both pre-checks: the partial unique index.
+    from sqlalchemy.exc import IntegrityError
+
+    with pytest.raises(IntegrityError):
+        await store.create_source(
+            case_id=case.id,
+            source_id="dup",
+            name="dup",
+            file_hash="d" * 64,
+            size_bytes=1,
+            converter_script_id=sid,
+            converter_input_hash=inp.raw_hash,
+        )
+    clickhouse.delete_source_events(case.id, j1.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_raw_file_is_retained_only_once_a_row_references_it(store, tmp_path, monkeypatch):
+    import uuid
+
+    from vestigo.core.retention import retention_path
+
+    monkeypatch.setenv("VESTIGO_CONVERTER_MAX_ATTEMPTS", "2")
+    get_settings.cache_clear()
+    case = await store.create_case("c", "d")
+
+    def _fresh_inputs() -> ConvertJobInputs:
+        # Retention is instance-global and content-addressed: a raw file some
+        # earlier test already retained would read as "existed before this
+        # job", so every step here uses bytes nobody else has seen.
+        inp = _inputs(case.id, tmp_path)
+        inp.raw_tmp_path.write_text((FIX / "sample.syslog").read_text() + f"# {uuid.uuid4()}\n")
+        inp.raw_hash = hash_file(inp.raw_tmp_path)
+        inp.raw_size = inp.raw_tmp_path.stat().st_size
+        return inp
+
+    # 1. Endpoint unreachable before the first prompt: nothing left the host,
+    #    so no row, no retained blob — the audit row and the job error remain.
+    async def down(system, task, *, timeout_s=180.0):
+        raise G.GenerationUnavailable("endpoint down")
+
+    monkeypatch.setattr(J, "generate_script", down)
+    inp = _fresh_inputs()
+    job = await _run(store, case.id, inp)
+    assert job.status == "failed" and "endpoint down" in (job.error or "")
+    assert await store.list_converter_scripts(case.id) == []
+    assert not retention_path(inp.raw_hash).exists()
+    audits = await store.query_audit(action="converter.generate")
+    assert audits and audits[0].detail["outcome"] == "unavailable"
+
+    # 2. A mistyped script id on reuse: refused before anything is retained.
+    inp = _fresh_inputs()
+    inp.reuse_script_id = "nope"
+    job = await _run(store, case.id, inp)
+    assert job.status == "failed" and not retention_path(inp.raw_hash).exists()
+
+    # 3. Every prompt errors *after* being sent: the excerpt left the host, so
+    #    a failed row named from the file carries the attempts and the audit,
+    #    and it references (and so retains) the raw file.
+    async def broken(system, task, *, timeout_s=180.0):
+        raise RuntimeError("HTTP 500 from the model")
+
+    monkeypatch.setattr(J, "generate_script", broken)
+    inp = _fresh_inputs()
+    job = await _run(store, case.id, inp)
+    assert job.status == "failed"
+    rows = await store.list_converter_scripts(case.id)
+    assert len(rows) == 1 and rows[0].status == "failed" and rows[0].name == "auth_log2vestigo"
+    row = await store.get_converter_script(case.id, rows[0].id)
+    assert [a["phase"] for a in row.attempts] == ["generate", "generate"]
+    assert all("HTTP 500" in a["error"] for a in row.attempts)
+    assert job.progress["converter_script_id"] == row.id
+    assert retention_path(inp.raw_hash).exists()
+    assert await store.source_hash_in_use(inp.raw_hash, exclude_source_id="")
+
+
+@pytest.mark.asyncio
+async def test_failure_after_the_full_run_is_an_ingest_attempt(store, tmp_path, monkeypatch):
+    """Registration refusing the Parquet (or the retention volume being full) after the
+    converter passed must land on the trail as an ``ingest`` attempt and audit row."""
+    from fastapi import HTTPException
+
+    from vestigo.api.routers import cases as C
+
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+
+    async def refuse(**kwargs):
+        raise HTTPException(status_code=400, detail="footer refused")
+
+    monkeypatch.setattr(C, "register_source_for_ingest", refuse)
+    case = await store.create_case("c", "d")
+    job = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert job.status == "failed" and "footer refused" in (job.error or "")
+    script = await store.get_converter_script(case.id, job.progress["converter_script_id"])
+    assert script.status == "working"
+    assert [a["phase"] for a in script.attempts] == ["sample", "full", "ingest"]
+    assert "footer refused" in script.attempts[-1]["error"]
+    runs = await store.query_audit(action="converter.run")
+    assert {a.detail["phase"] for a in runs} == {"full", "ingest"}
+    assert not [a for a in runs if a.detail["phase"] == "ingest"][0].detail["ok"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reuse_jobs_keep_both_trails(store, clickhouse, tmp_path, monkeypatch):
+    """Two jobs re-running one saved script append under a row lock — neither entry is lost."""
+    import asyncio
+
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+    case = await store.create_case("c", "d")
+    j1 = await _run(store, case.id, _inputs(case.id, tmp_path))
+    assert j1.status == "completed", j1.error
+    sid = j1.result["converter_script_id"]
+    inputs = []
+    for i in (2, 3):
+        raw = tmp_path / f"auth{i}.log"
+        raw.write_text((FIX / "sample.syslog").read_text().replace("web01", f"web0{i}"))
+        inputs.append(
+            ConvertJobInputs(
+                case_id=case.id,
+                user=_fake_user(),
+                raw_tmp_path=raw,
+                raw_hash=hash_file(raw),
+                raw_size=raw.stat().st_size,
+                filename=raw.name,
+                reuse_script_id=sid,
+            )
+        )
+    j2, j3 = await asyncio.gather(*(_run(store, case.id, inp) for inp in inputs))
+    assert j2.status == "completed" and j3.status == "completed", (j2.error, j3.error)
+    script = await store.get_converter_script(case.id, sid)
+    assert [a["phase"] for a in script.attempts] == ["sample", "full", "full", "full"]
+    assert [a["n"] for a in script.attempts] == [1, 2, 3, 4]
+    for j in (j1, j2, j3):
+        clickhouse.delete_source_events(case.id, j.result["source_id"])
+
+
+@pytest.mark.asyncio
+async def test_mtime_is_the_evidence_files_or_unknown(store, clickhouse, tmp_path, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(J, "generate_script", _fake_generator([GOOD], calls))
+    case = await store.create_case("c", "d")
+    inp = _inputs(case.id, tmp_path)
+    inp.raw_mtime = 1_700_000_000.0
+    job = await _run(store, case.id, inp)
+    assert job.status == "completed", job.error
+    assert "mtime 2023-11-14T22:13:20Z" in calls[0]
+    script = await store.get_converter_script(case.id, job.result["converter_script_id"])
+    assert script.raw_mtime.timestamp() == 1_700_000_000.0
+    clickhouse.delete_source_events(case.id, job.result["source_id"])
+    inp = _inputs(case.id, tmp_path, name="other.log")
+    job = await _run(store, case.id, inp)
+    assert job.status == "completed", job.error
+    assert "mtime unknown" in calls[1]
+    clickhouse.delete_source_events(case.id, job.result["source_id"])

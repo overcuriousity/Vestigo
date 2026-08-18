@@ -72,6 +72,8 @@ def _take_examples(batch: pa.RecordBatch, mask: pa.Array, have: list[Any]) -> No
     if len(have) >= _MAX_EXAMPLES:
         return
     try:
+        if pc.sum(mask).as_py() in (None, 0):
+            return  # nothing selected — skip the whole-batch filter
         sub = batch.filter(mask).column("message").slice(0, _MAX_EXAMPLES - len(have))
         have.extend(sub.to_pylist())
     except Exception:  # noqa: BLE001 — examples are a courtesy

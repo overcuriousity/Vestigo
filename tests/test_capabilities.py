@@ -158,11 +158,14 @@ def test_converter_generation_capability_needs_switch_and_model(
     as_admin(client, admin_bootstrap)
     caps = client.get("/api/health").json()["capabilities"]
     assert caps["converter_generation"] is False
+    assert caps["converter_reuse"] is False
 
     monkeypatch.setenv("VESTIGO_CONVERTER_GENERATION_ENABLED", "1")
     get_settings.cache_clear()
     caps = client.get("/api/health").json()["capabilities"]
     assert caps["converter_generation"] is False  # no model configured
+    # Re-running a saved script sends nothing: the switch alone is enough.
+    assert caps["converter_reuse"] is True
 
     async def probe_ok(config):
         return True

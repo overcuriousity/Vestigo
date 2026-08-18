@@ -749,7 +749,10 @@ class RegisteredSource:
 
     ``duplicate_of`` set means nothing was created: the bytes already exist as
     that source in this case (pre-check or lost race) and the caller answers
-    with it.
+    with it. For a generated-converter registration it can also mean the same
+    saved script already turned the same raw file into that source
+    (``ix_sources_converter_input``) — a converter's Parquet is not
+    byte-stable, so ``file_hash`` alone would let that evidence land twice.
     """
 
     source_id: str
@@ -780,7 +783,16 @@ async def register_source_for_ingest(
     ownership of ``tmp_path`` on every path except the duplicate ones, where
     it is unlinked here.
     """
-    existing_source = await store.get_source_by_hash(case_id, file_hash)
+
+    async def _existing() -> Source | None:
+        found = await store.get_source_by_hash(case_id, file_hash)
+        if found is None and converter_script_id and converter_input_hash:
+            found = await store.get_source_by_converter_input(
+                case_id, converter_script_id, converter_input_hash
+            )
+        return found
+
+    existing_source = await _existing()
     if existing_source is not None:
         tmp_path.unlink(missing_ok=True)
         return RegisteredSource(
@@ -855,9 +867,10 @@ async def register_source_for_ingest(
             converter_input_hash=converter_input_hash,
         )
     except IntegrityError:
-        # Lost a race against a concurrent upload of the same bytes:
-        # treat it the same as the pre-check duplicate response.
-        existing_source = await store.get_source_by_hash(case_id, file_hash)
+        # Lost a race against a concurrent upload of the same bytes (or a
+        # concurrent run of the same script over the same raw file): treat it
+        # the same as the pre-check duplicate response.
+        existing_source = await _existing()
         if existing_source is None:
             raise
         tmp_path.unlink(missing_ok=True)

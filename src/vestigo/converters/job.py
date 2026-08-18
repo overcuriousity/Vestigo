@@ -5,6 +5,13 @@ attempt is recorded on the ``converter_scripts`` row; the produced Parquet is
 handed to the same registration/ingest path a manual Parquet upload takes, so
 the resulting source is indistinguishable from one the analyst converted
 locally — except for ``converter_script_id`` pointing at the script.
+
+The trail is the contract (docs/INPUT_FORMATS.md §"What is kept"): whatever
+fails, and wherever, there is an attempt entry and an audit row saying so —
+including model errors before a row exists (buffered and flushed onto the
+row, or onto a ``failed`` row named from the file when no draft ever
+arrived), the endpoint going away mid-loop, and a failure after the full run
+passed (retention disk full, the Parquet footer refused, the database).
 """
 
 from __future__ import annotations
@@ -12,9 +19,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +44,7 @@ from vestigo.converters.validate import Check, ValidationReport, validate_output
 from vestigo.core.config import get_settings
 from vestigo.core.jobs import JobStore
 from vestigo.core.retention import retain_file, retention_path
-from vestigo.db.postgres import PostgresStore, User
+from vestigo.db.postgres import PostgresStore, User, converter_attempt_entry
 from vestigo.ingestion.files import hash_file
 
 logger = logging.getLogger(__name__)
@@ -64,6 +73,11 @@ class ConvertJobInputs:
     #: A private scratch directory the caller made for ``raw_tmp_path`` (the
     #: regenerate route and the CLI do); the job removes it when done.
     raw_tmp_dir: Path | None = None
+    #: The evidence file's own mtime (POSIX seconds) as the uploader knew it —
+    #: browser ``lastModified``, CLI ``stat``, a regeneration's stored value.
+    #: ``None`` means the model is told the mtime is unknown; the staging
+    #: copy's mtime is never used, it is just the upload time.
+    raw_mtime: float | None = None
 
     def __post_init__(self) -> None:
         # The upload's filename is client-controlled and gets joined onto temp
@@ -71,41 +85,86 @@ class ConvertJobInputs:
         self.filename = safe_filename(self.filename)
 
 
-class _Attempts:
-    """Attempt bookkeeping that keeps the row in sync after every entry."""
+class _Failed(RuntimeError):
+    """A failure whose attempt entry and audit row are already written."""
 
-    def __init__(self, store: PostgresStore, script_id: str, existing: list[dict] | None):
-        self.store = store
+
+class DuplicateConversion(RuntimeError):
+    """The same saved script already turned this raw file into a source of this case."""
+
+    def __init__(self, source_id: str, source_name: str) -> None:
+        super().__init__(
+            f"This file was already converted with this script as source "
+            f"{source_name!r} ({source_id})"
+        )
+        self.source_id = source_id
+
+
+@dataclass
+class _Trail:
+    """Attempt and audit bookkeeping for one job.
+
+    Entries recorded before the script row exists are buffered and flushed
+    onto the row the moment it is created (``bind``); afterwards every entry
+    is appended under a row lock (``PostgresStore.append_converter_attempt``),
+    so two jobs re-running the same saved script cannot overwrite each other's
+    trail. ``count`` is what the audit rows report.
+    """
+
+    store: PostgresStore
+    script_id: str | None = None
+    pending: list[dict[str, Any]] = field(default_factory=list)
+    count: int = 0
+
+    async def bind(self, script_id: str, existing: int) -> None:
+        """Attach to a row; buffered entries are appended first, in order."""
         self.script_id = script_id
-        self.entries: list[dict[str, Any]] = list(existing or [])
+        self.count = existing
+        for entry in self.pending:
+            entries = await self.store.append_converter_attempt(
+                script_id,
+                entry["phase"],
+                model=entry["model"],
+                elapsed_ms=entry["elapsed_ms"],
+                exit_code=entry["exit_code"],
+                stderr_tail=entry["stderr_tail"],
+                validation=entry["validation"],
+                script_hash=entry["script_hash"],
+                prompt_hash=entry["prompt_hash"],
+                error=entry["error"],
+            )
+            self.count = len(entries)
+        self.pending = []
 
     async def record(
         self,
         phase: str,
         *,
-        model: str | None,
-        result: RunResult | None,
-        report: ValidationReport | None,
-        script: str | None,
+        model: str | None = None,
+        result: RunResult | None = None,
+        report: ValidationReport | None = None,
+        script: str | None = None,
+        prompt_hash: str | None = None,
         error: str | None = None,
-        **row_updates: Any,
+        row_updates: dict[str, Any] | None = None,
     ) -> None:
-        self.entries.append(
-            {
-                "n": len(self.entries) + 1,
-                "phase": phase,
-                "model": model,
-                "elapsed_ms": result.elapsed_ms if result else 0,
-                "exit_code": result.exit_code if result else None,
-                "stderr_tail": (result.stderr_tail if result else "")[-4096:],
-                "validation": report.to_dict() if report else None,
-                "script_hash": hashlib.sha256(script.encode()).hexdigest() if script else None,
-                "error": error,
-            }
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "elapsed_ms": result.elapsed_ms if result else 0,
+            "exit_code": result.exit_code if result else None,
+            "stderr_tail": result.stderr_tail if result else "",
+            "validation": report.to_dict() if report else None,
+            "script_hash": hashlib.sha256(script.encode()).hexdigest() if script else None,
+            "prompt_hash": prompt_hash,
+            "error": error,
+        }
+        if self.script_id is None:
+            self.pending.append(converter_attempt_entry(len(self.pending) + 1, phase, **kwargs))
+            return
+        entries = await self.store.append_converter_attempt(
+            self.script_id, phase, row_updates=row_updates, **kwargs
         )
-        await self.store.update_converter_script(
-            self.script_id, attempts=self.entries, **row_updates
-        )
+        self.count = len(entries)
 
 
 def _phase(job_store: JobStore, job_id: str, phase: str, **more: Any) -> None:
@@ -124,6 +183,18 @@ def _run_failure_report(result: RunResult) -> ValidationReport:
     return ValidationReport(ok=False, checks=[Check("run", False, detail)])
 
 
+def _fallback_name(filename: str) -> str:
+    """A converter name derived from the file, for a failed draft the model never named.
+
+    ``^[a-z0-9_]{1,32}2vestigo$`` like a model-proposed name; the row it names
+    exists only so the attempts (all model errors) are on record and the
+    analyst can regenerate with a hint instead of finding nothing.
+    """
+    stem = re.sub(r"\.gz$", "", filename.lower())
+    stem = re.sub(r"[^a-z0-9]+", "_", stem).strip("_") or "input"
+    return f"{stem[:24]}2vestigo"
+
+
 async def _run_and_validate(
     script: str,
     input_path: Path,
@@ -132,14 +203,16 @@ async def _run_and_validate(
     version: int,
     name: str | None,
     input_name: str,
+    input_mtime: float | None,
     timeout_s: float,
     on_progress: Any = None,
 ) -> tuple[RunResult, ValidationReport, Path]:
     """Run the script and validate what it wrote; the report is never ``None``.
 
-    ``input_name`` is what the script sees as ``-i`` — the evidence file's real
-    name in both the sample and the full run, so a ``.gz``-by-suffix script and
-    the recorded ``source_file`` behave the same in both phases.
+    ``input_name``/``input_mtime`` are what the script sees on ``-i`` — the
+    evidence file's real name and mtime in both the sample and the full run,
+    so a ``.gz``-by-suffix script, a year taken from the mtime, and the
+    recorded ``source_file``/``original_files`` behave the same in both phases.
     """
     s = get_settings()
     out_dir = Path(tempfile.mkdtemp(prefix="vestigo-conv-out-"))
@@ -154,6 +227,7 @@ async def _run_and_validate(
         output_mb=s.converter_run_output_mb,
         on_progress=on_progress,
         input_name=input_name,
+        input_mtime=input_mtime,
     )
     if result.exit_code == 0 and out.exists():
         report = await asyncio.to_thread(
@@ -183,14 +257,48 @@ def _prompt_kwargs(
     }
 
 
+class _Retention:
+    """Retain the raw file only when a row is about to reference it, and take it back on failure.
+
+    Retaining first thing meant a job that failed in seconds (model down, not
+    a text file, a mistyped script id) left a full plaintext copy of the
+    evidence under ``data/sources/<hash>`` that no row named and nothing ever
+    swept. So: retain lazily — right before ``_create_row`` and right before
+    ``register_source_for_ingest`` — and on failure unlink the copy *this job*
+    created if nothing references it (``source_hash_in_use`` counts
+    ``raw_file_hash`` and ``converter_input_hash`` as references).
+    """
+
+    def __init__(self, store: PostgresStore, inputs: ConvertJobInputs) -> None:
+        self.store = store
+        self.inputs = inputs
+        self.path = retention_path(inputs.raw_hash)
+        self.created = False
+
+    async def ensure(self) -> None:
+        if not self.path.exists():
+            self.created = True
+        await asyncio.to_thread(retain_file, self.inputs.raw_tmp_path, self.path)
+
+    async def release_if_unreferenced(self) -> None:
+        if not self.created:
+            return
+        try:
+            if not await self.store.source_hash_in_use(self.inputs.raw_hash, exclude_source_id=""):
+                self.path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 — the job's own error is the one to keep
+            logger.exception("could not release retained raw file %s", self.inputs.raw_hash)
+
+
 async def _create_row(
     store: PostgresStore,
     inputs: ConvertJobInputs,
-    sample: Sample,
-    gen: GeneratedScript,
+    sample: Sample | None,
+    gen: GeneratedScript | None,
     *,
     name: str,
     version: int,
+    status: str = "generating",
 ) -> tuple[Any, int]:
     """Insert the script row, walking the version forward on a lost race.
 
@@ -207,14 +315,20 @@ async def _create_row(
                 version=version,
                 raw_file_hash=inputs.raw_hash,
                 raw_filename=inputs.filename,
-                model=gen.model,
-                provider_endpoint=gen.provider_endpoint,
-                prompt_hash=gen.prompt_hash,
-                sample_hash=sample.sha256,
-                sample_excerpt=sample.text,
+                raw_mtime=(
+                    datetime.fromtimestamp(inputs.raw_mtime, UTC)
+                    if inputs.raw_mtime is not None
+                    else None
+                ),
+                model=gen.model if gen else None,
+                provider_endpoint=gen.provider_endpoint if gen else None,
+                prompt_hash=gen.prompt_hash if gen else None,
+                sample_hash=sample.sha256 if sample else None,
+                sample_excerpt=sample.text if sample else None,
                 hint=inputs.hint,
                 created_by=inputs.user.id,
                 parent_id=inputs.parent_id,
+                status=status,
             )
             return row, version
         except IntegrityError:
@@ -229,16 +343,20 @@ async def _generate_loop(
     job_id: str,
     inputs: ConvertJobInputs,
     sample: Sample,
-) -> tuple[str, str, int, str, _Attempts]:
+    trail: _Trail,
+    retention: _Retention,
+) -> tuple[str, str, int, str]:
     """Generate → sample-run → validate → repair until a script passes or attempts run out.
 
-    Returns ``(script_id, script, version, name, attempts)``; raises
-    ``RuntimeError`` (with the row already marked ``failed``) when exhausted.
+    Returns ``(script_id, script, version, name)``; raises ``RuntimeError``
+    (with the row already marked ``failed`` and the trail written) when
+    exhausted. A model error before any draft arrived is buffered on ``trail``
+    and lands on the row once there is one — or on a ``failed`` row named from
+    the file if there never is, so the attempts and the audit exist either way.
     """
     settings = get_settings()
     max_attempts = settings.converter_max_attempts
     script_id: str | None = None
-    attempts: _Attempts | None = None
     name = inputs.name_hint
     version = await store.next_converter_version(inputs.case_id, name) if name else 1
     script = ""
@@ -246,6 +364,7 @@ async def _generate_loop(
     stderr_tail = ""
     gen: GeneratedScript | None = None
     fresh = True  # next prompt is a generation prompt (not a repair of ``script``)
+    sent = False  # has any prompt (with the excerpt) left the host?
     n = 0
     sample_dir = Path(tempfile.mkdtemp(prefix="vestigo-conv-sample-"))
     try:
@@ -274,31 +393,35 @@ async def _generate_loop(
                 )
             try:
                 gen = await generate_script(system, task)
-            except GenerationUnavailable:
-                raise
+            except GenerationUnavailable as exc:
+                # Raised by the availability probe, before anything is sent
+                # (``sent`` is deliberately left as it was). The endpoint is
+                # gone; retrying is pointless. Still an attempt on the trail —
+                # the excerpt may already have left the host on an earlier
+                # round — and the row (created below if there is none yet)
+                # ends ``failed`` with the reason on record.
+                stderr_tail = f"model unavailable: {exc}"
+                report = ValidationReport(ok=False, checks=[Check("model", False, stderr_tail)])
+                await trail.record("generate", report=report, error=stderr_tail)
+                break
             except Exception as exc:  # noqa: BLE001 — a model error is a failed attempt
+                sent = True
                 stderr_tail = f"model call failed: {exc}"
                 report = ValidationReport(ok=False, checks=[Check("model", False, stderr_tail)])
-                if attempts is not None:
-                    await attempts.record(
-                        "generate",
-                        model=None,
-                        result=None,
-                        report=report,
-                        script=None,
-                        error=stderr_tail,
-                    )
+                await trail.record("generate", report=report, error=stderr_tail)
                 continue
+            sent = True
             if script_id is None:
                 declared = version
                 if name is None:
                     name = gen.name
                     version = await store.next_converter_version(inputs.case_id, name)
+                await retention.ensure()
                 row, version = await _create_row(
                     store, inputs, sample, gen, name=name, version=version
                 )
                 script_id = row.id
-                attempts = _Attempts(store, script_id, None)
+                await trail.bind(script_id, 0)
                 job_store.update(job_id, progress={"converter_script_id": script_id})
                 if version != declared:
                     # The draft declared a version the harness would reject
@@ -306,12 +429,11 @@ async def _generate_loop(
                     # or a lost race for the number). Record the draft and ask
                     # again with the real name and version; not counted as an
                     # attempt — the model did nothing wrong.
-                    await attempts.record(
+                    await trail.record(
                         "generate",
                         model=gen.model,
-                        result=None,
-                        report=None,
                         script=gen.script,
+                        prompt_hash=gen.prompt_hash,
                         error=(
                             f"draft declared version {declared}.0.0 but {name} is at "
                             f"v{version}; regenerating with the real name and version"
@@ -321,21 +443,25 @@ async def _generate_loop(
                     fresh = True
                     continue
             fresh = False
-            assert attempts is not None  # noqa: S101 — set together with script_id
             script = gen.script
+            # The row's ``prompt_hash``/``model`` follow the attempt whose draft
+            # is the stored ``source_code`` — a repair round's prompt differs
+            # from the first draft's, and the provenance header must name the
+            # prompt that produced the code it sits on.
+            produced = {"source_code": script, "prompt_hash": gen.prompt_hash, "model": gen.model}
             violations = check_script(script)
             if violations:
                 report = ValidationReport(
                     ok=False, checks=[Check("static_check", False, "; ".join(violations))]
                 )
                 stderr_tail = ""
-                await attempts.record(
+                await trail.record(
                     "sample",
                     model=gen.model,
-                    result=None,
                     report=report,
                     script=script,
-                    source_code=script,
+                    prompt_hash=gen.prompt_hash,
+                    row_updates=produced,
                 )
                 continue
             _phase(job_store, job_id, "sample_run", attempt=n, max_attempts=max_attempts)
@@ -346,40 +472,67 @@ async def _generate_loop(
                 version=version,
                 name=name,
                 input_name=inputs.filename,
+                input_mtime=inputs.raw_mtime,
                 timeout_s=min(SAMPLE_RUN_TIMEOUT_S, settings.converter_run_timeout_seconds),
             )
             shutil.rmtree(out.parent, ignore_errors=True)
             stderr_tail = result.stderr_tail
-            await attempts.record(
+            await trail.record(
                 "sample",
                 model=gen.model,
                 result=result,
                 report=report,
                 script=script,
-                source_code=script,
+                prompt_hash=gen.prompt_hash,
+                row_updates=produced,
             )
             if report.ok:
                 break
-        else:
-            if script_id is not None:
-                await store.update_converter_script(script_id, status="failed")
+        if report is None or not report.ok:
+            if script_id is None and not sent:
+                # The endpoint was unreachable before the first prompt went
+                # out: nothing left the host, no evidence is retained, no row
+                # is worth an analyst's attention — the audit row and the job
+                # error say what happened.
                 await store.record_audit(
                     action="converter.generate",
                     actor=inputs.user,
                     case_id=inputs.case_id,
-                    target_type="converter_script",
-                    target_id=script_id,
-                    detail={
-                        "outcome": "failed",
-                        "attempts": len(attempts.entries) if attempts else 0,
-                    },
+                    target_type="case",
+                    target_id=inputs.case_id,
+                    detail={"outcome": "unavailable", "error": stderr_tail},
                 )
-            raise RuntimeError(
-                f"no working converter after {max_attempts} attempts; last report: {_summ(report)}"
+                raise _Failed(stderr_tail or "model unavailable")
+            if script_id is None:
+                # Every attempt died in the model call: no draft, no name. The
+                # excerpt did leave the host, so the trail must exist somewhere
+                # an analyst can find it — a failed row named from the file,
+                # regenerable with a hint.
+                name = name or _fallback_name(inputs.filename)
+                await retention.ensure()
+                row, version = await _create_row(
+                    store, inputs, sample, None, name=name, version=version, status="failed"
+                )
+                script_id = row.id
+                await trail.bind(script_id, 0)
+                job_store.update(job_id, progress={"converter_script_id": script_id})
+            else:
+                await store.update_converter_script(script_id, status="failed")
+            await store.record_audit(
+                action="converter.generate",
+                actor=inputs.user,
+                case_id=inputs.case_id,
+                target_type="converter_script",
+                target_id=script_id,
+                detail={"outcome": "failed", "attempts": trail.count},
+            )
+            raise _Failed(
+                f"no working converter after {n} attempt{'s' if n != 1 else ''}; "
+                f"last report: {_summ(report)}"
             )
     finally:
         shutil.rmtree(sample_dir, ignore_errors=True)
-    assert script_id is not None and attempts is not None and gen is not None and name  # noqa: S101
+    assert script_id is not None and gen is not None and name  # noqa: S101
     await store.record_audit(
         action="converter.generate",
         actor=inputs.user,
@@ -388,13 +541,13 @@ async def _generate_loop(
         target_id=script_id,
         detail={
             "outcome": "working",
-            "attempts": len(attempts.entries),
+            "attempts": trail.count,
             "model": gen.model,
             "prompt_hash": gen.prompt_hash,
             "sample_hash": sample.sha256,
         },
     )
-    return script_id, script, version, name, attempts
+    return script_id, script, version, name
 
 
 async def run_convert_ingest_job(
@@ -408,32 +561,54 @@ async def run_convert_ingest_job(
     settings = get_settings()
     script_id: str | None = None
     parquet_out: Path | None = None
+    trail = _Trail(store)
+    retention = _Retention(store, inputs)
+    phase = "generate"  # which attempt phase a failure recorded by the catch-all belongs to
     try:
-        # 1. Retain the raw file (always — the row references it), then either
-        #    count its lines (a re-run only needs the progress total) or build
-        #    the excerpt the model will see.
         _phase(job_store, job_id, "sampling")
-        await asyncio.to_thread(retain_file, inputs.raw_tmp_path, retention_path(inputs.raw_hash))
 
-        # 2. Script: reuse or generate.
+        # 1. Script: reuse or generate. A re-run only needs the raw file's
+        #    line count (the progress total); a generation builds the excerpt
+        #    the model will see. Nothing is retained yet: the raw file is
+        #    kept only once a row is about to reference it.
         if inputs.reuse_script_id:
             row = await store.get_converter_script(inputs.case_id, inputs.reuse_script_id)
             if row is None or row.status != "working" or not row.source_code:
                 raise RuntimeError("converter script is not reusable (missing or not working)")
             script_id, script, version, name = row.id, row.source_code, row.version, row.name
-            attempts = _Attempts(store, script_id, row.attempts)
+            # Same script over the same raw file: the endpoint refuses this
+            # up front, but the CLI and a concurrent submit reach the job
+            # directly, and the source row that would catch it as a duplicate
+            # exists only after the conversion — refuse before any work.
+            already = await store.get_source_by_converter_input(
+                inputs.case_id, script_id, inputs.raw_hash
+            )
+            if already is not None:
+                raise DuplicateConversion(already.id, already.name)
+            await trail.bind(script_id, len(row.attempts or []))
             job_store.update(job_id, progress={"converter_script_id": script_id})
+            phase = "full"
             line_count = await asyncio.to_thread(count_lines, inputs.raw_tmp_path)
         else:
             sample = await asyncio.to_thread(
-                build_sample, inputs.raw_tmp_path, settings.converter_sample_bytes
+                build_sample,
+                inputs.raw_tmp_path,
+                settings.converter_sample_bytes,
+                mtime=inputs.raw_mtime,
             )
             line_count = sample.line_count
-            script_id, script, version, name, attempts = await _generate_loop(
-                store=store, job_store=job_store, job_id=job_id, inputs=inputs, sample=sample
+            script_id, script, version, name = await _generate_loop(
+                store=store,
+                job_store=job_store,
+                job_id=job_id,
+                inputs=inputs,
+                sample=sample,
+                trail=trail,
+                retention=retention,
             )
 
-        # 3. Full run.
+        # 2. Full run, over the job's private copy of the raw file.
+        phase = "full"
         _phase(
             job_store,
             job_id,
@@ -448,15 +623,16 @@ async def run_convert_ingest_job(
 
         result, report, parquet_out = await _run_and_validate(
             script,
-            retention_path(inputs.raw_hash),
+            inputs.raw_tmp_path,
             raw_sha256=inputs.raw_hash,
             version=version,
             name=name,
             input_name=inputs.filename,
+            input_mtime=inputs.raw_mtime,
             timeout_s=settings.converter_run_timeout_seconds,
             on_progress=on_progress,
         )
-        await attempts.record("full", model=None, result=result, report=report, script=script)
+        await trail.record("full", result=result, report=report, script=script)
         await store.record_audit(
             action="converter.run",
             actor=inputs.user,
@@ -473,14 +649,17 @@ async def run_convert_ingest_job(
         if not report.ok:
             if not inputs.reuse_script_id:
                 await store.update_converter_script(script_id, status="failed")
-            raise RuntimeError(f"converter failed on the full file: {_summ(report)}")
+            raise _Failed(f"converter failed on the full file: {_summ(report)}")
         await store.update_converter_script(script_id, status="working", source_code=script)
 
-        # 4. Hand the Parquet to the normal path.
+        # 3. Hand the Parquet to the normal path. From here on the converter
+        #    passed; whatever fails is an ``ingest`` attempt on its trail.
+        phase = "ingest"
         _phase(job_store, job_id, "ingesting", converter_script_id=script_id)
         pq_hash = await asyncio.to_thread(hash_file, parquet_out)
         pq_size = parquet_out.stat().st_size
         pq_name = Path(inputs.filename).stem + ".parquet"
+        await retention.ensure()
         try:
             reg = await register_source_for_ingest(
                 store=store,
@@ -537,17 +716,6 @@ async def run_convert_ingest_job(
             # the trail must say its product never landed, or the last attempt
             # would assert a successful conversion whose source does not exist.
             ingest_error = (job.error if job else None) or "ingest failed"
-            await attempts.record(
-                "ingest", model=None, result=None, report=None, script=None, error=ingest_error
-            )
-            await store.record_audit(
-                action="converter.run",
-                actor=inputs.user,
-                case_id=inputs.case_id,
-                target_type="converter_script",
-                target_id=script_id,
-                detail={"phase": "ingest", "ok": False, "error": ingest_error},
-            )
             raise RuntimeError(f"ingest of the produced Parquet failed: {ingest_error}")
     except Exception as exc:  # noqa: BLE001 — every failure lands on the job
         logger.warning("convert_ingest job %s failed: %s", job_id, exc, exc_info=True)
@@ -564,20 +732,54 @@ async def run_convert_ingest_job(
             progress={"converter_script_id": known},
         )
         # Whatever raised — the model endpoint going away mid-loop, the runner,
-        # the validator, the database — a row this job created must not stay
-        # ``generating``: nothing else will ever finish it, and the panel would
-        # show a spinner forever on a script that is neither reusable nor
-        # regenerable as a failed draft. A reused script is not this job's row.
-        if known and not inputs.reuse_script_id:
-            try:
-                row = await store.get_converter_script(inputs.case_id, known)
-                if row is not None and row.status == "generating":
-                    await store.update_converter_script(known, status="failed")
-            except Exception:  # noqa: BLE001 — the job's own error is the one to keep
-                logger.exception("could not mark converter script %s failed", known)
+        # the validator, the retention volume, the database — the trail says
+        # so: an attempt entry for the phase that died and an audit row, unless
+        # the raising code already wrote both (``_Failed``). And a row this job
+        # created must not stay ``generating``: nothing else will ever finish
+        # it, and the panel would show a spinner forever on a script that is
+        # neither reusable nor regenerable as a failed draft. A reused script
+        # is not this job's row — its status stays; the attempt is still its.
+        if known and not isinstance(exc, _Failed):
+            await _record_failure(store, trail, inputs, known, phase, str(exc))
+        await retention.release_if_unreferenced()
     finally:
         inputs.raw_tmp_path.unlink(missing_ok=True)
         if inputs.raw_tmp_dir is not None:
             shutil.rmtree(inputs.raw_tmp_dir, ignore_errors=True)
         if parquet_out is not None:
             shutil.rmtree(parquet_out.parent, ignore_errors=True)
+
+
+async def _record_failure(
+    store: PostgresStore,
+    trail: _Trail,
+    inputs: ConvertJobInputs,
+    script_id: str,
+    phase: str,
+    error: str,
+) -> None:
+    """Attempt entry + audit row + status for a failure the raising code did not record."""
+    try:
+        if trail.script_id is None:
+            row = await store.get_converter_script(inputs.case_id, script_id)
+            await trail.bind(script_id, len(row.attempts or []) if row else 0)
+        row_updates: dict[str, Any] = {}
+        if not inputs.reuse_script_id:
+            row = await store.get_converter_script(inputs.case_id, script_id)
+            if row is not None and row.status == "generating":
+                row_updates["status"] = "failed"
+        await trail.record(phase, error=error, row_updates=row_updates)
+        await store.record_audit(
+            action="converter.generate" if phase == "generate" else "converter.run",
+            actor=inputs.user,
+            case_id=inputs.case_id,
+            target_type="converter_script",
+            target_id=script_id,
+            detail=(
+                {"outcome": "failed", "attempts": trail.count, "error": error}
+                if phase == "generate"
+                else {"phase": phase, "ok": False, "error": error}
+            ),
+        )
+    except Exception:  # noqa: BLE001 — the job's own error is the one to keep
+        logger.exception("could not record the failure of converter script %s", script_id)

@@ -184,6 +184,17 @@ export function ParserDownloadsPanel() {
                 disabled={!prompts.data}
               />
             )}
+            {prompts.error && (
+              // The query never refetches on its own (staleTime Infinity,
+              // no focus refetch), so a failed load would leave the buttons
+              // disabled forever with no explanation — say why and offer a retry.
+              <p className="flex flex-wrap items-center gap-1 text-xs text-[var(--color-danger)]">
+                Could not load the prompts: {(prompts.error as Error).message}
+                <Button variant="ghost" size="sm" onClick={() => prompts.refetch()}>
+                  Retry
+                </Button>
+              </p>
+            )}
           </div>
         </div>
       </div>

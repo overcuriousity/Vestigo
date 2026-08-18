@@ -28,7 +28,9 @@ def test_small_file_is_one_head_block(tmp_path):
     assert [b[0] for b in s.blocks] == ["head"]
     assert s.blocks[0][1] == 1 and s.blocks[0][2].splitlines()[-1] == "line 00010 payload"
     assert s.line_count == 10 and s.size_bytes == p.stat().st_size
-    assert len(s.sha256) == 64 and s.mtime_iso.endswith("Z")
+    assert len(s.sha256) == 64 and s.mtime_iso is None  # not told: never the staging copy's
+    told = build_sample(p, budget_bytes=65536, mtime=1_700_000_000.0)
+    assert told.mtime_iso == "2023-11-14T22:13:20Z"
 
 
 def test_large_file_has_three_blocks_with_absolute_numbers(tmp_path):

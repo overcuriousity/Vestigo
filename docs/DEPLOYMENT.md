@@ -97,12 +97,16 @@ reduced to `PATH`/`HOME`/`TMPDIR`/`LANG` and Python flags (no `VESTIGO_*`, no pr
 credentials), under `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, in its own
 session so a timeout kills the whole group; before it runs, an AST scan allow-lists imports
 (standard library plus `pyarrow`/`numpy`, minus network, subprocess, threading, `ctypes`,
-`importlib`, `builtins`, `runpy`), resolves import aliases and rejects `exec`/`eval`,
-`sys.modules` and destructive `os.*`/`Path.*` calls. This
-is the guard the standard library affords — deliberately no bwrap, no container-in-container,
-so the reference uv and image deployments keep working. It does **not** stop a script from
-writing anywhere the app user can write, nor from reaching the network if it evades the
-deny-list. Run the app as a dedicated unprivileged user (the container image already does),
+`importlib`, `builtins`, `runpy`, `pydoc`, `pickle`, `marshal`, `gc`, `inspect` and friends),
+resolves import aliases, allows an imported module only as `module.<attribute>` (no `x = os`,
+no `f(os)`), and rejects `exec`/`eval`/`globals`/`vars` wherever named, `sys.modules`/
+`sys.path`, `getattr` on a module or with a dunder string, the object-graph dunders
+(`__dict__`, `__subclasses__`, `__globals__`, …) and destructive `os.*`/`Path.*` attributes.
+This is the guard the standard library affords, and it is **best-effort static analysis**,
+not a sandbox — deliberately no bwrap, no container-in-container, so the reference uv and
+image deployments keep working. It does **not** stop a script from writing anywhere the app
+user can write, nor from reaching the network if it finds a path the scan does not cover.
+Run the app as a dedicated unprivileged user (the container image already does),
 keep the switch off on hosts where model-written code must not run, and remember that a log
 line is untrusted input to the model: the harness validates the *output* against the data
 contract and records every attempt, which is the mitigation for a script that mis-parses on

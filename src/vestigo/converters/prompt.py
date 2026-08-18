@@ -154,14 +154,16 @@ def _system_enforced() -> str:
 - {META_CONVERTER_NAME} equal to the converter name the task names, or — when the task leaves the name to you — equal to the "name" field you return
 - at least one row; at least 50% of rows not marked parse_status=unparsed; at least 50% of rows with a non-null timestamp
 - exit code 0 within the time and memory ceilings
-- NO network, NO subprocess, NO threads/multiprocessing, NO reading outside -i, NO writing outside -o. Only the standard library, pyarrow and numpy may be imported; these stdlib modules are rejected before the script runs: {denied}. Also rejected: exec, eval, compile, __import__, sys.modules, `from x import *`, getattr on a module, os.system/popen/exec*/spawn*/fork/kill/remove/rename/replace, and unlink/rmdir/chmod/chown on anything (pathlib.Path included).
+- NO network, NO subprocess, NO threads/multiprocessing, NO reading outside -i, NO writing outside -o. Only the standard library, pyarrow and numpy may be imported; a static scan rejects the script before it runs when it imports any of these stdlib modules: {denied}. Also rejected by that scan: exec, eval, compile, __import__, globals, locals, vars, sys.modules, sys.path, `from x import *`, a module used as anything but `module.<attribute>` (no `x = os`, no `f(os)`), getattr/setattr/hasattr on a module or with a dunder-name string, dunder attributes that reach the object graph (__dict__, __subclasses__, __bases__, __mro__, __globals__, __code__, ...), os.system/popen/exec*/spawn*/fork/kill/remove/rename/replace, and unlink/rmdir/chmod/chown on anything (pathlib.Path included).
 """
 
 
 _FAMILIES = """FORMAT FAMILIES AND HOW TO TREAT THEM
 - Timestamps: ISO-8601 (with or without zone), RFC 3164 syslog (no year, no zone), RFC 5424,
   epoch seconds/milliseconds, Apache CLF "[dd/Mon/yyyy:HH:MM:SS +zzzz]", "yyyy-MM-dd HH:mm:ss,fff".
-  Missing year: take it from the file mtime and say so in the timezone_assumption footer.
+  Missing year: take it from the file mtime the task states and say so in the timezone_assumption
+  footer. When the task says the mtime is unknown, use the newest full date visible in the sample,
+  else the current year — and say which in timezone_assumption.
   Missing zone: assume UTC and say so. Never guess silently.
 - Line families: syslog, CLF/combined, key=value (incl. CEF/LEEF), JSON per line, CSV/TSV with
   header, bracketed-field application logs, free text with a leading timestamp.
@@ -197,14 +199,18 @@ def _task_header(
     filename: str,
     size_bytes: int,
     line_count: int,
-    mtime_iso: str,
+    mtime_iso: str | None,
     version: int,
     hint: str | None,
     name: str | None,
 ) -> str:
+    # The mtime is the evidence file's own (the uploader's ``lastModified``,
+    # the CLI's ``stat``), never the staging copy's — when neither is known
+    # the model is told so rather than handed the upload time as a fact.
+    mtime = f"mtime {mtime_iso}" if mtime_iso else "mtime unknown"
     parts = [
         f"FILE: {filename}",
-        f"SIZE: {size_bytes} bytes, {line_count} lines, mtime {mtime_iso}",
+        f"SIZE: {size_bytes} bytes, {line_count} lines, {mtime}",
         f'DECLARE {META_CONVERTER_VERSION} = "{version}.0.0"',
     ]
     if name:
@@ -223,7 +229,7 @@ def render_generation_prompt(
     filename: str,
     size_bytes: int,
     line_count: int,
-    mtime_iso: str,
+    mtime_iso: str | None,
     version: int,
     hint: str | None,
     name: str | None = None,
@@ -260,7 +266,7 @@ def render_repair_prompt(
     filename: str,
     size_bytes: int,
     line_count: int,
-    mtime_iso: str,
+    mtime_iso: str | None,
     version: int,
     hint: str | None,
     name: str | None = None,

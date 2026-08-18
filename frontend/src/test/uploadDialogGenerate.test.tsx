@@ -124,4 +124,60 @@ describe("UploadDialog — AI converter mode", () => {
     await waitFor(() => expect(useJobsStore.getState().jobs["job-9"]).toBeTruthy());
     expect(useJobsStore.getState().jobs["job-9"].label).toContain("with AI");
   });
+
+  it("offers only saved converters when the model is unreachable (converter_reuse)", async () => {
+    capsMock.mockReturnValue({ converter_generation: false, converter_reuse: true });
+    convertMock.mockResolvedValue({ job_id: "job-2", converter_script_id: "s1" });
+    renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: /Upload Data/ }));
+    // The mode appears once the case is known to hold a working script…
+    fireEvent.click(await screen.findByRole("button", { name: /Use a saved converter/ }));
+    expect(screen.queryByText(/Let AI write the converter/)).toBeNull();
+    // …with no "generate a new one" entry, no hint field, and a submit that
+    // waits for a choice.
+    const select = (await screen.findByLabelText(
+      /Reuse a converter from this case/,
+    )) as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+      "Choose a saved converter…",
+      "syslog2vestigo v2",
+    ]);
+    expect(screen.queryByLabelText(/Hint for the model/)).toBeNull();
+    pickFile("app.log");
+    const submit = screen.getByRole("button", { name: "Generate & ingest" }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(select, { target: { value: "s1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convert & ingest" }));
+    await waitFor(() => expect(convertMock).toHaveBeenCalledTimes(1));
+    const [, , opts] = convertMock.mock.calls[0] as [string, File, Record<string, unknown>];
+    expect(opts).toEqual({ hint: undefined, converterScriptId: "s1" });
+  });
+
+  it("hides the converter mode when only reuse is possible and the case has no scripts", async () => {
+    capsMock.mockReturnValue({ converter_generation: false, converter_reuse: true });
+    listMock.mockResolvedValue({ scripts: [], sample_bytes: 65536 });
+    renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: /Upload Data/ }));
+    await waitFor(() => expect(listMock).toHaveBeenCalled());
+    expect(screen.queryByText(/Use a saved converter/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Upload" })).toBeTruthy();
+  });
+
+  it("freezes the mode switch while a transfer is in flight", async () => {
+    capsMock.mockReturnValue({ converter_generation: true, converter_reuse: true });
+    let resolve: (v: unknown) => void = () => {};
+    convertMock.mockReturnValue(new Promise((r) => (resolve = r)));
+    renderDialog();
+    openAndSwitch();
+    pickFile("app.log");
+    fireEvent.click(screen.getByRole("button", { name: "Generate & ingest" }));
+    await waitFor(() => expect(convertMock).toHaveBeenCalledTimes(1));
+    const other = screen.getByRole("button", { name: /Upload timeline/ }) as HTMLButtonElement;
+    expect(other.disabled).toBe(true);
+    // Switching is a no-op: the progress row (with its Cancel) stays mounted.
+    fireEvent.click(other);
+    expect(screen.getByRole("button", { name: /Cancel upload/ })).toBeTruthy();
+    resolve({ job_id: "job-3", converter_script_id: null });
+    await waitFor(() => expect(useJobsStore.getState().jobs["job-3"]).toBeTruthy());
+  });
 });

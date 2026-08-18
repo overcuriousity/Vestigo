@@ -460,7 +460,11 @@ The differences are `sources.converter_script_id`, which points at the script, a
 `sources.converter_input_hash`, the raw file's SHA-256 — a converter's Parquet is not
 byte-stable across runs (it stamps `converted_at`), so the source-level hash check cannot see
 a repeat; the convert endpoint refuses the *same saved script over the same raw file* with a
-409 that names the source it already produced, before any work happens. Another script, or a
+409 that names the source it already produced, before any work happens, and the job checks
+again before it starts (the CLI and a concurrent submit reach it without the endpoint's
+check) — with a partial unique index on `(case_id, converter_script_id,
+converter_input_hash)` as the backstop under both, so a race that slips past every pre-check
+registers as a duplicate rather than a second copy of the evidence. Another script, or a
 fresh generation, over the same raw file is allowed. When a run's Parquet nevertheless
 matches an existing source byte for byte, the job completes as a duplicate and the job tray
 says so instead of a bare "completed".
@@ -474,6 +478,14 @@ once known, the name — the script must declare, and the analyst's optional hin
 no key, no host name. Reusing a saved converter sends nothing. `tests/test_converter_prompt.py`
 asserts the rendered prompt against this list.
 
+The mtime is the **evidence file's own** — the browser sends `File.lastModified`, the CLI
+uses the file's `stat`, a regeneration replays the stored `converter_scripts.raw_mtime` — and
+it is also stamped onto the private copy the script sees on `-i`, so a year taken from the
+mtime and the `original_files[].mtime` a script records are the evidence's, never the upload
+time. A raw API client that sends none gets "mtime unknown" in the task header, and the
+prompt tells the model to fall back to the newest full date in the sample, else the current
+year, and to say which in `timezone_assumption`.
+
 ### The loop
 
 1. **Sample.** Binary files are refused up front (NUL bytes / mostly non-printable).
@@ -483,16 +495,25 @@ asserts the rendered prompt against this list.
    harness enforces so the model optimises for the checks that actually run.
 3. **Static check.** `converters/runner.py::check_script` allow-lists imports — the
    standard library minus a deny-list (`socket`, `subprocess`, `multiprocessing`, `ctypes`,
-   `http`, `urllib`, `importlib`, `threading`, `shutil`, `tempfile`, `builtins`, `runpy` and
-   friends) plus `pyarrow`/`numpy`, which is the prompt's own "pyarrow + stdlib" contract
-   enforced — resolves import aliases (`import os as o; o.system(...)` reads as
-   `os.system`), refuses `from <module> import *`, and rejects `exec`/`eval`/`compile`/
-   `__import__`, `sys.modules`, `getattr()` on a module, and the destructive or
-   process-spawning calls (`os.system/popen/exec*/spawn*/fork/kill/remove/rename/...`, and
-   `unlink`/`rmdir`/`chmod`/`chown` on any receiver, `pathlib.Path` included). A violation
-   costs an attempt. Still a static guard: what stands behind it is the runner (below), the
-   fact that the script only ever sees a private *copy* of its input, and the dedicated app
-   user.
+   `http`, `urllib`, `importlib`, `threading`, `shutil`, `tempfile`, `builtins`, `runpy`,
+   the import-by-string and loader modules `pydoc`/`pkgutil`/`zipimport`/`site`, the
+   deserialisers `pickle`/`marshal`/`shelve`, `gc`/`inspect`, `logging.config`,
+   `unittest.mock` and friends) plus `pyarrow`/`numpy`, which is the prompt's own "pyarrow +
+   stdlib" contract enforced — resolves import aliases (`import os as o; o.system(...)` reads
+   as `os.system`), refuses `from <module> import *`, allows a module bound by `import` only
+   as the receiver of an attribute access (`x = os`, `f(os)`, `[os]` are refused, so a denied
+   attribute cannot be reached through a rebinding), and rejects `exec`/`eval`/`compile`/
+   `__import__`/`globals`/`locals`/`vars` wherever they are *named* (not only called),
+   `sys.modules`/`sys.path`/frame access, `getattr`-family calls on a module or with a
+   dunder-name string, the dunder attributes that walk from any object back to the builtins
+   or a frame (`__dict__`, `__subclasses__`, `__bases__`, `__mro__`, `__globals__`,
+   `__code__`, …), and the destructive or process-spawning attributes
+   (`os.system/popen/exec*/spawn*/fork/kill/remove/rename/...`, and
+   `unlink`/`rmdir`/`chmod`/`chown` on any receiver, `pathlib.Path` included), read or
+   called. A violation costs an attempt. Still a static, best-effort guard — a determined
+   script can look for another path through the object graph: what stands behind it is the
+   runner (below), the fact that the script only ever sees a private *copy* of its input,
+   and the dedicated app user (`docs/DEPLOYMENT.md`).
 4. **Sample run.** The script runs on the head excerpt, staged under the upload's own
    basename and — for a `.gz` upload — re-gzipped, so `-i` looks exactly as it will in the
    full run (a script that handles `.gz` by suffix behaves the same in both phases, and the
@@ -515,8 +536,8 @@ asserts the rendered prompt against this list.
 6. **Repair.** On failure the model gets the previous script, the structured report (failed
    checks with three offending rows each) and the stderr tail, and is asked for a complete
    replacement. Up to `converter_max_attempts` rounds (default 4).
-7. **Full run** on the whole retained raw file with `converter_run_timeout_seconds` (default
-   600) — no repair here: a script that passed the sample and fails the whole file met a
+7. **Full run** on the whole raw file (the job's private copy) with
+   `converter_run_timeout_seconds` (default 600) — no repair here: a script that passed the sample and fails the whole file met a
    format change the sample did not show, and sending more evidence than disclosed is not
    the harness's call. The analyst regenerates with a hint instead. In both phases the
    script sees a private read-only *copy* of its input, never a link to the retained
@@ -533,17 +554,38 @@ asserts the rendered prompt against this list.
 `parent_id`, never an edit): the name and version, the status (`generating` · `working` ·
 `failed`), the source code, the model and endpoint used, `prompt_hash` (sha256 of exactly what
 was sent, plus the system-prompt version), the sample's hash **and** the sample text itself,
-the raw file's hash (it is retained content-addressed like any source so regeneration needs no
-re-upload — and the retention store counts that row as an owner, so an unrelated source's
-rollback never unlinks a converter's raw input), the hint, and `attempts` — every generation
-(including a first draft discarded because its proposed name already existed at a higher
-version), sample run, full run and ingest failure with elapsed time, exit code, stderr tail,
-the validation report and the script's hash. A row is `generating` only while its job runs:
-any failure the job sees flips it to `failed`, and startup reconciliation does the same for a
-row a restart orphaned (jobs are in-memory), recording the interruption as an attempt — a
-script never shows as generating forever. Deleting the case deletes its scripts. Audit rows:
-`converter.generate`, `converter.run`, `converter.regenerate`. Case export carries the rows and
-the raw files (`transfer/`); an archive from an older version simply has none.
+the raw file's hash and mtime (it is retained content-addressed like any source so
+regeneration needs no re-upload — and the retention store counts that row, and a converted
+source's `converter_input_hash`, as owners, so an unrelated source's rollback never unlinks a
+converter's raw input), the hint, and `attempts` — every generation (including a first draft
+discarded because its proposed name already existed at a higher version), sample run, full
+run and ingest failure with elapsed time, exit code, stderr tail, the validation report, the
+script's hash and, for the entries that sent a prompt, that prompt's hash. The row's own
+`prompt_hash`/`model` follow the attempt whose draft is the stored `source_code` — a repair
+round's prompt differs from the first draft's, and the download header must name the prompt
+that produced the code under it. Attempts are appended under a row lock, so two jobs
+re-running one saved script cannot overwrite each other's trail.
+
+The raw file is retained only once a row is about to reference it (right before the script
+row is inserted, or before the produced source is registered), and a job that fails before
+that point takes back the copy it made if nothing references it — a model endpoint that is
+down, a file that is not text, or a mistyped script id must not leave a plaintext copy of the
+evidence under `data/sources/` that no row names and nothing sweeps.
+
+Every failure is on the trail. Model errors before a row exists are buffered and flushed onto
+the row once there is one; if every attempt died in the model call after the excerpt was
+sent, a `failed` row named from the file (`auth_log2vestigo`) carries them and is regenerable
+with a hint; if the endpoint was unreachable before the first prompt went out, nothing left
+the host and only the audit row and the job error say so. A failure after the full run
+passed (the Parquet footer refused, the retention volume full, the database) is an `ingest`
+attempt and a `converter.run` audit row, and the script keeps its `working` status — its
+output validated. A row is `generating` only while its job runs: any failure the job sees
+flips it to `failed`, and startup reconciliation does the same for a row a restart orphaned
+(jobs are in-memory), recording the interruption as an attempt — before the app accepts a
+request, so it can never touch a live generation. A script never shows as generating
+forever. Deleting the case deletes its scripts. Audit rows: `converter.generate`,
+`converter.run`, `converter.regenerate`. Case export carries the rows and the raw files
+(`transfer/`); an archive from an older version simply has none.
 
 A downloaded script (`GET /api/cases/{id}/converters/{sid}/download`, or the panel's Download)
 is prefixed with a comment header naming the case, version, status, model, prompt and sample
@@ -553,9 +595,12 @@ downloadable after the switch is turned off; only starting new work is refused (
 ### Reuse and regeneration
 
 The upload dialog offers every `working` script in the case under *Reuse a converter*: the
-saved script runs on the new file with no model call. *Regenerate* (panel or
+saved script runs on the new file with no model call — and so needs only the operator switch,
+not a reachable model (`converter_reuse` capability, `503` otherwise): an airgapped site that
+imported a case with vetted converters converts with them without ever configuring a model,
+and the dialog then offers *Use a saved converter* alone. *Regenerate* (panel or
 `POST …/regenerate`) writes version *n+1* from the retained raw file plus a hint — for the
-"almost right" case. Editing in the browser is deliberately not offered: download, fix
+"almost right" case — and, like a fresh generation, needs the model. Editing in the browser is deliberately not offered: download, fix
 locally, and upload the Parquet is the path for anything a hint cannot express.
 
 The copy-paste prompts in the downloads panel are rendered by the same module

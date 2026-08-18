@@ -258,3 +258,90 @@ async def test_same_script_same_raw_is_refused(client, admin_bootstrap, enabled,
     # A fresh generation over the same raw file is a different question.
     r = client.post(f"/api/cases/{cid}/converters/convert", files={"file": ("again.log", raw)})
     assert r.status_code == 202, r.text
+
+
+@pytest.mark.asyncio
+async def test_reuse_needs_only_the_switch(
+    client, admin_bootstrap, monkeypatch, enabled, stub_job, store
+):
+    """A saved script sends nothing to the model, so a dead endpoint must not refuse it.
+
+    Generation and regeneration still need the model (503); reuse does not.
+    """
+
+    async def probe_down(config):
+        return False
+
+    monkeypatch.setattr(availability, "_probe", probe_down)
+    availability.reset_probe_cache()
+    admin = as_admin(client, admin_bootstrap)
+    cid = _case(client)
+    row = await store.create_converter_script(
+        case_id=cid,
+        name="x2vestigo",
+        version=1,
+        raw_file_hash="a" * 64,
+        raw_filename="x.log",
+        model="m",
+        provider_endpoint="e",
+        prompt_hash="p",
+        sample_hash="s",
+        sample_excerpt="SAMPLE",
+        hint=None,
+        created_by=admin["id"],
+        status="working",
+    )
+    raw = b"Jan  5 10:00:01 h p: m\n"
+    r = client.post(
+        f"/api/cases/{cid}/converters/convert",
+        files={"file": ("again.log", raw)},
+        data={"converter_script_id": row.id, "mtime": "1700000000.5"},
+    )
+    assert r.status_code == 202, r.text
+    assert stub_job[0].reuse_script_id == row.id
+    # The evidence file's own mtime travels with the upload; a raw API client
+    # that sends none leaves it None (the model is told "unknown").
+    assert stub_job[0].raw_mtime == 1700000000.5
+    r = client.post(f"/api/cases/{cid}/converters/convert", files={"file": ("again.log", raw)})
+    assert r.status_code == 503 and "model" in r.json()["detail"].lower()
+    r = client.post(f"/api/cases/{cid}/converters/{row.id}/regenerate")
+    assert r.status_code == 503
+    caps = client.get("/api/health").json()["capabilities"]
+    assert caps["converter_reuse"] is True and caps["converter_generation"] is False
+
+
+@pytest.mark.multiloop
+@pytest.mark.asyncio
+async def test_generating_rows_are_failed_before_the_app_serves(store, admin_bootstrap):
+    """Startup reconciliation runs before the lifespan yields, so a row created before boot
+    is failed and one created *after* the app is serving is left alone."""
+    from fastapi.testclient import TestClient
+
+    from vestigo.api.main import create_app
+
+    case = await store.create_case("c", "d")
+
+    async def _row(name: str):
+        return await store.create_converter_script(
+            case_id=case.id,
+            name=name,
+            version=1,
+            raw_file_hash="a" * 64,
+            raw_filename="x.log",
+            model=None,
+            provider_endpoint=None,
+            prompt_hash=None,
+            sample_hash=None,
+            sample_excerpt=None,
+            hint=None,
+            created_by=None,
+        )
+
+    stale = await _row("stale2vestigo")
+    with TestClient(create_app()) as c:
+        assert c.get("/api/health").status_code == 200
+        live = await _row("live2vestigo")
+    stale = await store.get_converter_script(case.id, stale.id)
+    live = await store.get_converter_script(case.id, live.id)
+    assert stale.status == "failed" and "restart" in stale.attempts[-1]["error"]
+    assert live.status == "generating" and live.attempts == []

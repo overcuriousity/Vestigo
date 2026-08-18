@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -14,7 +13,7 @@ from vestigo.cli.progress import BytesProgressPrinter
 from vestigo.core.config import get_settings
 from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.db.postgres import PostgresStore, User, generate_id
-from vestigo.ingestion.files import hash_file
+from vestigo.ingestion.files import copy_and_hash, hash_file
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
 app = typer.Typer(
@@ -401,19 +400,24 @@ def convert_ingest(
             raise typer.Exit(code=1)
         tmp_dir = Path(tempfile.mkdtemp(prefix="vestigo-cli-conv-"))
         tmp = tmp_dir / path_obj.name
-        shutil.copy2(path_obj, tmp)
+        # One pass: copy and hash together (the upload endpoint does the same).
+        with path_obj.open("rb") as src, tmp.open("wb") as dst:
+            raw_hash, raw_size = copy_and_hash(src, dst)
         jobs = JobStore()
         job = jobs.create(kind="convert_ingest", case_id=case_obj.id, created_by=actor.id)
         inputs = ConvertJobInputs(
             case_id=case_obj.id,
             user=actor,
             raw_tmp_path=tmp,
-            raw_hash=hash_file(tmp),
-            raw_size=tmp.stat().st_size,
+            raw_hash=raw_hash,
+            raw_size=raw_size,
             filename=path_obj.name,
             hint=hint,
             reuse_script_id=converter,
             raw_tmp_dir=tmp_dir,
+            # The evidence file's own mtime — the CLI is the one caller that
+            # has the real one; the model may take a missing year from it.
+            raw_mtime=path_obj.stat().st_mtime,
         )
         task = asyncio.create_task(run_convert_ingest_job(job.id, inputs, job_store=jobs))
         last: str | None = None

@@ -1064,6 +1064,9 @@ export interface Capabilities {
   demo_case: boolean;
   /** The model may write converter scripts for plain-text uploads. */
   converter_generation: boolean;
+  /** A saved converter script may be re-run over a new upload (switch on;
+   * needs no model — the script sends nothing). */
+  converter_reuse: boolean;
 }
 
 /**

@@ -145,3 +145,49 @@ async def test_get_source_by_converter_input(store: PostgresStore) -> None:
     assert found is not None and found.id == "src1"
     assert await store.get_source_by_converter_input(case.id, s.id, "f" * 64) is None
     assert await store.get_source_by_converter_input(case.id, "other", "d" * 64) is None
+
+
+@pytest.mark.asyncio
+async def test_converted_sources_raw_input_counts_as_retention_in_use(store: PostgresStore) -> None:
+    # A saved script re-run over new evidence: the raw file is referenced only
+    # by the source's converter_input_hash — still an owner.
+    case = await store.create_case("c", "d")
+    s = await _script(store, case.id, status="working", raw="a" * 64)
+    assert await store.source_hash_in_use("d" * 64, exclude_source_id="") is False
+    await store.create_source(
+        case_id=case.id,
+        source_id="src1",
+        name="x",
+        file_hash="c" * 64,
+        size_bytes=1,
+        converter_script_id=s.id,
+        converter_input_hash="d" * 64,
+    )
+    assert await store.source_hash_in_use("d" * 64, exclude_source_id="") is True
+    assert await store.source_hash_in_use("d" * 64, exclude_source_id="src1") is False
+
+
+@pytest.mark.asyncio
+async def test_append_converter_attempt_locks_and_numbers(store: PostgresStore) -> None:
+    import asyncio
+
+    case = await store.create_case("c", "d")
+    s = await _script(store, case.id, status="working")
+    results = await asyncio.gather(
+        *(store.append_converter_attempt(s.id, "full", error=f"e{i}") for i in range(6))
+    )
+    row = await store.get_converter_script(case.id, s.id)
+    assert [a["n"] for a in row.attempts] == [1, 2, 3, 4, 5, 6]
+    assert {a["error"] for a in row.attempts} == {f"e{i}" for i in range(6)}
+    assert max(len(r) for r in results) == 6
+    # Row updates ride the same transaction; a missing row appends nothing.
+    await store.append_converter_attempt(
+        s.id, "sample", prompt_hash="p2", row_updates={"prompt_hash": "p2", "source_code": "x"}
+    )
+    row = await store.get_converter_script(case.id, s.id)
+    assert (
+        row.prompt_hash == "p2"
+        and row.source_code == "x"
+        and row.attempts[-1]["prompt_hash"] == "p2"
+    )
+    assert await store.append_converter_attempt("nope", "full") == []
