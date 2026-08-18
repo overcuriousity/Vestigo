@@ -1,6 +1,25 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-18 (session 178 — PR #277 third review pass).
+Last updated: 2026-08-18 (session 179 — 1.13.0 release).
+
+## Session 179 — 2026-08-18: fourth review pass, the dependabot batch, 1.13.0
+
+- **Two findings from a fourth `/code-review 277`.** `source_hash_in_use` asked
+  `scalar_one_or_none()` of the converter-script lookup, so it raised as soon as two scripts
+  shared a raw file — which is what every *regeneration* produces. All four callers swallow the
+  exception, so the damage was silent and wrong rather than loud: an ingest rollback reported
+  "source-row removal failed" after removing the row, startup reconciliation skipped its
+  `source.ingest_interrupted` audit row and logged a retry that never comes, and retained blobs
+  leaked. Second: the AST guard flagged `input`/`help` in *any* context, so `input = args.input`
+  — the spelling the prompt's own `-i/--input` mandate invites — was rejected before the script
+  ran and cost one of four attempts, with the enforced-constraints paragraph never naming them.
+  They are now a separate shadowable set, refused only where the script never binds the name.
+- **Eleven dependabot PRs merged** (numpy, pyarrow, alembic, pydantic-settings,
+  sentence-transformers, pydantic-ai-slim → 2.31.1, and the frontend's Radix/lucide/
+  `@types/node`/jest-dom). `mcp` 2.0.0 (#269) is **not** takeable and was left open: every
+  `pydantic-ai-slim[mcp]` release pins `mcp>=1.24.0,<2.0`, so the bump makes the requirements
+  unsatisfiable. Full suite green at 2681 with the embeddings extra installed.
+- **1.13.0 released** — generated converters is the headline; see `CHANGELOG.md`.
 
 ## Session 178 — 2026-08-18: PR #277 third review — every finding fixed, minor ones included
 

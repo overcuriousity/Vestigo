@@ -195,3 +195,30 @@ terminal, list polled every 2 s while one is in flight, no pointless invalidatio
 `ParserDownloadsPanel` shows the prompt-load error with a Retry; `jobPhases.ts` drops the
 `validating` phase the job never emits; `_take_examples` skips the whole-batch filter when
 the mask selects nothing; the CLI copies and hashes the log in one pass (`copy_and_hash`).
+
+## Fourth pass — 2026-08-18
+
+Two findings, both applied.
+
+1. **`source_hash_in_use` raised as soon as two converter scripts shared a raw file**
+   (`db/postgres.py`). The converter-script half of the lookup used `scalar_one_or_none()`,
+   which raises `MultipleResultsFound` above one row — and two `converter_scripts` rows
+   against one `raw_file_hash` is not an edge case but what the feature's own Regenerate
+   button produces every time. Every one of the four callers swallows the exception, so it
+   failed silently and wrongly rather than 500-ing: `_run_ingestion_job`'s rollback told the
+   analyst "cleanup incomplete: source-row removal failed" *after* removing the row;
+   `api/main.py`'s startup reconciliation of orphaned `ingesting` sources skipped its
+   `source.ingest_interrupted` audit row and logged that the source "stays 'ingesting' and
+   will be retried on the next restart", which was false; and both retention-release paths
+   leaked the retained copy. Now `first()`, like the source query directly above it, with a
+   store test that pins the two-scripts-one-file case.
+
+2. **The AST guard rejected a script for binding `input`** (`converters/runner.py`).
+   `DENIED_NAMES` held `input`/`help`/`vars`, and the `ast.Name` check ignored `ctx`, so a
+   *store* tripped it too — meaning `input = args.input`, the natural spelling under the
+   prompt's own `-i/--input` mandate, was refused before the script ran and cost one of the
+   four attempts. Neither name is a boundary (`input` reads a stdin the runner has already
+   closed, `help` writes to stdout); they are in the list so a converter cannot stall on a
+   prompt. They are now a separate `SHADOWABLE_BUILTINS` set, flagged only in `Load` position
+   and only where the script never binds the name, and the enforced-constraints paragraph in
+   the prompt names them so a draft can avoid the ones that do still apply.
