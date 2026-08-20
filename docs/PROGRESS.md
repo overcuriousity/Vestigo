@@ -1,6 +1,37 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-18 (session 179 — 1.13.0 release).
+Last updated: 2026-08-20 (session 180 — the HAProxy converter).
+
+## Session 180 — 2026-08-20: haproxy2vestigo, and measuring a timezone instead of assuming it
+
+A 1.2 GB Docker `json-file` log of a HAProxy 2.6 frontend had no converter. Now it has one:
+`src/vestigo/assets/converters/haproxy2vestigo.py`, built on the `nginx2vestigo.py` template
+(same CLI, `.gz`, directory input, parallel chunking, `--split`, `--since/--until`).
+
+- **Two detected layers, no flags.** Envelope — Docker `json-file`, BSD syslog, or bare —
+  then payload: HTTP log, TCP log, connection error, startup/reload. On the real file:
+  4,207,331 events in 35 s, 0 skipped, 323 MB Parquet.
+- **A catch-all needs a gate.** An unmodelled shape still becomes an event
+  (`haproxy:message`) rather than being dropped, so the converter sniffs the first 200 lines
+  for a *structured* shape and refuses the file if it finds none. Without the gate it would
+  have "successfully" converted any text file at all.
+- **The timezone is measured.** `accept_date` carries no offset, so the Docker envelope's
+  RFC 3339 `time` sets the timestamp and each row records which clock it used in
+  `timestamp_desc`. The observed `envelope − accept_date` skew goes in the footer as evidence.
+- **The median was the wrong estimator, and the real file proved it.** First run reported a
+  9999 ms skew — not clock drift but HAProxy's 10 s **tarpit** on the `PT--` sessions that are
+  92% of that log. The difference is session duration plus write latency (accept stamped at
+  session start, logged at session end), so only its **minimum** is bounded by the clock
+  offset. A 5th percentile is not enough either — a log where every session is tarpitted
+  leaves it nothing fast to land on, which is what a fixture written for exactly that case
+  caught. The footer reports `_min` (the conclusion) beside `_p05`/`_median` (the context).
+
+`tests/test_haproxy_converter.py` (24 tests, synthetic fixtures only), a `manifest.json`
+entry, and `docs/INPUT_FORMATS.md` §"`haproxy2vestigo.py`" follow. The parser downloads panel
+is manifest-driven, so no frontend change. Verified end to end: 200k events through
+`vestigo ingest` carry `parser_name=haproxy2vestigo`, and the column advisor picks
+`src_ip`/`http_path`/`client_real_ip` on its own.
+
 
 ## Session 179 — 2026-08-18: fourth review pass, the dependabot batch, 1.13.0
 
