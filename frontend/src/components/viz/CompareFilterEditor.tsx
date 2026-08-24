@@ -5,6 +5,7 @@ import type { VizFieldInfo } from "@/api/types";
 import { fieldTokenLabel, fieldValueLabel } from "@/components/viz/lib/fieldDisplay";
 import { TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { FilterChips } from "@/components/explorer/FilterChips";
+import { removeFilterEntry } from "@/lib/fieldFilters";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import {
@@ -48,16 +49,11 @@ export function CompareFilterEditor({ filters, onChange, fields }: Props) {
     setFieldValue("");
   };
 
-  const handleRemove = (key: string, fieldKey?: string) => {
-    const next: EventFilters = { ...filters };
-    if (key === "q") delete next.q;
-    if (key === "filters" && fieldKey && next.filters) {
-      const { [fieldKey]: _removed, ...rest } = next.filters;
-      next.filters = Object.keys(rest).length > 0 ? rest : undefined;
-      if (next.filters === undefined) delete next.filters;
-    }
-    onChange(next);
-  };
+  // `FilterChips` renders exclusions, tags and time bounds too — a hand-rolled
+  // remover that only knew `q` and `filters` left those chips un-removable, so
+  // this shares the Explorer's semantics instead.
+  const handleRemove = (key: string, fieldKey?: string, value?: string) =>
+    onChange(removeFilterEntry(filters, key, fieldKey, value));
 
   return (
     <div className="space-y-2">

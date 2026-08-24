@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +28,18 @@ from vestigo.api.deps import (
     resolve_case_access,
 )
 from vestigo.api.uploads import receive_upload_to_tmp
+from vestigo.columns.jobs import (
+    get_active_recommendation,
+    schedule_for_source,
+    start_column_recommendation,
+)
 from vestigo.core.config import get_settings
 from vestigo.core.eta import ThroughputMeter
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.core.jobs import JobStore, get_job_store
 from vestigo.core.retention import retain_file as _retain_file
 from vestigo.core.retention import retention_path as _retention_path
+from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS, METHOD_IDS
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import validate_field_mappings
 from vestigo.db.field_stats import (
@@ -39,7 +48,15 @@ from vestigo.db.field_stats import (
     merged_list_fields,
     refresh_source_field_stats,
 )
-from vestigo.db.postgres import Case, PostgresStore, User, generate_id
+from vestigo.db.postgres import (
+    Case,
+    EnrichmentJobRun,
+    PostgresStore,
+    Source,
+    Timeline,
+    User,
+    generate_id,
+)
 from vestigo.db.qdrant import QdrantStore
 from vestigo.ingestion.parser import detect_format
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -76,6 +93,18 @@ class TimelineFieldMappingsUpdate(BaseModel):
     """Payload to replace a timeline's field mappings (None/{} clears them)."""
 
     field_mappings: dict[str, list[str]] | None = Field(default=None)
+
+
+class TimelineMutedMethodsUpdate(BaseModel):
+    """Payload to replace a timeline's muted analysis methods (None/[] clears them)."""
+
+    muted_methods: list[str] | None = Field(default=None)
+
+
+class TimelineFieldOverridesUpdate(BaseModel):
+    """Payload to replace a timeline's per-method field overrides (None/{} clears them)."""
+
+    field_overrides: dict[str, dict[str, bool]] | None = Field(default=None)
 
 
 class ViewCreate(BaseModel):
@@ -156,11 +185,19 @@ async def list_cases(user: User = Depends(get_current_user)) -> dict[str, Any]:
     Each case carries the caller's resolved ``access_level``
     (``none|read|contribute|manage``) so clients don't have to re-implement
     the access rules.
+
+    An admin sees every case except other users' seeded demo cases: those are
+    identical fabricated copies, one per account, and listing fifty of them
+    buries the real work. They remain reachable by id, and deleting a user
+    still cascades theirs.
     """
     store = get_store()
-    await store.init_schema()
     if user.is_admin:
-        cases = await store.list_cases()
+        cases = [
+            case
+            for case in await store.list_cases()
+            if not case.is_demo or case.owner_id == user.id
+        ]
         role_by_team: dict[str, str] = {}
     else:
         memberships = await store.list_user_memberships(user.id)
@@ -185,7 +222,6 @@ async def create_case(
     (or an admin); plain team members cannot create team cases.
     """
     store = get_store()
-    await store.init_schema()
     if payload.team_id:
         if not user.is_admin:
             membership = await store.get_membership(payload.team_id, user.id)
@@ -274,9 +310,27 @@ async def delete_case(
     case: Case = Depends(require_case_manage),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a case and cascade-remove all its sources, timelines, events, and vectors."""
+    """Delete a case and cascade-remove all its sources, timelines, events, and vectors.
+
+    A case carrying sealed story exports is admin-only to delete, and the
+    deleted exports' hashes go into the audit record. Deleting a single export
+    is admin-only because an export is an immutable attestation
+    (``routers/stories.py``), and a story carrying any is admin-only for the
+    same reason — the case cascade takes them too, so without the same gate it
+    would be the way around both.
+    """
     store = get_store()
     case_id = case.id
+
+    attestations = await store.list_case_export_attestations(case_id)
+    if attestations and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"case has {len(attestations)} sealed story export(s); "
+                "deleting it requires an administrator"
+            ),
+        )
 
     qdrant = QdrantStore()
     ch = ClickHouseStore()
@@ -288,9 +342,9 @@ async def delete_case(
     # retryable instead of leaving orphan events behind a "successful" delete.
     try:
         for source in sources:
-            qdrant.delete_source_points(case_id, source.id)
+            await asyncio.to_thread(qdrant.delete_source_points, case_id, source.id)
             await asyncio.to_thread(ch.delete_source_events, case_id, source.id)
-        qdrant.delete_case_collections(case_id)
+        await asyncio.to_thread(qdrant.delete_case_collections, case_id)
     except Exception as exc:
         await store.record_audit(
             action="case.delete_failed",
@@ -313,6 +367,10 @@ async def delete_case(
         case_id=case_id,
         target_type="case",
         target_id=case_id,
+        # The rows are gone; the audit log is the only place the attestations
+        # survive. Omitted entirely when there were none, rather than logging
+        # an empty list on every ordinary case delete.
+        detail={"story_exports": attestations} if attestations else None,
     )
     return {"deleted": True, "case_id": case_id}
 
@@ -442,6 +500,7 @@ async def _trigger_automatic_enrichments(
     """
     from vestigo.enrichers.jobs import (
         get_active_enricher_run,
+        oldest_unfinished_run,
         run_enrichment_job,
         spawn_tracked_enrichment_task,
         try_claim_enricher_run,
@@ -455,6 +514,34 @@ async def _trigger_automatic_enrichments(
         enricher = get_enricher(enricher_key)
         availability = get_cached_availability(enricher_key)
         if enricher is None or availability is None or not availability.available:
+            continue
+        # Skip (never raise) when an unfinished run is waiting to be resumed:
+        # a fresh run would strand its staged rows, and this code path runs
+        # inside the ingestion job where an exception is swallowed with a
+        # misleading log. The analyst resumes it from the enrichers dialog.
+        # Awaited here rather than below so the check/create/claim sequence
+        # stays await-free.
+        #
+        # A *live* run has a marker too, so exclude the job currently holding
+        # the run slot — same "marker present and slot not held by it" rule the
+        # enrichers dialog applies. Without it, a healthy auto-run still going
+        # on a sibling source would be reported as needing a resume that would
+        # only 409; the truthful message is the "already running" one below.
+        # This read is for message accuracy only — the authoritative slot check
+        # is re-read after the await.
+        running_job_id = get_active_enricher_run(timeline_id, enricher_key)
+        markers = await store.list_enrichment_job_runs_for_timeline(
+            case_id, timeline_id, enricher_key=enricher_key
+        )
+        dead = oldest_unfinished_run([m for m in markers if m.job_id != running_job_id])
+        if dead is not None:
+            logger.info(
+                "Skipping auto-enrichment %s for timeline %s: unfinished run %s must be "
+                "resumed first (enrichers dialog)",
+                enricher_key,
+                timeline_id,
+                dead.job_id,
+            )
             continue
         # Check before creating the job so a skip leaves no orphan pending
         # job in the store; check + create + claim happen in the same event-
@@ -471,7 +558,19 @@ async def _trigger_automatic_enrichments(
         job = job_store.create(
             kind="enrich", progress={"processed": 0, "total": 0}, created_by=None, case_id=case_id
         )
-        try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        # Checked, not discarded: the read above is only as authoritative as the
+        # absence of an await between it and here, and that is an invariant a
+        # later edit can break silently. The claim itself cannot be raced.
+        conflict = try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        if conflict is not None:
+            job_store.update(job.id, status="failed", error="Enrichment already running")
+            logger.info(
+                "Enrichment %s already running for timeline %s (job %s); skipping auto-trigger",
+                enricher_key,
+                timeline_id,
+                conflict,
+            )
+            continue
         # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
         # inside the background ingestion job, where no request scope exists.
         # spawn_tracked_enrichment_task keeps the strong reference that stops
@@ -563,6 +662,21 @@ async def _run_ingestion_job(
                 case_id,
             )
         await _revalidate_stale_field_mappings(store, case_id, source_id)
+        # Recommended columns follow the field-stats precompute above, since
+        # that is what they read. Isolated for the same reason as the
+        # auto-enrichment trigger below: a failure here must never fall through
+        # to the ingest rollback, which would delete a fully-ingested source
+        # over a cosmetic suggestion. A missed run self-heals on the next
+        # ingest or a manual re-run from the Columns picker.
+        try:
+            await schedule_for_source(store, clickhouse, job_store, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Column recommendation scheduling failed for source %s (case %s); "
+                "the explorer falls back to its built-in default columns",
+                source_id,
+                case_id,
+            )
         # Auto-enrichment scheduling runs *after* the source is committed
         # "ready"; a failure here must never fall through to the ingest
         # rollback below (which would delete a fully-ingested source). Isolate
@@ -629,6 +743,168 @@ async def _run_ingestion_job(
         tmp_path.unlink(missing_ok=True)
 
 
+@dataclass
+class RegisteredSource:
+    """What :func:`register_source_for_ingest` produced.
+
+    ``duplicate_of`` set means nothing was created: the bytes already exist as
+    that source in this case (pre-check or lost race) and the caller answers
+    with it. For a generated-converter registration it can also mean the same
+    saved script already turned the same raw file into that source
+    (``ix_sources_converter_input``) — a converter's Parquet is not
+    byte-stable, so ``file_hash`` alone would let that evidence land twice.
+    """
+
+    source_id: str
+    parser: str
+    fmt: str
+    duplicate_of: Source | None = None
+
+
+async def register_source_for_ingest(
+    *,
+    store: PostgresStore,
+    case_id: str,
+    tmp_path: Path,
+    file_hash: str,
+    size_bytes: int,
+    filename: str | None,
+    name: str | None,
+    parser: str | None,
+    user: User,
+    converter_script_id: str | None = None,
+    converter_input_hash: str | None = None,
+) -> RegisteredSource:
+    """Dedup, detect the format, validate a Parquet footer, retain, create the row.
+
+    Shared by the upload endpoint and the generated-converter job so both
+    register a file the same way. Raises ``HTTPException`` (400) for an
+    undetectable format or an invalid Parquet footer; the caller keeps
+    ownership of ``tmp_path`` on every path except the duplicate ones, where
+    it is unlinked here.
+    """
+
+    async def _existing() -> Source | None:
+        found = await store.get_source_by_hash(case_id, file_hash)
+        if found is None and converter_script_id and converter_input_hash:
+            found = await store.get_source_by_converter_input(
+                case_id, converter_script_id, converter_input_hash
+            )
+        return found
+
+    existing_source = await _existing()
+    if existing_source is not None:
+        tmp_path.unlink(missing_ok=True)
+        return RegisteredSource(
+            source_id=existing_source.id,
+            parser=existing_source.parser or "auto",
+            fmt=existing_source.parser or "auto",
+            duplicate_of=existing_source,
+        )
+
+    fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
+    if fmt is None:
+        try:
+            fmt = detect_format(tmp_path)
+        except ValueError as exc:
+            # Unknown extension is a client problem, not a server crash.
+            # detect_format's own message names the server-side temp file,
+            # which is useless (and mildly leaky) for the client.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot detect parser format for {filename!r}; "
+                    "pass an explicit parser (e.g. jsonl, timesketch_csv, "
+                    "vestigo_parquet)."
+                ),
+            ) from exc
+    source_id = generate_id(f"{case_id}:{file_hash}")
+    source_name = name or filename or tmp_path.name
+
+    # For interchange Parquet uploads, validate the footer now (a broken
+    # file should 400 here, not fail the background job) and record the
+    # embedded converter identity as the source's parser — that is the
+    # real provenance, not the generic format string.
+    source_parser = fmt
+    if fmt in {"vestigo_parquet", "parquet"}:
+        from vestigo.ingestion.parquet_reader import ParquetEventsParser
+
+        # The ParserConfig here is a throwaway: read_source_meta only reads
+        # the file's footer, and the real parser identity is taken from that
+        # footer below (source_parser). This placeholder config is never
+        # persisted or hashed.
+        reader = ParquetEventsParser(case_id, source_id, ParserConfig(name=fmt, version="0.1.0"))
+        try:
+            parquet_meta = await run_in_threadpool(reader.read_source_meta, tmp_path)
+        except ValueError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        source_parser = f"{parquet_meta.converter_name}@{parquet_meta.converter_version}"
+
+    # Retain the original file content-addressed by hash (hardlink fast
+    # path; copy only across filesystems). Threadpool because the copy
+    # fallback is a full I/O pass over the upload.
+    retention_path = _retention_path(file_hash)
+    await run_in_threadpool(_retain_file, tmp_path, retention_path)
+
+    # Create the source row up front (event_count=0) so a re-upload of
+    # the same bytes is rejected as a duplicate while ingestion runs.
+    try:
+        await store.create_source(
+            case_id=case_id,
+            source_id=source_id,
+            name=source_name,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            filename=filename,
+            parser=source_parser,
+            event_count=0,
+            created_by=user.id,
+            # Excluded from timeline queries/detectors/embedding until
+            # the background job flips it to "ready".
+            status="ingesting",
+            converter_script_id=converter_script_id,
+            converter_input_hash=converter_input_hash,
+        )
+    except IntegrityError:
+        # Lost a race against a concurrent upload of the same bytes (or a
+        # concurrent run of the same script over the same raw file): treat it
+        # the same as the pre-check duplicate response.
+        existing_source = await _existing()
+        if existing_source is None:
+            raise
+        tmp_path.unlink(missing_ok=True)
+        return RegisteredSource(
+            source_id=existing_source.id,
+            parser=existing_source.parser or "auto",
+            fmt=fmt,
+            duplicate_of=existing_source,
+        )
+
+    # Auto-add the new source to the case's default timeline. From here on the
+    # row exists with status="ingesting", and nothing else will ever flip it:
+    # a failure must take the row (and an unshared retention copy) back out,
+    # or every re-upload of these bytes reads as "duplicate, still ingesting".
+    try:
+        default_timeline = await store.get_default_timeline(case_id)
+        if default_timeline is not None:
+            await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
+    except Exception:
+        try:
+            await store.delete_source(case_id, source_id)
+            if not await store.source_hash_in_use(file_hash, exclude_source_id=source_id):
+                retention_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 — the original error is the one to surface
+            logger.exception(
+                "Registration rollback: failed to remove source row %s (case %s)",
+                source_id,
+                case_id,
+            )
+        raise
+
+    return RegisteredSource(source_id=source_id, parser=source_parser, fmt=fmt)
+
+
 @router.post("/{case_id}/sources")
 async def upload_source(
     background_tasks: BackgroundTasks,
@@ -671,9 +947,23 @@ async def upload_source(
         file, max_bytes=max_bytes, suffix=suffix
     )
 
-    existing_source = await store.get_source_by_hash(case_id, file_hash)
-    if existing_source is not None:
+    try:
+        reg = await register_source_for_ingest(
+            store=store,
+            case_id=case_id,
+            tmp_path=tmp_path,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            filename=file.filename,
+            name=name,
+            parser=parser,
+            user=user,
+        )
+    except Exception:
         tmp_path.unlink(missing_ok=True)
+        raise
+    if reg.duplicate_of is not None:
+        existing_source = reg.duplicate_of
         return SourceUploadResponse(
             source_id=existing_source.id,
             events_parsed=existing_source.event_count,
@@ -682,95 +972,9 @@ async def upload_source(
             duplicate=True,
             status=existing_source.status,
         )
+    source_id, source_parser = reg.source_id, reg.parser
 
-    source_created = False
     try:
-        fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
-        if fmt is None:
-            try:
-                fmt = detect_format(tmp_path)
-            except ValueError as exc:
-                # Unknown extension is a client problem, not a server crash.
-                # detect_format's own message names the server-side temp file,
-                # which is useless (and mildly leaky) for the client.
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Cannot detect parser format for {file.filename!r}; "
-                        "pass an explicit parser (e.g. jsonl, timesketch_csv, "
-                        "vestigo_parquet)."
-                    ),
-                ) from exc
-        source_id = generate_id(f"{case_id}:{file_hash}")
-        source_name = name or file.filename or tmp_path.name
-
-        # For interchange Parquet uploads, validate the footer now (a broken
-        # file should 400 here, not fail the background job) and record the
-        # embedded converter identity as the source's parser — that is the
-        # real provenance, not the generic format string.
-        source_parser = fmt
-        if fmt in {"vestigo_parquet", "parquet"}:
-            from vestigo.ingestion.parquet_reader import ParquetEventsParser
-
-            # The ParserConfig here is a throwaway: read_source_meta only reads
-            # the file's footer, and the real parser identity is taken from that
-            # footer below (source_parser). This placeholder config is never
-            # persisted or hashed.
-            reader = ParquetEventsParser(
-                case_id, source_id, ParserConfig(name=fmt, version="0.1.0")
-            )
-            try:
-                parquet_meta = await run_in_threadpool(reader.read_source_meta, tmp_path)
-            except ValueError as exc:
-                tmp_path.unlink(missing_ok=True)
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            source_parser = f"{parquet_meta.converter_name}@{parquet_meta.converter_version}"
-
-        # Retain the original file content-addressed by hash (hardlink fast
-        # path; copy only across filesystems). Threadpool because the copy
-        # fallback is a full I/O pass over the upload.
-        retention_path = _retention_path(file_hash)
-        await run_in_threadpool(_retain_file, tmp_path, retention_path)
-
-        # Create the source row up front (event_count=0) so a re-upload of
-        # the same bytes is rejected as a duplicate while ingestion runs.
-        try:
-            await store.create_source(
-                case_id=case_id,
-                source_id=source_id,
-                name=source_name,
-                file_hash=file_hash,
-                size_bytes=size_bytes,
-                filename=file.filename,
-                parser=source_parser,
-                event_count=0,
-                created_by=user.id,
-                # Excluded from timeline queries/detectors/embedding until
-                # the background job flips it to "ready".
-                status="ingesting",
-            )
-            source_created = True
-        except IntegrityError:
-            # Lost a race against a concurrent upload of the same bytes:
-            # treat it the same as the pre-check duplicate response.
-            existing_source = await store.get_source_by_hash(case_id, file_hash)
-            if existing_source is None:
-                raise
-            tmp_path.unlink(missing_ok=True)
-            return SourceUploadResponse(
-                source_id=existing_source.id,
-                events_parsed=existing_source.event_count,
-                events_inserted=0,
-                parser=parser or existing_source.parser or "auto",
-                duplicate=True,
-                status=existing_source.status,
-            )
-
-        # Auto-add the new source to the case's default timeline.
-        default_timeline = await store.get_default_timeline(case_id)
-        if default_timeline is not None:
-            await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
-
         job_store = get_job_store()
         job = job_store.create(
             kind="ingest",
@@ -784,7 +988,7 @@ async def upload_source(
             case_id,
             source_id,
             tmp_path,
-            fmt,
+            reg.fmt,
             file_hash,
             file.filename or tmp_path.name,
             file.filename,
@@ -793,8 +997,7 @@ async def upload_source(
             job_store,
         )
     except Exception:
-        if source_created:
-            await store.delete_source(case_id, source_id)
+        await store.delete_source(case_id, source_id)
         tmp_path.unlink(missing_ok=True)
         raise
 
@@ -853,7 +1056,7 @@ async def delete_source(
     # A failed cascade aborts with 502 so the delete stays visible and
     # retryable instead of leaving orphan events behind a "successful" delete.
     try:
-        qdrant.delete_source_points(case_id, source_id)
+        await asyncio.to_thread(qdrant.delete_source_points, case_id, source_id)
         await asyncio.to_thread(ch.delete_source_events, case_id, source_id)
     except Exception as exc:
         await store.record_audit(
@@ -891,7 +1094,77 @@ async def list_timelines(case: Case = Depends(require_case_read)) -> dict[str, A
     """List timelines within a case."""
     store = get_store()
     timelines = await store.list_timelines(case.id)
+    # Same settling as the single-timeline read (#213): a list that keeps
+    # reporting `running` for a job that died would have the two endpoints
+    # disagreeing about the same timeline, and callers that only ever list
+    # (the timelines page) would never see it resolve. Batched — a restart that
+    # orphaned several would otherwise cost one round trip each on a page that
+    # is opened constantly.
+    await _settle_dead_recommendations(store, case.id, timelines)
     return {"timelines": [t.to_dict() for t in timelines]}
+
+
+def _recommendation_is_dead(timeline: Timeline) -> bool:
+    """Whether this timeline claims a ``running`` job that no longer exists (#213).
+
+    The explorer polls on the word ``running``, and ``JobStore`` is in-memory:
+    a job killed as a cancelled task (rather than with the whole process) is
+    never settled by the boot-time sweep, and the timeline would claim to be
+    thinking forever. Answering it needs both checks — ``_ACTIVE`` covers a job
+    that is genuinely mid-flight, and the job store covers one that finished
+    without writing (which the placeholder rollback normally handles).
+
+    Pure and synchronous, so the list path can filter the whole page before
+    touching the database at all. False for every timeline that is not
+    mid-recommendation — which is all of them, almost always.
+
+    **Single-process, like everything it reads.** Both ``_ACTIVE`` and the job
+    store live in this process's memory, so under ``uvicorn --workers N`` a
+    second worker would read another worker's live job as dead and relabel the
+    payload; that job then writes its real answer anyway, so the visible damage
+    is a spinner ending early. Inherited from ``JobStore``, not introduced here
+    — ``docs/ROADMAP.md`` §"Explicitly out of scope" carries the standing
+    decision and names this as one more thing multi-process scale-out has to
+    move to a shared backend.
+    """
+    payload = timeline.recommended_columns
+    if not isinstance(payload, dict) or payload.get("status") != "running":
+        return False
+    if get_active_recommendation(timeline.id) is not None:
+        return False
+    job_id = payload.get("job_id")
+    return not (job_id and get_job_store().get(job_id) is not None)
+
+
+async def _settle_dead_recommendations(
+    store: PostgresStore, case_id: str, timelines: list[Timeline]
+) -> None:
+    """Relabel every dead ``running`` suggestion in *timelines*, in one write.
+
+    Mutates the passed timelines in place so the caller serializes the settled
+    payloads without a second read. Returns without touching the database when
+    nothing is stale, which is the overwhelmingly common case.
+
+    **This writes from a ``require_case_read`` endpoint, deliberately.** A
+    read-only member is the one caller who can never repair the row any other
+    way — they cannot re-run the job, and the alternative is a timeline that
+    reports "suggesting columns…" at them forever. The write is bounded to what
+    that makes safe: it only ever relabels a ``running`` payload whose job is
+    provably gone, it never recomputes, it touches no evidence and no
+    analyst-authored content, the settled columns are the ones already stored,
+    and the endpoint's own access check still governs *which* case's rows are
+    even considered. It is housekeeping on display metadata, not a mutation the
+    caller authored, which is also why it records no audit row — an audit trail
+    that logged "read-only user changed a timeline" every time a process
+    restarted would be describing something that did not happen.
+    """
+    stale = [t for t in timelines if _recommendation_is_dead(t)]
+    if not stale:
+        return
+    settled = await store.settle_running_recommendations(case_id, [t.id for t in stale])
+    for timeline in stale:
+        if timeline.id in settled:
+            timeline.recommended_columns = settled[timeline.id]
 
 
 @router.get("/{case_id}/timelines/{timeline_id}")
@@ -901,6 +1174,7 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     timeline = await store.get_timeline(case.id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+    await _settle_dead_recommendations(store, case.id, [timeline])
     return {"timeline": timeline.to_dict()}
 
 
@@ -988,7 +1262,65 @@ async def create_timeline(
         target_id=timeline_id,
         detail={"field_mappings": payload.field_mappings} if payload.field_mappings else None,
     )
+    # A timeline built from already-ingested sources never passes the
+    # post-ingest hook, so it would otherwise open on the built-in defaults
+    # until someone asked for a suggestion by hand.
+    start_column_recommendation(
+        case_id=case.id,
+        timeline_id=timeline_id,
+        job_store=get_job_store(),
+        store=store,
+        actor_id=user.id,
+        actor_username=user.username,
+    )
     return {"timeline": timeline.to_dict()}
+
+
+class RecommendColumnsRequest(BaseModel):
+    """Whether this run may consult the LLM (issue #213)."""
+
+    use_ai: bool = False
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/recommend-columns")
+async def recommend_timeline_columns(
+    timeline_id: str,
+    payload: RecommendColumnsRequest | None = None,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Re-derive this timeline's recommended event-grid columns (issue #213).
+
+    The same job the post-ingest hook runs, started by hand from the Columns
+    picker. Contribute access, because the result is shared with everyone who
+    can see the timeline — a read-only member changing what the timeline opens
+    on for the whole case would be a surprise. Returns ``job_id: null`` when a
+    job for this timeline is already in flight, so the caller can say so rather
+    than showing a job that never appears.
+
+    ``use_ai`` is the analyst's per-timeline opt-in to the advisor
+    (``columns/advisor.py``), which sends candidate field names and up to three
+    real sample values per field to the configured model endpoint. This
+    authenticated, explicit request *is* the authorization — the acknowledgement
+    stored in the caller's preferences is the UI's memory of having shown the
+    disclosure, not a second gate. Every other trigger for this job leaves it
+    False and stays local.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    use_ai = bool(payload and payload.use_ai)
+    job_id = start_column_recommendation(
+        case_id=case.id,
+        timeline_id=timeline_id,
+        job_store=get_job_store(),
+        store=store,
+        actor_id=user.id,
+        actor_username=user.username,
+        use_llm=use_ai,
+    )
+    return {"job_id": job_id, "use_ai": use_ai}
 
 
 @router.patch("/{case_id}/timelines/{timeline_id}/field-mappings")
@@ -1024,6 +1356,125 @@ async def update_timeline_field_mappings(
         target_type="timeline",
         target_id=timeline_id,
         detail={"previous": previous, "new": new_mappings},
+    )
+    return {"timeline": updated.to_dict()}
+
+
+@router.patch("/{case_id}/timelines/{timeline_id}/muted-methods")
+async def update_timeline_muted_methods(
+    timeline_id: str,
+    payload: TimelineMutedMethodsUpdate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Replace the analysis methods muted for this timeline (empty/None clears them).
+
+    A mute keeps a method out of the *unprompted* sweep — its findings, and the
+    histogram marks derived from them. It is not a gate: the analysis plan does
+    not consult it, and ``/analysis/findings`` still runs a muted method when
+    asked for it by name, exactly as it does for a method the gate marked
+    ``not_applicable``. So the rail owes a visible count of what it is holding
+    back, and this endpoint owes an audit row for every change.
+
+    Unknown ids are rejected rather than stored: a typo that persisted silently
+    would read in the audit trail as a deliberate mute of a method that does
+    not exist, and would never mute anything.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    requested = payload.muted_methods or []
+    unknown = sorted(set(requested) - set(METHOD_IDS))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown analysis method(s): {', '.join(unknown)}",
+        )
+    previous = timeline.muted_methods or []
+    updated = await store.update_timeline_muted_methods(case.id, timeline_id, requested)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    await store.record_audit(
+        action="timeline.update_muted_methods",
+        actor=user,
+        case_id=case.id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"previous": previous, "new": updated.muted_methods or []},
+    )
+    return {"timeline": updated.to_dict()}
+
+
+@router.patch("/{case_id}/timelines/{timeline_id}/field-overrides")
+async def update_timeline_field_overrides(
+    timeline_id: str,
+    payload: TimelineFieldOverridesUpdate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Replace the per-method field declarations for this timeline.
+
+    ``{method_id: {field_token: bool}}`` — True pins a field into that
+    detector's automatic selection, False takes it out, absent leaves the
+    recommender's own answer standing. It exists because the recommenders type
+    fields *syntactically*: an HTTP status code parses as a number, so the range
+    detector offers it and then reports every 500 as an outlier forever. Which
+    detector reads which field is the analyst's call; the recommenders suggest.
+
+    Like a mute, this is advice and not a gate. It steers only the automatic
+    selection — ``/analysis/findings`` with an explicit ``fields`` still scans
+    an excluded field, the analysis plan does not consult it, and a run that
+    held a field back says so in its warnings. So every change owes an audit
+    row, and unknown method ids are rejected rather than stored, where they
+    would read as a deliberate declaration that never applied to anything.
+
+    A *known* method that selects no fields is rejected for that same reason:
+    ``frequency`` and ``sequence_novelty`` take a single ``series_field``,
+    ``timestamp_order`` reads no field, and ``log_template`` clusters the
+    message text, so a declaration against any of them would be audited and
+    rendered as "declared" while the detector went on scanning exactly as
+    before, without so much as a warning to say so.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case.id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    requested = payload.field_overrides or {}
+    unknown = sorted(set(requested) - set(METHOD_IDS))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown analysis method(s): {', '.join(unknown)}",
+        )
+    fieldless = sorted(set(requested) - FIELD_OVERRIDE_METHOD_IDS)
+    if fieldless:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "These analysis method(s) select no fields, so a field declaration "
+                f"would never apply to them: {', '.join(fieldless)}"
+            ),
+        )
+    empty_tokens = sorted(
+        {m for m, fields in requested.items() for tok in fields if not tok.strip()}
+    )
+    if empty_tokens:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Empty field token declared for: {', '.join(empty_tokens)}",
+        )
+    previous = timeline.field_overrides or {}
+    updated = await store.update_timeline_field_overrides(case.id, timeline_id, requested)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    await store.record_audit(
+        action="timeline.update_field_overrides",
+        actor=user,
+        case_id=case.id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"previous": previous, "new": updated.field_overrides or {}},
     )
     return {"timeline": updated.to_dict()}
 
@@ -1160,12 +1611,25 @@ async def delete_view(
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a saved view."""
+    """Delete a saved view, or hide it when a story block still references it.
+
+    A ``view_ref`` block resolves its View at render and export time, so
+    removing one out from under a story would make that story's export fail.
+    Such a view is hidden instead, and swept once the last block referencing it
+    goes away; ``hidden`` in the response is what lets the UI say which of the
+    two happened. ``deleted`` reports whether the row is actually gone — a
+    client that reads only that field must not be told the view no longer
+    exists when it does.
+    """
     store = get_store()
-    deleted = await store.delete_view(case.id, view_id)
-    if not deleted:
+    outcome = await store.delete_view(case.id, view_id)
+    if outcome is None:
         raise HTTPException(status_code=404, detail="View not found")
-    return {"deleted": True, "view_id": view_id}
+    return {
+        "deleted": outcome == "deleted",
+        "view_id": view_id,
+        "hidden": outcome == "hidden",
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1458,6 +1922,51 @@ class TimelineEnricherConfigUpdate(BaseModel):
     enabled: bool
 
 
+class EnricherResumeRequest(BaseModel):
+    """Body for resuming an unfinished enrichment run."""
+
+    job_id: str = Field(..., min_length=1, max_length=64)
+
+
+def _unfinished_run_payload(
+    run: EnrichmentJobRun | None, staged: dict[str, tuple[int, set[str]]]
+) -> dict[str, Any] | None:
+    """Describe a dead enrichment run for the enrichers dialog, or None.
+
+    ``partial_sources`` is the partial-coverage signal: staged sources that the
+    run never finished staging, which get their values applied but stay
+    provenance-free and re-runnable. It is computed as a set difference rather
+    than by comparing ``staged_sources`` with ``completed_sources``, because
+    those two are not measured the same way — ``staged_sources`` is what is
+    *still* staged now, and a resume that dies partway through has already
+    deleted the staged rows of the sources it applied, driving that count below
+    the durable ``completed_sources`` and flipping a naive comparison to "not
+    partial" exactly when the caveat is true.
+
+    A marker with zero staged rows is still reported — it is still resumable (a
+    no-op apply that clears the marker), which is how an analyst lifts the
+    "resume before running" conflict. The dialog says something different for
+    that case, since "0 events were enriched but never written" is not what
+    happened.
+    """
+    if run is None:
+        return None
+    rows, staged_source_ids = staged.get(run.job_id, (0, set()))
+    completed = set(run.completed_source_ids or [])
+    started = run.created_at
+    if started.tzinfo is None:  # SQLite round-trips naive datetimes
+        started = started.replace(tzinfo=UTC)
+    return {
+        "job_id": run.job_id,
+        "started_at": started.isoformat(),
+        "age_seconds": max(0, int((datetime.now(UTC) - started).total_seconds())),
+        "staged_rows": rows,
+        "staged_sources": len(staged_source_ids),
+        "completed_sources": len(completed),
+        "partial_sources": len(staged_source_ids - completed),
+    }
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/enrichers")
 async def list_timeline_enrichers(
     timeline_id: str,
@@ -1470,6 +1979,7 @@ async def list_timeline_enrichers(
     GUI until an admin makes them available.
     """
     from vestigo.enrichers.base import effective_enricher_state
+    from vestigo.enrichers.jobs import get_active_enricher_run, oldest_unfinished_run
     from vestigo.enrichers.registry import all_enrichers, get_cached_availability
 
     store = get_store()
@@ -1483,6 +1993,23 @@ async def list_timeline_enrichers(
     configs = {c.enricher_key: c for c in await store.list_timeline_enrichers(timeline_id)}
     global_defaults = {
         c.enricher_key: c.auto_run_default for c in await store.list_enricher_global_configs()
+    }
+
+    # Unfinished runs: a marker whose (timeline, enricher) run slot is not held
+    # by that same job id is provably dead — the slot is claimed before the
+    # marker is written and released after it would have been deleted. A run
+    # orphaned while the process stayed up (ClickHouse died mid-apply) is
+    # invisible to startup reconciliation, so this is how an analyst finds it.
+    markers = await store.list_enrichment_job_runs_for_timeline(case_id, timeline_id)
+    stale = [m for m in markers if get_active_enricher_run(timeline_id, m.enricher_key) != m.job_id]
+    staged_counts = await store.staged_summary_by_job([m.job_id for m in stale])
+    # One marker per enricher, chosen by the shared oldest-first tie-break so the
+    # banner names the same job as the run route's 409 and the auto-trigger's log.
+    by_key: dict[str, list[EnrichmentJobRun]] = defaultdict(list)
+    for marker in stale:
+        by_key[marker.enricher_key].append(marker)
+    stale_by_key = {
+        key: run for key, markers_ in by_key.items() if (run := oldest_unfinished_run(markers_))
     }
 
     available = [
@@ -1500,8 +2027,12 @@ async def list_timeline_enrichers(
     def _check_one(enricher):
         return enricher.check_eligibility(ClickHouseStore(), case_id, ready_source_ids)
 
+    # return_exceptions: one unreachable/failing check must not blank the whole
+    # dialog. ClickHouse being down is exactly when an analyst needs to see the
+    # unfinished-run banner, and eligibility is only advisory anyway.
     eligibilities = await asyncio.gather(
-        *(run_in_threadpool(_check_one, enricher) for enricher in available)
+        *(run_in_threadpool(_check_one, enricher) for enricher in available),
+        return_exceptions=True,
     )
     result = []
     for enricher, eligibility in zip(available, eligibilities, strict=True):
@@ -1511,16 +2042,41 @@ async def list_timeline_enrichers(
             config.mode if config else None,
             global_defaults.get(enricher.key, False),
         )
+        failed = isinstance(eligibility, BaseException)
+        if failed:
+            logger.warning(
+                "Eligibility check failed for enricher %s on timeline %s: %s",
+                enricher.key,
+                timeline_id,
+                eligibility,
+            )
         result.append(
             {
                 "key": enricher.key,
                 "display_name": enricher.display_name,
                 "description": enricher.description,
-                "eligible": eligibility.eligible,
-                "sample_checked": eligibility.sample_checked,
-                "sample_matched": eligibility.sample_matched,
+                "eligible": False if failed else eligibility.eligible,
+                "sample_checked": 0 if failed else eligibility.sample_checked,
+                "sample_matched": 0 if failed else eligibility.sample_matched,
+                "eligibility_error": str(eligibility) if failed else None,
                 "mode": mode,
                 "enabled": enabled,
+                # The job holding the run slot, or None. A run in flight is
+                # exactly the case where `unfinished_run` is None *and* a run
+                # would 409: its marker is filtered out of `stale` above because
+                # the slot is held by it. Without this the dialog offers "Run
+                # now" during a live run — including one startup reconciliation
+                # is still applying — and the click fails with an "already
+                # running" error the analyst had no way to anticipate.
+                "running_job_id": get_active_enricher_run(timeline_id, enricher.key),
+                # None unless this enricher has a dead run waiting to be resumed.
+                # Markers for a currently-*unavailable* enricher are not rendered
+                # (it is filtered out of `available` above) — that enricher cannot
+                # be run either, so no new deadlock; startup reconciliation and a
+                # later re-availability both still reach it.
+                "unfinished_run": _unfinished_run_payload(
+                    stale_by_key.get(enricher.key), staged_counts
+                ),
             }
         )
     return {"enrichers": result}
@@ -1583,6 +2139,7 @@ async def run_timeline_enricher(
     """
     from vestigo.enrichers.jobs import (
         get_active_enricher_run,
+        oldest_unfinished_run,
         run_enrichment_job,
         try_claim_enricher_run,
     )
@@ -1606,6 +2163,44 @@ async def run_timeline_enricher(
     if not source_ids:
         raise HTTPException(status_code=422, detail="Timeline has no ready sources to enrich")
 
+    # Both conflict checks run *before* the provenance skip below: if a run is
+    # in flight or unfinished, "everything is already enriched, nothing to do"
+    # would be a misleading answer — the staged rows of an unfinished run are
+    # precisely the work that has not been applied yet.
+    #
+    # This read is for the *early* 409 only: several awaits separate it from the
+    # claim below, so it cannot be the authoritative check. The claim's own
+    # return value is (see there).
+    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
+    if active_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {active_job_id})",
+        )
+
+    # An unfinished run's staged rows are completed enrichment output stamped
+    # with a pinned enricher config/data version. A fresh run would strand them
+    # permanently (_apply_staged_rows only ever lists its own job's staged
+    # sources) and, if the enricher's data version has since changed, they are
+    # not recomputable at all — discarding them would destroy derived evidence
+    # that the pinned-hash design exists to keep reproducible. Make the analyst
+    # resume first; resume is always available and always terminal, so this can
+    # never wedge. Any marker reaching here is dead by the run-slot invariant:
+    # a live run would have 409'd on the check above.
+    unfinished = oldest_unfinished_run(
+        await store.list_enrichment_job_runs_for_timeline(
+            case_id, timeline_id, enricher_key=enricher_key
+        )
+    )
+    if unfinished is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An unfinished enrichment run (job {unfinished.job_id}) must be "
+                "resumed before a new run can start"
+            ),
+        )
+
     # Skip sources already enriched at the current config: a source's derived
     # fields live on its ClickHouse partition, not on the timeline, so a source
     # carried into a new timeline is already enriched. config_hash folds in the
@@ -1626,13 +2221,6 @@ async def run_timeline_enricher(
             "skipped_source_ids": skipped_source_ids,
         }
 
-    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
-    if active_job_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Enrichment already running (job {active_job_id})",
-        )
-
     job_store = get_job_store()
     # Construct the ClickHouse client *before* claiming the run slot: its
     # constructor can raise when ClickHouse is unreachable, and a claim taken
@@ -1648,7 +2236,23 @@ async def run_timeline_enricher(
     )
     # Claim now (before the response) so a double-click is rejected with 409
     # even though the job itself only starts after the response is sent.
-    try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    #
+    # The claim's return value is the authoritative conflict check, not the read
+    # near the top of this handler: three awaits sit between them (the marker
+    # query, the config_hash thread hop, the provenance query), so two "Run now"
+    # clicks — or one racing ``_trigger_automatic_enrichments`` from a concurrent
+    # ingest — can both pass that read. Losing the claim and spawning anyway
+    # would put two applies on the same source *and* leave the loser's live
+    # marker looking dead to the enrichers dialog (marker present, slot held by
+    # the winner), which offers Resume on a running job — exactly the concurrent
+    # partition rewrite ``enrichers/jobs.py`` exists to prevent.
+    conflict = try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    if conflict is not None:
+        job_store.update(job.id, status="failed", error="Enrichment already running")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {conflict})",
+        )
     background_tasks.add_task(
         run_enrichment_job,
         job_id=job.id,
@@ -1679,4 +2283,137 @@ async def run_timeline_enricher(
         "status": job.status,
         "source_ids": source_ids,
         "skipped_source_ids": skipped_source_ids,
+    }
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/enrichers/{enricher_key}/resume")
+async def resume_timeline_enricher(
+    timeline_id: str,
+    enricher_key: str,
+    body: EnricherResumeRequest,
+    background_tasks: BackgroundTasks,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Finish an enrichment run that died before its results were applied.
+
+    Applies the run's already-staged rows and clears its marker — no re-scan,
+    no recomputation. This is the recovery path when ClickHouse dies mid-apply
+    and comes back under a live app, which startup reconciliation never sees.
+
+    Auth matches the run route: resume performs the same partition rewrite, so
+    it cannot require less, and it computes nothing new, so it must not require
+    ``require_case_manage`` (reserved for changing enricher configuration).
+
+    ``body.job_id`` is optimistic concurrency, not routing: the dialog may have
+    been open for minutes, and echoing the id the analyst actually saw turns a
+    stale view into a clean 404 instead of a silent rewrite of a partition
+    nobody looked at.
+    """
+    from vestigo.enrichers.jobs import (
+        get_active_enricher_run,
+        run_resume_job,
+        try_claim_enricher_run,
+    )
+    from vestigo.enrichers.registry import get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+    # Deliberately no availability check: resume applies already-computed rows
+    # and never calls enrich_value, so a removed .mmdb must not strand valid
+    # results. _apply_staged_rows already degrades gracefully for an enricher
+    # it cannot resolve (it just skips stale-key stripping).
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    run = await store.get_enrichment_job_run(body.job_id)
+    if (
+        run is None
+        or run.case_id != case_id
+        or run.timeline_id != timeline_id
+        or run.enricher_key != enricher_key
+    ):
+        # One 404 for all four cases — a mismatched marker must not confirm
+        # that some other case's job id exists.
+        raise HTTPException(status_code=404, detail="No unfinished enrichment run with that id")
+
+    summary = await store.staged_summary_by_job([run.job_id])
+    staged_rows, staged_source_ids = summary.get(run.job_id, (0, set()))
+
+    # From here to the claim there is no await: check-then-claim must happen in
+    # one event-loop tick or two concurrent resumes both pass. Same
+    # document-by-invariant discipline _ACTIVE_RUNS relies on throughout.
+    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
+    if active_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {active_job_id})",
+        )
+
+    job_store = get_job_store()
+    # Before the claim, for the same reason as the run route: a constructor
+    # raise after claiming would wedge this (timeline, enricher) at 409.
+    ch_store = ClickHouseStore()
+    job = job_store.create(
+        kind="enrich",
+        progress={"processed": 0, "total": 0},
+        created_by=user.id,
+        case_id=case_id,
+    )
+    # Claim under the *marker's* job id, not the poll job's. That keeps the
+    # discovery invariant sound (marker present + slot held by it = live), so a
+    # second analyst cannot fire a second resume over the same staged rows, and
+    # it makes the run route's 409 name the run they already know about.
+    # Checked rather than discarded for the same reason as the run route: the
+    # read above is only authoritative while nothing awaits between it and here.
+    conflict = try_claim_enricher_run(timeline_id, enricher_key, run.job_id)
+    if conflict is not None:
+        job_store.update(job.id, status="failed", error="Enrichment already running")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {conflict})",
+        )
+
+    # Recorded before spawning so the named actor is on file even if the apply
+    # then fails.
+    await store.record_audit(
+        action="enricher.resume_requested",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "enricher_key": enricher_key,
+            "job_id": run.job_id,
+            "poll_job_id": job.id,
+            "staged_rows": staged_rows,
+            "staged_sources": len(staged_source_ids),
+            "completed_sources": len(run.completed_source_ids or []),
+            "partial_sources": len(staged_source_ids - set(run.completed_source_ids or [])),
+        },
+    )
+    background_tasks.add_task(
+        run_resume_job,
+        poll_job_id=job.id,
+        run=run,
+        job_store=job_store,
+        store=store,
+        ch_store=ch_store,
+        actor_user_id=user.id,
+        actor_username=user.username,
+    )
+    return {
+        # Two distinct ids: `job_id` polls the JobStore, `resumed_job_id` is the
+        # enrichment run whose staged rows are being applied. They cannot be the
+        # same value — the latter keys the staged rows and names the ClickHouse
+        # scratch table, so it stays pinned to the original run.
+        "job_id": job.id,
+        "resumed_job_id": run.job_id,
+        "status": job.status,
+        "staged_rows": staged_rows,
+        "staged_sources": len(staged_source_ids),
     }

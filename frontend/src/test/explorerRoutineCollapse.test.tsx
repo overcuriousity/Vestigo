@@ -101,6 +101,8 @@ vi.mock("@/api/baselines", async () => {
 // agent-apply seed-parity test); the panel itself is stubbed below.
 vi.mock("@/api/health", () => ({
   useHealth: () => ({ data: { agent_available: true } }),
+  // ColumnPicker gates its "Suggest with AI" button on this.
+  useCapabilities: () => ({ agent: false }),
 }));
 vi.mock("@/hooks/useCaseStream", () => ({
   useCaseStream: () => undefined,
@@ -132,9 +134,6 @@ vi.mock("@/components/explorer/EventDetailPanel", () => ({
     captures.detail = props;
     return null;
   },
-}));
-vi.mock("@/components/analysis/InvestigatePanel", () => ({
-  InvestigatePanel: () => null,
 }));
 vi.mock("@/components/agent/AgentPanel", () => ({
   AgentPanel: (props: Record<string, unknown>) => {

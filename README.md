@@ -17,57 +17,77 @@
   <img src="https://img.shields.io/badge/react-19-61DAFB?logo=react&logoColor=black" alt="React 19">
 </p>
 
-A local-first, forensic-grade log investigation platform for small security teams.
+**A local-first, large-scale log investigation platform for forensic investigators.**
 
-Vestigo ingests Timesketch-compatible timelines at scale, lets analysts explore them
-through an ELK-like web interface, and surfaces anomalies with explainable statistical
-detectors, Sigma rules, and locally-computed embeddings — reproducible and auditable at
-every step, airgapped if needed. It sits between a heavyweight SIEM and one-off notebook
-scripts: [Timesketch](https://github.com/google/timesketch)'s investigative UX combined
-with [logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner)'s
-lightweight, explainable detection, without needing a cluster to run it.
+Ingest Timesketch-compatible timelines and explore them through a web interface that
+inherits its UX from ELK-style tools. Surface anomalies with explainable statistical
+detectors and Sigma rules — every method documented, and explained in the interface itself
+for peer review. Every mutating action is audit-trailed and the whole application can be
+pinned offline, so chain of custody survives the investigation.
 
-<img width="2866" height="1589" alt="Vestigo Explorer" src="https://github.com/user-attachments/assets/d505af86-9ba2-4fe1-b448-10b18ae2d409" />
+<!-- Screenshot grid (2x2) pending: Analysis tab with Method panel, Stories with a live
+     embed, Agent with an applied finding, plus a re-shot Explorer at matching size. -->
+<p align="center">
+  <img width="2866" height="1589" alt="Vestigo Explorer" src="https://github.com/user-attachments/assets/d505af86-9ba2-4fe1-b448-10b18ae2d409">
+</p>
+
+## Quick start
+
+Run the three backing services (natively, or via the reference compose file — it binds to
+`127.0.0.1` only), then install and start the app:
+
+```bash
+docker compose up -d      # or: podman compose up -d
+uv sync
+uv run vestigo-web
+```
+
+The app is at `http://localhost:8080`, OpenAPI docs at `/api/docs`; the frontend is
+auto-built on first run. Log in with the one-time bootstrap admin credentials
+(`VESTIGO_ADMIN_PASSWORD`, rotated on first login). Configuration is env-driven
+(`VESTIGO_*`) — see `.env.example`.
+
+Local embeddings are not in the base install (~2 GB of torch + sentence-transformers). Add
+them with `uv sync --extra embeddings`, or point `VESTIGO_EMBEDDING_API_BASE_URL` at a
+remote OpenAI-compatible endpoint. Without either, embedding features report unavailable
+and everything else works normally.
+
+For production hardening, containerized deployment, airgapped installation, TLS and upgrade
+guarantees, see [Deployment](docs/DEPLOYMENT.md).
 
 ## Capabilities
 
-- **Ingestion at scale** — streaming parsers for Plaso CSV/JSONL and generic CSV/JSONL
-  handle tens of gigabytes without loading everything into memory; also scriptable via
-  `vestigo ingest` for huge files (no upload cap, live progress). Downloadable converter
-  scripts parse vendor logs (nginx, suricata, cloudtrail, pcap, evtx, apache, cowrie,
-  zeek, and more) client-side; the native converters emit typed Parquet that the server
-  bulk-inserts via Arrow — an order of magnitude faster than row-by-row CSV, with
-  per-row raw-file provenance — and stdlib-only Timesketch-format variants exist for
-  every format.
-- **Explorer** — virtualized event grid with full-text and structured filtering pushed
-  down into ClickHouse, time histogram with anomaly overlays, keyset pagination with
-  jump-to-time, tag/comment annotations with bulk apply, saved views, and streaming
-  CSV/JSONL export that includes the forensic columns.
-- **Anomaly detection** — twelve statistical detectors run directly over ClickHouse (no
-  embeddings required): value novelty, value combinations, frequency spikes/silences,
-  timestamp order, numeric range, charset novelty, entropy outliers, proportion shift,
-  interval cadence, sequence novelty, recurring-sequence motifs, and value-distribution
-  drift — plus log-template clustering, a Sigma rule runner, and semantic similarity
-  search over locally-computed embeddings (Qdrant). Every detector supports explicit
-  baseline-vs-suspect windows, and findings carry a confirm/dismiss disposition workflow
-  that survives re-scans. See [Anomaly Detection](docs/ANOMALY_DETECTION.md).
-- **Enrichment** — post-ingest enrichers (currently GeoIP via a local MaxMind database)
-  amend event attributes without ever touching the provenance columns.
-- **AI investigation agent (optional, off by default)** — an assistant embedded in the
-  Explorer that searches, aggregates, and runs detectors through read-only, case-scoped
-  tools, handing results back as findings the analyst applies with one click; writes
-  happen only through an explicit propose→confirm flow. Works with any OpenAI- or
-  Anthropic-compatible endpoint, including fully local ones (ollama, vllm, llama.cpp).
-  The same tools are exposable as an audited [MCP endpoint](docs/AGENT.md) for external
-  agents. Every conversation and tool call is persisted and audit-trailed.
-- **Teams, access control, audit** — session-cookie auth (optional OIDC SSO), case-level
+- **Ingestion at scale** — streaming parsers for Plaso and generic CSV/JSONL take tens of
+  gigabytes without loading them into memory, via the UI or `vestigo ingest` (no upload
+  cap). Downloadable converters normalize vendor logs — nginx, suricata, cloudtrail, evtx,
+  zeek and more — client-side into typed Parquet, bulk-inserted via Arrow with per-row
+  provenance. [Input Formats →](docs/INPUT_FORMATS.md)
+- **Explorer** — virtualized event grid, full-text and structured filters pushed down into
+  ClickHouse, time histogram with anomaly overlays, keyset pagination with jump-to-time,
+  tag/comment annotations with bulk apply, saved views, and streaming CSV/JSONL export that
+  keeps the forensic columns.
+- **Anomaly detection** — fourteen analysis tools: twelve statistical detectors over
+  ClickHouse needing no embeddings, a Sigma rule runner, and semantic similarity search
+  over local embeddings. Each is documented method by method, scores against explicit
+  baseline-vs-suspect windows, and yields findings whose confirm/dismiss disposition
+  survives re-scans. [Anomaly Detection →](docs/ANOMALY_DETECTION.md)
+- **Stories** — the write-up lives next to the evidence. View, chart and event blocks stay
+  live while the analyst writes, then freeze to a hashed, server-resolved snapshot on
+  export. [Stories →](docs/STORIES.md)
+- **AI investigation agent** (optional, off by default) — searches, aggregates and runs
+  detectors through read-only case-scoped tools, handing back findings the analyst applies
+  with one click; writes need an explicit propose→confirm. Any OpenAI- or
+  Anthropic-compatible endpoint works, including local ones (ollama, vllm, llama.cpp).
+  [Agent & MCP →](docs/AGENT.md)
+- **Teams, access control, audit** — session-cookie auth with optional OIDC SSO, case-level
   RBAC with teams, an append-only audit trail over every mutating action, and live
-  collaboration via Server-Sent Events.
-- **Forensic rigor by construction** — every ingested file is SHA-256 hashed, immutable,
-  and retained content-addressed; every event carries a content hash and byte offset back
-  into the raw file; parser and embedding configs are hashed into the identity of what
-  they produce. Airgapped/offline-by-default: no code path reaches the network
-  unconditionally.
+  collaboration over Server-Sent Events.
+- **Enrichment** — post-ingest enrichers (GeoIP and ASN via local MaxMind databases)
+  amend event attributes without touching the provenance columns.
+- **Forensic rigor by construction** — sources are SHA-256 hashed, immutable and retained
+  content-addressed; every event carries a content hash and byte offset back into its raw
+  file; parser and embedding configs are hashed into the identity of what they produce. No
+  code path reaches the network unconditionally.
 
 ## Architecture
 
@@ -76,32 +96,37 @@ lightweight, explainable detection, without needing a cluster to run it.
   (vectors). None run inside the app.
 - **Frontend** — React 19 + Vite + TypeScript, served as a static build directly from
   Uvicorn.
-- **CLI** — a Typer-based `vestigo` command mirrors the API/UI for scriptable, offline
-  use.
+- **CLI** — a Typer-based `vestigo` command mirrors the API/UI for scriptable, offline use.
 
-## Quick start
+## How it compares
 
-Run the three backing services (natively, or via the reference compose file — it binds
-to `127.0.0.1` only), then install and start the app:
+[Timesketch](https://github.com/google/timesketch) is the main inspiration and the tool
+Vestigo shares a category with. It defined what collaborative timeline investigation should
+feel like, and the Case/Timeline model here is descended from it. That is the comparison we
+invite, and three axes are where we think we are already the better place to run an
+investigation:
 
-```bash
-docker compose up -d      # or: podman compose up -d
-uv sync
-uv run vestigo-web
-```
+- **Detection is the workflow, not an add-on** — fourteen analysis tools in the box, each
+  scoring against an analyst-declared baseline and carrying a verdict that survives
+  re-scans, so triage accumulates instead of being redone.
+- **Provenance goes all the way down** — not just "this file was imported": a finding is
+  traceable to a byte range in an immutable, hashed original, months later.
+- **One process, three services, no cluster** — no search cluster, broker or worker fleet,
+  comfortable on 300M-row cases, and offline by default rather than as a hardening
+  exercise.
 
-The app is at `http://localhost:8080` (OpenAPI docs at `/api/docs`); the frontend is
-auto-built on first run. Log in with the one-time bootstrap admin credentials
-(`VESTIGO_ADMIN_PASSWORD`, rotated on first login).
+Timesketch is also a mature project with years of production use, a larger analyzer
+ecosystem and a community we have yet to earn.
 
-The base install ships without the local embedding stack (~2 GB of torch +
-sentence-transformers). For local embeddings run `uv sync --extra embeddings`, or point
-`VESTIGO_EMBEDDING_API_BASE_URL` at a remote OpenAI-compatible endpoint. Without either,
-embedding features report unavailable and everything else works normally.
+[logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner) is a **method
+source, not a competitor.** Its catalogue of detection methods, and the principle that a
+detector must explain itself, are where ours come from — re-derived as batch SQL over an
+already-ingested corpus, deliberately narrower, with several of its detectors not
+implemented at all. AMiner solves a different problem: online detection over live log
+streams. Anyone who needs that should run AMiner.
 
-Configuration is env-driven (`VESTIGO_*`); see `.env.example` for the full list. For
-production hardening, containerized deployment, fully airgapped installation, TLS, and
-upgrade guarantees, see [Deployment](docs/DEPLOYMENT.md).
+The full comparison, including what we hold narrower on purpose, is in
+[Concept §8](docs/CONCEPT.md#8-differentiation).
 
 ## Documentation
 
@@ -109,6 +134,7 @@ upgrade guarantees, see [Deployment](docs/DEPLOYMENT.md).
 - [Deployment](docs/DEPLOYMENT.md) — compose stack, airgapped install, TLS, upgrades
 - [Input Formats](docs/INPUT_FORMATS.md) — CSV/JSONL/Parquet field-level normalization spec
 - [Anomaly Detection](docs/ANOMALY_DETECTION.md) — every detector explained, plain language
+- [Stories](docs/STORIES.md) — the living report: blocks, collaboration, hashed export
 - [AI Agent](docs/AGENT.md) — the optional investigation agent and the external MCP endpoint
 - [Tech Stack](docs/TECH_STACK.md) — why each backing service was chosen
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — the Case / Source / Timeline / Event / Artifact model

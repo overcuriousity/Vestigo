@@ -2,10 +2,13 @@ import { CaseList } from "@/components/cases/CaseList";
 import { CreateCaseDialog } from "@/components/cases/CreateCaseDialog";
 import { ImportCaseDialog } from "@/components/cases/ImportCaseDialog";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
-import { guidance } from "@/lib/guidance";
+import { useCapabilities } from "@/api/health";
 import { ShieldAlert } from "lucide-react";
 
 export function CasesPage() {
+  // Case transfer is hidden entirely when the operator disabled it
+  // (VESTIGO_TRANSFER_ENABLED / the admin settings page).
+  const { transfer } = useCapabilities();
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-3xl px-6 py-8">
@@ -25,7 +28,7 @@ export function CasesPage() {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <ImportCaseDialog />
+            {transfer && <ImportCaseDialog />}
             <CreateCaseDialog />
           </div>
         </div>
@@ -33,9 +36,7 @@ export function CasesPage() {
         <CaseList />
 
         <div className="mt-8">
-          <GuidancePanel id="cases-page" title={guidance.casesPage.title}>
-            <p>{guidance.casesPage.body}</p>
-          </GuidancePanel>
+          <GuidancePanel id="cases-page" />
         </div>
       </div>
     </div>

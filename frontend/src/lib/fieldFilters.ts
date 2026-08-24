@@ -18,6 +18,21 @@ export function dropMode(
 }
 
 /**
+ * Drop the `""` placeholder an `empty`-mode entry carries.
+ *
+ * `""` is not a value an analyst ever asked to match — it exists only so that
+ * an `empty` mode has a key to hang off (the backend drops a mode whose key is
+ * absent from `filters`). Adding a clicked literal alongside it also drops the
+ * mode, so leaving the placeholder in place would turn "blank user_agent" plus
+ * "curl/7" into `user_agent IN ('', 'curl/7')` — every blank row silently
+ * riding along with the one the analyst clicked. `FilterRail.addFilter` strips
+ * it for the same reason.
+ */
+function withoutEmptyPlaceholder(prev: string[] | undefined): string[] {
+  return (prev ?? []).filter((v) => v !== "");
+}
+
+/**
  * Return a copy of *f* with `fieldKey = value` applied as an include or
  * exclude filter. Special cases:
  *   - filterKey "q"        → sets the free-text search (include only)
@@ -54,7 +69,7 @@ export function applyFieldFilter(
       next.excludeTag = value;
     }
   } else if (include) {
-    const prev = next.filters?.[fieldKey] ?? [];
+    const prev = withoutEmptyPlaceholder(next.filters?.[fieldKey]);
     if (!prev.includes(value)) {
       next.filters = { ...(next.filters ?? {}), [fieldKey]: [...prev, value] };
     }
@@ -62,16 +77,118 @@ export function applyFieldFilter(
     // otherwise the clicked text would be reinterpreted as glob/regex.
     next.filterModes = dropMode(next.filterModes, fieldKey);
   } else {
-    const prev = next.exclusions?.[fieldKey] ?? [];
+    const prev = withoutEmptyPlaceholder(next.exclusions?.[fieldKey]);
     if (!prev.includes(value)) {
       next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
-      // Same literal-value rule; mode is per key, so this also flips any
-      // pre-existing pattern-mode values of the key back to exact —
-      // visible via the chips' badge disappearing.
-      next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
     }
+    // Same literal-value rule; mode is per key, so this also flips any
+    // pre-existing pattern-mode values of the key back to exact —
+    // visible via the chips' badge disappearing.
+    next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
   }
 
+  return next;
+}
+
+/**
+ * Does *f* narrow the event set at all?
+ *
+ * "At all" means exactly "`FilterChips` would render at least one chip" — the
+ * two must agree, because every surface that asks this question does so in
+ * order to decide between showing chips and showing an empty state. Keep this
+ * list in step with `components/explorer/FilterChips.tsx`.
+ *
+ * Time bounds count: a chart of one brushed hour is not an unfiltered chart.
+ * Presentation-only members (`limit`, `sort`, the match-mode maps, and
+ * `collapseRoutine`, which is not URL-serialized) deliberately do not.
+ */
+export function hasActiveFilters(f: EventFilters): boolean {
+  return Boolean(
+    f.q ||
+      f.artifact ||
+      f.artifacts?.length ||
+      f.sourceId ||
+      f.tag ||
+      f.tagsInclude?.length ||
+      f.tagsExclude?.length ||
+      f.annotated?.length ||
+      f.start ||
+      f.end ||
+      Object.keys(f.filters ?? {}).length ||
+      Object.keys(f.exclusions ?? {}).length,
+  );
+}
+
+/**
+ * Return a copy of *f* with one filter chip's contribution removed.
+ *
+ * `key` names the `EventFilters` member; `fieldKey` picks the entry inside the
+ * `filters`/`exclusions` maps; `value` removes a single value from a multi-value
+ * entry (omit it to drop the whole entry). Emptying an entry also drops its
+ * match-mode, so a re-added value is never silently reinterpreted as a pattern.
+ *
+ * Shared by the Explorer's filter chips and Visualize's inherited-filters bar:
+ * both surfaces render the same chips, so removal must mean the same thing.
+ */
+export function removeFilterEntry(
+  f: EventFilters,
+  key: keyof EventFilters | string,
+  fieldKey?: string,
+  value?: string,
+): EventFilters {
+  const next = { ...f };
+  if (key === "filters" && fieldKey) {
+    if (value !== undefined) {
+      const remaining = (next.filters?.[fieldKey] ?? []).filter((v) => v !== value);
+      if (remaining.length === 0) {
+        const { [fieldKey]: _removed, ...rest } = next.filters ?? {};
+        next.filters = rest;
+        next.filterModes = dropMode(next.filterModes, fieldKey);
+      } else {
+        next.filters = { ...(next.filters ?? {}), [fieldKey]: remaining };
+      }
+    } else {
+      const { [fieldKey]: _removed, ...rest } = next.filters ?? {};
+      next.filters = rest;
+      next.filterModes = dropMode(next.filterModes, fieldKey);
+    }
+  } else if (key === "exclusions" && fieldKey) {
+    if (value !== undefined) {
+      const remaining = (next.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
+      if (remaining.length === 0) {
+        const { [fieldKey]: _removed, ...rest } = next.exclusions ?? {};
+        next.exclusions = rest;
+        next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
+      } else {
+        next.exclusions = {
+          ...((next.exclusions ?? {}) as Record<string, string[]>),
+          [fieldKey]: remaining,
+        };
+      }
+    } else {
+      const { [fieldKey]: _removed, ...rest } = next.exclusions ?? {};
+      next.exclusions = rest;
+      next.exclusionModes = dropMode(next.exclusionModes, fieldKey);
+    }
+  } else if (key === "artifacts" || key === "tagsInclude" || key === "tagsExclude") {
+    const listKey = key as "artifacts" | "tagsInclude" | "tagsExclude";
+    const remaining =
+      value !== undefined ? (next[listKey] ?? []).filter((v) => v !== value) : [];
+    if (remaining.length > 0) next[listKey] = remaining;
+    else delete next[listKey];
+  } else if (key === "annotated") {
+    const remaining =
+      value !== undefined ? (next.annotated ?? []).filter((t) => t !== value) : [];
+    if (remaining.length > 0) {
+      next.annotated = remaining;
+    } else {
+      delete next.annotated;
+      // The tag-value refinement only means anything alongside `annotated`.
+      delete next.annotationTagValue;
+    }
+  } else {
+    delete next[key as keyof EventFilters];
+  }
   return next;
 }
 

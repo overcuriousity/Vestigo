@@ -4,7 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { readFileSync } from "fs";
 import path from "path";
 
-const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "package.json"), "utf-8"));
+const pkg = JSON.parse(readFileSync(path.resolve(import.meta.dirname, "package.json"), "utf-8"));
 
 export default defineConfig({
   // Compile-time inject the package version so the footer never drifts from
@@ -13,7 +13,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
   server: {
@@ -33,5 +33,10 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
+    // Vitest stubs every CSS import to an empty string by default, `?raw`
+    // included. `designSystem.test.ts` parses index.css for the set of defined
+    // custom properties, so it needs the real text — scoped to that one file so
+    // no other test starts paying for the Tailwind pipeline.
+    css: { include: [/index\.css/] },
   },
 });

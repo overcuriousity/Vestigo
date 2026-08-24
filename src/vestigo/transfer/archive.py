@@ -205,7 +205,7 @@ class ArchiveWriter:
         total = 0
         info = zipfile.ZipInfo(arcname)
         info.compress_type = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
-        with src.open("rb") as fsrc, self._zip.open(info, mode="w") as fdst:
+        with src.open("rb") as fsrc, self._zip.open(info, mode="w", force_zip64=True) as fdst:
             while chunk := fsrc.read(_CHUNK):
                 sha.update(chunk)
                 total += len(chunk)

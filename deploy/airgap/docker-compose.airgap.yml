@@ -1,0 +1,101 @@
+# Airgapped deployment: the same stack as the repository's docker-compose.yml,
+# with every image pre-loaded from the bundle and nothing built on the host.
+#
+# `image:` everywhere and no `build:` anywhere is the point — a build would need
+# a registry. `install.sh` loads the images from `images/` before calling this.
+#
+# The backing services publish NO host ports: the app reaches them over the
+# compose network, so exposing them would only add an attack surface (they run
+# with default credentials) and a port conflict with whatever else the host
+# runs. Only the app is published — put TLS in front of it (nginx-tls.conf).
+# To inspect a service directly, use `compose exec`, or add a port yourself.
+#
+# `name:` is pinned so the project — and therefore the named volumes holding all
+# case data — does not depend on the directory this file happens to sit in. An
+# upgrade extracts a *new* bundle directory; without this, compose would derive
+# a new project name from it and bring up an empty stack next to the old data.
+# Set COMPOSE_PROJECT_NAME in .env to adopt an install that used another name.
+
+name: vestigo
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    environment:
+      POSTGRES_USER: vestigo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vestigo}
+      POSTGRES_DB: vestigo
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vestigo -d vestigo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.6.1.1193-alpine
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/allow-default-network.xml:/etc/clickhouse-server/users.d/zz-allow-default-network.xml:ro,z
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  qdrant:
+    image: docker.io/qdrant/qdrant:v1.18.2
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333 && echo -e 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    # Tag written by scripts/airgap-bundle.sh and recorded in the bundle's
+    # .env — an upgrade is: load the new image, bump this, `up -d`.
+    #
+    # `localhost/` is not decoration. Podman stores a locally built, unqualified
+    # image as `localhost/vestigo-app:TAG` and writes that name into the archive;
+    # docker `load` keeps it verbatim but resolves a *bare* `vestigo-app:TAG` to
+    # `docker.io/library/vestigo-app` — so a podman-built bundle installed on a
+    # docker host looked like "missing image(s) after load" for an image the log
+    # had just said it loaded. Podman resolves the same short name to
+    # `localhost/`, which is why only docker hosts saw it. Writing the name fully
+    # qualified makes both engines agree, and nothing ever pulls it.
+    image: localhost/vestigo-app:${VESTIGO_IMAGE_TAG:?set VESTIGO_IMAGE_TAG in .env}
+    ports:
+      - "${VESTIGO_BIND:-0.0.0.0}:${VESTIGO_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      # Connection settings point at the compose network, so they are fixed
+      # here rather than left to the .env an operator edits.
+      VESTIGO_POSTGRES_URL: postgresql+asyncpg://vestigo:${POSTGRES_PASSWORD:-vestigo}@postgres:5432/vestigo
+      VESTIGO_CLICKHOUSE_URL: http://clickhouse:8123
+      VESTIGO_QDRANT_URL: http://qdrant:6333
+    volumes:
+      - app_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  qdrant_data:
+  app_data:

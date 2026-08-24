@@ -76,5 +76,65 @@ def test_pruning_bounds_memory():
         b.register_failure(f"user{i}", "1.1.1.1")
     clock.t += 100.0  # all locks expired
     b.register_failure("fresh", "1.1.1.1")
-    assert len(b._entries) <= 5 + 1
+    assert len(b._entries) <= 5
     assert b.retry_after("fresh", "1.1.1.1") > 0
+
+
+def test_cap_holds_when_nothing_is_prunable():
+    """All entries locked into the future: pruning frees nothing, so evict instead."""
+    clock = FakeClock()
+    b = _backoff(threshold=1, base=1000.0, maximum=1000.0, max_entries=5, clock=clock)
+    for i in range(5):
+        b.register_failure(f"user{i}", "1.1.1.1")
+    b.register_failure("fresh", "1.1.1.1")
+    assert len(b._entries) == 5
+    assert b.retry_after("fresh", "1.1.1.1") > 0
+
+
+def test_eviction_drops_the_earliest_expiring_lock():
+    clock = FakeClock()
+    b = _backoff(threshold=1, base=1000.0, maximum=1000.0, max_entries=3, clock=clock)
+    for i in range(3):
+        b.register_failure(f"user{i}", "1.1.1.1")
+        clock.t += 1.0  # stagger locked_until so user0 expires first
+    b.register_failure("fresh", "1.1.1.1")
+    assert len(b._entries) == 3
+    assert b.retry_after("user0", "1.1.1.1") == 0.0  # evicted
+    assert b.retry_after("user2", "1.1.1.1") > 0  # latest lock survives
+
+
+def test_repeated_failure_on_known_key_does_not_evict():
+    """A key already tracked cannot grow the dict, so the cap must not fire."""
+    clock = FakeClock()
+    b = _backoff(threshold=1, base=1000.0, maximum=1000.0, max_entries=3, clock=clock)
+    for i in range(3):
+        b.register_failure(f"user{i}", "1.1.1.1")
+    b.register_failure("user0", "1.1.1.1")
+    assert len(b._entries) == 3
+    assert b._entries[("user0", "1.1.1.1")].failures == 2
+
+
+def test_eviction_costs_the_evicted_key_its_failure_count():
+    """Freeing a slot drops the entry, so the evicted key restarts below threshold."""
+    clock = FakeClock()
+    b = _backoff(threshold=3, base=1000.0, maximum=1000.0, max_entries=2, clock=clock)
+    for key in ("victim", "other"):  # both locked; victim's lock expires first
+        for _ in range(3):
+            b.register_failure(key, "1.1.1.1")
+            clock.t += 1.0
+    assert b.retry_after("victim", "1.1.1.1") > 0
+    b.register_failure("flood", "1.1.1.1")  # nothing prunable, so victim is evicted
+    assert len(b._entries) == 2
+    # Not one free attempt: the whole count went with the entry, so a full
+    # `threshold` attempts pass unthrottled before a lock re-arms.
+    for _ in range(b._threshold):
+        assert b.retry_after("victim", "1.1.1.1") == 0.0
+        b.register_failure("victim", "1.1.1.1")
+    assert b.retry_after("victim", "1.1.1.1") > 0
+
+
+def test_max_entries_below_one_is_clamped():
+    b = _backoff(threshold=1, max_entries=0)
+    b.register_failure("alice", "1.2.3.4")
+    b.register_failure("bob", "1.2.3.4")
+    assert len(b._entries) == 1

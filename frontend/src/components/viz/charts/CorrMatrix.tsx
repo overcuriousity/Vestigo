@@ -165,7 +165,7 @@ export function CorrMatrix({
                         fill={
                           value != null
                             ? divergingColor(value)
-                            : "var(--color-bg-subtle)"
+                            : "var(--color-bg-surface)"
                         }
                         fillOpacity={qualified ? 0.3 : 1}
                         stroke={

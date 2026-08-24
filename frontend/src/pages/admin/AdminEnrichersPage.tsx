@@ -1,21 +1,20 @@
-import { useRef } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { UploadCloud } from "lucide-react";
 import { enrichersApi, type AdminEnricherConfig } from "@/api/enrichers";
-import { Button } from "@/components/ui/Button";
+import { FileInputButton } from "@/components/ui/FileInput";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
 import { Switch } from "@/components/ui/Switch";
-
-function fmtBytes(bytes: number | null): string {
-  if (bytes == null) return "—";
-  const mb = bytes / (1024 * 1024);
-  return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
-}
+import { TransferProgressRow } from "@/components/ui/TransferProgressRow";
+import { useFileTransfer } from "@/hooks/useFileTransfer";
+import { fmtBytes } from "@/lib/format";
 
 function EnricherCard({ config }: { config: AdminEnricherConfig }) {
   const qc = useQueryClient();
-  const fileInput = useRef<HTMLInputElement>(null);
+  // Only for the progress row's denominator: the picker uploads immediately,
+  // so the file itself travels through `submit` rather than through state.
+  const [uploading, setUploading] = useState<File | null>(null);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["admin", "enrichers", "config"] });
@@ -28,9 +27,17 @@ function EnricherCard({ config }: { config: AdminEnricherConfig }) {
     onSuccess: invalidate,
   });
 
-  const uploadMutation = useMutation({
-    mutationFn: (file: File) => enrichersApi.uploadAsset(config.key, file),
-    onSuccess: invalidate,
+  // Assets are GeoLite-sized — hundreds of MB — and the install is synchronous
+  // server-side, so there is no job afterwards to watch. This progress row is
+  // the whole of the feedback.
+  const upload = useFileTransfer<{ available: boolean; reason: string | null }, File>({
+    mutationFn: (o, file) => enrichersApi.uploadAsset(config.key, file, o),
+    onSuccess: () => {
+      setUploading(null);
+      invalidate();
+    },
+    onError: () => setUploading(null),
+    onCancel: () => setUploading(null),
   });
 
   const asset = config.asset;
@@ -78,34 +85,33 @@ function EnricherCard({ config }: { config: AdminEnricherConfig }) {
             {asset.uploaded ? `uploaded (${fmtBytes(asset.size_bytes)})` : "not uploaded"}
           </div>
           <p className="text-xs text-[var(--color-fg-muted)]">{asset.description}</p>
-          <input
-            ref={fileInput}
-            type="file"
-            accept={asset.accepted_extensions.join(",")}
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) uploadMutation.mutate(file);
-              e.target.value = "";
-            }}
-          />
-          <Button
+          <FileInputButton
             variant="ghost"
-            size="sm"
-            disabled={uploadMutation.isPending}
-            onClick={() => fileInput.current?.click()}
+            accept={asset.accepted_extensions.join(",")}
+            pending={upload.active}
+            icon={<UploadCloud size={14} className="mr-1.5" />}
+            onFiles={(files) => {
+              const picked = files[0];
+              if (!picked) return;
+              setUploading(picked);
+              upload.submit(picked);
+            }}
           >
-            <UploadCloud size={14} className="mr-1.5" />
-            {uploadMutation.isPending
-              ? "Uploading…"
-              : asset.uploaded
-                ? `Replace ${asset.name}`
-                : `Upload ${asset.name}`}
-          </Button>
-          {uploadMutation.isError && (
-            <p className="mt-2 text-xs text-[var(--color-danger)]">
-              {(uploadMutation.error as Error).message}
-            </p>
+            {asset.uploaded ? `Replace ${asset.name}` : `Upload ${asset.name}`}
+          </FileInputButton>
+          {upload.active && uploading && (
+            <TransferProgressRow
+              label={`Uploading ${uploading.name}`}
+              state={upload.state}
+              fallbackTotal={uploading.size}
+              // The asset is only installed once the whole file has landed, so
+              // cancelling leaves the previous one in place.
+              onCancel={upload.cancel}
+              cancelLabel="Cancel"
+            />
+          )}
+          {upload.error && (
+            <p className="mt-2 text-xs text-[var(--color-danger)]">{upload.error}</p>
           )}
         </div>
       )}

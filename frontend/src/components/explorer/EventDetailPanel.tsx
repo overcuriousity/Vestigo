@@ -1,7 +1,8 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight, EyeOff } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { AddToStoryButton } from "@/components/stories/AddToStoryButton";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampFull, fmtRelative } from "@/lib/time";
@@ -41,6 +42,16 @@ interface Props {
   /** Pivots the explorer to a ±minutes window around this event's timestamp,
    * clearing all other filters (context query). */
   onContextQuery?: (ts: string, minutes: number) => void;
+  /**
+   * The timeline's canonical field mappings (canonical name → raw attribute
+   * keys). The backend resolves them into every presented row's `attributes`
+   * (db/field_mappings.py::project_mapped_fields), so without them here a
+   * derived value would read as a key the source file carries — it does not.
+   * Used only to *name* the raw fields behind a badge; whether a given row's
+   * key is derived at all comes from that row's `mapped_fields`, since a
+   * source may store the canonical name itself and then outrank the mapping.
+   */
+  fieldMappings?: Record<string, string[]> | null;
   /** Existing annotation-tag labels for autocomplete. */
   tagSuggestions?: string[];
   /** Active, not-yet-tagged analysis findings that apply to this event. */
@@ -81,6 +92,7 @@ function FieldRow({
   onShowHistogram,
   onMarkNormal,
   flag,
+  labelNote,
   dataTour,
 }: {
   label: string;
@@ -99,6 +111,11 @@ function FieldRow({
    */
   onMarkNormal?: (value: string) => void;
   flag?: { flag: string; label: string } | null;
+  /**
+   * Marker rendered next to the label for a value the row did not get from the
+   * source file — today, a canonical field coalesced from a timeline mapping.
+   */
+  labelNote?: { text: string; title: string } | null;
   /** Onboarding-tour anchor on the action-buttons cluster. */
   dataTour?: string;
 }) {
@@ -121,6 +138,14 @@ function FieldRow({
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
       <span className="w-36 shrink-0 break-all text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
+        {labelNote && (
+          <span
+            className="ml-1 text-xs text-[var(--color-fg-muted)] italic"
+            title={labelNote.title}
+          >
+            {labelNote.text}
+          </span>
+        )}
       </span>
       {fullValue && fullValue !== value ? (
         <Tooltip content={fullValue} side="top">
@@ -301,6 +326,7 @@ export function EventDetailPanel({
   onShowFieldHistogram,
   onJumpToTime,
   onContextQuery,
+  fieldMappings,
   tagSuggestions = [],
   liveFindings = [],
 }: Props) {
@@ -314,6 +340,16 @@ export function EventDetailPanel({
   });
   const toggleSection = (id: string) =>
     setCollapsedSections((s) => ({ ...s, [id]: !s[id] }));
+
+  // Which attribute keys the backend coalesced into this row (see the
+  // `fieldMappings` prop). Empty for an event that did not come from the paged
+  // query — the panel then badges nothing, which is the safe direction: a
+  // missing badge understates, a wrong one claims a provenance the source
+  // file contradicts.
+  const derivedFields = useMemo(
+    () => new Set(event.mapped_fields ?? []),
+    [event.mapped_fields],
+  );
 
   // Disposition = the analyst's verdict on a finding, shared with the
   // analysis finding rows via useDisposition (see docs/ANOMALY_DETECTION.md).
@@ -413,8 +449,12 @@ export function EventDetailPanel({
 
   return (
     <div
-      className="relative flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] shrink-0"
-      style={{ width: detailPanelWidth }}
+      // `min-w-0` + shrink rather than `shrink-0`: with several side panels
+      // open on a laptop the sum of their fixed widths used to exceed the
+      // viewport and the last one was pushed off screen. Shrinking degrades
+      // gracefully; overflowing does not.
+      className="relative flex h-full min-w-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      style={{ width: detailPanelWidth, flex: `0 1 ${detailPanelWidth}px` }}
     >
       {/* Accent bar — reflects Normal / anomaly state, sits under the drag handle */}
       <div
@@ -440,6 +480,16 @@ export function EventDetailPanel({
             </span>
           </Tooltip>
         )}
+        <AddToStoryButton
+          caseId={caseId}
+          iconOnly
+          className="h-8 w-8 px-0"
+          label="Add this event to a story"
+          content={{
+            kind: "event_ref",
+            content: { event_id: event.event_id, source_id: event.source_id },
+          }}
+        />
         {onJumpToTime && event.timestamp && (
           <Tooltip content="Locate this event in the timeline — keeps active filters; if it's normally hidden it's shown here, marked distinct">
             <Button
@@ -603,19 +653,39 @@ export function EventDetailPanel({
             collapsed={!!collapsedSections.attributes}
             onToggle={() => toggleSection("attributes")}
           >
-            {Object.entries(event.attributes ?? {}).map(([k, v]) => (
-              <FieldRow
-                key={k}
-                label={k}
-                value={v}
-                mono
-                filterKey={k}
-                onAddFilter={onAddFilter}
-                onShowHistogram={onShowFieldHistogram}
-                onMarkNormal={(val) => markFieldNormal(`attr:${k}`, val)}
-                flag={getAttributeDecoration(event.attributes ?? {}, k)}
-              />
-            ))}
+            {Object.entries(event.attributes ?? {}).map(([k, v]) => {
+              // A canonical field coalesced into the row by the query layer is
+              // not carried by the source file — say so, and address it by its
+              // canonical token rather than `attr:` (which bypasses mappings
+              // and would key an allowlist entry on a field no source has).
+              // The row itself declares which keys those are: a key that
+              // *does* exist in the source outranks the mapping and is absent
+              // from `mapped_fields`, so it must not be badged even though the
+              // timeline defines a mapping under that name.
+              const isDerived = derivedFields.has(k);
+              const mappedFrom = isDerived ? fieldMappings?.[k] : undefined;
+              return (
+                <FieldRow
+                  key={k}
+                  label={k}
+                  value={v}
+                  mono
+                  filterKey={k}
+                  onAddFilter={onAddFilter}
+                  onShowHistogram={onShowFieldHistogram}
+                  onMarkNormal={(val) => markFieldNormal(mappedFrom ? k : `attr:${k}`, val)}
+                  flag={getAttributeDecoration(event.attributes ?? {}, k)}
+                  labelNote={
+                    mappedFrom
+                      ? {
+                          text: "mapped",
+                          title: `Canonical field from this timeline's mapping — first value present of: ${mappedFrom.join(", ")}`,
+                        }
+                      : null
+                  }
+                />
+              );
+            })}
           </Section>
         )}
 

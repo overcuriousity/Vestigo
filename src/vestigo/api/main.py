@@ -5,38 +5,43 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vestigo import __version__
-from vestigo.agent.availability import agent_available
 from vestigo.api.deps import get_store, resolve_user_optional
 from vestigo.api.routers import (
     admin,
     agent,
     agent_tokens,
+    analysis,
     auth,
     baselines,
     cases,
     converters,
+    demo,
     dispositions,
     enrichers,
     events,
     jobs,
     sigma,
+    stories,
     stream,
     transfer,
     viz,
 )
+from vestigo.core.capabilities import get_capabilities
 from vestigo.core.config import get_settings
+from vestigo.core.demo_case import cancel_pending_seeds
+from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.core.security import hash_password
-from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, generate_id
-from vestigo.models.embeddings import embeddings_available
+from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, User, generate_id
+from vestigo.db.queries import QueryRequestTooLargeError
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +199,38 @@ async def _sweep_stale_transfer_archives() -> None:
         logger.exception("Transfer archive sweep failed; leftover export archives remain.")
 
 
+async def _reconcile_stale_converter_generations(store: PostgresStore) -> None:
+    """Fail every converter script still ``generating`` — its job did not survive the restart.
+
+    Same reasoning as the ingest reconciliation above: the JobStore is
+    in-memory, so a row in this state on boot has nothing left to finish it,
+    and it would sit in the panel as "generating" forever, neither reusable
+    nor regenerable as a failed draft. The row and its attempts stay; only the
+    status flips, and the trail records why.
+
+    Runs *before* the lifespan yields, like
+    ``_settle_orphaned_column_recommendations`` and for the same two reasons:
+    it is one fast Postgres statement that touches no external service, and it
+    fails *every* ``generating`` row — so it must run before the app can
+    accept a conversion, or (queued behind a slow ClickHouse sweep in
+    ``_startup_recovery``) it would flip a live generation to ``failed`` and
+    plant a bogus "interrupted by a server restart" attempt on it.
+    """
+    try:
+        rows = await store.fail_stale_converter_generations()
+    except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        logger.exception("Converter generation reconciliation failed")
+        return
+    for row in rows:
+        logger.warning(
+            "Marked converter script %s (%s v%s, case %s) failed: still generating on startup",
+            row.id,
+            row.name,
+            row.version,
+            row.case_id,
+        )
+
+
 async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
     """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
 
@@ -229,6 +266,88 @@ def _redact_url(url: str | None) -> str:
     return url
 
 
+# Query parameters whose *value* is a credential. The OIDC redirect carries an
+# authorization code and its CSRF state in the URL — that is the protocol, not
+# a flaw — but uvicorn's access log writes the full query string, so without
+# this every login puts a live credential into the system journal, which is
+# routinely readable by more people than the session store is.
+#
+# This is a *name list*, not a heuristic: a parameter whose name is not here is
+# logged in full. Anything added to the API that puts a secret in a query string
+# has to be added here too — lowercase, since matching folds case.
+#
+# Scope stops at this process. A fronting reverse proxy writes its own access
+# log from the request it received, unredacted — `nginx-tls.conf` ships in this
+# repo and `docs/DEPLOYMENT.md` §"TLS reverse proxy (nginx)" is the deployment
+# it describes. An operator terminating TLS upstream has to scrub or disable
+# that log separately; nothing here can reach it.
+_SECRET_QUERY_PARAMS = frozenset(
+    {
+        "code",
+        "state",
+        "token",
+        "access_token",
+        "id_token",
+        "refresh_token",
+        "session_state",
+        "client_secret",
+        "agent_token",
+        "api_key",
+        "apikey",
+        "password",
+        "signature",
+    }
+)
+REDACTED = "***"
+
+
+def redact_query(target: str) -> str:
+    """Replace the value of every sensitive query parameter in ``target``.
+
+    Matching is on the whole parameter name, percent-decoded and folded to
+    lowercase — a sensitive name appearing as a *substring* of another
+    parameter is not a match, a provider that capitalizes ``Code`` does not
+    slip through, and neither does one that sends ``%63ode``. Only names in
+    ``_SECRET_QUERY_PARAMS`` are redacted; nothing is inferred from the value.
+
+    The name is *emitted* exactly as it arrived, decoded only to decide. An
+    operator reading the journal should see what the client actually sent.
+
+    Args:
+        target: A request target, with or without a query string.
+
+    Returns:
+        The same target with sensitive values replaced by ``***``. Parameter
+        names, order and the path are preserved, so the log stays readable and
+        an operator can still see *that* a callback carried a code.
+    """
+    path, sep, query = target.partition("?")
+    if not sep or not query:
+        return target
+    parts = []
+    for pair in query.split("&"):
+        name, eq, _value = pair.partition("=")
+        secret = bool(eq) and unquote_plus(name).lower() in _SECRET_QUERY_PARAMS
+        parts.append(f"{name}={REDACTED}" if secret else pair)
+    return f"{path}?{'&'.join(parts)}"
+
+
+class AccessLogRedactor(logging.Filter):
+    """Scrub credentials out of uvicorn's access log records.
+
+    Uvicorn formats access lines from the record's ``args``, where the third
+    item is the request target including its query string. Rewriting the tuple
+    here catches every route at once, which is what makes this hold for
+    whatever query parameter the next subsystem adds.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], redact_query(args[2]), *args[3:])
+        return True
+
+
 def _log_config_report() -> None:
     """One startup block stating the resolved deployment-critical config."""
     settings = get_settings()
@@ -252,6 +371,41 @@ def _log_config_report() -> None:
             "environment=production but VESTIGO_AUTH_COOKIE_SECURE=false — session cookies "
             "will be sent over plain HTTP. Set VESTIGO_AUTH_COOKIE_SECURE=1 behind TLS."
         )
+
+
+async def _refresh_enricher_availability() -> None:
+    """Fill the enricher availability cache before the first request.
+
+    Deliberately *not* part of ``_startup_recovery``: an enricher's
+    ``check_availability()`` is a local filesystem check, so it neither needs
+    nor deserves the ClickHouse-deferred treatment, and the ``enrichers``
+    capability reads that cache — leaving it cold made the whole Enrichment UI
+    disappear whenever a recovery step above it raised. Recovery still refreshes
+    it again before scheduling re-runs; the call is idempotent.
+    """
+    try:
+        from vestigo.enrichers.registry import refresh_availability
+
+        await asyncio.to_thread(refresh_availability)
+    except Exception:
+        logger.exception("Could not determine enricher availability at startup.")
+
+
+async def _settle_orphaned_column_recommendations(store: PostgresStore) -> None:
+    """Relabel column recommendations a restart left mid-flight (issue #213).
+
+    Deliberately *not* part of ``_startup_recovery``, for the same reason as
+    ``_refresh_enricher_availability``: this is one fast Postgres statement
+    that touches no external service, and a ClickHouse-dependent step failing
+    above it must not leave a timeline polling forever for a job that died
+    with the previous process.
+    """
+    try:
+        settled = await store.clear_stale_running_recommendations()
+        if settled:
+            logger.info("Settled %d column recommendation(s) orphaned by a restart.", settled)
+    except Exception:
+        logger.exception("Could not settle orphaned column recommendations.")
 
 
 async def _startup_recovery(store: PostgresStore) -> None:
@@ -298,13 +452,20 @@ async def _startup_recovery(store: PostgresStore) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    _log_config_report()
     store = get_store()
-    # Only Postgres schema + admin seeding block startup — both are fast and
-    # required before the first request. Everything ClickHouse-dependent is
+    # Only Postgres schema + settings + admin seeding block startup — all fast
+    # and required before the first request. Everything ClickHouse-dependent is
     # deferred to a background task so booting can't hang behind it (502s).
     await store.init_schema()
+    # Before anything reads configuration: the DB-backed override layer is part
+    # of the effective settings, and the config report below should state what
+    # the process will actually use.
+    await load_runtime_settings()
+    _log_config_report()
     await _seed_admin()
+    await _refresh_enricher_availability()
+    await _settle_orphaned_column_recommendations(store)
+    await _reconcile_stale_converter_generations(store)
 
     recovery_task = asyncio.create_task(_startup_recovery(store))
     try:
@@ -313,6 +474,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery_task.cancel()
         with suppress(asyncio.CancelledError):
             await recovery_task
+        # Demo seeds tear their partial case down when cancelled, but only if
+        # someone cancels them — an unattended shutdown mid-ingest would
+        # otherwise leave a half-populated case in a user's list.
+        await cancel_pending_seeds()
 
 
 class AuthAuditMiddleware:
@@ -441,6 +606,11 @@ def create_app() -> FastAPI:
         level=get_settings().log_level.upper(),
         format="%(levelname)s:     %(name)s — %(message)s",
     )
+    # Attached to the logger rather than to a handler: uvicorn owns the
+    # handler, and an embedding process may replace it.
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, AccessLogRedactor) for f in access_logger.filters):
+        access_logger.addFilter(AccessLogRedactor())
     app = FastAPI(
         title="Vestigo",
         description="Local-first forensic log investigation platform.",
@@ -465,24 +635,76 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.exception_handler(QueryRequestTooLargeError)
+    async def _query_too_large(_request: Request, exc: QueryRequestTooLargeError) -> JSONResponse:
+        """Answer 413 instead of leaking a Poco form-parser 500.
+
+        Reached when a filter resolves to a value list ClickHouse refuses to
+        accept in one request (issue #181). Large membership lists now travel
+        as external data, so this is the backstop for whatever still overflows
+        — and it tells the analyst to narrow the filter rather than showing a
+        ClickHouse-internal message.
+
+        413 rather than 400: the analyst's own request is well-formed and
+        small, but the request *Vestigo* must make of the event store to
+        answer it exceeds a payload limit. 413 is the only status that names
+        size as the problem, which is the one thing the analyst can act on;
+        400 would suggest the filter itself is malformed.
+
+        Streaming exports reach this handler because the route pre-flights a
+        ``count()`` over the same ``EventQuery`` before constructing the
+        ``StreamingResponse`` (``routers/events.py``) — once the response
+        headers are flushed no handler can run, so that pre-flight is what
+        keeps an over-large export filter a clean 413 instead of a truncated
+        200. Covered by ``tests/test_query_too_large_handler.py``.
+        """
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": (
+                    f"This filter is too large for the event store to process ({exc}). "
+                    "Narrow it — a shorter time range or fewer selected events — and retry."
+                )
+            },
+        )
+
     @app.get("/api/health", response_class=JSONResponse)
-    async def health() -> dict:
-        return {
+    async def health(user: User | None = Depends(resolve_user_optional)) -> dict:
+        """Liveness, plus what this instance can actually do.
+
+        The route is exempt from the auth gate because the login page needs it
+        (``oidc_enabled`` decides whether the SSO button renders), so the body
+        is split: anonymous callers learn the app is up and which login methods
+        exist, and nothing else. Which optional subsystems an instance runs is
+        an inventory of its attack surface, so `capabilities` — and the three
+        flat aliases that predate it — need a session.
+
+        The middleware already resolved and cached this user on
+        ``request.state``, so the dependency costs no extra query.
+        """
+        body: dict = {
             "status": "ok",
             "version": __version__,
             "oidc_enabled": get_settings().oidc_enabled,
-            # False when the 'embeddings' extra is not installed and no
-            # remote embedding endpoint is configured — embed jobs and
-            # semantic search return 503 in that state.
-            "embeddings_available": embeddings_available(),
-            # False unless VESTIGO_AGENT_* is configured and the endpoint
-            # answered the cached probe — the frontend renders no agent UI
-            # at all in that state.
-            "agent_available": await agent_available(),
-            # True only when VESTIGO_MCP_ENABLED — the external streamable-HTTP
-            # MCP endpoint at /mcp. Off by default (Bearer-token-gated when on).
-            "mcp_enabled": get_settings().mcp_enabled,
         }
+        if user is None:
+            return body
+        # `capabilities` is the general form: one entry per optional subsystem,
+        # false when the subsystem is unconfigured, and the frontend renders no
+        # entry point for a false one (core/capabilities.py). The flat keys
+        # below predate it and are kept as aliases so an older client keeps
+        # working.
+        caps = await get_capabilities()
+        body["capabilities"] = caps
+        # Served rather than mirrored: the tag is a filter token the resolver
+        # and the grid must name identically, and a copy hardcoded in the
+        # frontend would drift silently — a renamed tag stops matching without
+        # raising anything. Outside `capabilities`, which is bool-only.
+        body["annotated_tag"] = events.ANNOTATED_TAG
+        body["embeddings_available"] = caps["embeddings"]
+        body["agent_available"] = caps["agent"]
+        body["mcp_enabled"] = caps["mcp"]
+        return body
 
     app.include_router(auth.router)
     app.include_router(admin.router)
@@ -492,14 +714,18 @@ def create_app() -> FastAPI:
     app.include_router(dispositions.router)
     app.include_router(events.router)
     app.include_router(viz.router)
+    app.include_router(analysis.router)
     app.include_router(jobs.router)
     app.include_router(sigma.router)
+    app.include_router(stories.router)
     app.include_router(stream.router)
     app.include_router(converters.router)
+    app.include_router(converters.case_router)
     app.include_router(agent.router)
     app.include_router(agent.info_router)
     app.include_router(agent_tokens.router)
     app.include_router(transfer.router)
+    app.include_router(demo.router)
 
     # External streamable-HTTP MCP endpoint (Bearer-token-gated), off by default.
     # Registered outside /api/, so AuthAuditMiddleware's session gate does not

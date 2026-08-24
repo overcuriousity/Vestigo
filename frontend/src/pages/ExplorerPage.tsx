@@ -4,22 +4,30 @@
  * Panels:
  *   Left:   FilterRail (collapsible via toolbar toggle)
  *   Center: EventGrid (always visible)
- *   Right:  EventDetailPanel + InvestigatePanel (independently closeable)
+ *   Right:  EventDetailPanel + the Investigate rail (independently closeable),
+ *           with the Investigate sheet overlaying the stage rather than joining it
  *
  * All filter state lives in the URL so investigation links are shareable.
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
  */
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { useQuery, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useQuery,
+  useInfiniteQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   FlaskConical,
   PanelLeftClose,
   PanelLeftOpen,
   BarChart2,
   AreaChart,
+  Columns3,
   Repeat,
   Sparkles,
+  Wrench,
+  X,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -28,7 +36,18 @@ import { dispositionsApi } from "@/api/dispositions";
 import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
-import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { casesApi } from "@/api/cases";
+import { canContributeToCase } from "@/lib/caseAccess";
+import { useColumnRecommendation } from "@/hooks/useColumnRecommendation";
+import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
+import { useUiStore } from "@/stores/ui";
+import {
+  hasAnsweredColumnAdvisor,
+  hasSuggestion,
+  isSuggesting,
+  resolveVisibleColumns,
+  suggestionPollInterval,
+} from "@/lib/columns";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { useBaselineStore } from "@/stores/baseline";
@@ -49,7 +68,10 @@ import { useCaseStream } from "@/hooks/useCaseStream";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
 import { FilterChips } from "@/components/explorer/FilterChips";
-import { EventGrid, type EventGridHandle } from "@/components/explorer/EventGrid";
+import {
+  EventGrid,
+  type EventGridHandle,
+} from "@/components/explorer/EventGrid";
 import { EventDetailPanel } from "@/components/explorer/EventDetailPanel";
 import { BulkActionBar } from "@/components/explorer/BulkActionBar";
 import { ExportDialog } from "@/components/explorer/ExportDialog";
@@ -57,7 +79,10 @@ import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
-import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
+import { InvestigateRail } from "@/components/analysis/InvestigateRail";
+import { InvestigateSheetHost } from "@/components/analysis/InvestigateSheetHost";
+import { RailResizeHandle } from "@/components/analysis/RailResizeHandle";
+import type { MethodId } from "@/components/analysis/method-registry";
 import { AgentPanel } from "@/components/agent/AgentPanel";
 import { useAgentStore } from "@/stores/agent";
 import { useHealth } from "@/api/health";
@@ -66,18 +91,27 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { AnomalyMarker, Disposition, Event, EventFilters, EventPage, Annotation } from "@/api/types";
+import type {
+  AnomalyMarker,
+  Disposition,
+  Event,
+  EventFilters,
+  EventPage,
+  Annotation,
+} from "@/api/types";
 import {
   applyFieldFilter,
-  dropMode,
+  hasActiveFilters,
   mapFieldTokenToFilterKey,
+  removeFilterEntry,
 } from "@/lib/fieldFilters";
 
 const PAGE_SIZE = 100;
 
 /** Matches a ClickHouse UUID event_id, used to detect an event_id typed into
  * the filter rail's search box (vs. a keyword/semantic query). */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Keyset pagination page param — `{}` requests the initial offset-0 page. */
 type EventsPageParam = { after?: string; before?: string };
@@ -90,9 +124,7 @@ function cursorParam(cursor: [string, string] | null): string | undefined {
  *  "ids"  — explicit per-row selection (IDs of in-memory events).
  *  "all"  — all events matching the current filter (resolved server-side).
  */
-type SelectionState =
-  | { mode: "ids"; ids: Set<string> }
-  | { mode: "all" };
+type SelectionState = { mode: "ids"; ids: Set<string> } | { mode: "all" };
 
 export function ExplorerPage() {
   const { caseId, timelineId } = useParams<{
@@ -182,14 +214,23 @@ export function ExplorerPage() {
         // `appliedIds` defaults to null (setAppliedIds(null) above clears it);
         // a finding-apply overrides it — along with collapse/run id — through
         // `overrides`, since those setters haven't committed yet at this point.
-        const nextEffective = computeEffectiveFilters(paramsToFilters(nextParams), {
-          anomalyRunId: anomalyRunIdRef.current,
-          appliedIds: null,
-          semanticSearchIds: semanticSearchIdsRef.current,
-          collapseRoutine: collapseRoutineRef.current,
-          ...overrides,
-        });
-        const targetKey = ["events", caseId, timelineId, nextEffective, sortDir];
+        const nextEffective = computeEffectiveFilters(
+          paramsToFilters(nextParams),
+          {
+            anomalyRunId: anomalyRunIdRef.current,
+            appliedIds: null,
+            semanticSearchIds: semanticSearchIdsRef.current,
+            collapseRoutine: collapseRoutineRef.current,
+            ...overrides,
+          },
+        );
+        const targetKey = [
+          "events",
+          caseId,
+          timelineId,
+          nextEffective,
+          sortDir,
+        ];
         queryClient.cancelQueries({ queryKey: targetKey }).then(async () => {
           if (softAnchorSeqRef.current !== seq) return;
           const anchorPage = await eventsApi.list(
@@ -218,7 +259,9 @@ export function ExplorerPage() {
             queryClient.invalidateQueries({ queryKey: targetKey });
             return;
           }
-          const anchorPageParam: EventsPageParam = { before: cursorParam(anchorPage.prev_cursor) };
+          const anchorPageParam: EventsPageParam = {
+            before: cursorParam(anchorPage.prev_cursor),
+          };
           queryClient.setQueryData(targetKey, {
             pages: [anchorPage],
             pageParams: [anchorPageParam],
@@ -245,69 +288,7 @@ export function ExplorerPage() {
 
   const removeFilter = useCallback(
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
-      const f = { ...filters };
-      if (key === "filters" && fieldKey) {
-        if (value !== undefined) {
-          const remaining = (f.filters?.[fieldKey] ?? []).filter((v) => v !== value);
-          if (remaining.length === 0) {
-            const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
-            f.filters = rest;
-            f.filterModes = dropMode(f.filterModes, fieldKey);
-          } else {
-            f.filters = { ...(f.filters ?? {}), [fieldKey]: remaining };
-          }
-        } else {
-          const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
-          f.filters = rest;
-          f.filterModes = dropMode(f.filterModes, fieldKey);
-        }
-      } else if (key === "exclusions" && fieldKey) {
-        if (value !== undefined) {
-          const remaining = (f.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
-          if (remaining.length === 0) {
-            const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
-            f.exclusions = rest;
-            f.exclusionModes = dropMode(f.exclusionModes, fieldKey);
-          } else {
-            f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: remaining };
-          }
-        } else {
-          const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
-          f.exclusions = rest;
-          f.exclusionModes = dropMode(f.exclusionModes, fieldKey);
-        }
-      } else if (key === "artifacts") {
-        const remaining = value !== undefined
-          ? (f.artifacts ?? []).filter((a) => a !== value)
-          : [];
-        if (remaining.length > 0) f.artifacts = remaining;
-        else delete f.artifacts;
-      } else if (key === "tagsInclude") {
-        const remaining = value !== undefined
-          ? (f.tagsInclude ?? []).filter((t) => t !== value)
-          : [];
-        if (remaining.length > 0) f.tagsInclude = remaining;
-        else delete f.tagsInclude;
-      } else if (key === "tagsExclude") {
-        const remaining = value !== undefined
-          ? (f.tagsExclude ?? []).filter((t) => t !== value)
-          : [];
-        if (remaining.length > 0) f.tagsExclude = remaining;
-        else delete f.tagsExclude;
-      } else if (key === "annotated") {
-        const remaining = value !== undefined
-          ? (f.annotated ?? []).filter((t) => t !== value)
-          : [];
-        if (remaining.length > 0) {
-          f.annotated = remaining as ("tag" | "anomaly")[];
-        } else {
-          delete f.annotated;
-          delete f.annotationTagValue;
-        }
-      } else {
-        delete f[key as keyof EventFilters];
-      }
-      setFilters(f);
+      setFilters(removeFilterEntry(filters, key, fieldKey, value));
     },
     [filters, setFilters],
   );
@@ -324,12 +305,16 @@ export function ExplorerPage() {
   );
 
   /** Wired to the detail panel's per-field histogram button. */
-  const [fieldHistogram, setFieldHistogram] = useState<{ fieldKey: string; value: string } | null>(
-    null,
+  const [fieldHistogram, setFieldHistogram] = useState<{
+    fieldKey: string;
+    value: string;
+  } | null>(null);
+  const handleShowFieldHistogram = useCallback(
+    (fieldKey: string, value: string) => {
+      setFieldHistogram({ fieldKey, value });
+    },
+    [],
   );
-  const handleShowFieldHistogram = useCallback((fieldKey: string, value: string) => {
-    setFieldHistogram({ fieldKey, value });
-  }, []);
 
   /** Maps an anomaly-finding field token to a filter-rail filterKey. */
   const mapAnomalyField = mapFieldTokenToFilterKey;
@@ -337,7 +322,9 @@ export function ExplorerPage() {
   /** Wired to ValueNoveltyView — sets a field=value filter from a rare-value finding. */
   const handleDrillField = useCallback(
     (field: string, value: string) => {
-      setFilters(applyFieldFilter(filters, mapAnomalyField(field), value, true));
+      setFilters(
+        applyFieldFilter(filters, mapAnomalyField(field), value, true),
+      );
     },
     [filters, setFilters, mapAnomalyField],
   );
@@ -383,10 +370,12 @@ export function ExplorerPage() {
   );
 
   // ── Panel visibility state ────────────────────────────────────────────
+  const investigatePanelWidth = useUiStore((s) => s.investigatePanelWidth);
   const filterRailOpen = useUiStore((s) => s.filterRailOpen);
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
   const investigatePanelOpen = useUiStore((s) => s.investigatePanelOpen);
   const setInvestigatePanelOpen = useUiStore((s) => s.setInvestigatePanelOpen);
+  const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
   // Agent panel: only offered when the backend probe says the agent exists —
   // an unconfigured install renders zero agent UI.
   const agentAvailable = useHealth().data?.agent_available ?? false;
@@ -397,10 +386,25 @@ export function ExplorerPage() {
     if (event) tourEvent("event-expanded");
     setExpandedEvent(event);
   }, []);
-  const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
+  const [selection, setSelection] = useState<SelectionState>({
+    mode: "ids",
+    ids: new Set(),
+  });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
+  /** What the Investigate overlay is showing, if anything. */
+  const [sheet, setSheet] = useState<
+    | { kind: "finding"; method: MethodId; rank: number }
+    | { kind: "method"; method: MethodId; autorun?: boolean }
+    | {
+        kind: "tools";
+        section?: "methods" | "signatures" | "explore" | "scope";
+      }
+    | null
+  >(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
-  const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
+  const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(
+    undefined,
+  );
   // Agent-applied event_id allowlist (a finding's `event_ids`). Session
   // overlay, never URL-serialized — same category as anomalyRunId/semantic
   // ids. Cleared by any manual filter change (see setFilters); re-set by
@@ -426,7 +430,9 @@ export function ExplorerPage() {
   // Scroll position feeds TimelineHistogram only, via a store subscribed
   // solely by that component (C15) — not page state, so scrolling doesn't
   // re-render EventGrid/FilterRail/InvestigatePanel on every row crossed.
-  const setCurrentPositionTs = useScrollPositionStore((s) => s.setCurrentPositionTs);
+  const setCurrentPositionTs = useScrollPositionStore(
+    (s) => s.setCurrentPositionTs,
+  );
   // Active baseline definition → histogram bands + detector windows. Fetched
   // here (once) so the histogram and detector views share one source of truth.
   const { data: baselinesData } = useQuery({
@@ -447,8 +453,13 @@ export function ExplorerPage() {
   // breadcrumb's only producer (jump-to-time keeps the analyst's filters now,
   // so it has nothing to restore). `rangeHighlight` is purely visual (a
   // Frequency finding's anomalous window), never a URL filter.
-  const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(null);
-  const [rangeHighlight, setRangeHighlight] = useState<{ start: string; end: string } | null>(null);
+  const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(
+    null,
+  );
+  const [rangeHighlight, setRangeHighlight] = useState<{
+    start: string;
+    end: string;
+  } | null>(null);
   // When a "locate"/jump target is only visible because we force-included it
   // (it would otherwise be hidden by the current view — a routine/mute
   // collapse or an active filter), its id lands here so the grid can render it
@@ -457,14 +468,19 @@ export function ExplorerPage() {
   // events makes the claim false), and whenever a jump targets an event the
   // current view already shows.
   const [locatedHiddenId, setLocatedHiddenId] = useState<string | null>(null);
-  const pendingJumpRef = useRef<{ ts: string; eventId?: string; seq: number } | null>(null);
+  const pendingJumpRef = useRef<{
+    ts: string;
+    eventId?: string;
+    seq: number;
+  } | null>(null);
   // Bumped on every jump; the pending-jump effect only trusts `events` once
   // `seededSeqRef` catches up, so a stray automatic fetch landing mid-jump
   // (or a second jump superseding the first) can't be mistaken for "ready".
   const jumpSeqRef = useRef(0);
   const seededSeqRef = useRef(0);
   const tlKey = `${caseId}/${timelineId}`;
-  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
+  const setVisibleColumns = useUiStore((s) => s.setVisibleColumns);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
   const setHistogramOpen = useUiStore((s) => s.setHistogramOpen);
   const setSortDir = useUiStore((s) => s.setSortDir);
@@ -480,7 +496,99 @@ export function ExplorerPage() {
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
+    // A column suggestion runs as a background job (issue #213) — poll while
+    // one is in flight so the grid re-lays out on its own. The timeline is
+    // never blocked on it: until it lands, the built-in defaults render. The
+    // interval widens with the job's age (see `suggestionPollInterval`), since
+    // a job still running after two minutes is not one a three-second poll
+    // catches any sooner.
+    refetchInterval: (query) =>
+      suggestionPollInterval(query.state.data?.recommended_columns),
   });
+
+  // Precedence: the analyst's own choice, then the timeline's suggestion, then
+  // the built-in defaults. See lib/columns.ts.
+  const visibleColumns = useMemo(
+    () => resolveVisibleColumns(storedColumns, timeline?.recommended_columns),
+    [storedColumns, timeline?.recommended_columns],
+  );
+  const suggestionRunning = isSuggesting(timeline?.recommended_columns);
+  // "Your grid is showing suggested columns" is only true while the analyst
+  // hasn't overridden them — once they pick their own, the notice is noise.
+  const showingSuggestion =
+    !storedColumns && hasSuggestion(timeline?.recommended_columns);
+
+  // Only needed for the access level: recomputing the column suggestion
+  // changes what the timeline opens on for everyone, so it is a contribute
+  // action, not a read one.
+  const { data: case_ } = useQuery({
+    queryKey: ["case", caseId],
+    queryFn: () => casesApi.get(caseId!),
+    enabled: !!caseId,
+  });
+  const canRecommendColumns = case_ ? canContributeToCase(case_) : false;
+
+  // ── The one-time AI column offer (issue #213) ──────────────────────────
+  // A timeline opens on locally-scored columns, always — that is the part
+  // that never sends anything. Whether the model gets to re-rank them is a
+  // question only the analyst can answer, and it was previously buried in the
+  // Columns popover: the common path (create a timeline, open it) landed on
+  // the heuristic answer with nothing saying a better one was available.
+  //
+  // So it is asked once per timeline, on first open, by whoever can act on it
+  // — and the answer is recorded either way, so "no" is as final as "yes".
+  // Deliberately not at creation time: a timeline built by an ingest never
+  // passes that dialog, and those are the ones an analyst opens first.
+  const columnAdvisor = useColumnRecommendation(caseId!, timelineId!);
+  const [advisorOfferOpen, setAdvisorOfferOpen] = useState(false);
+  const offeredFor = useRef<string | null>(null);
+  const recommendation = timeline?.recommended_columns;
+  useEffect(() => {
+    if (!timelineId || offeredFor.current === timelineId) return;
+    // Every condition has to hold before the question is worth asking: the
+    // model has to exist, the analyst has to be able to act on the answer,
+    // there has to be a local suggestion for it to re-rank, and nobody may
+    // have answered already. A run in flight waits — its result may make the
+    // offer moot.
+    if (!agentAvailable || !canRecommendColumns) return;
+    if (!recommendation || recommendation.status !== "ok") return;
+    if (recommendation.method !== "heuristic") return;
+    if (hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)) return;
+    offeredFor.current = timelineId;
+    setAdvisorOfferOpen(true);
+  }, [
+    timelineId,
+    agentAvailable,
+    canRecommendColumns,
+    recommendation,
+    columnAdvisor.preferences,
+  ]);
+
+  // Closing without confirming is an answer too, and recorded as one — an
+  // offer that returns on every visit is one people learn to dismiss unread.
+  //
+  // Never while the opt-in is in flight, though: that write is recording
+  // "yes", and a "no" racing it could win and leave the consent record
+  // contradicting the request the analyst authorized. `ColumnAdvisorNotice`
+  // refuses to close at all while pending, so this is the second lock on the
+  // same door — and the one that survives a future dialog that does not.
+  const closeAdvisorOffer = useCallback(
+    (open: boolean) => {
+      if (!open && columnAdvisor.optInPending) return;
+      setAdvisorOfferOpen(open);
+      if (
+        !open &&
+        timelineId &&
+        !hasAnsweredColumnAdvisor(columnAdvisor.preferences, timelineId)
+      ) {
+        columnAdvisor.decline.mutate();
+      }
+    },
+    [timelineId, columnAdvisor],
+  );
+  useEffect(() => {
+    if (columnAdvisor.optInAndRecommend.isSuccess) setAdvisorOfferOpen(false);
+  }, [columnAdvisor.optInAndRecommend.isSuccess]);
 
   const { data: timelineSources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
@@ -496,7 +604,8 @@ export function ExplorerPage() {
   // Sources still ingesting are excluded from every query by the backend
   // (events._resolve_timeline_scope) — surface that so partial results are
   // never mistaken for complete ones.
-  const ingestingSources = timelineSources?.filter((s) => s.status !== "ready") ?? [];
+  const ingestingSources =
+    timelineSources?.filter((s) => s.status !== "ready") ?? [];
 
   // Semantic search only runs when the analyst deliberately picked Semantic
   // mode in the filter rail — keyword (the default) never silently becomes
@@ -504,13 +613,26 @@ export function ExplorerPage() {
   // the URL. `filters.q` stays URL-shareable and drives the broadened keyword
   // search server-side while semantic results are loading or unavailable.
   const semanticMode = filters.qMode === "semantic";
-  const { data: semanticSearchData, isFetching: semanticSearchPending } = useQuery({
-    queryKey: ["search-filter", caseId, timelineId, filters.q],
-    queryFn: () => similarityApi.semanticSearch(caseId!, filters.q!, 200, timelineId),
-    enabled: !!(caseId && timelineId && hasVectors && filters.q && semanticMode),
-  });
+  const { data: semanticSearchData, isFetching: semanticSearchPending } =
+    useQuery({
+      queryKey: ["search-filter", caseId, timelineId, filters.q],
+      queryFn: () =>
+        similarityApi.semanticSearch(caseId!, filters.q!, 200, timelineId),
+      enabled: !!(
+        caseId &&
+        timelineId &&
+        hasVectors &&
+        filters.q &&
+        semanticMode
+      ),
+    });
   const semanticSearchIds = useMemo(() => {
-    if (!filters.q || !semanticMode || !hasVectors || semanticSearchData?.status !== "ok") {
+    if (
+      !filters.q ||
+      !semanticMode ||
+      !hasVectors ||
+      semanticSearchData?.status !== "ok"
+    ) {
       return null;
     }
     return semanticSearchData.results.map((r) => r.event_id);
@@ -615,7 +737,13 @@ export function ExplorerPage() {
     [filters, anomalyRunId, appliedIds, semanticSearchIds, collapseRoutine],
   );
 
-  const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
+  const eventsQueryKey = [
+    "events",
+    caseId,
+    timelineId,
+    effectiveFilters,
+    sortDir,
+  ];
 
   // When the last ingesting source flips to ready the backend starts
   // including it in query scope — refetch the grid and histogram so the new
@@ -624,8 +752,22 @@ export function ExplorerPage() {
   const prevIngestingCount = useRef(ingestingCount);
   useEffect(() => {
     if (prevIngestingCount.current > 0 && ingestingCount === 0) {
-      queryClient.invalidateQueries({ queryKey: ["events", caseId, timelineId] });
-      queryClient.invalidateQueries({ queryKey: ["histogram", caseId, timelineId] });
+      queryClient.invalidateQueries({
+        queryKey: ["events", caseId, timelineId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["histogram", caseId, timelineId],
+      });
+      // The same moment schedules a fresh column suggestion server-side
+      // (issue #213). Refetch the timeline to pick up its `running` status —
+      // otherwise nothing is polling and the new suggestion only appears on
+      // the next navigation.
+      queryClient.invalidateQueries({
+        queryKey: ["timeline", caseId, timelineId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["fields", caseId, timelineId],
+      });
     }
     prevIngestingCount.current = ingestingCount;
   }, [ingestingCount, caseId, timelineId, queryClient]);
@@ -688,7 +830,8 @@ export function ExplorerPage() {
     refetchInterval: 30_000,
   });
 
-  const routineCollapsedCount = eventsData?.pages?.[0]?.routine_collapsed_count ?? 0;
+  const routineCollapsedCount =
+    eventsData?.pages?.[0]?.routine_collapsed_count ?? 0;
   // Timeline-wide event total (ready sources only) — denominator for the
   // routine-collapse stat; matches routine_collapsed_count's timeline-wide scope.
   const timelineTotal = useMemo(
@@ -775,13 +918,17 @@ export function ExplorerPage() {
     return m;
   }, [anomalyMarkers]);
 
-  const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
+  const events = useMemo(
+    () => eventsData?.pages.flatMap((p) => p.events) ?? [],
+    [eventsData],
+  );
   // Only the initial, uncursored page carries a real COUNT(*) — later pages
   // (forward, backward, or a jump-to-time seek) return `total: null`. Keep it
   // `null` rather than defaulting to 0 — a jump-to-time session may never load
   // an offset-mode page, and 0 would read as "no matching events" when the
   // true count is simply unknown.
-  const pageTotal = eventsData?.pages.find((p) => p.total != null)?.total ?? null;
+  const pageTotal =
+    eventsData?.pages.find((p) => p.total != null)?.total ?? null;
 
   // A cursor-only session (jump-to-time seek, or paging past the first page
   // before an offset page ever loaded) has no `pageTotal`. Fetch the true match
@@ -791,7 +938,8 @@ export function ExplorerPage() {
   // thinking only the visible page matches the filter (regression #163-followup).
   const { data: countData } = useQuery({
     queryKey: ["events-count", caseId, timelineId, effectiveFilters],
-    queryFn: ({ signal }) => eventsApi.count(caseId!, timelineId!, effectiveFilters, signal),
+    queryFn: ({ signal }) =>
+      eventsApi.count(caseId!, timelineId!, effectiveFilters, signal),
     enabled: !!(caseId && timelineId) && pageTotal === null && !eventsLoading,
   });
   const total = pageTotal ?? countData?.total ?? null;
@@ -805,7 +953,8 @@ export function ExplorerPage() {
   }, [selection, events]);
 
   // Total count shown in BulkActionBar label
-  const selectionCount = selection.mode === "all" ? (total ?? events.length) : selection.ids.size;
+  const selectionCount =
+    selection.mode === "all" ? (total ?? events.length) : selection.ids.size;
 
   // Show the "select all N matching" banner when all loaded rows are in "ids"
   // mode selection and there are more events not yet loaded.
@@ -828,7 +977,11 @@ export function ExplorerPage() {
 
   const handleToggleSelectAll = useCallback(() => {
     setSelection((prev) => {
-      if (prev.mode === "ids" && prev.ids.size === events.length && events.length > 0) {
+      if (
+        prev.mode === "ids" &&
+        prev.ids.size === events.length &&
+        events.length > 0
+      ) {
         // All loaded are selected → deselect all
         return { mode: "ids", ids: new Set() };
       }
@@ -845,10 +998,16 @@ export function ExplorerPage() {
     if (!isFetching && hasPreviousPage) fetchPreviousPage();
   }, [isFetching, hasPreviousPage, fetchPreviousPage]);
 
-  const handleFindSimilar = useCallback((event: Event) => {
-    setSimilarAnchor(event);
-    setInvestigatePanelOpen(true);
-  }, [setInvestigatePanelOpen]);
+  const handleFindSimilar = useCallback(
+    (event: Event) => {
+      setSimilarAnchor(event);
+      // Similarity lives in the Tools sheet's Explore section — open it there,
+      // or this anchor would be set and never shown.
+      setInvestigatePanelOpen(true);
+      setSheet({ kind: "tools", section: "explore" });
+    },
+    [setInvestigatePanelOpen],
+  );
 
   const handleHistogramRange = useCallback(
     (start: string, end: string) => {
@@ -898,7 +1057,13 @@ export function ExplorerPage() {
       // Seed the *current* key (filters kept). Cancel any in-flight pagination
       // fetch on it first, or it can resolve after the setQueryData below and
       // clobber the anchor page.
-      const targetKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
+      const targetKey = [
+        "events",
+        caseId,
+        timelineId,
+        effectiveFilters,
+        sortDir,
+      ];
       await queryClient.cancelQueries({ queryKey: targetKey });
 
       let anchorPage: EventPage;
@@ -912,31 +1077,32 @@ export function ExplorerPage() {
         // collapse + field filters) tells us whether to flag it hidden.
         const inAllowlist =
           !effectiveFilters.ids || effectiveFilters.ids.includes(eventId);
-        const [targetEvent, beforePage, afterPage, probePage] = await Promise.all([
-          eventsApi.getById(caseId, timelineId, eventId),
-          eventsApi.list(
-            caseId,
-            timelineId,
-            { ...effectiveFilters, limit: halfBefore, order: sortDir },
-            undefined,
-            { before: `${ts},${eventId}` },
-          ),
-          eventsApi.list(
-            caseId,
-            timelineId,
-            { ...effectiveFilters, limit: halfAfter, order: sortDir },
-            undefined,
-            { after: `${ts},${eventId}` },
-          ),
-          inAllowlist
-            ? eventsApi.list(caseId, timelineId, {
-                ...effectiveFilters,
-                ids: [eventId],
-                limit: 1,
-                order: sortDir,
-              })
-            : Promise.resolve(null),
-        ]);
+        const [targetEvent, beforePage, afterPage, probePage] =
+          await Promise.all([
+            eventsApi.getById(caseId, timelineId, eventId),
+            eventsApi.list(
+              caseId,
+              timelineId,
+              { ...effectiveFilters, limit: halfBefore, order: sortDir },
+              undefined,
+              { before: `${ts},${eventId}` },
+            ),
+            eventsApi.list(
+              caseId,
+              timelineId,
+              { ...effectiveFilters, limit: halfAfter, order: sortDir },
+              undefined,
+              { after: `${ts},${eventId}` },
+            ),
+            inAllowlist
+              ? eventsApi.list(caseId, timelineId, {
+                  ...effectiveFilters,
+                  ids: [eventId],
+                  limit: 1,
+                  order: sortDir,
+                })
+              : Promise.resolve(null),
+          ]);
         hidden = inAllowlist ? (probePage?.events.length ?? 0) === 0 : true;
         const combinedEvents = [
           ...beforePage.events,
@@ -1053,8 +1219,12 @@ export function ExplorerPage() {
     if (!filters.q) return undefined;
     if (!semanticMode) {
       // Surface a server-side regex rejection (400) right under the box.
-      if (filters.qRegex && eventsError && eventsQueryError instanceof Error
-          && eventsQueryError.message.includes("invalid regular expression")) {
+      if (
+        filters.qRegex &&
+        eventsError &&
+        eventsQueryError instanceof Error &&
+        eventsQueryError.message.includes("invalid regular expression")
+      ) {
         return eventsQueryError.message;
       }
       return filters.qRegex ? "regex search" : undefined;
@@ -1117,9 +1287,7 @@ export function ExplorerPage() {
     pendingSoftAnchorRef.current = null;
   }, [events]);
 
-  const hasActiveFilters = Object.values(filters).some((v) =>
-    v && (typeof v === "string" ? v.length > 0 : Object.keys(v).length > 0),
-  );
+  const filtersActive = hasActiveFilters(filters);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1129,7 +1297,12 @@ export function ExplorerPage() {
           filters={filters}
           onChange={setFilters}
           views={views ?? []}
-          onApplyView={setFilters}
+          onApplyView={(f, columns) => {
+            setFilters(f);
+            // A view saved before layouts were stored carries none, and must
+            // leave the analyst's current columns alone rather than blank them.
+            if (columns) setVisibleColumns(tlKey, columns);
+          }}
           onSaveView={() => setSaveViewOpen(true)}
           onClose={() => setFilterRailOpen(false)}
           mergedTagSuggestions={mergedTagSuggestions}
@@ -1149,14 +1322,24 @@ export function ExplorerPage() {
         {/* Toolbar */}
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-1.5">
           {/* Filter rail toggle */}
-          <Tooltip content={filterRailOpen ? "Hide filter panel" : "Show filter panel"}>
+          <Tooltip
+            content={filterRailOpen ? "Hide filter panel" : "Show filter panel"}
+          >
             <Button
               variant="ghost"
               size="icon"
               onClick={() => setFilterRailOpen(!filterRailOpen)}
-              className={hasActiveFilters && !filterRailOpen ? "text-[var(--color-accent)]" : ""}
+              className={
+                filtersActive && !filterRailOpen
+                  ? "text-[var(--color-accent)]"
+                  : ""
+              }
             >
-              {filterRailOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
+              {filterRailOpen ? (
+                <PanelLeftClose size={15} />
+              ) : (
+                <PanelLeftOpen size={15} />
+              )}
             </Button>
           </Tooltip>
 
@@ -1172,7 +1355,12 @@ export function ExplorerPage() {
 
           {/* Right-side actions */}
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-            {collapseRoutine && (
+            {/* Only when something is actually hidden. The chip exists because
+                hiding events may never be silent — at a count of zero it
+                announces nothing and reads as clutter ("0 routine events
+                hidden (0.0% of timeline)"). The collapse toggle beside it
+                still shows the mode is on, so nothing goes undisclosed. */}
+            {collapseRoutine && routineCollapsedCount > 0 && (
               <RoutineCollapseStat
                 count={routineCollapsedCount}
                 timelineTotal={timelineTotal}
@@ -1207,7 +1395,9 @@ export function ExplorerPage() {
               </Tooltip>
             )}
 
-            <Tooltip content={histogramOpen ? "Hide histogram" : "Show histogram"}>
+            <Tooltip
+              content={histogramOpen ? "Hide histogram" : "Show histogram"}
+            >
               <Button
                 variant={histogramOpen ? "accent" : "ghost"}
                 size="icon"
@@ -1224,10 +1414,31 @@ export function ExplorerPage() {
               total={total}
             />
 
-            <ColumnPicker caseId={caseId!} timelineId={timelineId!} />
+            <ColumnPicker
+              caseId={caseId!}
+              timelineId={timelineId!}
+              recommended={timeline?.recommended_columns}
+              canRecommend={canRecommendColumns}
+            />
+            {/* Asked once per timeline, on first open. Same dialog and same
+                consent record as the Columns popover's own button — the two
+                share `useColumnRecommendation`, so neither can send anything
+                the other would not have. */}
+            <ColumnAdvisorNotice
+              open={advisorOfferOpen}
+              onOpenChange={closeAdvisorOffer}
+              onConfirm={() => columnAdvisor.optInAndRecommend.mutate()}
+              pending={columnAdvisor.optInPending}
+              error={columnAdvisor.optInError}
+            />
 
             <Tooltip content="Open the full visualization page">
-              <Button variant="outline" size="sm" asChild data-tour="visualize-link">
+              <Button
+                variant="outline"
+                size="sm"
+                asChild
+                data-tour="visualize-link"
+              >
                 <Link to={`visualize?${searchParams.toString()}`}>
                   <AreaChart size={13} />
                   Visualize
@@ -1235,9 +1446,19 @@ export function ExplorerPage() {
               </Button>
             </Tooltip>
 
-            <Tooltip content={investigatePanelOpen ? "Close Investigate panel" : "Open Investigate panel"}>
+            <Tooltip
+              content={
+                investigatePanelOpen
+                  ? "Close Investigate panel"
+                  : "Open Investigate panel"
+              }
+            >
               <Button
-                variant={investigatePanelOpen || activeBaselineId ? "accent" : "outline"}
+                variant={
+                  investigatePanelOpen || activeBaselineId
+                    ? "accent"
+                    : "outline"
+                }
                 size="sm"
                 onClick={() => setInvestigatePanelOpen(!investigatePanelOpen)}
               >
@@ -1247,7 +1468,13 @@ export function ExplorerPage() {
             </Tooltip>
 
             {agentAvailable && (
-              <Tooltip content={agentPanelOpen ? "Close Agent panel" : "Ask the AI agent to investigate"}>
+              <Tooltip
+                content={
+                  agentPanelOpen
+                    ? "Close Agent panel"
+                    : "Ask the AI agent to investigate"
+                }
+              >
                 <Button
                   variant={agentPanelOpen ? "accent" : "outline"}
                   size="sm"
@@ -1273,10 +1500,25 @@ export function ExplorerPage() {
             highlightRange={rangeHighlight}
             baselineWindows={activeBaselineWindows}
             markMode={baselineMarkMode}
-            onMarkModeChange={setBaselineMarkMode}
+            onMarkModeChange={(next) => {
+              setBaselineMarkMode(next);
+              // Marking is only ever for building a baseline, so pull the
+              // analyst to where that happens. Deliberately not opening the
+              // sheet yet: it would cover the histogram they are about to
+              // drag on.
+              if (next) setInvestigatePanelOpen(true);
+            }}
             onMarkRange={(start, end) => {
               setBaselinePendingRange({ start, end });
+              // The brushed range has to land somewhere the analyst can see.
+              // BaselineBuilderDrawer mounts inside the Tools sheet, so open
+              // Investigate at Scope — otherwise marking on the histogram sets
+              // a pending range that nothing ever renders.
               setInvestigatePanelOpen(true);
+              setSheet({ kind: "tools", section: "scope" });
+              // The drawer is the only consumer of pendingRange and it mounts
+              // closed, so opening the sheet is not enough on its own.
+              setBaselineBuilderOpen(true);
             }}
           />
         )}
@@ -1284,7 +1526,10 @@ export function ExplorerPage() {
         {/* Context-query breadcrumb — a ±window replaced the analyst's filters */}
         {preJumpFilters && (
           <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
-            <span>Showing a context window around this event — your filters were replaced.</span>
+            <span>
+              Showing a context window around this event — your filters were
+              replaced.
+            </span>
             <button
               className="font-semibold text-[var(--color-accent)] hover:underline"
               onClick={handleBackToFiltered}
@@ -1307,6 +1552,34 @@ export function ExplorerPage() {
           </div>
         )}
 
+        {/* Column suggestion (issue #213) — never blocks the grid; the built-in
+            defaults render until the job lands. aria-live so the swap is
+            announced rather than silently re-laying out the table. */}
+        {(suggestionRunning || showingSuggestion) && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border-subtle)] px-3 py-1 text-xs text-[var(--color-fg-muted)]"
+          >
+            {suggestionRunning ? (
+              <>
+                <Spinner size={11} />
+                <span>
+                  Suggesting columns from this timeline&rsquo;s data&hellip;
+                </span>
+              </>
+            ) : (
+              <>
+                <Columns3 size={11} />
+                <span>
+                  Showing columns suggested from this timeline&rsquo;s data —
+                  change them from the Columns menu.
+                </span>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Main area */}
         <div className="flex flex-1 min-h-0 overflow-hidden">
           {eventsLoading && !eventsData ? (
@@ -1315,31 +1588,42 @@ export function ExplorerPage() {
             </div>
           ) : eventsError ? (
             <div className="flex flex-1 items-center justify-center">
-              <p className="text-sm text-[var(--color-danger)]">Failed to load events</p>
+              <p className="text-sm text-[var(--color-danger)]">
+                Failed to load events
+              </p>
             </div>
           ) : (
             <div className="flex flex-1 min-w-0 flex-col overflow-hidden">
               {/* Select-all-matching-filter notice */}
               {showSelectAllBanner && (
                 <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent)] px-3 py-1 text-xs text-[var(--color-accent-fg)]">
-                  <span className="font-medium">All {events.length.toLocaleString()} loaded events selected.</span>
+                  <span className="font-medium">
+                    All {events.length.toLocaleString()} loaded events selected.
+                  </span>
                   <button
                     className="font-semibold underline hover:no-underline"
                     onClick={() => setSelection({ mode: "all" })}
                   >
-                    Select all {total !== null ? `${total.toLocaleString()} ` : ""}matching this
-                    filter
+                    Select all{" "}
+                    {total !== null ? `${total.toLocaleString()} ` : ""}matching
+                    this filter
                   </button>
                   <span className="opacity-50">·</span>
                   <button
                     className="opacity-70 hover:opacity-100"
-                    onClick={() => setSelection({ mode: "ids", ids: new Set() })}
+                    onClick={() =>
+                      setSelection({ mode: "ids", ids: new Set() })
+                    }
                   >
                     Clear
                   </button>
                 </div>
               )}
-              <div className="flex flex-1 min-h-0 overflow-hidden">
+              {/* `relative` is load-bearing: it is the containing block the
+                  InvestigateSheet resolves its `absolute` against. Without it
+                  the sheet and its scrim fall back to the viewport, covering
+                  the top bar and swallowing every click in the app. */}
+              <div className="relative flex flex-1 min-h-0 overflow-hidden">
                 {/* Event grid — always present, fills all available width */}
                 <EventGrid
                   ref={gridRef}
@@ -1358,8 +1642,13 @@ export function ExplorerPage() {
                   hasNextPage={!!hasNextPage}
                   isFetching={isFetching}
                   visibleColumns={visibleColumns}
+                  // Writes the same per-timeline override a manual column
+                  // choice writes, so the precedence in lib/columns.ts holds.
+                  onReorderColumns={(next) => setVisibleColumns(tlKey, next)}
                   sortDir={sortDir}
-                  onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
+                  onSortToggle={() =>
+                    setSortDir(sortDir === "desc" ? "asc" : "desc")
+                  }
                   liveAnomalies={liveAnomaliesByEvent}
                   dispositions={dispositionMap}
                   onVisibleTimestampChange={setCurrentPositionTs}
@@ -1371,8 +1660,12 @@ export function ExplorerPage() {
                 {expandedEvent && (
                   <EventDetailPanel
                     event={expandedEvent}
-                    annotations={annotationMap.get(expandedEvent.event_id) ?? []}
-                    liveFindings={liveAnomaliesByEvent.get(expandedEvent.event_id) ?? []}
+                    annotations={
+                      annotationMap.get(expandedEvent.event_id) ?? []
+                    }
+                    liveFindings={
+                      liveAnomaliesByEvent.get(expandedEvent.event_id) ?? []
+                    }
                     caseId={caseId!}
                     timelineId={timelineId!}
                     sourceId={expandedEvent.source_id}
@@ -1382,6 +1675,7 @@ export function ExplorerPage() {
                     onShowFieldHistogram={handleShowFieldHistogram}
                     onJumpToTime={handleJumpToTime}
                     onContextQuery={handleContextQuery}
+                    fieldMappings={timeline?.field_mappings}
                     tagSuggestions={tagSuggestions}
                   />
                 )}
@@ -1399,27 +1693,95 @@ export function ExplorerPage() {
                   />
                 )}
 
-                {/* Investigate panel (frame + detectors + windows & normality) */}
+                {/* Investigate: the rail is the ONLY fixed-width surface this
+                    flow spends. Its detail views render into the overlay sheet
+                    below, which is absolutely positioned and therefore cannot
+                    contribute to this row's minimum width. */}
                 {investigatePanelOpen && timeline && (
-                  <InvestigatePanel
+                  <div
+                    className="relative flex h-full min-w-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+                    style={{
+                      width: investigatePanelWidth,
+                      flex: `0 1 ${investigatePanelWidth}px`,
+                    }}
+                  >
+                    <RailResizeHandle />
+                    <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2.5">
+                      <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
+                        Investigate
+                      </h3>
+                      {/* Tools was only ever reachable sideways — through the
+                          scope strip, the skipped-methods summary, or an error
+                          message. Those all still land on their own section;
+                          this is the way in that does not require something to
+                          have gone wrong first. */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSheet({ kind: "tools" })}
+                        title="Methods, signatures, scope and pattern tools"
+                      >
+                        <Wrench size={12} />
+                        Tools
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => {
+                          setInvestigatePanelOpen(false);
+                          setSimilarAnchor(null);
+                          setBaselineMarkMode(false);
+                          setSheet(null);
+                        }}
+                        title="Close Investigate"
+                      >
+                        <X size={14} />
+                      </Button>
+                    </div>
+                    <div className="min-h-0 flex-1 overflow-y-auto p-3">
+                      <InvestigateRail
+                        caseId={caseId!}
+                        timelineId={timelineId!}
+                        onSelectFinding={(method, rank) =>
+                          setSheet({ kind: "finding", method, rank })
+                        }
+                        onOpenTools={(section) =>
+                          setSheet({ kind: "tools", section })
+                        }
+                        onSelectEvent={(ev) => handleExpandEvent(ev)}
+                        onJumpToTime={handleJumpToTime}
+                        onDrillField={handleDrillField}
+                        onAnomalyMarkers={setAnomalyMarkers}
+                        onComboDrill={handleComboDrill}
+                        onFrequencyDrill={handleFrequencyDrill}
+                        onTagFilter={handleTagDrill}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Investigate detail: one overlay, three modes. Absolutely
+                    positioned inside this stage, so it never joins the flex
+                    row and never widens it. */}
+                {investigatePanelOpen && timeline && sheet && (
+                  <InvestigateSheetHost
                     caseId={caseId!}
                     timelineId={timelineId!}
-                    hasVectors={hasVectors}
-                    similarAnchor={similarAnchor}
-                    onClose={() => {
-                      setInvestigatePanelOpen(false);
-                      setSimilarAnchor(null);
-                      setBaselineMarkMode(false);
-                    }}
-                    onSelectEvent={(ev) => handleExpandEvent(ev)}
-                    onSimilarClose={() => setSimilarAnchor(null)}
-                    onDrillField={handleDrillField}
-                    onComboDrill={handleComboDrill}
-                    onFrequencyDrill={handleFrequencyDrill}
-                    onAnomalyMarkers={setAnomalyMarkers}
-                    onAnomalyRunId={setAnomalyRunId}
-                    onJumpToTime={handleJumpToTime}
+                    railWidth={investigatePanelWidth}
+                    sheet={sheet}
+                    onClose={() => setSheet(null)}
+                    onOpenMethod={(method: MethodId) =>
+                      setSheet({ kind: "method", method })
+                    }
+                    onRunMethod={(method: MethodId) =>
+                      setSheet({ kind: "method", method, autorun: true })
+                    }
                     onTagFilter={handleTagDrill}
+                    onDrillField={handleDrillField}
+                    onJumpToTime={handleJumpToTime}
+                    similarAnchor={similarAnchor}
+                    onSimilarClose={() => setSimilarAnchor(null)}
+                    onSelectEvent={(ev) => handleExpandEvent(ev)}
                   />
                 )}
 
@@ -1437,7 +1799,9 @@ export function ExplorerPage() {
 
               {/* Bulk action bar */}
               <BulkActionBar
-                selectedEvents={events.filter((e) => selectedIds.has(e.event_id))}
+                selectedEvents={events.filter((e) =>
+                  selectedIds.has(e.event_id),
+                )}
                 selectionCount={selectionCount}
                 selectionMode={selection.mode}
                 caseId={caseId!}
@@ -1463,6 +1827,7 @@ export function ExplorerPage() {
         onClose={() => setSaveViewOpen(false)}
         caseId={caseId!}
         filters={filters}
+        visibleColumns={visibleColumns}
       />
     </div>
   );

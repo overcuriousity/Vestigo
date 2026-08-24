@@ -4,6 +4,7 @@ import { SHOW_DISMISSED_KEY } from "@/components/analysis/detector-hooks";
 import { DETECTORS, type DetectorId } from "@/components/analysis/detector-registry";
 import { dispositionsApi } from "@/api/dispositions";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
+import { useScopeParams } from "@/hooks/useAnalysisPlan";
 import { toast } from "@/stores/toasts";
 import type {
   AnomaliesResponse,
@@ -93,17 +94,20 @@ function markFindingsDismissed(data: AnomaliesResponse, t: DispositionTarget): A
 /** Flag (not drop) the findings a new confirmation covers — the row stays
  * visible with a durable confirmed badge, matching what a refetch returns.
  * Confirmed dispositions are always event-scoped, and the backend stamps
- * covered findings by `event_id` alone (`_apply_confirmations`) — so match
- * only on the event here too, never on the (field, value) key: several
- * findings can share one value key (e.g. multiple frequency windows of the
- * same series) and must not all light up from confirming one of them. */
+ * covered findings by `event_id` *within the request's scope*
+ * (`_apply_confirmations`) — so match only on the event here too, never on the
+ * (field, value) key: several findings can share one value key (e.g. multiple
+ * frequency windows of the same series) and must not all light up from
+ * confirming one of them. The verdict is written under the scope on screen, so
+ * the optimistic flag is in-scope by construction — and it clears any
+ * "confirmed elsewhere" marker, which this click has just answered. */
 function markFindingsConfirmed(data: AnomaliesResponse, t: DispositionTarget): AnomaliesResponse {
   if (!t.eventId) return data;
   let changed = false;
   const results = data.results.map((f) => {
     if (f.event_id !== t.eventId || f.confirmed) return f;
     changed = true;
-    return { ...f, confirmed: true };
+    return { ...f, confirmed: true, confirmed_other_scope: false };
   });
   return changed ? { ...data, results } : data;
 }
@@ -111,11 +115,11 @@ function markFindingsConfirmed(data: AnomaliesResponse, t: DispositionTarget): A
 const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string; hint: string }> = {
   normal: {
     title: (label) => `Marked normal — ${label}`,
-    hint: "Added to the known-normal list — matching findings suppressed in future scans. Manage under Windows & normality.",
+    hint: "Added to the known-normal list — matching findings suppressed in future scans. Take it back any time under Tools → Scope.",
   },
   dismissed: {
     title: (label) => `Dismissed — ${label}`,
-    hint: "Hidden as noise; detectors keep scoring it. Manage under Windows & normality.",
+    hint: "Hidden as noise; detectors keep scoring it. Take it back any time under Tools → Scope.",
   },
   confirmed: {
     title: (label) => `Confirmed — ${label}`,
@@ -149,6 +153,14 @@ const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string;
  */
 export function useDisposition(caseId: string, timelineId: string) {
   const qc = useQueryClient();
+  // Every verdict records the comparison it was reached under. Read from the
+  // same store the analysis requests read, so the stamp cannot drift from the
+  // scope the findings on screen were actually computed with.
+  const scopeParams = useScopeParams();
+  const analysisScope = {
+    frame: scopeParams.frame,
+    baseline_id: scopeParams.baseline_id ?? null,
+  };
   return useMutation({
     mutationFn: async (
       t: DispositionTarget,
@@ -161,6 +173,7 @@ export function useDisposition(caseId: string, timelineId: string) {
           detector: t.detector as Parameters<typeof anomaliesApi.persistFinding>[3]["detector"],
           content: t.content ?? "Manually confirmed finding",
           details: t.details ?? {},
+          analysis_scope: analysisScope,
         });
         return {};
       }
@@ -173,6 +186,7 @@ export function useDisposition(caseId: string, timelineId: string) {
           // routine needs the motif snapshot (details.values drives the
           // occurrence materialization server-side).
           details: t.kind === "routine" ? (t.details ?? null) : undefined,
+          analysis_scope: analysisScope,
         });
         return {
           dispositionId: res.disposition.id,
@@ -189,6 +203,7 @@ export function useDisposition(caseId: string, timelineId: string) {
         detector: t.detector,
         source_id: t.sourceId,
         event_id: t.eventId,
+        analysis_scope: analysisScope,
       });
       return { dispositionId: res.disposition.id };
     },
@@ -255,8 +270,7 @@ export function useDisposition(caseId: string, timelineId: string) {
               : filterFindings(data, t),
         );
       }
-      // The shared detector sweep (feeding FindingsFeed and the accordion's
-      // badges) lives under its own key, not the ["anomalies", …] prefix —
+      // The legacy shared detector sweep lives under its own key, not the ["anomalies", …] prefix —
       // without filtering it too, a verdict declared from the feed leaves the
       // row visibly untouched and reads as a dead button. Sweeps are always
       // fetched without include_dismissed, so plain removal matches a refetch.
@@ -306,7 +320,9 @@ export function useDisposition(caseId: string, timelineId: string) {
       };
       // Undo deletes the just-created disposition — the finding resurfaces on
       // the next refetch. Confirm has no undo here: it also persisted a system
-      // annotation, so undoing it is a deliberate act in the dispositions list.
+      // annotation, so undoing it is a deliberate act in the dispositions list
+      // under Tools → Scope. The toast is the *convenient* revert, never the
+      // only one — it lasts four seconds, and every kind is reversible there.
       const undo =
         data.dispositionId !== undefined
           ? {

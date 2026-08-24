@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from pathlib import Path
 
 import typer
 
 from vestigo import __version__
 from vestigo.cli.progress import BytesProgressPrinter
+from vestigo.core.config import get_settings
+from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.db.postgres import PostgresStore, User, generate_id
-from vestigo.ingestion.files import hash_file
+from vestigo.ingestion.files import copy_and_hash, hash_file
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
 app = typer.Typer(
@@ -26,6 +29,21 @@ app.add_typer(cases_app, name="cases")
 def _get_store() -> PostgresStore:
     """Return a PostgresStore instance for CLI operations."""
     return PostgresStore()
+
+
+async def _bootstrap(store: PostgresStore) -> None:
+    """Bring the schema up to date and apply the DB-backed settings layer.
+
+    The CLI mirrors what the API does, and that includes configuration: an
+    admin who tuned ``ingest_batch_size`` or an embedding endpoint in the web
+    console expects ``vestigo ingest`` to honour it. Without this the CLI would
+    silently run on the environment and the built-in defaults, which is a
+    different configuration than the one the deployment is showing its
+    operator. The store is passed explicitly so this never touches the API's
+    process-wide singleton (``api.deps.get_store``).
+    """
+    await store.init_schema()
+    await load_runtime_settings(store)
 
 
 @app.command()
@@ -45,7 +63,7 @@ def cases_list() -> None:
     store = _get_store()
 
     async def _run() -> None:
-        await store.init_schema()
+        await _bootstrap(store)
         cases = await store.list_cases()
         users = {u.id: u for u in await store.list_users()}
         teams = {t.id: t for t in await store.list_teams()}
@@ -105,6 +123,52 @@ async def _resolve_actor(store: PostgresStore, username: str | None) -> User:
     raise typer.Exit(code=1)
 
 
+async def _suggest_columns(store: PostgresStore, case_id: str, source_id: str, actor: User) -> None:
+    """Recompute recommended grid columns for the timelines holding *source_id*.
+
+    Awaited rather than spawned: the CLI is a one-shot process, so a
+    fire-and-forget task the way the API schedules it would be cancelled at
+    exit and the case would open on the built-in defaults for an operator who
+    only ever ingests from the command line. Best-effort — a suggestion is
+    never worth failing an ingest that already succeeded.
+
+    Local scoring only: ``run_column_recommendation_job`` defaults
+    ``use_llm=False``, so a CLI ingest never contacts a model endpoint.
+    """
+    from vestigo.columns.jobs import JOB_KIND, run_column_recommendation_job
+    from vestigo.core.jobs import JobStore
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    try:
+        timelines = await store.list_timelines_for_source(case_id, source_id)
+        if not timelines:
+            return
+        job_store = JobStore()
+        # One client for every timeline this source belongs to, rather than one
+        # connection per job — and opened only once there is a timeline to
+        # score, so a source belonging to none never pays a ClickHouse
+        # connection (nor reports a blip as a skipped suggestion).
+        ch_store = ClickHouseStore()
+        for timeline in timelines:
+            job = job_store.create(kind=JOB_KIND, case_id=case_id, created_by=actor.id)
+            await run_column_recommendation_job(
+                job_id=job.id,
+                case_id=case_id,
+                timeline_id=timeline.id,
+                job_store=job_store,
+                store=store,
+                ch_store=ch_store,
+                actor_id=actor.id,
+                actor_username=actor.username,
+            )
+            recommendation = (await store.get_timeline(case_id, timeline.id)) or timeline
+            columns = (recommendation.recommended_columns or {}).get("columns") or []
+            if columns:
+                typer.echo(f"Suggested columns for '{timeline.name}': {', '.join(columns)}")
+    except Exception as exc:  # noqa: BLE001 — advisory step, never fails the ingest
+        typer.echo(f"WARNING: column suggestion skipped ({exc})", err=True)
+
+
 @app.command()
 def ingest(
     path: str = typer.Argument(..., help="Path to log file or directory to ingest."),
@@ -143,7 +207,7 @@ def ingest(
     store = _get_store()
 
     async def _run() -> None:
-        await store.init_schema()
+        await _bootstrap(store)
         resolved_user = await _resolve_actor(store, user)
         case_obj = await store.get_case(case)
         if case_obj is None:
@@ -205,6 +269,7 @@ def ingest(
                 "via": "cli",
             },
         )
+        await _suggest_columns(store, case_obj.id, source_id, resolved_user)
 
         if result.errors:
             for error in result.errors:
@@ -237,7 +302,7 @@ def embed(
     store = _get_store()
 
     async def _run() -> None:
-        await store.init_schema()
+        await _bootstrap(store)
         resolved_user = await _resolve_actor(store, user)
         case_obj = await store.get_case(case)
         if case_obj is None:
@@ -280,6 +345,138 @@ def embed(
             for error in result.errors:
                 typer.echo(f"ERROR: {error}", err=True)
             raise typer.Exit(code=1)
+
+    asyncio.run(_run())
+
+
+# ── Generated converters ─────────────────────────────────────────────────
+
+converters_app = typer.Typer(help="Generated converter scripts (per case).")
+app.add_typer(converters_app, name="converters")
+
+
+@app.command("convert-ingest")
+def convert_ingest(
+    path: str = typer.Argument(..., help="Plain-text log file."),
+    case: str = typer.Option(..., "--case", "-c", help="Target case ID."),
+    hint: str | None = typer.Option(None, "--hint", help="Hint for the model about the data."),
+    converter: str | None = typer.Option(
+        None, "--converter", help="Reuse a saved converter script id instead of generating."
+    ),
+    user: str | None = typer.Option(
+        None,
+        "--user",
+        "-u",
+        help="Username to attribute this ingest to (default: the sole active admin, if unambiguous).",
+    ),
+) -> None:
+    """Let the configured model write a converter for PATH, run it, and ingest the result.
+
+    Same job the web upload dialog runs (docs/INPUT_FORMATS.md §"Generated
+    converters"); needs VESTIGO_CONVERTER_GENERATION_ENABLED and a reachable
+    agent endpoint.
+    """
+    from vestigo.converters.job import ConvertJobInputs, run_convert_ingest_job
+    from vestigo.core.jobs import JobStore
+
+    path_obj = Path(path).resolve()
+    if not path_obj.is_file():
+        typer.echo(f"ERROR: not a file: {path}", err=True)
+        raise typer.Exit(code=1)
+    store = _get_store()
+
+    async def _run() -> None:
+        await _bootstrap(store)
+        if not get_settings().converter_generation_enabled:
+            typer.echo(
+                "ERROR: converter generation is disabled (VESTIGO_CONVERTER_GENERATION_ENABLED).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        actor = await _resolve_actor(store, user)
+        case_obj = await store.get_case(case)
+        if case_obj is None:
+            typer.echo(f"ERROR: No case with id '{case}'.", err=True)
+            raise typer.Exit(code=1)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="vestigo-cli-conv-"))
+        tmp = tmp_dir / path_obj.name
+        # One pass: copy and hash together (the upload endpoint does the same).
+        with path_obj.open("rb") as src, tmp.open("wb") as dst:
+            raw_hash, raw_size = copy_and_hash(src, dst)
+        jobs = JobStore()
+        job = jobs.create(kind="convert_ingest", case_id=case_obj.id, created_by=actor.id)
+        inputs = ConvertJobInputs(
+            case_id=case_obj.id,
+            user=actor,
+            raw_tmp_path=tmp,
+            raw_hash=raw_hash,
+            raw_size=raw_size,
+            filename=path_obj.name,
+            hint=hint,
+            reuse_script_id=converter,
+            raw_tmp_dir=tmp_dir,
+            # The evidence file's own mtime — the CLI is the one caller that
+            # has the real one; the model may take a missing year from it.
+            raw_mtime=path_obj.stat().st_mtime,
+        )
+        task = asyncio.create_task(run_convert_ingest_job(job.id, inputs, job_store=jobs))
+        last: str | None = None
+        while not task.done():
+            j = jobs.get(job.id)
+            phase = (j.progress or {}).get("phase") if j else None
+            if phase and phase != last:
+                typer.echo(f"… {phase}", err=True)
+                last = phase
+            await asyncio.sleep(0.5)
+        await task
+        j = jobs.get(job.id)
+        assert j is not None  # noqa: S101 — created above in this process
+        if j.status != "completed":
+            typer.echo(f"ERROR: {j.error}", err=True)
+            sid = (j.progress or {}).get("converter_script_id")
+            if sid:
+                typer.echo(f"converter script (failed draft): {sid}", err=True)
+            raise typer.Exit(code=1)
+        result = j.result or {}
+        typer.echo(
+            f"source {result.get('source_id')} ingested; "
+            f"converter script {result.get('converter_script_id')}"
+        )
+
+    asyncio.run(_run())
+
+
+@converters_app.command("list")
+def converters_list(case: str = typer.Option(..., "--case", "-c", help="Case ID.")) -> None:
+    """List generated converter scripts in a case."""
+    store = _get_store()
+
+    async def _run() -> None:
+        await _bootstrap(store)
+        for r in await store.list_converter_scripts(case):
+            created = r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "?"
+            typer.echo(f"{r.id}\t{r.name}\tv{r.version}\t{r.status}\t{r.model}\t{created}")
+
+    asyncio.run(_run())
+
+
+@converters_app.command("download")
+def converters_download(
+    script_id: str = typer.Argument(..., help="Converter script ID."),
+    case: str = typer.Option(..., "--case", "-c", help="Case ID."),
+    output: str = typer.Option(..., "--output", "-o", help="Destination .py path."),
+) -> None:
+    """Write a converter script to OUTPUT."""
+    store = _get_store()
+
+    async def _run() -> None:
+        await _bootstrap(store)
+        r = await store.get_converter_script(case, script_id)
+        if r is None or not r.source_code:
+            typer.echo("ERROR: converter script not found", err=True)
+            raise typer.Exit(code=1)
+        Path(output).write_text(r.source_code, encoding="utf-8")
+        typer.echo(f"wrote {output}")
 
     asyncio.run(_run())
 

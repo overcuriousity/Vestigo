@@ -28,6 +28,7 @@ import {
 import {
   agentApi,
   formatTokenCount,
+  parseToolArgObject,
   type AgentChartSpec,
   type AgentFilterSpec,
   type AgentMessage,
@@ -37,12 +38,22 @@ import {
 import { useAgentStore } from "@/stores/agent";
 import { triggerDownload } from "@/lib/download";
 import { Button } from "@/components/ui/Button";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
 import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
+import { StoryBlockProposalCard } from "./StoryBlockProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
+import { AgentFiltersBar } from "./AgentFiltersBar";
+import { FilterChips } from "@/components/explorer/FilterChips";
+import { hasActiveFilters } from "@/lib/fieldFilters";
+import {
+  PROPOSAL_KIND_BY_ITEM,
+  proposalItemKind,
+  type ProposalItemKind,
+} from "./proposalTools";
 import { Markdown } from "./Markdown";
 import { capPersistedForStream, type TurnBaseline } from "./transcript";
 import type { EventFilters } from "@/api/types";
@@ -58,7 +69,15 @@ interface Props {
 
 /** One renderable chat item, unified over persisted rows and live stream events. */
 type ChatItem =
-  | { kind: "user"; content: string }
+  | {
+      kind: "user";
+      content: string;
+      /** Persisted row id — keys the per-message filter stamp's testid. */
+      messageId?: string;
+      /** The Explorer filters the agent received with this message (#205).
+       * Null/absent = no snapshot (pre-stamp rows, or none active). */
+      filters?: EventFilters | null;
+    }
   | {
       kind: "assistant";
       content: string;
@@ -66,7 +85,16 @@ type ChatItem =
       promptTokens?: number | null;
       completionTokens?: number | null;
     }
-  | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
+  | {
+      kind: "tool";
+      /** The call's `tool_call_id` — pairs the row with its result and keys
+       * the expandable detail (`data-testid`). Null on pre-migration rows. */
+      id?: string | null;
+      tool: string;
+      args?: Record<string, unknown> | null;
+      /** What the tool returned, paired from the result row (#203). */
+      result?: unknown;
+    }
   | { kind: "thinking"; content: string; streaming?: boolean }
   /** Historical marker rows from the retired compaction/fidelity mechanisms —
    * old transcripts still carry them, so they still render. */
@@ -83,15 +111,22 @@ type ChatItem =
       duplicateCalls: number;
       resultsCapped: number;
     }
+  /** `id` is the proposing call's `tool_call_id` where one exists. Card items
+   * are the only ones wrapped in an ErrorBoundary, and a boundary keyed by
+   * array index keeps its fallback when a later item shifts into that slot —
+   * so these two carry an identity of their own. Null on pre-`tool_call_id`
+   * rows, which fall back to the index like every other item. */
   | {
       kind: "finding";
+      id?: string | null;
       title: string;
       description: string;
       spec: AgentFilterSpec;
       total?: number | null;
     }
-  | { kind: "chart"; title: string; description: string; spec: AgentChartSpec }
+  | { kind: "chart"; id?: string | null; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
+  | { kind: "storyProposal"; proposalId: string }
   | { kind: "error"; detail: string }
   /** Something happened that isn't a failure — a turn the analyst stopped. */
   | { kind: "notice"; detail: string };
@@ -103,9 +138,22 @@ interface ProposeChartArgs {
 }
 
 interface PendingChart {
+  id?: string | null;
   title: string;
   description: string;
   spec: AgentChartSpec;
+}
+
+/**
+ * The proposal for a card, or null when it is missing from the query or is of
+ * a kind that card cannot render.
+ */
+function proposalOfKind(
+  proposal: AgentProposal | undefined,
+  itemKind: ProposalItemKind,
+): AgentProposal | null {
+  if (!proposal) return null;
+  return proposal.kind === PROPOSAL_KIND_BY_ITEM[itemKind] ? proposal : null;
 }
 
 function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
@@ -117,12 +165,45 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   // Keyed by tool_call_id: models that batch parallel tool calls persist N
   // call rows followed by N result rows in *completion* order, so adjacency
   // pairing mislabels one card and drops the other N-1. Rows written before
-  // the tool_call_id migration fall back to FIFO order.
+  // the tool_call_id migration have no key to pair on, and are matched by
+  // FIFO order *only while that is unambiguous* — see below.
   const pendingCharts = new Map<string, PendingChart>();
   const pendingChartFifo: PendingChart[] = [];
+  // Generic tool rows (#203): the call row renders immediately and the result
+  // row folds back into it. Same pairing discipline as the charts — keyed by
+  // tool_call_id, FIFO only while a single unkeyed call is in flight.
+  const openToolCalls = new Map<string, ChatItem & { kind: "tool" }>();
+  const orphanToolCalls: (ChatItem & { kind: "tool" })[] = [];
+  /**
+   * Is this the *result* half of a tool pair?
+   *
+   * A keyed row answers by identity: its call row is the one already waiting on
+   * that `tool_call_id`. Failing that, `tool_result` settles it — the server
+   * writes a call row with `tool_args` and a result row with `tool_result`,
+   * never both, so an orphaned result (its call row missing from the
+   * transcript) is still recognizable and passes silently instead of rendering
+   * as a bare, argument-less call.
+   *
+   * Only unkeyed legacy rows fall back to "has no args", which is a guess — a
+   * provider that persists `null` args for a zero-argument call would otherwise
+   * have that call row read as a result, consume a pending entry and mispair a
+   * real result onto the wrong call.
+   */
+  const isResult = (m: AgentMessage) =>
+    m.tool_call_id
+      ? openToolCalls.has(m.tool_call_id) ||
+        pendingCharts.has(m.tool_call_id) ||
+        m.tool_result != null
+      : !m.tool_args;
   for (const m of messages) {
+    const proposalKind = m.role === "tool" ? proposalItemKind(m.tool_name) : null;
     if (m.role === "user") {
-      items.push({ kind: "user", content: m.content });
+      items.push({
+        kind: "user",
+        content: m.content,
+        messageId: m.id,
+        filters: (m.view_filters as EventFilters | null) ?? null,
+      });
     } else if (m.role === "thinking") {
       if (m.content) items.push({ kind: "thinking", content: m.content });
     } else if (m.role === "compaction") {
@@ -160,16 +241,16 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
           completionTokens: m.completion_tokens,
         });
       }
-    } else if (m.role === "tool" && m.tool_name === "propose_annotation") {
-      // propose_annotation is rendered from its *result* row (which carries
-      // proposal_id, the key into the proposals query) rather than the call
-      // row (which only carries the proposed tag/comment/event_ids) — the
-      // call row intentionally produces nothing.
+    } else if (proposalKind) {
+      // A proposal tool (see PROPOSAL_TOOLS) is rendered from its *result* row
+      // — which carries proposal_id, the key into the proposals query — rather
+      // than the call row, which only carries the proposed body (tag/comment,
+      // block content). The call row intentionally produces nothing.
       const result = m.tool_result as { proposal_id?: string } | null;
       if (result?.proposal_id) {
-        items.push({ kind: "proposal", proposalId: result.proposal_id });
+        items.push({ kind: proposalKind, proposalId: result.proposal_id });
       }
-    } else if (m.role === "tool" && m.tool_name === "propose_chart" && !m.tool_args) {
+    } else if (m.role === "tool" && m.tool_name === "propose_chart" && isResult(m)) {
       // Result row: only a successful validation ("ok": true) gets a card —
       // a failed spec (bad kind, missing field) produced a tool error, no
       // proposal to show. A failed one still consumes its buffered call so
@@ -179,13 +260,21 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       if (m.tool_call_id) {
         chart = pendingCharts.get(m.tool_call_id);
         pendingCharts.delete(m.tool_call_id);
-      } else {
+      } else if (pendingChartFifo.length === 1) {
+        // Unkeyed rows can only be paired by order, and order is not a fact
+        // here: a failed call row is persisted before its validation error,
+        // so with two or more buffered an `ok` result can pop the *rejected*
+        // spec and draw a chart that does not match its own title. A card an
+        // analyst reads as evidence must never be a guess — with the pairing
+        // ambiguous, show nothing and let the transcript stand on its own.
         chart = pendingChartFifo.shift();
+      } else {
+        pendingChartFifo.length = 0;
       }
       if (result?.ok && chart) items.push({ kind: "chart", ...chart });
-    } else if (m.role === "tool" && m.tool_args) {
-      // Tool rows come in pairs (call with args, then result); render on the
-      // call row and let the result row pass silently.
+    } else if (m.role === "tool" && m.tool_name && !isResult(m)) {
+      // Tool rows come in pairs (call, then result); render on the call row and
+      // fold the result back into it below.
       if (m.tool_name === "propose_finding") {
         const args = m.tool_args as {
           title?: string;
@@ -194,17 +283,23 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         };
         items.push({
           kind: "finding",
+          id: m.tool_call_id,
           title: args.title ?? "Finding",
           description: args.description ?? "",
-          spec: args.filters ?? {},
+          spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
         });
       } else if (m.tool_name === "propose_chart") {
         const args = m.tool_args as ProposeChartArgs;
-        if (args.spec) {
+        // A spec the provider stringified is still a usable spec; one that is
+        // neither object nor parseable JSON renders nothing rather than
+        // taking the whole conversation down.
+        const spec = parseToolArgObject<AgentChartSpec>(args.spec);
+        if (spec) {
           const chart: PendingChart = {
+            id: m.tool_call_id,
             title: args.title ?? "Chart",
             description: args.description ?? "",
-            spec: args.spec,
+            spec,
           };
           if (m.tool_call_id) pendingCharts.set(m.tool_call_id, chart);
           else pendingChartFifo.push(chart);
@@ -214,8 +309,30 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         // an intervening call between a chart's call row and its result row
         // is normal. An orphaned entry (result row never persisted) just
         // stays buffered and renders nothing.
-        items.push({ kind: "tool", tool: m.tool_name, args: m.tool_args });
+        const item: ChatItem & { kind: "tool" } = {
+          kind: "tool",
+          id: m.tool_call_id,
+          tool: m.tool_name,
+          args: m.tool_args,
+        };
+        if (m.tool_call_id) openToolCalls.set(m.tool_call_id, item);
+        else orphanToolCalls.push(item);
+        items.push(item);
       }
+    } else if (m.role === "tool" && m.tool_name) {
+      // Generic result row (#203): fold the result into its call row instead
+      // of passing silently. Unkeyed legacy rows pair FIFO only while that is
+      // unambiguous — same rule as the chart pairing above.
+      let target: (ChatItem & { kind: "tool" }) | undefined;
+      if (m.tool_call_id) {
+        target = openToolCalls.get(m.tool_call_id);
+        openToolCalls.delete(m.tool_call_id);
+      } else if (orphanToolCalls.length === 1) {
+        target = orphanToolCalls.shift();
+      } else {
+        orphanToolCalls.length = 0;
+      }
+      if (target) target.result = m.tool_result;
     }
   }
   return items;
@@ -319,17 +436,20 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           ...flushed,
           {
             kind: "finding",
+            id: e.tool_call_id,
             title: args.title ?? "Finding",
             description: args.description ?? "",
-            spec: args.filters ?? {},
+            spec: parseToolArgObject<AgentFilterSpec>(args.filters) ?? {},
           },
         ],
         liveText: "",
       };
     }
-    if (e.tool === "propose_annotation") {
+    if (proposalItemKind(e.tool)) {
       // Rendered from the paired tool_result below, once proposal_id is
-      // known — the call event only carries the proposed tag/comment.
+      // known — the call event only carries the proposed tag/comment (or the
+      // block body). Falling through to the generic row here is what showed
+      // a bare "propose_story_block" line instead of the card.
       return { ...s, items: flushed, liveText: "" };
     }
     if (e.tool === "propose_chart") {
@@ -337,13 +457,15 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
       // shows no card, same contract as itemsFromMessages. Keyed by
       // tool_call_id: parallel batches keep several proposals in flight.
       const args = e.args as { title?: string; description?: string; spec?: AgentChartSpec };
+      const spec = parseToolArgObject<AgentChartSpec>(args.spec);
       let pendingCharts = s.pendingCharts;
-      if (args.spec) {
+      if (spec) {
         const next = new Map(s.pendingCharts);
         next.set(e.tool_call_id, {
+          id: e.tool_call_id,
           title: args.title ?? "Chart",
           description: args.description ?? "",
-          spec: args.spec,
+          spec,
         });
         pendingCharts = next;
       }
@@ -351,20 +473,21 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     }
     return {
       ...s,
-      items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }],
+      items: [...flushed, { kind: "tool", id: e.tool_call_id, tool: e.tool, args: e.args }],
       liveText: "",
     };
   }
   if (e.type === "tool_result") {
-    // Most tool_result rows stay invisible (results feed the model, not
-    // the analyst) — propose_annotation/propose_chart are exceptions, since
+    // Most tool_result rows stay invisible (results feed the model, not the
+    // analyst) — the proposal tools and propose_chart are exceptions, since
     // what they render is only known once the result lands.
-    if (e.tool === "propose_annotation") {
+    const proposalKind = proposalItemKind(e.tool);
+    if (proposalKind) {
       const result = e.result as { proposal_id?: string } | null;
       return {
         ...s,
         items: result?.proposal_id
-          ? [...flushed, { kind: "proposal", proposalId: result.proposal_id }]
+          ? [...flushed, { kind: proposalKind, proposalId: result.proposal_id }]
           : flushed,
         liveText: "",
       };
@@ -387,7 +510,17 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
         pendingCharts,
       };
     }
-    return s;
+    // Generic tool result (#203): fold it into the call row it answers so the
+    // row can show what the tool returned, instead of dropping it outright.
+    // The id must be non-empty to pair on: a provider that emitted "" for every
+    // call would otherwise splash one result across every unkeyed row.
+    if (!e.tool_call_id) return s;
+    return {
+      ...s,
+      items: s.items.map((it) =>
+        it.kind === "tool" && it.id === e.tool_call_id ? { ...it, result: e.result } : it,
+      ),
+    };
   }
   if (e.type === "cancelled") {
     // Flush whatever streamed before the stop — the partial turn is persisted
@@ -409,16 +542,74 @@ function itemsFromStream(s: StreamState): ChatItem[] {
   return out;
 }
 
-function ToolRow({ tool, args }: { tool: string; args?: Record<string, unknown> | null }) {
-  const summary = args && Object.keys(args).length > 0 ? JSON.stringify(args) : "";
+/** Cap on the rendered tool result — the full payload stays in the transcript
+ * record; the row shows enough to audit the call without flooding the panel. */
+function formatToolResult(result: unknown): string {
+  const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  return text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
+}
+
+function ToolRow({
+  id,
+  tool,
+  args,
+  result,
+}: {
+  id?: string | null;
+  tool: string;
+  args?: Record<string, unknown> | null;
+  result?: unknown;
+}) {
+  // A <details> renders its children whether or not it is open, so the bodies
+  // are mounted on demand instead: tool results are event lists, and
+  // stringifying every one of them on every panel render (there are dozens of
+  // rows in a long transcript) is a cost the collapsed row shouldn't pay.
+  const [open, setOpen] = useState(false);
+  const hasArgs = !!args && Object.keys(args).length > 0;
+  const summary = hasArgs ? JSON.stringify(args) : "";
+  const argsText = useMemo(
+    () => (open && hasArgs ? JSON.stringify(args, null, 2) : ""),
+    [open, hasArgs, args],
+  );
+  const resultText = useMemo(
+    () => (open && result !== undefined && result !== null ? formatToolResult(result) : ""),
+    [open, result],
+  );
   return (
-    <div className="flex items-start gap-1.5 px-1 text-[11px] text-[var(--color-fg-secondary)]">
-      <Wrench size={11} className="mt-0.5 shrink-0" />
-      <span className="min-w-0 break-all font-mono">
-        {tool}
-        {summary && <span className="opacity-70"> {summary.slice(0, 200)}</span>}
-      </span>
-    </div>
+    <details
+      data-testid={id ? `tool-call-${id}` : undefined}
+      // Fully controlled: React owns `open`, and the summary's click handler
+      // suppresses the browser's own toggle. Letting both drive it means two
+      // state changes per click racing each other, and letting only the browser
+      // drive it means `open` never updates where <details> is not natively
+      // implemented. One mechanism, same behavior everywhere.
+      open={open}
+      className="rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+    >
+      <summary
+        onClick={(e) => {
+          e.preventDefault();
+          setOpen((o) => !o);
+        }}
+        className="flex cursor-pointer select-none items-center gap-1.5"
+      >
+        <Wrench size={11} className="shrink-0" />
+        <span className="min-w-0 break-all font-mono">
+          {tool}
+          {summary && <span className="opacity-70"> {summary.slice(0, 200)}</span>}
+        </span>
+      </summary>
+      {argsText && (
+        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words">
+          {argsText}
+        </pre>
+      )}
+      {resultText && (
+        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words">
+          {resultText}
+        </pre>
+      )}
+    </details>
   );
 }
 
@@ -554,7 +745,10 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           (event) => {
             if (event.type === "error") failed = true;
             setStream((prev) => foldStreamEvent(prev, event));
-            if (event.type === "tool_result" && event.tool === "propose_annotation") {
+            if (event.type === "tool_result" && proposalItemKind(event.tool)) {
+              // Every proposal kind is rendered from this query — without the
+              // refetch the card resolves against a list fetched before the
+              // proposal existed and degrades to a bare tool row.
               queryClient.invalidateQueries({
                 queryKey: ["agent-proposals", caseId, conversationId],
               });
@@ -715,8 +909,10 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
   return (
     <div
-      className="relative flex shrink-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
-      style={{ width: panelWidth }}
+      // See EventDetailPanel: shrinkable rather than shrink-0, so no
+      // combination of open panels can push one off the viewport.
+      className="relative flex min-w-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      style={{ width: panelWidth, flex: `0 1 ${panelWidth}px` }}
       data-testid="agent-panel"
     >
       <div
@@ -790,6 +986,10 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         </p>
       )}
 
+      {/* Inherited-filters transparency (#205): which Explorer view the next
+          message sends as context. Read-only — editing stays in the Explorer. */}
+      <AgentFiltersBar filters={currentFilters} />
+
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto p-2.5">
         {items.length === 0 && !streaming && (
@@ -821,6 +1021,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 className="ml-6 whitespace-pre-wrap rounded-md bg-[var(--color-accent-dim)] px-2.5 py-1.5 text-xs text-[var(--color-fg-primary)]"
               >
                 {item.content}
+                {item.filters && hasActiveFilters(item.filters) && (
+                  <div
+                    data-testid={`message-filters-${item.messageId}`}
+                    className="mt-1 border-t border-[var(--color-border)]/50 pt-1"
+                  >
+                    <span className="text-[10px] text-[var(--color-fg-secondary)]">
+                      View at send:{" "}
+                    </span>
+                    <FilterChips filters={item.filters} />
+                  </div>
+                )}
               </div>
             );
           }
@@ -842,7 +1053,19 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             );
           }
           if (item.kind === "tool") {
-            return <ToolRow key={i} tool={item.tool} args={item.args} />;
+            // Keyed by call identity, not position: the row owns `<details>`
+            // open state, and an index key would hand it to whatever ends up at
+            // that slot. Prefixed so a tool_call_id can never collide with a
+            // sibling's index key.
+            return (
+              <ToolRow
+                key={item.id ? `tool-${item.id}` : i}
+                id={item.id}
+                tool={item.tool}
+                args={item.args}
+                result={item.result}
+              />
+            );
           }
           if (item.kind === "thinking") {
             return (
@@ -909,31 +1132,50 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           }
           if (item.kind === "finding") {
             return (
-              <FindingCard
-                key={i}
-                caseId={caseId}
-                title={item.title}
-                description={item.description}
-                spec={item.spec}
-                total={item.total}
-                onApply={onApplyFilters}
-              />
+              <ErrorBoundary
+                key={item.id ?? `i${i}`}
+                resetKey={item.id ?? item.title}
+                label="This finding"
+              >
+                <FindingCard
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  title={item.title}
+                  description={item.description}
+                  spec={item.spec}
+                  total={item.total}
+                  onApply={onApplyFilters}
+                />
+              </ErrorBoundary>
             );
           }
           if (item.kind === "chart") {
             return (
-              <ChartProposalCard
-                key={i}
-                caseId={caseId}
-                timelineId={timelineId}
-                title={item.title}
-                description={item.description}
-                spec={item.spec}
-              />
+              // A chart card renders model-authored JSON that was persisted
+              // verbatim and cannot be corrected after the fact, so a card
+              // that cannot be drawn degrades to a notice rather than taking
+              // the conversation — or the app — with it.
+              <ErrorBoundary
+                key={item.id ?? `i${i}`}
+                resetKey={item.id ?? item.title}
+                label="This chart proposal"
+              >
+                <ChartProposalCard
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  title={item.title}
+                  description={item.description}
+                  spec={item.spec}
+                />
+              </ErrorBoundary>
             );
           }
           if (item.kind === "proposal") {
-            const proposal = proposalsById[item.proposalId];
+            // The kind check is not redundant with the lookup: two item kinds
+            // now resolve against the same query, and a card handed a
+            // proposal of the other shape reads its payload off fields that
+            // are null there. Fall back to the tool row instead.
+            const proposal = proposalOfKind(proposalsById[item.proposalId], item.kind);
             if (!proposal || !activeId) {
               return <ToolRow key={i} tool="propose_annotation" />;
             }
@@ -944,6 +1186,20 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 conversationId={activeId}
                 proposal={proposal}
                 onApply={onApplyFilters}
+              />
+            );
+          }
+          if (item.kind === "storyProposal") {
+            const proposal = proposalOfKind(proposalsById[item.proposalId], item.kind);
+            if (!proposal || !activeId) {
+              return <ToolRow key={i} tool="propose_story_block" />;
+            }
+            return (
+              <StoryBlockProposalCard
+                key={i}
+                caseId={caseId}
+                conversationId={activeId}
+                proposal={proposal}
               />
             );
           }

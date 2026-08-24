@@ -21,6 +21,13 @@ export interface DispositionInput {
   event_id?: string;
   note?: string | null;
   details?: Record<string, unknown> | null;
+  /**
+   * The analysis comparison this verdict was reached under. A verdict is an
+   * assertion about a comparison, so without it "confirmed on 4 March" cannot
+   * say what the finding was compared against. Optional: a caller that does
+   * not know its scope records none rather than a guess.
+   */
+  analysis_scope?: Record<string, unknown> | null;
 }
 
 /**

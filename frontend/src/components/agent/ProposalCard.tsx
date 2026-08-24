@@ -49,7 +49,7 @@ export function ProposalCard({ caseId, conversationId, proposal, onApply }: Prop
   });
 
   const deciding = confirmMutation.isPending || rejectMutation.isPending;
-  const skippedCount = confirmMutation.data?.skipped_event_ids.length ?? 0;
+  const skippedCount = confirmMutation.data?.skipped_event_ids?.length ?? 0;
   const userName = useUserNames();
 
   if (proposal.status === "rejected") {

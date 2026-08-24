@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,8 +30,17 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    defer,
+    mapped_column,
+    relationship,
+    selectinload,
+)
 
 from vestigo.core.config import get_settings
 
@@ -55,6 +65,13 @@ class Case(Base):
     # Investigation team this case belongs to, or None for a personal case
     # (visible only to its owner and admins).
     team_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # A seeded demo case (``core/demo_case.py``). Marks fabricated data as such:
+    # admins do not see other users' copies in the case list, and the restore
+    # endpoint refuses while the caller still has one. Otherwise an ordinary
+    # case — nothing downstream branches on this.
+    is_demo: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -75,6 +92,7 @@ class Case(Base):
             "description": self.description,
             "owner_id": self.owner_id,
             "team_id": self.team_id,
+            "is_demo": self.is_demo,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -89,7 +107,24 @@ class Source(Base):
     """
 
     __tablename__ = "sources"
-    __table_args__ = (Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),)
+    __table_args__ = (
+        Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
+        # One source per (saved script, raw file) per case: the Parquet a
+        # converter writes is not byte-stable across runs, so ``file_hash``
+        # cannot catch the same evidence being converted twice by the same
+        # script — this index does, as the backstop behind the pre-checks in
+        # the endpoint and the job (migration 0032).
+        Index(
+            "ix_sources_converter_input",
+            "case_id",
+            "converter_script_id",
+            "converter_input_hash",
+            unique=True,
+            postgresql_where=text(
+                "converter_script_id IS NOT NULL AND converter_input_hash IS NOT NULL"
+            ),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -124,6 +159,14 @@ class Source(Base):
     time_offset_seconds: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    # The generated converter that produced this Parquet source, when one did.
+    # Plain id, no FK (house style): the script row is a record and outlives
+    # the source; the transfer importer remaps it through the id map.
+    converter_script_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # SHA-256 of the raw file that converter was run over. The Parquet's own
+    # ``file_hash`` is not stable across runs (converters stamp ``converted_at``),
+    # so this is what "already converted with this script" is keyed on.
+    converter_input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     @property
     def is_ready(self) -> bool:
@@ -167,10 +210,123 @@ class Source(Base):
             "vector_count": self.vector_count,
             "status": self.status,
             "time_offset_seconds": self.time_offset_seconds,
+            "converter_script_id": self.converter_script_id,
+            "converter_input_hash": self.converter_input_hash,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+def converter_attempt_entry(
+    n: int,
+    phase: str,
+    *,
+    model: str | None = None,
+    elapsed_ms: int = 0,
+    exit_code: int | None = None,
+    stderr_tail: str = "",
+    validation: dict[str, Any] | None = None,
+    script_hash: str | None = None,
+    prompt_hash: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """One ``converter_scripts.attempts`` entry — the single place its shape is defined.
+
+    Built here for the job (``converters/job.py``) and for startup
+    reconciliation alike, so the two can never disagree about a key.
+    ``prompt_hash`` is set on the entries that sent a prompt (``generate``
+    and the ``sample`` run of the script that prompt produced), which is what
+    lets the row name the prompt that produced its *stored* code.
+    """
+    return {
+        "n": n,
+        "phase": phase,
+        "model": model,
+        "elapsed_ms": elapsed_ms,
+        "exit_code": exit_code,
+        "stderr_tail": stderr_tail[-4096:],
+        "validation": validation,
+        "script_hash": script_hash,
+        "prompt_hash": prompt_hash,
+        "error": error,
+    }
+
+
+class ConverterScript(Base):
+    """A converter script the configured model wrote for one case.
+
+    Case-bound and append-only in spirit: a regeneration is a new row with
+    ``parent_id`` set, never an edit of ``source_code`` after ``status`` has
+    reached ``working``. ``sample_excerpt`` is the exact text sent to the
+    model, ``attempts`` every generation/repair/run — together with
+    ``prompt_hash`` and ``model`` that is what makes "how did this script come
+    to be" answerable later (docs/INPUT_FORMATS.md §"Generated converters").
+    """
+
+    __tablename__ = "converter_scripts"
+    __table_args__ = (
+        Index("ix_converter_scripts_case_name_version", "case_id", "name", "version", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # generating | working | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="generating")
+    source_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: The evidence file's own mtime as the uploader knew it (browser
+    #: ``lastModified``, CLI ``stat``) — what the prompt stated; ``None`` when
+    #: the model was told the mtime is unknown. Regeneration replays it.
+    raw_mtime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, *, include_code: bool = False) -> dict[str, Any]:
+        """Serialize; ``source_code``/``sample_excerpt`` only on request (they are large)."""
+        d: dict[str, Any] = {
+            "id": self.id,
+            "case_id": self.case_id,
+            "name": self.name,
+            "version": self.version,
+            "parent_id": self.parent_id,
+            "status": self.status,
+            "model": self.model,
+            "provider_endpoint": self.provider_endpoint,
+            "prompt_hash": self.prompt_hash,
+            "sample_hash": self.sample_hash,
+            "raw_file_hash": self.raw_file_hash,
+            "raw_filename": self.raw_filename,
+            "raw_mtime": self.raw_mtime.isoformat() if self.raw_mtime else None,
+            "hint": self.hint,
+            "attempts": self.attempts or [],
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_code:
+            d["source_code"] = self.source_code
+            d["sample_excerpt"] = self.sample_excerpt
+        return d
 
 
 class Timeline(Base):
@@ -210,6 +366,39 @@ class Timeline(Base):
     # ingested events are never rewritten; None/empty means no mapping.
     field_mappings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Recommended event-grid columns (issue #213): the derived-from-the-data
+    # answer to "what should this timeline open on", shared by every user with
+    # access. Display metadata only — a per-user column choice in the browser
+    # always outranks it, and the events are never touched. See
+    # ``vestigo/columns/`` for the payload shape and how it is produced.
+    recommended_columns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Analysis methods the analysts on this case have muted for this timeline:
+    # a list of ``db/analysis_plan.py::METHOD_IDS`` entries. Shared rather than
+    # per-browser, because "this source's clocks are a mess, stop surfacing it"
+    # is a finding about the *data* that the next analyst inherits.
+    #
+    # A reading preference, never a gate: the plan endpoint does not consult
+    # this (a mute is not a claim that the method *cannot* produce a finding),
+    # and ``/analysis/findings`` still runs a muted method when asked for it
+    # directly. All it does is keep the method out of the unprompted sweep, and
+    # the rail is required to disclose the count it is holding back.
+    muted_methods: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    # Per-method field decisions the analysts on this case have declared for
+    # this timeline: ``{method_id: {field_token: bool}}``, where True pins a
+    # field into that detector's *automatic* field selection and False takes it
+    # out. Shared for the same reason ``muted_methods`` is — "an HTTP status
+    # code is not a range field" is a finding about the data, not a browser
+    # preference, and the recommenders type fields syntactically so they cannot
+    # discover it themselves.
+    #
+    # Advice to the recommenders, never a gate: it applies only where a
+    # detector picks its own fields, an explicit ``fields=[…]`` still runs the
+    # method on an excluded field, the plan endpoint does not consult it, and a
+    # detector that held a field back says so in its warnings.
+    field_overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # --- Embedding state (all nullable; None → not yet embedded) -------------
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -236,6 +425,9 @@ class Timeline(Base):
             "is_default": self.is_default,
             "source_ids": [s.id for s in self.sources],
             "field_mappings": self.field_mappings,
+            "recommended_columns": self.recommended_columns,
+            "muted_methods": self.muted_methods or [],
+            "field_overrides": self.field_overrides or {},
             "is_embedded": is_embedded,
             "is_stale": is_stale,
             "embedding_model": self.embedding_model,
@@ -330,6 +522,43 @@ class EnricherGlobalConfig(Base):
         return {
             "enricher_key": self.enricher_key,
             "auto_run_default": self.auto_run_default,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AppSettingRow(Base):
+    """One admin-edited override of a ``Settings`` field.
+
+    Key/value rather than a wide column-per-setting table: the set of settings
+    is declared in ``core/settings_registry.py`` and changes with the code, so
+    a schema that mirrored it would need a migration per tunable. The value is
+    stored as JSON so an int stays an int across a round-trip.
+
+    A row exists only for a field an admin actually set — clearing an override
+    deletes the row rather than storing NULL, which keeps "no opinion" and
+    "explicitly empty" distinguishable (an empty *string* is a legitimate
+    stored value, e.g. ``sigma_rules_path``). The environment still wins over
+    anything here; see ``core/config.py``.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "key": self.key,
+            "value": self.value,
             "updated_by": self.updated_by,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -559,6 +788,13 @@ class View(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     query: Mapped[str] = mapped_column(String(4096), nullable=False, default="")
     view_filter: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Set when an analyst deleted this view while a story block still
+    # referenced it. The row survives so that story keeps rendering and
+    # exporting; it is hard-deleted once the last reference goes away (see
+    # ``purge_orphaned_hidden_views``). NULL means live.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -579,6 +815,7 @@ class View(Base):
             "name": self.name,
             "query": self.query,
             "filter": self.view_filter or {},
+            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -625,6 +862,210 @@ class SavedChart(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class Story(Base):
+    """A per-case block document — the investigation report (W7).
+
+    Content lives in ``StoryBlock`` rows; this row is title/metadata only.
+    See docs/STORIES.md.
+    """
+
+    __tablename__ = "stories"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the Story API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "title": self.title,
+            "description": self.description,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class StoryBlock(Base):
+    """One ordered block of a Story.
+
+    ``position`` uses an integer gap strategy (1024, 2048, ...); insert-between
+    takes the midpoint and the story is renumbered when a gap is exhausted.
+    ``(story_id, position)`` is unique so a racing insert fails loudly instead
+    of producing two blocks that tie for the same slot — document order in a
+    forensic report must not be ambiguous.
+    ``version`` is the optimistic-concurrency counter: every update/move
+    increments it via a compare-and-swap, and a stale caller gets a 409
+    instead of clobbering. ``content`` is validated per ``kind`` at the API
+    boundary (``vestigo.stories.schemas``); the DB stores it opaquely.
+    """
+
+    __tablename__ = "story_blocks"
+    __table_args__ = (Index("ix_story_blocks_story_position", "story_id", "position", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    story_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the StoryBlock API response."""
+        return {
+            "id": self.id,
+            "story_id": self.story_id,
+            "position": self.position,
+            "kind": self.kind,
+            "content": self.content or {},
+            "origin": self.origin,
+            "version": self.version,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+#: Gap between consecutive story-block positions. Insert-between takes the
+#: midpoint; when a gap closes to <2 the story is renumbered back onto this
+#: stride inside the same transaction.
+STORY_POSITION_GAP = 1024
+
+
+class StaleBlockError(Exception):
+    """A block update/move carried a stale version; ``current`` is the winner."""
+
+    def __init__(self, current: StoryBlock) -> None:
+        super().__init__(f"stale version for block {current.id}")
+        self.current = current
+
+
+class ReferentGoneError(ValueError):
+    """A block write's referent was deleted before the write could commit.
+
+    A ``ValueError`` subclass so every caller that already maps the pre-write
+    scope check (:mod:`vestigo.stories.refs`) to a 422 keeps doing so
+    unchanged; named so the agent's confirm handler can tell it apart from the
+    "anchor block vanished" ValueError, which it retries.
+    """
+
+
+class _Unset:
+    """Sentinel for "caller did not supply this field" (distinct from ``None``)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNSET"
+
+
+#: Distinguishes "leave unchanged" from an explicit ``None`` ("clear it") on
+#: partial updates. ``PATCH {"description": null}`` has to be able to blank a
+#: field that ``PATCH {"title": "x"}`` must leave alone.
+UNSET = _Unset()
+
+#: How many times a block insert/move retries after losing a race for its
+#: computed position. The story row lock serializes these on Postgres, but a
+#: lock only orders transactions — it doesn't make a value read before it was
+#: taken current, and SQLite ignores ``FOR UPDATE`` entirely. The unique index
+#: on ``(story_id, position)`` is the real invariant; a collision means
+#: somebody else took the slot, and recomputing is the correct response since
+#: the caller asked for "after block X", not for a specific integer.
+STORY_POSITION_ATTEMPTS = 25
+
+#: Substrings identifying a ``(story_id, position)`` uniqueness violation.
+#: Postgres names the index in its message; SQLite names the columns.
+_POSITION_CONFLICT_MARKERS = ("ix_story_blocks_story_position", "story_blocks.position")
+
+
+def _is_position_conflict(exc: IntegrityError) -> bool:
+    """True when *exc* is the position race the insert/move loops retry.
+
+    Retrying anything else is wrong: a duplicate block id or a NOT NULL
+    violation is not going to resolve itself, and swallowing it costs 25
+    round-trips before surfacing as a misleading "could not place a block".
+    """
+    return any(marker in str(exc.orig) for marker in _POSITION_CONFLICT_MARKERS)
+
+
+class StoryExport(Base):
+    """An immutable point-in-time export of a Story.
+
+    ``snapshot`` is the server-resolved frozen bundle (see docs/STORIES.md for
+    the ``"v": 1`` format); ``snapshot_hash`` is SHA-256 over its canonical
+    JSON. ``html``/``html_hash`` hold the client-rendered standalone artifact,
+    uploaded exactly once after creation (sealed thereafter). No update path;
+    deletion is admin-only and audit-logged.
+    """
+
+    __tablename__ = "story_exports"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    story_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    html_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, include_snapshot: bool = False) -> dict[str, Any]:
+        """Return a serializable dictionary for the StoryExport API response.
+
+        The snapshot can be large; listings omit it unless asked.
+        """
+        d: dict[str, Any] = {
+            "id": self.id,
+            "story_id": self.story_id,
+            "case_id": self.case_id,
+            "snapshot_hash": self.snapshot_hash,
+            "html_hash": self.html_hash,
+            "has_artifact": self.html is not None,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_snapshot:
+            d["snapshot"] = self.snapshot
+        return d
 
 
 def _windows_config_hash(payload: dict[str, Any]) -> str:
@@ -757,6 +1198,26 @@ class FindingDisposition(Base):
     note: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # confirmed: the finding's structured details snapshot at confirm time.
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The comparison this verdict was reached under — frame, baseline id and
+    # name. A verdict is an assertion about a *comparison*, so without this
+    # "confirmed on 4 March" cannot say what the finding was compared against.
+    # Nullable: rows written before scope provenance existed read as "not
+    # recorded", which is honest where a backfill would be invention.
+    # Deliberately NOT part of :func:`dispositions_hash` — that hashes
+    # detection-affecting facts, and scope-at-verdict-time is provenance.
+    # Named `analysis_scope`, not `scope`: this class already uses "scope" for
+    # the value-vs-event distinction (see the class docstring), and one word
+    # meaning two things in one model is how the wrong one gets read.
+    #
+    # The one JSONB column in this model, and the only one anywhere that is
+    # *compared* rather than merely stored: `create_disposition` puts it in the
+    # dedupe predicate for `confirmed`, and PostgreSQL has no equality operator
+    # for `json` — only for `jsonb`. SQLite keeps the plain-JSON text encoding,
+    # where `=` is byte equality, so both dialects only agree if the value is
+    # canonicalized first (see :func:`canonical_scope`).
+    analysis_scope: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -778,12 +1239,71 @@ class FindingDisposition(Base):
             "event_id": self.event_id,
             "note": self.note,
             "details": self.details,
+            "analysis_scope": self.analysis_scope,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
 DISPOSITION_KINDS = ("normal", "dismissed", "confirmed", "routine")
+
+
+def canonical_scope(scope: dict | None) -> dict | None:
+    """Return *scope* with its keys in a fixed order, or None.
+
+    ``analysis_scope`` is the one JSON column that participates in an equality
+    comparison, and the two dialects disagree about what equality means: JSONB
+    normalizes, SQLite's JSON is text and compares byte for byte. Writing and
+    comparing the canonical form makes the same two verdicts collide on both.
+    """
+    return None if scope is None else json.loads(json.dumps(scope, sort_keys=True))
+
+
+def scope_identity(scope: dict | None) -> tuple[str | None, str | None]:
+    """The two fields of an ``analysis_scope`` that identify a comparison.
+
+    Deliberately narrower than whole-dict equality, and the same rule the
+    findings endpoints badge by (``api/routers/events.py::_scope_key``, which
+    delegates here). The scope object an analyst echoes back also carries
+    display material (``baseline_name``) and a ``dispositions_hash`` that moves
+    every time any verdict is recorded; comparing the whole object would make
+    a rename — or the analyst's own previous click — look like a different
+    comparison, so re-confirming one finding would write a second ``confirmed``
+    row and a second system annotation for one claim.
+
+    The full object is still what gets *stored*: it is the audit record of what
+    was on screen. Only the comparison narrows.
+    """
+    if not scope:
+        return (None, None)
+    baseline_id = scope.get("baseline_id")
+    return (scope.get("frame"), baseline_id if baseline_id is None else str(baseline_id))
+
+
+def disposition_identity(
+    *,
+    timeline_id: Any,
+    kind: Any,
+    detector: Any,
+    field: Any,
+    value: Any,
+    source_id: Any,
+    event_id: Any,
+    analysis_scope: Any = None,
+) -> tuple:
+    """The dedupe key for a disposition row, as one hashable tuple.
+
+    ``analysis_scope`` joins the key for ``confirmed`` only — see
+    :meth:`PostgresStore.create_disposition` for why the two verdict families
+    differ — and joins it narrowed to what identifies a comparison, per
+    :func:`scope_identity`.
+
+    Shared by the single-row and bulk paths so the identity rule is stated once:
+    two expressions of it drift, and a drifted dedupe silently writes a
+    duplicate verdict.
+    """
+    scope_part = scope_identity(analysis_scope) if kind == "confirmed" else None
+    return (timeline_id, kind, detector, field, value, source_id, event_id, scope_part)
 
 
 def dispositions_hash(rows: Iterable[FindingDisposition]) -> str:
@@ -854,6 +1374,38 @@ class DetectorRun(Base):
             "result": self.result,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class AnalysisCache(Base):
+    """Memoized analysis results, keyed on a fingerprint of everything that can change them.
+
+    Distinct in kind from :class:`DetectorRun`, which is the accumulating
+    forensic diary of what an analyst ran, with what parameters, and when. This
+    table answers a different question: "for exactly this data and exactly these
+    settings, what is the answer?" Because sources are immutable after ingestion
+    (enrichment applies excepted, and those move the fingerprint), a hit is
+    *proof* the answer still holds rather than a guess that it is recent enough
+    — which is why nothing here has a TTL and no caller ever has to judge
+    staleness.
+
+    Every row is derived data. Evicting one costs a rescan and nothing else,
+    which is why eviction needs no policy discussion, no audit trail and no
+    analyst-visible consequence.
+    """
+
+    __tablename__ = "analysis_cache"
+    __table_args__ = (Index("ix_analysis_cache_case_key", "case_id", "cache_key", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    cache_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        index=True,
+    )
 
 
 # Origin of an agent-confirmed annotation (A1): distinguishes it from
@@ -1043,6 +1595,14 @@ class AgentConversation(Base):
     # creation — later preference edits never mutate an existing chat.
     disabled_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
     history: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Set while `history` holds a mid-turn checkpoint rather than a completed
+    # turn — an errored, stopped or process-killed turn. Cleared only when a
+    # turn completes. Drives the resume note on the next turn; a column rather
+    # than sniffing the blob because a completed turn and an interrupted one
+    # both end in a ModelResponse.
+    history_partial_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -1065,6 +1625,13 @@ class AgentConversation(Base):
             "title": self.title,
             "model_id": self.model_id,
             "disabled_tools": self.disabled_tools,
+            # Exposed so a reader of an export — or of the API — can tell a
+            # replayable turn boundary from a mid-turn checkpoint. Without it the
+            # blob looks the same either way and an analyst has no way to know
+            # the conversation is resuming from a turn that never finished.
+            "history_partial_at": (
+                self.history_partial_at.isoformat() if self.history_partial_at else None
+            ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -1103,6 +1670,10 @@ class AgentMessage(Base):
     # N result rows in *completion* order, so this id is the only reliable
     # way to pair them back up. NULL on pre-migration rows.
     tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Snapshot of the analyst's Explorer filters at send time (frontend
+    # EventFilters shape); NULL for rows that are not user messages or predate
+    # the column. Context record only — never read back into agent logic.
+    view_filters: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Measured LLM usage for this turn (assistant rows only). NULL = not
     # measured (pre-metering rows, or the endpoint reported no usage) —
     # never an estimate.
@@ -1125,6 +1696,7 @@ class AgentMessage(Base):
             "tool_args": self.tool_args,
             "tool_result": self.tool_result,
             "tool_call_id": self.tool_call_id,
+            "view_filters": self.view_filters,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -1148,6 +1720,14 @@ class AgentProposal(Base):
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    # What the proposal proposes: "annotation" (the original shape, columns
+    # below) or "story_block" (payload carries {story_id, block_kind, content,
+    # after_block_id} — see W7). One table so the decide/409 idempotency
+    # backbone and the audit surface stay single-path.
+    kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="annotation", server_default="annotation"
+    )
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -1168,6 +1748,8 @@ class AgentProposal(Base):
             "case_id": self.case_id,
             "timeline_id": self.timeline_id,
             "status": self.status,
+            "kind": self.kind,
+            "payload": self.payload,
             "tag": self.tag,
             "comment": self.comment,
             "rationale": self.rationale,
@@ -1247,9 +1829,23 @@ class User(Base):
     onboarding_completed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # When this user's demo case was seeded. Null means "never" — which is also
+    # every pre-existing row, so an upgrade backfills through the same
+    # first-login path as a brand-new account. Stays stamped after the user
+    # deletes the case, so it never comes back on its own.
+    demo_case_seeded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Namespaced per-user preference blob (e.g. "agent_disabled_tools").
     # A JSON column rather than a table: per-user singleton, never queried
     # by value. Nothing secret lives here.
+    #
+    # `JSON`, deliberately, not `JSONB`: Postgres' `json` stores the document
+    # verbatim and preserves key order, and `api/routers/auth.py::_merge_bounded`
+    # depends on that — it evicts the *oldest* entries of an over-large
+    # dict-valued preference, and insertion order is the only timestamp a bare
+    # `true` value carries. `JSONB` normalizes key order away, so switching this
+    # column would silently make that eviction arbitrary.
     preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1496,9 +2092,17 @@ def _pre_alembic_fixups(sync_conn: Any) -> None:
 class PostgresStore:
     """Async PostgreSQL store for metadata."""
 
-    def __init__(self, url: str | None = None) -> None:
+    def __init__(self, url: str | None = None, **engine_kwargs: Any) -> None:
+        """Open the metadata store.
+
+        ``engine_kwargs`` go straight to :func:`create_async_engine`. The one
+        caller that needs it passes ``poolclass=NullPool``: asyncpg binds a
+        connection to the event loop that opened it, so a pooled connection is
+        unusable to a process that runs each unit of work in its own
+        ``asyncio.run`` — which is what the CLI tests do.
+        """
         self.url = url or get_settings().postgres_url
-        self.engine = create_async_engine(self.url, echo=False, future=True)
+        self.engine = create_async_engine(self.url, echo=False, future=True, **engine_kwargs)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -1551,10 +2155,16 @@ class PostgresStore:
         description: str | None = None,
         owner_id: str | None = None,
         team_id: str | None = None,
+        is_demo: bool = False,
     ) -> Case:
         """Create a new case and its default timeline."""
         case = Case(
-            id=case_id, name=name, description=description, owner_id=owner_id, team_id=team_id
+            id=case_id,
+            name=name,
+            description=description,
+            owner_id=owner_id,
+            team_id=team_id,
+            is_demo=is_demo,
         )
         default_timeline = Timeline(
             id=generate_id("all-sources"),
@@ -1660,6 +2270,8 @@ class PostgresStore:
         event_count: int = 0,
         created_by: str | None = None,
         status: str = "ready",
+        converter_script_id: str | None = None,
+        converter_input_hash: str | None = None,
     ) -> Source:
         """Create a new source record within a case.
 
@@ -1679,6 +2291,8 @@ class PostgresStore:
             event_count=event_count,
             created_by=created_by,
             status=status,
+            converter_script_id=converter_script_id,
+            converter_input_hash=converter_input_hash,
         )
         async with self.session_factory() as session:
             session.add(source)
@@ -1751,20 +2365,251 @@ class PostgresStore:
             return source
 
     async def source_hash_in_use(self, file_hash: str, *, exclude_source_id: str) -> bool:
-        """Whether any *other* source row (in any case) still has this file hash.
+        """Whether any *other* row (in any case) still references this retained hash.
 
         Retention storage is content-addressed by hash alone (not per-case),
         so a file uploaded into multiple cases shares one retained copy —
         callers must check this before deleting a retained file for a source
-        being removed, or they'd delete a copy another case still needs.
+        being removed, or they'd delete a copy another case still needs. A
+        generated converter's ``raw_file_hash`` is a reference too: the raw
+        log it was written from is retained under the same store (regenerate
+        and export read it back), and it is never a source of its own — and so
+        is a converted source's ``converter_input_hash``, the raw evidence a
+        saved script was re-run over. ``exclude_source_id`` may be ``""`` to
+        ask "does anything at all reference this hash".
         """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Source.id).where(
-                    Source.file_hash == file_hash, Source.id != exclude_source_id
+                    or_(Source.file_hash == file_hash, Source.converter_input_hash == file_hash),
+                    Source.id != exclude_source_id,
                 )
             )
-            return result.scalar_one_or_none() is not None
+            if result.first() is not None:
+                return True
+            result = await session.execute(
+                select(ConverterScript.id).where(ConverterScript.raw_file_hash == file_hash)
+            )
+            # ``first()``, not ``scalar_one_or_none()``: several scripts legitimately
+            # share one raw file — every regeneration adds a row against the same hash.
+            return result.first() is not None
+
+    # ── Converter scripts ────────────────────────────────────────────────
+
+    async def create_converter_script(
+        self,
+        *,
+        case_id: str,
+        name: str,
+        version: int,
+        raw_file_hash: str,
+        raw_filename: str | None,
+        model: str | None,
+        raw_mtime: datetime | None = None,
+        provider_endpoint: str | None,
+        prompt_hash: str | None,
+        sample_hash: str | None,
+        sample_excerpt: str | None,
+        hint: str | None,
+        created_by: str | None,
+        parent_id: str | None = None,
+        status: str = "generating",
+    ) -> ConverterScript:
+        """Insert a converter-script row (docs/INPUT_FORMATS.md §"Generated converters")."""
+        row = ConverterScript(
+            id=generate_id(f"conv_{case_id}_{name}"),
+            case_id=case_id,
+            name=name,
+            version=version,
+            parent_id=parent_id,
+            status=status,
+            model=model,
+            provider_endpoint=provider_endpoint,
+            prompt_hash=prompt_hash,
+            sample_hash=sample_hash,
+            sample_excerpt=sample_excerpt,
+            raw_file_hash=raw_file_hash,
+            raw_filename=raw_filename,
+            raw_mtime=raw_mtime,
+            hint=hint,
+            attempts=[],
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def update_converter_script(
+        self,
+        script_id: str,
+        *,
+        status: str | None = None,
+        source_code: str | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        prompt_hash: str | None = None,
+    ) -> ConverterScript | None:
+        """Update mutable fields; ``attempts`` replaces the list wholesale."""
+        async with self.session_factory() as session:
+            row = await session.get(ConverterScript, script_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if source_code is not None:
+                row.source_code = source_code
+            if attempts is not None:
+                row.attempts = list(attempts)
+            if model is not None:
+                row.model = model
+            if prompt_hash is not None:
+                row.prompt_hash = prompt_hash
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def append_converter_attempt(
+        self,
+        script_id: str,
+        phase: str,
+        *,
+        model: str | None = None,
+        elapsed_ms: int = 0,
+        exit_code: int | None = None,
+        stderr_tail: str = "",
+        validation: dict[str, Any] | None = None,
+        script_hash: str | None = None,
+        prompt_hash: str | None = None,
+        error: str | None = None,
+        row_updates: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Append one attempt under a row lock and return the new list.
+
+        Two jobs may run the same ``working`` script over different raw files
+        at once; each must add its own entries without overwriting the
+        other's, so this is a ``SELECT ... FOR UPDATE`` + append + commit,
+        never a client-side snapshot written back wholesale. ``n`` is
+        assigned here from the locked row. Any ``row_updates`` (``status``,
+        ``source_code``, ``model``, ``prompt_hash``) land in the same
+        transaction. Returns ``[]`` when the row is gone.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript).where(ConverterScript.id == script_id).with_for_update()
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return []
+            entries = list(row.attempts or [])
+            entries.append(
+                converter_attempt_entry(
+                    len(entries) + 1,
+                    phase,
+                    model=model,
+                    elapsed_ms=elapsed_ms,
+                    exit_code=exit_code,
+                    stderr_tail=stderr_tail,
+                    validation=validation,
+                    script_hash=script_hash,
+                    prompt_hash=prompt_hash,
+                    error=error,
+                )
+            )
+            row.attempts = entries
+            for key, value in (row_updates or {}).items():
+                if value is not None:
+                    setattr(row, key, value)
+            await session.commit()
+            return entries
+
+    async def get_converter_script(self, case_id: str, script_id: str) -> ConverterScript | None:
+        """Return the row when it exists *and* belongs to ``case_id``."""
+        async with self.session_factory() as session:
+            row = await session.get(ConverterScript, script_id)
+            return row if row is not None and row.case_id == case_id else None
+
+    async def list_converter_scripts(self, case_id: str) -> list[ConverterScript]:
+        """Newest first, without the two large Text columns the list surfaces never show.
+
+        ``source_code`` and ``sample_excerpt`` are deferred; the rows come from a
+        closed session, so reading either on a listed row is a programming error
+        — use :meth:`get_converter_script` for one script with its code.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript)
+                .options(defer(ConverterScript.source_code), defer(ConverterScript.sample_excerpt))
+                .where(ConverterScript.case_id == case_id)
+                .order_by(ConverterScript.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def next_converter_version(self, case_id: str, name: str) -> int:
+        """1 for a new name in this case, else max(version) + 1."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(func.max(ConverterScript.version)).where(
+                    ConverterScript.case_id == case_id, ConverterScript.name == name
+                )
+            )
+            current = result.scalar_one_or_none()
+            return (current or 0) + 1
+
+    async def count_sources_by_converter(self, case_id: str) -> dict[str, int]:
+        """``{converter_script_id: number of sources it produced}`` within a case."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source.converter_script_id, func.count())
+                .where(Source.case_id == case_id, Source.converter_script_id.is_not(None))
+                .group_by(Source.converter_script_id)
+            )
+            return {sid: int(n) for sid, n in result.all()}
+
+    async def get_source_by_converter_input(
+        self, case_id: str, script_id: str, raw_hash: str
+    ) -> Source | None:
+        """The source this script already produced from this raw file in this case, if any."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source).where(
+                    Source.case_id == case_id,
+                    Source.converter_script_id == script_id,
+                    Source.converter_input_hash == raw_hash,
+                )
+            )
+            return result.scalars().first()
+
+    async def fail_stale_converter_generations(self) -> list[ConverterScript]:
+        """Mark every ``generating`` script row ``failed`` and return them.
+
+        Startup reconciliation: the job that owns a generation lives in the
+        in-memory JobStore, so a row still ``generating`` on a fresh boot has
+        no job left to finish it — it would show as generating forever and
+        never become reusable or regenerable.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConverterScript)
+                .options(defer(ConverterScript.source_code), defer(ConverterScript.sample_excerpt))
+                .where(ConverterScript.status == "generating")
+            )
+            rows = list(result.scalars().all())
+            for row in rows:
+                row.status = "failed"
+                row.attempts = [
+                    *(row.attempts or []),
+                    converter_attempt_entry(
+                        len(row.attempts or []) + 1,
+                        "generate",
+                        error="generation interrupted by a server restart",
+                    ),
+                ]
+            await session.commit()
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     async def list_ingesting_sources(self) -> list[Source]:
         """Return every source still marked "ingesting", across all cases.
@@ -1894,6 +2739,40 @@ class PostgresStore:
             await session.commit()
             await session.refresh(row)
             return row
+
+    async def list_app_settings(self) -> list[AppSettingRow]:
+        """Return every stored settings override."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(AppSettingRow))
+            return list(result.scalars().all())
+
+    async def set_app_settings(
+        self, values: dict[str, Any], updated_by: str | None
+    ) -> list[AppSettingRow]:
+        """Upsert the given overrides; a value of ``None`` deletes that row.
+
+        Only keys present in ``values`` are touched — a key absent from the
+        mapping keeps whatever is stored. Returns the full override set after
+        the write, which the caller applies to the process (see
+        ``core/runtime_settings.py``).
+        """
+        async with self.session_factory() as session:
+            for key, value in values.items():
+                row = await session.get(AppSettingRow, key)
+                if value is None:
+                    if row is not None:
+                        await session.delete(row)
+                    continue
+                if row is None:
+                    row = AppSettingRow(key=key, value=value, updated_by=updated_by)
+                    session.add(row)
+                else:
+                    row.value = value
+                    row.updated_by = updated_by
+                    row.updated_at = datetime.now(UTC)
+            await session.commit()
+            result = await session.execute(select(AppSettingRow))
+            return list(result.scalars().all())
 
     async def get_agent_settings(self) -> AgentSettingsRow | None:
         """Return the single instance-wide agent settings row, if it exists."""
@@ -2113,12 +2992,93 @@ class PostgresStore:
             result = await session.execute(select(EnrichmentJobRun))
             return list(result.scalars().all())
 
+    async def get_enrichment_job_run(self, job_id: str) -> EnrichmentJobRun | None:
+        """Return one enrichment job marker by id, or None if it has no marker."""
+        async with self.session_factory() as session:
+            return await session.get(EnrichmentJobRun, job_id)
+
+    async def list_enrichment_job_runs_for_timeline(
+        self, case_id: str, timeline_id: str, enricher_key: str | None = None
+    ) -> list[EnrichmentJobRun]:
+        """Markers for one timeline (optionally one enricher), newest first.
+
+        The timeline-scoped counterpart to
+        :meth:`list_orphaned_enrichment_job_runs`, which is startup-only and
+        deliberately unfiltered. A row here is **not** necessarily orphaned — a
+        live run has a marker too. Callers must exclude the job currently
+        holding the in-memory run slot (``enrichers.jobs.get_active_enricher_run``);
+        the slot is claimed before the marker is written and released after it
+        would have been deleted, so "marker present and slot not held by it"
+        is what actually means dead.
+
+        Newest-first is a display order, not a tie-break: a caller that has to
+        name *one* dead marker (banner, 409 detail, skip log) must pick it with
+        ``enrichers.jobs.oldest_unfinished_run`` rather than by index, so every
+        surface names the same job.
+        """
+        async with self.session_factory() as session:
+            stmt = select(EnrichmentJobRun).where(
+                EnrichmentJobRun.case_id == case_id,
+                EnrichmentJobRun.timeline_id == timeline_id,
+            )
+            if enricher_key is not None:
+                stmt = stmt.where(EnrichmentJobRun.enricher_key == enricher_key)
+            result = await session.execute(stmt.order_by(EnrichmentJobRun.created_at.desc()))
+            return list(result.scalars().all())
+
+    async def staged_summary_by_job(
+        self, job_ids: Collection[str]
+    ) -> dict[str, tuple[int, set[str]]]:
+        """Map ``job_id -> (staged_row_count, set of source ids with staged rows)``.
+
+        One GROUP BY for every marker on a timeline, so the enrichers dialog
+        doesn't fan out a count query per enricher. Job ids with no staged rows
+        are simply absent from the result — a marker can legitimately have
+        zero staged rows (the run died before its first batch, or its apply got
+        far enough to drain them), and that is still a resumable marker.
+
+        The source *ids* rather than their count, because the dialog's
+        partial-coverage caveat is "some staged source was never staged fully",
+        which is the staged set minus ``EnrichmentJobRun.completed_source_ids``.
+        Comparing the two cardinalities instead gets this backwards after a
+        partially-applied resume, which deletes staged rows source by source and
+        so shrinks the staged count below the (durable) completed one.
+        Cardinality is per timeline, so materializing the ids is cheap.
+        """
+        if not job_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    EnrichmentResultStaging.job_id,
+                    EnrichmentResultStaging.source_id,
+                    func.count(),
+                )
+                .where(EnrichmentResultStaging.job_id.in_(list(job_ids)))
+                .group_by(EnrichmentResultStaging.job_id, EnrichmentResultStaging.source_id)
+            )
+            summary: dict[str, tuple[int, set[str]]] = {}
+            for job_id, source_id, rows in result.all():
+                total, sources = summary.get(job_id, (0, set()))
+                sources.add(source_id)
+                summary[job_id] = (total + int(rows), sources)
+            return summary
+
     async def delete_source(self, case_id: str, source_id: str) -> bool:
         """Delete a source row and its enrichment provenance/staging.
 
         ``SourceEnrichment`` and ``EnrichmentResultStaging`` reference the
         source by a plain ``source_id`` column (no FK/cascade), so they are
         deleted here too or they'd orphan when the source is removed.
+
+        ``AnalysisCache`` is purged for the whole case rather than for this
+        source: its rows are keyed by a fingerprint, not by source id, so there
+        is no way to select the ones computed over these events — and their
+        payloads hold event ids, field values and message templates from a
+        source the operator just deleted. Being unreachable (the fingerprint
+        covers the source set) is not the same as being gone, and eviction only
+        runs on a later write for the same case. The whole-case sweep costs a
+        rescan of derived data and nothing else.
 
         Returns True if a row was removed, False if it did not exist.
         """
@@ -2152,6 +3112,7 @@ class PostgresStore:
                     SourceFieldStats.source_id == source_id,
                 )
             )
+            await session.execute(delete(AnalysisCache).where(AnalysisCache.case_id == case_id))
             await session.delete(source)
             await session.commit()
             return True
@@ -2513,6 +3474,202 @@ class PostgresStore:
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
 
+    async def update_timeline_muted_methods(
+        self,
+        case_id: str,
+        timeline_id: str,
+        muted_methods: list[str] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's muted analysis methods (None/empty clears them).
+
+        Stored sorted and de-duplicated so the audit trail's before/after is a
+        comparison of sets rather than of insertion orders. Validation of the
+        ids against ``METHOD_IDS`` happens at the API layer, where an unknown id
+        can be reported as a 422 rather than silently persisted.
+
+        Returns the updated timeline with sources eagerly loaded, or None if it
+        doesn't exist.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.muted_methods = sorted(set(muted_methods)) if muted_methods else None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
+    async def update_timeline_field_overrides(
+        self,
+        case_id: str,
+        timeline_id: str,
+        field_overrides: dict[str, dict[str, bool]] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's per-method field overrides (None/empty clears them).
+
+        Methods whose map ends up empty are dropped rather than stored as ``{}``,
+        so "nothing declared for this method" has one representation and the
+        audit trail's before/after compares decisions rather than leftovers.
+        Validation of the method ids against ``METHOD_IDS`` happens at the API
+        layer, where an unknown id can be reported as a 422.
+
+        Returns the updated timeline with sources eagerly loaded, or None if it
+        doesn't exist.
+        """
+        from sqlalchemy import select
+
+        cleaned = {
+            method: {field: bool(state) for field, state in sorted(fields.items())}
+            for method, fields in sorted((field_overrides or {}).items())
+            if fields
+        }
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.field_overrides = cleaned or None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
+    async def update_timeline_recommended_columns(
+        self,
+        case_id: str,
+        timeline_id: str,
+        recommended_columns: dict[str, Any] | None,
+    ) -> Timeline | None:
+        """Replace a timeline's recommended event-grid columns (issue #213).
+
+        Written only by the recommendation job (``vestigo/columns/jobs.py``) and
+        the read-path settler in ``api/routers/cases.py``, which share the
+        payload shape. Returns the updated timeline, or None if it doesn't
+        exist — a timeline deleted while its job was running is an ordinary
+        outcome, not an error.
+
+        ``None`` clears the column — "never recommended", which is what the
+        job's rollback path writes when its first run fails. An **empty dict
+        clears it too**: there is no payload without a ``status``, so a caller
+        passing ``{}`` means "nothing to record" rather than "recorded, empty",
+        and storing it would leave the explorer reading a payload it cannot
+        interpret.
+
+        ``sources`` is deliberately *not* eager-loaded on the way out: no
+        caller serializes this return value (the job discards it), and the
+        payload is written twice per run, so the extra round trip would be pure
+        cost. Callers that need ``to_dict()`` re-read through ``get_timeline``.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            timeline.recommended_columns = recommended_columns or None
+            await session.commit()
+            await session.refresh(timeline)
+            return timeline
+
+    async def settle_running_recommendations(
+        self, case_id: str, timeline_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Relabel the named timelines' ``running`` recommendations in one pass.
+
+        The read-path counterpart to
+        :py:meth:`clear_stale_running_recommendations`, sharing the same
+        relabel (``columns/jobs.settle_running_payload``). One session and one
+        commit for the whole set: the timelines list settles every stale row it
+        finds, and a restart that orphaned a dozen recommendations would
+        otherwise cost a dozen sequential round trips on a page an analyst
+        opens constantly.
+
+        Re-checks ``status == "running"`` under this session rather than
+        trusting the caller's snapshot — a job may have written its real answer
+        between the read and this call, and overwriting that with a settled
+        placeholder would age a fresh recommendation backwards.
+
+        Returns ``{timeline_id: settled_payload}`` for the rows actually
+        changed, so the caller can serialize them without a second read.
+        """
+        from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
+
+        if not timeline_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id.in_(timeline_ids),
+                )
+            )
+            settled: dict[str, dict[str, Any]] = {}
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                timeline.recommended_columns = settle_running_payload(payload)
+                settled[timeline.id] = timeline.recommended_columns
+            if settled:
+                await session.commit()
+            return settled
+
+    async def clear_stale_running_recommendations(self) -> int:
+        """Settle column recommendations left ``running`` by a restart (#213).
+
+        ``JobStore`` is in-memory, so a process that dies mid-recommendation
+        leaves a Postgres payload claiming a job is in flight that no longer
+        exists — the explorer would poll for it forever. The relabel itself
+        lives in ``columns/jobs.settle_running_payload``, shared with the
+        read-path settler so the two can never drift. Nothing is recomputed
+        here; the next ingest or a manual re-suggest does that.
+
+        Filtering happens in Python rather than with a JSON path predicate:
+        the same code runs against SQLite in the test suite, and the number of
+        timelines with a stored recommendation is bounded by the number of
+        timelines. Returns the number of rows settled.
+        """
+        from sqlalchemy import select
+
+        from vestigo.columns.jobs import settle_running_payload
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(Timeline.recommended_columns.is_not(None))
+            )
+            settled = 0
+            for timeline in result.scalars():
+                payload = timeline.recommended_columns
+                if not isinstance(payload, dict) or payload.get("status") != "running":
+                    continue
+                timeline.recommended_columns = settle_running_payload(payload)
+                settled += 1
+            if settled:
+                await session.commit()
+            return settled
+
     async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
         """Delete a timeline row.
 
@@ -2547,9 +3704,15 @@ class PostgresStore:
         Returns True if the case existed and was removed, False otherwise.
 
         ``View``, ``Annotation``, ``DetectorRun``, the Sigma tables
-        (``SigmaRule``, ``SigmaRun``), and the enrichment tables
-        (``SourceEnrichment``, ``EnrichmentResultStaging``,
-        ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
+        (``SigmaRule``, ``SigmaRun``), the story tables (``Story``,
+        ``StoryBlock``, ``StoryExport`` — the last of which holds frozen event
+        data the operator believes went with the case), and the enrichment
+        tables (``SourceEnrichment``, ``EnrichmentResultStaging``,
+        ``EnrichmentJobRun``), ``AnalysisCache`` (derived, but its payloads
+        hold event ids, field values and message templates, and its eviction
+        only ever runs on a write for the same case — so a row left here would
+        never be reclaimed) and ``ConverterScript`` (whose ``sample_excerpt``
+        is a verbatim slice of the evidence log) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
         ``cases.id``), so they must be deleted explicitly here alongside
         ``Timeline``/``Source`` or they'd silently orphan on every case delete
@@ -2583,8 +3746,18 @@ class PostgresStore:
             await session.execute(
                 delete(EnrichmentJobRun).where(EnrichmentJobRun.case_id == case_id)
             )
+            await session.execute(delete(AnalysisCache).where(AnalysisCache.case_id == case_id))
             await session.execute(delete(SigmaRule).where(SigmaRule.case_id == case_id))
             await session.execute(delete(SigmaRun).where(SigmaRun.case_id == case_id))
+            # StoryBlock has no case_id of its own — reach it through its story.
+            await session.execute(
+                delete(StoryBlock).where(
+                    StoryBlock.story_id.in_(select(Story.id).where(Story.case_id == case_id))
+                )
+            )
+            await session.execute(delete(StoryExport).where(StoryExport.case_id == case_id))
+            await session.execute(delete(Story).where(Story.case_id == case_id))
+            await session.execute(delete(ConverterScript).where(ConverterScript.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True
@@ -2594,17 +3767,30 @@ class PostgresStore:
     # ------------------------------------------------------------------
 
     async def list_views(self, case_id: str) -> list[View]:
-        """Return all saved views for a case ordered by creation time (newest first)."""
+        """Return a case's live saved views, newest first.
+
+        Hidden views (``deleted_at`` set — deleted by an analyst while a story
+        block still referenced them) are excluded: they exist only to keep that
+        story rendering, and must not come back as something anyone can pick or
+        embed again.
+        """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(View).where(View.case_id == case_id).order_by(View.created_at.desc())
+                select(View)
+                .where(View.case_id == case_id, View.deleted_at.is_(None))
+                .order_by(View.created_at.desc())
             )
             return list(result.scalars().all())
 
     async def get_view(self, case_id: str, view_id: str) -> View | None:
-        """Return a saved view by case and view IDs."""
+        """Return a saved view by case and view IDs.
+
+        Deliberately *not* filtered on ``deleted_at``: resolving a hidden view
+        is the whole point of hiding rather than deleting it, since a story
+        block's render and export both go through here.
+        """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
@@ -2635,23 +3821,135 @@ class PostgresStore:
             await session.refresh(view)
             return view
 
-    async def delete_view(self, case_id: str, view_id: str) -> bool:
-        """Delete a saved view row.
+    async def _case_id_for_story(self, session: Any, story_id: str) -> str | None:
+        """The case a story belongs to — the hop a block-level mutation needs
+        before it can sweep that case's hidden views."""
+        from sqlalchemy import select
 
-        Returns True if the row existed and was removed.
+        return (
+            await session.execute(select(Story.case_id).where(Story.id == story_id))
+        ).scalar_one_or_none()
+
+    async def _view_ref_counts(self, session: Any, case_id: str) -> dict[str, int]:
+        """How many ``view_ref`` blocks in *case_id* point at each view id.
+
+        Counted in Python over the case's ``view_ref`` blocks rather than with
+        a JSON path operator in SQL: those differ between PostgreSQL and
+        SQLite, and the test suite runs on SQLite. The row count here is
+        bounded by the case's story blocks, which is small.
+        """
+        from sqlalchemy import select
+
+        rows = await session.execute(
+            select(StoryBlock.content)
+            .join(Story, Story.id == StoryBlock.story_id)
+            .where(Story.case_id == case_id, StoryBlock.kind == "view_ref")
+        )
+        counts: dict[str, int] = {}
+        for (content,) in rows.all():
+            view_id = (content or {}).get("view_id")
+            if view_id:
+                counts[view_id] = counts.get(view_id, 0) + 1
+        return counts
+
+    async def _lock_live_view(self, session: Any, case_id: str, view_id: str) -> None:
+        """Take the view row's lock inside *session*; raise if it isn't live.
+
+        The counterpart to the same lock in :meth:`delete_view`, and what makes
+        "delete a view no block references" and "create a block referencing a
+        view" serialize against each other. Without it the two interleave:
+        ``delete_view`` counts zero references, a collaborator commits a
+        ``view_ref`` block, and the delete then removes the view out from under
+        it — leaving a dangling reference that surfaces as a frozen
+        ``resolution.error`` in a forensic export, which is precisely the
+        outcome the hide-instead-of-delete design exists to prevent.
+
+        A block write holds this lock until it commits, so ``delete_view``
+        either runs first (and the block write then finds the view gone) or
+        waits and counts the now-committed reference. Raises ValueError so
+        callers map it exactly like the pre-write scope check in
+        :mod:`vestigo.stories.refs`.
+        """
+        from sqlalchemy import select
+
+        view = (
+            await session.execute(
+                select(View).where(View.case_id == case_id, View.id == view_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if view is None or view.deleted_at is not None:
+            raise ReferentGoneError(f"view {view_id!r} is not in this case")
+
+    async def _lock_referenced_view(self, session: Any, story_id: str, kind: str, content: dict):
+        """Lock the view a ``view_ref`` block points at; no-op for other kinds."""
+        if kind != "view_ref":
+            return
+        case_id = await self._case_id_for_story(session, story_id)
+        if case_id is None:  # pragma: no cover - the story lock already proved it exists
+            return
+        await self._lock_live_view(session, case_id, str(content.get("view_id")))
+
+    async def delete_view(self, case_id: str, view_id: str) -> str | None:
+        """Delete a saved view, or hide it when a story block still needs it.
+
+        Returns ``"deleted"`` when the row was removed, ``"hidden"`` when it
+        was stamped ``deleted_at`` because a ``view_ref`` block references it,
+        and None when there was no such view. Hiding rather than deleting is
+        what keeps a story that embeds the view rendering and exporting;
+        :meth:`purge_orphaned_hidden_views` finishes the job once the last
+        reference is gone.
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
+            # Locked before counting: a block write takes the same lock and
+            # holds it to commit, so the count below cannot miss a reference
+            # that lands between the count and the delete.
             result = await session.execute(
-                select(View).where(View.case_id == case_id, View.id == view_id)
+                select(View).where(View.case_id == case_id, View.id == view_id).with_for_update()
             )
             view = result.scalar_one_or_none()
             if view is None:
-                return False
+                return None
+            counts = await self._view_ref_counts(session, case_id)
+            if counts.get(view_id, 0) > 0:
+                if view.deleted_at is None:
+                    view.deleted_at = datetime.now(UTC)
+                    await session.commit()
+                return "hidden"
             await session.delete(view)
             await session.commit()
-            return True
+            return "deleted"
+
+    async def purge_orphaned_hidden_views(self, case_id: str) -> int:
+        """Hard-delete hidden views nothing references any more; return the count.
+
+        Idempotent and cheap, so every operation that can drop a ``view_ref``
+        calls it unconditionally rather than working out whether this
+        particular change orphaned anything. Sweeping the case instead of
+        tracking one view is what makes it impossible to forget a code path.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            counts = await self._view_ref_counts(session, case_id)
+            hidden = (
+                (
+                    await session.execute(
+                        select(View).where(View.case_id == case_id, View.deleted_at.is_not(None))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            removed = 0
+            for view in hidden:
+                if counts.get(view.id, 0) == 0:
+                    await session.delete(view)
+                    removed += 1
+            if removed:
+                await session.commit()
+            return removed
 
     # ------------------------------------------------------------------
     # Saved charts
@@ -2690,6 +3988,20 @@ class PostgresStore:
             await session.commit()
             await session.refresh(chart)
             return chart
+
+    async def get_saved_chart(
+        self, case_id: str, timeline_id: str, chart_id: str
+    ) -> SavedChart | None:
+        """Return a saved chart by case, timeline and chart IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SavedChart).where(
+                    SavedChart.case_id == case_id,
+                    SavedChart.timeline_id == timeline_id,
+                    SavedChart.id == chart_id,
+                )
+            )
+            return result.scalar_one_or_none()
 
     async def rename_saved_chart(
         self, case_id: str, timeline_id: str, chart_id: str, name: str
@@ -2733,6 +4045,636 @@ class PostgresStore:
             if chart is None:
                 return False
             await session.delete(chart)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Stories (W7)
+    # ------------------------------------------------------------------
+
+    async def create_story(
+        self, case_id: str, story_id: str, title: str, description: str | None, user: str
+    ) -> Story:
+        """Create a story within a case."""
+        story = Story(
+            id=story_id,
+            case_id=case_id,
+            title=title,
+            description=description,
+            created_by=user,
+            updated_by=user,
+        )
+        async with self.session_factory() as session:
+            session.add(story)
+            await session.commit()
+            await session.refresh(story)
+            return story
+
+    async def get_story(self, case_id: str, story_id: str) -> Story | None:
+        """Return a story by case and story IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def list_stories(self, case_id: str) -> list[Story]:
+        """Return a case's stories, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id).order_by(Story.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def update_story(
+        self,
+        case_id: str,
+        story_id: str,
+        *,
+        title: str | None | _Unset = UNSET,
+        description: str | None | _Unset = UNSET,
+        user: str,
+    ) -> Story | None:
+        """Update story title/description; returns the row or None if missing.
+
+        Fields left at ``UNSET`` are untouched; passing ``description=None``
+        explicitly clears it. ``title`` is required on the row, so ``None`` is
+        rejected by the API boundary rather than here.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            story = result.scalar_one_or_none()
+            if story is None:
+                return None
+            if not isinstance(title, _Unset) and title is not None:
+                story.title = title
+            if not isinstance(description, _Unset):
+                story.description = description
+            story.updated_by = user
+            await session.commit()
+            await session.refresh(story)
+            return story
+
+    async def delete_story(self, case_id: str, story_id: str) -> dict[str, Any] | None:
+        """Delete a story with its blocks and exports.
+
+        Returns a summary of what went with it — ``block_count`` and every
+        deleted export's ``id``/``snapshot_hash`` — or None when the story
+        doesn't exist. Exports are immutable attestations, so their hashes
+        have to survive into the caller's audit record even though the rows
+        themselves don't.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Story).where(Story.case_id == case_id, Story.id == story_id)
+            )
+            story = result.scalar_one_or_none()
+            if story is None:
+                return None
+            exports = (
+                await session.execute(
+                    select(StoryExport.id, StoryExport.snapshot_hash, StoryExport.html_hash)
+                    .where(StoryExport.story_id == story_id)
+                    .order_by(StoryExport.created_at.asc())
+                )
+            ).all()
+            block_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(StoryBlock)
+                    .where(StoryBlock.story_id == story_id)
+                )
+            ).scalar_one()
+            await session.execute(delete(StoryBlock).where(StoryBlock.story_id == story_id))
+            await session.execute(delete(StoryExport).where(StoryExport.story_id == story_id))
+            await session.delete(story)
+            await session.commit()
+        # The story's view_ref blocks are gone, which may have been the last
+        # thing keeping a hidden view alive.
+        await self.purge_orphaned_hidden_views(case_id)
+        return {
+            "block_count": int(block_count or 0),
+            "exports": [{"id": e[0], "snapshot_hash": e[1], "html_hash": e[2]} for e in exports],
+        }
+
+    async def list_story_blocks(self, story_id: str) -> list[StoryBlock]:
+        """Return a story's blocks in document order.
+
+        ``id`` breaks position ties so document order is stable across polls
+        even on a database written before the unique index existed.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryBlock)
+                .where(StoryBlock.story_id == story_id)
+                .order_by(StoryBlock.position.asc(), StoryBlock.id.asc())
+            )
+            return list(result.scalars().all())
+
+    async def count_story_blocks(self, story_ids: list[str]) -> dict[str, int]:
+        """Return ``{story_id: block_count}`` for the given stories in one query.
+
+        Listings need only the count; fetching every block of every story to
+        call ``len()`` on it is one query per story and pulls whole documents
+        into memory to discard them.
+        """
+        if not story_ids:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryBlock.story_id, func.count())
+                .where(StoryBlock.story_id.in_(story_ids))
+                .group_by(StoryBlock.story_id)
+            )
+            counts = {row[0]: int(row[1]) for row in result.all()}
+        return {story_id: counts.get(story_id, 0) for story_id in story_ids}
+
+    async def get_story_block(self, block_id: str) -> StoryBlock | None:
+        """Return a block by ID."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+            return result.scalar_one_or_none()
+
+    @staticmethod
+    async def _lock_story(session: AsyncSession, story_id: str) -> bool:
+        """Take a row lock on the story, serializing its position mutations.
+
+        Gap positions are derived from a read of the sibling set, so two
+        concurrent inserts would otherwise compute the same position (and now
+        collide on the unique index). Locking the parent row makes insert and
+        move mutually exclusive per story — stories are documents, not a hot
+        path, so a per-document mutex is cheap. SQLite ignores ``FOR UPDATE``
+        and is single-writer anyway. Returns False if the story is gone.
+        """
+        result = await session.execute(
+            select(Story.id).where(Story.id == story_id).with_for_update()
+        )
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    async def _story_block_order(session: AsyncSession, story_id: str) -> list[tuple[str, int]]:
+        """Return ``(block_id, position)`` in document order, ties broken by id."""
+        result = await session.execute(
+            select(StoryBlock.id, StoryBlock.position)
+            .where(StoryBlock.story_id == story_id)
+            .order_by(StoryBlock.position.asc(), StoryBlock.id.asc())
+        )
+        return [(row[0], row[1]) for row in result.all()]
+
+    @staticmethod
+    async def _renumber_story_blocks(
+        session: AsyncSession,
+        story_id: str,
+        order: list[tuple[str, int]],
+        *,
+        start_index: int = 1,
+    ) -> list[tuple[str, int]]:
+        """Rewrite ``order`` onto the canonical stride, collision-free.
+
+        ``(story_id, position)`` is unique, so assigning final positions in
+        place can transiently collide with a row that still holds the target
+        value. Every row in the story is first parked at a distinct negative
+        rank — disjoint from the positive finals by construction — and the
+        finals are then written. Rows of the story absent from ``order`` (the
+        block being moved) stay parked; the caller gives them their position.
+
+        ``updated_at`` is self-assigned so renumbering doesn't make untouched
+        blocks look edited to a polling client, and ``version`` is deliberately
+        left alone so it never manufactures a 409 for a collaborator.
+        """
+        parked = (
+            await session.execute(select(StoryBlock.id).where(StoryBlock.story_id == story_id))
+        ).scalars()
+        for rank, parked_id in enumerate(parked.all(), start=1):
+            await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == parked_id)
+                .values(position=-rank, updated_at=StoryBlock.updated_at)
+            )
+        renumbered = [
+            (block_id, (i + start_index) * STORY_POSITION_GAP)
+            for i, (block_id, _position) in enumerate(order)
+        ]
+        for block_id, position in renumbered:
+            await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == block_id)
+                .values(position=position, updated_at=StoryBlock.updated_at)
+            )
+        return renumbered
+
+    @staticmethod
+    def _story_position_for(order: list[tuple[str, int]], after_block_id: str | None) -> int | None:
+        """Compute the gap position for an insert, or None if the gap is exhausted.
+
+        ``order`` is ``(block_id, position)`` in document order.
+        ``after_block_id=None`` appends at the end. Raises ValueError when
+        ``after_block_id`` names a block that isn't in ``order``.
+        """
+        if after_block_id is None:
+            return order[-1][1] + STORY_POSITION_GAP if order else STORY_POSITION_GAP
+        idx = next((i for i, (bid, _) in enumerate(order) if bid == after_block_id), None)
+        if idx is None:
+            raise ValueError(f"after_block_id {after_block_id!r} not in story")
+        lo = order[idx][1]
+        hi = order[idx + 1][1] if idx + 1 < len(order) else lo + 2 * STORY_POSITION_GAP
+        mid = (lo + hi) // 2
+        return mid if lo < mid < hi else None
+
+    async def _story_top_position(
+        self,
+        session: AsyncSession,
+        story_id: str,
+        order: list[tuple[str, int]],
+    ) -> tuple[int, list[tuple[str, int]]]:
+        """A position sorting before every block in ``order``, renumbering if needed.
+
+        Halves below the first block, and when there is no room left above it
+        (``position < 2``) renumbers the story onto the stride from index 2 so
+        there is. Returns the position together with the (possibly rewritten)
+        order, since the caller's copy is stale after a renumber.
+
+        Shared by insert-at-top and move-to-top so "top of document" has one
+        definition. ``after_block_id`` cannot express it: on create that value
+        means "append at end" (see :meth:`create_story_block`), so a block
+        going above every existing one has no anchor to name.
+        """
+        if not order:
+            return STORY_POSITION_GAP, order
+        if order[0][1] < 2:
+            order = await self._renumber_story_blocks(session, story_id, order, start_index=2)
+        return order[0][1] // 2, order
+
+    async def create_story_block(
+        self,
+        story_id: str,
+        block_id: str,
+        kind: str,
+        content: dict,
+        user: str,
+        origin: str = "user",
+        after_block_id: str | None = None,
+        at_top: bool = False,
+    ) -> StoryBlock | None:
+        """Insert a block; appends at the end unless placed explicitly.
+
+        ``after_block_id`` inserts directly after that block. ``at_top`` puts
+        the block above every existing one — the placement ``after_block_id``
+        has no way to name, since on create ``None`` means "append at end"
+        (it means "top" on :meth:`move_story_block`, which is why the two are
+        not interchangeable). The two are mutually exclusive.
+
+        Returns None when the story doesn't exist. Positions are computed under
+        the story row lock and guarded by the unique index; losing the race for
+        a slot is retried (see ``STORY_POSITION_ATTEMPTS``), not surfaced.
+        """
+        if at_top and after_block_id is not None:
+            raise ValueError("at_top and after_block_id are mutually exclusive")
+        for _attempt in range(STORY_POSITION_ATTEMPTS):
+            try:
+                return await self._create_story_block_once(
+                    story_id, block_id, kind, content, user, origin, after_block_id, at_top
+                )
+            except IntegrityError as exc:
+                if not _is_position_conflict(exc):
+                    raise
+                continue
+        raise RuntimeError(
+            f"could not place a block in story {story_id!r} after "
+            f"{STORY_POSITION_ATTEMPTS} attempts"
+        )
+
+    async def _create_story_block_once(
+        self,
+        story_id: str,
+        block_id: str,
+        kind: str,
+        content: dict,
+        user: str,
+        origin: str,
+        after_block_id: str | None,
+        at_top: bool = False,
+    ) -> StoryBlock | None:
+        """One insert attempt; raises IntegrityError if the position was taken."""
+        async with self.session_factory() as session:
+            if not await self._lock_story(session, story_id):
+                return None
+            order = await self._story_block_order(session, story_id)
+            if at_top:
+                position, order = await self._story_top_position(session, story_id, order)
+            else:
+                position = self._story_position_for(order, after_block_id)
+                if position is None:
+                    # Gap exhausted: renumber onto the stride, then recompute.
+                    order = await self._renumber_story_blocks(session, story_id, order)
+                    position = self._story_position_for(order, after_block_id)
+            if position is None:  # pragma: no cover - unreachable after a renumber
+                raise RuntimeError(f"no free position in story {story_id!r} even after renumbering")
+            # Re-checked under the view's row lock, held until this commit.
+            # `validate_block_scope` already ran, but in an earlier transaction
+            # — only the lock keeps a concurrent `delete_view` from hard-
+            # deleting the referent in between.
+            await self._lock_referenced_view(session, story_id, kind, content)
+            block = StoryBlock(
+                id=block_id,
+                story_id=story_id,
+                position=position,
+                kind=kind,
+                content=content,
+                origin=origin,
+                created_by=user,
+                updated_by=user,
+            )
+            session.add(block)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise
+            await session.refresh(block)
+            return block
+
+    @staticmethod
+    async def _reload_block(session: AsyncSession, block_id: str) -> StoryBlock | None:
+        """Read a block inside ``session`` (used after a Core-level write)."""
+        result = await session.execute(select(StoryBlock).where(StoryBlock.id == block_id))
+        return result.scalar_one_or_none()
+
+    async def update_story_block(
+        self, block_id: str, content: dict, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """Update a block's content under optimistic concurrency.
+
+        The version guard is a compare-and-swap in the UPDATE's WHERE clause,
+        not a read-then-write: under READ COMMITTED two collaborators could
+        both read ``version=1``, both pass a Python-side check, and both write
+        ``version=2``, silently losing one edit. ``rowcount == 0`` means the
+        row moved under us.
+
+        Raises StaleBlockError (carrying the current row) when
+        ``expected_version`` no longer matches; returns None when the block
+        doesn't exist.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == block_id, StoryBlock.version == expected_version)
+                .values(
+                    content=content,
+                    version=StoryBlock.version + 1,
+                    updated_by=user,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if result.rowcount == 0:
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return None
+                session.expunge(current)
+                raise StaleBlockError(current)
+            block = await self._reload_block(session, block_id)
+            if block is not None:
+                # Repointing a view_ref makes this write a new reference, so it
+                # takes the referent's row lock exactly like a create does —
+                # see :meth:`_lock_live_view`. Raising here rolls the update
+                # back with the session close.
+                await self._lock_referenced_view(session, block.story_id, block.kind, content)
+            await session.commit()
+            if block is not None:
+                await session.refresh(block)
+            case_id = await self._case_id_for_story(session, block.story_id) if block else None
+        # Repointing a view_ref may have dropped the last reference to a
+        # hidden view. Runs only on the success path — a 409 changed nothing.
+        if case_id:
+            await self.purge_orphaned_hidden_views(case_id)
+        return block
+
+    async def move_story_block(
+        self, block_id: str, after_block_id: str | None, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """Reposition a block; ``after_block_id=None`` moves it to the top.
+
+        Same compare-and-swap version semantics as ``update_story_block``, run
+        under the story row lock so the sibling renumber and the move commit
+        atomically. Losing the race for the computed slot is retried; losing
+        the version race is a StaleBlockError and propagates immediately.
+        """
+        for _attempt in range(STORY_POSITION_ATTEMPTS):
+            try:
+                return await self._move_story_block_once(
+                    block_id, after_block_id, expected_version, user
+                )
+            except IntegrityError as exc:
+                if not _is_position_conflict(exc):
+                    raise
+                continue
+        raise RuntimeError(
+            f"could not reposition block {block_id!r} after {STORY_POSITION_ATTEMPTS} attempts"
+        )
+
+    async def _move_story_block_once(
+        self, block_id: str, after_block_id: str | None, expected_version: int, user: str
+    ) -> StoryBlock | None:
+        """One move attempt; raises IntegrityError if the position was taken."""
+        async with self.session_factory() as session:
+            story_id = (
+                await session.execute(select(StoryBlock.story_id).where(StoryBlock.id == block_id))
+            ).scalar_one_or_none()
+            if story_id is None:
+                return None
+            await self._lock_story(session, story_id)
+            order = [
+                row
+                for row in await self._story_block_order(session, story_id)
+                if row[0] != block_id
+            ]
+            if after_block_id is None:
+                # Top of document — same definition insert-at-top uses.
+                position, order = await self._story_top_position(session, story_id, order)
+            else:
+                try:
+                    position = self._story_position_for(order, after_block_id)
+                except ValueError:
+                    await session.rollback()
+                    raise
+                if position is None:
+                    order = await self._renumber_story_blocks(session, story_id, order)
+                    position = self._story_position_for(order, after_block_id)
+                if position is None:  # pragma: no cover - unreachable after a renumber
+                    raise RuntimeError(
+                        f"no free position in story {story_id!r} even after renumbering"
+                    )
+            result = await session.execute(
+                update(StoryBlock)
+                .where(StoryBlock.id == block_id, StoryBlock.version == expected_version)
+                .values(
+                    position=position,
+                    version=StoryBlock.version + 1,
+                    updated_by=user,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if result.rowcount == 0:
+                # Rolls the renumber back too — the move never happened.
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return None
+                session.expunge(current)
+                raise StaleBlockError(current)
+            block = await self._reload_block(session, block_id)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise
+            if block is not None:
+                await session.refresh(block)
+            return block
+
+    async def delete_story_block(self, block_id: str, expected_version: int | None = None) -> bool:
+        """Delete a block row. Returns True if it existed.
+
+        With ``expected_version``, the delete is guarded the same way an
+        update or a move is: a compare-and-swap in the DELETE's WHERE clause,
+        raising StaleBlockError when the row moved under the caller. Deleting
+        a block a collaborator has meanwhile rewritten destroys their edit
+        with no conflict to resolve, which is the one outcome the optimistic
+        ``version`` exists to prevent — so it must not be the one mutation
+        that skips the check.
+        """
+        async with self.session_factory() as session:
+            # Resolved before the delete: afterwards there is no row to walk
+            # back to the story, and the sweep needs the case.
+            doomed = await self._reload_block(session, block_id)
+            case_id = await self._case_id_for_story(session, doomed.story_id) if doomed else None
+            stmt = delete(StoryBlock).where(StoryBlock.id == block_id)
+            if expected_version is not None:
+                stmt = stmt.where(StoryBlock.version == expected_version)
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.rollback()
+                current = await self._reload_block(session, block_id)
+                if current is None:
+                    return False
+                session.expunge(current)
+                raise StaleBlockError(current)
+            await session.commit()
+        # Deleting a view_ref may have dropped the last reference to a hidden
+        # view. Runs only on the success path — a 409 changed nothing.
+        if case_id:
+            await self.purge_orphaned_hidden_views(case_id)
+        return True
+
+    async def create_story_export(
+        self,
+        export_id: str,
+        story_id: str,
+        case_id: str,
+        snapshot: dict,
+        snapshot_hash: str,
+        user: str,
+    ) -> StoryExport:
+        """Persist a resolved export snapshot (immutable; artifact sealed later)."""
+        export = StoryExport(
+            id=export_id,
+            story_id=story_id,
+            case_id=case_id,
+            snapshot=snapshot,
+            snapshot_hash=snapshot_hash,
+            created_by=user,
+        )
+        async with self.session_factory() as session:
+            session.add(export)
+            await session.commit()
+            await session.refresh(export)
+            return export
+
+    async def get_story_export(self, case_id: str, export_id: str) -> StoryExport | None:
+        """Return an export by case and export IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport).where(
+                    StoryExport.case_id == case_id, StoryExport.id == export_id
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_story_exports(self, story_id: str) -> list[StoryExport]:
+        """Return a story's exports, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(StoryExport)
+                .where(StoryExport.story_id == story_id)
+                .order_by(StoryExport.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def list_case_export_attestations(self, case_id: str) -> list[dict[str, Any]]:
+        """Return every sealed export in a case as ``id``/``story_id``/hashes.
+
+        Deleting a case cascades its exports away. The hashes *are* the
+        attestation, so the caller has to be able to put them in an audit
+        record that outlives the rows — and to decide whether a cascade that
+        destroys them needs a stronger gate than an ordinary case delete.
+        Deliberately not returning ORM rows: the snapshot column is large and
+        nothing on this path reads it.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    StoryExport.id,
+                    StoryExport.story_id,
+                    StoryExport.snapshot_hash,
+                    StoryExport.html_hash,
+                )
+                .where(StoryExport.case_id == case_id)
+                .order_by(StoryExport.created_at.asc())
+            )
+            return [
+                {"id": r[0], "story_id": r[1], "snapshot_hash": r[2], "html_hash": r[3]}
+                for r in result.all()
+            ]
+
+    async def seal_story_export_artifact(
+        self, export_id: str, html: str, html_hash: str
+    ) -> StoryExport | None:
+        """Attach the rendered artifact to an export, exactly once.
+
+        Returns None when the export doesn't exist **or** already carries an
+        artifact — exports are immutable, so a second upload is refused rather
+        than overwriting the sealed record. The ``html IS NULL`` guard lives in
+        the UPDATE's WHERE clause, not in a preceding read: two concurrent
+        uploads would both observe an unsealed row and the second would
+        overwrite a sealed forensic record.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(StoryExport)
+                .where(StoryExport.id == export_id, StoryExport.html.is_(None))
+                .values(html=html, html_hash=html_hash)
+            )
+            if result.rowcount == 0:
+                await session.rollback()
+                return None
+            export = (
+                await session.execute(select(StoryExport).where(StoryExport.id == export_id))
+            ).scalar_one()
+            await session.commit()
+            await session.refresh(export)
+            return export
+
+    async def delete_story_export(self, export_id: str) -> bool:
+        """Delete an export row (admin-only path). Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(StoryExport).where(StoryExport.id == export_id))
+            export = result.scalar_one_or_none()
+            if export is None:
+                return False
+            await session.delete(export)
             await session.commit()
             return True
 
@@ -2906,6 +4848,7 @@ class PostgresStore:
         event_id: str | None = None,
         note: str | None = None,
         details: dict | None = None,
+        analysis_scope: dict | None = None,
         created_by: str | None = None,
     ) -> FindingDisposition:
         """Create a disposition row, or return the existing identical one.
@@ -2915,22 +4858,66 @@ class PostgresStore:
         case/timeline — so repeating the same verdict is a no-op rather than
         an error and the UI action stays idempotent. Scope validation (exactly
         one of value/event scope) lives in the API layer.
+
+        ``analysis_scope`` joins that key for ``confirmed`` only, because the
+        two verdict families mean different things. A ``confirmed`` verdict is
+        an assertion *about a comparison* — escalating a finding against the
+        February baseline and escalating it again against the March one are two
+        separate claims, and collapsing them would lose one. ``normal`` (and
+        ``dismissed``/``routine``) are standing declarations about a value,
+        effective under every frame; duplicating those per scope would inflate
+        :func:`dispositions_hash`'s input and the triage burndown without
+        expressing anything new.
         """
+        scope_in_identity = kind == "confirmed"
+        analysis_scope = canonical_scope(analysis_scope)
         async with self.session_factory() as session:
-            existing = (
-                await session.execute(
-                    select(FindingDisposition).where(
-                        FindingDisposition.case_id == case_id,
-                        FindingDisposition.timeline_id == timeline_id,
-                        FindingDisposition.kind == kind,
-                        FindingDisposition.detector == detector,
-                        FindingDisposition.field == field,
-                        FindingDisposition.value == value,
-                        FindingDisposition.source_id == source_id,
-                        FindingDisposition.event_id == event_id,
+            conditions = [
+                FindingDisposition.case_id == case_id,
+                FindingDisposition.timeline_id == timeline_id,
+                FindingDisposition.kind == kind,
+                FindingDisposition.detector == detector,
+                FindingDisposition.field == field,
+                FindingDisposition.value == value,
+                FindingDisposition.source_id == source_id,
+                FindingDisposition.event_id == event_id,
+            ]
+            # All matches, not `scalar_one_or_none`: nothing in the schema
+            # enforces this tuple's uniqueness, and pre-existing duplicates must
+            # dedupe to the oldest rather than raise MultipleResultsFound.
+            candidates = (
+                (
+                    await session.execute(
+                        select(FindingDisposition)
+                        .where(*conditions)
+                        .order_by(FindingDisposition.created_at.asc())
                     )
                 )
-            ).scalar_one_or_none()
+                .scalars()
+                .all()
+            )
+            # The scope arm of the key is settled here rather than in SQL: the
+            # comparison is over two extracted fields, not the stored JSON, and
+            # SQL cannot express even the NULL arm portably (SQLAlchemy's JSON
+            # comparator does not render `IS NULL` as a plain SQL null test).
+            # The candidate set is one row per scope this exact finding was
+            # confirmed under, so the filter costs nothing to do in Python.
+            if scope_in_identity:
+                # Same comparison, and nothing else — `scope_identity`, not
+                # whole-dict equality, so a baseline rename or a moved
+                # `dispositions_hash` in the echoed scope does not read as a
+                # different frame. A row carrying no scope was confirmed under a
+                # comparison nobody recorded, so it can neither answer for this
+                # scope nor be backfilled with it — the backfill would make the
+                # audit column assert a frame the verdict was not reached under.
+                # Re-confirming such a finding writes a new, stamped row and
+                # leaves the old one honest.
+                want = scope_identity(analysis_scope)
+                existing = next(
+                    (r for r in candidates if scope_identity(r.analysis_scope) == want), None
+                )
+            else:
+                existing = candidates[0] if candidates else None
             if existing is not None:
                 return existing
             row = FindingDisposition(
@@ -2945,6 +4932,7 @@ class PostgresStore:
                 event_id=event_id,
                 note=note,
                 details=details,
+                analysis_scope=analysis_scope,
                 created_by=created_by,
             )
             session.add(row)
@@ -2972,17 +4960,6 @@ class PostgresStore:
         if not items:
             return []
 
-        def _scope_key(
-            timeline_id: Any,
-            kind: Any,
-            detector: Any,
-            field: Any,
-            value: Any,
-            source_id: Any,
-            event_id: Any,
-        ) -> tuple:
-            return (timeline_id, kind, detector, field, value, source_id, event_id)
-
         async with self.session_factory() as session:
             # One prefetch covering every row a batch item could collide with.
             # NULL scope columns rule out a composite-tuple IN (NULL never
@@ -3004,22 +4981,32 @@ class PostgresStore:
                 .all()
             )
             by_key: dict[tuple, FindingDisposition] = {
-                _scope_key(
-                    r.timeline_id, r.kind, r.detector, r.field, r.value, r.source_id, r.event_id
+                disposition_identity(
+                    timeline_id=r.timeline_id,
+                    kind=r.kind,
+                    detector=r.detector,
+                    field=r.field,
+                    value=r.value,
+                    source_id=r.source_id,
+                    event_id=r.event_id,
+                    analysis_scope=r.analysis_scope,
                 ): r
                 for r in existing_rows
             }
             rows: list[FindingDisposition] = []
             for it in items:
-                key = _scope_key(
-                    it.get("timeline_id"),
-                    it["kind"],
-                    it.get("detector", "*"),
-                    it.get("field"),
-                    it.get("value"),
-                    it.get("source_id"),
-                    it.get("event_id"),
+                key = disposition_identity(
+                    timeline_id=it.get("timeline_id"),
+                    kind=it["kind"],
+                    detector=it.get("detector", "*"),
+                    field=it.get("field"),
+                    value=it.get("value"),
+                    source_id=it.get("source_id"),
+                    event_id=it.get("event_id"),
+                    analysis_scope=it.get("analysis_scope"),
                 )
+                # Exact identity only — an unstamped `confirmed` row is never
+                # adopted here either. See :meth:`create_disposition`.
                 existing = by_key.get(key)
                 if existing is not None:
                     rows.append(existing)
@@ -3036,6 +5023,7 @@ class PostgresStore:
                     event_id=it.get("event_id"),
                     note=it.get("note"),
                     details=it.get("details"),
+                    analysis_scope=canonical_scope(it.get("analysis_scope")),
                     created_by=it.get("created_by"),
                 )
                 session.add(row)
@@ -3212,12 +5200,16 @@ class PostgresStore:
         title: str | None = None,
         history: list | None = None,
         disabled_tools: list[str] | None = None,
+        history_partial_at: datetime | None | _Unset = UNSET,
     ) -> None:
         """Update a conversation's title, replayable history, and/or tool set.
 
         ``disabled_tools`` accepts ``[]`` meaningfully (re-enable everything),
         so it is checked against None rather than falsiness — the caller
         clearing the restriction must not be read as "no change".
+        ``history_partial_at`` goes further: ``None`` *is* the clearing value
+        (this turn completed), so it needs the ``UNSET`` sentinel to express
+        "leave it alone".
         """
         values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
         if title is not None:
@@ -3226,6 +5218,8 @@ class PostgresStore:
             values["history"] = history
         if disabled_tools is not None:
             values["disabled_tools"] = disabled_tools
+        if not isinstance(history_partial_at, _Unset):
+            values["history_partial_at"] = history_partial_at
         async with self.session_factory() as session:
             await session.execute(
                 update(AgentConversation)
@@ -3261,6 +5255,7 @@ class PostgresStore:
         tool_args: dict | None = None,
         tool_result: dict | list | None = None,
         tool_call_id: str | None = None,
+        view_filters: dict | None = None,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
     ) -> AgentMessage:
@@ -3274,6 +5269,7 @@ class PostgresStore:
             tool_args=tool_args,
             tool_result=tool_result,
             tool_call_id=tool_call_id,
+            view_filters=view_filters,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
@@ -3372,22 +5368,26 @@ class PostgresStore:
         case_id: str,
         timeline_id: str,
         conversation_id: str,
-        tag: str | None,
-        comment: str | None,
-        rationale: str,
-        events: list,
+        tag: str | None = None,
+        comment: str | None = None,
+        rationale: str = "",
+        events: list | None = None,
+        kind: str = "annotation",
+        payload: dict | None = None,
     ) -> AgentProposal:
-        """Create a new proposed annotation awaiting analyst decision."""
+        """Create a new agent proposal awaiting analyst decision."""
         proposal = AgentProposal(
             id=generate_id("agentprop"),
             conversation_id=conversation_id,
             case_id=case_id,
             timeline_id=timeline_id,
             status="proposed",
+            kind=kind,
+            payload=payload,
             tag=tag,
             comment=comment,
             rationale=rationale,
-            events=events,
+            events=events or [],
         )
         async with self.session_factory() as session:
             session.add(proposal)
@@ -3908,6 +5908,52 @@ class PostgresStore:
             )
             return [row[0] for row in result.all()]
 
+    async def list_event_ids_with_any_annotation(
+        self, case_id: str, source_ids: list[str]
+    ) -> list[str]:
+        """Return the event_ids carrying at least one annotation of any kind.
+
+        Deliberately unfiltered by type or origin: this backs the derived
+        ``annotated`` tag, which means "somebody or something has touched this
+        event" — a human tag, a comment, an agent proposal or a detector
+        finding all count.
+
+        Uncapped, like its typed siblings above. The result feeds
+        ``TagFilter.postgres_event_ids`` and reaches ClickHouse through the
+        external-table path, whose breadth is a decision already taken and
+        argued — see ``EXTERNAL_LIST_THRESHOLD`` in ``vestigo/db/queries.py``,
+        whose comment names this very filter as the case it was sized for.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.event_id)
+                .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
+                .distinct()
+            )
+            return [row[0] for row in result.all()]
+
+    async def has_any_annotation(self, case_id: str, source_ids: list[str]) -> bool:
+        """Whether anything in this scope carries an annotation at all.
+
+        Same unfiltered-by-type-or-origin question as
+        :py:meth:`list_event_ids_with_any_annotation`, asked where only the
+        answer matters — the merged-tags facet, which offers the derived
+        ``annotated`` tag once the timeline has earned it. Materializing every
+        annotated event_id to test a list for emptiness costs the whole
+        annotation table on an endpoint the filter panel hits constantly.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.id)
+                .where(Annotation.case_id == case_id, Annotation.source_id.in_(source_ids))
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
     # ------------------------------------------------------------------
     # Users
     # ------------------------------------------------------------------
@@ -4044,6 +6090,57 @@ class PostgresStore:
                 update(User).where(User.id == user_id).values(last_login_at=datetime.now(UTC))
             )
             await session.commit()
+
+    async def claim_demo_seed(self, user_id: str) -> bool:
+        """Stamp the demo-seed flag, returning True only for the winning caller.
+
+        Conditional on the column still being null, so two simultaneous logins
+        cannot both dispatch a seed job. Stamped *before* the import runs: a
+        failed import leaves a failed job the user can retry explicitly, which
+        beats re-importing on every subsequent login.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(User)
+                .where(User.id == user_id, User.demo_case_seeded_at.is_(None))
+                .values(demo_case_seeded_at=datetime.now(UTC))
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def release_demo_seed(self, user_id: str) -> None:
+        """Clear the demo-seed flag, so this user is seeded at their next login.
+
+        The claim is stamped before the build is dispatched, which leaves a
+        window: if dispatch itself fails — the concurrency cap is full during a
+        post-upgrade burst of logins, say — the user would be marked as seeded
+        without a job ever having run, and would never be offered the case
+        again. Releasing an unspent claim is strictly better than holding it.
+        Not used once a build has started: from that point a failed job is the
+        record, and the user restores explicitly.
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                update(User).where(User.id == user_id).values(demo_case_seeded_at=None)
+            )
+            await session.commit()
+
+    async def find_demo_case_for_owner(self, owner_id: str) -> Case | None:
+        """Return this user's seeded demo case, if they still have one.
+
+        The restore endpoint's guard: each user gets one demo case at a time,
+        and a fresh copy is only reachable after deleting the old one.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Case)
+                .where(Case.owner_id == owner_id, Case.is_demo.is_(True))
+                .order_by(Case.created_at.desc())
+                .limit(1)
+            )
+            return result.scalars().first()
 
     async def delete_user(self, user_id: str, reassign_cases_to: str | None = None) -> bool:
         """Delete a user, cascading their sessions and team memberships.

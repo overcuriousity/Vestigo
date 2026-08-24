@@ -19,15 +19,13 @@ from tests.conftest import _fake_user
 from vestigo.api import deps
 from vestigo.api.routers import events
 from vestigo.db.postgres import Case, PostgresStore
+from vestigo.db.queries import QueryRequestTooLargeError
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    """In-memory SQLite store — same pattern as tests/test_annotations.py."""
-    db_path = tmp_path / "test_events_router.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database):
+    """A private PostgreSQL database — same pattern as tests/test_annotations.py."""
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 
@@ -277,6 +275,115 @@ async def test_resolve_tags_filter_resolves_only_postgres_side(patched_store):
     assert result.postgres_event_ids == ["ann-evt"]
 
 
+@pytest.mark.asyncio
+async def test_annotated_tag_matches_every_annotated_event(patched_store):
+    """The derived ``annotated`` tag spans annotation types and origins.
+
+    A comment, a detector finding and a human tag are all "somebody touched
+    this event", so all three match — which is what makes the tag mean what
+    its name says rather than "has a tag".
+    """
+    for i, (ann_type, origin) in enumerate(
+        [("tag", "user"), ("comment", "user"), ("anomaly", "system")]
+    ):
+        await patched_store.create_annotation(
+            case_id="c1",
+            source_id="s1",
+            event_id=f"evt{i}",
+            annotation_id=f"a{i}",
+            annotation_type=ann_type,
+            origin=origin,
+            content="whatever",
+        )
+
+    result = await events._resolve_tags_filter("c1", ["s1"], [events.ANNOTATED_TAG])
+    assert sorted(result.postgres_event_ids) == ["evt0", "evt1", "evt2"]
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_matches_nothing_when_nothing_is_annotated(patched_store):
+    result = await events._resolve_tags_filter("c1", ["s1"], [events.ANNOTATED_TAG])
+    assert result.postgres_event_ids == []
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_unions_with_ordinary_tag_values(patched_store):
+    """Asking for ``annotated`` plus a real tag is an OR, like any two tags."""
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="commented",
+        annotation_id="a1",
+        annotation_type="comment",
+        origin="user",
+        content="look at this",
+    )
+    await patched_store.create_annotation(
+        case_id="c2",
+        source_id="s2",
+        event_id="other-case",
+        annotation_id="a2",
+        annotation_type="tag",
+        origin="user",
+        content="suspicious",
+    )
+    result = await events._resolve_tags_filter("c1", ["s1"], [events.ANNOTATED_TAG, "suspicious"])
+    # Scoped to the case and its sources, so the other case's event is absent.
+    assert result.postgres_event_ids == ["commented"]
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_is_not_resolved_when_not_asked_for(patched_store):
+    """It costs a query, so it must only run when the filter names it."""
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="commented",
+        annotation_id="a1",
+        annotation_type="comment",
+        origin="user",
+        content="look at this",
+    )
+    result = await events._resolve_tags_filter("c1", ["s1"], ["suspicious"])
+    assert result.postgres_event_ids == []
+
+
+@pytest.mark.asyncio
+async def test_merged_tags_offers_annotated_only_when_something_is(patched_store, monkeypatch):
+    """The facet appears once the timeline has an annotation, and not before.
+
+    A filter value that is guaranteed to match nothing is noise in the panel,
+    so this follows the same rule as every other value the endpoint returns:
+    offered because something carries it.
+    """
+
+    class _Svc:
+        def list_distinct_parser_tags(self, case_id, source_ids):
+            return ["parser-tag"]
+
+    monkeypatch.setattr(events, "_get_query_service", lambda: _Svc())
+
+    async def _sources(case_id, timeline_id):
+        return ["s1"]
+
+    monkeypatch.setattr(events, "_resolve_timeline_source_ids", _sources)
+
+    before = await events.list_merged_tags("c1", "t1", case=None)
+    assert before["tags"] == ["parser-tag"]
+
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="evt0",
+        annotation_id="a0",
+        annotation_type="comment",
+        origin="user",
+        content="look at this",
+    )
+    after = await events.list_merged_tags("c1", "t1", case=None)
+    assert after["tags"] == [events.ANNOTATED_TAG, "parser-tag"]
+
+
 # ---------------------------------------------------------------------------
 # bulk_annotate_by_filter
 # ---------------------------------------------------------------------------
@@ -333,6 +440,49 @@ async def test_bulk_annotate_by_filter_honors_annotated_restriction(patched_stor
 
     assert result == {"tagged": 1}
     assert fake_service.last_query.event_ids == ["flagged-evt"]
+
+
+@pytest.mark.asyncio
+async def test_annotated_tag_reaches_the_event_query(patched_store, monkeypatch):
+    """The derived tag has to survive the hop into ``EventQuery``.
+
+    Every other test for it stops at ``_resolve_tags_filter``, which leaves the
+    wiring untested — a tag that resolves correctly and is then dropped on the
+    way to the store filters nothing, and nothing would have failed. Exercised
+    through ``_resolve_event_id_filters``, the resolver both this endpoint and
+    ``list_events`` share.
+    """
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+    await patched_store.create_annotation(
+        case_id="c1",
+        source_id="s1",
+        event_id="commented-evt",
+        annotation_id="ann1",
+        annotation_type="comment",
+        content="look at this",
+        origin="user",
+    )
+
+    fake_service = _FakeQueryService(refs=[("commented-evt", "s1")])
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
+
+    await events.bulk_annotate_by_filter(
+        "c1",
+        "t1",
+        events.BulkAnnotateByFilterRequest(
+            annotation_type="tag",
+            content="reviewed",
+            tags_include=events.ANNOTATED_TAG,
+        ),
+        case=Case(id="c1"),
+        user=_fake_user(),
+    )
+
+    tag_filter = fake_service.last_query.tags_include
+    assert tag_filter.tag_values == [events.ANNOTATED_TAG]
+    assert tag_filter.postgres_event_ids == ["commented-evt"]
 
 
 @pytest.mark.asyncio
@@ -577,6 +727,39 @@ async def test_export_complete_marks_trailer_and_does_not_raise(patched_store, m
     assert ("rows=3" in joined) or ('"written": 3' in joined)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["jsonl", "csv"])
+async def test_export_surfaces_too_large_filter_before_streaming(patched_store, monkeypatch, fmt):
+    """A too-large filter must reach the 413 handler, not truncate a 200.
+
+    Once ``StreamingResponse`` flushes headers no exception handler can run, so
+    a ``QueryRequestTooLargeError`` from ``iter_events`` would leave the analyst
+    with a silently short file. The route's pre-flight ``count()`` executes the
+    identical WHERE clause, so the failure surfaces while a status code can
+    still be chosen. This test pins that ordering — moving the count below the
+    response construction would break it.
+    """
+    await _seed_export_timeline(patched_store)
+
+    class _TooLargeService:
+        def count(self, query):
+            raise QueryRequestTooLargeError("the filter is too large")
+
+        def iter_events(self, query, batch_size: int = 1000):
+            raise AssertionError("streaming must not start")
+
+        def query(self, query):
+            raise AssertionError("query() should not be called")
+
+    fake = _TooLargeService()
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format=fmt, filter=events.ExportFilter())
+    with pytest.raises(QueryRequestTooLargeError):
+        await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+
+
 # ---------------------------------------------------------------------------
 # _index_annotations_by_event (export enrichment)
 # ---------------------------------------------------------------------------
@@ -686,6 +869,30 @@ def test_parse_modes_object_accepts_valid_modes():
     }
 
 
+def test_parse_modes_object_accepts_the_empty_presence_mode():
+    assert events._parse_modes_object('{"user_agent": "empty"}') == {"user_agent": "empty"}
+
+
+def test_validate_field_modes_ignores_empty_mode_fields():
+    """`empty` carries no pattern, so the regex pre-check must skip it rather
+    than trying to compile its placeholder value."""
+    events._validate_field_modes({"user_agent": [""]}, {"user_agent": "empty"})
+    events._validate_field_modes({"user_agent": ["(["]}, {"user_agent": "empty"})
+
+
+def test_validate_field_modes_rejects_orphan_empty_mode_with_400():
+    """An `empty` mode whose key is absent from the filter map would be
+    silently ignored by the query builder and answer with the whole timeline —
+    reachable from a hand-edited or truncated shared URL."""
+    with pytest.raises(HTTPException) as exc_info:
+        events._validate_field_modes({}, {"user_agent": "empty"})
+    assert exc_info.value.status_code == 400
+    assert "no matching filter entry" in exc_info.value.detail
+    # A different key present is not the key the mode names.
+    with pytest.raises(HTTPException):
+        events._validate_field_modes({"src_ip": ["10.0.0.1"]}, {"user_agent": "empty"})
+
+
 def test_parse_modes_object_rejects_unknown_mode_with_400():
     with pytest.raises(HTTPException) as exc_info:
         events._parse_modes_object('{"src_ip": "glob"}')
@@ -693,20 +900,20 @@ def test_parse_modes_object_rejects_unknown_mode_with_400():
     assert "invalid match mode" in exc_info.value.detail
 
 
-def test_validate_field_regexes_rejects_invalid_pattern_with_400():
+def test_validate_field_modes_rejects_invalid_pattern_with_400():
     with pytest.raises(HTTPException) as exc_info:
-        events._validate_field_regexes({"msg": "(["}, {"msg": "regex"})
+        events._validate_field_modes({"msg": "(["}, {"msg": "regex"})
     assert exc_info.value.status_code == 400
     assert "invalid regular expression" in exc_info.value.detail
     # Exclusion-shaped (list) values are checked per value.
     with pytest.raises(HTTPException):
-        events._validate_field_regexes({"msg": ["ok", "(["]}, {"msg": "regex"})
+        events._validate_field_modes({"msg": ["ok", "(["]}, {"msg": "regex"})
 
 
-def test_validate_field_regexes_ignores_non_regex_modes():
+def test_validate_field_modes_ignores_non_regex_modes():
     # "([" is an invalid regex but valid literal/wildcard — must not raise.
-    events._validate_field_regexes({"msg": "(["}, {"msg": "wildcard"})
-    events._validate_field_regexes({"msg": "(["}, {})
+    events._validate_field_modes({"msg": "(["}, {"msg": "wildcard"})
+    events._validate_field_modes({"msg": "(["}, {})
 
 
 def test_uses_regex_detects_field_modes():
@@ -1031,6 +1238,69 @@ async def test_run_stat_detector_dispatches_to_charset(patched_store, monkeypatc
     # Explicit fields → the field-stats cache inventory is not resolved.
     assert fake_svc.charset_calls[0]["inventory"] is None
     assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_charset_passes_group_field(patched_store, monkeypatch):
+    """D14: group_field threads through dispatch, the resolution snapshot, and
+    the service call (None when unset)."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="charset",
+        fields="attr:user",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+        group_field="attr:host",
+    )
+    assert result == "charset-result"
+    assert fake_svc.charset_calls[0]["group_field"] == "attr:host"
+    assert resolution["charset_group_field"] == "attr:host"
+
+    _result2, resolution2 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="charset",
+        fields="attr:user",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.charset_calls[1]["group_field"] is None
+    assert resolution2["charset_group_field"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_charset_rejects_bad_group_field(patched_store, monkeypatch):
+    """A group_field the detector refuses (non-string column) surfaces as 422,
+    not as a ClickHouse type error behind a 500."""
+
+    class _Refusing(_FakeStatAnomalyService):
+        def find_charset_novelty(self, **kwargs):
+            raise ValueError("group_field 'timestamp' is not a string field")
+
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: _Refusing())
+
+    with pytest.raises(HTTPException) as excinfo:
+        await events._run_stat_detector(
+            "c1",
+            "t1",
+            ["s1"],
+            detector="charset",
+            fields="attr:user",
+            series_field="artifact",
+            z_threshold=None,
+            limit=50,
+            group_field="timestamp",
+        )
+    assert excinfo.value.status_code == 422
+    assert "not a string field" in str(excinfo.value.detail)
 
 
 @pytest.mark.asyncio
@@ -1586,12 +1856,14 @@ async def timeline_setup(patched_store):
     return patched_store
 
 
-def _call_list_anomalies(persist: bool = True):
+def _call_list_anomalies(
+    persist: bool = True, detector: str = "value_novelty", fields: str | None = None
+):
     return events.list_anomalies(
         "c1",
         "t1",
-        detector="value_novelty",
-        fields=None,
+        detector=detector,
+        fields=fields,
         series_field="artifact",
         z_threshold=None,
         min_skew_seconds=None,
@@ -1619,6 +1891,86 @@ async def test_list_anomalies_persists_run_by_default(
     run = await timeline_setup.get_detector_run("c1", response["run_id"])
     assert run is not None
     assert run.result["results"][0]["event_id"] == "evt-1"
+
+
+@pytest.mark.asyncio
+async def test_persisted_run_records_the_field_declaration(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A run whose params read "auto" does not say which fields were scanned.
+
+    The declaration steers a detector's automatic field selection, so two runs
+    whose params both read "auto" can have scanned different fields once an
+    analyst edits it. An exclusion reaches `warnings`; an applied pin leaves no
+    other trace at all — which makes the run's own diary the only place it can
+    be recorded.
+    """
+    declared = {"attr:status_code": False, "attr:user": True}
+    await timeline_setup.update_timeline_field_overrides("c1", "t1", {"value_novelty": declared})
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies()
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] == declared
+
+
+@pytest.mark.asyncio
+async def test_persisted_run_records_no_declaration_as_none(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies()
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_with_explicit_fields_records_no_declaration(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """Naming fields bypasses the declaration, so the run must not cite it.
+
+    The key exists because a run reading "auto" does not say what it scanned.
+    Recording it against a scan it never touched is the same failure pointed
+    the other way: the diary would claim a declaration steered this run.
+    """
+    await timeline_setup.update_timeline_field_overrides(
+        "c1", "t1", {"value_novelty": {"attr:status_code": False}}
+    )
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies(fields="attr:user")
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_detector_that_selects_no_fields_records_no_declaration(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """`frequency` takes one named series field, so a declaration cannot steer it.
+
+    The PATCH endpoint refuses to store one; written straight to the store (as
+    a pre-validation row would have been), it must still not reach the run's
+    diary — a recorded declaration reads as one that applied.
+    """
+    await timeline_setup.update_timeline_field_overrides(
+        "c1", "t1", {"frequency": {"attr:user": False}}
+    )
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await _call_list_anomalies(detector="frequency")
+
+    run = await timeline_setup.get_detector_run("c1", response["run_id"])
+    assert run.params["field_overrides"] is None
 
 
 @pytest.mark.asyncio
@@ -2187,3 +2539,52 @@ def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
 
     without = list(events._stream_csv(eq, {}, None, expected=2, tally={}))
     assert not without[0].startswith("#")
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_passes_max_gap_seconds(patched_store, monkeypatch):
+    """D14: max_gap_seconds threads to both sequence detectors and their
+    resolution snapshots; unset stays None (no gap bound)."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _r1, res1 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+        max_gap_seconds=300,
+    )
+    assert fake_svc.sequence_calls[0]["max_gap_seconds"] == 300
+    assert res1["sequence_max_gap_seconds"] == 300
+
+    _r2, res2 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_motif",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+        max_gap_seconds=3600,
+    )
+    assert fake_svc.motif_calls[0]["max_gap_seconds"] == 3600
+    assert res2["motif_max_gap_seconds"] == 3600
+
+    _r3, res3 = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.sequence_calls[1]["max_gap_seconds"] is None
+    assert res3["sequence_max_gap_seconds"] is None

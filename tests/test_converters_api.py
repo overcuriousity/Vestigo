@@ -49,7 +49,7 @@ def test_list_and_download(client, admin_bootstrap) -> None:
     # cloudtrail/filterlog/nginx/pcap/suricata are served both ways: the
     # vendored stdlib-only script stays available as a minimal-dependency
     # alternative alongside the native pyarrow-based Parquet converter.
-    for stem in ("cloudtrail", "filterlog", "nginx", "pcap", "suricata"):
+    for stem in ("cloudtrail", "evtx", "filterlog", "nginx", "pcap", "suricata"):
         assert f"{stem}2timesketch" in names
         assert f"{stem}2vestigo" in names
     # timesketch2parquet is a generic converter with no vendored counterpart
@@ -69,6 +69,7 @@ def test_native_converter_entries_flagged() -> None:
     for name in (
         "nginx2vestigo",
         "cloudtrail2vestigo",
+        "evtx2vestigo",
         "filterlog2vestigo",
         "pcap2vestigo",
         "suricata2vestigo",
@@ -76,6 +77,8 @@ def test_native_converter_entries_flagged() -> None:
     ):
         assert by_name[name]["native"] is True
         assert "pyarrow" in by_name[name]["requires"]
+    # evtx2vestigo is the only converter needing a second runtime dependency.
+    assert by_name["evtx2vestigo"]["requires"] == ["pyarrow", "evtx"]
     # Vendored entries carry no native flag.
     assert "native" not in by_name["browser2timesketch"]
     assert "native" not in by_name["cloudtrail2timesketch"]

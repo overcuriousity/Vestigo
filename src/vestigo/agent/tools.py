@@ -17,6 +17,9 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import types
+import typing
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -26,18 +29,14 @@ from fastapi.concurrency import run_in_threadpool
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from vestigo.agent.chart_exec import execute_chart_spec
 from vestigo.agent.chart_meta import (
-    CHART_META,
     LEGACY_KIND_MAP,
-    METRIC_INFO,
     PIE_COMFORTABLE_MAX,
     ChartType,
     Metric,
     Scale,
     chart_types_for,
-    compare_capable,
-    metric_available,
-    requires_field,
 )
 from vestigo.agent.encoding import columnar, columnar_auto
 from vestigo.agent.fidelity import DEFAULT_FIDELITY, Fidelity
@@ -76,6 +75,19 @@ MAX_PROPOSAL_EVENTS = 500
 # a model that cannot tell a capped list from a complete one would reason over
 # a silently partial set, which is exactly what the evidence rule forbids.
 MAX_LIST_ROWS = 200
+
+# read_story's markdown budget. A story's narrative is not incidental string
+# data like an attribute value — it is the document the agent is asked to
+# reason about and to continue writing, and a write accepts up to
+# VESTIGO_STORY_MAX_MARKDOWN_BYTES (256 KiB). Reading it back at the old
+# ATTR_VALUE_TRUNCATE * 8 (1600 chars) silently cut ordinary prose blocks, so
+# the cap is per-block *and* per-response: one long block cannot eat the whole
+# response, and a long story degrades block by block instead of all at once.
+# Every cut is stamped (`truncated`, `text_length`) — an unmarked cut is the
+# failure mode that matters, because the model then reasons over half a
+# paragraph believing it read the block.
+STORY_TEXT_TRUNCATE = 8000
+STORY_TEXT_BUDGET = 24000
 
 # A9: viz-tool result caps — tighter than the Visualize page's own bounds
 # (e.g. field_scatter's UI cap is 20000 points, series_limit up to 50) since
@@ -175,6 +187,12 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         tier="core",
     ),
     ToolInfo(
+        "propose_story_block",
+        "Propose adding a block to a story — the analyst must confirm.",
+        requires_conversation=True,
+        tier="core",
+    ),
+    ToolInfo(
         "semantic_search",
         "Find events semantically similar to free text (needs embeddings).",
         embeddings_gated=True,
@@ -185,6 +203,8 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         embeddings_gated=True,
     ),
     ToolInfo("list_baselines", "List saved baseline definitions (range + suspect windows)."),
+    ToolInfo("list_stories", "List this case's stories (the analyst's report documents)."),
+    ToolInfo("read_story", "Read a story's ordered blocks — markdown text and embed references."),
     ToolInfo("list_dispositions", "List analyst verdicts on anomaly findings."),
     ToolInfo("list_saved_views", "List the analyst's saved filter views for this case."),
     ToolInfo("list_annotations", "List annotations across this timeline's sources."),
@@ -201,7 +221,111 @@ TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOL_REGISTRY)
 # beside the tiers it selects: `agent/fidelity.py::FIDELITY_TIERED_TOOLS`.
 
 
-class FilterSpec(BaseModel):
+def coerce_object_arg(data: Any) -> Any:
+    """Parse a tool argument a provider handed over as a JSON string.
+
+    Nested object arguments are not universally emitted as objects: some
+    providers stringify them, and pydantic-ai only parses the *top* level of a
+    tool call's arguments (``ToolCallPart.args_as_dict``), so the inner value
+    arrives as text. Rejecting it costs the model a retry it has to guess its
+    way out of, on tools it otherwise uses correctly — every filtered query in
+    the toolset takes a nested ``FilterSpec``. Anything that is not a JSON
+    object falls through unchanged to the normal validation error.
+    """
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        # `json.JSONDecodeError` subclasses `ValueError`; catching the base also
+        # covers the `str`-subclass edge cases `json.loads` raises it for.
+        except ValueError:
+            return data
+    return data
+
+
+def _admits_json_object(annotation: Any) -> bool:
+    """True when a field accepts a JSON object and never a plain string.
+
+    The ``str`` exclusion is the whole safety argument: ``q: str | None`` may
+    legitimately hold ``'{"a": 1}'`` as a free-text search, and coercing it
+    would silently rewrite the analyst's query into a dict. A field is only
+    coerced when an object is the *only* thing a string could have meant.
+
+    Raises:
+        TypeError: if an annotation cannot be inspected (an unresolved forward
+            reference, i.e. a model whose `model_rebuild()` has not run). The
+            honest answers are "yes", "no" and "cannot tell", and silently
+            folding the third into "no" would drop a field from coercion with
+            no signal anywhere — exactly the failure this whole path exists to
+            make loud. Reached at class-inspection time, not per call.
+    """
+    origin = typing.get_origin(annotation)
+    members = (
+        [m for m in typing.get_args(annotation) if m is not type(None)]
+        if origin in (typing.Union, types.UnionType)
+        else [annotation]
+    )
+    unresolved = [m for m in members if isinstance(m, str | typing.ForwardRef)]
+    if unresolved:
+        raise TypeError(
+            f"cannot decide object-coercion for unresolved annotation {annotation!r} "
+            f"({unresolved!r}) — call model_rebuild() on the owning model first"
+        )
+    if any(m is str for m in members):
+        return False
+    return any(
+        typing.get_origin(m) in (dict, Mapping)
+        or (isinstance(m, type) and issubclass(m, BaseModel))
+        for m in members
+    )
+
+
+# Keyed by field *name*, so a `Field(alias=...)` on a nested-argument model
+# would need this revisited — none of them use one today.
+_OBJECT_FIELDS: dict[type[BaseModel], frozenset[str]] = {}
+
+
+class ObjectArgModel(BaseModel):
+    """Base for every model used as a *nested* tool argument.
+
+    Carries `coerce_object_arg` so tolerance is a property of the position
+    (nested argument) rather than something each spec remembers to add — for
+    the model itself *and* for every field of it that admits a JSON object.
+    A provider that stringifies one level tends to stringify the next, and
+    ``FilterSpec.filters`` (a plain ``dict``, not a model) is as reachable
+    that way as ``ChartSpec.options`` is.
+    """
+
+    @classmethod
+    def _object_fields(cls) -> frozenset[str]:
+        """Field names whose annotation admits a JSON object; see `_admits_json_object`."""
+        cached = _OBJECT_FIELDS.get(cls)
+        if cached is None:
+            cached = frozenset(
+                name for name, f in cls.model_fields.items() if _admits_json_object(f.annotation)
+            )
+            _OBJECT_FIELDS[cls] = cached
+        return cached
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_stringified(cls, data: Any) -> Any:
+        data = coerce_object_arg(data)
+        if not isinstance(data, dict):
+            return data
+        fields = cls._object_fields()
+        stringified = [k for k in fields if isinstance(data.get(k), str)]
+        if not stringified:
+            return data
+        # Copied, never mutated in place: the same mapping is the tool call's
+        # `tool_args`, persisted verbatim as the model emitted it. Normalizing
+        # for validation must not rewrite the forensic record.
+        data = dict(data)
+        for key in stringified:
+            data[key] = coerce_object_arg(data[key])
+        return data
+
+
+class FilterSpec(ObjectArgModel):
     """Event filters, mirroring the Explorer's filter shape.
 
     This is the contract that makes findings applicable: the exact same spec
@@ -232,10 +356,21 @@ class FilterSpec(BaseModel):
     )
     filter_modes: dict[str, str] = Field(
         default_factory=dict,
-        description='Per-field match mode for filters: "exact" (default) | "wildcard" | "regex".',
+        description=(
+            'Per-field match mode for filters: "exact" (default) | "wildcard" | '
+            '"regex" | "empty". "empty" ignores the field\'s values and matches '
+            "rows where the field has no value at all (absent or blank) — name "
+            "the field here and leave it out of `filters` entirely."
+        ),
     )
     exclusion_modes: dict[str, str] = Field(
-        default_factory=dict, description="Per-field match mode for exclusions."
+        default_factory=dict,
+        description=(
+            "Per-field match mode for exclusions, same values as filter_modes. "
+            '"empty" drops rows where the field has no value, i.e. keeps only '
+            "rows that have one; name the field here and leave it out of "
+            "`exclusions`."
+        ),
     )
     tags_include: list[str] | None = Field(
         default=None, description="Only events carrying any of these tags."
@@ -286,7 +421,23 @@ class FilterSpec(BaseModel):
         answers the question actually being asked. This is the same contract as
         the chart-legality errors: an error the model is meant to act on, with
         ``retries=3`` (``agent/runtime.py``) giving it room to.
+
+        ``empty`` mode is the one legitimate valueless predicate, and it is
+        normalized here rather than rejected: the mode asks about the field's
+        presence, so there is no value to name. ``_build_where`` only visits
+        keys present in the filter map, so a mode with no key would otherwise
+        be silently dropped and answer with the whole timeline — the exact
+        failure this validator exists to prevent, arrived at from the other
+        side. The placeholder value the predicate ignores is injected instead.
         """
+        for mapping, modes in (
+            (self.filters, self.filter_modes),
+            (self.exclusions, self.exclusion_modes),
+        ):
+            for key, mode in modes.items():
+                if mode == "empty" and not mapping.get(key):
+                    mapping[key] = [""]
+
         empty_maps = [
             (name, key)
             for name, mapping in (("filters", self.filters), ("exclusions", self.exclusions))
@@ -313,7 +464,7 @@ class FilterSpec(BaseModel):
         return self
 
 
-class ChartCompareSpec(BaseModel):
+class ChartCompareSpec(ObjectArgModel):
     """The optional second layer a chart is measured against."""
 
     mode: Literal["off", "baseline", "custom"] = Field(
@@ -330,7 +481,7 @@ class ChartCompareSpec(BaseModel):
     )
 
 
-class ChartOptionsSpec(BaseModel):
+class ChartOptionsSpec(ObjectArgModel):
     """Presentation and sizing knobs, mirroring the Visualize page's controls.
 
     Every field is optional; omitting one takes the same default the analyst
@@ -396,7 +547,7 @@ class ChartOptionsSpec(BaseModel):
     )
 
 
-class ChartSpec(BaseModel):
+class ChartSpec(ObjectArgModel):
     """A chart, described exactly as the Visualize page describes one.
 
     This mirrors the frontend's `ChartConfig` field for field, so anything an
@@ -487,6 +638,12 @@ class ChartSpec(BaseModel):
         restart, whose model still holds the previous tool schema in context —
         and is deletable once no such conversation can predate the change.
         """
+        # `ObjectArgModel` coerces a stringified argument too, but the two
+        # before-validators' relative order is pydantic's business — doing it
+        # here as well keeps the legacy translation below reachable for a
+        # stringified legacy spec whichever way that order falls. Parsing an
+        # already-parsed value is a no-op.
+        data = coerce_object_arg(data)
         if not isinstance(data, dict):
             return data
         kind = data.get("kind")
@@ -1011,7 +1168,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         _persist_detector_run,
         _run_stat_detector,
         _serialize_stat_result,
-        _validate_field_regexes,
+        _validate_field_modes,
         _validate_regex,
     )
 
@@ -1039,8 +1196,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     def _validated(spec: FilterSpec | None) -> FilterSpec:
         spec = spec or FilterSpec()
         _validate_regex(spec.q, spec.q_regex)
-        _validate_field_regexes(spec.filters, spec.filter_modes)
-        _validate_field_regexes(spec.exclusions, spec.exclusion_modes)
+        _validate_field_modes(spec.filters, spec.filter_modes)
+        _validate_field_modes(spec.exclusions, spec.exclusion_modes)
         return spec
 
     # Field vocabulary for chart validation, resolved once per tool server
@@ -1129,6 +1286,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         whole record either way. Iterate by refining `filters` rather than
         paging deeply — aggregations (field_terms, histogram) summarize better
         than paging.
+
+        Where the timeline defines canonical field mappings, each event's
+        attributes carry the canonical field alongside the raw keys it was
+        coalesced from — the same value a filter on that field matches.
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec, limit=limit, offset=offset, order=order)
@@ -1522,6 +1683,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         min_support: int | None = Field(default=None, ge=2),
         start: datetime | None = None,
         end: datetime | None = None,
+        group_field: str | None = None,
+        max_gap_seconds: int | None = Field(default=None, ge=1),
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
@@ -1536,7 +1699,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         otherwise): z_threshold (frequency |z| cutoff), min_skew_seconds
         (timestamp_order), fdr_q (BH false-discovery ceiling), min_ratio
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
-        (sequence_motif), start/end (sequence_motif mining window).
+        (sequence_motif), start/end (sequence_motif mining window),
+        group_field (charset only: learn one alphabet per value of this
+        field, e.g. per host, instead of one merged alphabet),
+        max_gap_seconds (sequence_novelty/sequence_motif only: break a
+        sequence when consecutive events are farther apart than this).
         Returns findings plus a persisted run_id the analyst can open. Each
         finding carries an example `event_id`; how much of that event comes
         with it depends on the deployment, and the result's `fidelity`/`note`
@@ -1565,6 +1732,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             min_support=min_support,
             start=start,
             end=end,
+            group_field=group_field,
+            max_gap_seconds=max_gap_seconds,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )
@@ -1633,429 +1802,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         call's result size for your context only — the analyst's card is drawn
         at the full size you asked for.
         """
-        chart_type = spec.chart_type
-        meta = CHART_META[chart_type]
-        data_kind = meta.data_kind
-        opts = spec.options
-        warnings: list[str] = []
-
-        # ── legality, before any query ───────────────────────────────────────
-        scale = spec.scale or meta.default_scale
-        if scale not in meta.scales:
-            raise ValueError(
-                f'chart_type="{chart_type}" requires scale in '
-                f"{{{', '.join(chr(34) + s + chr(34) for s in meta.scales)}}}, "
-                f'got "{scale}". Chart types legal for scale="{scale}": '
-                f"{', '.join(chart_types_for(scale))}."
-            )
-
-        if requires_field(chart_type) and not meta.multi_field and not spec.field:
-            raise ValueError(
-                f'chart_type="{chart_type}" requires field. Only chart_type="time" and '
-                '"punchcard" chart the whole event count with no field.'
-            )
-        if meta.requires_second_field and not spec.field_y:
-            raise ValueError(
-                f'chart_type="{chart_type}" requires field_y — it charts '
-                "field x field_y, not a single distribution. For one field over "
-                'time use chart_type="heatmap" instead.'
-            )
-        if spec.field_y and not meta.requires_second_field and not meta.accepts_second_field:
-            # Naming trap worth spelling out rather than only enumerating: our
-            # "heatmap" is one field x time, and the field x field grid an
-            # analyst also calls a heatmap is "pivot". A model that reached for
-            # the word alone burned both its retries on the same rejection.
-            two_field = [c for c in CHART_META if CHART_META[c].requires_second_field]
-            hint = (
-                ' chart_type="heatmap" is one field over time; for a field x field '
-                'heatmap grid use chart_type="pivot".'
-                if chart_type == "heatmap"
-                else ""
-            )
-            raise ValueError(
-                f'chart_type="{chart_type}" takes no field_y. '
-                f"Two-field chart types: {', '.join(two_field)}.{hint}"
-            )
-
-        if meta.multi_field:
-            if not spec.fields or len(spec.fields) < 2:
-                raise ValueError(
-                    f'chart_type="{chart_type}" needs `fields`: 2-'
-                    f"{VIZ_CORR_MAX_FIELDS} numeric field tokens to correlate. "
-                    "`field`/`field_y` are not used by this chart."
-                )
-            if len(set(spec.fields)) != len(spec.fields):
-                raise ValueError("`fields` must not repeat a field token.")
-            # Reject, don't truncate: silently charting the first eight would
-            # answer a question the model never asked and label it the answer
-            # to the one it did — the same rule (and wording) as the
-            # field_correlation tool and the HTTP endpoint's 422.
-            if len(spec.fields) > VIZ_CORR_MAX_FIELDS:
-                raise ValueError(
-                    f"a correlation matrix needs between 2 and {VIZ_CORR_MAX_FIELDS} fields, "
-                    f"got {len(spec.fields)}. Correlate the most promising ones, or run "
-                    "several matrices."
-                )
-        elif spec.fields:
-            multi = [c for c in CHART_META if CHART_META[c].multi_field]
-            raise ValueError(
-                f'chart_type="{chart_type}" takes no `fields` list. '
-                f"Charts that do: {', '.join(multi)}."
-            )
-
-        compare_on = spec.compare.mode != "off"
-        if compare_on and not meta.supports_compare:
-            raise ValueError(
-                f'chart_type="{chart_type}" does not support a comparison layer. '
-                f"Compare-capable chart types: {', '.join(compare_capable())}."
-            )
-        if spec.compare.mode == "custom" and spec.compare.filters is None:
-            raise ValueError(
-                'compare.mode="custom" needs compare.filters. Use mode="baseline" to '
-                "compare against this timeline's whole unfiltered event set."
-            )
-        if not metric_available(spec.metric, chart_type, compare_on):
-            info = METRIC_INFO[spec.metric]
-            if info.requires_compare and not compare_on:
-                raise ValueError(
-                    f'metric="{spec.metric}" ({info.label}) needs a comparison layer — '
-                    'set compare.mode to "baseline" or "custom".'
-                )
-            raise ValueError(
-                f'metric="{spec.metric}" ({info.label}) is only defined on '
-                f'chart_type="time", which is the one chart with ordered time bins. '
-                f"Its formula is {info.formula}."
-            )
-
-        # Options this chart never reads are inert, not fatal — but silence
-        # would leave the model believing it had set something.
-        ignored = sorted(
-            key
-            for key, value in opts.model_dump().items()
-            if value is not None and key not in meta.reads_options
+        payload = await execute_chart_spec(
+            scope, spec, service=service, validated=_validated, check_field=_check_chart_field
         )
-        if ignored:
-            reads = ", ".join(meta.reads_options) or "no options"
-            warnings.append(
-                f'options {", ".join(ignored)} ignored by chart_type="{chart_type}" '
-                f"(it reads: {reads})."
-            )
-
-        await _check_chart_field(spec.field, "field")
-        await _check_chart_field(spec.field_y, "field_y")
-        for token in spec.fields or []:
-            await _check_chart_field(token, "fields")
-
-        def _capped(value: int | None, default: int, cap: int, name: str, floor: int = 1) -> int:
-            resolved = max(floor, min(value or default, cap))
-            if value is not None and resolved != value:
-                warnings.append(
-                    f"options.{name}={value} clamped to {resolved} for this validation "
-                    "query (agent context budget); the analyst's card is not capped."
-                )
-            return resolved
-
-        primary_filters = _validated(spec.filters)
-        primary_query = await _build_query(scope, primary_filters)
-        comparison_query = None
-        if compare_on:
-            # "baseline" is the timeline's whole event set — the same unfiltered
-            # resolution POST /viz/compare does for mode="baseline".
-            comparison_filters = _validated(
-                spec.compare.filters if spec.compare.mode == "custom" else FilterSpec()
-            )
-            comparison_query = await _build_query(scope, comparison_filters)
-
-        applied: dict[str, Any] = {}
-        #: Options this chart type nominally reads but that this *particular*
-        #: spec made inert (a bounded time axis ignores its limit). Kept out
-        #: of the `resolved` echo below, which otherwise re-adds them.
-        inert_options: set[str] = set()
-
-        # ── execute, dispatching on the aggregation the mark needs ───────────
-        if data_kind == "terms":
-            applied["top_n"] = _capped(opts.top_n, 30, VIZ_MAX_TERMS, "top_n")
-            if comparison_query is not None:
-                result = await run_in_threadpool(
-                    service.compare_field_terms,
-                    primary_query,
-                    comparison_query,
-                    spec.field,
-                    applied["top_n"],
-                )
-                summary = {
-                    "primary_total": result["primary_total"],
-                    "comparison_total": result["comparison_total"],
-                    "distinct": result["distinct"],
-                }
-            else:
-                result = await run_in_threadpool(
-                    service.field_terms, primary_query, spec.field, applied["top_n"]
-                )
-                summary = {
-                    "total": result["total"],
-                    "distinct": result["distinct"],
-                    "top_values": result["values"][:5],
-                }
-                if chart_type == "pie":
-                    readability = _pie_readability_warning(result)
-                    if readability:
-                        warnings.append(readability)
-        elif data_kind == "numeric" and spec.field_y and meta.accepts_second_field:
-            # Grouped box/violin: numeric response × categorical grouping field.
-            applied["groups"] = _capped(opts.groups, 8, VIZ_GROUPS_MAX, "groups", floor=2)
-            applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
-            result = await run_in_threadpool(
-                service.field_numeric_grouped,
-                primary_query,
-                spec.field,
-                spec.field_y,
-                applied["groups"],
-                applied["bins"],
-                bool(opts.show_points),
-                VIZ_POINTS_OVERLAY_MAX,
-            )
-            if not result["total"]:
-                raise ValueError(
-                    f'field "{spec.field}" has no numeric values under these filters, so '
-                    f'chart_type="{chart_type}" would render empty. Treat it as '
-                    'categorical: chart_type "bar"/"pie"/"heatmap" with scale "nominal".'
-                )
-            summary = {
-                "total": result["total"],
-                "groups": [
-                    {"value": g["value"], "count": g["count"], "median": g["quantiles"]["0.5"]}
-                    for g in result["groups"]
-                ],
-                "omitted_groups": result["omitted_groups"],
-                "omitted_count": result["omitted_count"],
-            }
-            # Omission belongs in `warnings`, not only in the summary the model
-            # may skim: a chart that drops groups has to say so out loud.
-            if result["omitted_groups"]:
-                warnings.append(
-                    f"{result['omitted_groups']} further {spec.field_y} value(s) "
-                    f"({result['omitted_count']} events) fall outside the top "
-                    f"{applied['groups']} and are omitted — not merged into an "
-                    '"Other" box, which would be a distribution of unrelated things.'
-                )
-            # Advisory, like the pie rule: a grouping variable with hundreds of
-            # values is usually an identifier, and a box per identifier is not
-            # a comparison. Never a refusal — the analyst may know better.
-            if result["distinct_groups"] > VIZ_GROUP_CARDINALITY_CAUTION:
-                warnings.append(
-                    f'"{spec.field_y}" has {result["distinct_groups"]} distinct values — '
-                    "that looks like an identifier rather than a grouping variable, and "
-                    "only the top groups are drawn. A categorical field with few values "
-                    "compares more honestly."
-                )
-        elif data_kind == "numeric":
-            if comparison_query is not None:
-                # The comparison aggregation has no auto-bin path (shared bin
-                # edges are negotiated between the two layers), so an omitted
-                # bins falls back to the manual default.
-                applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
-                result = await run_in_threadpool(
-                    service.compare_field_numeric,
-                    primary_query,
-                    comparison_query,
-                    spec.field,
-                    applied["bins"],
-                )
-                summary = {
-                    "primary_total": result["primary_total"],
-                    "comparison_total": result["comparison_total"],
-                }
-            else:
-                # bins omitted → the service picks Freedman–Diaconis; echo the
-                # resolved count so the model knows what will be drawn.
-                bins_arg = (
-                    _capped(opts.bins, 30, VIZ_MAX_BINS, "bins") if opts.bins is not None else None
-                )
-                result = await run_in_threadpool(
-                    service.field_numeric_stats, primary_query, spec.field, bins_arg
-                )
-                applied["bins"] = len(result["bins"]) or None
-                applied["bin_rule"] = result.get("bin_rule", "manual")
-                if not result["count"]:
-                    raise ValueError(
-                        f'field "{spec.field}" has no numeric values under these filters, so '
-                        f'chart_type="{chart_type}" would render empty. Treat it as '
-                        'categorical: chart_type "bar"/"pie"/"heatmap" with scale "nominal".'
-                    )
-                summary = {
-                    "count": result["count"],
-                    "min": result["min"],
-                    "max": result["max"],
-                    "mean": result["mean"],
-                    "skewness": result.get("skewness"),
-                }
-        elif data_kind == "timeseries":
-            applied["buckets"] = _capped(
-                opts.buckets, 30, VIZ_TIMESERIES_MAX_BUCKETS, "buckets", floor=4
-            )
-            applied["top_n"] = _capped(opts.top_n, 6, VIZ_TIMESERIES_MAX_SERIES, "top_n")
-            result = await run_in_threadpool(
-                service.field_value_timeseries,
-                primary_query,
-                spec.field,
-                applied["buckets"],
-                applied["top_n"],
-            )
-            summary = {
-                "series_count": len(result["series"]),
-                "interval_seconds": result["interval_seconds"],
-            }
-        elif data_kind == "time":
-            applied["buckets"] = _capped(opts.buckets, 30, VIZ_MAX_BUCKETS, "buckets", floor=4)
-            if comparison_query is not None:
-                result = await run_in_threadpool(
-                    service.compare_time_histogram,
-                    primary_query,
-                    comparison_query,
-                    applied["buckets"],
-                )
-                summary = {
-                    "primary_total": result["primary_total"],
-                    "comparison_total": result["comparison_total"],
-                }
-            else:
-                result = await run_in_threadpool(
-                    service.histogram, primary_query, applied["buckets"]
-                )
-                summary = {
-                    "buckets": len(result["buckets"]),
-                    "interval_seconds": result["interval_seconds"],
-                }
-        elif data_kind == "punchcard":
-            result = await run_in_threadpool(service.time_punchcard, primary_query)
-            summary = {"total": result["total"], "max_count": result["max_count"]}
-        elif data_kind == "pivot":
-            applied["limit_x"] = _capped(opts.limit_x, 8, VIZ_PIVOT_MAX_LIMIT, "limit_x")
-            applied["limit_y"] = _capped(opts.limit_y, 8, VIZ_PIVOT_MAX_LIMIT, "limit_y")
-            result = await run_in_threadpool(
-                service.field_pivot,
-                primary_query,
-                spec.field,
-                spec.field_y,
-                applied["limit_x"],
-                applied["limit_y"],
-            )
-            # A bounded `time:` axis is charted as its whole natural-order
-            # domain (an hour with no events is a finding, not a value to
-            # hide), so its limit never applied. Say so and stop echoing a
-            # limit that did nothing — silence here would leave the model
-            # believing it had bounded a matrix it had not.
-            for axis, token in (("x", spec.field), ("y", spec.field_y)):
-                axis_spec = resolve_time_field(token or "")
-                if axis_spec is None or axis_spec.domain is None:
-                    continue
-                applied.pop(f"limit_{axis}", None)
-                inert_options.add(f"limit_{axis}")
-                warnings.append(
-                    f'options.limit_{axis} does not apply to "{token}": a bounded time '
-                    f"axis is charted as its full {len(axis_spec.domain)}-value domain, "
-                    "so empty slots stay visible."
-                )
-            summary = {
-                "total": result["total"],
-                # `*_distinct` carries two units — a measured distinct count
-                # the axis may have been truncated against, or the size of a
-                # bounded time domain charted whole. `*_bounded` says which,
-                # so "12 of 400 distinct" and "12 of 12" are not read alike.
-                "x_distinct": result["x_distinct"],
-                "y_distinct": result["y_distinct"],
-                "x_bounded": result["x_bounded"],
-                "y_bounded": result["y_bounded"],
-                # Size of the matrix the model is about to reason over —
-                # what the axes actually resolved to, which for a bounded
-                # time axis is its whole domain rather than a limit.
-                "matrix_size": len(result["x_values"]) * len(result["y_values"]),
-            }
-        elif data_kind == "corr":
-            # `fields` is already validated (2–VIZ_CORR_MAX_FIELDS, distinct)
-            # by the multi_field guard above, so no capping happens here.
-            fields = spec.fields or []
-            result = await run_in_threadpool(service.field_correlation, primary_query, fields)
-            dropped = [d["field"] for d in result["dropped_fields"]]
-            if dropped:
-                warnings.append(
-                    f"no numeric values for {', '.join(dropped)} under these filters — "
-                    "their row/column will be empty. Check them with describe_field."
-                )
-            summary = {
-                "total": result["total"],
-                "pairs": [
-                    {
-                        "x": p["x"],
-                        "y": p["y"],
-                        "n": p["n"],
-                        "pearson": p["pearson"],
-                        "spearman": p["spearman"],
-                    }
-                    for p in result["pairs"]
-                ],
-                "dropped_fields": dropped,
-            }
-        else:  # scatter
-            applied["sample_limit"] = _capped(
-                opts.sample_limit, 300, VIZ_SCATTER_MAX_POINTS, "sample_limit"
-            )
-            result = await run_in_threadpool(
-                service.field_scatter,
-                primary_query,
-                spec.field,
-                spec.field_y,
-                applied["sample_limit"],
-            )
-            if not result["sampled"]:
-                raise ValueError(
-                    f'no event has numeric values for both "{spec.field}" and '
-                    f'"{spec.field_y}" under these filters, so chart_type="scatter" '
-                    "would render empty. Check both fields with describe_field."
-                )
-            summary = {"total": result["total"], "sampled": result["sampled"]}
-            stats_block = result.get("stats")
-            if stats_block:
-                # The correlation verdict, compressed for the model — full
-                # detail renders on the analyst's card from the same response.
-                summary["stats"] = {
-                    "pearson_r": stats_block["pearson"]["r"],
-                    "pearson_p": stats_block["pearson"]["p"],
-                    "spearman_rho": stats_block["spearman"]["rho"],
-                    "spearman_p": stats_block["spearman"]["p"],
-                    "regression": stats_block["regression"],
-                    "recommendation": stats_block["recommendation"],
-                    # "default" means normality was never tested — quote the
-                    # coefficient, not a verdict nothing measured.
-                    "recommendation_basis": stats_block["recommendation_basis"],
-                }
-
-        # Presentation options don't reach the query, but belong in the echo —
-        # they are part of what the analyst will see.
-        for key in meta.reads_options:
-            if key in applied or key in inert_options:
-                continue
-            value = getattr(opts, key)
-            if value is not None:
-                applied[key] = value
-
-        return {
-            "ok": True,
-            "resolved": {
-                "chart_type": chart_type,
-                "scale": scale,
-                "metric": spec.metric,
-                "compare_mode": spec.compare.mode,
-                "data_kind": data_kind,
-                "field": spec.field,
-                "field_y": spec.field_y,
-                "fields": spec.fields,
-                "options": applied,
-            },
-            "warnings": warnings,
-            "summary": summary,
-        }
+        # The full aggregation payload is for server-side consumers (Stories
+        # export resolver); the model gets the compressed summary only.
+        payload.pop("result", None)
+        return payload
 
     if scope.conversation_id is not None:
 
@@ -2104,6 +1857,94 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "status": "proposed",
                 "event_count": len(found),
             }
+
+        @server.tool()
+        async def propose_story_block(
+            story_id: str,
+            block_kind: str,
+            content: dict[str, Any],
+            after_block_id: str | None = None,
+            rationale: str = "",
+        ) -> dict[str, Any]:
+            """Propose adding one block to a story — the analyst must confirm.
+
+            Nothing is written until the analyst confirms the proposal card.
+            block_kind is one of markdown | view_ref | chart_ref | event_ref.
+            view_ref/event_ref must reference existing persisted objects.
+            chart_ref may instead carry {"chart_spec": {...}, "name": "..."} —
+            a spec exactly as propose_chart takes, validated by executing it;
+            confirming then saves the chart and embeds it in one step.
+            """
+            from vestigo.api.deps import get_store
+            from vestigo.stories.export import spec_to_stored_chart_config
+            from vestigo.stories.refs import validate_block_scope
+            from vestigo.stories.schemas import validate_block_content
+
+            store = get_store()
+            story = await store.get_story(scope.case_id, story_id)
+            if story is None:
+                return {"error": f"story {story_id!r} not found in this case — list_stories"}
+            if after_block_id is not None:
+                blocks = await store.list_story_blocks(story_id)
+                if after_block_id not in {b.id for b in blocks}:
+                    return {"error": f"after_block_id {after_block_id!r} not in this story"}
+            # `content` is a *top-level* argument, so it arrives parsed even
+            # from a provider that stringifies it: pydantic-ai parses the top
+            # level, and the MCP SDK's `pre_parse_json` parses any non-`str`
+            # parameter again. The guard is stated anyway because the failure
+            # it would prevent is silent rather than loud — `in` on a string
+            # is a *substring* match, which passes and then fails on `.get`.
+            if not isinstance(content, dict):
+                return {"error": "content must be a JSON object keyed for the block kind"}
+            inline_chart = block_kind == "chart_ref" and "chart_spec" in content
+            try:
+                if inline_chart:
+                    if not (content.get("name") or "").strip():
+                        return {"error": 'inline chart_ref needs a "name" for the saved chart'}
+                    spec = ChartSpec.model_validate(content["chart_spec"])
+                    executed = await execute_chart_spec(
+                        scope,
+                        spec,
+                        service=service,
+                        validated=_validated,
+                        check_field=_check_chart_field,
+                    )
+                    # Derive the stored ChartConfig now, not at confirm time:
+                    # a spec that can't be represented as one has to be an
+                    # error the model can correct, not a saved chart nothing
+                    # can draw. The spec's filters are part of that config, so
+                    # the block resolves to the slice the chart was proposed
+                    # over rather than the whole timeline.
+                    content = {
+                        "chart_spec": spec.model_dump(mode="json", exclude_none=True),
+                        "chart_config": spec_to_stored_chart_config(spec),
+                        "name": content["name"].strip(),
+                        "resolved": executed["resolved"],
+                    }
+                else:
+                    content = validate_block_content(block_kind, content)
+                    # Checked here so a wrong id is an error the model can
+                    # correct, rather than a proposal card the analyst
+                    # confirms into a block that resolves to an error.
+                    # Re-checked at confirm time — referents can be deleted
+                    # in between.
+                    await validate_block_scope(scope.case_id, block_kind, content, store=store)
+            except ValueError as exc:
+                return {"error": str(exc)}
+            proposal = await store.create_agent_proposal(
+                case_id=scope.case_id,
+                timeline_id=scope.timeline_id,
+                conversation_id=scope.conversation_id,
+                rationale=rationale,
+                kind="story_block",
+                payload={
+                    "story_id": story_id,
+                    "block_kind": block_kind,
+                    "content": content,
+                    "after_block_id": after_block_id,
+                },
+            )
+            return {"proposal_id": proposal.id, "status": "proposed"}
 
     @server.tool()
     async def semantic_search(q: str, limit: int = 10) -> dict[str, Any]:
@@ -2187,6 +2028,102 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             ],
             len(rows),
         )
+
+    @server.tool()
+    async def list_stories() -> dict[str, Any]:
+        """List this case's stories — the analyst's report documents.
+
+        Read one with read_story. Stories collect markdown narrative plus
+        embedded views/charts/events; they are where the investigation's
+        conclusions live.
+        """
+        from vestigo.api.deps import get_store
+
+        store = get_store()
+        rows = await store.list_stories(scope.case_id)
+        # Count in one grouped query and only for the rows that survive the
+        # listing cap — the discarded tail's blocks are never looked at.
+        shown = rows[:MAX_LIST_ROWS]
+        counts = await store.count_story_blocks([s.id for s in shown])
+        listing = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "description": _truncate(s.description, SLIM_MESSAGE_TRUNCATE),
+                "block_count": counts.get(s.id, 0),
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+                "updated_by": s.updated_by,
+            }
+            for s in shown
+        ]
+        return _listing("stories", listing, len(rows))
+
+    @server.tool()
+    async def read_story(story_id: str) -> dict[str, Any]:
+        """Read a story's blocks in document order.
+
+        Markdown blocks carry their text; embed blocks carry their reference —
+        resolve a view/chart/event through the matching read tools rather than
+        expecting inline data here. Long stories are capped at the usual
+        listing limit and say so.
+
+        A markdown block long enough to exhaust the response's text budget
+        comes back cut, marked `"truncated": true` with the full
+        `text_length`. Treat such a block as unread rather than summarizing
+        it: the tail is not retrievable here, and the analyst's own document
+        is the authority on what it says.
+        """
+        from vestigo.api.deps import get_store
+
+        store = get_store()
+        story = await store.get_story(scope.case_id, story_id)
+        if story is None:
+            return {"error": f"story {story_id!r} not found in this case"}
+        blocks = await store.list_story_blocks(story_id)
+        # Individual markdown text was capped but the block *list* was not, so
+        # a long report could return hundreds of entries into the context.
+        shown = blocks[:MAX_LIST_ROWS]
+
+        # Markdown is spent against a shared budget in document order: the
+        # blocks a reader would reach first are the ones that arrive whole,
+        # and a story that outruns the budget still returns every block's
+        # id/kind/origin — structure the model can act on (and re-read one
+        # block through the analyst's own surfaces) rather than a list that
+        # stops early.
+        remaining = STORY_TEXT_BUDGET
+        out_blocks: list[dict[str, Any]] = []
+        truncated_blocks = 0
+        for b in shown:
+            content: dict[str, Any]
+            if b.kind == "markdown":
+                text = b.content.get("text", "") or ""
+                taken = text[: min(STORY_TEXT_TRUNCATE, remaining)]
+                content = {"text": taken}
+                if len(text) > len(taken):
+                    content["truncated"] = True
+                    content["text_length"] = len(text)
+                    truncated_blocks += 1
+                # Spend what was actually taken, not the cap: charging every
+                # block the full per-block limit would exhaust the budget after
+                # three short paragraphs and report whole blocks as cut.
+                remaining -= len(taken)
+            else:
+                content = dict(b.content)
+            out_blocks.append({"id": b.id, "kind": b.kind, "origin": b.origin, "content": content})
+
+        result: dict[str, Any] = {
+            "story": {
+                "id": story.id,
+                "title": story.title,
+                "description": story.description,
+            },
+            "block_count": len(blocks),
+            "returned": len(shown),
+            "blocks": out_blocks,
+        }
+        if truncated_blocks:
+            result["truncated_blocks"] = truncated_blocks
+        return result
 
     @server.tool()
     async def list_dispositions(
@@ -2346,7 +2283,18 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             return {"error": f"no sigma run with id {run_id} in this timeline"}
         return row.to_dict()
 
-    if scope.disabled_tools:
+    # An unconfigured subsystem is invisible, not broken: a tool that could
+    # only answer "embeddings are not available" costs schema tokens on every
+    # request and invites the model to try it. Same treatment the whole agent
+    # gets when no LLM endpoint is configured (core/capabilities.py).
+    unavailable = (
+        frozenset()
+        if embeddings_available()
+        else frozenset(t.name for t in TOOL_REGISTRY if t.embeddings_gated)
+    )
+    removable = scope.disabled_tools | unavailable
+
+    if removable:
         # Remove after registration rather than skipping registration: the
         # closures stay uniform above, and the intersection guards names that
         # were never registered for this scope (propose_annotation outside a
@@ -2359,7 +2307,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             for t in TOOL_REGISTRY
             if not t.requires_conversation or scope.conversation_id is not None
         }
-        for name in scope.disabled_tools & registered:
+        for name in removable & registered:
             server.remove_tool(name)
 
     _apply_schema_slimming(server)
@@ -2400,14 +2348,20 @@ _TOOL_ENVELOPE_CHARS = 96
 
 
 @lru_cache(maxsize=32)
-def _schema_chars_for(disabled: frozenset[str], with_conversation: bool) -> int:
+def _schema_chars_for(
+    disabled: frozenset[str], with_conversation: bool, embeddings: bool = True
+) -> int:
     """Measure the advertised tool list for one *shape* of scope.
 
-    The tool set depends on exactly two things — which tools are disabled, and
+    The tool set depends on exactly three things — which tools are disabled,
     whether the scope has a conversation (``propose_annotation`` is only
-    registered when it does) — so the measurement is cached on that pair
-    rather than recomputed per turn. Nothing case-specific enters the key,
-    because nothing case-specific changes the schemas.
+    registered when it does), and whether embeddings are available (their two
+    tools are absent when they are not) — so the measurement is cached on that
+    triple rather than recomputed per turn. Embeddings are part of the key
+    because settings are now runtime-editable: a cache keyed without them
+    would keep reporting the old tool list after an admin configured an
+    embedding endpoint. Nothing case-specific enters the key, because nothing
+    case-specific changes the schemas.
     """
     probe = AgentScope(
         case_id="_measure",
@@ -2429,7 +2383,9 @@ def schema_chars_for_scope(scope: AgentScope) -> int:
     tool list (30 tools, ~12.9k tokens) was the difference between a budget
     that fit and a provider 400.
     """
-    return _schema_chars_for(scope.disabled_tools, scope.conversation_id is not None)
+    return _schema_chars_for(
+        scope.disabled_tools, scope.conversation_id is not None, embeddings_available()
+    )
 
 
 def _apply_schema_slimming(server: FastMCP) -> None:

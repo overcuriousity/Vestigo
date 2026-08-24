@@ -9,6 +9,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ToolSelectorPopover } from "@/components/agent/ToolSelector";
+import { CARD_TOOLS } from "@/components/agent/proposalTools";
 import type { AgentToolInfo } from "@/api/agent";
 
 const getInfoMock = vi.fn();
@@ -106,6 +107,45 @@ describe("ToolSelectorPopover presets", () => {
     renderSelector();
     await openPopover();
     expect(screen.queryByText("None")).not.toBeInTheDocument();
+  });
+
+  // Disabling a card tool removes its proposal cards from the chat, which is
+  // a workflow change and not just narrower coverage. The warning used to be
+  // its own hand-maintained allowlist and covered only two of the four tools,
+  // so propose_story_block and propose_chart could be switched off silently.
+  // It now derives from CARD_TOOLS — parameterized here so a tool added there
+  // has to carry its warning.
+  describe.each(Object.entries(CARD_TOOLS))("card tool %s", (name, cardName) => {
+    beforeEach(() => {
+      getInfoMock.mockResolvedValue({
+        model: "m",
+        provider: "openai",
+        api_base_url: "http://x",
+        context_window: 32000,
+        tools: [...TOOLS, tool(name, { tier: "core" })],
+        user_disabled_tools: [],
+      });
+    });
+
+    it("warns that disabling it removes its cards", async () => {
+      renderSelector(vi.fn(), [name]);
+      await openPopover();
+      expect(
+        screen.getByText(new RegExp(`removes the ${cardName} proposal cards`)),
+      ).toBeInTheDocument();
+    });
+
+    it("does not warn while it is enabled", async () => {
+      renderSelector();
+      await openPopover();
+      expect(screen.queryByText(/proposal cards/)).not.toBeInTheDocument();
+    });
+  });
+
+  it("does not warn for a tool that renders no card", async () => {
+    renderSelector(vi.fn(), ["field_scatter"]);
+    await openPopover();
+    expect(screen.queryByText(/proposal cards/)).not.toBeInTheDocument();
   });
 
   it("hides Core when the backend does not tier its catalog", async () => {

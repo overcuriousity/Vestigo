@@ -83,4 +83,15 @@ describe("CompareFilterEditor with a bounded time field", () => {
     fireEvent.click(screen.getByText("artifact"));
     expect(screen.getByPlaceholderText("value")).toHaveValue("");
   });
+
+  it("removes an exclusion chip, which the old hand-rolled remover could not", () => {
+    // FilterChips renders exclusions/tags/time chips here too; a remover that
+    // only knew `q` and `filters` left those chips inert.
+    const onChange = setup({ exclusions: { host: ["srv1"] } });
+    const chip = [...document.querySelectorAll("span")].find(
+      (el) => el.textContent === "!host=srv1",
+    )!;
+    fireEvent.click(chip.querySelector("button")!);
+    expect(onChange.mock.calls[0][0].exclusions).toEqual({});
+  });
 });

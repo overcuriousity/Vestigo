@@ -20,6 +20,35 @@ from typing import Any
 from vestigo.models.event import Event, ParserConfig, content_hash
 
 
+def _raw_bytes_and_text(line: str) -> tuple[int, str]:
+    """Return ``(byte_length, sanitized_text)`` for a surrogate-escaped line.
+
+    Source files are decoded with ``errors="surrogateescape"`` so undecodable
+    bytes survive round-tripping: re-encoding recovers the *exact* original
+    bytes, which is the only way ``byte_offset`` can keep pointing at the real
+    location in the immutable source file. Measuring ``errors="replace"`` text
+    instead over-counts by two bytes per bad byte (U+FFFD encodes to three),
+    so every offset after the first non-UTF-8 byte would be wrong.
+
+    The text handed on is re-decoded with ``errors="replace"``, so the event
+    payload sees the same U+FFFD substitution as before — lone surrogates
+    would blow up JSON encoding and the ClickHouse insert.
+    """
+    # This runs once per line of every ingested file, so the common case has
+    # to stay free. `str.isascii()` reads CPython's cached ASCII flag on the
+    # string object — O(1), no scan — and an ASCII line's byte length is its
+    # character count, so the encode/decode round-trip below is skipped
+    # entirely for the overwhelming majority of log lines.
+    if line.isascii():
+        return len(line), line
+    raw = line.encode("utf-8", "surrogateescape")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return len(raw), raw.decode("utf-8", "replace")
+    return len(raw), line
+
+
 class _RecordTrackingIterator:
     """Track the byte offset, line number, and raw lines of each CSV record.
 
@@ -50,10 +79,11 @@ class _RecordTrackingIterator:
 
     def __next__(self) -> str:
         line = next(self._fh)
-        self._buffer.append(line)
-        self._next_offset += len(line.encode("utf-8"))
+        byte_length, text = _raw_bytes_and_text(line)
+        self._buffer.append(text)
+        self._next_offset += byte_length
         self._next_line += 1
-        return line
+        return text
 
     def finish_record(self) -> tuple[int, int, str]:
         """Return ``(byte_offset, line_number, raw_text)`` of the record just completed."""
@@ -210,7 +240,7 @@ class TimesketchCsvParser(Parser):
     def parse(self, path: Path) -> Iterator[Event]:
         """Yield events from a Timesketch-compatible CSV file."""
         source_file = path.resolve()
-        with source_file.open("r", encoding="utf-8", newline="", errors="replace") as fh:
+        with source_file.open("r", encoding="utf-8", newline="", errors="surrogateescape") as fh:
             sample = fh.read(4096)
             fh.seek(0)
             try:
@@ -226,10 +256,10 @@ class TimesketchCsvParser(Parser):
             header_line = fh.readline()
             if not header_line:
                 return
-            header_reader = csv.reader([header_line], dialect=dialect)
+            header_bytes, header_text = _raw_bytes_and_text(header_line)
+            header_reader = csv.reader([header_text], dialect=dialect)
             headers = next(header_reader, None) or []
             headers = [h.strip() if h else h for h in headers]
-            header_bytes = len(header_line.encode("utf-8"))
 
             # Stream the remaining lines through the tracking wrapper —
             # csv.DictReader groups them into logical records (including
@@ -323,13 +353,14 @@ class JsonlParser(Parser):
     def parse(self, path: Path) -> Iterator[Event]:
         """Yield events from a JSONL file."""
         source_file = path.resolve()
-        with source_file.open("r", encoding="utf-8", errors="replace") as fh:
+        with source_file.open("r", encoding="utf-8", errors="surrogateescape") as fh:
             byte_offset = 0
             line_number = 0
-            for raw_line in fh:
+            for line in fh:
                 line_number += 1
+                byte_length, raw_line = _raw_bytes_and_text(line)
                 current_offset = byte_offset
-                byte_offset += len(raw_line.encode("utf-8"))
+                byte_offset += byte_length
                 if not raw_line.strip():
                     continue
                 try:

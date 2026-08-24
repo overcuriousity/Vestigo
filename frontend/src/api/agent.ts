@@ -10,7 +10,12 @@
  * (same wire format as useCaseStream's EventSource, parsed by hand).
  */
 import { BASE, get, post, put, patch, del, fetchBlobGet, ApiError } from "./client";
-import type { EventFilters, FieldMatchMode } from "./types";
+import type {
+  EventFilters,
+  FieldMatchMode,
+  StoryBlock,
+  StoryBlockKind,
+} from "./types";
 import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { Metric } from "@/components/viz/lib/transforms";
@@ -102,6 +107,28 @@ export type AgentChartSpec = AgentChartSpecV2 | AgentChartSpecLegacy;
 const isLegacySpec = (spec: AgentChartSpec): spec is AgentChartSpecLegacy =>
   !("chart_type" in spec);
 
+/**
+ * Coerce a persisted tool-call argument into an object.
+ *
+ * Tool args are stored verbatim as the model emitted them, and some providers
+ * hand back a nested object as a JSON *string*. A stored row like
+ * `{"spec": "{\"chart_type\": ...}"}` is not rewritable after the fact, so
+ * every reader of `tool_args` normalizes here rather than trusting the shape.
+ * Returns null for anything that is not (or does not parse to) an object.
+ */
+export function parseToolArgObject<T>(raw: unknown): T | null {
+  let value = raw;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as T;
+}
+
 /** Which `ChartType` (and matching `Scale`, per `CHART_META`) renders each
  * retired `propose_chart` kind. Frozen: these pairs are what historical chart
  * cards rendered as, so changing one rewrites the past. */
@@ -132,12 +159,20 @@ const SCALE_BY_KIND: Record<AgentChartSpecLegacy["kind"], ChartConfig["scale"]> 
  * Map a `propose_chart` spec onto the Visualize page's `ChartConfig` — the
  * shape every chart component, "Open in Visualize", and "Save" consume.
  * Mirrors `specToEventFilters` above: agent shapes translate to UI shapes at
- * the frontend boundary.
+ * the frontend boundary — which is also where a provider-stringified nested
+ * value is normalized (`parseToolArgObject`), so no caller has to remember to.
+ *
+ * Throws when the spec is neither an object nor JSON that parses to one.
+ * `AgentPanel` filters those out before an item is ever created, so this is
+ * the far side of that guard: an `ErrorBoundary` showing why one card is
+ * missing beats a chart drawn from nothing.
  */
-export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
+export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
+  const spec = parseToolArgObject<AgentChartSpec>(raw);
+  if (!spec) throw new Error("chart spec is not a JSON object");
   if (isLegacySpec(spec)) return specToChartConfigLegacy(spec);
 
-  const o = spec.options ?? {};
+  const o = parseToolArgObject<NonNullable<AgentChartSpecV2["options"]>>(spec.options) ?? {};
   const options: ChartConfig["options"] = {};
   // `!= null` rather than a truthiness check: an explicit 0 is a value the
   // caller chose, and the old falsy guards silently dropped it.
@@ -156,7 +191,7 @@ export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
   if (o.show_points != null) options.showPoints = o.show_points;
   if (o.show_density != null) options.showDensity = o.show_density;
 
-  const compare = spec.compare;
+  const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
   return {
     v: 1,
     field: spec.field ?? null,
@@ -225,12 +260,23 @@ function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
 /** An agent-proposed annotation, propose→confirm (A1): the agent never
  * writes annotations directly — `propose_annotation` creates one of these,
  * and an analyst confirms or rejects it via the endpoints below. */
+export interface StoryBlockProposalPayload {
+  story_id: string;
+  block_kind: StoryBlockKind;
+  content: Record<string, unknown>;
+  after_block_id: string | null;
+}
+
 export interface AgentProposal {
   id: string;
   conversation_id: string;
   case_id: string;
   timeline_id: string;
   status: "proposed" | "confirmed" | "rejected";
+  /** What the proposal proposes; "annotation" for every pre-W7 row. */
+  kind: "annotation" | "story_block";
+  /** Kind-specific body — the story-block target and content, else null. */
+  payload: StoryBlockProposalPayload | null;
   tag: string | null;
   comment: string | null;
   rationale: string;
@@ -255,6 +301,11 @@ export interface AgentConversation {
    * process state, not a column. Lets a reopened panel show a working Stop
    * instead of an input that silently 409s. */
   active?: boolean;
+  /** Set while the replayable history blob is a mid-turn checkpoint rather than
+   * a completed turn — a stopped, errored or process-killed turn. Cleared when
+   * the next turn completes. The next turn resumes from that snapshot, so this
+   * says "the model is continuing an interrupted turn", not "data was lost". */
+  history_partial_at: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -277,6 +328,10 @@ export interface AgentMessage {
    * pairing key when a model batches parallel tool calls (results land in
    * completion order, not call order). Null on pre-migration rows. */
   tool_call_id?: string | null;
+  /** Explorer filter snapshot sent with this message (user rows only; null
+   * otherwise and on rows predating the column). Context record — the stamp
+   * shown under the message, never read back into agent logic. */
+  view_filters?: Record<string, unknown> | null;
   created_at: string | null;
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
@@ -354,13 +409,30 @@ export function formatTokenCount(n: number): string {
   return String(n);
 }
 
-/** Map a backend FilterSpec onto the Explorer's EventFilters (camelCase). */
-export function specToEventFilters(spec: AgentFilterSpec): EventFilters {
-  const modes = (m?: Record<string, string>): Record<string, FieldMatchMode> | undefined => {
-    if (!m) return undefined;
+/**
+ * Map a backend FilterSpec onto the Explorer's EventFilters (camelCase).
+ *
+ * Tolerant of a provider-stringified spec *and* of stringified values inside
+ * it: `filters` and friends are maps, and `Object.keys` on a string yields
+ * character indices — a filter set built from those is wrong rather than
+ * absent, which is the failure this whole path exists to prevent. Mirrors
+ * `ObjectArgModel` on the backend, which coerces the same positions on write.
+ */
+export function specToEventFilters(raw: AgentFilterSpec | string | null | undefined): EventFilters {
+  const spec = parseToolArgObject<AgentFilterSpec>(raw) ?? {};
+  const fieldMap = (m: unknown): Record<string, string[]> | undefined =>
+    parseToolArgObject<Record<string, string[]>>(m) ?? undefined;
+  const modes = (m: unknown): Record<string, FieldMatchMode> | undefined => {
+    const parsed = parseToolArgObject<Record<string, string>>(m);
+    if (!parsed) return undefined;
     const out: Record<string, FieldMatchMode> = {};
-    for (const [k, v] of Object.entries(m)) {
-      if (v === "wildcard" || v === "regex") out[k] = v;
+    for (const [k, v] of Object.entries(parsed)) {
+      // Keep this list in step with `queryParams.ts::sanitizeModes` and the
+      // backend's `_VALID_FILTER_MODES`. Dropping `empty` here would not drop
+      // the `[""]` placeholder `FilterSpec` pairs with it, so the Explorer
+      // would run an *exact* match on the literal empty string — which skips
+      // `ifNull(...)` and so silently excludes NULL rows the agent counted.
+      if (v === "wildcard" || v === "regex" || v === "empty") out[k] = v;
     }
     return Object.keys(out).length > 0 ? out : undefined;
   };
@@ -371,8 +443,10 @@ export function specToEventFilters(spec: AgentFilterSpec): EventFilters {
   if (spec.source_id) f.sourceId = spec.source_id;
   if (spec.start) f.start = spec.start;
   if (spec.end) f.end = spec.end;
-  if (spec.filters && Object.keys(spec.filters).length > 0) f.filters = spec.filters;
-  if (spec.exclusions && Object.keys(spec.exclusions).length > 0) f.exclusions = spec.exclusions;
+  const filters = fieldMap(spec.filters);
+  if (filters && Object.keys(filters).length > 0) f.filters = filters;
+  const exclusions = fieldMap(spec.exclusions);
+  if (exclusions && Object.keys(exclusions).length > 0) f.exclusions = exclusions;
   const fm = modes(spec.filter_modes);
   if (fm) f.filterModes = fm;
   const em = modes(spec.exclusion_modes);
@@ -438,7 +512,16 @@ export const agentApi = {
     ),
 
   confirmProposal: (caseId: string, conversationId: string, proposalId: string) =>
-    post<{ proposal: AgentProposal; written: number; skipped_event_ids: string[] }>(
+    post<{
+      proposal: AgentProposal;
+      // Annotation proposals report what they wrote…
+      written?: number;
+      skipped_event_ids?: string[];
+      // …story-block proposals report whether the block landed.
+      applied?: boolean;
+      block?: StoryBlock | null;
+      reason?: string | null;
+    }>(
       `/cases/${caseId}/agent/conversations/${conversationId}/proposals/${proposalId}/confirm`,
     ),
 

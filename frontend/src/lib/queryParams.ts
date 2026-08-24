@@ -3,17 +3,21 @@
  * All filter state lives in the URL so investigation links are shareable.
  */
 import type { EventFilters, FieldMatchMode } from "@/api/types";
+import { sanitizeColumns } from "@/stores/ui";
 
 /** Sanitize an untrusted parsed object into a match-mode map.
  *
- * Drops anything that isn't "wildcard"/"regex" — including explicit "exact"
- * (absence already means exact) and unknown strings from hand-edited URLs
- * or legacy payloads, so downstream code never sees an invalid mode. */
+ * Drops anything that isn't a known non-default mode — including explicit
+ * "exact" (absence already means exact) and unknown strings from hand-edited
+ * URLs or legacy payloads, so downstream code never sees an invalid mode.
+ * A mode missing from this whitelist does not fail loudly: it silently
+ * becomes an exact match, which asks a different question than the analyst
+ * saved. Keep it in step with `FieldMatchMode`. */
 function sanitizeModes(raw: unknown): Record<string, FieldMatchMode> | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const out: Record<string, FieldMatchMode> = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (v === "wildcard" || v === "regex") out[k] = v;
+    if (v === "wildcard" || v === "regex" || v === "empty") out[k] = v;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -139,6 +143,41 @@ export function serializeEventFilterParams(
   }
   return out;
 }
+
+/**
+ * Every URL param key `filtersToParams` owns.
+ *
+ * `filtersToParams` builds a *fresh* `URLSearchParams` and writes only what is
+ * set, so "this filter is cleared" and "this key was never ours" look identical
+ * in its output. A caller rebuilding a URL around a new filter set therefore
+ * cannot tell which of the old keys to carry over by looking at the result —
+ * it has to know the namespace, which is this.
+ *
+ * Kept in step with `filtersToParams` by `queryParams.test.ts`, which populates
+ * every member of `EventFilters` and asserts the produced keys are exactly this
+ * set: a new filter param that forgets to land here would otherwise survive a
+ * rebuild that was supposed to drop it.
+ */
+export const FILTER_PARAM_KEYS: ReadonlySet<string> = new Set([
+  "q",
+  "qMode",
+  "qRegex",
+  "artifact",
+  "artifacts",
+  "sourceId",
+  "tag",
+  "excludeTag",
+  "tagsInclude",
+  "tagsExclude",
+  "start",
+  "end",
+  "filters",
+  "exclusions",
+  "filterModes",
+  "exclusionModes",
+  "annotated",
+  "annotationTagValue",
+]);
 
 export function filtersToParams(filters: EventFilters): URLSearchParams {
   const p = new URLSearchParams();
@@ -341,4 +380,25 @@ export function viewPayloadToFilters(
     f.annotationTagValue = payload.annotationTagValue;
   }
   return f;
+}
+
+/**
+ * The column layout a saved view carries, or undefined when it has none.
+ *
+ * Deliberately separate from `viewPayloadToFilters`: columns are not filters,
+ * and `filtersToViewPayload` is shared with the Visualize page's chart config
+ * (`viz/lib/chartConfig.ts`), where a column layout would be meaningless.
+ *
+ * A list that sanitizes to nothing reads as absent rather than as "this view
+ * shows no columns" — the latter is not a state the grid has, and treating it
+ * as one would blank an analyst's layout on applying an old view.
+ */
+export function viewPayloadColumns(
+  payload: Record<string, unknown>,
+): string[] | undefined {
+  const raw = payload.columns;
+  if (!Array.isArray(raw)) return undefined;
+  if (!raw.every((c) => typeof c === "string")) return undefined;
+  const sanitized = sanitizeColumns(raw as string[]);
+  return sanitized.length > 0 ? sanitized : undefined;
 }

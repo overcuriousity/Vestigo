@@ -1,0 +1,226 @@
+/**
+ * ChartCanvas — the shared "render a ChartConfig against a timeline" surface.
+ *
+ * Fetches through the same `vizApi` calls the Visualize page uses and renders
+ * the same marks, keyed on the chart *type* rather than the aggregation that
+ * fed it (several marks share one dataKind; switching on the fetch result is
+ * what once turned a requested pie into a bar). Read-only: no click-to-filter,
+ * which stays the Visualize page's affordance.
+ *
+ * Used by the agent's chart proposal cards and by Story chart blocks, so a
+ * chart looks identical wherever it is embedded.
+ */
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
+import type { ChartConfig } from "@/components/viz/lib/chartConfig";
+import { fetchChartData, type ChartResult } from "@/components/viz/chartFetch";
+import { CHART_META } from "@/components/viz/lib/chartMeta";
+import {
+  resolveChartOptions,
+  type ResolvedChartOptions,
+} from "@/components/viz/lib/chartOptions";
+import { BarChart } from "@/components/viz/charts/BarChart";
+import { PieChart } from "@/components/viz/charts/PieChart";
+import { WaffleChart } from "@/components/viz/charts/WaffleChart";
+import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
+import { BoxPlot } from "@/components/viz/charts/BoxPlot";
+import { ViolinPlot } from "@/components/viz/charts/ViolinPlot";
+import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
+import { EcdfChart } from "@/components/viz/charts/EcdfChart";
+import { LineChart } from "@/components/viz/charts/LineChart";
+import { Heatmap } from "@/components/viz/charts/Heatmap";
+import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
+import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
+import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
+import { ScatterChart } from "@/components/viz/charts/ScatterChart";
+import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
+import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
+import { Spinner } from "@/components/ui/Spinner";
+import type { EventFilters } from "@/api/types";
+
+interface Props {
+  caseId: string;
+  timelineId: string;
+  config: ChartConfig;
+  /** Primary-layer filters; omit for the whole timeline. */
+  filters?: EventFilters;
+  /** Shown when the config names no field to plot. */
+  incompleteMessage?: string;
+  testId?: string;
+}
+
+export function ChartCanvas({
+  caseId,
+  timelineId,
+  config,
+  filters: filtersProp,
+  incompleteMessage = "This chart is missing a field, so there is nothing to plot.",
+  testId = "chart-canvas",
+}: Props) {
+  const filters = useMemo<EventFilters>(() => filtersProp ?? {}, [filtersProp]);
+  const dataKind = CHART_META[config.chartType].dataKind;
+  const compareOn = config.compare.mode !== "off";
+  // Same resolver the Visualize page uses, so an embedded chart and the chart
+  // the analyst gets from "Open in Visualize" are drawn from identical values.
+  const opts = useMemo(() => resolveChartOptions(config), [config]);
+
+  // Every kind but time/punchcard needs a field, and pivot/scatter need two.
+  // Callers normally validate before rendering (`propose_chart` rejects an
+  // incomplete spec; a saved chart was legal when saved), but an un-run query
+  // renders as neither loading nor error — i.e. a silently blank chart box —
+  // so say so explicitly rather than leave the analyst looking at nothing.
+  const specComplete =
+    dataKind === "time" || dataKind === "punchcard"
+      ? true
+      : dataKind === "corr"
+        ? (config.fields?.length ?? 0) >= 2
+        : dataKind === "pivot" || dataKind === "scatter"
+          ? !!(config.field && config.fieldY)
+          : !!config.field;
+
+  const chartQuery = useQuery({
+    queryKey: ["chart-canvas", caseId, timelineId, config, filters],
+    queryFn: () => fetchChartData(caseId, timelineId, config, filters, opts),
+    enabled: specComplete,
+  });
+
+  return (
+    <div
+      data-testid={testId}
+      className="mt-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-2"
+    >
+      {!specComplete && (
+        <p className="py-2 text-[var(--color-fg-muted)]">{incompleteMessage}</p>
+      )}
+      {chartQuery.isLoading && (
+        <div className="flex items-center justify-center py-6">
+          <Spinner size={16} />
+        </div>
+      )}
+      {chartQuery.isError && (
+        <p className="py-2 text-[var(--color-danger)]">
+          Couldn't load this chart:{" "}
+          {chartQuery.error instanceof Error
+            ? chartQuery.error.message
+            : "unknown error"}
+        </p>
+      )}
+      {chartQuery.data && (
+        <ChartMarks
+          config={config}
+          data={chartQuery.data}
+          opts={opts}
+          compareOn={compareOn}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The mark dispatch, drawn from whatever produced the data — a live query or
+ * a frozen export snapshot — so an exported report and the live page render
+ * identically.
+ */
+export type { ChartResult };
+
+export function ChartMarks({
+  config,
+  data,
+  opts,
+  compareOn,
+}: {
+  config: ChartConfig;
+  data: ChartResult;
+  opts: ResolvedChartOptions;
+  compareOn: boolean;
+}) {
+  return (
+    <>
+      {/* Keyed on the chart *type*, not the aggregation that fed it: several
+          marks share one dataKind (pie and bar both read terms; box, violin
+          and ecdf all read numeric), so switching on the fetch result is
+          what silently turned a requested pie into a bar. Mirrors the
+          Visualize page's canvas one-for-one, minus click-to-filter — the
+          card is a read-only sandbox and filtering is the page's affordance. */}
+      {data.kind === "terms" && config.chartType === "bar" && (
+        <BarChart
+          terms={data.compare ? undefined : data.data}
+          compare={data.compare ? data.data : undefined}
+          orientation={opts.orientation}
+          sort={opts.sort}
+          logScale={opts.logScale}
+        />
+      )}
+      {data.kind === "terms" && config.chartType === "pie" && !data.compare && (
+        <PieChart terms={data.data} />
+      )}
+      {data.kind === "terms" &&
+        config.chartType === "waffle" &&
+        !data.compare && <WaffleChart terms={data.data} />}
+      {data.kind === "numeric" && config.chartType === "histogram" && (
+        <NumericHistogram
+          stats={data.compare ? undefined : data.data}
+          compare={data.compare ? data.data : undefined}
+          logScale={opts.logScale}
+          showDensity={opts.showDensity}
+          showMarkers
+        />
+      )}
+      {data.kind === "numeric_grouped" &&
+        (config.chartType === "box" || config.chartType === "violin") && (
+          <GroupedDistribution
+            data={data.data}
+            mark={config.chartType}
+            showPoints={opts.showPoints}
+          />
+        )}
+      {data.kind === "numeric" &&
+        !data.compare &&
+        config.chartType === "box" && (
+          <BoxPlot stats={data.data} showPoints={opts.showPoints} />
+        )}
+      {data.kind === "numeric" &&
+        !data.compare &&
+        config.chartType === "violin" && (
+          <ViolinPlot stats={data.data} showPoints={opts.showPoints} />
+        )}
+      {data.kind === "numeric" &&
+        !data.compare &&
+        config.chartType === "ecdf" && <EcdfChart stats={data.data} />}
+      {data.kind === "timeseries" && config.chartType === "line" && (
+        <LineChart
+          data={data.data}
+          seriesMode={opts.seriesMode}
+          showPoints={config.options.showPoints ?? true}
+          showLegend={opts.legend}
+        />
+      )}
+      {data.kind === "timeseries" && config.chartType === "heatmap" && (
+        <Heatmap data={data.data} />
+      )}
+      {data.kind === "time" && (
+        <CompareHistogram
+          data={data.data}
+          metric={config.metric}
+          hasComparison={compareOn}
+        />
+      )}
+      {data.kind === "punchcard" && <PunchCard data={data.data} />}
+      {data.kind === "pivot" && config.chartType === "pivot" && (
+        <PivotHeatmap data={data.data} />
+      )}
+      {data.kind === "pivot" && config.chartType === "sankey" && (
+        <SankeyFlow data={data.data} />
+      )}
+      {data.kind === "corr" && <CorrMatrix data={data.data} />}
+      {data.kind === "scatter" && (
+        <>
+          <ScatterChart data={data.data} />
+          {data.data.stats && <ScatterStatsPanel stats={data.data.stats} />}
+        </>
+      )}
+    </>
+  );
+}

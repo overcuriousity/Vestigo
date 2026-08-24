@@ -12,9 +12,16 @@ interface UiState {
   density: Density;
   setDensity: (density: Density) => void;
 
-  /** Per-timeline column selections, keyed by "caseId/timelineId". */
+  /**
+   * Per-timeline column selections, keyed by "caseId/timelineId".
+   *
+   * A key that is *absent* means "no analyst override" — not "empty" — which
+   * is what lets the timeline's server-side suggestion (issue #213) apply.
+   * Passing `undefined` to `setVisibleColumns` restores that state, so a later
+   * recomputed suggestion still reaches this browser.
+   */
   visibleColumnsByTimeline: Record<string, string[]>;
-  setVisibleColumns: (key: string, cols: string[]) => void;
+  setVisibleColumns: (key: string, cols: string[] | undefined) => void;
 
   /** Whether the Investigate panel (frame + detectors + windows) is open. */
   investigatePanelOpen: boolean;
@@ -44,9 +51,61 @@ interface UiState {
   investigatePanelWidth: number;
   setInvestigatePanelWidth: (w: number) => void;
 
+  /**
+   * Keep dismissed findings visible (flagged, dimmed) instead of filtered.
+   *
+   * Global rather than per-view: the rail and the sheet render the same query
+   * results, and a per-component toggle would show a finding as dismissed in
+   * one and absent in the other. Without a reveal anywhere, a mis-click is
+   * unrecoverable from the UI — the server keeps supporting both.
+   */
+  includeDismissedFindings: boolean;
+  setIncludeDismissedFindings: (include: boolean) => void;
+
   /** Persisted event grid column widths (px), keyed by column id. */
   columnWidths: Record<string, number>;
   setColumnWidth: (id: string, width: number) => void;
+
+  /**
+   * Collapsed guidance panels, keyed by `GuidancePanel` id. Lives here rather
+   * than in raw localStorage so a reset re-renders panels that are already
+   * mounted — the old implementation read its flag once into `useState`, so
+   * clearing storage left every open panel visually unchanged until remount.
+   */
+  collapsedGuidance: Record<string, boolean>;
+  setGuidanceCollapsed: (id: string, collapsed: boolean) => void;
+  /** Re-expand every guidance panel. Wired to the Settings control. */
+  resetGuidance: () => void;
+}
+
+const LEGACY_GUIDANCE_PREFIX = "vestigo-guidance-";
+
+/**
+ * Adopt the pre-v5 `vestigo-guidance-<id>` localStorage keys so nobody's
+ * dismissals resurface on upgrade, and clear them so the two stores cannot
+ * disagree later.
+ *
+ * Called from `onRehydrateStorage`, not from `migrate`. `migrate` only runs when
+ * this store already has persisted state at an older version, so a browser that
+ * dismissed guidance without ever writing a UI preference would both lose the
+ * dismissal *and* keep its `vestigo-guidance-*` keys forever — the next write
+ * persists at v5 directly and `migrate` never fires again. Rehydration happens
+ * on every load, so the adoption lands and the cleanup completes either way.
+ */
+function adoptLegacyGuidanceKeys(): Record<string, boolean> {
+  const adopted: Record<string, boolean> = {};
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith(LEGACY_GUIDANCE_PREFIX)) continue;
+      if (localStorage.getItem(key) === "collapsed") {
+        adopted[key.slice(LEGACY_GUIDANCE_PREFIX.length)] = true;
+      }
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // localStorage unavailable (private mode) — nothing to adopt.
+  }
+  return adopted;
 }
 
 export const DEFAULT_COLUMNS = [
@@ -70,13 +129,24 @@ const KNOWN_COLUMN_IDS = new Set([
   "_annotations",
 ]);
 
-function migrateColumns(cols: string[] | undefined): string[] {
-  if (!Array.isArray(cols)) return [...DEFAULT_COLUMNS];
+/**
+ * Sanitize a column-id list: remap retired ids, drop grid-internal ids that
+ * aren't real columns, dedupe. Returns an empty array when nothing survives —
+ * callers decide what "nothing" means, which is what lets a server-supplied
+ * suggestion (`lib/columns.ts`) tell "sanitized to nothing" apart from
+ * "sanitized to the built-in default".
+ */
+export function sanitizeColumns(cols: string[] | undefined): string[] {
+  if (!Array.isArray(cols)) return [];
   const mapped = cols
     .map((id) => RETIRED_COLUMN_IDS[id] || id)
     .filter((id) => KNOWN_COLUMN_IDS.has(id) || !id.startsWith("_"));
-  const deduped = [...new Set(mapped)];
-  return deduped.length > 0 ? deduped : [...DEFAULT_COLUMNS];
+  return [...new Set(mapped)];
+}
+
+function migrateColumns(cols: string[] | undefined): string[] {
+  const sanitized = sanitizeColumns(cols);
+  return sanitized.length > 0 ? sanitized : [...DEFAULT_COLUMNS];
 }
 
 export const useUiStore = create<UiState>()(
@@ -87,9 +157,15 @@ export const useUiStore = create<UiState>()(
 
       visibleColumnsByTimeline: {},
       setVisibleColumns: (key, cols) =>
-        set((s) => ({
-          visibleColumnsByTimeline: { ...s.visibleColumnsByTimeline, [key]: cols },
-        })),
+        set((s) => {
+          if (cols === undefined) {
+            const { [key]: _dropped, ...rest } = s.visibleColumnsByTimeline;
+            return { visibleColumnsByTimeline: rest };
+          }
+          return {
+            visibleColumnsByTimeline: { ...s.visibleColumnsByTimeline, [key]: cols },
+          };
+        }),
 
       investigatePanelOpen: false,
       setInvestigatePanelOpen: (open) => set({ investigatePanelOpen: open }),
@@ -111,14 +187,21 @@ export const useUiStore = create<UiState>()(
 
       investigatePanelWidth: 400,
       setInvestigatePanelWidth: (w) => set({ investigatePanelWidth: w }),
+      includeDismissedFindings: false,
+      setIncludeDismissedFindings: (include) => set({ includeDismissedFindings: include }),
 
       columnWidths: {},
       setColumnWidth: (id, width) =>
         set((s) => ({ columnWidths: { ...s.columnWidths, [id]: width } })),
+
+      collapsedGuidance: {},
+      setGuidanceCollapsed: (id, collapsed) =>
+        set((s) => ({ collapsedGuidance: { ...s.collapsedGuidance, [id]: collapsed } })),
+      resetGuidance: () => set({ collapsedGuidance: {} }),
     }),
     {
       name: "vestigo-ui",
-      version: 4,
+      version: 6,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -142,7 +225,29 @@ export const useUiStore = create<UiState>()(
           state.investigatePanelWidth = legacy ?? state.investigatePanelWidth ?? 400;
           delete (state as unknown as { analysisPanelWidth?: number }).analysisPanelWidth;
         }
+        if (version < 5) {
+          // Guidance dismissal moved out of its own `vestigo-guidance-*` keys.
+          // Adopting those keys is `onRehydrateStorage`'s job (see
+          // `adoptLegacyGuidanceKeys`); all this branch owes is the field.
+          state.collapsedGuidance = state.collapsedGuidance ?? {};
+        }
+        if (version < 6) {
+          // Hiding is the default the reveal toggles away from, so an upgraded
+          // session must not come back with dismissed findings already shown.
+          state.includeDismissedFindings = false;
+        }
         return state;
+      },
+      // Runs after migrate + merge, on every load rather than only on a version
+      // bump. Mutating `state` in place is safe here: with localStorage the
+      // hydration is synchronous, so this lands before the first render and
+      // there is nothing subscribed yet to miss a notification.
+      onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        const adopted = adoptLegacyGuidanceKeys();
+        if (Object.keys(adopted).length > 0) {
+          state.collapsedGuidance = { ...adopted, ...(state.collapsedGuidance ?? {}) };
+        }
       },
     },
   ),

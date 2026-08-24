@@ -19,7 +19,7 @@ interface Props {
 
 export function RoutineCollapseStat({ count, timelineTotal, onShow }: Props) {
   return (
-    <Tooltip content="Timeline-wide count, independent of active filters. Hidden events belong to patterns marked routine in the Patterns tab. Click to show them again.">
+    <Tooltip content="Timeline-wide count, independent of active filters. Hidden events belong to patterns marked routine under Tools → Explore. Click to show them again.">
       <button
         onClick={onShow}
         className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-[var(--color-accent)] bg-[var(--color-accent-dim)] hover:underline"

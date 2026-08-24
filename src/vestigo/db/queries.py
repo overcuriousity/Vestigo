@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
+
+from clickhouse_connect.driver.exceptions import DatabaseError
+from clickhouse_connect.driver.external import ExternalData
 
 from vestigo import stats as stats_helpers
 from vestigo.db._buckets import (
@@ -20,6 +24,7 @@ from vestigo.db._buckets import (
 from vestigo.db._columns import (
     EVENT_SELECT_COLUMNS,
     TOP_LEVEL_NON_STRING_COLUMNS,
+    decode_fixed_string_columns,
     resolve_column_token,
 )
 from vestigo.db._dt import (
@@ -42,6 +47,7 @@ from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
+    project_mapped_fields,
     resolve_mapping,
 )
 from vestigo.db.field_recommend import (
@@ -67,6 +73,152 @@ _NULL_TIMESTAMP_SENTINEL_ISO = NULL_TS_SENTINEL_ISO
 _MIN_EVENT_ID = "00000000-0000-0000-0000-000000000000"
 
 _logger = logging.getLogger(__name__)
+
+# Above this many values, a membership list ships as a ClickHouse external
+# data table instead of an inline `Array(...)` query parameter.
+#
+# clickhouse-connect moves bind parameters out of the URL and into a
+# multipart *form field* once they exceed 4 KiB, and ClickHouse parses that
+# body with Poco's HTMLForm, which caps a single field value at
+# `http_max_field_value_size` (128 KiB by default). One UUID costs ~39 bytes
+# inside the formatted array, so an id list dies at roughly 3,300 entries with
+# a raw 500 (`code: 1000, HTML Form Exception: Field value too long`) — and
+# annotated/tag filters resolve to exactly such a list, growing with tagging.
+# External data travels as a multipart *file* part instead (bounded by
+# `http_max_multipart_form_data_size`, 1 GiB), and `IN (SELECT * FROM t)`
+# builds a hash set rather than scanning a constant array per row.
+#
+# The threshold sits far below the failure point on purpose: it only needs to
+# keep the inline path (cheaper for the common handful-of-values filter) away
+# from the cliff.
+#
+# Cost note: external data is per-*request*, not per-session — ClickHouse's
+# HTTP interface has no place to keep a temp table between requests, and the
+# pooled stateless client is a deliberate design choice (`docs/TECH_STACK.md`).
+# So one Explorer page under a large `annotated=` filter uploads the table
+# once per statement it issues (count + key scan + hydrate = 3). That is
+# bounded and acceptable; what is *not* acceptable is an unbounded multiplier,
+# which is why :class:`_ExternalTables` is threaded through the per-batch
+# `_build_where` rebuilds in :py:meth:`EventQueryService.iter_events` instead
+# of re-serializing the payload for every export batch.
+EXTERNAL_LIST_THRESHOLD = 512
+
+
+class QueryRequestTooLargeError(Exception):
+    """The request ClickHouse was asked to parse exceeded a server-side limit.
+
+    Raised in place of the raw Poco ``code: 1000`` ``DatabaseError``, whose
+    message ("HTML Form Exception: Field value too long") tells an analyst
+    nothing. The API turns this into a 413 with an actionable explanation.
+    """
+
+
+# Mirrors ClickHouse's TSV escape table exactly, so every sequence we emit
+# decodes back to the byte we meant. Tab/newline/backslash are the ones that
+# would actually corrupt the table (column shift, row shift, escape hijack);
+# the rest are escaped for round-trip symmetry — a NUL or form-feed inside a
+# log field value is rare but perfectly legal, and silently relying on the
+# reader to pass it through is the kind of assumption that breaks on a
+# ClickHouse upgrade.
+_TSV_ESCAPES = str.maketrans(
+    {
+        "\\": "\\\\",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\r": "\\r",
+        "\0": "\\0",
+        "\b": "\\b",
+        "\f": "\\f",
+    }
+)
+
+
+def _tsv_payload(values: Sequence[Any]) -> bytes:
+    """Encode *values* as a single-column TSV body for external data.
+
+    Membership lists are not always UUIDs — a field-value filter can carry an
+    arbitrary log string, and an unescaped tab or newline in one would shift
+    the rest of the table by a column or a row.
+
+    Duplicates are dropped (first occurrence wins): the payload feeds an
+    ``IN`` test, where a repeated value is pure upload weight. Annotation
+    lookups routinely resolve to the same event id more than once (one row per
+    tag), so this is not a theoretical saving.
+
+    Lone surrogates cannot reach here — ingestion re-decodes undecodable bytes
+    to U+FFFD (see ``ingestion/parser.py``) — but ``errors="surrogatepass"``
+    is *not* used deliberately: an encode failure here should be loud, not a
+    silently truncated filter.
+    """
+    lines = dict.fromkeys(str(value).translate(_TSV_ESCAPES) for value in values)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+class _ExternalTables:
+    """Content-addressed registry of the external-data tables one query needs.
+
+    Two jobs, both about not paying for the same bytes twice:
+
+    * **Within a statement** — the same value list can be reachable from more
+      than one predicate (an id set used by both a tag filter and an explicit
+      ``ids=``). Identical payloads collapse onto one table.
+    * **Across statement rebuilds** — :py:meth:`EventQueryService.iter_events`
+      calls ``_build_where`` once per export batch, because the keyset cursor
+      lives in the WHERE clause. Passing one registry through every rebuild
+      keeps the table name *and* the serialized payload stable, so a 50k-id
+      export uploads the TSV once instead of once per 1000-row batch.
+
+    Table names are numbered from this registry's own counter rather than the
+    builder's parameter counter: parameter numbering shifts between rebuilds
+    (the cursor predicate binds extra parameters), which would rename the
+    table mid-export and defeat the cache.
+    """
+
+    def __init__(self) -> None:
+        # Keyed on a digest, not the payload itself — an id list is megabytes
+        # and the bytes are already held by the ExternalFile.
+        self._names_by_key: dict[tuple[str, bytes], str] = {}
+        self._counter = 0
+        self.data: ExternalData | None = None
+
+    def register(self, values: Sequence[Any], ch_type: str) -> str:
+        """Return the SQL table name holding *values*, creating it if new."""
+        payload = _tsv_payload(values)
+        key = (ch_type, hashlib.blake2b(payload, digest_size=16).digest())
+        cached = self._names_by_key.get(key)
+        if cached is not None:
+            return cached
+        name = f"vestigo_ext_{self._counter}"
+        self._counter += 1
+        structure = [f"v {ch_type}"]
+        if self.data is None:
+            self.data = ExternalData(file_name=name, data=payload, fmt="TSV", structure=structure)
+        else:
+            self.data.add_file(file_name=name, data=payload, fmt="TSV", structure=structure)
+        self._names_by_key[key] = name
+        return name
+
+
+class QueryParameters(dict[str, Any]):
+    """Query parameters plus the external-data tables their SQL references.
+
+    The two travel together because they must: a WHERE clause that names
+    ``vestigo_ext_p3`` is only executable if the request also carries that
+    table. Anything that forwards these parameters to ClickHouse must go
+    through :meth:`EventQueryService._select`, and anything that *copies* them
+    must use :func:`_with_params` — a plain ``{**parameters}`` drops the
+    attribute and the query fails with "Unknown table".
+    """
+
+    external: ExternalData | None = None
+
+
+def _with_params(parameters: Mapping[str, Any], **extra: Any) -> QueryParameters:
+    """Copy *parameters*, add *extra*, and carry any external data along."""
+    merged = QueryParameters(parameters)
+    merged.external = getattr(parameters, "external", None)
+    merged.update(extra)
+    return merged
 
 
 def _nan_to_none(value: float | None) -> float | None:
@@ -384,8 +536,9 @@ def _escape_like(value: str) -> str:
 
 
 # Match modes accepted for field filters/exclusions. "exact" is the implied
-# default everywhere a mode map has no entry for a field key.
-VALID_MATCH_MODES = ("exact", "wildcard", "regex")
+# default everywhere a mode map has no entry for a field key. "empty" is the
+# presence predicate: it carries no value, and its value list is a placeholder.
+VALID_MATCH_MODES = ("exact", "wildcard", "regex", "empty")
 
 
 def _glob_to_like(value: str) -> str:
@@ -402,7 +555,7 @@ def _glob_to_like(value: str) -> str:
 def _normalize_event_row(
     row: dict[str, Any], source_offsets: dict[str, int] | None = None
 ) -> dict[str, Any]:
-    """Attach an explicit UTC offset to timestamps and stringify `event_id`.
+    """Attach an explicit UTC offset to timestamps, stringify `event_id`, decode hashes.
 
     The `events` table's `timestamp`/`ingest_time` columns have no explicit
     timezone component, so clickhouse-connect returns naive `datetime`
@@ -418,6 +571,13 @@ def _normalize_event_row(
     `str`. Stringify it here so callers never have to remember to do it
     themselves — e.g. export's annotation lookup keys its dict by `str`
     annotation `event_id`s and would silently miss every match otherwise.
+
+    The `FixedString(64)` hash columns arrive as NUL-padded `bytes` — see
+    `_columns.decode_fixed_string_columns`. Both callers of this function
+    (the Explorer page and the streaming export) shipped them undecoded:
+    the export's `json.dumps(..., default=str)` / CSV writer rendered
+    `content_hash` and `file_hash` as the Python repr `b'<hex>'`, so an
+    exported hash never compared equal to the real SHA-256.
     """
     offset = 0
     if source_offsets:
@@ -440,7 +600,7 @@ def _normalize_event_row(
             row[key] = ensure_utc_iso(value)
     if "event_id" in row:
         row["event_id"] = str(row["event_id"])
-    return row
+    return decode_fixed_string_columns(row)
 
 
 # SQL column list for every event query (shared between paginated query and
@@ -494,7 +654,7 @@ def _field_column_expr(
         return time_spec.sql(effective_ts_sql(source_offsets))
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
-        return mapping_coalesce_expr(mapped_raws, parameters, param_name)
+        return mapping_coalesce_expr(field_token.strip(), mapped_raws, parameters, param_name)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         if cast_non_string and column in TOP_LEVEL_NON_STRING_COLUMNS:
@@ -514,9 +674,14 @@ class _ParameterizedQueryBuilder:
         *,
         source_offsets: dict[str, int] | None = None,
         search_blob_ready: bool = False,
+        external_tables: _ExternalTables | None = None,
     ) -> None:
         self.conditions: list[str] = []
-        self.parameters: dict[str, Any] = {}
+        self.parameters: QueryParameters = QueryParameters()
+        # Shared by callers that rebuild the WHERE clause repeatedly for one
+        # logical read (the export keyset loop) so the payload is serialized
+        # and uploaded once. A fresh registry per builder is the default.
+        self._external = external_tables if external_tables is not None else _ExternalTables()
         self._counter = 0
         self._field_mappings = field_mappings
         # Only `time:` tokens read this — they bucket the offset-corrected
@@ -537,6 +702,21 @@ class _ParameterizedQueryBuilder:
     def add(self, condition: str) -> None:
         """Add a raw condition that does not need parameterization."""
         self.conditions.append(condition)
+
+    def _external_list(self, values: Sequence[Any], ch_type: str = "String") -> str:
+        """Register *values* as an external table and return its SQL name.
+
+        The caller embeds the name as ``<expr> IN (SELECT * FROM <name>)``.
+        See :data:`EXTERNAL_LIST_THRESHOLD` for why large lists cannot stay
+        inline query parameters, and :class:`_ExternalTables` for why the
+        registry — not this builder — owns the names and the payloads.
+        """
+        name = self._external.register(values, ch_type)
+        self.parameters.external = self._external.data
+        return name
+
+    def _use_external(self, values: Sequence[Any]) -> bool:
+        return len(values) > EXTERNAL_LIST_THRESHOLD
 
     def add_param(self, sql_fragment: str, value: Any) -> None:
         """Add a condition containing exactly one ':name' placeholder."""
@@ -563,7 +743,15 @@ class _ParameterizedQueryBuilder:
         fixed (equality-constrained) sort-key prefix lets ClickHouse read in
         order for ``ORDER BY timestamp LIMIT n`` — the common single-source
         timeline otherwise falls back to scanning every row's sort keys.
+
+        Past :data:`EXTERNAL_LIST_THRESHOLD` values the list becomes an
+        external table instead of an inline array.
         """
+        if self._use_external(values):
+            table = self._external_list(values)
+            expr = f"toString({column})" if cast_to_string else column
+            self.conditions.append(f"{expr} IN (SELECT * FROM {table})")
+            return
         name = self._param_name()
         if cast_to_string:
             self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
@@ -579,12 +767,27 @@ class _ParameterizedQueryBuilder:
         self, column: str, values: list[str], *, cast_to_string: bool = False
     ) -> None:
         """Add a negated membership condition — the inverse of :py:meth:`add_in_list`."""
+        if self._use_external(values):
+            table = self._external_list(values)
+            expr = f"toString({column})" if cast_to_string else column
+            self.conditions.append(f"{expr} NOT IN (SELECT * FROM {table})")
+            return
         name = self._param_name()
         if cast_to_string:
             self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
         else:
             self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
         self.parameters[name] = values
+
+    def add_not_in_typed_list(self, column: str, values: Sequence[Any], *, ch_type: str) -> None:
+        """``column NOT IN`` over a non-String typed list (e.g. UInt64 hashes)."""
+        if self._use_external(values):
+            table = self._external_list(values, ch_type=ch_type)
+            self.conditions.append(f"{column} NOT IN (SELECT * FROM {table})")
+            return
+        name = self._param_name()
+        self.conditions.append(f"{column} NOT IN {{{name}:Array({ch_type})}}")
+        self.parameters[name] = list(values)
 
     def bind(self, value: Any) -> str:
         """Register *value* as a query parameter and return its generated name.
@@ -608,25 +811,34 @@ class _ParameterizedQueryBuilder:
         have one specific half."
         """
         tags_name = self._param_name()
-        ids_name = self._param_name()
-        clause = (
-            f"(hasAny(tags, {{{tags_name}:Array(String)}}) "
-            f"OR has({{{ids_name}:Array(String)}}, toString(event_id)))"
-        )
+        # The ids half is what `annotated=` resolves to, so it is the half
+        # that outgrows an inline array (see EXTERNAL_LIST_THRESHOLD); the
+        # tag-values half is bounded by the case's distinct tags.
+        if self._use_external(filt.postgres_event_ids):
+            ids_predicate = f"toString(event_id) IN (SELECT * FROM {self._external_list(filt.postgres_event_ids)})"
+        else:
+            ids_name = self._param_name()
+            ids_predicate = f"has({{{ids_name}:Array(String)}}, toString(event_id))"
+            self.parameters[ids_name] = filt.postgres_event_ids
+        clause = f"(hasAny(tags, {{{tags_name}:Array(String)}}) OR {ids_predicate})"
         self.conditions.append(f"NOT {clause}" if negate else clause)
         self.parameters[tags_name] = filt.tag_values
-        self.parameters[ids_name] = filt.postgres_event_ids
 
     def _match_column_expr(self, key: str, mode: str) -> str:
         """Column expression for a field predicate under *mode*.
 
         Exact keeps typed comparison (no toString) so `=`/`NOT IN` compare
         against typed literals; wildcard/regex are string operations and need
-        non-string top-level columns cast.
+        non-string top-level columns cast. ``empty`` casts for the same reason
+        and additionally coalesces: a NULL top-level column would otherwise
+        make ``= ''`` and ``!= ''`` both evaluate to NULL, dropping the row
+        from the include and the exclude side alike. An absent ``attributes``
+        Map key already reads as ``''`` in ClickHouse, so one predicate covers
+        "key missing" and "key present but blank".
         """
         if mode == "exact":
             return self._column_expr(key)
-        return _field_column_expr(
+        expr = _field_column_expr(
             key,
             self.parameters,
             self._param_name,
@@ -634,6 +846,7 @@ class _ParameterizedQueryBuilder:
             field_mappings=self._field_mappings,
             source_offsets=self._source_offsets,
         )
+        return f"ifNull({expr}, '')" if mode == "empty" else expr
 
     def add_field_filter(self, key: str, values: list[str], mode: str = "exact") -> None:
         """Add a filter on a top-level column or attribute.
@@ -643,13 +856,22 @@ class _ParameterizedQueryBuilder:
         equality, wildcard (*/? glob via ILIKE, case-insensitive), or regex
         (RE2 match(), case-sensitive). Routers validate mode strings up
         front; the ValueError here is a defense-in-depth backstop.
+
+        ``empty`` ignores *values* entirely and asks only whether the field
+        has a value at all.
         """
+        if mode == "empty":
+            self.conditions.append(f"{self._match_column_expr(key, mode)} = ''")
+            return
         if not values:
             return
         column = self._match_column_expr(key, mode)
         if mode == "exact":
             if len(values) == 1:
                 self.add_param(f"{column} = :name", values[0])
+            elif self._use_external(values):
+                table = self._external_list(values)
+                self.conditions.append(f"{column} IN (SELECT * FROM {table})")
             else:
                 name = self._param_name()
                 self.conditions.append(f"{column} IN {{{name}:Array(String)}}")
@@ -676,11 +898,20 @@ class _ParameterizedQueryBuilder:
 
         Exact uses `!=`/`NOT IN`; wildcard/regex OR one predicate per value
         and negate the whole, so "matches none of the patterns".
+
+        ``empty`` ignores *values* and keeps only rows where the field has a
+        value — the negative form of the presence predicate.
         """
+        if mode == "empty":
+            self.conditions.append(f"{self._match_column_expr(key, mode)} != ''")
+            return
         column = self._match_column_expr(key, mode)
         if mode == "exact":
             if len(values) == 1:
                 self.add_param(f"{column} != :name", values[0])
+            elif self._use_external(values):
+                table = self._external_list(values)
+                self.conditions.append(f"{column} NOT IN (SELECT * FROM {table})")
             else:
                 name = self._param_name()
                 self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
@@ -884,17 +1115,49 @@ class EventQueryService:
             futures = [pool.submit(fn) for fn in fns]
             return [f.result() for f in futures]
 
-    def _build_where(self, query: EventQuery) -> tuple[str, dict[str, Any]]:
+    def _select(self, sql: str, parameters: Mapping[str, Any] | None = None, **kwargs: Any) -> Any:
+        """Run *sql*, forwarding any external-data tables its parameters carry.
+
+        Every read in this module goes through here rather than
+        ``store.client.query`` directly: a WHERE clause built from a large
+        membership list references an external table (see
+        :data:`EXTERNAL_LIST_THRESHOLD`) that only exists if the request ships
+        it alongside the parameters.
+        """
+        external = getattr(parameters, "external", None)
+        if external is not None:
+            kwargs["external_data"] = external
+        try:
+            return self.store.client.query(sql, parameters=parameters, **kwargs)
+        except DatabaseError as exc:
+            message = str(exc)
+            if "code: 1000" in message and "Field value too long" in message:
+                raise QueryRequestTooLargeError(
+                    "the filter is too large for ClickHouse to accept in one request"
+                ) from exc
+            raise
+
+    def _build_where(
+        self, query: EventQuery, *, external_tables: _ExternalTables | None = None
+    ) -> tuple[str, QueryParameters]:
         """Build the parameterized WHERE clause for *query*.
 
-        Returns the clause string and the bound parameters dict.
-        Both are consumed by :py:meth:`query` (paginated) and
-        :py:meth:`iter_events` (streaming export).
+        Returns the clause string and the bound parameters. The parameters
+        may carry external-data tables the clause references, so they must be
+        passed to :py:meth:`_select` (and copied with :func:`_with_params`),
+        never to ``store.client.query`` directly. Both are consumed by
+        :py:meth:`query` (paginated) and :py:meth:`iter_events` (streaming
+        export).
+
+        *external_tables* lets a caller that rebuilds the clause many times
+        for one logical read reuse the already-serialized payloads — see
+        :class:`_ExternalTables`. Leave it unset for a one-shot read.
         """
         builder = _ParameterizedQueryBuilder(
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
             search_blob_ready=self.store.search_blob_ready() if query.q else False,
+            external_tables=external_tables,
         )
         builder.add_param("case_id = :name", query.case_id)
 
@@ -1000,8 +1263,9 @@ class EventQueryService:
         if query.exclude_template_hashes:
             # Direct predicate — the materialized template_hash column IS the
             # membership test, no aux table (contrast exclude_routine_disposition_ids).
-            th_name = builder.bind(query.exclude_template_hashes)
-            builder.add(f"template_hash NOT IN {{{th_name}:Array(UInt64)}}")
+            builder.add_not_in_typed_list(
+                "template_hash", query.exclude_template_hashes, ch_type="UInt64"
+            )
 
         if query.tags_include is not None:
             builder.add_tag_filter(query.tags_include, negate=False)
@@ -1097,7 +1361,7 @@ class EventQueryService:
             # attributes map) running them serially doubles first-page
             # latency, so run them concurrently.
             def _count() -> int:
-                count_result = self.store.client.query(
+                count_result = self._select(
                     f"SELECT count() FROM {database}.events WHERE {where}",
                     parameters=parameters,
                 )
@@ -1105,10 +1369,10 @@ class EventQueryService:
 
             total, key_result = self._run_parallel(
                 _count,
-                lambda: self.store.client.query(sql, parameters=parameters),
+                lambda: self._select(sql, parameters=parameters),
             )
         else:
-            key_result = self.store.client.query(sql, parameters=parameters)
+            key_result = self._select(sql, parameters=parameters)
         key_rows = key_result.result_rows
 
         has_more_after = False
@@ -1133,6 +1397,22 @@ class EventQueryService:
             _normalize_event_row(dict(zip(columns, row, strict=False)), query.source_offsets)
             for row in rows
         ]
+        # Canonical mapped fields are resolved for the *presented* page only —
+        # the same coalesce the filter SQL applies, so a rendered column and a
+        # filter on that column cannot disagree. Export (`iter_events`)
+        # deliberately does not do this; see project_mapped_fields. Each row
+        # also declares which of its attribute keys it got from the mapping
+        # rather than from the source file, so the detail panel can say so
+        # without re-deriving it (and without mislabelling a stored key that
+        # happens to carry a canonical name).
+        if query.field_mappings:
+            for event in events:
+                attributes, derived_keys = project_mapped_fields(
+                    event.get("attributes"), query.field_mappings
+                )
+                event["attributes"] = attributes
+                if derived_keys:
+                    event["mapped_fields"] = derived_keys
         if query.before is not None:
             events.reverse()
 
@@ -1177,7 +1457,7 @@ class EventQueryService:
         """
         if not key_rows:
             return (), []
-        params = dict(parameters)
+        params = _with_params(parameters)
         timestamps = [ts for _, ts in key_rows]
         params["hts_min"] = to_clickhouse_utc(ensure_utc(min(timestamps)), precise=True)
         params["hts_max"] = to_clickhouse_utc(ensure_utc(max(timestamps)), precise=True)
@@ -1185,7 +1465,7 @@ class EventQueryService:
         for name, (event_id, _) in zip(id_names, key_rows, strict=True):
             params[name] = str(event_id)
         id_list = ", ".join(f"{{{name}:UUID}}" for name in id_names)
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT {_EVENT_SELECT_COLUMNS}
             FROM {self.store.database}.events
@@ -1231,10 +1511,16 @@ class EventQueryService:
         sort_dir = query.order.upper()
         eff = effective_ts_sql(query.source_offsets)
         q = replace(query, after=None, before=None, offset=0)
+        # One registry for the whole export: the clause is rebuilt per batch
+        # (the keyset cursor lives inside it), but the membership payloads it
+        # references do not change, and re-serializing + re-uploading a
+        # multi-megabyte id list once per 1000-row batch is the difference
+        # between one upload and one per batch.
+        external_tables = _ExternalTables()
 
         while True:
-            where, parameters = self._build_where(q)
-            result = self.store.client.query(
+            where, parameters = self._build_where(q, external_tables=external_tables)
+            result = self._select(
                 f"""
                 SELECT {_EVENT_SELECT_COLUMNS}, {eff} AS _cursor_ts
                 FROM {database}.events
@@ -1267,7 +1553,7 @@ class EventQueryService:
         where, parameters = self._build_where(query)
         database = self.store.database
 
-        result = self.store.client.query(
+        result = self._select(
             f"SELECT event_id, source_id FROM {database}.events WHERE {where} LIMIT {cap}",
             parameters=parameters,
         )
@@ -1287,7 +1573,7 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
-        result = self.store.client.query(
+        result = self._select(
             f"SELECT count() FROM {database}.events WHERE {where}",
             parameters=parameters,
         )
@@ -1320,7 +1606,7 @@ class EventQueryService:
 
         params: dict[str, Any] = {"p0": case_id, "src": source_ids}
 
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT groupUniqArrayArray(mapKeys(attributes)) AS keys
             FROM {database}.events
@@ -1363,7 +1649,7 @@ class EventQueryService:
             "src": source_ids,
             "per": sample_rows_per_source,
         }
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT
                 k,
@@ -1406,7 +1692,7 @@ class EventQueryService:
         self.store.init_schema()
         database = self.store.database
         params: dict[str, Any] = {"p0": case_id, "src": source_ids}
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT DISTINCT artifact
             FROM {database}.events
@@ -1428,7 +1714,7 @@ class EventQueryService:
         self.store.init_schema()
         database = self.store.database
         params: dict[str, Any] = {"p0": case_id, "src": source_ids}
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT groupUniqArrayArray(tags) AS tags
             FROM {database}.events
@@ -1489,7 +1775,7 @@ class EventQueryService:
         params: dict[str, Any] = {"p0": case_id, "src": source_ids, "per": sample_per_artifact}
 
         # 1. Full attribute-key inventory + event count per artifact.
-        inv = self.store.client.query(
+        inv = self._select(
             f"""
             SELECT
                 artifact,
@@ -1510,7 +1796,7 @@ class EventQueryService:
         # 2. Randomised value sample per artifact **and source** so that
         #    cross-source cohesion can be computed per field.
         cols = ["message", "timestamp_desc", "artifact_long", "display_name", "tags"]
-        sample = self.store.client.query(
+        sample = self._select(
             f"""
             SELECT source_id, artifact, {", ".join(cols)}, attributes
             FROM (
@@ -1687,7 +1973,7 @@ class EventQueryService:
             min_ts = ensure_utc(query.start)
             max_ts = ensure_utc(query.end)
             interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-            bucket_result = self.store.client.query(
+            bucket_result = self._select(
                 f"""
                 SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
                        count() AS c
@@ -1719,7 +2005,7 @@ class EventQueryService:
         # query result (any(...)), never be recomputed in Python: toUnixTimestamp
         # truncates DateTime64(3) to whole seconds, so a Python float-duration
         # recomputation could disagree with the interval the buckets used.
-        result = self.store.client.query(
+        result = self._select(
             f"""
             WITH (
                 SELECT (min({eff}), max({eff}))
@@ -1789,7 +2075,7 @@ class EventQueryService:
         # ORDER BY/LIMIT, so every surviving row carries the pre-LIMIT event
         # total and group count (= distinct non-empty values, since the
         # grouping key is the value itself).
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT {col_expr} AS val,
                    count() AS c,
@@ -1898,7 +2184,7 @@ class EventQueryService:
         cast_expr = _finite_float_cast(col_expr)
 
         quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
-        stats_result = self.store.client.query(
+        stats_result = self._select(
             f"""
             SELECT count(v) AS n, min(v) AS mn, max(v) AS mx, avg(v) AS mean,
                    stddevPop(v) AS sd, skewPop(v) AS skew, {quantile_exprs}
@@ -1952,7 +2238,7 @@ class EventQueryService:
                 clamped = bin_count != fd
         bin_width = span / bin_count if span > 0 else 1.0
 
-        hist_result = self.store.client.query(
+        hist_result = self._select(
             f"""
             SELECT greatest(0, least({bin_count - 1},
                    toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
@@ -1963,7 +2249,7 @@ class EventQueryService:
             ORDER BY bin_idx
             {HEAVY_SCAN_SETTINGS}
             """,
-            parameters={**parameters, "mn": mn, "bw": bin_width},
+            parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
         counts_by_bin = {row[0]: row[1] for row in hist_result.result_rows}
         bins_out = [
@@ -1977,7 +2263,7 @@ class EventQueryService:
 
         points_block = None
         if points:
-            sample_result = self.store.client.query(
+            sample_result = self._select(
                 f"""
                 SELECT v
                 FROM (
@@ -2072,7 +2358,7 @@ class EventQueryService:
                 f"rankCorr(v{a}, v{b})",
             ]
 
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT {", ".join(selects)}
             FROM ({values_subquery}) AS t
@@ -2187,7 +2473,7 @@ class EventQueryService:
         # Wave 1 — the extent scan and the per-group aggregate scan have no
         # data dependency on each other.
         global_result, groups_result = self._run_parallel(
-            lambda: self.store.client.query(
+            lambda: self._select(
                 f"""
                 SELECT count(v), min(v), max(v), uniqExact(g)
                 FROM ({pairs_subquery}) AS t
@@ -2196,7 +2482,7 @@ class EventQueryService:
                 """,
                 parameters=parameters,
             ),
-            lambda: self.store.client.query(
+            lambda: self._select(
                 f"""
                 SELECT g, count(v) AS c, min(v), max(v), avg(v), stddevPop(v), skewPop(v),
                        {quantile_exprs}
@@ -2235,7 +2521,7 @@ class EventQueryService:
         # Wave 2 — bins and the optional point sample, both keyed on wave 1's
         # bin width and kept-group list.
         def _bins_scan() -> Any:
-            return self.store.client.query(
+            return self._select(
                 f"""
                 SELECT g, greatest(0, least({bin_count - 1},
                        toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
@@ -2246,13 +2532,13 @@ class EventQueryService:
                 ORDER BY g, bin_idx
                 {HEAVY_SCAN_SETTINGS}
                 """,
-                parameters={**parameters, "mn": mn, "bw": bin_width, "kept": kept_values},
+                parameters=_with_params(parameters, mn=mn, bw=bin_width, kept=kept_values),
             )
 
         def _points_scan() -> Any:
             if not points or not kept_values:
                 return None
-            return self.store.client.query(
+            return self._select(
                 f"""
                 SELECT g, v
                 FROM (
@@ -2266,7 +2552,7 @@ class EventQueryService:
                 LIMIT {int(points_limit)}
                 {HEAVY_SCAN_SETTINGS}
                 """,
-                parameters={**parameters, "kept": kept_values},
+                parameters=_with_params(parameters, kept=kept_values),
             )
 
         bins_result, sample_result = self._run_parallel(_bins_scan, _points_scan)
@@ -2396,7 +2682,7 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
 
-        fused_result = self.store.client.query(
+        fused_result = self._select(
             f"""
             SELECT val,
                    sum(c) AS total,
@@ -2513,7 +2799,7 @@ class EventQueryService:
         """Return epoch-aligned bucket-start (ISO) → event count for *query*."""
         where, parameters = self._build_where(query)
         eff = effective_ts_sql(query.source_offsets)
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
                    count() AS c
@@ -2613,7 +2899,7 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
         parameters["cmp_values"] = values
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT if(has({{cmp_values:Array(String)}}, {col_expr}), {col_expr}, '') AS val,
                    count() AS c
@@ -2701,7 +2987,7 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
         cast_expr = _finite_float_cast(col_expr)
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT count(v), min(v), max(v)
             FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
@@ -2726,7 +3012,7 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
         cast_expr = _finite_float_cast(col_expr)
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT greatest(0, least({bin_count - 1},
                        toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
@@ -2737,7 +3023,7 @@ class EventQueryService:
             ORDER BY bin_idx
             {HEAVY_SCAN_SETTINGS}
             """,
-            parameters={**parameters, "mn": mn, "bw": bin_width},
+            parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
         return {row[0]: row[1] for row in result.result_rows}
 
@@ -2842,7 +3128,7 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         eff = effective_ts_sql(query.source_offsets)
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT toDayOfWeek({eff}, 0, 'UTC') AS dow,
                    toHour({eff}, 'UTC') AS hod,
@@ -2949,7 +3235,7 @@ class EventQueryService:
         )
         parameters["pivot_x_values"] = x_values
         parameters["pivot_y_values"] = y_values
-        result = self.store.client.query(
+        result = self._select(
             f"""
             SELECT if(has({{pivot_x_values:Array(String)}}, {col_x}), {col_x}, '') AS xv,
                    if(has({{pivot_y_values:Array(String)}}, {col_y}), {col_y}, '') AS yv,
@@ -3035,7 +3321,7 @@ class EventQueryService:
                 if with_rank
                 else "CAST(NULL, 'Nullable(Float64)')"
             )
-            return self.store.client.query(
+            return self._select(
                 f"""
                 SELECT count(), min(vx), max(vx), min(vy), max(vy),
                        corr(assumeNotNull(vx), assumeNotNull(vy)),
@@ -3087,7 +3373,7 @@ class EventQueryService:
         # The sample repeats the casts rather than reusing `pairs_subquery`:
         # the ordering key has to be projected alongside them, and only this
         # scan needs it.
-        sample_result = self.store.client.query(
+        sample_result = self._select(
             f"""
             SELECT vx, vy
             FROM (

@@ -12,7 +12,7 @@
  */
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { type UseMutationResult } from "@tanstack/react-query";
-import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, EyeOff, Pin, RefreshCw, Tag } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, EyeOff, Info, Pin, RefreshCw, Tag } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useDisposition } from "@/hooks/useDisposition";
@@ -23,28 +23,40 @@ import { InfoHint } from "@/components/ui/InfoHint";
 import { GLOSSARY } from "@/lib/glossary";
 
 /**
- * Shown in place of a detector's findings when the global frame is `baseline`
- * but no definition is active — every view renders this instead of silently
- * running a self-baseline scan, so "compare windows" always means an explicit
- * baseline. The frame bar's definition dropdown / window editor is the fix.
+ * Shown in place of a detector's findings when there are none.
+ *
+ * Same contract as `viz/primitives/ChartEmptyState`: the primary line says what
+ * happened, the optional `hint` gives the likely cause and what to try next, and
+ * both stay at the call site because only the detector knows why it came back
+ * empty. Only the markup is shared — until now this one block was hand-rolled
+ * identically in thirteen views, which is how they drifted into stating absence
+ * twice ("No drift findings. No events ingested yet.").
+ *
+ * Layout is inline rather than that component's centered fixed-height box: these
+ * sit in a scrolling panel between the field picker and the findings list.
  */
-export function NeedsBaselinePrompt() {
+export function AnalysisEmptyState({
+  children,
+  hint,
+}: {
+  children: React.ReactNode;
+  hint?: React.ReactNode;
+}) {
   return (
-    <div className="flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 text-xs text-[var(--color-fg-muted)]">
-      <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--color-warning)]" />
-      <span>
-        Comparing against a baseline, but none is selected. Pick or build a
-        baseline definition in <strong>Windows &amp; normality</strong> below,
-        or switch the frame to <strong>Scan all events</strong>.
-      </span>
+    <div className="flex items-start gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
+      <Info size={13} className="mt-0.5 shrink-0" />
+      <div className="space-y-1">
+        <p className="text-[var(--color-fg-secondary)]">{children}</p>
+        {hint && <p>{hint}</p>}
+      </div>
     </div>
   );
 }
 
 /**
  * The show/hide-dismissed reveal link. One source of truth for its wording
- * and styling — rendered by `ResultsBar` and by OrderViolationsView's bespoke
- * per-source notice bar.
+ * and styling — rendered by `ResultsBar`, which is what the surviving
+ * per-detector views use.
  */
 export function DismissedToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
   return (
@@ -219,8 +231,69 @@ export function DetectorStatusLine({
  */
 const FindingRowCtx = createContext<{
   confirmed: boolean;
+  confirmedOtherScope: boolean;
   flash: (kind: "normal") => void;
-}>({ confirmed: false, flash: () => {} });
+}>({ confirmed: false, confirmedOtherScope: false, flash: () => {} });
+
+/**
+ * Provide the row state `FindingRowActions` reads, outside a `FindingShell`.
+ *
+ * The finding sheet renders the same verdict buttons as a rail row, and they
+ * must show the same confirmed / confirmed-elsewhere state. Re-deriving it
+ * there would fork the one thing in this subsystem that has to stay
+ * single-sourced. `flash` is a no-op: the flash exists to make a row's
+ * optimistic *removal* read as accepted, and the sheet has no row to remove.
+ */
+export function FindingRowState({
+  confirmed = false,
+  confirmedOtherScope = false,
+  children,
+}: {
+  confirmed?: boolean;
+  confirmedOtherScope?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <FindingRowCtx.Provider value={{ confirmed, confirmedOtherScope, flash: () => {} }}>
+      {children}
+    </FindingRowCtx.Provider>
+  );
+}
+
+/**
+ * The pinned-verdict badge, in its two tones.
+ *
+ * One component rather than two literal spans because the accented and muted
+ * forms must stay the same shape: they sit in the same slot, and a row that
+ * changed size when a verdict moved out of scope would read as a different row.
+ */
+function PinBadge({
+  title,
+  muted = false,
+  testId,
+  children,
+}: {
+  title: string;
+  muted?: boolean;
+  testId?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <span
+      data-testid={testId}
+      title={title}
+      className={cn(
+        "mt-0.5 flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium",
+        muted
+          ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"
+          : "bg-[var(--color-anomaly,var(--color-warning))]/15 text-[var(--color-anomaly,var(--color-warning))]",
+      )}
+    >
+      <Pin size={10} />
+      {children}
+    </span>
+  );
+}
 
 export function FindingShell({
   onClick,
@@ -229,6 +302,7 @@ export function FindingShell({
   highlight = false,
   dismissed = false,
   confirmed = false,
+  confirmedOtherScope = false,
   title,
   children,
 }: {
@@ -243,6 +317,13 @@ export function FindingShell({
   dismissed?: boolean;
   /** Covered by a confirmed disposition — durable badge + tinted border. */
   confirmed?: boolean;
+  /**
+   * Covered only by a verdict reached under a *different* comparison. Marked,
+   * not badged: the claim is real but it was not made about this scope, so
+   * Confirm stays live and the row invites a second look rather than reading
+   * as already triaged here.
+   */
+  confirmedOtherScope?: boolean;
   title?: string;
   children: React.ReactNode;
 }) {
@@ -271,7 +352,7 @@ export function FindingShell({
             ? "border-[var(--color-anomaly,var(--color-warning))]/50 hover:border-[var(--color-anomaly,var(--color-warning))]"
             : highlight && !dismissed
               ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-dim)]"
-              : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+              : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]",
         dismissed && "opacity-60",
       )}
       title={title}
@@ -287,20 +368,27 @@ export function FindingShell({
           </span>
         )}
         {confirmed && !dismissed && (
-          <span
-            title="Confirmed — escalated as a durable finding; survives detector re-runs"
-            className="mt-0.5 flex shrink-0 items-center gap-1 rounded bg-[var(--color-anomaly,var(--color-warning))]/15 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-anomaly,var(--color-warning))]"
-          >
-            <Pin size={10} />
+          <PinBadge title="Confirmed — escalated as a durable finding; survives detector re-runs">
             confirmed
-          </span>
+          </PinBadge>
+        )}
+        {confirmedOtherScope && !confirmed && !dismissed && (
+          <PinBadge
+            muted
+            testId="confirmed-other-scope"
+            title="Confirmed under a different comparison — the verdict stands, but not for this scope. Confirm again to claim it here."
+          >
+            confirmed elsewhere
+          </PinBadge>
         )}
         <div className="min-w-0 flex-1 space-y-0.5">{children}</div>
 
         {/* Actions — dimmed at rest (not hidden: the verdict affordances must
             be discoverable without hover, incl. on touch), full on hover/focus. */}
         <div className="shrink-0 flex items-center gap-1 opacity-50 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
-          <FindingRowCtx.Provider value={{ confirmed, flash }}>{actions}</FindingRowCtx.Provider>
+          <FindingRowCtx.Provider value={{ confirmed, confirmedOtherScope, flash }}>
+            {actions}
+          </FindingRowCtx.Provider>
           <button
             title={expanded ? "Collapse" : "Details"}
             className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"
@@ -354,7 +442,7 @@ export function TagFindingsBar({
           {tagResultLabel(mutation.data)}
         </span>
       )}
-      {mutation.isError && <span className="text-xs text-[var(--color-error)]">Failed</span>}
+      {mutation.isError && <span className="text-xs text-[var(--color-danger)]">Failed</span>}
     </div>
   );
 }
@@ -501,9 +589,11 @@ export function FindingRowActions({
           title={
             row.confirmed
               ? "Already confirmed — a durable finding covers this event"
-              : canConfirm
-                ? "Confirm: escalate as a durable finding — survives detector re-runs"
-                : "Unavailable: no representative event to persist a confirmed finding against"
+              : !canConfirm
+                ? "Unavailable: no representative event to persist a confirmed finding against"
+                : row.confirmedOtherScope
+                  ? "Confirmed under a different comparison — confirm again to claim it under this one"
+                  : "Confirm: escalate as a durable finding — survives detector re-runs"
           }
           className={cn(
             "rounded p-0.5",

@@ -45,11 +45,8 @@ def _event(i: int, timestamp: str | None) -> Event:
 
 @pytest.fixture(scope="module")
 def ch_store():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     yield store
     store.delete_source_events(CASE_ID, SOURCE_ID)
 

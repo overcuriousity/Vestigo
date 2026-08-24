@@ -5,15 +5,13 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from vestigo.db.analysis_cache import cache_get, cache_put
 from vestigo.db.postgres import PostgresStore
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    db_path = tmp_path / "test_postgres_store.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database):
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 
@@ -93,6 +91,15 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
         content_hash="cd" * 32,
     )
     sigma_run = await store.create_sigma_run("c1", "t1", params={})
+    story = await store.create_story("c1", "st1", "Report", None, user="alice")
+    await store.create_story_block(story.id, "b1", "markdown", {"text": "x"}, user="alice")
+    # An export snapshot holds frozen event data — the most important of these
+    # to take with the case, and the easiest to leave behind.
+    await store.create_story_export("ex1", story.id, "c1", {"v": 1}, "hash", user="alice")
+    # Derived, but the payload holds event ids, field values and message
+    # templates — and eviction only ever runs on a write for the same case, so
+    # a row left behind here is never reclaimed by anything.
+    await cache_put(store, "c1", "k1", {"results": [{"event_id": "e1"}]}, max_rows=10)
 
     assert await store.delete_case("c1") is True
 
@@ -101,6 +108,10 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
     assert await store.get_detector_run("c1", run.id) is None
     assert await store.get_sigma_rule("c1", sigma_rule.id) is None
     assert await store.get_sigma_run("c1", sigma_run.id) is None
+    assert await store.get_story("c1", "st1") is None
+    assert await store.list_story_blocks("st1") == []
+    assert await store.list_story_exports("st1") == []
+    assert await cache_get(store, "c1", "k1") is None
 
 
 @pytest.mark.asyncio
@@ -190,11 +201,11 @@ async def test_saved_chart_rename_and_delete_scoped_by_timeline(store):
 
 
 @pytest.mark.asyncio
-async def test_init_schema_fresh_db_reaches_alembic_head(tmp_path):
+async def test_init_schema_fresh_db_reaches_alembic_head(blank_pg_database):
     """A fresh database is created entirely by `alembic upgrade head`."""
     from sqlalchemy import inspect, text
 
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/fresh.db")
+    s = PostgresStore(url=blank_pg_database)
     await s.init_schema()
     async with s.engine.begin() as conn:
         tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
@@ -207,14 +218,14 @@ async def test_init_schema_fresh_db_reaches_alembic_head(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_init_schema_adopts_pre_alembic_db(tmp_path):
+async def test_init_schema_adopts_pre_alembic_db(blank_pg_database):
     """A database created by the old create_all path (no alembic_version) is
     normalized by the legacy fixups, stamped at 0001, then upgraded."""
     from sqlalchemy import inspect, text
 
     from vestigo.db.postgres import Base
 
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/legacy.db")
+    s = PostgresStore(url=blank_pg_database)
     async with s.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # A real pre-Alembic database has only the revision-0001 tables —
@@ -233,7 +244,28 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("DROP TABLE agent_proposals"))
         # 0011 adds the instance-wide agent settings table.
         await conn.execute(text("DROP TABLE agent_settings"))
+        # 0020 adds the instance settings table.
+        await conn.execute(text("DROP TABLE app_settings"))
+        # 0026 adds the analysis result cache and the verdict's analysis scope.
+        await conn.execute(text("DROP TABLE analysis_cache"))
+        # 0031 adds the raw-input hash a generated converter was run over (0032 makes its
+        # index unique; it also names converter_script_id, so it goes before 0030's column).
+        await conn.execute(text("DROP INDEX ix_sources_converter_input"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN converter_input_hash"))
+        # 0030 adds the generated-converter scripts and the source back-reference.
+        await conn.execute(text("DROP TABLE converter_scripts"))
+        await conn.execute(text("DROP INDEX ix_sources_converter_script_id"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN converter_script_id"))
+        # 0016 adds the Stories tables.
+        await conn.execute(text("DROP TABLE stories"))
+        await conn.execute(text("DROP TABLE story_blocks"))
+        await conn.execute(text("DROP TABLE story_exports"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
+        # 0025 adds the soft-delete marker for story-referenced views. Its
+        # index has to go first — SQLite refuses to drop a column an index
+        # still names.
+        await conn.execute(text("DROP INDEX ix_views_deleted_at"))
+        await conn.execute(text("ALTER TABLE views DROP COLUMN deleted_at"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
         # 0001-era annotations still carried `pinned` (retired by 0004).
@@ -244,6 +276,16 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
         # 0012 adds the per-user preferences blob.
         await conn.execute(text("ALTER TABLE users DROP COLUMN preferences"))
+        # 0022 adds the demo-case seed stamp.
+        await conn.execute(text("ALTER TABLE users DROP COLUMN demo_case_seeded_at"))
+        # 0023 marks seeded demo cases.
+        await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
+        # 0024 adds the per-timeline recommended grid columns.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN recommended_columns"))
+        # 0028 adds the per-timeline muted analysis methods.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN muted_methods"))
+        # 0029 adds the per-timeline, per-method field overrides.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN field_overrides"))
     await s.init_schema()
     async with s.engine.begin() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()

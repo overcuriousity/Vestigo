@@ -194,9 +194,10 @@ from __future__ import annotations
 import functools
 import math
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -205,7 +206,7 @@ from vestigo.db._buckets import (
     bucket_interval_seconds,
     query_timestamp_range,
 )
-from vestigo.db._columns import resolve_column_token
+from vestigo.db._columns import TOP_LEVEL_NON_STRING_COLUMNS, resolve_column_token
 from vestigo.db._dt import (
     VESTIGO_NOT_SENTINEL_SQL,
     ensure_utc,
@@ -275,6 +276,62 @@ _MIN_CHARSET_BASELINE = 20
 # scripts, e.g. CJK) — a huge alphabet makes "novel character" meaningless and
 # the reference-set query parameter unreasonably large.
 _MAX_CHARSET_SIZE = 5000
+
+# Row ceiling on the grouped charset violation scan. `LIMIT plim BY grp` keeps
+# each group's budget, so this only bounds what a pathological group count can
+# materialize in one response; findings are capped again by `limit` afterwards.
+_MAX_CHARSET_GROUPED_ROWS = 5000
+
+# Group values named in a charset warning before it degrades to a bare count.
+_CHARSET_WARN_GROUPS = 5
+
+# Row ceiling on the grouped charset fallback probe. The probe only answers
+# "does any group in the suspect windows have no baseline-window reference?",
+# so it stops as soon as it has enough rows to be sure — and a result that hits
+# the ceiling is treated as "yes", never as "no". Guessing "no" here would be a
+# silent blind spot, which is the whole thing the fallback exists to prevent.
+_CHARSET_GROUP_PROBE_LIMIT = 1000
+
+
+def _name_groups(names: set[str]) -> str:
+    """``a, b, c`` — capped at ``_CHARSET_WARN_GROUPS`` with a ``+N more`` tail."""
+    ordered = sorted(names)
+    named = ", ".join(ordered[:_CHARSET_WARN_GROUPS])
+    more = len(ordered) - _CHARSET_WARN_GROUPS
+    return f"{named}, +{more} more" if more > 0 else named
+
+
+def _name_groups_by_field(by_field: dict[str, set[str]]) -> str:
+    """``field: a, b; other: c`` — the per-field form of :func:`_name_groups`."""
+    return "; ".join(f"{f}: {_name_groups(names)}" for f, names in sorted(by_field.items()))
+
+
+class _CharsetLearn(NamedTuple):
+    """One learned charset reference for the charset detector.
+
+    ``group`` is the ``group_field`` value the reference was learned for, or
+    ``None`` for an ungrouped reference (whole scope) and for the fallback
+    references that score groups without a usable own reference.
+
+    ``char_counts`` (per-character distinct-value counts) is populated only by
+    the rare-chars recipe — self-baseline mode and the temporal fallback —
+    since a temporal per-group reference *is* the full baseline alphabet and
+    has no per-character rarity to report. ``alphabet_size`` measures every
+    character seen, not just the non-rare subset, because that is what the
+    "free text, novel character is meaningless" skip guard is about.
+
+    ``basis`` names the data the reference came from and is stamped onto every
+    finding it scores (``details.group_basis``), so a report never conflates a
+    baseline-window reference with the fallback.
+    """
+
+    group: str | None
+    reference: list[str]
+    char_counts: dict[str, int]
+    n_vals: int
+    alphabet_size: int
+    basis: str
+
 
 # Minimum distinct baseline values before the entropy detector trusts a
 # field's entropy distribution — quartiles over fewer points are noise.
@@ -1062,12 +1119,29 @@ def _col_expr(
     """
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
-        return mapping_coalesce_expr(mapped_raws, params, prefix)
+        return mapping_coalesce_expr(field_token.strip(), mapped_raws, params, prefix)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         return column
     params[prefix] = attr_key
     return f"attributes[{{{prefix}:String}}]"
+
+
+def _group_expr(
+    field_token: str,
+    params: dict[str, Any],
+    field_mappings: dict[str, list[str]] | None = None,
+) -> str:
+    """Return a String-typed SQL expression for a *grouping* field token.
+
+    Same resolution as :func:`_col_expr` (with the ``gk`` parameter prefix, so
+    one params dict can hold a scan field and a group field), wrapped in
+    ``toString`` so the value can be compared and returned as a string
+    whatever column it resolves to. Callers that reject non-string tokens up
+    front still get a defined query instead of a ClickHouse type error if a new
+    non-string column ever slips past them.
+    """
+    return f"toString({_col_expr(field_token, params, field_mappings, prefix='gk')})"
 
 
 def _split_novelty_fields(
@@ -1269,6 +1343,7 @@ def _ngram_inner_sql(
     ngram: int,
     w_idx_expr: str,
     scope_pred: str,
+    max_gap: int | None = None,
 ) -> str:
     """Two-level n-gram assembly subquery shared by the sequence detectors.
 
@@ -1281,6 +1356,13 @@ def _ngram_inner_sql(
     guard is NULL exactly on each partition's first ``ngram - 1`` rows
     (incomplete n-grams), same trick as ``find_order_violations``.
 
+    *max_gap* (seconds, D14) inserts a segmentation level between the two:
+    ``seg`` is a running count of gaps longer than *max_gap* between
+    consecutive events, and the assembly window partitions by it, so an
+    n-gram never spans a quiet gap — AMiner's ``timeout`` reset, in batch
+    form. ``None`` keeps the pre-D14 shape bit-identical. The value is an
+    int inlined as a literal, same convention as the ``ngram - 1`` frame.
+
     Callers must run the enclosing query **once per source** (window sorts
     can't spill — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
     and filter on ``guard IS NOT NULL`` to keep only complete n-grams.
@@ -1288,16 +1370,7 @@ def _ngram_inner_sql(
     gram_lags = ", ".join(
         [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
     )
-    return f"""
-            SELECT
-                val,
-                ets,
-                w_idx,
-                [{gram_lags}] AS gram,
-                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
-                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
-                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
-            FROM (
+    level1 = f"""
                 SELECT
                     source_id,
                     {col} AS val,
@@ -1313,9 +1386,54 @@ def _ngram_inner_sql(
                   AND {col} != ''
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                   AND ({scope_pred})
-            )
+            """
+    if max_gap is not None:
+        gap = int(max_gap)
+        # gap_s is NULL on each partition's first row; ClickHouse's `if` takes
+        # the else branch for a NULL condition (verified: `if(NULL > n, 1, 0)`
+        # is 0, UInt8, and the window `sum` stays UInt64), so segments start at
+        # 0 and increment after every over-gap boundary — the first row is never
+        # stranded in a segment of its own.
+        #
+        # `age`, not `dateDiff`: dateDiff counts unit *boundaries crossed*, so
+        # 12:00:00.900 → 12:00:02.100 — 1.2 s of elapsed time — reports 2, and a
+        # `max_gap` of 1 segments a burst that never paused for a second. `age`
+        # counts complete elapsed units and reports 1 there, which is what
+        # "farther apart than N seconds" means. Both yield NULL on the first row
+        # identically — measured on 26.6.1, including the Nullable(Int64) →
+        # UInt8 → UInt64 chain above.
+        level1 = f"""
+                SELECT
+                    *,
+                    sum(if(gap_s > {gap}, 1, 0)) OVER ord AS seg
+                FROM (
+                    SELECT
+                        *,
+                        age('second', lagInFrame(ets, 1) OVER ord, ets) AS gap_s
+                    FROM ({level1})
+                    WINDOW ord AS (
+                        PARTITION BY source_id, w_idx
+                        ORDER BY ets, byte_offset, line_number, event_id
+                    )
+                )
+                WINDOW ord AS (
+                    PARTITION BY source_id, w_idx
+                    ORDER BY ets, byte_offset, line_number, event_id
+                )
+            """
+    partition = "source_id, w_idx, seg" if max_gap is not None else "source_id, w_idx"
+    return f"""
+            SELECT
+                val,
+                ets,
+                w_idx,
+                [{gram_lags}] AS gram,
+                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
+                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
+                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
+            FROM ({level1})
             WINDOW w AS (
-                PARTITION BY source_id, w_idx
+                PARTITION BY {partition}
                 ORDER BY ets, byte_offset, line_number, event_id
                 ROWS BETWEEN {ngram - 1} PRECEDING AND CURRENT ROW
             )
@@ -1389,6 +1507,66 @@ def _select_auto_scan_tokens(cats: list[str], ids: list[str]) -> list[str]:
         # remaining categoricals.
         picked += [t for t in cats if t not in picked][: _MAX_AUTO_SCAN_FIELDS - len(picked)]
     return picked
+
+
+def apply_field_overrides(
+    selected: Sequence[str],
+    overrides: Mapping[str, bool] | None,
+    known: Iterable[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Steer a detector's *automatic* field selection by analyst declaration.
+
+    *overrides* is one method's slice of ``Timeline.field_overrides``:
+    ``{field_token: True}`` pins a field into the scan, ``{field_token: False}``
+    takes it out. It exists because the recommenders type fields syntactically
+    and say so — an HTTP status code parses as a number, so the range detector
+    learns a band over ``{200, 404, 500}`` and reports the 500s forever, and no
+    amount of probing discovers that it is a categorical field wearing digits.
+    Only a human (or an agent reasoning about the field's meaning) knows.
+
+    Pinned fields come first, so they survive the per-detector ``[:cap]`` slice
+    that follows — being ranked below the cut is exactly why an analyst pins
+    one. *known*, when given, is the candidate universe the recommender saw: a
+    pin naming a field this timeline does not have is dropped rather than sent
+    to ClickHouse as a column that is always empty.
+
+    Returns ``(fields, notes)``. *notes* names what the declaration held back or
+    ignored, for the caller's ``warnings`` — a field silently missing from a
+    scan is indistinguishable from a field that produced no finding, which is
+    the one thing an override must never look like. Never applied where the
+    caller named *fields* explicitly: this is advice to the recommenders, not a
+    lock on the detector.
+    """
+    if not overrides:
+        return list(selected), []
+    notes: list[str] = []
+    kept = [t for t in selected if overrides.get(t) is not False]
+    held = [t for t in selected if overrides.get(t) is False]
+    # Every pin, including one the recommender already picked: being ranked
+    # below the cut is exactly why an analyst pins a field it *did* pick, so a
+    # pin the recommender ranked 18th has to move ahead of the [:15] slice, not
+    # keep its rank. Promoted ones leave `kept` below rather than appearing
+    # twice.
+    pins = [t for t, on in sorted(overrides.items()) if on]
+    if known is not None:
+        # A field the caller already selected is present by construction,
+        # whatever the recommender universe says — claiming otherwise would be
+        # a run that scans a field and reports it missing in the same breath.
+        universe = set(known) | set(selected)
+        absent = [t for t in pins if t not in universe]
+        pins = [t for t in pins if t in universe]
+        if absent:
+            notes.append(
+                f"{len(absent)} field(s) this timeline declares for this method are not "
+                f"present in it and were ignored: {', '.join(sorted(absent))}."
+            )
+    if held:
+        notes.append(
+            f"{len(held)} field(s) held back by this timeline's field overrides: "
+            f"{', '.join(sorted(held))}. Naming a field explicitly still scans it."
+        )
+    pinned = set(pins)
+    return pins + [t for t in kept if t not in pinned], notes
 
 
 # ---------------------------------------------------------------------------
@@ -1589,7 +1767,12 @@ class StatisticalAnomalyService:
               AND has({{src:Array(String)}}, source_id)
               AND val != ''
             GROUP BY key
-            ORDER BY cov_count DESC
+            -- `key` is a tie-break, not cosmetics: coverage ties are common
+            -- (every field of one source covers the same event count), and
+            -- with only `cov_count DESC` the rows that survive LIMIT differ
+            -- between runs on the same data. A recommender whose candidate
+            -- set is a coin flip is not reproducible.
+            ORDER BY cov_count DESC, key ASC
             LIMIT {{max_keys:UInt32}}
             {HEAVY_SCAN_SETTINGS}
         """
@@ -1627,8 +1810,8 @@ class StatisticalAnomalyService:
         m_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         m_parts = []
         canonicals = list(field_mappings.items())
-        for i, (_, raws) in enumerate(canonicals):
-            expr = mapping_coalesce_expr(raws, m_params, f"inv{i}")
+        for i, (canonical, raws) in enumerate(canonicals):
+            expr = mapping_coalesce_expr(canonical, raws, m_params, f"inv{i}")
             m_parts.append(f"uniqExact({expr}) AS d{i}, countIf({expr} != '') AS c{i}")
         m_sql = (
             f"SELECT {', '.join(m_parts)}"
@@ -1698,8 +1881,16 @@ class StatisticalAnomalyService:
                 )
             )
 
-        # Sort: recommended first, then by coverage descending.
-        findings.sort(key=lambda f: (not f.recommended, -f.coverage))
+        # Sort: recommended first, then by coverage descending, then by token.
+        # The token is what makes the order *total*. Coverage ties are the norm
+        # (fields of one source all cover that source's events), and without a
+        # final key the tie order is whatever the inventory happened to arrive
+        # in — which for a ClickHouse GROUP BY is not stable across runs. That
+        # is visible to analysts, since `find_value_novelty` and
+        # `find_value_combos` take the top 1 / top 2 of this list when the
+        # caller names no fields: the same timeline could be scored on
+        # different fields each time it is opened.
+        findings.sort(key=lambda f: (not f.recommended, -f.coverage, f.token))
         return findings
 
     # ------------------------------------------------------------------
@@ -1793,6 +1984,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen values per field, ranked by surprise score.
 
@@ -1828,6 +2020,9 @@ class StatisticalAnomalyService:
         # Total event count for surprise score denominator.
         total_events = self._count_events(case_id, source_ids)
 
+        # Populated only on the auto path: naming fields explicitly bypasses the
+        # timeline's overrides entirely, so there is nothing to disclose.
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
@@ -1844,6 +2039,9 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
             # Plain-attribute fields share one batched map scan below, but the
             # cap still bounds the ARRAY JOIN expansion width / LIMIT BY output
             # (and the residual per-field round-trips for mapped or top-level
@@ -1862,12 +2060,12 @@ class StatisticalAnomalyService:
         # Per-window event totals (surprise denominators) — temporal only.
         baseline_size = total_events
         suspect_totals: list[int] = []
-        run_warnings: list[str] = []
+        run_warnings: list[str] = [*override_notes]
         if windows is not None:
             baseline_size, suspect_totals = self._window_totals(
                 case_id, source_ids, windows, source_offsets
             )
-            run_warnings = _window_size_warnings(windows, suspect_totals)
+            run_warnings += _window_size_warnings(windows, suspect_totals)
 
         all_findings: list[ValueFinding] = []
 
@@ -2222,6 +2420,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen *combinations* of field values.
 
@@ -2264,13 +2463,22 @@ class StatisticalAnomalyService:
 
         # Field resolution (auto mode) issues live queries — only after the
         # empty-corpus short-circuit above.
+        override_notes: list[str] = []
         if fields is not None:
             combo_fields = fields
         else:
             rec = self.recommend_novelty_fields(
                 case_id, source_ids, total=total_events, field_mappings=field_mappings
             )
-            combo_fields = [f.token for f in rec if f.recommended][:2]
+            # Overrides are applied before the pair is cut, not after: a pinned
+            # field the recommender ranked third is pinned precisely so it makes
+            # the pair.
+            combo_fields, override_notes = apply_field_overrides(
+                [f.token for f in rec if f.recommended],
+                field_overrides,
+                [f.token for f in rec],
+            )
+            combo_fields = combo_fields[:2]
 
         if len(combo_fields) < 2:
             if fields is not None:
@@ -2281,6 +2489,7 @@ class StatisticalAnomalyService:
                 detector="value_combo",
                 method=method,
                 baseline_size=total_events,
+                warnings=override_notes,
             )
 
         # Build one expression per field into a single shared params dict —
@@ -2299,12 +2508,12 @@ class StatisticalAnomalyService:
         # Per-window event totals (surprise denominators) — temporal only.
         baseline_size = total_events
         suspect_totals: list[int] = []
-        run_warnings: list[str] = []
+        run_warnings: list[str] = [*override_notes]
         if windows is not None:
             baseline_size, suspect_totals = self._window_totals(
                 case_id, source_ids, windows, source_offsets
             )
-            run_warnings = _window_size_warnings(windows, suspect_totals)
+            run_warnings += _window_size_warnings(windows, suspect_totals)
 
         if windows is None:
             params["floor"] = rarity_floor
@@ -2543,7 +2752,13 @@ class StatisticalAnomalyService:
             )
             for (tok, dist, cov), ratio in zip(candidates, ratios, strict=True)
         ]
-        out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage))
+        # Token last, for the same reason as `recommend_numeric_fields`' sibling
+        # in `recommend_novelty_fields`: `find_range_violations` and the auto-scan
+        # path below take a top-N slice of this list, and numeric-ratio ties are
+        # the norm (every field whose values all parse scores exactly 1.0), so
+        # without a final key the same timeline can be scored on different fields
+        # between runs.
+        out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage, f.token))
         return out
 
     @_gated_scan
@@ -2559,6 +2774,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return numeric values falling outside a field's learned range.
 
@@ -2594,13 +2810,22 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
             rec = self.recommend_numeric_fields(
                 case_id, source_ids, total=total_events, field_mappings=field_mappings
             )
-            scan_fields = [f.token for f in rec if f.recommended][:_MAX_AUTO_SCAN_FIELDS]
+            # The detector this override exists for: a status code parses as a
+            # number, so the recommender offers it and the learned band reports
+            # every 500 forever. Declaring it off is the only way to say so.
+            scan_fields, override_notes = apply_field_overrides(
+                [f.token for f in rec if f.recommended],
+                field_overrides,
+                [f.token for f in rec],
+            )
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         all_findings: list[RangeFinding] = []
         evaluated_fields = 0
@@ -2759,6 +2984,7 @@ class StatisticalAnomalyService:
                 detector="numeric_range",
                 method=method,
                 baseline_size=total_events,
+                warnings=override_notes,
                 windows=windows.payload() if windows is not None else None,
             )
 
@@ -2777,6 +3003,7 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=total_events,
             results=results,
+            warnings=override_notes,
             windows=windows.payload() if windows is not None else None,
             total_findings=len(all_findings),
         )
@@ -2793,7 +3020,8 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None,
         inventory: list[tuple[str, int, int]] | None,
         inventory_total: int | None,
-    ) -> list[str]:
+        field_overrides: dict[str, bool] | None = None,
+    ) -> tuple[list[str], list[str]]:
         """Auto-select string fields for the charset/entropy detectors.
 
         Unlike value_novelty's default (categorical only), identifier-kind
@@ -2822,7 +3050,31 @@ class StatisticalAnomalyService:
             f.token for f in rec if f.kind == "categorical" and f.token not in _SYNTHETIC_FIELDS
         ]
         ids = [f.token for f in rec if f.kind == "identifier" and f.token not in _SYNTHETIC_FIELDS]
-        return _select_auto_scan_tokens(cats, ids)
+        # Excluded fields are dropped *before* the quota so the other kind
+        # backfills the slot, rather than after, which would silently shrink the
+        # scan below its own cap. That happens ahead of apply_field_overrides,
+        # which would then have nothing left to disclose, so the exclusions are
+        # run through it separately — against the selection an *undeclared* run
+        # would have scanned, which is exactly the set this run differs from.
+        # Reporting against the whole candidate universe instead would count
+        # fields ranked far below the cap, and claim a scan was narrowed when it
+        # is byte-identical to the one nobody declared anything for. Only the
+        # exclusions are passed: a pin belongs to the note below, and would
+        # otherwise be reported absent against a list it is not in yet.
+        excluded = {t: False for t, on in (field_overrides or {}).items() if not on}
+        _, notes = apply_field_overrides(_select_auto_scan_tokens(cats, ids), excluded or None)
+        if field_overrides:
+            cats = [t for t in cats if field_overrides.get(t) is not False]
+            ids = [t for t in ids if field_overrides.get(t) is not False]
+        picked, pin_notes = apply_field_overrides(
+            _select_auto_scan_tokens(cats, ids), field_overrides, [f.token for f in rec]
+        )
+        # Re-cut after the pins are prepended, like every other detector does:
+        # the quota bounds this scan at _MAX_AUTO_SCAN_FIELDS heavy per-field
+        # queries under one HEAVY_SCAN_GATE slot, and a stored declaration must
+        # not be able to double that.
+        picked = picked[:_MAX_AUTO_SCAN_FIELDS]
+        return picked, notes + pin_notes
 
     @_gated_scan
     def find_charset_novelty(
@@ -2840,6 +3092,8 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        group_field: str | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values containing characters outside a field's reference charset.
 
@@ -2872,7 +3126,69 @@ class StatisticalAnomalyService:
         values or a reference charset larger than ``_MAX_CHARSET_SIZE`` are
         skipped; when every scanned field skips the status is
         ``insufficient_data``.
+
+        ``group_field`` (D14) scopes the learning per value of a second field
+        — one alphabet per host, per user, per session — instead of one
+        merged alphabet across the whole scope, so groups that legitimately
+        differ no longer mask each other. Both modes honor it, and suppressions
+        stay keyed on ``(field, value)``, applying across groups.
+
+        The two skip guards apply per group, and they mean opposite things, so
+        a group failing one is not treated like a group failing the other:
+
+        * ``alphabet_size > _MAX_CHARSET_SIZE`` — *the question does not
+          apply*. Free text in a large script has no meaningful "novel
+          character" however much of it there is, so the group is **dropped**
+          and named in ``warnings``. (In practice such a group also forces the
+          fallback over the same ceiling — the fallback is learned from a
+          superset of the group's own data — so the whole field goes
+          unevaluated; the group is excluded explicitly regardless, so the
+          routing does not rest on that.)
+        * ``n_vals < _MIN_CHARSET_BASELINE`` — *not enough evidence to learn
+          this group's own alphabet*. The group is not thereby exonerated, so it
+          is scored against a **fallback** reference instead of dropped. Note
+          that "absent from the baseline window" is just ``n_vals == 0``, the
+          degenerate case of the same condition: routing 0 to a fallback but 3
+          to a blind spot would mean less evidence bought better treatment,
+          right where a freshly provisioned host would sit.
+
+        The fallback is mode-specific and learned with the rare-chars recipe:
+        temporal mode learns it from events *outside the suspect windows*
+        (``basis="outside-suspect-windows"``) — a whole-scope reference would
+        let a suspect value into its own alphabet and mask itself — and
+        self-baseline mode from the merged whole scope
+        (``basis="scope-merged"``), which is exactly the pre-``group_field``
+        reference, so enabling grouping cannot narrow coverage. Every finding
+        records which reference scored it in ``details.group_basis`` and its own
+        group's evidence count in ``details.group_baseline_distinct_values``.
+
+        Grouping costs at most one extra *learn* query per field, never one
+        violation scan per group: the per-group references travel into the
+        single scan as parallel ``{grps, sets}`` array parameters, and
+        ``LIMIT plim BY grp`` preserves each group's finding budget. The
+        fallback learn is only run when some group actually needs it — in
+        temporal mode a bounded ``SELECT DISTINCT`` probe over the suspect
+        windows answers that far more cheaply than the whole-scope scan it
+        guards. A pathological group count is bounded at
+        ``_MAX_CHARSET_GROUPED_ROWS`` returned rows per field; that ceiling
+        orders by novelty across *all* groups, so hitting it drops whole
+        low-novelty groups and is therefore reported in ``warnings`` rather
+        than left to look like a clean result.
+
+        Every warning is keyed by field, since the same group name can be thin
+        for one field and absent from the baseline window for another.
+
+        Raises:
+            ValueError: if ``group_field`` resolves to a non-string column
+                (string comparisons against it are a ClickHouse type error).
         """
+        if group_field is not None:
+            column, _ = resolve_column_token(group_field)
+            if column in TOP_LEVEL_NON_STRING_COLUMNS:
+                raise ValueError(
+                    f"group_field '{group_field}' is not a string field and cannot group "
+                    "charset learning; pick a categorical field or an attribute."
+                )
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
@@ -2888,94 +3204,361 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
-            scan_fields = self._auto_string_fields(
-                case_id, source_ids, total_events, field_mappings, inventory, inventory_total
+            scan_fields, override_notes = self._auto_string_fields(
+                case_id,
+                source_ids,
+                total_events,
+                field_mappings,
+                inventory,
+                inventory_total,
+                field_overrides,
             )
+
+        def _learn_rare_chars(field: str, *, exclude_suspects: bool, basis: str) -> _CharsetLearn:
+            """Ungrouped rare-chars reference for *field* — the fallback recipe.
+
+            Shared by both grouped fallbacks. *exclude_suspects* negates the
+            suspect-window predicates (temporal mode), so a suspect value can
+            never land in the reference that is about to score it; without it
+            the reference is the merged whole scope, which is precisely what
+            self-baseline mode learned before ``group_field`` existed.
+            """
+            params: dict[str, Any] = {**base_params}
+            fcol = _col_expr(field, params, field_mappings)
+            pred = ""
+            if exclude_suspects and windows is not None:
+                _, sps = _window_preds(windows, params, source_offsets)
+                pred = f"\n                                  AND NOT ({' OR '.join(sps)})"
+            sql = f"""
+                SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
+                FROM (
+                    SELECT
+                        count() OVER () AS total,
+                        arrayDistinct(extractAll(val, '(?s).')) AS chars
+                    FROM (
+                        SELECT DISTINCT {fcol} AS val
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {fcol} != ''{pred}
+                    )
+                )
+                ARRAY JOIN chars AS c
+                GROUP BY c
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            counts = {str(c): int(nv) for c, nv, _ in rows}
+            n = int(rows[0][2]) if rows else 0
+            return _CharsetLearn(
+                None,
+                [c for c, nv in counts.items() if nv > rarity_floor],
+                counts,
+                n,
+                len(counts),
+                basis,
+            )
+
+        def _suspect_groups_without_reference(field: str, known: set[str]) -> tuple[set[str], bool]:
+            """Groups in the suspect windows with no baseline reference.
+
+            Returns ``(names, truncated)``. One bounded ``SELECT DISTINCT``
+            over the suspect windows only — far cheaper than the whole-scope
+            fallback learn it guards, which is why it is worth running to find
+            out whether that learn is needed at all. *truncated* means the
+            ceiling was hit and the answer is incomplete: callers must treat
+            that as "there may be more", never as "there are none".
+
+            The predicate mirrors the violation scan's suspect-window clause,
+            sentinel guard included: a group present only in sentinel-timestamp
+            rows is one the scan will never score, so reporting it absent would
+            buy a whole-scope fallback learn and a warning naming a group no
+            finding can ever come from.
+            """
+            params: dict[str, Any] = {**base_params}
+            vcol = _col_expr(field, params, field_mappings)
+            pcol = _group_expr(group_field, params, field_mappings)  # type: ignore[arg-type]
+            _, sps = _window_preds(windows, params, source_offsets)
+            params["glim"] = _CHARSET_GROUP_PROBE_LIMIT
+            sql = f"""
+                SELECT DISTINCT {pcol} AS grp
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {vcol} != ''
+                  AND ({" OR ".join(sps)})
+                  AND {VESTIGO_NOT_SENTINEL_SQL}
+                LIMIT {{glim:UInt32}}
+                {HEAVY_SCAN_SETTINGS}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            missing = {str(row[0]) for row in rows if str(row[0]) not in known}
+            return missing, len(rows) >= _CHARSET_GROUP_PROBE_LIMIT
 
         all_findings: list[CharsetFinding] = []
         evaluated_fields = 0
+        run_warnings: list[str] = [*override_notes]
+        # Every way a grouped run can deviate from "each group scored against
+        # its own alphabet" is accumulated here and reported in `warnings`, so
+        # the run never quietly narrows what it looked at — and never claims to
+        # have narrowed something it did not. All of them are keyed by field:
+        # the same group name can be thin for one field and absent for another,
+        # and a warning that merges the two leaves an analyst no way to tell
+        # which field it is about.
+        fallback_absent: dict[str, set[str]] = {}  # field -> fallback-scored, no own reference
+        fallback_thin: dict[str, set[str]] = {}  # field -> fallback-scored, own reference thin
+        wide_dropped: dict[str, set[str]] = {}  # field -> groups dropped as free text
+        thin_unevaluated: dict[str, set[str]] = {}  # field -> thin groups with no fallback
+        absent_unevaluated: list[str] = []  # fields where absent groups had no fallback
+        fallback_failed: dict[str, str] = {}  # field -> why no fallback could be learned
+        row_ceiling_hit: list[str] = []  # fields whose grouped scan hit _MAX_CHARSET_GROUPED_ROWS
 
         for field_token in scan_fields:
-            # --- Learn the reference charset. ---
-            char_counts: dict[str, int] = {}
+            # --- Learn the reference charset(s). With group_field, one
+            # alphabet per value of the group field (D14); without it, a
+            # single None-grouped entry — the pre-D14 whole-scope behavior.
+            learns: list[_CharsetLearn] = []
+            # Temporal grouped mode only: reference for groups with no
+            # baseline-window values (see the docstring).
+            fallback: _CharsetLearn | None = None
             if windows is None:
                 # Per-character distinct-value counts over the whole corpus,
                 # plus the total distinct-value count in the same scan: a window
                 # `count() OVER ()` over the DISTINCT subquery yields n_vals on
                 # every row, so we avoid a second whole-corpus uniqExact scan of
-                # the identical column/predicate.
+                # the identical column/predicate. Grouped: the window and the
+                # GROUP BY partition per group instead.
                 cc_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, cc_params, field_mappings)
-                cc_sql = f"""
-                    SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
-                    FROM (
-                        SELECT
-                            count() OVER () AS total,
-                            arrayDistinct(extractAll(val, '(?s).')) AS chars
+                if group_field is None:
+                    cc_sql = f"""
+                        SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
                         FROM (
-                            SELECT DISTINCT {col} AS val
-                            FROM {db}.events
-                            WHERE case_id = {{cid:String}}
-                              AND has({{src:Array(String)}}, source_id)
-                              AND {col} != ''
+                            SELECT
+                                count() OVER () AS total,
+                                arrayDistinct(extractAll(val, '(?s).')) AS chars
+                            FROM (
+                                SELECT DISTINCT {col} AS val
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {col} != ''
+                            )
+                        )
+                        ARRAY JOIN chars AS c
+                        GROUP BY c
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
+                    char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
+                    n_vals = int(cc_rows[0][2]) if cc_rows else 0
+                    reference = [c for c, nv in char_counts.items() if nv > rarity_floor]
+                    # Skip decision is about the field's *whole* alphabet, not
+                    # just its non-rare subset: on a huge-alphabet field (CJK
+                    # prose, base64 blobs) most characters are rare, so
+                    # `reference` stays small while the real alphabet is
+                    # enormous — "novel character" is meaningless there.
+                    # Measure `char_counts`, which holds every character seen
+                    # (temporal mode's `reference` already is the full baseline
+                    # alphabet).
+                    learns.append(
+                        _CharsetLearn(
+                            None, reference, char_counts, n_vals, len(char_counts), "scope"
                         )
                     )
-                    ARRAY JOIN chars AS c
-                    GROUP BY c
-                    {HEAVY_SCAN_SETTINGS}
-                """
-                cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
-                char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
-                n_vals = int(cc_rows[0][2]) if cc_rows else 0
-                reference = [c for c, nv in char_counts.items() if nv > rarity_floor]
-                # Skip decision is about the field's *whole* alphabet, not just
-                # its non-rare subset: on a huge-alphabet field (CJK prose,
-                # base64 blobs) most characters are rare, so `reference` stays
-                # small while the real alphabet is enormous — "novel character"
-                # is meaningless there. Measure `char_counts`, which holds every
-                # character seen (temporal mode's `reference` already is the
-                # full baseline alphabet).
-                alphabet_size = len(char_counts)
+                else:
+                    gcol = _group_expr(group_field, cc_params, field_mappings)
+                    cc_sql = f"""
+                        SELECT grp, c, count() AS n_vals_with_c, any(total) AS n_vals
+                        FROM (
+                            SELECT
+                                grp,
+                                count() OVER (PARTITION BY grp) AS total,
+                                arrayDistinct(extractAll(val, '(?s).')) AS chars
+                            FROM (
+                                SELECT DISTINCT {col} AS val, {gcol} AS grp
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {col} != ''
+                            )
+                        )
+                        ARRAY JOIN chars AS c
+                        GROUP BY grp, c
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
+                    by_grp: dict[str, dict[str, int]] = {}
+                    n_vals_by_grp: dict[str, int] = {}
+                    for grp, c, nv, grp_total in cc_rows:
+                        by_grp.setdefault(str(grp), {})[str(c)] = int(nv)
+                        n_vals_by_grp[str(grp)] = int(grp_total)
+                    for grp, grp_counts in by_grp.items():
+                        reference = [c for c, nv in grp_counts.items() if nv > rarity_floor]
+                        learns.append(
+                            _CharsetLearn(
+                                grp,
+                                reference,
+                                grp_counts,
+                                n_vals_by_grp[grp],
+                                len(grp_counts),
+                                "scope",
+                            )
+                        )
             else:
                 # Charset of the baseline window (a bounded range now, so the
                 # year-2299 sentinel can never fall inside it).
                 bs_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, bs_params, field_mappings)
                 bs_bp, _ = _window_preds(windows, bs_params, source_offsets)
-                bs_sql = f"""
-                    SELECT
-                        groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
-                        count() AS n_vals
-                    FROM (
-                        SELECT DISTINCT {col} AS val
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {col} != ''
-                          AND {bs_bp}
+                if group_field is None:
+                    bs_sql = f"""
+                        SELECT
+                            groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
+                            count() AS n_vals
+                        FROM (
+                            SELECT DISTINCT {col} AS val
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {col} != ''
+                              AND {bs_bp}
+                        )
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
+                    if not bs_rows:
+                        continue
+                    charset_arr, n_vals = bs_rows[0]
+                    n_vals = int(n_vals)
+                    reference = [str(c) for c in (charset_arr or [])]
+                    learns.append(
+                        _CharsetLearn(
+                            None, reference, {}, n_vals, len(reference), "baseline-window"
+                        )
                     )
-                    {HEAVY_SCAN_SETTINGS}
-                """
-                bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
-                if not bs_rows:
-                    continue
-                charset_arr, n_vals = bs_rows[0]
-                n_vals = int(n_vals)
-                reference = [str(c) for c in (charset_arr or [])]
-                alphabet_size = len(reference)
+                else:
+                    gcol = _group_expr(group_field, bs_params, field_mappings)
+                    bs_sql = f"""
+                        SELECT
+                            grp,
+                            groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
+                            count() AS n_vals
+                        FROM (
+                            SELECT DISTINCT {col} AS val, {gcol} AS grp
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {col} != ''
+                              AND {bs_bp}
+                        )
+                        GROUP BY grp
+                        {HEAVY_SCAN_SETTINGS}
+                    """
+                    bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
+                    for grp, charset_arr, grp_n_vals in bs_rows:
+                        reference = [str(c) for c in (charset_arr or [])]
+                        learns.append(
+                            _CharsetLearn(
+                                str(grp),
+                                reference,
+                                {},
+                                int(grp_n_vals),
+                                len(reference),
+                                "baseline-window",
+                            )
+                        )
 
-            if n_vals < _MIN_CHARSET_BASELINE or alphabet_size > _MAX_CHARSET_SIZE:
+            # The two skip guards apply per group (ungrouped: per field, as
+            # before) and mean opposite things — see the docstring. `wide` is a
+            # statement about the *question* and drops the group; `thin` is a
+            # statement about the *evidence* and routes it to a fallback.
+            # Precedence is wide-over-thin: no amount of evidence makes "novel
+            # character" meaningful on free text in a large script.
+            wide = [learn for learn in learns if learn.alphabet_size > _MAX_CHARSET_SIZE]
+            thin = [
+                learn
+                for learn in learns
+                if learn.alphabet_size <= _MAX_CHARSET_SIZE and learn.n_vals < _MIN_CHARSET_BASELINE
+            ]
+            evaluated = [
+                learn
+                for learn in learns
+                if learn.alphabet_size <= _MAX_CHARSET_SIZE
+                and learn.n_vals >= _MIN_CHARSET_BASELINE
+            ]
+
+            if group_field is not None:
+                if wide:
+                    wide_dropped[field_token] = {str(learn.group) for learn in wide}
+                # Who needs a fallback, by name, *before* deciding to pay for
+                # one. The probe is only meaningful in temporal mode: the
+                # self-baseline learn scans the same corpus the violation scan
+                # does, so every group the scan will see is already in `learns`
+                # and none can be absent.
+                thin_names = {str(learn.group) for learn in thin}
+                absent_names: set[str] = set()
+                probe_truncated = False
+                if windows is not None:
+                    absent_names, probe_truncated = _suspect_groups_without_reference(
+                        field_token, {str(learn.group) for learn in learns}
+                    )
+                if thin_names or absent_names or probe_truncated:
+                    candidate = _learn_rare_chars(
+                        field_token,
+                        exclude_suspects=windows is not None,
+                        basis=(
+                            "outside-suspect-windows" if windows is not None else "scope-merged"
+                        ),
+                    )
+                    if (
+                        candidate.n_vals >= _MIN_CHARSET_BASELINE
+                        and candidate.alphabet_size <= _MAX_CHARSET_SIZE
+                    ):
+                        fallback = candidate
+                        # Reported for having been *scored differently*, not for
+                        # having produced findings: a group measured against
+                        # another reference is a fact about the run even when it
+                        # comes back clean.
+                        if thin_names:
+                            fallback_thin.setdefault(field_token, set()).update(thin_names)
+                        if absent_names:
+                            fallback_absent.setdefault(field_token, set()).update(absent_names)
+                    else:
+                        # Nothing left to score them against. They go
+                        # unevaluated, and the run names which ones and why
+                        # rather than reporting a bare field name — including
+                        # *which* guard the fallback itself tripped, since the
+                        # two failures call for different responses (widen the
+                        # baseline vs. this field is free text).
+                        fallback_failed[field_token] = (
+                            "too few distinct values to learn one from"
+                            if candidate.n_vals < _MIN_CHARSET_BASELINE
+                            else (
+                                f"the reference it would learn is itself wider than "
+                                f"{_MAX_CHARSET_SIZE} characters"
+                            )
+                        )
+                        if thin_names:
+                            thin_unevaluated[field_token] = thin_names
+                        if absent_names or probe_truncated:
+                            absent_unevaluated.append(field_token)
+
+            if not evaluated and fallback is None:
                 continue
             evaluated_fields += 1
 
-            # --- Flag values containing characters outside the reference set. ---
+            # --- Flag values containing characters outside the reference set.
+            # One scan per field either way: grouped runs carry the per-group
+            # references in as parallel arrays and pick each row's reference by
+            # `indexOf`, instead of re-scanning `events` once per group. ---
             viol_params: dict[str, Any] = {**base_params}
             bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
-            viol_params["base"] = reference
             viol_params["plim"] = per_field_limit
             win_idx_sel = ""
             win_idx_group = ""
@@ -2989,47 +3572,170 @@ class StatisticalAnomalyService:
                 win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
                 win_idx_group = ", win_idx"
                 detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
-            viol_sql = f"""
-                SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
-                FROM (
-                    SELECT
-                        val,
-                        arrayFilter(
-                            c -> NOT has({{base:Array(String)}}, c),
-                            arrayDistinct(extractAll(val, '(?s).'))
-                        ) AS novel,
-                        cnt, first_seen, evt_id{win_idx_group}
+
+            if group_field is None:
+                viol_params["base"] = evaluated[0].reference
+                viol_sql = f"""
+                    SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
                     FROM (
                         SELECT
-                            {vcol} AS val,
-                            count() AS cnt,
-                            min({eff}) AS first_seen,
-                            toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {vcol} != ''{detect_clause}
-                        GROUP BY val{win_idx_group}
+                            val,
+                            arrayFilter(
+                                c -> NOT has({{base:Array(String)}}, c),
+                                arrayDistinct(extractAll(val, '(?s).'))
+                            ) AS novel,
+                            cnt, first_seen, evt_id{win_idx_group}
+                        FROM (
+                            SELECT
+                                {vcol} AS val,
+                                count() AS cnt,
+                                min({eff}) AS first_seen,
+                                toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {vcol} != ''{detect_clause}
+                            GROUP BY val{win_idx_group}
+                        )
                     )
-                )
-                WHERE length(novel) > 0
-                ORDER BY length(novel) DESC, cnt ASC
-                LIMIT {{plim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
-            """
+                    WHERE length(novel) > 0
+                    ORDER BY length(novel) DESC, cnt ASC
+                    LIMIT {{plim:UInt32}}
+                    {HEAVY_SCAN_SETTINGS}
+                """
+            else:
+                vgcol = _group_expr(group_field, viol_params, field_mappings)
+                viol_params["grps"] = [learn.group for learn in evaluated]
+                viol_params["sets"] = [learn.reference for learn in evaluated]
+                viol_params["fb"] = fallback.reference if fallback is not None else []
+                viol_params["has_fb"] = 1 if fallback is not None else 0
+                viol_params["skip"] = [learn.group for learn in wide]
+                viol_params["tlim"] = _MAX_CHARSET_GROUPED_ROWS
+                # `greatest(gidx, 1)` because ClickHouse evaluates both `if`
+                # branches and rejects array index 0; the guarded index is only
+                # read when gidx > 0, and an out-of-range index yields an empty
+                # array rather than an error.
+                #
+                # Row routing: gidx > 0 is a group with its own reference.
+                # gidx = 0 covers both "too thin to learn from" and "absent from
+                # the reference scan", which the fallback is there to score —
+                # but *not* a group the wide-alphabet guard dropped, since
+                # "novel character" is meaningless for it whatever alphabet you
+                # measure against. `skip` carries those out so gidx = 0 keeps
+                # one unambiguous meaning.
+                #
+                # `skip` is belt-and-braces rather than load-bearing: the
+                # fallback is learned from a superset of every group's own data
+                # (everything outside the suspect windows, or the whole scope),
+                # so its alphabet is at least as wide as the widest group's. A
+                # group over the ceiling therefore guarantees the fallback is
+                # over it too and `has_fb` is 0 anyway. Keeping the exclusion
+                # explicit costs one array parameter and means the routing does
+                # not depend on that argument holding.
+                viol_sql = f"""
+                    SELECT val, grp, novel, cnt, first_seen, evt_id{win_idx_group}
+                    FROM (
+                        SELECT
+                            val,
+                            grp,
+                            arrayFilter(
+                                c -> NOT has(
+                                    if(
+                                        gidx = 0,
+                                        {{fb:Array(String)}},
+                                        {{sets:Array(Array(String))}}[greatest(gidx, 1)]
+                                    ),
+                                    c
+                                ),
+                                arrayDistinct(extractAll(val, '(?s).'))
+                            ) AS novel,
+                            cnt, first_seen, evt_id{win_idx_group}
+                        FROM (
+                            SELECT
+                                val,
+                                grp,
+                                indexOf({{grps:Array(String)}}, grp) AS gidx,
+                                cnt, first_seen, evt_id{win_idx_group}
+                            FROM (
+                                SELECT
+                                    {vcol} AS val,
+                                    {vgcol} AS grp,
+                                    count() AS cnt,
+                                    min({eff}) AS first_seen,
+                                    toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {vcol} != ''{detect_clause}
+                                GROUP BY val, grp{win_idx_group}
+                            )
+                            WHERE gidx > 0
+                               OR ({{has_fb:UInt8}} = 1
+                                   AND NOT has({{skip:Array(String)}}, grp))
+                        )
+                    )
+                    WHERE length(novel) > 0
+                    ORDER BY length(novel) DESC, cnt ASC
+                    LIMIT {{plim:UInt32}} BY grp
+                    LIMIT {{tlim:UInt32}}
+                    {HEAVY_SCAN_SETTINGS}
+                """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            if group_field is not None and len(vrows) >= _MAX_CHARSET_GROUPED_ROWS:
+                # The per-group budget (`LIMIT plim BY grp`) is preserved, but the
+                # global ceiling under it is not per-group: the ordering is by
+                # novelty length across every group, so what a truncated scan
+                # drops is whole low-novelty groups. Silently returning the top
+                # slice would read as "these are the groups with novel
+                # characters" when it means "these are the first 5,000 rows".
+                row_ceiling_hit.append(field_token)
+            by_group = {learn.group: learn for learn in evaluated}
+            # Every learn, not just the evaluated ones — a row's own group is
+            # what distinguishes "too thin" from "absent" and stamps
+            # `group_baseline_distinct_values`.
+            by_group_all = {learn.group: learn for learn in learns}
 
             for vrow in vrows:
-                if windows is None:
-                    val, novel, cnt, first_seen, evt_id = vrow
-                    window: TimeWindow | None = None
+                grp: str | None = None
+                if group_field is None:
+                    if windows is None:
+                        val, novel, cnt, first_seen, evt_id = vrow
+                        window: TimeWindow | None = None
+                    else:
+                        val, novel, cnt, first_seen, evt_id, win_idx = vrow
+                        wi = int(win_idx)
+                        window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
+                elif windows is None:
+                    val, grp, novel, cnt, first_seen, evt_id = vrow
+                    window = None
                 else:
-                    val, novel, cnt, first_seen, evt_id, win_idx = vrow
+                    val, grp, novel, cnt, first_seen, evt_id, win_idx = vrow
                     wi = int(win_idx)
                     window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 novel_chars = [str(c) for c in (novel or [])]
                 if not val or not novel_chars:
                     continue
+                # The learn that scored this row: its own group's, or the
+                # fallback when the group has no usable reference of its own.
+                own = by_group_all.get(grp)
+                if own is not None and own.alphabet_size > _MAX_CHARSET_SIZE:
+                    # Belt-and-braces against the `skip` array in the SQL: a
+                    # wide-alphabet group is never scored, by any reference.
+                    continue
+                learn = by_group.get(grp)
+                if learn is None:
+                    learn = fallback
+                    if learn is None:
+                        continue
+                    if grp is not None:
+                        # Both buckets are normally filled by name at decision
+                        # time; this catches a group the probe could not
+                        # enumerate because it hit its ceiling. `own is None` =
+                        # absent from the reference scan, otherwise present but
+                        # too thin — different sentences in the warnings.
+                        target = fallback_thin if own is not None else fallback_absent
+                        target.setdefault(field_token, set()).add(str(grp))
+                char_counts, n_vals = learn.char_counts, learn.n_vals
                 score = 0.0
                 for c in novel_chars:
                     nv_c = char_counts.get(c, 0)
@@ -3054,7 +3760,20 @@ class StatisticalAnomalyService:
                     "allowlist_field": field_token,
                     "allowlist_value": str(val),
                 }
-                if windows is None:
+                if group_field is not None:
+                    details["group_field"] = group_field
+                    details["group_value"] = grp
+                    details["group_basis"] = learn.basis
+                    # This group's *own* evidence, which is what explains why a
+                    # fallback reference was used. `baseline_distinct_values`
+                    # above stays the count of whichever reference produced the
+                    # score, so the two together read as "scored against N
+                    # values, of which this group contributed M".
+                    details["group_baseline_distinct_values"] = own.n_vals if own else 0
+                # Rarity is reportable exactly when the reference came from the
+                # rare-chars recipe — self-baseline mode, or the temporal
+                # fallback (a per-group baseline alphabet carries no counts).
+                if char_counts:
                     details["rarity_floor"] = rarity_floor
                     details["char_value_counts"] = {c: char_counts.get(c, 0) for c in novel_chars}
                 if window is not None:
@@ -3079,6 +3798,62 @@ class StatisticalAnomalyService:
                     )
                 )
 
+        # What the fallback reference was, in the words the analyst chose the
+        # mode in — the two modes learn it from different data.
+        fb_desc = (
+            "a reference learned outside the suspect windows"
+            if windows is not None
+            else "the merged whole-scope alphabet"
+        )
+        if fallback_absent:
+            total = sum(len(names) for names in fallback_absent.values())
+            run_warnings.append(
+                f"{total} {group_field} group(s) had no baseline-window values "
+                f"and were scored against {fb_desc} ({_name_groups_by_field(fallback_absent)})."
+            )
+        if fallback_thin:
+            total = sum(len(names) for names in fallback_thin.values())
+            run_warnings.append(
+                f"{total} {group_field} group(s) had fewer than "
+                f"{_MIN_CHARSET_BASELINE} distinct values of their own and were scored against "
+                f"{fb_desc} ({_name_groups_by_field(fallback_thin)})."
+            )
+        if wide_dropped:
+            total = sum(len(names) for names in wide_dropped.values())
+            run_warnings.append(
+                f"{total} {group_field} group(s) not evaluated: reference alphabet larger than "
+                f"{_MAX_CHARSET_SIZE} characters, where a novel character carries no signal "
+                f"({_name_groups_by_field(wide_dropped)})."
+            )
+        if thin_unevaluated:
+            total = sum(len(names) for names in thin_unevaluated.values())
+            reasons = "; ".join(
+                f"{f}: {fallback_failed.get(f, 'no fallback reference could be learned')}"
+                for f in sorted(thin_unevaluated)
+            )
+            run_warnings.append(
+                f"{total} {group_field} group(s) below the {_MIN_CHARSET_BASELINE}-value floor "
+                f"were not evaluated, because no fallback reference could be learned — {reasons} "
+                f"({_name_groups_by_field(thin_unevaluated)})."
+            )
+        if absent_unevaluated:
+            fields = sorted(set(absent_unevaluated))
+            reasons = "; ".join(
+                f"{f}: {fallback_failed.get(f, 'no fallback reference could be learned')}"
+                for f in fields
+            )
+            run_warnings.append(
+                "Groups absent from the baseline window were not evaluated for "
+                f"{', '.join(fields)}, because no fallback reference could be learned — {reasons}."
+            )
+        if row_ceiling_hit:
+            run_warnings.append(
+                f"The grouped scan returned its {_MAX_CHARSET_GROUPED_ROWS}-row ceiling for "
+                f"{', '.join(sorted(set(row_ceiling_hit)))} — rows are ordered by novelty across "
+                "all groups, so lower-novelty groups may be missing entirely. Narrow the scope, "
+                "or pick a lower-cardinality group_field."
+            )
+
         return self._finalize_findings(
             all_findings,
             detector="charset",
@@ -3090,6 +3865,7 @@ class StatisticalAnomalyService:
             case_id=case_id,
             source_ids=source_ids,
             allowlist=allowlist,
+            warnings=run_warnings,
             windows=windows,
         )
 
@@ -3112,6 +3888,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose Shannon character entropy falls outside a learned band.
 
@@ -3120,8 +3897,14 @@ class StatisticalAnomalyService:
         distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
         Values above the band look random (DGA domains, encoded payloads,
         keys); values below it look degenerate (padding, repeated-character
-        stuffing). AMiner ``EntropyDetector`` — entropy is a property of the
-        characters, never of what the value means.
+        stuffing). Entropy is a property of the characters, never of what the
+        value means.
+
+        Inspired by AMiner's ``EntropyDetector`` but **not the same statistic**:
+        AMiner scores values against a learned character-*bigram* transition
+        table, which catches ordinary-alphabet-unusual-order values (DGA
+        domains); per-value Shannon entropy does not. See
+        ``docs/ANOMALY_DETECTION.md`` §6 and roadmap D11.
 
         Two modes: *self-baseline* (``method="iqr"``) computes the fence over
         the whole corpus's per-distinct-value entropies (unlike an exact
@@ -3153,11 +3936,18 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
+        override_notes: list[str] = []
         if fields is not None:
             scan_fields = fields
         else:
-            scan_fields = self._auto_string_fields(
-                case_id, source_ids, total_events, field_mappings, inventory, inventory_total
+            scan_fields, override_notes = self._auto_string_fields(
+                case_id,
+                source_ids,
+                total_events,
+                field_mappings,
+                inventory,
+                inventory_total,
+                field_overrides,
             )
 
         # Shannon character entropy in bits (log2) per distinct value, via
@@ -3327,6 +4117,7 @@ class StatisticalAnomalyService:
             total_events=total_events,
             evaluated_fields=evaluated_fields,
             allowlist=allowlist,
+            warnings=override_notes,
             windows=windows,
             exclude_event_ids=exclude_event_ids,
             limit=limit,
@@ -3355,6 +4146,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose share of events shifted between baseline and suspect windows.
 
@@ -3432,6 +4224,10 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
             scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         # Phase 1: fetch per-(field, value) window counts from ClickHouse.
@@ -3620,6 +4416,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose arrival cadence changed between baseline and suspect windows.
 
@@ -3705,6 +4502,10 @@ class StatisticalAnomalyService:
                 inventory=inventory,
             )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
             scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         # Window durations in seconds — the Poisson-rate test's exposures.
@@ -3966,8 +4767,9 @@ class StatisticalAnomalyService:
         inventory_total: int | None,
         windows: AnalysisWindows | None = None,
         source_offsets: dict[str, int] | None = None,
-    ) -> tuple[list[str], list[str]]:
-        """Return ``(numeric_fields, categorical_fields)`` for the drift scan.
+        field_overrides: dict[str, bool] | None = None,
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Return ``(numeric_fields, categorical_fields, notes)`` for the drift scan.
 
         Explicit *fields* are honored verbatim and branch-classified by one
         :meth:`_numeric_ratio_probe` call (the exact syntactic test the range
@@ -3981,7 +4783,7 @@ class StatisticalAnomalyService:
         if fields is not None:
             scan = [t for t in fields if t]
             if not scan:
-                return [], []
+                return [], [], []
             ratios = self._numeric_ratio_probe(
                 case_id,
                 source_ids,
@@ -3994,40 +4796,84 @@ class StatisticalAnomalyService:
             categorical: list[str] = []
             for tok, ratio in zip(scan, ratios, strict=True):
                 (numeric if ratio >= _MIN_NUMERIC_RATIO else categorical).append(tok)
-            return numeric, categorical
+            return numeric, categorical, []
 
         if inventory is None:
             inventory, inventory_total = self.field_inventory(
                 case_id, source_ids, total_events, field_mappings
             )
-        numeric = [
-            f.token
-            for f in self.recommend_numeric_fields(
+        numeric_rec = self.recommend_numeric_fields(
+            case_id,
+            source_ids,
+            total=inventory_total,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            windows=windows,
+            source_offsets=source_offsets,
+        )
+        novelty_rec = self.recommend_novelty_fields(
+            case_id,
+            source_ids,
+            total=inventory_total,
+            field_mappings=field_mappings,
+            inventory=inventory,
+        )
+        numeric = [f.token for f in numeric_rec if f.recommended]
+        numeric_set = set(numeric)
+        categorical = [f.token for f in novelty_rec if f.recommended and f.token not in numeric_set]
+        # The declaration is resolved against the whole candidate universe once,
+        # not per branch: passing a branch's own selection as its `known` would
+        # make every pin "absent" (a pin is by construction a field the branch
+        # did not select), so pins would never apply and the run would report a
+        # field this timeline does have as missing from it.
+        overrides = field_overrides or {}
+        notes: list[str] = []
+        universe = {f.token for f in numeric_rec} | {f.token for f in novelty_rec}
+        pins = [t for t, on in sorted(overrides.items()) if on]
+        absent = [t for t in pins if t not in universe]
+        pins = [t for t in pins if t in universe]
+        if absent:
+            notes.append(
+                f"{len(absent)} field(s) this timeline declares for this method are not "
+                f"present in it and were ignored: {', '.join(sorted(absent))}."
+            )
+        # A pin the recommenders left out belongs to whichever branch its own
+        # numeric probe puts it in — the same classification the explicit-fields
+        # path above uses, so declaring a field costs one probe, not a guess.
+        cat_set = set(categorical)
+        fresh = [t for t in pins if t not in numeric_set and t not in cat_set]
+        num_pins = [t for t in pins if t in numeric_set]
+        cat_pins = [t for t in pins if t in cat_set]
+        if fresh:
+            ratios = self._numeric_ratio_probe(
                 case_id,
                 source_ids,
-                total=inventory_total,
-                field_mappings=field_mappings,
-                inventory=inventory,
+                fresh,
+                field_mappings,
                 windows=windows,
                 source_offsets=source_offsets,
             )
-            if f.recommended
-        ]
-        numeric_set = set(numeric)
-        categorical = [
-            f.token
-            for f in self.recommend_novelty_fields(
-                case_id,
-                source_ids,
-                total=inventory_total,
-                field_mappings=field_mappings,
-                inventory=inventory,
-            )
-            if f.recommended and f.token not in numeric_set
-        ]
+            for tok, ratio in zip(fresh, ratios, strict=True):
+                (num_pins if ratio >= _MIN_NUMERIC_RATIO else cat_pins).append(tok)
+        # Exclusions apply to both branches: a field declared off is off for the
+        # drift scan whichever test would have taken it.
+        off = {t: False for t, on in overrides.items() if not on}
+        numeric, numeric_notes = apply_field_overrides(
+            numeric, {**off, **dict.fromkeys(num_pins, True)}
+        )
+        categorical, cat_notes = apply_field_overrides(
+            categorical, {**off, **dict.fromkeys(cat_pins, True)}
+        )
         numeric = numeric[:_MAX_AUTO_SCAN_FIELDS]
-        categorical = categorical[: _MAX_AUTO_SCAN_FIELDS - len(numeric)]
-        return numeric, categorical
+        # The categorical branch gets whatever budget the numeric one left —
+        # but never less than its own pins. A timeline wide enough to fill the
+        # cap with numeric fields would otherwise slice this to [:0] and drop a
+        # pinned categorical field without a note, leaving a held-back field
+        # indistinguishable from one that found nothing. Everywhere else a pin
+        # survives the cap because it is prepended; here the budget itself has
+        # to make room for it.
+        categorical = categorical[: max(_MAX_AUTO_SCAN_FIELDS - len(numeric), len(cat_pins))]
+        return numeric, categorical, [*notes, *numeric_notes, *cat_notes]
 
     @_gated_scan
     def find_distribution_drift(
@@ -4047,6 +4893,7 @@ class StatisticalAnomalyService:
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
     ) -> StatAnomalyResult:
         """Return fields whose value distribution drifted between baseline and suspects.
 
@@ -4108,7 +4955,7 @@ class StatisticalAnomalyService:
                 windows=windows.payload(),
             )
 
-        numeric_fields, categorical_fields = self._drift_split_fields(
+        numeric_fields, categorical_fields, override_notes = self._drift_split_fields(
             case_id,
             source_ids,
             fields,
@@ -4118,7 +4965,9 @@ class StatisticalAnomalyService:
             inventory_total,
             windows=windows,
             source_offsets=source_offsets,
+            field_overrides=field_overrides,
         )
+        run_warnings += override_notes
 
         # One pooled test list across both branches; each entry carries what
         # Phase 3 needs to build its finding without re-querying.
@@ -4974,6 +5823,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        max_gap_seconds: int | None = None,
     ) -> StatAnomalyResult:
         """Return event-order n-grams present in a suspect window but absent from the baseline.
 
@@ -5048,7 +5898,13 @@ class StatisticalAnomalyService:
         w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
 
         inner = _ngram_inner_sql(
-            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr=w_idx_expr, scope_pred=union_pred
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=ngram,
+            w_idx_expr=w_idx_expr,
+            scope_pred=union_pred,
+            max_gap=max_gap_seconds,
         )
 
         # Query A (once per source): complete-n-gram totals per window —
@@ -5238,6 +6094,7 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
+        max_gap_seconds: int | None = None,
     ) -> StatAnomalyResult:
         """Return recurring event-order n-grams (motifs), ranked by support and regularity.
 
@@ -5304,7 +6161,13 @@ class StatisticalAnomalyService:
         scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
 
         inner = _ngram_inner_sql(
-            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr="0", scope_pred=scope_pred
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=ngram,
+            w_idx_expr="0",
+            scope_pred=scope_pred,
+            max_gap=max_gap_seconds,
         )
 
         # Pass 1 (once per source): support per complete n-gram, highest first.

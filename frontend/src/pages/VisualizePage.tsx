@@ -3,7 +3,10 @@
  *
  * Inherits the Explorer's current filters/time-range from the URL (same
  * `paramsToFilters` the Explorer itself reads), so a chart here always
- * matches whatever the analyst was just looking at in the grid. The analyst
+ * matches whatever the analyst was just looking at in the grid. That
+ * inheritance is stated on the canvas by `viz/InheritedFiltersBar` — the
+ * scope of an exported figure has to be legible before the chart is read,
+ * not only in the caption underneath it. The analyst
  * picks a field, declares its scale of measurement, and gets the chart
  * types appropriate to that scale — each backed by one of the `vizApi`
  * aggregations.
@@ -16,18 +19,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, HelpCircle, Lightbulb, Repeat, RotateCcw, X } from "lucide-react";
-import { vizApi, type CompareMode } from "@/api/viz";
+import { ArrowLeft, HelpCircle, Lightbulb, Repeat, X } from "lucide-react";
+import { savedChartsApi, vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
 import { dispositionsApi } from "@/api/dispositions";
-import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { FILTER_PARAM_KEYS, filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { InheritedFiltersBar } from "@/components/viz/InheritedFiltersBar";
 import {
   resolveCollapseRoutine,
   routineSignature,
   type RoutineOverride,
 } from "@/lib/routineCollapse";
-import { applyFieldEntries } from "@/lib/fieldFilters";
+import { applyFieldEntries, removeFilterEntry } from "@/lib/fieldFilters";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -59,10 +63,13 @@ import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { CorrMatrix, type CorrMethod } from "@/components/viz/charts/CorrMatrix";
 import {
-  chartConfigToParams,
-  filterParamsPreservingChartConfig,
+  CHART_ID_PARAM,
+  chartUrlParams,
   histogramToCompare,
   paramsToChartConfig,
+  parseStoredChartConfig,
+  parseStoredChartFilters,
+  unrepresentableFilterMembers,
   type ChartConfig,
   type ChartType,
   type Scale,
@@ -152,8 +159,92 @@ function compareUnavailableReason(chartType: ChartType): string {
 export function VisualizePage() {
   const { caseId, timelineId } = useParams<{ caseId: string; timelineId: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const urlFilters = useMemo(() => paramsToFilters(searchParams), [searchParams]);
-  const config = useMemo(() => paramsToChartConfig(searchParams), [searchParams]);
+
+  // A saved chart can be addressed by id instead of spelled out as `c_*`
+  // params, and when it is, storage — not the URL — is the source of both
+  // halves. That is the whole point: three members of the filter set
+  // (`ids`, `anomalyRunId`, `collapseRoutine`) have no URL representation, so
+  // a link that reconstructed the chart from params would quietly widen an
+  // agent-scoped chart to the whole timeline. `?c_chart=<id>` cannot.
+  const chartId = searchParams.get(CHART_ID_PARAM);
+  const savedChartsQuery = useQuery({
+    // Same key SavedChartsRail uses, so the two share one fetch.
+    queryKey: ["viz-saved-charts", caseId, timelineId],
+    queryFn: () => savedChartsApi.list(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId && chartId),
+  });
+  const savedChart = useMemo(
+    () => (chartId ? savedChartsQuery.data?.charts.find((c) => c.id === chartId) : undefined),
+    [chartId, savedChartsQuery.data],
+  );
+  const storedConfig = useMemo(
+    () => (savedChart ? parseStoredChartConfig(savedChart.config) : null),
+    [savedChart],
+  );
+  // Whether the reference has been resolved as far as it ever will be. An
+  // *error* settles it too: a chart list that could not be fetched is not a
+  // chart that is still arriving, and treating it as one would suspend the
+  // page indefinitely — every defaulting effect below suppressed and
+  // `scopeReady` false, so no chart renders, no notice appears, and there is
+  // nothing on screen to explain either. Falling through to the params draws
+  // the default chart, which is the same graceful degradation a deleted chart
+  // already got.
+  const chartRefSettled = savedChartsQuery.isSuccess || savedChartsQuery.isError;
+  // A `c_chart` that names a deleted chart, one saved by an incompatible
+  // config version, or one whose list could not be loaded at all falls through
+  // to the params — the page still works, and the notice below says why it is
+  // not the chart that was linked.
+  const chartRefBroken =
+    !!chartId && chartRefSettled && (savedChart === undefined || storedConfig === null);
+  // While the URL names a chart, *nothing writes the URL automatically* — not
+  // while the reference is resolving (where `config` below is still the
+  // default chart) and not after it has, where the stored chart already
+  // answered every question the defaulting effects exist to answer. Both
+  // windows are the same rule, because both would end the same way: any
+  // automatic write goes through `takeOver`, which spells the chart out as
+  // `c_*` params and drops `c_chart` along with the three filter members
+  // params cannot carry. Only the analyst's own edit may do that.
+  //
+  // A *broken* reference is deliberately not live: a link to a deleted or
+  // unreadable chart falls through to the params, where the page is building
+  // a chart again and the defaults are wanted.
+  const chartRefLive = !!chartId && !chartRefBroken;
+
+  // Why the last `c_chart` could not be honoured. Latched in state for the
+  // same reason `droppedScope` is: the moment the reference settles as broken
+  // the defaulting effects start writing the default chart into the URL, and
+  // `chartConfigToParams` drops `c_chart` along with the rest of the namespace
+  // — so the *derived* answer stops being true one tick after it becomes true,
+  // and the notice explaining the page would blink out with it. An analyst who
+  // clicked a link to a chart is owed the reason it is not on screen for
+  // longer than a frame.
+  const [brokenChartRef, setBrokenChartRef] = useState<
+    "unfetchable" | "unreadable" | "missing" | null
+  >(null);
+  useEffect(() => {
+    if (!chartRefBroken) return;
+    setBrokenChartRef(
+      savedChartsQuery.isError ? "unfetchable" : savedChart ? "unreadable" : "missing",
+    );
+  }, [chartRefBroken, savedChartsQuery.isError, savedChart]);
+
+  const urlFilters = useMemo(() => {
+    if (!(storedConfig && savedChart)) return paramsToFilters(searchParams);
+    // Routine collapse is *live* state on this page, never stored state: the
+    // disposition set is the single source of truth (#147) and `filters` below
+    // re-derives it from scratch. A stored `true` riding along here would
+    // survive the reveal toggle — which only ever *adds* the flag, so it could
+    // never turn one off — and would be reported by `takeOver` as a narrowing
+    // the URL dropped, when the URL never carried it and the page re-derives
+    // it either way. The frozen renderers (`ChartBlockCard`, the export
+    // resolver) do read it, which is the whole reason it is stored.
+    const { collapseRoutine: _live, ...stored } = parseStoredChartFilters(savedChart.config);
+    return stored;
+  }, [storedConfig, savedChart, searchParams]);
+  const config = useMemo(
+    () => storedConfig ?? paramsToChartConfig(searchParams),
+    [storedConfig, searchParams],
+  );
 
   // Routine collapse, derived exactly as on ExplorerPage (#147): a mute is a
   // filter and the charts must aggregate the set the grid displays.
@@ -178,18 +269,90 @@ export function VisualizePage() {
   // fetch would render (then refetch and recompute) the muted superset on
   // every page load with mutes — the #147 flash, one page over. One small
   // Postgres query before first paint, usually already warm from Explorer.
-  const scopeReady = !!(caseId && timelineId) && dispositionsQuery.isSuccess;
+  // Same argument one step further for `c_chart`: fetching the default chart's
+  // data and then the linked chart's would render the wrong chart first.
+  // Settled, not succeeded: a failed chart-list fetch has already fallen back
+  // to the params above, and there is nothing left to wait for.
+  const scopeReady =
+    !!(caseId && timelineId) && dispositionsQuery.isSuccess && (!chartId || chartRefSettled);
   const filters = useMemo(
     () => (collapseRoutine ? { ...urlFilters, collapseRoutine: true } : urlFilters),
     [urlFilters, collapseRoutine],
   );
 
+  // Narrowings the URL cannot carry that the analyst's last edit therefore
+  // dropped. Held in state rather than derived, because after `takeOver` the
+  // params are all that is left — the evidence of what was lost exists only at
+  // the moment it is lost.
+  const [droppedScope, setDroppedScope] = useState<string[] | null>(null);
+
+  // Editing either half is the analyst taking the chart over: the URL stops
+  // naming a saved chart and starts describing this one, spelled out in full.
+  // Both halves are written every time, because after this the params are the
+  // only record — `chartConfigToParams` drops `c_chart` along with the rest of
+  // the `c_*` keys it rewrites, so there is no separate step to forget.
+  //
+  // Three filter members have no param form, so spelling the chart out *widens*
+  // it whenever they were set. That is unavoidable — the URL is the record now —
+  // but it must not be silent: a chart scoped to a fixed event set becoming a
+  // chart over the whole timeline is exactly the failure `?c_chart=` exists to
+  // prevent, and an analyst who is not told reads the wider chart as the one
+  // they opened.
+  //
+  // In practice only two of the three ever reach here: `collapseRoutine` is
+  // stripped from `urlFilters` above because this page re-derives it from live
+  // dispositions, so a take-over does not lose it and must not claim to. The
+  // third stays in `unrepresentableFilterMembers` regardless — the rail saves
+  // the *resolved* filters, where the flag is real.
+  //
+  // `chartUrlParams` rewrites both namespaces and carries everything else in
+  // the URL over untouched — this page owns `c_*` and the filter params, not
+  // the whole query string.
+  const takeOver = useCallback(
+    (nextConfig: ChartConfig, nextFilters: EventFilters) => {
+      const dropped = unrepresentableFilterMembers(nextFilters);
+      setDroppedScope(dropped.length > 0 ? dropped : null);
+      setSearchParams((prev) => chartUrlParams(nextConfig, nextFilters, prev), {
+        replace: true,
+      });
+    },
+    [setSearchParams],
+  );
+
   const updateConfig = useCallback(
-    (patch: Partial<ChartConfig>) => {
+    (patch: Partial<ChartConfig>) => takeOver({ ...config, ...patch }, urlFilters),
+    [takeOver, config, urlFilters],
+  );
+
+  // The one place a filter change is written from this page.
+  const updateFilters = useCallback(
+    (next: EventFilters) => takeOver(config, next),
+    [takeOver, config],
+  );
+
+  // Loading a saved chart addresses it by id and lets the resolution above
+  // read both halves out of storage. Writing its `c_*` params instead would
+  // lose exactly the members storage exists to carry.
+  const loadSavedChart = useCallback(
+    (loadedChartId: string) => {
+      // The URL names a chart again, so whatever a previous take-over dropped
+      // — and whatever a previous reference failed to resolve — is no longer
+      // what is on screen.
+      setDroppedScope(null);
+      setBrokenChartRef(null);
+      // Clears both namespaces this page owns — the stored chart supplies the
+      // shape *and* the filters, so a leftover filter param would narrow it
+      // further than the analyst who saved it ever saw. Anything outside those
+      // two namespaces is not ours to drop.
       setSearchParams(
         (prev) => {
-          const next = { ...paramsToChartConfig(prev), ...patch };
-          return chartConfigToParams(next, new URLSearchParams(prev));
+          const params = new URLSearchParams();
+          for (const [key, value] of prev.entries()) {
+            if (key.startsWith("c_") || FILTER_PARAM_KEYS.has(key)) continue;
+            params.append(key, value);
+          }
+          params.set(CHART_ID_PARAM, loadedChartId);
+          return params;
         },
         { replace: true },
       );
@@ -197,14 +360,12 @@ export function VisualizePage() {
     [setSearchParams],
   );
 
-  // The one place a filter change is written from this page — the helper
-  // carries the `c_*` chart-config keys over, since `filtersToParams`
-  // builds a fresh URLSearchParams (see its doc comment).
-  const updateFilters = useCallback(
-    (next: EventFilters) => {
-      setSearchParams((prev) => filterParamsPreservingChartConfig(next, prev));
-    },
-    [setSearchParams],
+  // Round trip back to the grid these filters came from. Only the filter params
+  // travel — the `c_*` chart config means nothing to the Explorer.
+  const explorerHref = useMemo(
+    () =>
+      `/cases/${caseId}/timelines/${timelineId}?${filtersToParams(urlFilters).toString()}`,
+    [caseId, timelineId, urlFilters],
   );
 
   // Click-to-filter: charts report the clicked mark's field=value pair(s);
@@ -269,10 +430,11 @@ export function VisualizePage() {
   // Default to the first field once the list loads — the backend sorts by
   // coverage descending, so this is the highest-coverage field.
   useEffect(() => {
+    if (chartRefLive) return;
     if (field == null && fieldsQuery.data?.fields.length) {
       updateConfig({ field: fieldsQuery.data.fields[0].token });
     }
-  }, [field, fieldsQuery.data, updateConfig]);
+  }, [field, fieldsQuery.data, updateConfig, chartRefLive]);
 
   // Probe numeric-ness only when actually needed: once per field change (to
   // auto-suggest a scale) and while a numeric chart type is displayed (as its
@@ -310,14 +472,27 @@ export function VisualizePage() {
       !multiField &&
       !groupedOn &&
       (dataKind === "numeric" ||
-        (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
+        (!chartRefLive &&
+          !fieldFree &&
+          !requiresSecondField &&
+          field !== autoProbedField.current)),
   });
+
+  // A named chart's field arrives *after* mount, so it is never the field the
+  // ref was initialized with — without this, resolving the reference looks
+  // exactly like the analyst picking a new field and spends the one-shot
+  // suggestion on a chart that already has its own answer. Declared before the
+  // two suggestion effects below, which React therefore runs after it.
+  useEffect(() => {
+    if (chartRefLive && field) autoProbedField.current = field;
+  }, [chartRefLive, field]);
 
   // Scale suggestion for a virtual time field — the statically-known answer,
   // no round-trip. Must run before the numeric-probe effect below so the
   // shared `autoProbedField` ref is spent first; React runs effects in
   // declaration order.
   useEffect(() => {
+    if (chartRefLive) return;
     if (!field || !fieldIsTime || field === autoProbedField.current) return;
     // Advance the ref even when the early-return below fires: it means "this
     // field's one-shot suggestion is spent", not "we fetched something".
@@ -325,9 +500,10 @@ export function VisualizePage() {
     if (fieldFree || requiresSecondField || multiField) return;
     const scale = TIME_FIELDS[field].scale;
     updateConfig({ scale, chartType: defaultChartTypeForScale(scale, field) });
-  }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig]);
+  }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig, chartRefLive]);
 
   useEffect(() => {
+    if (chartRefLive) return;
     if (!field || field === autoProbedField.current) return;
     // Inert for time fields anyway (the query is disabled, so `data` stays
     // undefined) — stated explicitly so the intent survives a refactor.
@@ -350,6 +526,7 @@ export function VisualizePage() {
     requiresSecondField,
     multiField,
     updateConfig,
+    chartRefLive,
   ]);
 
   // Keep chartType valid when the analyst switches scale — clamped at event
@@ -378,8 +555,9 @@ export function VisualizePage() {
     [compareOn, dataKind],
   );
   useEffect(() => {
+    if (chartRefLive) return;
     if (!metricAvailable(metric)) updateConfig({ metric: "count" });
-  }, [metric, metricAvailable, updateConfig]);
+  }, [metric, metricAvailable, updateConfig, chartRefLive]);
 
   const compareTermsOn = compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({
@@ -617,9 +795,12 @@ export function VisualizePage() {
       {/* Control rail */}
       <div className="flex w-72 shrink-0 flex-col gap-4 overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-bg-surface)] p-3">
         <div>
+          {/* The resolved filters, not the raw params: under `?c_chart=<id>`
+              the URL names a chart and holds no filters at all, and the
+              Explorer has no use for `c_*` keys either way. */}
           {caseId && timelineId && (
             <Link
-              to={`/cases/${caseId}/timelines/${timelineId}?${searchParams.toString()}`}
+              to={explorerHref}
               className="flex items-center gap-1 text-xs text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
             >
               <ArrowLeft size={12} /> Back to Explorer
@@ -635,6 +816,31 @@ export function VisualizePage() {
             <Lightbulb size={12} /> Presets
           </button>
         </div>
+
+        {/* A link into a chart that is gone, or one this build cannot read.
+            Said out loud rather than left to look like a chart that was
+            always this shape — the page below is the default chart, not the
+            one the link named. */}
+        {brokenChartRef && (
+          <p role="status" className="text-xs text-[var(--color-warning)]">
+            {brokenChartRef === "unfetchable"
+              ? "That chart could not be loaded — the saved charts could not be fetched. Showing a default chart instead; reload to try again."
+              : brokenChartRef === "unreadable"
+                ? "That chart was saved with an incompatible config version and cannot be loaded."
+                : "That saved chart no longer exists."}
+          </p>
+        )}
+
+        {/* Editing a saved chart spells it into the URL, which cannot carry
+            these narrowings — so the chart on screen is now wider than the one
+            that was loaded. Said out loud, and repeated in the saved-chart rail
+            (re-saving from here would freeze the wider slice). */}
+        {droppedScope && (
+          <p role="status" className="text-xs text-[var(--color-warning)]">
+            Editing this chart dropped {droppedScope.join(" and ")} — it now covers the whole
+            timeline. Reload the saved chart to get that scope back.
+          </p>
+        )}
 
         {/* Field picker — hidden for the correlation matrix, which charts a
             list of fields instead (its own picker is below). */}
@@ -1258,7 +1464,13 @@ export function VisualizePage() {
               caseId={caseId}
               timelineId={timelineId}
               currentConfig={config}
-              onLoad={(loaded) => updateConfig(loaded)}
+              // The *resolved* filters, routine collapse included. Only this
+              // page re-derives collapse from live dispositions; the story
+              // card and the frozen export render a saved chart's stored
+              // filters verbatim, so leaving it out here is what would make
+              // those two show the uncollapsed superset of what was saved.
+              currentFilters={filters}
+              onLoad={loadSavedChart}
             />
           )}
           <ExportControls
@@ -1279,6 +1491,18 @@ export function VisualizePage() {
 
       {/* Canvas */}
       <div className="flex-1 overflow-auto p-4">
+        {/* Scope first, chart second: these filters come from the Explorer via
+            the URL, and a chart that gets exported into a report has to say
+            what it covers before it is read. */}
+        <InheritedFiltersBar
+          filters={urlFilters}
+          explorerHref={explorerHref}
+          onRemove={(key, fieldKey, value) =>
+            updateFilters(removeFilterEntry(urlFilters, key, fieldKey, value))
+          }
+          onClearAll={() => updateFilters({})}
+          onResetRange={() => updateFilters({ ...urlFilters, start: undefined, end: undefined })}
+        />
         {/* Nothing hidden silently: whenever routine dispositions shape the
             charts (or have been revealed), say so — the grid's collapsed-count
             stat, one page over. Renders only when the set is non-empty, same
@@ -1311,21 +1535,6 @@ export function VisualizePage() {
                 <Repeat size={11} /> {collapseRoutine ? "Show routine events" : "Collapse routine"}
               </button>
             </Tooltip>
-          </div>
-        )}
-        {(filters.start || filters.end) && (
-          <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-            <span>
-              Time range: {filters.start ?? "…"} → {filters.end ?? "…"}
-            </span>
-            <button
-              type="button"
-              onClick={() => updateFilters({ ...filters, start: undefined, end: undefined })}
-              className="flex items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 hover:bg-[var(--color-bg-hover)]"
-              title="Clear the start/end range (set by brush-zoom or inherited from the Explorer)"
-            >
-              <RotateCcw size={11} /> Reset range
-            </button>
           </div>
         )}
         {presetsOpen && (
@@ -1400,7 +1609,7 @@ export function VisualizePage() {
                 metric={metric}
                 hasComparison={compareOn}
                 svgRef={svgRef}
-                onRangeSelect={(start, end) => updateFilters({ ...filters, start, end })}
+                onRangeSelect={(start, end) => updateFilters({ ...urlFilters, start, end })}
               />
             )}
             {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (
@@ -1417,7 +1626,7 @@ export function VisualizePage() {
             {chartType === "pie" && termsQuery.data && (
               <>
                 {pieWarning && (
-                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-subtle)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
+                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
                     <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
                     {pieWarning}{" "}
                     <button

@@ -23,6 +23,9 @@ pytestmark = pytest.mark.clickhouse
 
 CASE_ID = f"tc-fieldmap-{uuid.uuid4().hex[:8]}"
 SRC_A, SRC_B = "src-a", "src-b"
+# Ingested *after* the mapping was saved, carrying the canonical name itself —
+# the one case validate_field_mappings cannot catch (issue #10).
+SRC_C = "src-c"
 MAPPINGS = {"ip_address": ["src_ip", "ip_addr"]}
 
 
@@ -50,11 +53,8 @@ def ch_store():
     # Constructing the store already opens a connection — keep it inside the
     # guard so an unreachable ClickHouse skips the module instead of erroring
     # every test at fixture setup.
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     events = [
         # Source A uses src_ip; one shared value (10.0.0.1) and one unique.
         _event(SRC_A, 1, {"src_ip": "10.0.0.1", "status": "200"}),
@@ -62,10 +62,12 @@ def ch_store():
         # Source B uses ip_addr for the same kind of data.
         _event(SRC_B, 3, {"ip_addr": "10.0.0.1", "proto": "tcp"}),
         _event(SRC_B, 4, {"ip_addr": "10.0.0.3", "proto": "udp"}),
+        # Source C stores the canonical name as a real key.
+        _event(SRC_C, 5, {"ip_address": "10.0.0.7", "proto": "tcp"}),
     ]
     store.insert_events(events)
     yield store
-    for sid in (SRC_A, SRC_B):
+    for sid in (SRC_A, SRC_B, SRC_C):
         store.delete_source_events(CASE_ID, sid)
 
 
@@ -78,11 +80,65 @@ def _query(**kw) -> EventQuery:
     )
 
 
+def _shadow_query(**kw) -> EventQuery:
+    return EventQuery(
+        case_id=CASE_ID,
+        source_ids=[SRC_C],
+        field_mappings=MAPPINGS,
+        **kw,
+    )
+
+
+def test_a_stored_canonical_key_filters_and_renders_the_same_value(ch_store):
+    """The mapping reads the canonical name itself first, so a source that
+    stores that key is filterable by it and shows the stored value — display
+    and filter agree here too, and the row does not claim the mapping made it."""
+    service = EventQueryService(store=ch_store)
+    page = service.query(_shadow_query(field_filters={"ip_address": ["10.0.0.7"]}))
+    assert page.total == 1
+    assert page.events[0]["attributes"]["ip_address"] == "10.0.0.7"
+    assert "mapped_fields" not in page.events[0]
+
+
 def test_filter_on_canonical_field_matches_both_sources(ch_store):
     service = EventQueryService(store=ch_store)
     page = service.query(_query(field_filters={"ip_address": ["10.0.0.1"]}))
     assert page.total == 2
     assert {e["source_id"] for e in page.events} == {SRC_A, SRC_B}
+
+
+def test_page_rows_carry_the_canonical_field_for_every_source(ch_store):
+    """The projection half of the mapping: a canonical column the picker
+    offers must render on rows from both spellings."""
+    service = EventQueryService(store=ch_store)
+    page = service.query(_query())
+    assert len(page.events) == 4
+    by_source: dict[str, set[str]] = {}
+    for event in page.events:
+        assert "ip_address" in event["attributes"], event["attributes"]
+        by_source.setdefault(event["source_id"], set()).add(event["attributes"]["ip_address"])
+    assert by_source == {SRC_A: {"10.0.0.1", "10.0.0.2"}, SRC_B: {"10.0.0.1", "10.0.0.3"}}
+
+
+def test_projected_value_agrees_with_a_filter_on_the_same_field(ch_store):
+    """Display and filter resolve the same canonical field through the same
+    coalesce rule — the one thing that must not drift."""
+    service = EventQueryService(store=ch_store)
+    filtered = service.query(_query(field_filters={"ip_address": ["10.0.0.1"]}))
+    assert {e["attributes"]["ip_address"] for e in filtered.events} == {"10.0.0.1"}
+    all_rows = service.query(_query())
+    matching = {
+        e["event_id"] for e in all_rows.events if e["attributes"].get("ip_address") == "10.0.0.1"
+    }
+    assert matching == {e["event_id"] for e in filtered.events}
+
+
+def test_export_rows_stay_raw(ch_store):
+    """Export carries what was ingested — the mapping is a query-time view."""
+    service = EventQueryService(store=ch_store)
+    rows = list(service.iter_events(_query()))
+    assert len(rows) == 4
+    assert all("ip_address" not in row["attributes"] for row in rows)
 
 
 def test_exclusion_on_canonical_field(ch_store):

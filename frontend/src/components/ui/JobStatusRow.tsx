@@ -3,10 +3,11 @@
  * jobs) and CaseJobsPanel (shared, case-scoped job visibility) — the two
  * differ in data source and lifecycle, not in how a job's status renders.
  */
+import type { ReactNode } from "react";
 import { Loader2, CheckCircle, XCircle, X } from "lucide-react";
 import type { Job } from "@/api/types";
-import { Progress } from "@/components/ui/Progress";
-import { fmtDuration } from "@/lib/time";
+import { ProgressMeter } from "@/components/ui/ProgressMeter";
+import { progressPct } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
 interface Props {
@@ -14,24 +15,29 @@ interface Props {
   status: Job["status"];
   progress: Job["progress"];
   error: string | null;
+  /** Resolved human phase copy (see `lib/jobPhases.ts`), shown after the
+   * status word. This row stays presentational — callers resolve the text. */
+  detail?: string | null;
+  /** Optional slot under the error line — e.g. a link to what a failed job left behind. */
+  footer?: ReactNode;
   onDismiss?: () => void;
   className?: string;
 }
 
-export function JobStatusRow({ label, status, progress, error, onDismiss, className }: Props) {
+export function JobStatusRow({
+  label,
+  status,
+  progress,
+  error,
+  detail,
+  footer,
+  onDismiss,
+  className,
+}: Props) {
   const isTerminal = status === "completed" || status === "failed";
-
-  const pct =
-    progress && progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : null;
-
-  const rate = progress?.rate_bps;
-  const etaS = progress?.eta_s;
-  const showEta = status === "running" && rate != null && rate > 0;
-  const etaLine = showEta
-    ? [`${(rate / 1e6).toFixed(1)} MB/s`, etaS != null ? `~${fmtDuration(etaS)} left` : null]
-        .filter(Boolean)
-        .join(" · ")
-    : null;
+  const pct = progressPct(progress?.processed, progress?.total);
+  // A finished or failed job's rate is history, not a live reading.
+  const running = status === "running";
 
   const icon =
     status === "completed" ? (
@@ -53,17 +59,25 @@ export function JobStatusRow({ label, status, progress, error, onDismiss, classN
       <div className="mt-0.5">{icon}</div>
       <div className="flex-1 min-w-0">
         <div className="truncate font-medium text-[var(--color-fg-primary)]">{label}</div>
-        <div className="text-[var(--color-fg-muted)] capitalize">
-          {status}
+        <div className="text-[var(--color-fg-muted)]">
+          {/* `capitalize` stays scoped to the status word — it would title-case
+              every word of the phase copy otherwise. */}
+          <span className="capitalize">{status}</span>
+          {detail && ` · ${detail}`}
           {pct != null && ` · ${pct}%`}
         </div>
-        {pct != null && status !== "failed" && <Progress value={pct} className="mt-1.5" />}
-        {etaLine && (
-          <div className="mt-1 font-mono text-[10px] text-[var(--color-fg-muted)] tabular-nums">
-            {etaLine}
-          </div>
-        )}
+        <ProgressMeter
+          processed={progress?.processed}
+          total={progress?.total}
+          rate_bps={running ? progress?.rate_bps : null}
+          eta_s={running ? progress?.eta_s : null}
+          // A running job always shows a moving bar, even mid-phase before that
+          // phase knows how many items it covers.
+          indeterminate={running}
+          barHidden={status === "failed"}
+        />
         {error && <div className="mt-1 text-[var(--color-danger)] line-clamp-2 break-all">{error}</div>}
+        {footer}
       </div>
       {isTerminal && onDismiss && (
         <button

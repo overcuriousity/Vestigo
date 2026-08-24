@@ -4,12 +4,21 @@
  * Fetches the timeline's field list from /fields (top-level + dynamic
  * attributes) and renders a searchable checkbox list.  Selection is persisted
  * to the UI store (localStorage) via setVisibleColumns.
+ *
+ * Columns the backend suggested for this timeline (issue #213) are marked, and
+ * carry the evidence behind the suggestion in a tooltip — a default an analyst
+ * cannot interrogate is a default they have to take on faith.  The footer is
+ * where the suggestion is recomputed, locally or — after the disclosure in
+ * `ColumnAdvisorNotice` — with the configured model.
  */
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search } from "lucide-react";
+import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search, Sparkles } from "lucide-react";
 import { eventsApi } from "@/api/events";
+import { useCapabilities } from "@/api/health";
+import { useColumnRecommendation } from "@/hooks/useColumnRecommendation";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { ColumnAdvisorNotice } from "@/components/explorer/ColumnAdvisorNotice";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -19,12 +28,27 @@ import {
   PopoverContent,
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
+import {
+  hasColumnAdvisorOptIn,
+  hasSuggestion,
+  isSuggesting,
+  resolveVisibleColumns,
+  suggestedColumns,
+} from "@/lib/columns";
 import { splitDerivedKey } from "@/lib/enrichment";
+import type { RecommendedColumns } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
+  /** The timeline's stored suggestion, or null/undefined when it has none. */
+  recommended?: RecommendedColumns | null;
+  /** Whether this analyst may recompute the shared suggestion. */
+  canRecommend?: boolean;
 }
+
+/** How long the Columns button announces itself after a timeline is opened. */
+const FLASH_DURATION_MS = 10_000;
 
 /** Human-readable labels for the built-in top-level columns. */
 const TOP_LEVEL_LABELS: Record<string, string> = {
@@ -42,11 +66,14 @@ function ColumnRow({
   label,
   checked,
   onChange,
+  suggestedReason,
 }: {
   id: string;
   label: string;
   checked: boolean;
   onChange: (id: string, checked: boolean) => void;
+  /** Present when this column is part of the timeline's suggestion. */
+  suggestedReason?: string;
 }) {
   return (
     <label
@@ -64,6 +91,17 @@ function ColumnRow({
       <span className={cn("flex-1 truncate", checked && "text-[var(--color-fg-primary)]")}>
         {label}
       </span>
+      {suggestedReason !== undefined && (
+        <span
+          title={suggestedReason ? `Suggested — ${suggestedReason}` : "Suggested"}
+          aria-label={
+            suggestedReason ? `Suggested column: ${suggestedReason}` : "Suggested column"
+          }
+          className="shrink-0 text-[var(--color-accent)]"
+        >
+          <Sparkles size={11} />
+        </span>
+      )}
     </label>
   );
 }
@@ -110,12 +148,51 @@ function DerivedGroup({
   );
 }
 
-export function ColumnPicker({ caseId, timelineId }: Props) {
+export function ColumnPicker({ caseId, timelineId, recommended, canRecommend }: Props) {
   const [search, setSearch] = useState("");
   const tlKey = `${caseId}/${timelineId}`;
-  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const storedColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey]);
   const setVisibleColumnsStore = useUiStore((s) => s.setVisibleColumns);
   const setVisibleColumns = (cols: string[]) => setVisibleColumnsStore(tlKey, cols);
+  const suggestion = useMemo(() => suggestedColumns(recommended), [recommended]);
+  // Through the shared resolver, not a local copy of the same three-way
+  // precedence — the ticks here must match what the grid is rendering.
+  const visibleColumns = useMemo(
+    () => resolveVisibleColumns(storedColumns, recommended),
+    [storedColumns, recommended],
+  );
+  const suggestedReasons = hasSuggestion(recommended) ? recommended.reasons : {};
+  const suggestedSet = useMemo(() => new Set(suggestion ?? []), [suggestion]);
+
+  // This button governs what the whole grid shows, and it is the one control
+  // an analyst who has never opened it does not know is there — it sits in a
+  // row of same-shaped buttons and says nothing about itself. So it announces
+  // itself for a few seconds whenever a timeline is opened, and stops the
+  // moment it is used: the pulse means "you have not looked in here", and
+  // continuing after someone has is just noise. Unconditional, deliberately —
+  // gating it on whether a suggestion exists would hide it exactly on the
+  // corpora whose columns need the most attention.
+  const [flashing, setFlashing] = useState(true);
+  useEffect(() => {
+    setFlashing(true);
+    const timer = setTimeout(() => setFlashing(false), FLASH_DURATION_MS);
+    return () => clearTimeout(timer);
+  }, [timelineId]);
+
+  const agentAvailable = useCapabilities().agent;
+  const [noticeOpen, setNoticeOpen] = useState(false);
+  // Shared with the Explorer's one-time offer (`useColumnRecommendation`), so
+  // the two surfaces record the same consent and start the same job. Every run
+  // it starts also clears this browser's column override — the analyst asked
+  // for the new answer, so it has to be allowed to reach them.
+  const advisor = useColumnRecommendation(caseId, timelineId);
+  const optedIn = hasColumnAdvisorOptIn(advisor.preferences, timelineId);
+
+  useEffect(() => {
+    if (advisor.optInAndRecommend.isSuccess) setNoticeOpen(false);
+  }, [advisor.optInAndRecommend.isSuccess]);
+
+  const recommendRunning = advisor.pending || isSuggesting(recommended);
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],
@@ -193,9 +270,14 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
   const activeCount = visibleColumns.filter((c) => c !== "_select" && c !== "_expand").length;
 
   return (
-    <Popover>
+    <Popover onOpenChange={(open) => open && setFlashing(false)}>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm" data-tour="column-picker">
+        <Button
+          variant="outline"
+          size="sm"
+          data-tour="column-picker"
+          className={cn(flashing && "attention-pulse")}
+        >
           <Columns3 size={13} />
           Columns
           {activeCount > 0 && (
@@ -243,6 +325,9 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                       label={c.label}
                       checked={visibleSet.has(c.id)}
                       onChange={toggle}
+                      suggestedReason={
+                        suggestedSet.has(c.id) ? (suggestedReasons[c.id] ?? "") : undefined
+                      }
                     />
                   ))}
                 </div>
@@ -260,6 +345,9 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                         label={id}
                         checked={visibleSet.has(id)}
                         onChange={toggle}
+                        suggestedReason={
+                          suggestedSet.has(id) ? (suggestedReasons[id] ?? "") : undefined
+                        }
                       />
                       {children.length > 0 && (
                         <DerivedGroup
@@ -303,16 +391,66 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
           )}
         </div>
 
-        {/* Reset footer */}
-        <div className="border-t border-[var(--color-border)] p-2">
+        {/* Reset / suggestion footer */}
+        <div className="flex flex-wrap items-center gap-1 border-t border-[var(--color-border)] p-2">
           <button
             className="flex items-center gap-1.5 text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-base"
-            onClick={() => setVisibleColumns(DEFAULT_COLUMNS)}
+            // Clears this browser's override rather than writing one. That is
+            // what lets the timeline's suggestion — including a later
+            // recomputation — reach this analyst again; writing
+            // DEFAULT_COLUMNS here would quietly opt them out of it forever.
+            onClick={() => setVisibleColumnsStore(tlKey, undefined)}
+            disabled={!storedColumns}
+            title={
+              suggestion
+                ? "Show the columns suggested for this timeline"
+                : "Show the built-in default columns"
+            }
           >
-            <RotateCcw size={10} /> Reset to defaults
+            {/* Named for what it actually restores. With a suggestion stored,
+                "defaults" is the suggestion, and a label saying otherwise
+                describes a different button than the one that is there. */}
+            <RotateCcw size={10} /> {suggestion ? "Reset to suggested" : "Reset to defaults"}
           </button>
+          {canRecommend && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => advisor.recommend(false)}
+              disabled={recommendRunning || advisor.optInPending}
+            >
+              {recommendRunning ? <Spinner size={11} /> : <RotateCcw size={11} />}
+              {recommendRunning ? "Suggesting…" : "Re-suggest columns"}
+            </Button>
+          )}
+          {canRecommend && agentAvailable && (
+            <Button
+              variant="ghost"
+              size="sm"
+              // Opted in on this timeline already: no dialog, the analyst has
+              // read what it sends — which also makes the footer the only
+              // place a failure can be reported. Otherwise the disclosure comes
+              // first and nothing is sent until they confirm it.
+              onClick={() => (optedIn ? advisor.recommend(true) : setNoticeOpen(true))}
+              disabled={recommendRunning || advisor.optInPending}
+            >
+              <Sparkles size={11} /> Suggest with AI
+            </Button>
+          )}
+          {advisor.footerError && (
+            <p role="status" className="w-full text-xs text-[var(--color-danger)]">
+              Could not start the suggestion — the columns on screen are unchanged. Try again.
+            </p>
+          )}
         </div>
       </PopoverContent>
+      <ColumnAdvisorNotice
+        open={noticeOpen}
+        onOpenChange={setNoticeOpen}
+        onConfirm={() => advisor.optInAndRecommend.mutate()}
+        pending={advisor.optInPending}
+        error={advisor.optInError}
+      />
     </Popover>
   );
 }

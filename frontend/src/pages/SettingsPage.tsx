@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/Input";
 import { usePasswordChangeForm } from "@/hooks/usePasswordChangeForm";
 import { useAuthStore } from "@/stores/auth";
 import { useTourStore } from "@/stores/tour";
+import { useUiStore } from "@/stores/ui";
 import { useInvalidateCurrentUser } from "@/hooks/useCurrentUser";
 
 export function SettingsPage() {
@@ -16,6 +17,7 @@ export function SettingsPage() {
   const setUser = useAuthStore((s) => s.setUser);
   const invalidate = useInvalidateCurrentUser();
   const navigate = useNavigate();
+  const resetGuidance = useUiStore((s) => s.resetGuidance);
   const [auditError, setAuditError] = useState<string | null>(null);
 
   const [username, setUsername] = useState(user?.username ?? "");
@@ -196,6 +198,19 @@ export function SettingsPage() {
           >
             <Compass size={14} />
             {restartTour.isPending ? "Restarting…" : "Restart onboarding tour"}
+          </Button>
+
+          {/* Guidance panels are the in-page counterpart to the tour: the tour
+              walks the workflow once, these explain the surface you are on.
+              Both belong to the same "show me the explanations again" intent, so
+              they share a section rather than getting one each. */}
+          <p className="mt-5 mb-4 text-sm text-[var(--color-fg-muted)]">
+            Bring back the guidance panels you've folded away — the short explainers at
+            the top of the Cases, case overview and Investigate views. This browser only.
+          </p>
+          <Button variant="outline" size="sm" onClick={() => resetGuidance()}>
+            <Compass size={14} />
+            Show guidance again
           </Button>
         </section>
 

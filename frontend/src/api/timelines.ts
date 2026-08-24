@@ -47,6 +47,35 @@ export const timelinesApi = {
       },
     ).then((r) => r.timeline),
 
+  /**
+   * Replace the analysis methods muted for this timeline (empty clears them).
+   *
+   * Shared state, not a browser preference: the next analyst on the case
+   * inherits the mute, and every change lands in the audit trail.
+   */
+  patchMutedMethods: (caseId: string, timelineId: string, mutedMethods: string[]) =>
+    patch<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/muted-methods`,
+      { muted_methods: mutedMethods },
+    ).then((r) => r.timeline),
+
+  /**
+   * Replace the per-method field declarations for this timeline.
+   *
+   * `{method_id: {field_token: boolean}}` — true pins a field into a detector's
+   * automatic selection, false takes it out. Shared state like the mute list:
+   * the next analyst inherits it and every change is audited.
+   */
+  patchFieldOverrides: (
+    caseId: string,
+    timelineId: string,
+    fieldOverrides: Record<string, Record<string, boolean>>,
+  ) =>
+    patch<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/field-overrides`,
+      { field_overrides: fieldOverrides },
+    ).then((r) => r.timeline),
+
   /** Per-raw-field coverage across sources, for the wizard's aggregation step. */
   fieldCoverage: (caseId: string, sourceIds: string[]) =>
     get<FieldCoverageResponse>(
@@ -69,6 +98,21 @@ export const timelinesApi = {
   removeSource: (caseId: string, timelineId: string, sourceId: string) =>
     del<{ removed: boolean }>(
       `/cases/${caseId}/timelines/${timelineId}/sources/${sourceId}`,
+    ),
+
+  /**
+   * Re-derive the timeline's suggested grid columns (issue #213).
+   *
+   * `useAi` is the analyst's per-timeline opt-in to the LLM reranker, which
+   * sends candidate field names and sample values to the configured model
+   * endpoint; without it the scoring is local and nothing leaves the machine.
+   * `job_id` is null when a recommendation is already running for this
+   * timeline.
+   */
+  recommendColumns: (caseId: string, timelineId: string, useAi = false) =>
+    post<{ job_id: string | null; use_ai: boolean }>(
+      `/cases/${caseId}/timelines/${timelineId}/recommend-columns`,
+      { use_ai: useAi },
     ),
 
   /** Fetch per-artifact field recommendations for the timeline's embedding wizard. */

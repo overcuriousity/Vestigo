@@ -1,0 +1,12 @@
+Jan  5 10:00:01 web01 sshd[4242]: Accepted publickey for alice from 10.0.0.5 port 51234 ssh2
+Jan  5 10:00:02 web01 sshd[4242]: pam_unix(sshd:session): session opened for user alice by (uid=0)
+Jan  5 10:00:07 web01 sudo[4301]: alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/bin/systemctl restart nginx
+Jan  5 10:00:09 web01 systemd[1]: Stopping A high performance web server and a reverse proxy server...
+Jan  5 10:00:09 web01 systemd[1]: Started A high performance web server and a reverse proxy server.
+Jan  5 10:01:15 web01 sshd[4400]: Failed password for invalid user admin from 203.0.113.9 port 40022 ssh2
+Jan  5 10:01:17 web01 sshd[4400]: Failed password for invalid user admin from 203.0.113.9 port 40022 ssh2
+Jan  5 10:01:19 web01 sshd[4400]: Connection closed by invalid user admin 203.0.113.9 port 40022 [preauth]
+this line has no timestamp and should be kept as unparsed
+Jan  5 10:02:00 web01 cron[4500]: (root) CMD (/usr/local/bin/backup.sh)
+Jan  5 10:02:44 web01 sshd[4242]: Received disconnect from 10.0.0.5 port 51234:11: disconnected by user
+Jan  5 10:02:44 web01 sshd[4242]: pam_unix(sshd:session): session closed for user alice

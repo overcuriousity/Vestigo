@@ -1,6 +1,25 @@
-"""Application configuration loaded from environment variables."""
+"""Application configuration: environment variables plus DB-backed overrides.
 
+Two layers, resolved per field. The environment (``VESTIGO_*``, optionally via
+``.env``) is the deploy-time layer; the ``app_settings`` table is the runtime
+layer an admin edits from the web console without a restart. **Environment
+always wins**: a field the operator pinned in the environment ignores any
+stored override, so a locked-down deployment stays locked down.
+
+:func:`get_settings` returns the merged view and is what the whole application
+calls. The merge is cheap (a cached ``model_copy``) and synchronous, because
+the DB layer is not read here — it is loaded once at startup and re-applied
+whenever an admin saves (:func:`set_runtime_overrides`, driven by
+``core/runtime_settings.py``). Overrides are process-local, matching the
+single-process deployment model that ``core/jobs.py`` already assumes.
+
+Which fields may be overridden, and how they are presented, is declared in
+``core/settings_registry.py`` — not here.
+"""
+
+from collections.abc import Mapping
 from functools import lru_cache
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,6 +38,16 @@ class Settings(BaseSettings):
     environment: str = "development"
     log_level: str = "INFO"
     allow_online: bool = False
+
+    # Where secrets edited in the admin console may live. "db" (default):
+    # admins may store passwords/API keys in the app_settings table (plaintext
+    # at rest — acceptable only if Postgres itself is trusted). "env-only":
+    # the settings API refuses to store any secret and the resolver ignores
+    # previously stored ones, leaving the environment as the only source.
+    # Deliberately env-only itself: a mode meant to constrain the console must
+    # not be editable from it. Its agent-scoped predecessor
+    # (`agent_secret_mode`) still applies to the LLM key on its own page.
+    secrets_mode: str = Field(default="db", pattern="^(db|env-only)$")
 
     # Login backoff: after `threshold` consecutive failures per
     # (username, client IP), attempts are rejected with 429 for
@@ -140,6 +169,35 @@ class Settings(BaseSettings):
     # Only the top-K merged candidates by support get the second cadence
     # pass — bounds the PARTITION BY gram window sort (can't spill).
     stat_motif_cadence_top_k: int = 500
+    # ── Analysis gate ────────────────────────────────────────────────────────
+    # Structural preconditions deciding which methods the Investigate rail
+    # offers up front (db/analysis_plan.py). A method is gated off only when it
+    # *cannot* produce a finding on the data — never when it is merely unlikely
+    # to — and a gated method is always still runnable on request. Raising any
+    # of these therefore costs coverage of the "offered automatically" set, not
+    # reachability.
+    #
+    # Share of a field's sampled values that must parse as a number before the
+    # numeric-range band has anything to learn.
+    analysis_gate_min_numeric_ratio: float = Field(default=0.9, gt=0, le=1)
+    # A field with at most this many distinct values is enum-like: its learned
+    # alphabet is the union of a handful of literals and every value is drawn
+    # from it, so charset novelty cannot fire. Entropy is deliberately not
+    # gated on this — its band is a comparison, and one enum literal can sit
+    # far outside it.
+    analysis_gate_max_enum_distinct: int = Field(default=5, ge=1)
+    # Distinct series values needed before two n-grams can differ at all. One
+    # value yields a single repeated n-gram; two already yield 2**n.
+    analysis_gate_min_series_distinct: int = Field(default=2, ge=2)
+    # Seconds of span a timeline must cover before frequency bucketing is
+    # meaningful — below this the buckets it splits into (stat_frequency_buckets)
+    # are narrower than a second and collapse into each other.
+    analysis_gate_min_frequency_buckets: int = Field(default=12, ge=2)
+    # Repeats a series value needs before an inter-arrival cadence can be fitted.
+    analysis_gate_min_interval_periods: int = Field(default=3, ge=2)
+    # Cached method results retained per case, least-recently-computed evicted
+    # first. Every row is derived data: eviction costs a rescan and nothing else.
+    analysis_cache_max_rows_per_case: int = Field(default=500, ge=1)
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.
@@ -165,6 +223,24 @@ class Settings(BaseSettings):
     # stack past the ClickHouse host's RAM — observed as a kernel OOM-kill
     # of clickhouse-server, not a clean query error.
     stat_scan_concurrency: int = Field(default=2, ge=1)
+    # Write-side guardrail for the enrichment partition rewrite
+    # (db/clickhouse.py::finalize_enrichment_apply). The stat_scan_* settings
+    # above bound a *scan*; the rewrite also INSERTs a full copy of the
+    # source's partition, which is the query shape that OOM-killed a 32 GiB
+    # full-docker host (session-56 incident). ClickHouse's own
+    # max_insert_threads is deliberately left alone: its default (0) means a
+    # single-threaded INSERT SELECT, and raising it would give every thread
+    # its own squashing buffer — more write-side memory on exactly the query
+    # we are trying to bound, to speed up a path that runs once per source at
+    # job end and is never latency-critical.
+    #
+    # min_insert_block_size_bytes is a squash *floor*, not a cap on in-flight
+    # block size: rows are accumulated until a block reaches at least this many
+    # bytes before a part is written. Lowering it trades more (smaller) parts
+    # and more background merge work for less insert-time memory. 64 MiB sits
+    # deliberately under ClickHouse's own 256 MiB default — this path buys
+    # headroom with throughput.
+    enrichment_apply_insert_block_bytes: int = Field(default=67_108_864, ge=1_048_576)
     # Max entries in the process-local baseline-compare layer cache
     # (db/viz_cache.py, M24c) — memoizes the unfiltered baseline layer of
     # Visualize compare renders so it isn't a full-timeline re-scan on every
@@ -197,6 +273,10 @@ class Settings(BaseSettings):
     # forced on an existing directory; startup fails only if the path is owned
     # by another user or is not a real directory. Size it for the largest case
     # exported, not for the average one.
+    # Master switch for case export/import. Off hides the feature entirely
+    # (no buttons in the UI, 503 from the router) — for deployments where a
+    # whole-case archive leaving the box is a policy problem, not a feature.
+    transfer_enabled: bool = True
     transfer_temp_path: str = "data/transfer"
     # Ceiling on an imported archive's total *uncompressed* size; 0 disables.
     # Events and blobs travel ZIP_STORED, so a legitimate archive expands by
@@ -216,6 +296,19 @@ class Settings(BaseSettings):
     # small — this is admission control, not a throughput knob.
     transfer_max_concurrent: int = Field(default=2, ge=0)
 
+    # Seeds a fabricated demo case into each user's case list the first time
+    # they log in (once per user, ever — deleting it is final unless they
+    # restore it explicitly). Off for deployments where fabricated data in a
+    # case list is a policy problem.
+    demo_case_enabled: bool = True
+    # Concurrent demo-case builds across the instance; 0 disables the cap.
+    # Generating and ingesting a quarter of a million events is CPU-bound
+    # Python, so it holds the GIL and every concurrent build contends with the
+    # API's own event loop. One at a time keeps a post-upgrade burst of first
+    # logins from making the whole instance feel slow; raise it on a box with
+    # cores to spare.
+    demo_max_concurrent: int = Field(default=1, ge=0)
+
     # Sigma rule runner (docs/ANOMALY_DETECTION.md §13). Global ruleset
     # directory scanned for *.yml/*.yaml at run time — an offline file drop
     # (e.g. a vendored SigmaHQ clone); empty string disables the global set.
@@ -225,6 +318,20 @@ class Settings(BaseSettings):
     # persists hits. Hits stream from ClickHouse in blocks, so this bounds
     # both write-transaction size and peak memory for match-everything rules.
     sigma_annotation_batch_size: int = Field(default=5_000, ge=100, le=50_000)
+
+    # Stories (docs/STORIES.md). An export freezes every block server-side and
+    # then stores the client-rendered standalone HTML artifact, so both the
+    # work and the stored bytes need a ceiling. The block cap bounds how much
+    # querying one export request can trigger (resolution is synchronous); the
+    # snapshot cap bounds the JSON column; the artifact cap bounds the uploaded
+    # HTML, which inlines the stylesheet and every frozen row.
+    story_export_max_blocks: int = Field(default=500, ge=1)
+    story_export_max_snapshot_bytes: int = Field(default=64 * 1024**2, ge=0)
+    story_max_artifact_bytes: int = Field(default=20 * 1024**2, ge=0)
+    # Ceiling on one markdown block's text. Generous for report prose; the
+    # point is that a block is embedded verbatim into every later snapshot,
+    # so an unbounded one multiplies across exports.
+    story_max_markdown_bytes: int = Field(default=256 * 1024, ge=1024)
 
     # Enrichers: where admin-uploaded enricher assets (e.g. the MaxMind
     # GeoLite2 database) are stored.
@@ -317,8 +424,82 @@ class Settings(BaseSettings):
     # MCP needs no LLM endpoint).
     mcp_enabled: bool = False
 
+    # ── Generated converters (docs/INPUT_FORMATS.md §"Generated converters") ──
+    # Off by default: enabling it lets LLM-authored Python run in a guarded
+    # subprocess on this host. Needs a configured, reachable agent endpoint too.
+    converter_generation_enabled: bool = False
+    # Generation + repair rounds on the sample before giving up.
+    converter_max_attempts: int = Field(default=4, ge=1, le=10)
+    # Bytes of the raw file sent to the model (head/middle/tail excerpt).
+    converter_sample_bytes: int = Field(default=65536, ge=4096, le=1048576)
+    # Wall clock for the full-file conversion run; the sample run gets min(60, this).
+    converter_run_timeout_seconds: int = Field(default=600, ge=30, le=7200)
+    # RLIMIT_AS for the converter subprocess. Floor measured 2026-08-17: pyarrow
+    # imports at 2048 MB and fails at 1024 (OpenBLAS refuses to allocate).
+    converter_run_memory_mb: int = Field(default=2048, ge=2048, le=65536)
+    # RLIMIT_FSIZE for the subprocess: the produced Parquet cannot grow past this.
+    converter_run_output_mb: int = Field(default=4096, ge=64, le=1048576)
+
 
 @lru_cache
-def get_settings() -> Settings:
-    """Return cached application settings."""
+def get_base_settings() -> Settings:
+    """Return the environment/default layer alone, with no DB overrides applied.
+
+    This is what tells "the operator set VESTIGO_X" apart from "the field
+    carries its own default": pydantic-settings only records a field in
+    ``model_fields_set`` when something actually supplied it. Applying
+    overrides on top would pollute that set, so env-pin checks must always ask
+    this object, never the merged one.
+    """
     return Settings()
+
+
+#: DB-backed overrides for fields the environment did not pin. Process-local
+#: and replaced wholesale by :func:`set_runtime_overrides`.
+_overrides: dict[str, Any] = {}
+_effective: Settings | None = None
+
+
+def env_pinned(field: str) -> bool:
+    """Whether the environment explicitly supplied this field."""
+    return field in get_base_settings().model_fields_set
+
+
+def get_settings() -> Settings:
+    """Return the effective settings: environment first, then DB overrides."""
+    global _effective
+    if _effective is None:
+        base = get_base_settings()
+        applicable = {k: v for k, v in _overrides.items() if not env_pinned(k)}
+        _effective = base.model_copy(update=applicable) if applicable else base
+    return _effective
+
+
+def set_runtime_overrides(values: Mapping[str, Any]) -> None:
+    """Replace the DB-backed override layer and invalidate the merged view.
+
+    Values are expected to have been validated already (the settings API
+    validates a full candidate ``Settings`` before persisting) — ``model_copy``
+    does not re-run validators.
+    """
+    global _overrides, _effective
+    _overrides = dict(values)
+    _effective = None
+
+
+def runtime_overrides() -> dict[str, Any]:
+    """The currently applied DB-backed override layer (read-only copy)."""
+    return dict(_overrides)
+
+
+def _clear_settings_cache() -> None:
+    """Drop both layers. Used by tests that mutate the environment."""
+    global _overrides, _effective
+    get_base_settings.cache_clear()
+    _overrides = {}
+    _effective = None
+
+
+# Preserved so the many `get_settings.cache_clear()` calls in the test suite
+# keep working now that get_settings is a merge rather than an lru_cache.
+get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]

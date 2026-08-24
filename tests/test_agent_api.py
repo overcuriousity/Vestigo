@@ -12,6 +12,7 @@ import asyncio
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tests.conftest import as_admin, login
 from vestigo.agent import availability
@@ -159,7 +160,8 @@ async def test_probe_bearer_header_only_for_kimi(store, monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer sk-secret"
 
 
-def test_health_reports_agent_available(client):
+def test_health_reports_agent_available(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
     resp = client.get("/api/health")
     assert resp.status_code == 200
     assert resp.json()["agent_available"] is False
@@ -2373,3 +2375,339 @@ def test_interrupted_turn_still_persists_window_row(
     assert len(rows) == 1
     assert rows[0].tool_result["reason"] == "fit"
     assert rows[0].tool_result["results_elided"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Proposals: story_block kind (W7 agent parity)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_story_block_proposal(store, case_id, timeline_id, user_id, payload):
+    await store.create_story(case_id, "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation(case_id, timeline_id, user_id, model_id="m")
+    proposal = await store.create_agent_proposal(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        conversation_id=conv.id,
+        rationale="drafted summary",
+        kind="story_block",
+        payload=payload,
+    )
+    return conv, proposal
+
+
+def test_confirm_story_block_creates_agent_block(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "## drafted by agent"},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True
+    assert body["block"]["origin"] == "agent"
+    assert body["block"]["content"] == {"text": "## drafted by agent"}
+
+    # Idempotency backbone holds for the new kind.
+    again = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert again.status_code == 409
+
+    blocks = asyncio.run(store.list_story_blocks("s1"))
+    assert len(blocks) == 1 and blocks[0].origin == "agent"
+
+    audit_rows = asyncio.run(store.query_audit(case_id=case_id))
+    assert any(a.action == "agent.story_block_confirm" for a in audit_rows)
+
+
+def test_confirm_story_block_inline_chart_creates_saved_chart(
+    client, admin_bootstrap, agent_on, store
+):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "chart_ref",
+                "content": {
+                    "chart_spec": {"v": 1, "chart_type": "bar", "field": "port"},
+                    "name": "Top ports",
+                },
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True
+    chart_id = body["block"]["content"]["chart_id"]
+
+    chart = asyncio.run(store.get_saved_chart(case_id, timeline_id, chart_id))
+    assert chart is not None
+    assert chart.name == "Top ports"
+    # SavedChart.config is the frontend's versioned camelCase ChartConfig, not
+    # the agent's snake_case ChartSpec. Storing the spec dump produced a chart
+    # that every consumer refused to draw, with no error at write time.
+    assert chart.config["v"] == 1
+    assert chart.config["chartType"] == "bar"
+    assert chart.config["field"] == "port"
+    # And it must survive the trip back into an executable spec.
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    assert _stored_chart_to_spec(chart.config).chart_type == "bar"
+
+
+def test_confirm_story_block_story_deleted(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "x"},
+                "after_block_id": None,
+            },
+        )
+    )
+    asyncio.run(store.delete_story(case_id, "s1"))
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "deleted" in body["reason"]
+    assert body["proposal"]["status"] == "confirmed"
+
+
+def test_confirm_story_block_legacy_spec_keeps_its_base_filters(
+    client, admin_bootstrap, agent_on, store
+):
+    """A confirmed chart proposal is saved as the slice it was proposed over.
+
+    Proposals now carry ``chart_config`` from propose time; ones written
+    before that fall back to converting the spec at confirm. Either way the
+    spec's ``filters`` have to reach the stored config, or the block redraws
+    over the whole timeline and shows what the agent had filtered out.
+    """
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "chart_ref",
+                "content": {
+                    "chart_spec": {
+                        "v": 1,
+                        "chart_type": "bar",
+                        "field": "port",
+                        "filters": {"q": "ssh"},
+                    },
+                    "name": "Top ports",
+                },
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True, body
+
+    blocks = asyncio.run(store.list_story_blocks("s1"))
+    assert len(blocks) == 1
+    chart = asyncio.run(store.get_saved_chart(case_id, timeline_id, blocks[0].content["chart_id"]))
+    assert chart is not None
+    assert chart.config["filters"] == {"q": "ssh"}
+
+
+def test_confirm_story_block_rechecks_referent_scope(client, admin_bootstrap, agent_on, store):
+    """A referent deleted between propose and confirm is reported, not embedded."""
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "view_ref",
+                "content": {"view_id": "gone", "timeline_id": timeline_id},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "not in this case" in body["reason"]
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+
+def test_reject_story_block_writes_nothing(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "x"},
+                "after_block_id": None,
+            },
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/reject"
+    )
+    assert resp.status_code == 200, resp.text
+    assert asyncio.run(store.list_story_blocks("s1")) == []
+
+    audit_rows = asyncio.run(store.query_audit(case_id=case_id))
+    assert any(a.action == "agent.story_block_reject" for a in audit_rows)
+
+
+@pytest.mark.asyncio
+async def test_user_message_persists_view_filters(store, monkeypatch):
+    """The Explorer filter snapshot sent with a message lands on its row (#205).
+
+    The agent already receives ``view_filters`` per turn for prompt context;
+    persisting it makes the transcript self-describing about what the agent
+    saw per turn, so a mid-investigation filter change is visible in the
+    record instead of silently shifting the agent's ground.
+    """
+    from vestigo.api.routers import agent as agent_router
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    _reserve_turn(agent_router, conversation.id)
+
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None, **kwargs):
+        yield {"type": "text_delta", "text": "ok"}
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    # Measuring the advertised tool schemas builds the query service, which
+    # needs a live ClickHouse; irrelevant to what this test asserts.
+    monkeypatch.setattr(agent_router, "schema_chars_for_scope", lambda scope: 0)
+
+    payload = agent_router.SendMessageRequest(
+        content="look into this", view_filters={"q": "ssh", "tagsInclude": ["auth"]}
+    )
+    async for _ in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    messages = await store.list_agent_messages(conversation.id)
+    user_rows = [m for m in messages if m.role == "user"]
+    assert len(user_rows) == 1
+    assert user_rows[0].view_filters == {"q": "ssh", "tagsInclude": ["auth"]}
+    assert user_rows[0].to_dict()["view_filters"] == {"q": "ssh", "tagsInclude": ["auth"]}
+
+
+@pytest.mark.asyncio
+async def test_user_message_view_filters_defaults_to_none(store, monkeypatch):
+    """A message sent without a snapshot stores NULL, not a fabricated filter set."""
+    from vestigo.api.routers import agent as agent_router
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    _reserve_turn(agent_router, conversation.id)
+
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None, **kwargs):
+        yield {"type": "text_delta", "text": "ok"}
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+    # See above: stub the ClickHouse-dependent tool-schema measurement.
+    monkeypatch.setattr(agent_router, "schema_chars_for_scope", lambda scope: 0)
+
+    payload = agent_router.SendMessageRequest(content="look into this")
+    async for _ in agent_router._message_stream(case.id, conversation, payload, user):
+        pass
+
+    user_row = (await store.list_agent_messages(conversation.id))[0]
+    assert user_row.role == "user"
+    assert user_row.view_filters is None
+
+
+def test_view_filters_snapshot_is_size_bounded():
+    """The snapshot is persisted per user message, so it is bounded like
+    `content` is — an unbounded client dict could grow the transcript at will.
+    The shape stays free-form (the frontend's EventFilters keeps evolving)."""
+    from vestigo.api.routers import agent as agent_router
+
+    realistic = {"q": "ssh", "tagsInclude": ["auth"], "filters": {"attr:host": "web-01"}}
+    assert (
+        agent_router.SendMessageRequest(content="hi", view_filters=realistic).view_filters
+        == realistic
+    )
+
+    oversize = {"filters": {f"attr:k{i}": "x" * 64 for i in range(1000)}}
+    with pytest.raises(ValidationError, match="too large"):
+        agent_router.SendMessageRequest(content="hi", view_filters=oversize)

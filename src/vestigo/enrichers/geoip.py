@@ -3,7 +3,7 @@
 Availability requires an admin-uploaded ``.mmdb`` database file (see
 ``api/routers/admin.py``'s upload endpoint). Since arbitrary ingested data has
 no canonical "ip" field name, this enricher scans every attribute value that
-matches the IPv4 pattern rather than a single hardcoded field — the job loop
+matches the IP pattern rather than a single hardcoded field — the job loop
 (``enrichers/jobs.py``) is responsible for pairing each match back to the
 source attribute key it came from.
 """
@@ -32,14 +32,30 @@ from vestigo.ingestion.files import hash_file
 
 logger = logging.getLogger(__name__)
 
-# IPv4 only for v1; IPv6 support is a documented follow-up.
-#
 # This is the *eligibility pattern*, not a validator: it is pushed into
 # ClickHouse match() by check_eligibility and reused as the cheap per-value
 # gate in is_field_eligible, so it must stay a ClickHouse-compatible re2
 # regex. Correctness validation happens via stdlib ipaddress in enrich_value.
-IPV4_REGEX = (
-    r"^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$"
+# The IPv6 arms are deliberately loose (re2 has no lookarounds/backrefs); they
+# cover full/compressed forms and IPv4-mapped tails like ::ffff:1.2.3.4.
+# They must NOT collide with the colon-separated non-addresses that show up all
+# over forensic data: a MAC address (00:1a:2b:3c:4d:5e) and a bare time-of-day
+# (13:45:02) would both match a plain "2..7 colon-separated hex groups" arm, and
+# check_eligibility runs in ClickHouse — a pcap/DHCP/ARP timeline would be
+# reported eligible and auto-run a full scan that yields nothing. So the
+# uncompressed arm requires the full eight groups and the compressed arm
+# requires a literal "::".
+#
+# Note: this pattern is an input to config_hash() — changing it (as the IPv6
+# widening did) gives already-enriched sources a new hash, so they are
+# offered re-enrichment.
+IP_REGEX = (
+    r"^(?:(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])"
+    r"|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
+    r"|(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::"
+    r"(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?"
+    r"|(?:[0-9a-fA-F]{0,4}:){1,6}(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}"
+    r"(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9]))$"
 )
 
 # Single source for the output-field names: the `output_fields` contract tuple
@@ -87,7 +103,7 @@ class GeoIPEnricher(Enricher):
         "Resolves IP address attribute values to country and city using a "
         "locally uploaded MaxMind GeoLite2 City database."
     )
-    eligibility_regex = IPV4_REGEX
+    eligibility_regex = IP_REGEX
     output_fields = (_FIELD_COUNTRY, _FIELD_CITY, _FIELD_COUNTRY_CODE)
     asset_spec = AssetSpec(
         name="GeoLite2 City database",
@@ -292,18 +308,26 @@ class GeoIPEnricher(Enricher):
             self._reader = None
 
     def enrich_value(self, raw_value: str) -> dict[str, str] | None:
-        """Resolve one IPv4 value, or None for invalid input / no geolocation match.
+        """Resolve one IP value, or None for invalid input / no geolocation match.
 
-        Only an invalid address or a legitimate lookup miss maps to None —
-        reader failures (closed handle, corrupt database) propagate so the
-        job fails loudly instead of silently producing incomplete results.
+        Only an invalid address, an address family the installed database does
+        not carry, or a legitimate lookup miss maps to None — reader failures
+        (closed handle, corrupt database) propagate so the job fails loudly
+        instead of silently producing incomplete results.
         """
         try:
-            ipaddress.IPv4Address(raw_value)
+            address = ipaddress.ip_address(raw_value)
         except ValueError:
             return None
+        reader = self._get_reader()
+        # An IPv4-only .mmdb raises a bare ValueError (not AddressNotFoundError)
+        # for any IPv6 lookup, which enrichers/jobs.py re-raises — one IPv6-shaped
+        # value would fail the entire run. Such a database simply holds no answer
+        # for this address, so treat it as a miss.
+        if address.version == 6 and reader.metadata().ip_version == 4:
+            return None
         try:
-            response = self._get_reader().city(raw_value)
+            response = reader.city(raw_value)
         except geoip2.errors.AddressNotFoundError:
             return None
         country = response.country.name or ""

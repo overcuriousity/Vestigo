@@ -4,12 +4,13 @@ import { casesApi } from "@/api/cases";
 import { sourcesApi } from "@/api/sources";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
+import { StoriesPanel } from "@/components/stories/StoriesPanel";
+import { GeneratedConvertersPanel } from "@/components/sources/GeneratedConvertersPanel";
 import { ParserDownloadsPanel } from "@/components/sources/ParserDownloadsPanel";
 import { CaseJobsPanel } from "@/components/jobs/CaseJobsPanel";
 import { Spinner } from "@/components/ui/Spinner";
 import { Badge } from "@/components/ui/Badge";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
-import { guidance } from "@/lib/guidance";
 import { fmtRelative } from "@/lib/time";
 import { FolderOpen, Cpu } from "lucide-react";
 
@@ -93,29 +94,17 @@ export function CaseOverviewPage() {
         </div>
 
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-[300px_minmax(0,1fr)_300px]">
-          <div className="order-2 lg:order-1">
+          <div className="order-2 space-y-6 lg:order-1">
             <ParserDownloadsPanel />
+            <GeneratedConvertersPanel caseId={caseId!} />
           </div>
 
           <div className="order-1 space-y-8 lg:order-2">
             <TimelineList caseId={caseId!} />
             <SourceList caseId={caseId!} />
+            <StoriesPanel caseId={caseId!} />
 
-            <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
-              <ol className="space-y-2">
-                {guidance.caseOverview.steps.map((step, i) => (
-                  <li key={step.title} className="flex gap-2">
-                    <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
-                    <span>
-                      <span className="font-medium text-[var(--color-fg-secondary)]">
-                        {step.title}.
-                      </span>{" "}
-                      {step.body}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            </GuidancePanel>
+            <GuidancePanel id="case-overview" />
           </div>
 
           <div className="order-3">

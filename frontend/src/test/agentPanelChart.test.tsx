@@ -62,6 +62,7 @@ function conversation(): AgentConversation {
     title: "Investigating",
     model_id: "m",
     disabled_tools: null,
+    history_partial_at: null,
     created_at: null,
     updated_at: null,
   };
@@ -94,6 +95,30 @@ function chartMessages(resultOk: boolean | "missing"): AgentMessage[] {
     created_at: null,
   };
   return [call, result];
+}
+
+/**
+ * A trailing assistant row, appended to fixtures whose assertion is that *no*
+ * card rendered. Awaiting its text is a positive signal that the conversation
+ * query resolved and the transcript rendered — a timer tick is not, since a
+ * `queryBy…` for something that never appears passes before the fetch lands.
+ */
+const TRANSCRIPT_ANCHOR = "transcript rendered";
+
+function anchored(messages: AgentMessage[]): AgentMessage[] {
+  return [
+    ...messages,
+    {
+      id: "anchor",
+      conversation_id: CONV_ID,
+      role: "assistant",
+      content: TRANSCRIPT_ANCHOR,
+      tool_name: null,
+      tool_args: null,
+      tool_result: null,
+      created_at: null,
+    } as AgentMessage,
+  ];
 }
 
 function renderPanel() {
@@ -167,19 +192,23 @@ describe("AgentPanel propose_chart folding", () => {
   });
 
   it("a result with ok:false renders no card", async () => {
-    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages(false) });
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: anchored(chartMessages(false)),
+    });
     renderPanel();
-    // Let the conversation query settle, then assert nothing appeared.
-    await screen.findByTestId("agent-panel");
-    await new Promise((r) => setTimeout(r, 0));
+    // Wait for the transcript itself, then assert nothing appeared alongside it.
+    await screen.findByText(TRANSCRIPT_ANCHOR);
     expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 
   it("a call row with no paired result renders no card", async () => {
-    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages("missing") });
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: anchored(chartMessages("missing")),
+    });
     renderPanel();
-    await screen.findByTestId("agent-panel");
-    await new Promise((r) => setTimeout(r, 0));
+    await screen.findByText(TRANSCRIPT_ANCHOR);
     expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 
@@ -226,17 +255,34 @@ describe("AgentPanel propose_chart folding", () => {
     expect(cards.map((c) => c.textContent)).toEqual(["Good chart"]);
   });
 
-  it("legacy rows without tool_call_id pair in FIFO order", async () => {
-    const charts = [
-      { id: null, title: "Legacy one", ok: true },
-      { id: null, title: "Legacy two", ok: true },
-    ];
+  it("a single legacy row without tool_call_id still pairs — order is unambiguous", async () => {
+    const charts = [{ id: null, title: "Legacy one", ok: true }];
     getConversationMock.mockResolvedValue({
       ...conversation(),
       messages: batchRows(charts),
     });
     renderPanel();
     const cards = await screen.findAllByTestId("chart-proposal-card");
-    expect(cards.map((c) => c.textContent)).toEqual(["Legacy one", "Legacy two"]);
+    expect(cards.map((c) => c.textContent)).toEqual(["Legacy one"]);
+  });
+
+  it("ambiguous legacy rows render no card rather than a mislabelled one", async () => {
+    // Two unkeyed proposals in flight: results carry no key either, so which
+    // spec belongs to which result is a guess. The call row is persisted
+    // before its validation runs, so guessing can pair an `ok` result with a
+    // *rejected* spec and draw a chart that contradicts its own title —
+    // silently, in a tool whose output is read as evidence. Showing nothing
+    // is the only honest answer; the transcript still records both calls.
+    const charts = [
+      { id: null, title: "Legacy one", ok: false },
+      { id: null, title: "Legacy two", ok: true },
+    ];
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: anchored(batchRows(charts)),
+    });
+    renderPanel();
+    await screen.findByText(TRANSCRIPT_ANCHOR);
+    expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
   });
 });

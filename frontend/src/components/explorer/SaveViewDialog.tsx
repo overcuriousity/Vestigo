@@ -12,15 +12,26 @@ interface Props {
   onClose: () => void;
   caseId: string;
   filters: EventFilters;
+  /** The grid's current column layout — saved with the view so applying it
+   *  later restores what the analyst was actually looking at. Omitted where
+   *  there is no grid to speak for (the agent's finding cards): the view then
+   *  makes no statement about columns and applying it leaves them alone. */
+  visibleColumns?: string[];
 }
 
-export function SaveViewDialog({ open, onClose, caseId, filters }: Props) {
+export function SaveViewDialog({ open, onClose, caseId, filters, visibleColumns }: Props) {
   const [name, setName] = useState("");
   const qc = useQueryClient();
 
   const { mutate, isPending, error } = useMutation({
     mutationFn: () =>
-      viewsApi.create(caseId, name.trim(), filters.q ?? "", filtersToViewPayload(filters)),
+      viewsApi.create(caseId, name.trim(), filters.q ?? "", {
+        ...filtersToViewPayload(filters),
+        // Added here rather than inside filtersToViewPayload: the Visualize
+        // page shares that helper for chart configs, where columns mean
+        // nothing.
+        ...(visibleColumns ? { columns: visibleColumns } : {}),
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["views", caseId] });
       onClose();

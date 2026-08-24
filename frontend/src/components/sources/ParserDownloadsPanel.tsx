@@ -8,13 +8,21 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Download, Check, Clipboard, Wand2, Search, Zap, FileStack } from "lucide-react";
 import { convertersApi } from "@/api/converters";
-import { guidance } from "@/lib/guidance";
+import { converterCopy } from "@/lib/guidance";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { fmtBytes } from "@/lib/format";
 
-function CopyPromptButton({ prompt, label }: { prompt: string; label: string }) {
+function CopyPromptButton({
+  prompt,
+  label,
+  disabled,
+}: {
+  prompt: string;
+  label: string;
+  disabled?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -28,7 +36,7 @@ function CopyPromptButton({ prompt, label }: { prompt: string; label: string }) 
   };
 
   return (
-    <Button variant="outline" size="sm" onClick={copy}>
+    <Button variant="outline" size="sm" onClick={copy} disabled={disabled}>
       {copied ? <Check size={13} /> : <Clipboard size={13} />}
       {copied ? "Copied" : label}
     </Button>
@@ -42,7 +50,8 @@ const BLURB: Record<Mode, string> = {
     "*2vestigo scripts emit a compact, typed Parquet file uploaded directly — " +
     "the server bulk-inserts it via Arrow, skipping row-by-row CSV/JSON parsing " +
     "entirely. Smaller on disk, faster to ingest, and carries forensic provenance " +
-    "(source hash, byte offset, content hash) in the schema itself. Needs pyarrow.",
+    "(source hash, byte offset, content hash) in the schema itself. Each script lists " +
+    "the packages it needs below.",
   other:
     "*2timesketch scripts are stdlib-only (no dependencies to install) and emit " +
     "Timesketch-compatible CSV/JSONL, vendored from the upstream 2timesketch project. " +
@@ -56,6 +65,11 @@ export function ParserDownloadsPanel() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["converters"],
     queryFn: convertersApi.list,
+    staleTime: Infinity,
+  });
+  const prompts = useQuery({
+    queryKey: ["converter-prompts"],
+    queryFn: convertersApi.prompts,
     staleTime: Infinity,
   });
 
@@ -127,6 +141,18 @@ export function ParserDownloadsPanel() {
                 <p className="mt-0.5 text-[11px] leading-snug text-[var(--color-fg-muted)]">
                   {c.description} ({fmtBytes(c.size_bytes)})
                 </p>
+                {c.requires && c.requires.length > 0 && (
+                  <p className="mt-1 flex flex-wrap items-center gap-1">
+                    {c.requires.map((dep) => (
+                      <code
+                        key={dep}
+                        className="rounded bg-[var(--color-bg-surface)] px-1.5 py-0.5 text-[10px] text-[var(--color-fg-muted)]"
+                      >
+                        {dep}
+                      </code>
+                    ))}
+                  </p>
+                )}
               </div>
               <Button variant="ghost" size="icon" asChild title={`Download ${c.filename}`}>
                 <a href={convertersApi.downloadUrl(c.name)} download rel="noopener noreferrer">
@@ -143,18 +169,31 @@ export function ParserDownloadsPanel() {
           <Wand2 size={13} className="mt-0.5 shrink-0 text-[var(--color-fg-muted)] opacity-60" />
           <div className="flex-1 space-y-2">
             <p className="text-[11px] leading-relaxed text-[var(--color-fg-muted)]">
-              {guidance.converters.hint}
+              {converterCopy.hint}
             </p>
             {mode === "optimized" ? (
               <CopyPromptButton
-                prompt={guidance.converters.llmPromptParquet}
+                prompt={prompts.data?.parquet ?? ""}
                 label="Copy LLM prompt (Parquet)"
+                disabled={!prompts.data}
               />
             ) : (
               <CopyPromptButton
-                prompt={guidance.converters.llmPromptCsv}
+                prompt={prompts.data?.csv ?? ""}
                 label="Copy LLM prompt (CSV/JSONL)"
+                disabled={!prompts.data}
               />
+            )}
+            {prompts.error && (
+              // The query never refetches on its own (staleTime Infinity,
+              // no focus refetch), so a failed load would leave the buttons
+              // disabled forever with no explanation — say why and offer a retry.
+              <p className="flex flex-wrap items-center gap-1 text-xs text-[var(--color-danger)]">
+                Could not load the prompts: {(prompts.error as Error).message}
+                <Button variant="ghost" size="sm" onClick={() => prompts.refetch()}>
+                  Retry
+                </Button>
+              </p>
             )}
           </div>
         </div>

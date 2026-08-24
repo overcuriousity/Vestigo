@@ -15,6 +15,11 @@ export const viewsApi = {
       (r) => r.view,
     ),
 
+  /** `hidden` is true when a story block still embeds the view: the row is
+   *  kept so that story keeps rendering, and swept once the last block
+   *  referencing it is gone. */
   delete: (caseId: string, viewId: string) =>
-    del<{ deleted: boolean }>(`/cases/${caseId}/views/${viewId}`),
+    del<{ deleted: boolean; view_id: string; hidden: boolean }>(
+      `/cases/${caseId}/views/${viewId}`,
+    ),
 };

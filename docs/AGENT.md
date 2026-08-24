@@ -18,13 +18,21 @@ management) and `api/routers/agent.py` (HTTP/SSE layer). Design records:
   analyst click applies filters (through the normal URL-driven filter path,
   `frontend/src/lib/queryParams.ts`).
 - **Propose→confirm writes.** The agent itself never writes an annotation.
-  `propose_annotation` (available only once a conversation is bound) records an
-  `AgentProposal` row — it does not touch `annotations`. An analyst confirms or
-  rejects via `POST .../proposals/{id}/confirm|reject`; confirm re-resolves the
-  events against the *current* scope, writes one annotation per still-resolving
-  event with `origin="agentic-analysis"` and `created_by` set to the confirming
-  analyst, and reports `skipped_event_ids`. The decide is an atomic
-  `UPDATE … WHERE status='proposed'`, so a second confirm/reject 409s.
+  `propose_annotation` and `propose_story_block` (available only once a
+  conversation is bound) record an
+  `AgentProposal` row — it does not touch `annotations` or `story_blocks`. An
+  analyst confirms or rejects via `POST .../proposals/{id}/confirm|reject`; the
+  decide is an atomic `UPDATE … WHERE status='proposed'`, so a second
+  confirm/reject 409s. `AgentProposal.kind` discriminates what gets applied:
+  - `annotation` — confirm re-resolves the events against the *current* scope,
+    writes one annotation per still-resolving event with
+    `origin="agentic-analysis"` and `created_by` set to the confirming analyst,
+    and reports `skipped_event_ids`.
+  - `story_block` (W7) — confirm creates the block with `origin: agent` in the
+    story named by `payload`; an inline `chart_spec` is saved as a SavedChart
+    first, so the block references a persisted object like every other embed. A
+    story deleted since propose time still decides the proposal and reports
+    `applied: false` with a reason. See `docs/STORIES.md`.
   `run_anomaly_detector` is the only other write-shaped tool (it persists a
   `DetectorRun`, same as an analyst-triggered scan).
   - **Origin is provenance, not a visibility class.** A confirmed
@@ -33,10 +41,12 @@ management) and `api/routers/agent.py` (HTTP/SSE layer). Design records:
     (`USER_VISIBLE_ANNOTATION_ORIGINS = ("user", "agentic-analysis")`); only
     `origin="system"` stays outside that set.
   - Every decision is audited (`agent.annotation_confirm` /
-    `agent.annotation_reject`, keyed to `target_type="agent_proposal"`).
-  - `propose_annotation` and the decide endpoints are **absent from the
-    external `/mcp` transport** — only an in-app conversation binds the
-    `conversation_id` that gates the tool's registration.
+    `agent.annotation_reject`, `agent.story_block_confirm` /
+    `agent.story_block_reject`, keyed to `target_type="agent_proposal"`).
+  - `propose_annotation`, `propose_story_block` and the decide endpoints are
+    **absent from the external `/mcp` transport** — only an in-app conversation
+    binds the `conversation_id` that gates the tools' registration. Story
+    *read* tools are exposed there like every other read tool.
 - **Invisible unless configured.** `/api/health` reports `agent_available` only
   when `VESTIGO_AGENT_*` is set **and** the endpoint answered a cached probe
   (`agent/availability.py`, TTL `VESTIGO_AGENT_PROBE_TTL_SECONDS`). Otherwise
@@ -133,7 +143,10 @@ propose→confirm annotation path and `run_anomaly_detector`'s persisted run.
 `TOOL_REGISTRY` is the single source of truth for the catalog (name,
 description, `embeddings_gated`, `requires_conversation`, `tier`); a
 registry-parity test keeps it in sync with the actual `@server.tool()`
-registrations. `tier="core"` marks the 11-tool lean profile for
+registrations. The two `embeddings_gated` tools are **removed** from the
+server when embeddings are unconfigured, not left as error stubs — an
+unavailable subsystem costs no schema tokens and gets no calls
+(`core/capabilities.py`). `tier="core"` marks the 11-tool lean profile for
 small-context local models.
 
 | Tool | Tier | Purpose |
@@ -157,11 +170,14 @@ small-context local models.
 | `propose_finding` | core | Finding card with applicable Explorer filters. |
 | `propose_chart` | | Chart card, validated by executing the underlying query. |
 | `propose_annotation` | core | Propose tagging/commenting events; conversation-bound only, analyst must confirm. |
-| `semantic_search` | | Events similar to free text (embeddings-gated). |
-| `similar_events` | | Events similar to an existing event (embeddings-gated). |
+| `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
+| `semantic_search` | | Events similar to free text (embeddings-gated: absent when embeddings are unconfigured). |
+| `similar_events` | | Events similar to an existing event (embeddings-gated: absent when embeddings are unconfigured). |
 | `list_baselines` | | Saved baseline definitions — unlocks the temporal-only detectors. |
 | `list_dispositions` | | Analyst verdicts on anomaly findings. |
 | `list_saved_views` | | The analyst's saved filter views. |
+| `list_stories` | | The case's stories (the analyst's report documents). |
+| `read_story` | | One story's ordered blocks — markdown text and embed references. |
 | `list_annotations` | | Annotations across the timeline's sources. |
 | `get_event_annotations` | | All annotations on one event. |
 | `list_sigma_rules` | | Sigma rules available to the case. |
@@ -177,11 +193,66 @@ which caps at `MAX_LIST_ROWS` and reports **`returned` alongside `total`** —
 a silently partial set the model reasons over as whole is exactly what the
 system prompt's evidence rule forbids.
 
+`read_story` is the one read whose payload is prose rather than records, and
+it is budgeted differently for that reason: markdown is capped per block
+(`STORY_TEXT_TRUNCATE`) *and* per response (`STORY_TEXT_BUDGET`), spent in
+document order so a long story degrades block by block while every block still
+returns its id/kind/origin. Any cut carries `truncated: true` and the real
+`text_length`, with `truncated_blocks` on the response. The earlier cap
+(`ATTR_VALUE_TRUNCATE * 8`, 1600 chars) treated a report the analyst may write
+up to 256 KiB of as if it were an attribute value, and cut it unmarked.
+
 `propose_finding`'s `FilterSpec` uses the exact Explorer filter shape
 (including `annotated`, `annotation_tag_value`, `run_id`, `event_ids`,
 `collapse_routine`); the backend echoes the current hit count and the
 frontend renders an "Apply to Explorer" card (`run_id` maps onto
 `EventFilters.anomalyRunId`).
+
+### Nested arguments a provider stringified
+
+Not every provider emits a nested object argument as an object; some hand it
+back as JSON *text*. pydantic-ai parses only the **top** level of a tool
+call's arguments (`ToolCallPart.args_as_dict`), and the MCP SDK's
+`pre_parse_json` likewise only covers top-level parameters — so a top-level
+argument always arrives parsed, and anything nested arrives exactly as the
+provider sent it. Rejecting that costs a retry the model has to guess its way
+out of, on tools it is otherwise using correctly (`FilterSpec` is a nested
+argument on 14 of them — every filtered query and aggregation in the toolset).
+
+`ObjectArgModel` in `agent/tools.py` is the base for every nested-argument
+model and the single place this is handled. It coerces the model itself and
+every **field** whose annotation admits a JSON object — so `ChartSpec.options`
+(a model) and `FilterSpec.filters` (a plain `dict`) are covered by the same
+mechanism, no per-field opt-in. The rule is `_admits_json_object`: a field
+qualifies when some union member is a mapping or `BaseModel` and **no** member
+is `str`. That exclusion is the whole safety argument — `q: str | None` may
+legitimately hold `'{"a": 1}'` as a free-text search, and coercing it would
+rewrite the analyst's query. Coercion works on a copy: the same mapping is the
+call's `tool_args`, persisted verbatim, and a forensic record must not change
+shape between being stored and being validated.
+
+Both halves of that are enforced rather than merely documented, because both
+fail *silently* — one provider retry-looping on a tool it is using correctly
+is not something a test suite notices on its own.
+`test_every_nested_argument_model_derives_from_object_arg_model` walks the
+built server's real signatures (and transitively through model fields, which
+is how `FilterSpec` inside `ChartSpec.compare` is reached) and fails if any
+model in a nested position is a bare `BaseModel`; the same walk feeds
+`test_spec_reference_covers_every_nested_argument_model`, so a new spec cannot
+have its `$defs` prose slimmed away without being added to `SHARED_SPEC_NAMES`.
+And `_admits_json_object` **raises** on an annotation it cannot decide (an
+unresolved forward reference) rather than answering "no": quietly dropping a
+field from coercion is the failure mode this whole path exists to make loud.
+
+The frontend needs the mirror image, because `tool_args` is persisted exactly
+as emitted — a bad row is permanent and every re-render of that conversation
+reads it. `specToChartConfig` and `specToEventFilters` (`api/agent.ts`)
+normalize through `parseToolArgObject` at the translation boundary, so no
+caller has to remember to; `AgentPanel` additionally uses it as the render-or-
+don't decision, and an unusable spec produces no card rather than a throw.
+A stringified `compare` is the reason this is not optional: unparsed, it made
+`compare?.mode` undefined and silently drew one layer where the model proposed
+two.
 
 ### `propose_chart` — isomorphic with the analyst's `ChartConfig`
 
@@ -248,6 +319,14 @@ a categorical grouping variable producing one distribution per group;
   translation for persisted old-shape `tool_args`. Virtual `time:` fields are
   analyst-facing too (`viz/lib/fieldDisplay.ts` labels tokens and values;
   canonical values, not labels, round-trip into filters/URLs/saved charts).
+- **Save** stores `spec.filters` with the chart, `event_ids`/`run_id`/
+  `collapse_routine` included — a chart the agent scoped to one detector run
+  must not widen to the whole timeline on the analyst's click. **Open in
+  Visualize** on this card cannot carry those three: the chart is not saved
+  yet, so there is no id to name, and it falls back to describing the chart in
+  `c_*` params where they have no representation. Saving first is what makes
+  the chart addressable (`?c_chart=<id>`, `docs/STORIES.md`) and its link
+  exact.
 
 ### Per-tool enable/disable (three layers)
 
@@ -296,6 +375,124 @@ the conversation row (incl. `model_id`, `disabled_tools`), every message row
 token usage), the proposals, and `raw_history` — the provider-wire
 pydantic-ai history blob (the only place thinking signatures live).
 
+## Outside the agent loop: the column advisor
+
+One feature reaches the configured LLM endpoint without being an agent turn:
+the event-grid column suggestion (`src/vestigo/columns/advisor.py`, issue
+#213). It is documented here because it shares this subsystem's configuration
+and its availability gate — not because it shares its machinery. It has no
+conversation, no tool server, no history, no proposals, and writes nothing an
+analyst has to decide on.
+
+**What it does.** A deterministic sweep over the per-source field-statistics
+cache (`db/field_stats.py`) has already scored every candidate column before
+the model is involved. The model receives a candidate table — token, how many
+sources carry it, fill rate, distinct count, three sample values — and returns
+3–5 of those tokens in a useful order, as a pydantic `output_type`
+(`ColumnChoice`). That is the whole interaction: one request, no tools.
+
+**How the invariants apply.**
+
+| Invariant | How it holds here |
+|---|---|
+| Invisible unless configured | Gated on the same cached `agent_available()` probe `/api/health` uses. Unconfigured or unreachable ⇒ never called, and the deterministic answer ships instead. The "Suggest with AI" button is gated on the same `capabilities.agent`, so an instance with no model configured renders no entry point either. |
+| Scope safety | The model is given no case, timeline, source or event id, and no event row. It *is* given up to three real sample values per candidate field (40 characters each, ≤20 fields) — evidence-derived strings, which is why the path is opt-in rather than on by default. `tests/test_columns_api.py` asserts the rendered prompt against that promise. |
+| Sandbox + apply | The result is a *default*, not a mutation. It lands in `Timeline.recommended_columns`; any analyst's own column choice outranks it, and "Reset to defaults" is one click. |
+| Forensic reproducibility | Every run writes a `timeline.recommend_columns` audit row with the method, the model id, the chosen columns and the full candidate set. The heuristic half is deterministic and unit-tested; the LLM half is recorded as `method: "llm"` so a suggestion is never mistaken for a computation. |
+| Bounded trust | Every returned token is intersected with the candidate set — the model cannot introduce a field. A response that falls below the minimum after filtering is rejected whole rather than padded. Malformed, timed out (45 s ceiling), or errored is indistinguishable from "not configured". |
+
+**What it deliberately does not do.** It does not go through `build_tool_server`
+or `FastMCPClient`. Driving the real tools would mean `describe_field`'s two
+live ClickHouse scans per field across ~50 candidates, for data the stats cache
+already holds exactly; the tools are also timeline-scoped where the evidence
+here is per-source. The tool-deny layers are not bypassed by this, because no
+tool is called.
+
+**Opt-in per analyst, per timeline — with the disclosure attached to the
+opting.** There is no instance-wide setting for this, deliberately: whether the
+model half is *available* is already answered by whether an agent endpoint is
+configured, and a second tri-state on top of it only made the disclosure
+incoherent (a dialog explaining egress that was not happening, offering an
+action most users could not take).
+
+The job takes `use_llm`, and it defaults to False. Every automatic trigger —
+post-ingest, timeline creation, the CLI, the demo build — leaves it there, so
+the scorer runs locally and **egress is never a side effect of uploading a
+file**. Exactly one caller sets it: `POST
+/api/cases/{id}/timelines/{id}/recommend-columns` with `{"use_ai": true}`,
+behind the disclosure
+(`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`), which names
+exactly what would be sent, the endpoint URL and the model. Confirming records
+the answer for that timeline (`preferences.column_advisor_optin`, a
+`{timeline_id: bool}` map written through `PUT /api/auth/me/preferences`) and
+only then runs. Cancelling sends nothing and records `false` — a declined
+timeline has to be distinguishable from one nobody has been asked about, or the
+offer below returns on every visit and people learn to dismiss it unread. The
+next timeline asks again, because the sample values sent are that timeline's
+evidence.
+
+The disclosure refuses to close while its confirm is in flight — Escape, the
+overlay and the X included. A close is recorded as "no thanks", so a dismissal
+landing between the opt-in write and its response would race a `false` against
+the `true` the analyst just gave, and the stored consent could end up
+contradicting the request that was actually sent.
+
+One derived run exists, and it is always local: when an ingest trigger is
+collapsed into an already-running job (`columns/jobs.py::_DIRTY`), that job
+re-runs itself once for the sources it read too early — with `use_llm` unset
+however the run that scheduled it was started, so a burst can never turn one
+opted-in "Suggest with AI" into repeated egress.
+
+Two surfaces open that disclosure, both through
+`frontend/src/hooks/useColumnRecommendation.ts` so neither can send anything the
+other would not:
+
+- **The "Suggest with AI" button** in the Columns picker, at any time.
+- **A one-time offer** the first time someone with contribute access opens a
+  timeline that holds a `method: "heuristic"` suggestion they have not answered
+  for. The button alone was not enough: the common path (create a timeline, open
+  it) landed on the local answer with nothing on screen saying a better one
+  existed, and a disclosure nobody finds is not a choice anybody made. The offer
+  merely appearing sends nothing — it is the same dialog, gated on the same
+  `capabilities.agent`, and it never fires for a read-only member, a timeline
+  with no local suggestion yet, or one already ranked by the model.
+
+An explicit run from either surface also clears the requesting browser's stored
+column override. The per-user choice still outranks *automatic* recomputes (a
+colleague's ingest never moves anyone's columns), but pressing the button is
+asking for the new answer — leaving the override in place made the button look
+broken, since a single earlier checkbox click had already frozen the grid on the
+suggestion it was showing at the time.
+
+The contribute-access check on the endpoint is the authorization; the stored
+opt-in is the UI's memory of having shown the disclosure, not a second gate. The
+resulting suggestion is shared with everyone who can see the timeline — the
+opt-in governs who *causes* egress, not who may read the result afterwards, and
+the audit row names the analyst who triggered it. See
+`vestigo/columns/__init__.py` for the layering.
+
+### The converter generator
+
+The second non-agent use of the endpoint (1.13): `src/vestigo/converters/generator.py`
+writes a converter script for a plain-text log the analyst uploaded, and
+`converters/job.py` runs, validates, repairs and ingests it —
+`docs/INPUT_FORMATS.md` §"Generated converters" is the full description. Same
+shape as the column advisor — one typed request per attempt, no tools, no
+history — and the same wire call: both go through
+`src/vestigo/agent/oneshot.py::typed_completion`. Two things differ. It is gated on its own operator switch
+(`converter_generation_enabled`, off by default) *in addition to* the agent
+probe, because it executes model-written code on the host; and it does not
+degrade silently — a script that could not be written is a failed attempt the
+analyst sees, not a heuristic fallback.
+
+| Invariant | How it holds here |
+|---|---|
+| Invisible unless configured | Capability `converter_generation` = switch **and** `agent_available()`. Off ⇒ no "Let AI write the converter" mode, no regenerate button; generation and `regenerate` answer 503. Re-running a *saved* script sends nothing, so it hangs off `converter_reuse` = switch alone: with the model down or never configured the dialog offers *Use a saved converter* only, and `convert` with a `converter_script_id` still runs. Listing and downloading existing scripts stay available — they are records. |
+| Scope safety | The task message carries a bounded head/middle/tail excerpt of the raw file, its name, size, line count, mtime, the version to declare and the analyst's hint. No case/source/timeline/user id, key or host name. `tests/test_converter_prompt.py` asserts it; the dialog names the model, endpoint host and byte count before the analyst confirms. Reusing a saved script sends nothing. |
+| Sandbox + apply | The script runs under `python -I` in a private working directory with a scrubbed environment and `RLIMIT_AS`/`CPU`/`FSIZE`/`NOFILE` (set by a bootstrap inside the child, never `preexec_fn`), after a best-effort static guard (`runner.check_script`: import allow-list, module aliases usable only as `module.<attr>`, dynamic-lookup and object-graph dunders refused — `docs/INPUT_FORMATS.md` §"The loop" lists it). Its output is *validated* before anything is ingested, and the ingest itself is the ordinary Parquet path — the model never touches ClickHouse or Postgres. |
+| Forensic reproducibility | Every attempt (generation — including model errors before a row exists — sample run, full run, and any failure after the converter passed) is on `converter_scripts.attempts` with the report, stderr tail, script hash and the hash of the prompt that round sent; the row keeps the exact sample text, the evidence file's mtime as stated to the model, and `prompt_hash`/`model` of the attempt that produced its stored code. Audit: `converter.generate`, `converter.run`, `converter.regenerate`. The Parquet carries the usual per-row provenance, so the *ingest* is reproducible from the raw file and the script even though the model's output is not. |
+| Bounded trust | Validation is what the harness checks, not what the model claims: schema, footer, the raw file's real hash, non-null provenance, parse and timestamp floors. Attempts are capped (`converter_max_attempts`), each run is time- and memory-limited, and the model's proposed name is sanitized to `^[a-z0-9_]+2vestigo$`. |
+
 ## Configuration
 
 | Variable | Meaning |
@@ -311,8 +508,8 @@ pydantic-ai history blob (the only place thinking signatures live).
 | `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset = the sliding window engages only reactively after an overflow. |
 | `VESTIGO_AGENT_TOOL_FIDELITY` | How much of an example record tool results carry: `full` (default) / `message` / `minimal` / `auto`. |
 | `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`). |
-| `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
-| `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Env-only, not admin-editable. |
+| `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). Edited on `Admin → Settings`, not the Agent tab. |
+| `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Edited on `Admin → Settings`. |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
 
 Works with any OpenAI-compatible endpoint (ollama, vllm, llama.cpp server,
@@ -324,8 +521,12 @@ operator decision.
 ### DB-backed settings, env-wins precedence
 
 Every field above except `VESTIGO_AGENT_PROBE_TTL_SECONDS`,
-`VESTIGO_AGENT_SECRET_MODE`, and `VESTIGO_MCP_ENABLED` is also editable from
-`Admin → Agent`, backed by a singleton `agent_settings` row.
+`VESTIGO_AGENT_SECRET_MODE`, and `VESTIGO_MCP_ENABLED` is editable from
+`Admin → Agent`, backed by a singleton `agent_settings` row. Those three live
+on `Admin → Settings` instead, in the generic `app_settings` layer
+(`core/settings_registry.py`); the agent's own row predates it and keeps its
+purpose-built resolver, so the two coexist deliberately — same precedence
+rules, same "pinned by environment" semantics, different storage.
 `resolve_agent_config()` (`agent/config.py`) resolves **per field**: env var
 if set, else DB value, else hardcoded default — so an operator can pin
 `VESTIGO_AGENT_API_KEY` while leaving `model` admin-editable. The resolved
@@ -549,6 +750,97 @@ model request counted against the turn limit, so not more than three.
 Whatever streamed before an early end persists with an ` [interrupted]`
 marker.
 
+### Turn checkpointing and resume
+
+`AgentConversation.history` is the only thing a follow-up turn replays; the
+`AgentMessage` rows are the human-readable record and never feed the model. It
+used to be written only when a turn reached its result, so a stop, a provider
+error or a process restart discarded the whole turn — the 2026-07-26 export
+shows 125 persisted tool rows against an empty history blob, and the next turn
+re-ran the entire orientation sweep.
+
+`stream_turn` now drives `agent.iter` and updates a caller-owned `TurnRecorder`
+after every tool result and at every node boundary, yielding a router-internal
+`checkpoint` event. Each snapshot passes through
+`agent/resume.py::repair_partial`, and any checkpoint is replayable on its own.
+
+pydantic-ai already normalizes a history before every request
+(`_clean_message_history`: drop orphaned results, answer dangling calls, merge
+adjacent same-role messages), so `repair_partial` is not there to make the blob
+sendable — it is there to make it *faithful*, and to keep it that way if a
+future version normalizes differently:
+
+- **Unpaired calls are answered with the part the tool actually produced.** The
+  library's own repair substitutes a generic stub; replaying the real
+  `ToolReturnPart` — or `RetryPromptPart`, so a rejection is never replayed as a
+  success — keeps the resumed history in agreement with the run about what each
+  tool returned, including the content's type and its `outcome`. Only a call that
+  genuinely never returned gets `INTERRUPTED_RESULT`, stamped
+  `outcome="interrupted"` so a reader of an export can tell synthesized answers
+  from real ones without parsing prose. Answers are inserted in the request
+  immediately following the response that made the call, because the Anthropic
+  protocol requires that adjacency and nothing downstream reorders across a
+  response.
+- **A truncated trailing call is kept, not dropped.** A dead model stream can
+  leave a `ToolCallPart` with half-written JSON arguments. Removing it would
+  rewrite the shape of a `ModelResponse` whose thinking signature was computed
+  over the turn that included the call, and this blob is the only place those
+  signatures live. Malformed arguments are already sendable (`args_as_dict`
+  degrades them), so the call is replayed and answered like any other — the same
+  reasoning pydantic-ai gives for its own pass.
+- **The trailing request/response pair is closed** with a `RESUME_MARKER`
+  response. On 2.17.0 this is belt-and-braces: `_merge_consecutive_messages`
+  already folds a trailing tool-return request into the next turn's prompt
+  request, so the unmerged shape is not a protocol error. But that merge is
+  private API under a `>=` pin, and a checkpoint blob shaped exactly like a
+  completed turn's is one less case for the window and the exporter to reason
+  about. `tests/test_agent_resume.py::test_the_library_still_merges_adjacent_requests`
+  fails loudly if a bump changes it.
+
+No checkpoint is taken before the model commits a response: there would be
+nothing to save, and closing the pair on a lone prompt would put a reply to the
+analyst in the model's mouth.
+
+Checkpointing is deliberately cheap. The node-boundary checkpoint is skipped
+when the node produced nothing mapped, and when its last mapped event was a
+`tool_result` (that checkpoint already captured the same state), so a
+125-tool-call turn takes ~125 snapshots rather than 250. Reaching the database is
+throttled separately, because each write is a full `dump_history` plus a
+whole-column JSON UPDATE of a monotonically growing blob on the event loop —
+writing every snapshot costs bytes quadratic in the turn's length.
+`_persist_partial` skips a write whose `recorder.revision` has not advanced, and
+skips a periodic one taken less than `_CHECKPOINT_MIN_INTERVAL` (3s) after the
+last. Every terminal exit forces the write regardless, so the floor bounds
+worst-case loss at a few seconds of tool work and never at an analyst's turn. The
+per-tool-result checkpoint stays — losing a tool batch to a `kill -9` is the
+thing this exists to prevent.
+
+The router writes each checkpoint and stamps `history_partial_at`. Only a
+completed turn clears it; a stop is treated as an interruption like any other.
+While it is set, the next turn is run with `RESUME_NOTE` as pydantic-ai
+`instructions` — it tells the model the previous turn ended early and to build
+on the history rather than re-orient, without being folded into the prompt: the
+prompt is persisted verbatim as the analyst's `UserPromptPart`, so a note there
+would claim words the analyst never wrote and stack one stale copy per
+interruption. Instructions come from the current run only (verified against
+pydantic-ai 2.17.0), so a note left on an older `ModelRequest` is never resent.
+The recorder is reset per attempt, so the reactive overflow re-run replays from
+the same pre-turn base rather than concatenating the failed attempt's messages.
+If that re-run dies before its own first checkpoint, attempt 0's stamped
+snapshot stays on the record: it is a faithful account of work that really ran,
+and the window sizes it like any other history on the next turn.
+
+`history_partial_at` is on the conversation payload (`to_dict`), so it reaches
+the list and detail responses and the JSON export alongside `raw_history` — a
+reader can tell a replayable turn boundary from a mid-turn checkpoint without
+inspecting the blob. A partial write also bumps `updated_at`, which floats an
+actively streaming conversation to the top of the list; that is the intent.
+
+No extra truncation logic: a resumed history is ordinary `message_history` and
+the sliding window (`agent/window.py`) still sizes every request. Because the
+learned budget and calibrated `chars_per_token` persist per conversation, a
+resumed turn starts with the budget the interrupted turn paid to learn.
+
 ## Provider notes
 
 ### Reasoning effort
@@ -607,7 +899,8 @@ route).
 - `tests/test_agent_tokens.py` / `tests/test_mcp_http.py` — token model +
   management API (create/list/revoke, RBAC), token lifecycle over HTTP,
   scope binding, an end-to-end tool call, off-by-default 404, admin deny
-  list on the external `tools/list`, `propose_annotation` absent from `/mcp`.
+  list on the external `tools/list`, `propose_annotation` and
+  `propose_story_block` absent from `/mcp`.
 - `tests/test_chart_meta.py` — chart-meta legality table + generated
   frontend copy is regeneration-stable.
 - Frontend: `frontend/src/test/agent.test.ts` — FilterSpec → EventFilters

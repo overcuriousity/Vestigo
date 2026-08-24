@@ -7,6 +7,7 @@ import { ExportCaseDialog } from "./ExportCaseDialog";
 import { Badge } from "@/components/ui/Badge";
 import { canManageCase } from "@/lib/caseAccess";
 import { useAuthStore } from "@/stores/auth";
+import { useCapabilities } from "@/api/health";
 import type { Case } from "@/api/types";
 
 interface Props {
@@ -17,6 +18,8 @@ export function CaseCard({ case_ }: Props) {
   const user = useAuthStore((s) => s.user);
   const team = user?.teams?.find((t) => t.id === case_.team_id);
   const canManage = canManageCase(case_);
+  // Export disappears with the subsystem, not just when it errors.
+  const transferEnabled = useCapabilities().transfer;
 
   return (
     <div className="group relative flex items-center gap-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-5 py-4 hover:border-[var(--color-border-strong)] hover:bg-[var(--color-bg-elevated)] transition-base">
@@ -52,7 +55,7 @@ export function CaseCard({ case_ }: Props) {
         </p>
       </Link>
       <div className="flex items-center gap-1">
-        {canManage && <ExportCaseDialog case_={case_} />}
+        {canManage && transferEnabled && <ExportCaseDialog case_={case_} />}
         {canManage && <ChangeCaseScopeDialog case_={case_} />}
         {canManage && <DeleteCaseDialog case_={case_} />}
         <Link to={`/cases/${case_.id}`} tabIndex={-1}>

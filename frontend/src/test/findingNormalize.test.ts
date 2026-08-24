@@ -76,8 +76,13 @@ describe("normalizeFinding", () => {
       score: 600,
     };
     const item = normalizeFinding(DETECTORS_BY_ID.order, f, 0);
-    expect(item.title).toContain("s1");
+    // The headline is the record's position, not the source id: a real one is
+    // ~60 characters whose first 24 repeat across every source in the case, so
+    // it wrapped over three lines and buried the skew. The source moves to the
+    // subtitle, shortened to its distinguishing tail.
+    expect(item.title).toContain("line 2");
     expect(item.subtitle).toContain("600.0s");
+    expect(item.subtitle).toContain("s1");
     expect(item.ts).toBe("2024-01-03T00:00:00Z");
   });
 

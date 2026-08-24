@@ -47,9 +47,6 @@ interface Props {
   iconTrigger?: boolean;
 }
 
-const EMBEDDINGS_UNAVAILABLE_HINT =
-  "Embeddings are not available on this server — install the 'embeddings' extra or configure a remote embedding endpoint (VESTIGO_EMBEDDING_API_BASE_URL).";
-
 const TOP_LEVEL_LABELS: Record<string, string> = {
   message: "Message",
   timestamp_desc: "Timestamp description",
@@ -252,7 +249,7 @@ export function EmbedWizard({ caseId, timeline, onJobStarted, iconTrigger }: Pro
   const { data: health } = useHealth();
   // Optimistic until the health response arrives, so the button doesn't
   // flicker in on installations where embeddings work (the common case).
-  const embeddingsAvailable = health?.embeddings_available ?? true;
+  const embeddingsAvailable = health?.capabilities?.embeddings ?? true;
 
   const isEmbedded = timeline.is_embedded;
   const isStale = timeline.is_stale;
@@ -357,24 +354,15 @@ export function EmbedWizard({ caseId, timeline, onJobStarted, iconTrigger }: Pro
     [data],
   );
 
-  // Single trigger element, reused for the enabled (DialogTrigger) and the
-  // disabled (embeddings-unavailable) cases so the two icon/outline variants
-  // aren't spelled out four times. Stale styling only shows when enabled.
-  const staleWhenEnabled = embeddingsAvailable && isStale;
+  // One trigger element for both variants (icon in dense rows, labeled button
+  // in banners) so the styling isn't spelled out twice.
   const trigger = iconTrigger ? (
     <Button
       variant="ghost"
       size="icon"
-      disabled={!embeddingsAvailable}
       aria-label={label}
-      title={
-        !embeddingsAvailable
-          ? undefined
-          : isStale
-            ? `${label} — new sources aren't embedded yet`
-            : label
-      }
-      className={staleWhenEnabled ? "text-[var(--color-warning)]" : ""}
+      title={isStale ? `${label} — new sources aren't embedded yet` : label}
+      className={isStale ? "text-[var(--color-warning)]" : ""}
     >
       <Cpu size={14} />
     </Button>
@@ -382,25 +370,18 @@ export function EmbedWizard({ caseId, timeline, onJobStarted, iconTrigger }: Pro
     <Button
       variant="outline"
       size="sm"
-      disabled={!embeddingsAvailable}
-      className={
-        staleWhenEnabled ? "border-[var(--color-warning)] text-[var(--color-warning)]" : ""
-      }
+      className={isStale ? "border-[var(--color-warning)] text-[var(--color-warning)]" : ""}
     >
       <Cpu size={13} /> {label}
-      {staleWhenEnabled && <span className="ml-1 text-[9px] opacity-80">· stale</span>}
+      {isStale && <span className="ml-1 text-[9px] opacity-80">· stale</span>}
     </Button>
   );
 
-  // After all hooks (rules-of-hooks): embeddings can't run on this server —
-  // show the same-sized trigger, disabled, with an explanatory tooltip.
-  if (!embeddingsAvailable) {
-    return (
-      <span title={EMBEDDINGS_UNAVAILABLE_HINT} className="inline-flex cursor-not-allowed">
-        {trigger}
-      </span>
-    );
-  }
+  // After all hooks (rules-of-hooks): embeddings can't run on this server, so
+  // the wizard is absent rather than present-but-disabled. An unconfigured
+  // subsystem shows no entry point at all (core/capabilities.py) — a disabled
+  // button here only asked the analyst to interpret an error they cannot fix.
+  if (!embeddingsAvailable) return null;
 
   return (
     <Dialog open={open} onOpenChange={handleOpen}>

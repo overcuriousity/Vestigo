@@ -259,7 +259,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               </Button>
             </div>
             {saveMut.isError && (
-              <div className="text-xs text-[var(--color-error)]">
+              <div className="text-xs text-[var(--color-danger)]">
                 {(saveMut.error as Error)?.message ?? "Failed to save"}
               </div>
             )}
@@ -291,7 +291,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               "flex items-center gap-2 rounded border px-2 py-1.5 transition-colors",
               d.id === activeBaselineId
                 ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)]"
-                : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
+                : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]",
             )}
           >
             <button
@@ -318,7 +318,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               <Pencil size={12} />
             </button>
             <button
-              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+              className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
               onClick={() => deleteMut.mutate(d.id)}
               title="Delete definition"
             >
@@ -352,12 +352,19 @@ const KIND_META: Record<
   },
   routine: {
     heading: "Routine",
-    hint: "Recurring expected patterns (Patterns tab) — collapsible in the event grid.",
+    hint: "Recurring expected patterns (Tools → Explore) — collapsible in the event grid.",
     removeTitle: "Remove — its events reappear in the grid",
   },
 };
 
-/** The analyst's dispositions (normal / dismissed / confirmed), grouped by verdict. */
+/**
+ * The analyst's dispositions (normal / dismissed / confirmed), grouped by verdict.
+ *
+ * The only durable way to take a verdict back — the toast's Undo lasts four
+ * seconds and then the id is gone. That makes this list the undo path for a
+ * decision that changes detection, not a convenience: mounted under Tools →
+ * Scope, beside the other control over what a sweep will show.
+ */
 export function NormalValuesList({ caseId, timelineId }: Props) {
   const qc = useQueryClient();
   const { data } = useQuery({
@@ -417,7 +424,8 @@ export function NormalValuesList({ caseId, timelineId }: Props) {
                   </span>
                 </span>
                 <button
-                  className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+                  data-testid={`disposition-remove-${d.id}`}
+                  className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
                   onClick={() => removeMut.mutate(d.id)}
                   title={KIND_META[kind].removeTitle}
                 >
@@ -491,7 +499,7 @@ function WindowRow({
         {onRemove && (
           <button
             onClick={onRemove}
-            className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-error)]"
+            className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
             title="Remove"
           >
             <X size={12} />

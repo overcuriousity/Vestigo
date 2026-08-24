@@ -1,5 +1,5 @@
 /**
- * SigmaPanel — the Sigma tab of the InvestigatePanel.
+ * SigmaPanel — the Signatures section of the Tools sheet.
  *
  * Deterministic signature matching, deliberately separate from the
  * statistical detectors: analysts pick rules (admin-managed global set +
@@ -8,7 +8,7 @@
  * filterable in the unified tag panel. Run history shows per-rule outcomes
  * with the compiled SQL for forensic review.
  */
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -23,6 +23,7 @@ import { sigmaApi } from "@/api/sigma";
 import type { SigmaRuleInfo, SigmaRun, SigmaRunResult } from "@/api/sigma";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { FileInputButton } from "@/components/ui/FileInput";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { useJobsStore } from "@/stores/jobs";
 import { cn } from "@/lib/cn";
@@ -54,7 +55,6 @@ function logsourceText(r: SigmaRuleInfo): string {
 export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   // Per-file upload failures from the latest batch (multi-file uploads run
   // concurrently — collecting keeps every failure visible, not just the last).
   const [uploadErrors, setUploadErrors] = useState<string[]>([]);
@@ -121,25 +121,16 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
     },
   });
 
-  const handleFiles = async (files: FileList | null) => {
-    if (!files) return;
+  const handleFiles = async (files: File[]) => {
     setUploadErrors([]);
-    for (const file of Array.from(files)) {
+    for (const file of files) {
       uploadMutation.mutate({ name: file.name, yaml: await file.text() });
     }
   };
 
   return (
     <div className="space-y-4">
-      <GuidancePanel id="investigate-sigma" title="How Sigma scanning works">
-        <p>
-          Sigma rules are community-standard YAML signatures for suspicious log patterns.
-          Running them evaluates each rule against every event in this timeline; matches are
-          tagged <span className="font-mono">sigma: &lt;rule title&gt;</span> as system
-          annotations, filterable from the Tags panel. Signature matching is deterministic —
-          it complements, not replaces, the statistical anomaly detectors.
-        </p>
-      </GuidancePanel>
+      <GuidancePanel id="investigate-sigma" />
 
       {/* Rules */}
       <section>
@@ -150,21 +141,14 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
               {selectedRules.length}/{runnable.length} selected
             </span>
           </h4>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".yml,.yaml"
+          <FileInputButton
             multiple
-            className="hidden"
-            onChange={(e) => {
-              void handleFiles(e.target.files);
-              e.target.value = "";
-            }}
-          />
-          <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()}>
-            <Upload size={12} className="mr-1" />
+            accept=".yml,.yaml"
+            onFiles={(files) => void handleFiles(files)}
+            icon={<Upload size={12} className="mr-1" />}
+          >
             Upload rule
-          </Button>
+          </FileInputButton>
           <Button
             size="sm"
             disabled={selectedRules.length === 0 || runMutation.isPending}

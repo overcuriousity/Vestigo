@@ -30,6 +30,7 @@ from vestigo.api.deps import (
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
+from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS
 from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     CharsetFinding,
@@ -60,6 +61,7 @@ from vestigo.db.postgres import (
     User,
     dispositions_hash,
     generate_id,
+    scope_identity,
 )
 from vestigo.db.queries import EventQuery, EventQueryService, TagFilter
 from vestigo.db.similarity import EncoderUnavailableError, SimilarityService
@@ -239,11 +241,11 @@ def _parse_multivalue_object(value: str | None) -> dict[str, list[str]]:
     return result
 
 
-_VALID_FILTER_MODES = {"exact", "wildcard", "regex"}
+_VALID_FILTER_MODES = {"exact", "wildcard", "regex", "empty"}
 
 
 def _parse_modes_object(value: str | None) -> dict[str, str]:
-    """Parse a ``{"field": "exact"|"wildcard"|"regex"}`` match-mode map.
+    """Parse a ``{"field": "exact"|"wildcard"|"regex"|"empty"}`` match-mode map.
 
     Absent keys mean exact everywhere downstream; explicit ``"exact"``
     entries are accepted and harmless. Unknown mode strings are a client
@@ -257,16 +259,32 @@ def _parse_modes_object(value: str | None) -> dict[str, str]:
     return parsed
 
 
-def _validate_field_regexes(
+def _validate_field_modes(
     field_map: dict[str, str] | dict[str, list[str]], modes: dict[str, str]
 ) -> None:
-    """Pre-check every regex-mode field pattern with ``re.compile`` → 400.
+    """Check a match-mode map against the field map it applies to → 400.
 
-    Same non-authoritative cheap check as :func:`_validate_regex` — RE2
-    inside ClickHouse is the final arbiter, guarded by
-    :func:`_run_regex_guarded`.
+    Two checks, both cheap and both about a mode that cannot mean what it
+    says:
+
+    * Every ``regex``-mode pattern is pre-compiled with ``re.compile``. Same
+      non-authoritative check as :func:`_validate_regex` — RE2 inside
+      ClickHouse is the final arbiter, guarded by
+      :func:`_run_regex_guarded`.
+    * Every ``empty``-mode key must actually appear in *field_map*. The query
+      builder only ever visits keys that are present there, so a lone
+      ``{"user_agent": "empty"}`` would be silently dropped and answer with
+      the whole timeline instead of the blank rows the caller asked for —
+      reachable from a hand-edited or truncated shared URL. This mirrors the
+      contract the agent's ``FilterSpec`` validator enforces by injecting the
+      ``[""]`` placeholder.
     """
     for key, mode in modes.items():
+        if mode == "empty" and key not in field_map:
+            raise HTTPException(
+                status_code=400,
+                detail=f"match mode 'empty' for field {key!r} has no matching filter entry",
+            )
         if mode != "regex":
             continue
         raw = field_map.get(key)
@@ -330,6 +348,23 @@ async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[s
 
 _FIELDS_NONE_TOKEN = "__none__"
 
+# A tag every annotated event carries, derived at read time from whether the
+# event has any annotation at all rather than stored as a row of its own. It
+# therefore cannot drift from the annotations it describes: deleting the last
+# annotation removes the tag, and no write path has to remember to maintain it.
+# An analyst is free to also create a real annotation tag with this name; the
+# two populations are unioned, so that is harmless.
+#
+# Not to be confused with the ``annotated`` *filter field* a few lines down (and
+# its ``FilterSpec`` twin), which selects by annotation **type**:
+# ``annotated=["tag"]`` means "has a tag annotation", while
+# ``tags_include=["annotated"]`` means "carries this derived tag". Same word,
+# different axis.
+#
+# Served to the frontend on ``/api/health`` (``annotated_tag``) rather than
+# mirrored there, because a renamed tag stops matching without raising anything.
+ANNOTATED_TAG = "annotated"
+
 
 def _parse_novelty_fields(fields: str | None) -> list[str] | None:
     """Parse the ``fields`` param for value_novelty scans.
@@ -375,7 +410,16 @@ async def _resolve_tags_filter(
     sigma_ids = await store.list_event_ids_by_annotation_type(
         case_id, source_ids, "sigma", origins=("system",), content_in=tag_values
     )
-    return TagFilter(tag_values=tag_values, postgres_event_ids=list({*ann_ids, *sigma_ids}))
+    # A fourth population, derived rather than stored: every annotated event
+    # carries ANNOTATED_TAG. Nothing writes it, so it can never disagree with
+    # the annotations it describes.
+    annotated_ids: set[str] = set()
+    if ANNOTATED_TAG in tag_values:
+        annotated_ids = set(await store.list_event_ids_with_any_annotation(case_id, source_ids))
+    return TagFilter(
+        tag_values=tag_values,
+        postgres_event_ids=list({*ann_ids, *sigma_ids, *annotated_ids}),
+    )
 
 
 def _intersect_optional(*id_lists: list[str] | None) -> list[str] | None:
@@ -609,8 +653,9 @@ async def list_events(
         default=None,
         description=(
             "JSON object mapping a `filters` field to its match mode "
-            '("exact"|"wildcard"|"regex"), e.g. {"src_ip":"wildcard"}. '
-            "Absent fields match exact."
+            '("exact"|"wildcard"|"regex"|"empty"), e.g. {"src_ip":"wildcard"}. '
+            'Absent fields match exact. "empty" ignores the field\'s values '
+            "and matches rows where it has no value at all."
         ),
     ),
     exclusion_modes: str | None = Query(
@@ -673,8 +718,8 @@ async def list_events(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
 
     after_cursor = _parse_cursor(after, param_name="after")
     before_cursor = _parse_cursor(before, param_name="before")
@@ -796,7 +841,7 @@ class BulkAnnotateByFilterRequest(BaseModel):
     )
     filter_modes: str | None = Field(
         default=None,
-        description='JSON match-mode map for `filters`, e.g. {"src_ip":"wildcard"}.',
+        description='JSON match-mode map for `filters`, e.g. {"src_ip":"wildcard"} or {"ua":"empty"}.',
     )
     exclusion_modes: str | None = Field(
         default=None,
@@ -855,8 +900,8 @@ async def bulk_annotate_by_filter(
     parsed_exclusions = _parse_multivalue_object(body.exclusions)
     parsed_filter_modes = _parse_modes_object(body.filter_modes)
     parsed_exclusion_modes = _parse_modes_object(body.exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
 
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
@@ -1008,7 +1053,12 @@ async def list_merged_tags(
     ann_tags = await store.list_distinct_tag_contents(case_id, source_ids)
     sigma_tags = await store.list_distinct_sigma_tags(case_id, source_ids)
     parser_tags = await run_in_threadpool(service.list_distinct_parser_tags, case_id, source_ids)
-    return {"tags": sorted(set(ann_tags) | set(sigma_tags) | set(parser_tags))}
+    tags = set(ann_tags) | set(sigma_tags) | set(parser_tags)
+    # Offered only when something in this timeline actually carries it, like
+    # every other value here — a facet that always matches nothing is noise.
+    if await store.has_any_annotation(case_id, source_ids):
+        tags.add(ANNOTATED_TAG)
+    return {"tags": sorted(tags)}
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")
@@ -1098,8 +1148,8 @@ async def count_events(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -1193,8 +1243,8 @@ async def get_histogram(
     parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
-    _validate_field_regexes(parsed_filters, parsed_filter_modes)
-    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    _validate_field_modes(parsed_filters, parsed_filter_modes)
+    _validate_field_modes(parsed_exclusions, parsed_exclusion_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -1468,8 +1518,8 @@ async def export_events(
                 raise HTTPException(
                     status_code=400, detail=f"invalid match mode {v!r} for field {k!r}"
                 )
-    _validate_field_regexes(body.filter.fields, body.filter.field_modes)
-    _validate_field_regexes(body.filter.exclude, body.filter.exclude_modes)
+    _validate_field_modes(body.filter.fields, body.filter.field_modes)
+    _validate_field_modes(body.filter.exclude, body.filter.exclude_modes)
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -1526,6 +1576,14 @@ async def export_events(
     # Pre-flight the expected row count over the *same* EventQuery, so the stream
     # can prove it emitted every matching row (and hard-fail if it didn't). Same
     # WHERE as the stream's keyset scan → identical scope.
+    #
+    # Second job, load-bearing: this is the last point at which a query-layer
+    # failure can still become a status code. Once StreamingResponse flushes
+    # headers, an exception from `iter_events` truncates a 200 — no exception
+    # handler runs. Because the count executes the identical WHERE, anything
+    # structurally wrong with the filter (an over-large membership list →
+    # QueryRequestTooLargeError → 413) surfaces here instead. Don't move this
+    # below the StreamingResponse construction.
     expected = await _run_regex_guarded(
         _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes),
         _get_query_service().count,
@@ -1682,6 +1740,42 @@ async def _resolve_analysis_windows(
     return _windows_from_definition(definition)
 
 
+async def _resolve_field_overrides(
+    case_id: str, timeline_id: str, detector: str
+) -> dict[str, bool] | None:
+    """Return this timeline's field declaration for *detector*, or None.
+
+    ``Timeline.field_overrides`` is ``{method_id: {field_token: bool}}`` — the
+    analysts' answer to a recommender that types fields syntactically. Only the
+    named method's slice is returned: a status code that is meaningless to
+    ``numeric_range`` is an excellent ``value_novelty`` field, so a declaration
+    is never global.
+
+    A method that selects no fields of its own gets ``None`` without a lookup
+    (:data:`FIELD_OVERRIDE_METHOD_IDS`). The PATCH endpoint refuses to store
+    those, so this is belt-and-braces — but it is what keeps the cache key and
+    the ``DetectorRun`` record from naming a declaration that steered nothing.
+    """
+    if detector not in FIELD_OVERRIDE_METHOD_IDS:
+        return None
+    timeline = await get_store().get_timeline(case_id, timeline_id)
+    if timeline is None:
+        return None
+    overrides = (timeline.field_overrides or {}).get(detector)
+    return dict(overrides) if overrides else None
+
+
+#: Sentinel for `_run_stat_detector(field_overrides=...)`: `None` is a real
+#: answer ("this timeline declares nothing for this method"), so a caller that
+#: already resolved the declaration — `/analysis/findings` builds it into its
+#: cache key — needs a way to hand it over rather than pay a second lookup.
+_RESOLVE_OVERRIDES: Any = object()
+
+
+async def _already_resolved(value: dict[str, bool] | None) -> dict[str, bool] | None:
+    return value
+
+
 async def _run_stat_detector(
     case_id: str,
     timeline_id: str,
@@ -1700,8 +1794,11 @@ async def _run_stat_detector(
     min_support: int | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    group_field: str | None = None,
+    max_gap_seconds: int | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
+    field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve analysis windows + normal dispositions, then dispatch to the detector.
 
@@ -1732,7 +1829,19 @@ async def _run_stat_detector(
         detector=detector,
     )
     windows_task = _resolve_analysis_windows(store, case_id, timeline_id, baseline_id)
-    normal_rows, windows = await asyncio.gather(normal_task, windows_task)
+    # Resolved here rather than by each caller: every entry point into a
+    # detector — the sweep, an explicit run, tagging, the agent — must see the
+    # same declaration, and this is the one place all four pass through. A
+    # caller that already read it hands it over instead (see
+    # _RESOLVE_OVERRIDES), so a cache miss costs one timeline read, not two.
+    overrides_task = (
+        _resolve_field_overrides(case_id, timeline_id, detector)
+        if field_overrides is _RESOLVE_OVERRIDES
+        else _already_resolved(field_overrides)
+    )
+    normal_rows, windows, field_overrides = await asyncio.gather(
+        normal_task, windows_task, overrides_task
+    )
     allowlist: set[tuple[str, str]] | None = {
         (d.field, d.value) for d in normal_rows if d.field is not None and d.value is not None
     } or None
@@ -1746,6 +1855,23 @@ async def _run_stat_detector(
         "windows_hash": windows.config_hash() if windows is not None else None,
         "dispositions_hash": dispositions_hash(normal_rows),
         "dispositions_count": len(normal_rows),
+        # Recorded for the same reason the windows and thresholds are: it
+        # changes which fields the detector picked for itself, so two runs that
+        # both read "auto" in `DetectorRun.params` can have scanned different
+        # fields. An exclusion reaches `warnings` on its own; an applied pin
+        # leaves no other trace.
+        #
+        # Only where it actually steered the run, though. An explicit `fields`
+        # bypasses the declaration in every detector, so recording it there
+        # would claim a declaration shaped a scan it never touched — the same
+        # "the run does not describe what was scanned" problem this key exists
+        # to fix, pointed the other way. (`_resolve_field_overrides` already
+        # returns None for the methods that select no fields at all.)
+        "field_overrides": (
+            dict(sorted(field_overrides.items()))
+            if field_overrides and _parse_novelty_fields(fields) is None
+            else None
+        ),
     }
 
     if detector == "timestamp_order":
@@ -1788,6 +1914,8 @@ async def _run_stat_detector(
         resolution["sequence_ngram"] = (
             ngram_size if ngram_size is not None else cfg.stat_sequence_ngram
         )
+        # D14: None = no gap bound (pre-1.8.6 behavior).
+        resolution["sequence_max_gap_seconds"] = max_gap_seconds
         try:
             result = await run_in_threadpool(
                 svc.find_sequence_novelty,
@@ -1802,6 +1930,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                max_gap_seconds=max_gap_seconds,
             )
             return result, resolution
         except ValueError as exc:
@@ -1818,6 +1947,9 @@ async def _run_stat_detector(
         resolution["motif_min_support"] = (
             min_support if min_support is not None else cfg.stat_motif_min_support
         )
+        # D14: same gap bound as sequence_novelty — both detectors must agree
+        # on what a sequence is.
+        resolution["motif_max_gap_seconds"] = max_gap_seconds
         try:
             result = await run_in_threadpool(
                 svc.find_sequence_motifs,
@@ -1835,6 +1967,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                max_gap_seconds=max_gap_seconds,
             )
             return result, resolution
         except ValueError as exc:
@@ -1855,6 +1988,7 @@ async def _run_stat_detector(
             exclude_event_ids=exclude_ids,
             allowlist=allowlist,
             field_mappings=field_mappings,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -1882,6 +2016,7 @@ async def _run_stat_detector(
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
+                field_overrides=field_overrides,
             )
             return result, resolution
         except ValueError as exc:
@@ -1900,22 +2035,32 @@ async def _run_stat_detector(
         )
 
     if detector == "charset":
-        result = await run_in_threadpool(
-            svc.find_charset_novelty,
-            case_id=case_id,
-            source_ids=source_ids,
-            source_offsets=source_offsets,
-            fields=parsed_fields,
-            limit=limit,
-            per_field_limit=cfg.stat_per_field_limit,
-            rarity_floor=cfg.stat_charset_rarity_floor,
-            windows=windows,
-            exclude_event_ids=exclude_ids,
-            allowlist=allowlist,
-            field_mappings=field_mappings,
-            inventory=inventory,
-            inventory_total=inventory_total,
-        )
+        # D14: per-identifier scoping — one learned alphabet per group value
+        # (None = one merged alphabet per field, the pre-1.8.6 behavior).
+        resolution["charset_group_field"] = group_field
+        try:
+            result = await run_in_threadpool(
+                svc.find_charset_novelty,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                per_field_limit=cfg.stat_per_field_limit,
+                rarity_floor=cfg.stat_charset_rarity_floor,
+                windows=windows,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                group_field=group_field,
+                field_overrides=field_overrides,
+            )
+        except ValueError as exc:
+            # e.g. a non-string group_field, which would otherwise reach
+            # ClickHouse as a type error.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
     if detector == "entropy":
@@ -1933,6 +2078,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -1959,6 +2105,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -1992,6 +2139,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2018,6 +2166,7 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
+            field_overrides=field_overrides,
         )
         return result, resolution
 
@@ -2036,6 +2185,7 @@ async def _run_stat_detector(
         field_mappings=field_mappings,
         inventory=inventory,
         inventory_total=inventory_total,
+        field_overrides=field_overrides,
     )
     return result, resolution
 
@@ -2376,22 +2526,71 @@ def _apply_dismissals(
     return payload
 
 
-def _apply_confirmations(payload: dict[str, Any], confirmed_rows: list[Any]) -> dict[str, Any]:
+def _scope_key(scope: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """The two fields that identify a comparison: frame and baseline id.
+
+    Delegates to :func:`vestigo.db.postgres.scope_identity` so badging here and
+    the ``confirmed`` dedupe there cannot drift: one narrowing and the other
+    comparing whole dicts is how the same verdict gets written twice and then
+    displayed once.
+    """
+    return scope_identity(scope)
+
+
+def _apply_confirmations(
+    payload: dict[str, Any],
+    confirmed_rows: list[Any],
+    analysis_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Stamp ``"confirmed": true`` on findings covered by a confirmed disposition.
 
     Presentation-only, like :func:`_apply_dismissals` — the flag lets the UI
     render a durable confirmed state (badge, disabled re-confirm) instead of
     leaving the row indistinguishable from an untriaged one. Confirmed
     dispositions are always event-scoped with a concrete detector
-    (``_validate_scope``), so matching is by ``event_id`` alone; the
+    (``_validate_scope``), so the *event* is what identifies the finding; the
     dispositions read is already detector-filtered.
+
+    The event alone is not the whole claim, though. ``confirmed`` is the one
+    kind whose ``disposition_identity`` includes the scope, precisely so that
+    escalating a finding against the February baseline and again against the
+    March one are two claims. Badging by event alone collapses them back: the
+    February verdict would badge the row under March and disable Confirm, so
+    the second claim could never be made from the UI.
+
+    So, given a scope:
+
+    - a row reached under the *same* comparison sets ``confirmed``;
+    - a row reached under a *different* one sets ``confirmed_other_scope``,
+      which the rail renders as a muted marker with Confirm still live — this
+      is the "marked so you can re-examine them" the scope-change dialog
+      promises;
+    - a row carrying **no** scope sets ``confirmed`` under every comparison. It
+      predates scope provenance, and demoting it would silently unbadge
+      existing evidence to assert something the database never recorded.
+
+    ``analysis_scope=None`` means scope-blind, which is the older
+    ``/anomalies`` endpoints' behavior and what they keep passing.
     """
-    event_ids = {d.event_id for d in confirmed_rows if d.event_id is not None}
-    if not event_ids:
+    if not confirmed_rows:
         return payload
+    want = _scope_key(analysis_scope)
+    in_scope: set[str] = set()
+    other_scope: set[str] = set()
+    for d in confirmed_rows:
+        if d.event_id is None:
+            continue
+        recorded = getattr(d, "analysis_scope", None)
+        if analysis_scope is None or recorded is None or _scope_key(recorded) == want:
+            in_scope.add(d.event_id)
+        else:
+            other_scope.add(d.event_id)
     for f in payload.get("results", []):
-        if f.get("event_id") in event_ids:
+        event_id = f.get("event_id")
+        if event_id in in_scope:
             f["confirmed"] = True
+        elif event_id in other_scope:
+            f["confirmed_other_scope"] = True
     return payload
 
 
@@ -2444,11 +2643,28 @@ async def _persist_detector_run(
             or resolution.get("interval_min_rate_ratio"),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
+            # charset: per-identifier scoping (None = one alphabet per field).
+            "group_field": resolution.get("charset_group_field"),
+            # sequence_novelty / sequence_motif: gap bound (None = no bound).
+            # Disjoint keys, coalesced on presence rather than truthiness: the
+            # API floor is currently ge=1, but a persisted 0 must not fall
+            # through to the other detector's key if that floor ever moves.
+            "max_gap_seconds": (
+                resolution["sequence_max_gap_seconds"]
+                if "sequence_max_gap_seconds" in resolution
+                else resolution.get("motif_max_gap_seconds")
+            ),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
             "dispositions_hash": resolution.get("dispositions_hash"),
             "dispositions_count": resolution.get("dispositions_count"),
+            # The timeline's field declaration for this method at run time
+            # (None when it declared nothing). "auto" alone does not describe
+            # what was scanned: an analyst editing the declaration later gives
+            # the same params a different field set, and a pin that applied
+            # leaves no other trace — an exclusion at least reaches `warnings`.
+            "field_overrides": resolution.get("field_overrides"),
             # W2: the per-source clock-skew offsets applied to this run's
             # windows/timestamps (None when none was active), so the run stays
             # reproducible even if a source's offset is later changed.
@@ -2470,6 +2686,10 @@ async def get_detector_run(
     ``run_id`` — as referenced by ``list_events``/``histogram``/bulk-annotate/
     export's ``run_id`` filter param — actually contains, without re-running
     the detector.
+
+    Supported with no frontend caller by design: it is the explainability
+    affordance for a run id surfaced in a filter, an audit entry or an export.
+    See "Persisted detector runs" in ``docs/ANOMALY_DETECTION.md``.
     """
     store = get_store()
     run = await store.get_detector_run(case_id, run_id)
@@ -2546,6 +2766,23 @@ async def list_anomalies(
         description=(
             "sequence_motif only: minimum occurrences before an n-gram counts "
             "as a recurring motif. Omit to use the server default."
+        ),
+    ),
+    group_field: str | None = Query(
+        default=None,
+        description=(
+            "charset only: learn one reference alphabet per value of this field "
+            "(e.g. per host) instead of one merged alphabet per field. Omit for "
+            "whole-scope learning."
+        ),
+    ),
+    max_gap_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "sequence_novelty and sequence_motif only: break an n-gram when "
+            "consecutive events are more than this many seconds apart. Omit "
+            "for no gap bound."
         ),
     ),
     start: datetime | None = Query(
@@ -2660,6 +2897,8 @@ async def list_anomalies(
         min_support=min_support,
         start=start,
         end=end,
+        group_field=group_field,
+        max_gap_seconds=max_gap_seconds,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2834,6 +3073,18 @@ class TagAnomaliesRequest(BaseModel):
         ge=2,
         description="sequence_motif only: minimum occurrences for a recurring motif.",
     )
+    group_field: str | None = Field(
+        default=None,
+        description="charset only: learn one reference alphabet per value of this field.",
+    )
+    max_gap_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "sequence_novelty and sequence_motif only: break an n-gram when "
+            "consecutive events are more than this many seconds apart."
+        ),
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -2898,6 +3149,8 @@ async def tag_anomalies(
         min_support=body.min_support,
         start=body.start,
         end=body.end,
+        group_field=body.group_field,
+        max_gap_seconds=body.max_gap_seconds,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3245,6 +3498,15 @@ class PersistAnomalyFindingRequest(BaseModel):
         description="Human-readable finding description, as shown in the Analysis panel.",
     )
     details: dict[str, Any] = Field(default_factory=dict)
+    analysis_scope: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "The comparison this verdict was reached under (frame, baseline_id), as "
+            "recorded on the disposition. Confirmed is the only kind whose identity "
+            "includes it, so two analysts confirming the same event against different "
+            "baselines make two distinct claims rather than one deduplicated row."
+        ),
+    )
 
 
 @router.post("/{case_id}/sources/{source_id}/events/{event_id}/anomalies/persist")
@@ -3289,6 +3551,7 @@ async def persist_anomaly_finding(
         source_id=source_id,
         event_id=event_id,
         details=body.details,
+        analysis_scope=body.analysis_scope,
         created_by=user.id,
     )
     publish_annotation_change(case_id, None, event_id, user)
@@ -3302,6 +3565,7 @@ async def persist_anomaly_finding(
             "detector": body.detector,
             "source_id": source_id,
             "disposition_id": disposition.id,
+            "analysis_scope": body.analysis_scope,
         },
     )
     return {"annotation": annotation.to_dict(), "disposition": disposition.to_dict()}

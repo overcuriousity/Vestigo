@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
+import time
+
 from tests.conftest import as_admin, login
+
+
+def _wait_for_seeds(builds, expected, timeout=15.0):
+    """Demo seeds are dispatched into the app's loop after the login returns.
+
+    Fails on timeout rather than returning: a caller that proceeds on a seed
+    that never landed asserts against an empty list, which reads as a product
+    bug rather than the wait giving up.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and len(builds) < expected:
+        time.sleep(0.02)
+    assert len(builds) >= expected, (
+        f"only {len(builds)}/{expected} demo seeds ran within {timeout}s"
+    )
 
 
 def _create_user(client, username: str, password: str = "abcdefgh12") -> dict:
@@ -208,3 +225,34 @@ def test_list_cases_scoped_per_user_not_global(client, admin_bootstrap, store):
     resp = client.get("/api/cases/")
     names = {c["name"] for c in resp.json()["cases"]}
     assert {"admin-case", "alice-case"} <= names
+
+
+def test_admin_listing_hides_other_users_demo_cases(client, admin_bootstrap, store, builds):
+    """Everything-visible stops at other people's seeded demo cases.
+
+    One per account, all identical and all fabricated: on an instance with any
+    number of users they would crowd out the real work in an admin's list. The
+    admin's own copy still shows, and ordinary cases are untouched.
+    """
+    admin = as_admin(client, admin_bootstrap)  # first session seeds the admin's demo case
+    _create_user(client, "alice3")
+    client.post("/api/cases/", json={"name": "real-case"})
+
+    # Alice's client holds its portal open for the whole block. A bare
+    # TestClient starts and stops one per request, and the seed her login
+    # dispatches is a background task on that loop — it dies with the portal
+    # unless it happens to finish inside the request that started it.
+    with client.__class__(client.app) as alice_client:
+        login(alice_client, "alice3", "abcdefgh12")  # seeds alice's demo case
+        _wait_for_seeds(builds, 2)
+
+        cases = client.get("/api/cases/").json()["cases"]
+        demos = [c for c in cases if c["is_demo"]]
+        assert {c["name"] for c in cases} >= {"real-case"}
+        assert [c["owner_id"] for c in demos] == [admin["id"]], (
+            "an admin must see their own demo case and no one else's"
+        )
+
+        # Alice still has hers, and it is the only case she can see.
+        alice_cases = alice_client.get("/api/cases/").json()["cases"]
+        assert [c["is_demo"] for c in alice_cases] == [True]

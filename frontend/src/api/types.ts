@@ -8,6 +8,8 @@ export interface Case {
   owner_id: string | null;
   /** Investigation team this case belongs to, or null for a personal case. */
   team_id: string | null;
+  /** A seeded demo case (fabricated data). Other users' copies are never listed. */
+  is_demo: boolean;
   /** Caller's resolved access level, computed by the backend (api/deps.py). */
   access_level: "none" | "read" | "contribute" | "manage";
   created_at: string;
@@ -42,6 +44,14 @@ export interface User {
   last_login_at: string | null;
   /** Only present on /auth/me and /auth/me/password responses. */
   teams?: TeamMembershipSummary[];
+  /**
+   * Per-user UI state that has to outlive one browser — currently the agent's
+   * `agent_disabled_tools` and `column_advisor_optin` (issue #213), a
+   * `{ [timelineId]: true }` map of the timelines this user has opted in to AI
+   * column suggestions on. Written through the whitelisted
+   * `PUT /auth/me/preferences`.
+   */
+  preferences?: Record<string, unknown> | null;
 }
 
 export interface Team {
@@ -107,6 +117,8 @@ export interface Source {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  /** Generated converter that produced this Parquet source, when one did. */
+  converter_script_id?: string | null;
 }
 
 export interface Timeline {
@@ -130,8 +142,47 @@ export interface Timeline {
   embedded_at: string | null;
   /** Canonical field name -> ordered raw attribute keys (query-time merge). */
   field_mappings: Record<string, string[]> | null;
+  /** Data-derived default grid columns, shared by everyone with access. */
+  recommended_columns: RecommendedColumns | null;
+  /**
+   * Analysis methods kept out of this timeline's unprompted sweep, shared by
+   * everyone with access. A reading preference, never a gate — the analysis
+   * plan ignores it and a muted method still runs when asked for by name.
+   */
+  muted_methods: string[];
+  /**
+   * Per-method field declarations: `{method_id: {field_token: boolean}}`, where
+   * `true` pins a field into that detector's automatic selection and `false`
+   * takes it out. Shared by everyone with access, and advice rather than a
+   * gate — an explicit `fields` still scans an excluded field, and a run that
+   * held one back says so in its warnings.
+   */
+  field_overrides: Record<string, Record<string, boolean>>;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * A timeline's suggested event-grid columns (issue #213), derived from its own
+ * field statistics rather than a fixed default.
+ *
+ * `status` is the whole contract: `running` while a job is in flight,
+ * `ok` when `columns` should be applied, and `insufficient` when the backend
+ * looked and found nothing worth suggesting — in which case the grid keeps
+ * `DEFAULT_COLUMNS`. A per-user column choice always outranks this.
+ */
+export interface RecommendedColumns {
+  status: "ok" | "insufficient" | "running";
+  /** Grid column ids, `timestamp` first. Empty unless `status === "ok"`. */
+  columns: string[];
+  /** Column id -> why it was chosen; shown as a tooltip in the picker. */
+  reasons: Record<string, string>;
+  /** Which path produced this — the deterministic scorer, or the LLM on top. */
+  method: "heuristic" | "llm";
+  model: string | null;
+  source_ids: string[];
+  generated_at: string;
+  job_id: string | null;
 }
 
 /** Per-source presence of one raw attribute key (timeline wizard). */
@@ -171,6 +222,15 @@ export interface Event {
   /** Parser-derived tags (ClickHouse). Different from annotation tags. */
   tags: string[];
   attributes: Record<string, string>;
+  /**
+   * Attribute keys this row got from the timeline's `field_mappings` rather
+   * than from its source file (db/field_mappings.py::project_mapped_fields).
+   * Only present on the paged event query — absent on exports, on frozen
+   * `event_ref` story blocks, and whenever the timeline defines no mappings.
+   * A key stored under a canonical name is deliberately *not* listed: the
+   * source file did carry it.
+   */
+  mapped_fields?: string[];
   embedding_model: string | null;
   embedding_config_hash: string | null;
 }
@@ -205,6 +265,10 @@ export interface View {
   name: string;
   query: string;
   filter: Record<string, unknown>;
+  /** Set when this view was deleted while a story block still referenced it.
+   *  Such views never appear in a list response; the field exists so a client
+   *  resolving one directly can tell. */
+  deleted_at?: string | null;
   created_at: string;
 }
 
@@ -247,8 +311,28 @@ export interface Job {
   status: "queued" | "running" | "completed" | "failed";
   progress:
     | {
-        total: number;
-        processed: number;
+        /** Unit-count progress. Optional: a job may publish only a `phase`
+         * before it knows how many items the phase covers. */
+        total?: number;
+        processed?: number;
+        /** Coarse stage within a multi-stage job. Vocabulary is per `kind`:
+         * `case_export` → queued|postgres|events|blobs|manifest
+         * (transfer/exporter.py), `case_import` → queued|verify|postgres|
+         * events|blobs|stats (transfer/importer.py). The same token means
+         * opposite directions in the two, so always resolve copy through
+         * `lib/jobPhases.ts` keyed on `kind`. */
+        phase?: string;
+        /** `convert_ingest`: generation round counters and the script the job
+         * produced (also present on failure, so the tray can link to it). */
+        attempt?: number;
+        max_attempts?: number;
+        converter_script_id?: string | null;
+        /** Size of the received archive (`case_import` only, set at job
+         * creation). Note `JobStore.update` *merges* progress dicts
+         * (core/jobs.py), so this survives every later phase write. */
+        bytes?: number;
+        /** Total archive bytes (`case_export`, emitted on completion). */
+        bytes_total?: number;
         /** Kalman-filtered throughput/ETA (bytes ingest jobs only; see
          * core/eta.py). Absent for embed jobs and before the second batch. */
         rate_bps?: number | null;
@@ -295,6 +379,12 @@ export interface ValueNoveltyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One anomalous time window from the frequency detector. */
@@ -316,6 +406,12 @@ export interface FrequencyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One rare / first-seen field *combination* from the value_combo detector. */
@@ -336,6 +432,12 @@ export interface ValueComboFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One out-of-range numeric value from the numeric_range detector. */
@@ -357,6 +459,12 @@ export interface NumericRangeFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One value containing never-seen characters from the charset detector. */
@@ -377,6 +485,12 @@ export interface CharsetFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One entropy-outlier value from the entropy detector. */
@@ -400,6 +514,12 @@ export interface EntropyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One value-share shift between windows from the proportion_shift detector. */
@@ -432,6 +552,12 @@ export interface ProportionShiftFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One arrival-cadence change between windows from the interval_periodicity detector. */
@@ -466,6 +592,12 @@ export interface IntervalPeriodicityFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
@@ -491,6 +623,12 @@ export interface SequenceNoveltyFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One out-of-order timestamp finding from the timestamp_order detector. */
@@ -514,6 +652,12 @@ export interface TimestampOrderFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One whole-field distribution change between windows from the value_distribution_drift detector. */
@@ -546,6 +690,12 @@ export interface DistributionDriftFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 /** One recurring event-order n-gram from the sequence_motif miner. */
@@ -577,6 +727,12 @@ export interface SequenceMotifFinding {
   dismissed?: boolean;
   /** Present (true) when a confirmed disposition covers this finding's event. */
   confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
 }
 
 export type AnomalyFinding =
@@ -706,6 +862,13 @@ export interface Disposition {
   event_id: string | null;
   note: string | null;
   details: Record<string, unknown> | null;
+  /**
+   * The comparison the verdict was reached under (`frame`, `baseline_id`).
+   * Null on rows written before scope provenance existed. Only `confirmed`
+   * folds it into the row's identity, so only that kind can hold two rows for
+   * one finding — one per scope.
+   */
+  analysis_scope?: { frame?: string; baseline_id?: string | null } | null;
   created_by: string | null;
   created_at: string | null;
 }
@@ -887,23 +1050,64 @@ export interface UploadResult {
   job_id?: string | null;
 }
 
+/** Optional subsystems that are hidden entirely when unconfigured. Keys match
+ * `CAPABILITY_KEYS` in `src/vestigo/core/capabilities.py`. */
+export interface Capabilities {
+  embeddings: boolean;
+  agent: boolean;
+  mcp: boolean;
+  oidc: boolean;
+  enrichers: boolean;
+  sigma: boolean;
+  transfer: boolean;
+  /** Demo-case seeding is enabled on this instance. */
+  demo_case: boolean;
+  /** The model may write converter scripts for plain-text uploads. */
+  converter_generation: boolean;
+  /** A saved converter script may be re-run over a new upload (switch on;
+   * needs no model — the script sends nothing). */
+  converter_reuse: boolean;
+}
+
+/**
+ * `/api/health`. Everything below `oidc_enabled` requires a session: which
+ * optional subsystems an instance runs is an inventory of its attack surface,
+ * while the login page legitimately needs to know the app is up and whether to
+ * render the SSO button. Hence the optional fields — an anonymous response
+ * carries only the first three.
+ */
 export interface HealthResponse {
   status: "ok";
   version: string;
   oidc_enabled: boolean;
+  /** One entry per optional subsystem — false means "unconfigured", and the UI
+   * renders no entry point for it. The flat flags below are older aliases. */
+  capabilities?: Capabilities;
   /** False when neither local embedding deps nor a remote endpoint are configured. */
-  embeddings_available: boolean;
+  embeddings_available?: boolean;
   /**
    * True only when VESTIGO_AGENT_* is configured and the LLM endpoint
    * answered the backend's probe — the agent UI renders nothing otherwise.
    */
-  agent_available: boolean;
+  agent_available?: boolean;
   /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
-  mcp_enabled: boolean;
+  mcp_enabled?: boolean;
+  /**
+   * The tag every annotated event carries, derived at read time rather than
+   * stored (`ANNOTATED_TAG` in `api/routers/events.py`). Served instead of
+   * mirrored so the resolver and the grid cannot end up naming different
+   * tags — a copy here would drift silently, since a renamed tag stops
+   * matching without raising anything.
+   */
+  annotated_tag?: string;
 }
 
-/** Non-default field-filter match modes; "exact" is implied by absence. */
-export type FieldMatchMode = "wildcard" | "regex";
+/**
+ * Non-default field-filter match modes; "exact" is implied by absence.
+ * "empty" is a presence predicate rather than a comparison: it carries no
+ * value, and its value list is a `[""]` placeholder on the wire.
+ */
+export type FieldMatchMode = "wildcard" | "regex" | "empty";
 
 /** Filter params for the events query */
 export interface EventFilters {
@@ -1353,4 +1557,160 @@ export interface ExportRequest {
     annotation_tag_value?: string;
     run_id?: string;
   };
+}
+
+// ---------------------------------------------------------------------------
+// Stories (W7)
+// ---------------------------------------------------------------------------
+
+export type StoryBlockKind = "markdown" | "view_ref" | "chart_ref" | "event_ref";
+
+export interface Story {
+  id: string;
+  case_id: string;
+  title: string;
+  description: string | null;
+  created_by: string;
+  updated_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Per-kind block content, mirroring the backend's pydantic models
+ * (`vestigo/stories/schemas.py`) field for field.
+ *
+ * Typed as a discriminated union rather than `Record<string, unknown>` on
+ * purpose: the untyped version forced every renderer to re-assert the shape
+ * locally, and a mismatch between what the server freezes and what a mark
+ * reads then surfaces as a blank chart in a signed report instead of a build
+ * failure. Narrow on `kind`, don't cast.
+ */
+export interface MarkdownBlockContent {
+  text: string;
+}
+
+export interface ViewRefBlockContent {
+  view_id: string;
+  timeline_id: string;
+  display?: { limit?: number; columns?: string[] | null };
+}
+
+export interface ChartRefBlockContent {
+  chart_id: string;
+  timeline_id: string;
+}
+
+export interface EventRefBlockContent {
+  event_id: string;
+  source_id: string;
+  caption?: string | null;
+}
+
+interface StoryBlockBase {
+  id: string;
+  story_id: string;
+  position: number;
+  origin: "user" | "agent";
+  version: number;
+  created_by: string;
+  updated_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type StoryBlock =
+  | (StoryBlockBase & { kind: "markdown"; content: MarkdownBlockContent })
+  | (StoryBlockBase & { kind: "view_ref"; content: ViewRefBlockContent })
+  | (StoryBlockBase & { kind: "chart_ref"; content: ChartRefBlockContent })
+  | (StoryBlockBase & { kind: "event_ref"; content: EventRefBlockContent });
+
+/** One variant of `StoryBlock`, selected by kind. */
+export type StoryBlockOf<K extends StoryBlockKind> = Extract<StoryBlock, { kind: K }>;
+
+export interface StoryExportMeta {
+  id: string;
+  story_id: string;
+  case_id: string;
+  snapshot_hash: string;
+  html_hash: string | null;
+  has_artifact: boolean;
+  created_by: string;
+  created_at: string;
+}
+
+export interface SnapshotResolution {
+  executed_at: string;
+  timeline_id?: string;
+  error: string | null;
+}
+
+export interface SnapshotViewData {
+  rows: Record<string, unknown>[];
+  row_count_total: number;
+  rows_included: number;
+  truncated: boolean;
+  columns: string[] | null;
+}
+
+export interface SnapshotChartData {
+  name: string;
+  config: Record<string, unknown>;
+  /** The aggregation the server actually ran, which selects the mark. */
+  resolved: { data_kind: string; compare_mode: string } | null;
+  warnings: string[];
+  /** Raw aggregation payload — reshape via `snapshotToChartResult`, never cast. */
+  chart: unknown;
+}
+
+export interface SnapshotEventData {
+  event: Record<string, unknown>;
+  caption: string | null;
+}
+
+interface SnapshotBlockBase {
+  id: string;
+  origin: string;
+  resolution: SnapshotResolution;
+}
+
+/**
+ * One frozen block of an export snapshot, discriminated on `kind`.
+ *
+ * `data` is null exactly when the server could not resolve the block (see
+ * `resolution.error`) — that pairing is the "honest gap" contract, so both
+ * have to be checked together before rendering.
+ */
+export type SnapshotBlock =
+  | (SnapshotBlockBase & {
+      kind: "markdown";
+      ref: MarkdownBlockContent;
+      data: MarkdownBlockContent | null;
+    })
+  | (SnapshotBlockBase & {
+      kind: "view_ref";
+      ref: ViewRefBlockContent & { name?: string; query?: string; filter?: Record<string, unknown> };
+      data: SnapshotViewData | null;
+    })
+  | (SnapshotBlockBase & {
+      kind: "chart_ref";
+      ref: ChartRefBlockContent & { name?: string };
+      data: SnapshotChartData | null;
+    })
+  | (SnapshotBlockBase & {
+      kind: "event_ref";
+      ref: EventRefBlockContent;
+      data: SnapshotEventData | null;
+    });
+
+export interface StorySnapshot {
+  v: 1;
+  story: {
+    id: string;
+    title: string;
+    case_id: string;
+    exported_at: string;
+    exported_by: string;
+  };
+  blocks: SnapshotBlock[];
 }

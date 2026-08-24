@@ -8,12 +8,17 @@ import { useQuery } from "@tanstack/react-query";
 import { jobsApi } from "@/api/jobs";
 import { JobStatusRow } from "@/components/ui/JobStatusRow";
 import { Spinner } from "@/components/ui/Spinner";
+import { jobOutcomeNote, jobPhaseLabel } from "@/lib/jobPhases";
 
 const KIND_LABELS: Record<string, string> = {
   ingest: "Ingest",
   embed: "Embed",
   enrich: "Enrich",
   sigma_run: "Sigma scan",
+  case_export: "Case export",
+  case_import: "Case import",
+  column_recommend: "Column suggestion",
+  convert_ingest: "AI conversion",
 };
 
 interface Props {
@@ -57,6 +62,14 @@ export function CaseJobsPanel({ caseId }: Props) {
               status={job.status}
               progress={job.progress}
               error={job.error}
+              detail={jobPhaseLabel(job.kind, job.progress)}
+              footer={
+                job.status === "completed" && jobOutcomeNote(job.kind, job.result) ? (
+                  <div className="mt-1 text-[var(--color-warning)]">
+                    {jobOutcomeNote(job.kind, job.result)}
+                  </div>
+                ) : null
+              }
             />
           ))}
         </div>

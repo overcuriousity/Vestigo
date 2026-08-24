@@ -40,7 +40,7 @@ const VIEW_KEYS: Record<string, unknown[]> = {
   numeric_range: ["anomalies", CASE, TL, "numeric_range", "bl", "__auto__", 50, "dismissed-hidden"],
   value_combo: ["anomalies", CASE, TL, "value_combo", "bl", "__auto__", 50, "dismissed-hidden"],
   timestamp_order: ["anomalies", CASE, TL, "timestamp_order", 0, 100, "dismissed-hidden"],
-  charset: ["anomalies", CASE, TL, "charset", "bl", "__auto__", 50, "dismissed-hidden"],
+  charset: ["anomalies", CASE, TL, "charset", "bl", "__auto__", "__scope__", 50, "dismissed-hidden"],
   entropy: ["anomalies", CASE, TL, "entropy", "bl", "__auto__", 50, "dismissed-hidden"],
   frequency: ["anomalies", CASE, TL, "frequency", "host", 3, "bl", 30, "dismissed-hidden"],
   proportion_shift: ["anomalies", CASE, TL, "proportion_shift", "bl", "__auto__", 50, "dismissed-hidden"],
@@ -169,7 +169,13 @@ describe("useDisposition optimistic filtering", () => {
       CASE,
       "s1",
       "ev1",
-      expect.objectContaining({ detector: "charset", content: "confirmed finding" }),
+      expect.objectContaining({
+        detector: "charset",
+        content: "confirmed finding",
+        // `confirmed` is the only kind whose identity includes the scope, so
+        // dropping it here would collapse one claim per baseline into one row.
+        analysis_scope: { frame: "self", baseline_id: null },
+      }),
     );
     // Row stays, optimistically flagged confirmed — the durable badge state.
     const data = qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.charset);

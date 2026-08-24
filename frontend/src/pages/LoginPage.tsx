@@ -32,6 +32,10 @@ export function LoginPage() {
       // cached 401 would otherwise survive until the refetch settles and sign
       // us right back out (see useCurrentUser).
       queryClient.setQueryData(["auth", "me"], user);
+      // Health was fetched anonymously to render this page, so it carries no
+      // capabilities; without this the whole app would gate on the optimistic
+      // fallback until the 15 s poll came round.
+      queryClient.invalidateQueries({ queryKey: ["health"] });
       navigate(from, { replace: true });
     },
     // Rejected logins render inline under the form (and 401 here is the

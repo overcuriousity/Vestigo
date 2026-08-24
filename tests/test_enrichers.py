@@ -1,4 +1,4 @@
-"""Tests for the enricher subsystem: registry, GeoIP plugin, and Postgres CRUD."""
+"""Tests for the enricher subsystem: registry, GeoIP/ASN plugins, and Postgres CRUD."""
 
 from __future__ import annotations
 
@@ -8,16 +8,15 @@ import pytest
 import pytest_asyncio
 
 from vestigo.db.postgres import PostgresStore
+from vestigo.enrichers.asn import IP_REGEX as ASN_IP_REGEX
+from vestigo.enrichers.asn import ASNEnricher
 from vestigo.enrichers.base import AvailabilityResult
-from vestigo.enrichers.geoip import IPV4_REGEX, GeoIPEnricher
+from vestigo.enrichers.geoip import IP_REGEX, GeoIPEnricher
 
 
 @pytest_asyncio.fixture()
-async def store(tmp_path):
-    db_path = tmp_path / "test_enrichers.db"
-    url = f"sqlite+aiosqlite:///{db_path}"
-    s = PostgresStore(url=url)
-    await s.init_schema()
+async def store(pg_database):
+    s = PostgresStore(url=pg_database)
     yield s
     await s.engine.dispose()
 
@@ -33,20 +32,41 @@ def test_geoip_unavailable_when_database_missing(tmp_path):
     assert result == AvailabilityResult(False, "GeoLite2 database not uploaded")
 
 
-def test_geoip_eligibility_regex_matches_ipv4():
+def test_geoip_eligibility_regex_matches_ip():
     enricher = GeoIPEnricher(db_path=None)
     assert enricher.is_field_eligible("8.8.8.8")
     assert enricher.is_field_eligible("192.168.1.1")
+    assert enricher.is_field_eligible("2001:db8::1")
+    assert enricher.is_field_eligible("::1")
     assert not enricher.is_field_eligible("not-an-ip")
     assert not enricher.is_field_eligible("999.999.999.999")
 
 
-def test_ipv4_regex_rejects_hostnames_and_partial_matches():
+def test_ip_regex_rejects_hostnames_and_partial_matches():
     import re
 
-    assert re.match(IPV4_REGEX, "10.0.0.1")
-    assert not re.match(IPV4_REGEX, "example.com")
-    assert not re.match(IPV4_REGEX, "10.0.0.1extra")
+    assert re.match(IP_REGEX, "10.0.0.1")
+    assert re.match(IP_REGEX, "2001:0db8:85a3:0000:0000:8a2e:0370:7334")
+    assert re.match(IP_REGEX, "fe80::1%eth0") is None  # zone ids are out of scope
+    assert re.match(IP_REGEX, "::ffff:10.0.0.1")
+    assert not re.match(IP_REGEX, "example.com")
+    assert not re.match(IP_REGEX, "10.0.0.1extra")
+    assert not re.match(IP_REGEX, "2001:db8::1extra")
+    # GeoIP and ASN deliberately share the same eligibility gate.
+    assert ASN_IP_REGEX == IP_REGEX
+
+
+def test_ip_regex_does_not_match_mac_addresses_or_times():
+    # The pattern is pushed into ClickHouse by check_eligibility, so a match on
+    # these would report a pcap/DHCP/ARP/Windows-network timeline as eligible
+    # and auto-run a full-timeline scan that can only produce zero rows.
+    import re
+
+    for value in ("00:1a:2b:3c:4d:5e", "AA:BB:CC:DD:EE:FF", "13:45:02", "a:b:c", "1:2:3:4:5:6:7"):
+        assert re.match(IP_REGEX, value) is None, value
+    # ...while every real IPv6 form still matches.
+    for value in ("::", "::1", "fe80::", "2001:db8::1", "1:2:3:4:5:6:7:8", "::ffff:10.0.0.1"):
+        assert re.match(IP_REGEX, value), value
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +87,9 @@ def test_registry_lists_geoip_and_caches_availability(tmp_path, monkeypatch):
     registry.register(GeoIPEnricher(db_path=tmp_path / "missing.mmdb"))
 
     assert registry.get_enricher("geoip") is not None
+    assert registry.get_enricher("asn") is not None
     assert any(e.key == "geoip" for e in registry.all_enrichers())
+    assert any(e.key == "asn" for e in registry.all_enrichers())
 
     availability = registry.refresh_availability()
     assert availability["geoip"].available is False
@@ -384,7 +406,7 @@ def test_process_batch_dedups_lookups_per_distinct_value():
 
 
 @pytest.mark.asyncio
-async def test_init_schema_drops_legacy_staging_table(tmp_path):
+async def test_init_schema_drops_legacy_staging_table(blank_pg_database):
     """M16 destructive migration: a legacy row-per-field staging table
     (recognized by its field_key column) is dropped and recreated in the
     row-per-(job, event) shape; orphaned pre-upgrade rows are discarded.
@@ -396,8 +418,7 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
 
     from vestigo.db.postgres import Base
 
-    db_path = tmp_path / "legacy_staging.db"
-    s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
+    s = PostgresStore(url=blank_pg_database)
     async with s.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # A real pre-Alembic database has only the revision-0001 tables.
@@ -415,7 +436,28 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.execute(text("DROP TABLE agent_proposals"))
         # 0011 adds the instance-wide agent settings table.
         await conn.execute(text("DROP TABLE agent_settings"))
+        # 0020 adds the instance settings table.
+        await conn.execute(text("DROP TABLE app_settings"))
+        # 0026 adds the analysis result cache and the verdict's analysis scope.
+        await conn.execute(text("DROP TABLE analysis_cache"))
+        # 0031 adds the raw-input hash a generated converter was run over (0032 makes its
+        # index unique; it also names converter_script_id, so it goes before 0030's column).
+        await conn.execute(text("DROP INDEX ix_sources_converter_input"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN converter_input_hash"))
+        # 0030 adds the generated-converter scripts and the source back-reference.
+        await conn.execute(text("DROP TABLE converter_scripts"))
+        await conn.execute(text("DROP INDEX ix_sources_converter_script_id"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN converter_script_id"))
+        # 0016 adds the Stories tables.
+        await conn.execute(text("DROP TABLE stories"))
+        await conn.execute(text("DROP TABLE story_blocks"))
+        await conn.execute(text("DROP TABLE story_exports"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
+        # 0025 adds the soft-delete marker for story-referenced views. Its
+        # index has to go first — SQLite refuses to drop a column an index
+        # still names.
+        await conn.execute(text("DROP INDEX ix_views_deleted_at"))
+        await conn.execute(text("ALTER TABLE views DROP COLUMN deleted_at"))
         # 0005 adds completed_source_ids to the job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
         # 0001-era annotations still carried `pinned` (retired by 0004).
@@ -424,11 +466,23 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         )
         # 0012 adds the per-user preferences blob.
         await conn.execute(text("ALTER TABLE users DROP COLUMN preferences"))
+        # 0022 adds the demo-case seed stamp.
+        await conn.execute(text("ALTER TABLE users DROP COLUMN demo_case_seeded_at"))
+        # 0023 marks seeded demo cases.
+        await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
+        # 0024 adds the per-timeline recommended grid columns.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN recommended_columns"))
+        # 0028 adds the per-timeline muted analysis methods.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN muted_methods"))
+        # 0029 adds the per-timeline, per-method field overrides.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN field_overrides"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(
                 "CREATE TABLE enrichment_results_staging ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id VARCHAR(64), "
+                # SERIAL, not SQLite's AUTOINCREMENT: this DDL now runs against
+                # the real PostgreSQL the migration will meet in production.
+                "id SERIAL PRIMARY KEY, job_id VARCHAR(64), "
                 "case_id VARCHAR(64), source_id VARCHAR(64), timeline_id VARCHAR(64), "
                 "event_id VARCHAR(64), enricher_key VARCHAR(128), "
                 "field_key VARCHAR(128), value VARCHAR(1024), computed_at TIMESTAMP)"
@@ -589,6 +643,82 @@ async def test_reconcile_grants_provenance_to_marker_completed_sources(store):
     assert len(provenance) == 1
     assert provenance[0].enricher_config_hash == "hash1"
     assert [r.job_id for r in recovered] == ["job1"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_holds_the_run_slot_while_applying(store, monkeypatch):
+    """Recovery must look like a live run to every other surface while it applies.
+
+    ``_startup_recovery`` runs *after* the app is serving, so without a claim
+    the enrichers dialog sees marker-present + slot-not-held, calls the marker
+    dead and offers Resume — and the resume route's own check would pass. Two
+    applies of one job id share ClickHouse scratch tables keyed on the job id
+    alone while ``_APPLY_LOCKS`` only serializes per source, so they would
+    finalize partitions from each other's rows.
+    """
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    held: list[str | None] = []
+    real_resume = _jobs.resume_enrichment_run
+
+    async def _spy(store_, ch_, run, **kwargs):
+        held.append(_jobs.get_active_enricher_run(run.timeline_id, run.enricher_key))
+        return await real_resume(store_, ch_, run, **kwargs)
+
+    monkeypatch.setattr(_jobs, "resume_enrichment_run", _spy)
+    recovered = await _jobs.reconcile_orphaned_enrichment_jobs(store, _RecordingClickHouse())
+
+    assert [r.job_id for r in recovered] == ["job1"]
+    assert held == ["job1"]
+    # Released afterwards, or the re-run scheduled next would never get a slot.
+    assert _jobs.get_active_enricher_run("t1", "geoip") is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_releases_the_run_slot_when_the_apply_fails(store):
+    """A failed recovery must not wedge the (timeline, enricher) at 409 until restart."""
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    assert await _jobs.reconcile_orphaned_enrichment_jobs(store, _BrokenClickHouse()) == []
+    assert _jobs.get_active_enricher_run("t1", "geoip") is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_a_marker_whose_slot_is_already_held(store):
+    """A run live under this process is not an orphan, whatever the marker says."""
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    _jobs.try_claim_enricher_run("t1", "geoip", "someone-else")
+    try:
+        ch = _RecordingClickHouse()
+        assert await _jobs.reconcile_orphaned_enrichment_jobs(store, ch) == []
+        assert ch.applied == []
+        # Marker and staged rows untouched — the slot holder still owns them.
+        assert [o.job_id for o in await store.list_orphaned_enrichment_job_runs()] == ["job1"]
+        assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+    finally:
+        _jobs.release_enricher_run("t1", "geoip", "someone-else")
 
 
 @pytest.mark.asyncio
@@ -802,10 +932,10 @@ def test_enricher_run_guard_claim_release():
     # Second claim reports the conflicting job.
     assert jobs.try_claim_enricher_run("t1", "geoip", "jobB") == "jobA"
     # Release by a non-owner is a no-op.
-    jobs._release_enricher_run("t1", "geoip", "jobB")
+    jobs.release_enricher_run("t1", "geoip", "jobB")
     assert jobs.get_active_enricher_run("t1", "geoip") == "jobA"
     # Owner release frees the slot.
-    jobs._release_enricher_run("t1", "geoip", "jobA")
+    jobs.release_enricher_run("t1", "geoip", "jobA")
     assert jobs.get_active_enricher_run("t1", "geoip") is None
 
 
@@ -1080,6 +1210,29 @@ def test_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_pa
         enricher.enrich_value("8.8.8.8")
 
 
+def test_geoip_enrich_value_skips_ipv6_on_ipv4_only_database(tmp_path):
+    # maxminddb raises a bare ValueError for an IPv6 lookup against an
+    # IPv4-only .mmdb; jobs.py re-raises anything but AddressNotFoundError, so
+    # without the guard one IPv6-shaped value would fail the whole run.
+    class _V4Meta:
+        ip_version = 4
+
+    class _V4Reader:
+        def metadata(self):
+            return _V4Meta()
+
+        def city(self, value):
+            raise ValueError("you attempted to look up an IPv6 address in an IPv4-only database.")
+
+    enricher = GeoIPEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _V4Reader()
+    assert enricher.enrich_value("2001:db8::1") is None
+    # The guard is scoped to IPv6: an IPv4 lookup still reaches the reader
+    # (this fake raises for every address, so the error must propagate).
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
 @pytest.mark.asyncio
 async def test_manual_run_skips_sources_already_enriched_at_current_config(store, monkeypatch):
     from fastapi import BackgroundTasks
@@ -1163,7 +1316,7 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
     # Release the slot claimed by the re-run so it doesn't leak into other tests.
     from vestigo.enrichers import jobs as _jobs
 
-    _jobs._release_enricher_run(timeline.id, "stub-skip", res["job_id"])
+    _jobs.release_enricher_run(timeline.id, "stub-skip", res["job_id"])
 
     # force=True bypasses matching provenance entirely — the recovery path when
     # provenance claims "enriched" but the events disagree (e.g. provenance
@@ -1188,7 +1341,56 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
     assert res["job_id"] is not None
     assert res["source_ids"] == ["sk"]
     assert res["skipped_source_ids"] == []
-    _jobs._release_enricher_run(timeline.id, "stub-skip", res["job_id"])
+    _jobs.release_enricher_run(timeline.id, "stub-skip", res["job_id"])
+
+
+@pytest.mark.asyncio
+async def test_manual_run_409s_when_the_claim_loses_a_race(store, monkeypatch):
+    """The claim, not the early read, is what decides the conflict.
+
+    Several awaits separate the two (the marker query, the ``config_hash``
+    thread hop, the provenance query), so two "Run now" clicks — or one racing
+    ``_trigger_automatic_enrichments`` from a concurrent ingest — can both pass
+    the read. Spawning anyway would put two applies on one source *and* make the
+    loser's live marker look dead to the enrichers dialog, which would then
+    offer Resume on a running job. Simulated here by holding the slot while the
+    early read reports it free.
+    """
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import run_timeline_enricher
+    from vestigo.core.jobs import get_job_store
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-race")
+    await store.set_source_status("c1", "s1", "ready")
+
+    _jobs.try_claim_enricher_run(timeline.id, "stub-race", "winner-job")
+    monkeypatch.setattr(_jobs, "get_active_enricher_run", lambda *a, **k: None)
+    background_tasks = BackgroundTasks()
+    try:
+        with pytest.raises(HTTPException) as excinfo:
+            await run_timeline_enricher(
+                timeline_id=timeline.id,
+                enricher_key="stub-race",
+                background_tasks=background_tasks,
+                case=case,
+                user=User(id="u1", username="t", is_admin=True, is_active=True),
+            )
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-race", "winner-job")
+
+    assert excinfo.value.status_code == 409
+    assert "winner-job" in excinfo.value.detail
+    # No enrichment scheduled, and the loser's job is not left pending forever.
+    assert background_tasks.tasks == []
+    losers = [
+        j
+        for j in get_job_store().list_by_case(case.id)
+        if j.kind == "enrich" and j.status == "failed"
+    ]
+    assert losers and losers[-1].error == "Enrichment already running"
 
 
 @pytest.mark.asyncio
@@ -1252,7 +1454,7 @@ async def test_manual_run_409_and_auto_trigger_skip_when_run_active(store, monke
         await _trigger_automatic_enrichments(store, None, job_store, "cg", "sg")
         assert job_store._jobs == {}
     finally:
-        jobs._release_enricher_run(timeline.id, "stub-guard", "existing-job")
+        jobs.release_enricher_run(timeline.id, "stub-guard", "existing-job")
 
 
 @pytest.mark.asyncio
@@ -1476,3 +1678,1197 @@ async def test_eligibility_fanout_builds_one_clickhouse_store_per_check(store, m
     assert created == 2
     assert len(seen_stores) == 2
     assert seen_stores[0] is not seen_stores[1]
+
+
+# ---------------------------------------------------------------------------
+# ASN enricher
+# ---------------------------------------------------------------------------
+
+
+class _FakeASNMeta:
+    build_epoch = 1700000000
+    database_type = "GeoLite2-ASN"
+    ip_version = 6
+
+
+class _FakeASNResponse:
+    def __init__(self, number=64512, org="Example Hosting GmbH"):
+        self.autonomous_system_number = number
+        self.autonomous_system_organization = org
+
+
+def test_asn_unavailable_when_database_missing(tmp_path):
+    enricher = ASNEnricher(db_path=tmp_path / "missing.mmdb")
+    result = enricher.check_availability()
+    assert result == AvailabilityResult(False, "GeoLite2-ASN database not uploaded")
+
+
+def test_asn_eligibility_regex_matches_ip():
+    enricher = ASNEnricher(db_path=None)
+    assert enricher.is_field_eligible("8.8.8.8")
+    assert enricher.is_field_eligible("2001:db8::1")
+    assert not enricher.is_field_eligible("not-an-ip")
+
+
+def test_asn_output_fields_contract_locked():
+    # Order is part of config_hash() — a reorder silently changes every
+    # enricher identity, so lock the exact tuple.
+    assert ASNEnricher(db_path=None).output_fields == ("asn_number", "asn_org")
+
+
+def test_asn_enrich_value_maps_response(tmp_path):
+    class _FakeReader:
+        def metadata(self):
+            return _FakeASNMeta()
+
+        def asn(self, value):
+            return _FakeASNResponse()
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _FakeReader()
+    # IPv4 and IPv6 both resolve through the same path.
+    assert enricher.enrich_value("8.8.8.8") == {
+        "asn_number": "64512",
+        "asn_org": "Example Hosting GmbH",
+    }
+    assert enricher.enrich_value("2001:db8::1") == {
+        "asn_number": "64512",
+        "asn_org": "Example Hosting GmbH",
+    }
+
+
+def test_asn_enrich_value_miss_and_empty_response_return_none(tmp_path):
+    import geoip2.errors
+
+    class _MissReader:
+        def asn(self, value):
+            raise geoip2.errors.AddressNotFoundError("nope")
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _MissReader()
+    assert enricher.enrich_value("8.8.8.8") is None
+
+    class _EmptyReader:
+        def asn(self, value):
+            return _FakeASNResponse(number=None, org=None)
+
+    enricher._reader = _EmptyReader()
+    assert enricher.enrich_value("8.8.8.8") is None
+
+
+def test_asn_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_path):
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    # Invalid input is a legitimate None — never touches the reader.
+    assert enricher.enrich_value("not-an-ip") is None
+
+    class _BrokenReader:
+        def asn(self, value):
+            raise ValueError("reader is closed or corrupt")
+
+    enricher._reader = _BrokenReader()
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
+def test_asn_enrich_value_skips_ipv6_on_ipv4_only_database(tmp_path):
+    # maxminddb raises a bare ValueError for an IPv6 lookup against an
+    # IPv4-only .mmdb; jobs.py re-raises anything but AddressNotFoundError, so
+    # without the guard one IPv6-shaped value would fail the whole run.
+    class _V4Meta:
+        ip_version = 4
+
+    class _V4Reader:
+        def metadata(self):
+            return _V4Meta()
+
+        def asn(self, value):
+            raise ValueError("you attempted to look up an IPv6 address in an IPv4-only database.")
+
+    enricher = ASNEnricher(db_path=tmp_path / "whatever.mmdb")
+    enricher._reader = _V4Reader()
+    assert enricher.enrich_value("2001:db8::1") is None
+    # The guard is scoped to IPv6: an IPv4 lookup still reaches the reader
+    # (this fake raises for every address, so the error must propagate).
+    with pytest.raises(ValueError):
+        enricher.enrich_value("8.8.8.8")
+
+
+def test_asn_spawn_pins_identity_against_mid_run_db_replacement(tmp_path, monkeypatch):
+    """spawn() captures the exact bytes it reads; a later on-disk swap can't change them."""
+    import hashlib
+
+    import geoip2.database
+    import maxminddb
+
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"v1-bytes")
+
+    captured: dict = {}
+
+    class _FakeReader:
+        def __init__(self, fileish, mode=0):
+            # Pinning must hand the Reader an open file object (MODE_FD), not a
+            # path — that's what makes the read immune to a later replacement.
+            captured["is_fileobj"] = hasattr(fileish, "read")
+            captured["mode"] = mode
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+
+    enricher = ASNEnricher(db_path=db_path).spawn()
+    pinned = enricher.config_extras()
+    assert captured["is_fileobj"] is True
+    assert captured["mode"] == maxminddb.MODE_FD
+    assert pinned["database_sha256"] == hashlib.sha256(b"v1-bytes").hexdigest()
+    assert pinned["database_type"] == "GeoLite2-ASN"
+
+    # Admin replaces the database on disk after the run has started.
+    db_path.write_bytes(b"v2-completely-different-bytes")
+
+    # Identity is unchanged — still the bytes pinned at spawn.
+    assert enricher.config_extras() == pinned
+    enricher.close()
+
+
+def test_asn_config_extras_reads_and_writes_sidecar(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from vestigo.enrichers.asn import read_asn_sidecar, write_asn_sidecar
+
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"fake-mmdb-content")
+
+    # Sidecar present: no Reader needed at all.
+    write_asn_sidecar(
+        db_path, {"sha256": "abc123", "build_epoch": 1700000000, "database_type": "GeoLite2-ASN"}
+    )
+    extras = ASNEnricher(db_path=db_path).config_extras()
+    assert extras == {
+        "database_sha256": "abc123",
+        "build_epoch": 1700000000,
+        "database_type": "GeoLite2-ASN",
+    }
+
+    # Missing sidecar: fallback hashes the file, reads metadata, persists sidecar.
+    (tmp_path / "GeoLite2-ASN.mmdb.meta.json").unlink()
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    extras = ASNEnricher(db_path=db_path).config_extras()
+    import hashlib
+
+    expected_sha = hashlib.sha256(b"fake-mmdb-content").hexdigest()
+    assert extras["database_sha256"] == expected_sha
+    assert extras["build_epoch"] == 1700000000
+    assert read_asn_sidecar(db_path)["sha256"] == expected_sha
+
+
+def test_asn_availability_uses_sidecar_without_opening_reader(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from vestigo.enrichers.asn import write_asn_sidecar
+
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"fake-mmdb-content")
+
+    def _boom(path):
+        raise AssertionError("Reader must not be opened when the sidecar has database_type")
+
+    monkeypatch.setattr(geoip2.database, "Reader", _boom)
+
+    # Sidecar with the right flavor: available, no Reader opened.
+    write_asn_sidecar(db_path, {"sha256": "a", "database_type": "GeoLite2-ASN"})
+    assert ASNEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
+
+    # Sidecar with the wrong flavor: unavailable with the flavor message.
+    write_asn_sidecar(db_path, {"sha256": "a", "database_type": "GeoLite2-City"})
+    result = ASNEnricher(db_path=db_path).check_availability()
+    assert result.available is False
+    assert "Wrong database flavor" in result.reason
+
+    # No sidecar (pre-sidecar install): falls back to opening a Reader.
+    (tmp_path / "GeoLite2-ASN.mmdb.meta.json").unlink()
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    assert ASNEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
+
+
+def test_asn_asset_status_and_install(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from vestigo.enrichers.asn import read_asn_sidecar
+    from vestigo.enrichers.base import AssetValidationError
+
+    db_path = tmp_path / "data" / "GeoLite2-ASN.mmdb"
+    enricher = ASNEnricher(db_path=db_path)
+
+    assert enricher.asset_status() == {"uploaded": False, "size_bytes": None, "detail": {}}
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeASNMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    upload = tmp_path / "upload.mmdb"
+    upload.write_bytes(b"payload")
+    detail = enricher.install_asset(upload, "sha-abc")
+    assert detail["sha256"] == "sha-abc"
+    assert db_path.read_bytes() == b"payload"
+    assert read_asn_sidecar(db_path)["database_type"] == "GeoLite2-ASN"
+
+    status = enricher.asset_status()
+    assert status["uploaded"] is True
+    assert status["size_bytes"] == len(b"payload")
+    assert status["detail"]["sha256"] == "sha-abc"
+
+    # Wrong flavor raises AssetValidationError and installs nothing new.
+    class _CityMeta(_FakeASNMeta):
+        database_type = "GeoLite2-City"
+
+    monkeypatch.setattr(_FakeReader, "metadata", lambda self: _CityMeta())
+    upload2 = tmp_path / "upload2.mmdb"
+    upload2.write_bytes(b"city")
+    with pytest.raises(AssetValidationError, match="ASN database"):
+        enricher.install_asset(upload2, "sha-def")
+    assert db_path.read_bytes() == b"payload"
+
+
+# ---------------------------------------------------------------------------
+# Resuming an unfinished run (session-56: ClickHouse OOM-killed mid-apply while
+# the app stayed up, so startup reconciliation never saw the orphan)
+# ---------------------------------------------------------------------------
+
+
+async def _stub_resume_case(store, monkeypatch, key="stub-resume"):
+    """Register an always-available stub enricher and a case/timeline/source for it."""
+    from vestigo.api import deps
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import Enricher
+
+    class Stub(Enricher):
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = ".*"
+        output_fields = ("x",)
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            return None
+
+    Stub.key = key
+    registry.register(Stub())
+    registry.refresh_availability()
+    monkeypatch.setattr(deps, "_store", store)
+    monkeypatch.setattr("vestigo.api.routers.cases.ClickHouseStore", lambda: object())
+
+    case = await store.create_case("c1", "Case One")
+    timeline = await store.create_timeline("c1", "t1", "Timeline One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.add_source_to_timeline("c1", timeline.id, "s1")
+    return case, timeline
+
+
+# --- store layer -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_enrichment_job_runs_for_timeline_filters(store):
+    await store.start_enrichment_job_run("j1", timeline_id="t1", case_id="c1", enricher_key="geoip")
+    await store.start_enrichment_job_run("j2", timeline_id="t1", case_id="c1", enricher_key="asn")
+    await store.start_enrichment_job_run("j3", timeline_id="t2", case_id="c1", enricher_key="geoip")
+
+    both = await store.list_enrichment_job_runs_for_timeline("c1", "t1")
+    assert {r.job_id for r in both} == {"j1", "j2"}
+
+    only_geoip = await store.list_enrichment_job_runs_for_timeline("c1", "t1", enricher_key="geoip")
+    assert [r.job_id for r in only_geoip] == ["j1"]
+
+    # Another case never sees them, even with the same timeline id.
+    assert await store.list_enrichment_job_runs_for_timeline("c2", "t1") == []
+
+    # The unfiltered startup path is unchanged.
+    assert {r.job_id for r in await store.list_orphaned_enrichment_job_runs()} == {
+        "j1",
+        "j2",
+        "j3",
+    }
+
+
+@pytest.mark.asyncio
+async def test_staged_summary_by_job_returns_row_counts_and_source_ids(store):
+    async def stage(job_id, source_id, event_id):
+        await store.stage_enrichment_results(
+            [
+                {
+                    "job_id": job_id,
+                    "case_id": "c1",
+                    "source_id": source_id,
+                    "timeline_id": "t1",
+                    "event_id": event_id,
+                    "enricher_key": "geoip",
+                    "fields": {"ip:geo_country": "DE"},
+                    "computed_at": datetime.now(UTC),
+                    "enricher_config_hash": "hash1",
+                }
+            ]
+        )
+
+    await stage("job1", "s1", "e1")
+    await stage("job1", "s1", "e2")
+    await stage("job1", "s2", "e3")
+    await stage("job2", "s1", "e4")
+
+    summary = await store.staged_summary_by_job(["job1", "job2", "job-none"])
+    assert summary == {"job1": (3, {"s1", "s2"}), "job2": (1, {"s1"})}
+    # A job with no staged rows is simply absent, not zero-valued.
+    assert "job-none" not in summary
+    assert await store.staged_summary_by_job([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_enrichment_job_run_returns_none_for_unknown_id(store):
+    assert await store.get_enrichment_job_run("nope") is None
+    await store.start_enrichment_job_run("j1", timeline_id="t1", case_id="c1", enricher_key="geoip")
+    run = await store.get_enrichment_job_run("j1")
+    assert run is not None and run.enricher_key == "geoip"
+
+
+# --- resume_enrichment_run primitive ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_enrichment_run_applies_finishes_and_audits_manual(store):
+    from vestigo.enrichers.jobs import resume_enrichment_run
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    await store.mark_enrichment_source_staged("job1", "s1")
+    run = await store.get_enrichment_job_run("job1")
+
+    ch = _RecordingClickHouse()
+    applied = await resume_enrichment_run(
+        store, ch, run, trigger="manual", actor_user_id="u1", actor_username="analyst"
+    )
+
+    assert applied == 1
+    assert [(c, s, suf) for c, s, suf, _ in ch.applied] == [("c1", "s1", "job1")]
+    assert await store.list_staged_rows_for_job("job1", limit=10) == []
+    assert await store.list_orphaned_enrichment_job_runs() == []
+
+    provenance = await store.list_source_enrichments("s1")
+    assert len(provenance) == 1
+    assert provenance[0].enricher_config_hash == "hash1"
+
+    recovered = await store.query_audit(action="enricher.job_recovered")
+    assert len(recovered) == 1
+    assert recovered[0].detail["trigger"] == "manual"
+    assert recovered[0].detail["fields_applied"] == 1
+    assert recovered[0].user_id == "u1"
+
+
+@pytest.mark.asyncio
+async def test_resume_enrichment_run_preserves_state_when_apply_fails(store):
+    """The session-56 shape: ClickHouse still down, so nothing may be lost."""
+    from vestigo.enrichers.jobs import resume_enrichment_run
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    await store.mark_enrichment_source_staged("job1", "s1")
+    run = await store.get_enrichment_job_run("job1")
+
+    with pytest.raises(ConnectionError):
+        await resume_enrichment_run(store, _BrokenClickHouse(), run, trigger="manual")
+
+    assert [o.job_id for o in await store.list_orphaned_enrichment_job_runs()] == ["job1"]
+    assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+    assert await store.list_source_enrichments("s1") == []
+    assert await store.query_audit(action="enricher.job_recovered") == []
+
+
+@pytest.mark.asyncio
+async def test_resume_enrichment_run_skips_provenance_for_uncompleted_source(store):
+    from vestigo.enrichers.jobs import resume_enrichment_run
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    # Never marked staged: the run died mid-source.
+    run = await store.get_enrichment_job_run("job1")
+
+    applied = await resume_enrichment_run(store, _RecordingClickHouse(), run, trigger="manual")
+
+    # Values applied and staged rows cleared, but the source stays eligible.
+    assert applied == 1
+    assert await store.list_staged_rows_for_job("job1", limit=10) == []
+    assert await store.list_source_enrichments("s1") == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_records_startup_trigger(store):
+    from vestigo.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+
+    await reconcile_orphaned_enrichment_jobs(store, _RecordingClickHouse())
+
+    recovered = await store.query_audit(action="enricher.job_recovered")
+    assert len(recovered) == 1
+    assert recovered[0].detail["trigger"] == "startup"
+    assert recovered[0].user_id is None
+
+
+# --- run_resume_job wrapper ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_resume_job_completes_and_releases_slot(store):
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    await store.mark_enrichment_source_staged("job1", "s1")
+    run = await store.get_enrichment_job_run("job1")
+
+    job_store = JobStore()
+    poll = job_store.create(kind="enrich", case_id="c1")
+    # The route claims under the marker's id before responding.
+    _jobs.try_claim_enricher_run("t1", "geoip", "job1")
+
+    await _jobs.run_resume_job(
+        poll_job_id=poll.id,
+        run=run,
+        job_store=job_store,
+        store=store,
+        ch_store=_RecordingClickHouse(),
+        actor_user_id="u1",
+        actor_username="analyst",
+    )
+
+    done = job_store.get(poll.id)
+    assert done.status == "completed"
+    assert done.result["fields_applied"] == 1
+    assert done.result["resumed_job_id"] == "job1"
+    assert done.result["resumed"] is True
+    assert _jobs.get_active_enricher_run("t1", "geoip") is None
+
+
+@pytest.mark.asyncio
+async def test_run_resume_job_fails_releases_slot_and_keeps_marker(store):
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    run = await store.get_enrichment_job_run("job1")
+
+    job_store = JobStore()
+    poll = job_store.create(kind="enrich", case_id="c1")
+    _jobs.try_claim_enricher_run("t1", "geoip", "job1")
+
+    await _jobs.run_resume_job(
+        poll_job_id=poll.id,
+        run=run,
+        job_store=job_store,
+        store=store,
+        ch_store=_BrokenClickHouse(),
+        actor_user_id="u1",
+        actor_username="analyst",
+    )
+
+    failed = job_store.get(poll.id)
+    assert failed.status == "failed"
+    assert "clickhouse down" in failed.error
+    # Slot released, and the run stays discoverable so the dialog re-offers it.
+    assert _jobs.get_active_enricher_run("t1", "geoip") is None
+    assert [o.job_id for o in await store.list_orphaned_enrichment_job_runs()] == ["job1"]
+    assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+
+    assert len(await store.query_audit(action="enricher.resume_failed")) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_resume_job_does_not_schedule_a_rerun(store, monkeypatch):
+    """Startup reconciliation reschedules; the manual path must not.
+
+    A full-timeline re-scan nobody asked for would produce a second partition
+    rewrite that no audit row attributes to a decision.
+    """
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import jobs as _jobs
+
+    called: list[object] = []
+    monkeypatch.setattr(
+        _jobs, "schedule_enrichment_reruns", lambda *a, **k: called.append(a) or None
+    )
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    run = await store.get_enrichment_job_run("job1")
+
+    job_store = JobStore()
+    poll = job_store.create(kind="enrich", case_id="c1")
+    _jobs.try_claim_enricher_run("t1", "geoip", "job1")
+    before = set(_jobs.background_enrichment_tasks)
+
+    await _jobs.run_resume_job(
+        poll_job_id=poll.id,
+        run=run,
+        job_store=job_store,
+        store=store,
+        ch_store=_RecordingClickHouse(),
+    )
+
+    assert called == []
+    assert set(_jobs.background_enrichment_tasks) == before
+
+
+# --- discovery on the enrichers listing ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_timeline_enrichers_reports_unfinished_run(store, monkeypatch):
+    from vestigo.api.routers.cases import list_timeline_enrichers
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-disc")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-disc"
+    )
+    await store.stage_enrichment_results(
+        [
+            {
+                "job_id": "job1",
+                "case_id": case.id,
+                "source_id": "s1",
+                "timeline_id": timeline.id,
+                "event_id": "e1",
+                "enricher_key": "stub-disc",
+                "fields": {"a:x": "v"},
+                "computed_at": datetime.now(UTC),
+                "enricher_config_hash": "hash1",
+            }
+        ]
+    )
+
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    row = next(e for e in res["enrichers"] if e["key"] == "stub-disc")
+    unfinished = row["unfinished_run"]
+    assert unfinished["job_id"] == "job1"
+    assert unfinished["staged_rows"] == 1
+    assert unfinished["staged_sources"] == 1
+    assert unfinished["completed_sources"] == 0
+    assert isinstance(unfinished["age_seconds"], int)
+
+
+@pytest.mark.asyncio
+async def test_unfinished_run_payload_partial_survives_a_half_applied_resume(store):
+    """Partial coverage is a set difference, not a comparison of two counts.
+
+    ``staged_sources`` is what is *still* staged; ``completed_sources`` comes
+    from the durable marker. A resume that dies partway has already deleted the
+    staged rows of the sources it applied, so the counts cross over and the
+    "one source was only partly processed" caveat used to disappear exactly
+    when it was true.
+    """
+    from vestigo.api.routers.cases import _unfinished_run_payload
+    from vestigo.db.postgres import EnrichmentJobRun
+
+    run = EnrichmentJobRun(
+        job_id="job1",
+        timeline_id="t1",
+        case_id="c1",
+        enricher_key="geoip",
+        created_at=datetime.now(UTC),
+        # s4 was cut off mid-scan; s1..s3 were staged fully.
+        completed_source_ids=["s1", "s2", "s3"],
+    )
+    # A resume applied s1 and s2 before dying: fewer staged sources (2) than
+    # completed ones (3), yet s4 is still only partly processed.
+    payload = _unfinished_run_payload(run, {"job1": (120, {"s3", "s4"})})
+    assert payload["staged_sources"] == 2
+    assert payload["completed_sources"] == 3
+    assert payload["partial_sources"] == 1
+
+    # Every staged source fully staged -> no caveat.
+    clean = _unfinished_run_payload(run, {"job1": (120, {"s2", "s3"})})
+    assert clean["partial_sources"] == 0
+
+    # A marker with nothing staged is still reported (it is what blocks a fresh
+    # run), just with zero everything so the dialog can say so honestly.
+    empty = _unfinished_run_payload(run, {})
+    assert (empty["staged_rows"], empty["staged_sources"], empty["partial_sources"]) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_list_timeline_enrichers_reports_the_live_run_slot(store, monkeypatch):
+    """A live run is reported so the dialog disables running instead of 409ing.
+
+    Its marker is deliberately hidden (the slot is held by it), which used to
+    leave the dialog with nothing at all to show for work in flight — including
+    a startup reconciliation still applying.
+    """
+    from vestigo.api.routers.cases import list_timeline_enrichers
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-slot")
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    assert next(e for e in res["enrichers"] if e["key"] == "stub-slot")["running_job_id"] is None
+
+    _jobs.try_claim_enricher_run(timeline.id, "stub-slot", "job1")
+    try:
+        res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+        row = next(e for e in res["enrichers"] if e["key"] == "stub-slot")
+        assert row["running_job_id"] == "job1"
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-slot", "job1")
+
+
+@pytest.mark.asyncio
+async def test_list_timeline_enrichers_hides_marker_for_live_run(store, monkeypatch):
+    """The run-slot invariant: a marker held by its own job is alive, not orphaned."""
+    from vestigo.api.routers.cases import list_timeline_enrichers
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-live")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-live"
+    )
+
+    _jobs.try_claim_enricher_run(timeline.id, "stub-live", "job1")
+    try:
+        res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+        row = next(e for e in res["enrichers"] if e["key"] == "stub-live")
+        assert row["unfinished_run"] is None
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-live", "job1")
+
+    # Once the slot is gone the same marker is reported as unfinished.
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    row = next(e for e in res["enrichers"] if e["key"] == "stub-live")
+    assert row["unfinished_run"]["job_id"] == "job1"
+
+
+@pytest.mark.asyncio
+async def test_list_timeline_enrichers_unfinished_run_is_none_without_marker(store, monkeypatch):
+    from vestigo.api.routers.cases import list_timeline_enrichers
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-clean")
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    row = next(e for e in res["enrichers"] if e["key"] == "stub-clean")
+    assert row["unfinished_run"] is None
+    assert row["eligibility_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_timeline_enrichers_survives_a_failing_eligibility_check(store, monkeypatch):
+    """One broken check must not blank the dialog — that is when resume is needed."""
+    from vestigo.api.routers.cases import list_timeline_enrichers
+    from vestigo.enrichers import registry
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-broken")
+    enricher = registry.get_enricher("stub-broken")
+
+    def _boom(*args, **kwargs):
+        raise ConnectionError("clickhouse down")
+
+    monkeypatch.setattr(type(enricher), "check_eligibility", _boom)
+
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    row = next(e for e in res["enrichers"] if e["key"] == "stub-broken")
+    assert row["eligible"] is False
+    assert "clickhouse down" in row["eligibility_error"]
+
+
+@pytest.mark.asyncio
+async def test_oldest_marker_is_what_every_surface_names(store, monkeypatch):
+    """Dialog banner, run-route 409 and the skip log must agree on one job id.
+
+    Two markers for one (timeline, enricher) are reachable on any database
+    written before the run route refused while a marker exists. The banner used
+    to surface the oldest (dict last-write-wins over a newest-first list) while
+    the 409 named the newest, so resuming the job the analyst was shown left
+    them blocked by a job nobody had mentioned.
+    """
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import list_timeline_enrichers, run_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers.jobs import oldest_unfinished_run
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-order")
+    for job_id in ("job-old", "job-new"):
+        await store.start_enrichment_job_run(
+            job_id, timeline_id=timeline.id, case_id=case.id, enricher_key="stub-order"
+        )
+        await _stage_one_row(store, job_id=job_id)
+
+    markers = await store.list_enrichment_job_runs_for_timeline(case.id, timeline.id)
+    # The query orders newest-first; the tie-break deliberately does not.
+    assert [m.job_id for m in markers] == ["job-new", "job-old"]
+    assert oldest_unfinished_run(markers).job_id == "job-old"
+
+    res = await list_timeline_enrichers(timeline_id=timeline.id, case=case)
+    row = next(e for e in res["enrichers"] if e["key"] == "stub-order")
+    assert row["unfinished_run"]["job_id"] == "job-old"
+
+    with pytest.raises(HTTPException) as excinfo:
+        await run_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-order",
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=User(id="u1", username="t", is_admin=True, is_active=True),
+        )
+    assert excinfo.value.status_code == 409
+    assert "job-old" in excinfo.value.detail
+
+
+def test_oldest_unfinished_run_of_nothing_is_none():
+    from vestigo.enrichers.jobs import oldest_unfinished_run
+
+    assert oldest_unfinished_run([]) is None
+
+
+# --- resume route ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_claims_slot_under_marker_job_id(store, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from vestigo.api.routers.cases import EnricherResumeRequest, resume_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-res")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-res"
+    )
+    await store.stage_enrichment_results(
+        [
+            {
+                "job_id": "job1",
+                "case_id": case.id,
+                "source_id": "s1",
+                "timeline_id": timeline.id,
+                "event_id": "e1",
+                "enricher_key": "stub-res",
+                "fields": {"a:x": "v"},
+                "computed_at": datetime.now(UTC),
+                "enricher_config_hash": "hash1",
+            }
+        ]
+    )
+    user = User(id="u1", username="analyst", is_admin=True, is_active=True)
+
+    try:
+        res = await resume_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-res",
+            body=EnricherResumeRequest(job_id="job1"),
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=user,
+        )
+        assert res["resumed_job_id"] == "job1"
+        assert res["job_id"] != "job1"
+        assert res["staged_rows"] == 1
+        assert res["staged_sources"] == 1
+        # Claimed under the marker's id, so discovery keeps reporting it live.
+        assert _jobs.get_active_enricher_run(timeline.id, "stub-res") == "job1"
+
+        requested = await store.query_audit(action="enricher.resume_requested")
+        assert len(requested) == 1
+        assert requested[0].detail["job_id"] == "job1"
+        assert requested[0].user_id == "u1"
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-res", "job1")
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_409_when_a_run_is_active(store, monkeypatch):
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import EnricherResumeRequest, resume_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-busy")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-busy"
+    )
+    _jobs.try_claim_enricher_run(timeline.id, "stub-busy", "other-job")
+    try:
+        with pytest.raises(HTTPException) as excinfo:
+            await resume_timeline_enricher(
+                timeline_id=timeline.id,
+                enricher_key="stub-busy",
+                body=EnricherResumeRequest(job_id="job1"),
+                background_tasks=BackgroundTasks(),
+                case=case,
+                user=User(id="u1", username="t", is_admin=True, is_active=True),
+            )
+        assert excinfo.value.status_code == 409
+        assert "other-job" in excinfo.value.detail
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-busy", "other-job")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_id,timeline_of_marker,enricher_of_marker",
+    [
+        ("nope", None, None),
+        ("job1", "other-timeline", None),
+        ("job1", None, "some-other-key"),
+    ],
+)
+async def test_resume_endpoint_404_for_unknown_or_mismatched_marker(
+    store, monkeypatch, job_id, timeline_of_marker, enricher_of_marker
+):
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import EnricherResumeRequest, resume_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-404")
+    await store.start_enrichment_job_run(
+        "job1",
+        timeline_id=timeline_of_marker or timeline.id,
+        case_id=case.id,
+        enricher_key=enricher_of_marker or "stub-404",
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await resume_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-404",
+            body=EnricherResumeRequest(job_id=job_id),
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=User(id="u1", username="t", is_admin=True, is_active=True),
+        )
+    assert excinfo.value.status_code == 404
+    assert _jobs.get_active_enricher_run(timeline.id, "stub-404") is None
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_allows_an_unavailable_enricher(store, monkeypatch):
+    """A removed .mmdb must not strand already-computed results."""
+    from fastapi import BackgroundTasks
+
+    from vestigo.api.routers.cases import EnricherResumeRequest, resume_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+    from vestigo.enrichers import registry
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-gone")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-gone"
+    )
+    # The asset disappeared after the run was staged.
+    monkeypatch.setattr(
+        type(registry.get_enricher("stub-gone")),
+        "check_availability",
+        lambda self: AvailabilityResult(False, "database removed"),
+    )
+    registry.refresh_availability()
+
+    try:
+        res = await resume_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-gone",
+            body=EnricherResumeRequest(job_id="job1"),
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=User(id="u1", username="t", is_admin=True, is_active=True),
+        )
+        assert res["resumed_job_id"] == "job1"
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-gone", "job1")
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_succeeds_with_zero_staged_rows(store, monkeypatch):
+    """Resume must always be terminal, or the run route's 409 becomes permanent."""
+    from fastapi import BackgroundTasks
+
+    from vestigo.api.routers.cases import EnricherResumeRequest, resume_timeline_enricher
+    from vestigo.core.jobs import JobStore
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-empty")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-empty"
+    )
+
+    res = await resume_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-empty",
+        body=EnricherResumeRequest(job_id="job1"),
+        background_tasks=BackgroundTasks(),
+        case=case,
+        user=User(id="u1", username="t", is_admin=True, is_active=True),
+    )
+    assert res["staged_rows"] == 0
+
+    # Driving the job clears the marker, lifting the run route's conflict.
+    run = await store.get_enrichment_job_run("job1")
+    job_store = JobStore()
+    poll = job_store.create(kind="enrich", case_id=case.id)
+    await _jobs.run_resume_job(
+        poll_job_id=poll.id,
+        run=run,
+        job_store=job_store,
+        store=store,
+        ch_store=_RecordingClickHouse(),
+    )
+    assert await store.list_enrichment_job_runs_for_timeline(case.id, timeline.id) == []
+
+
+# --- the run route refuses while a marker exists ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_manual_run_409_when_unfinished_marker_exists(store, monkeypatch):
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import run_timeline_enricher
+    from vestigo.core.jobs import JobStore
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-block")
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-block"
+    )
+    await store.stage_enrichment_results(
+        [
+            {
+                "job_id": "job1",
+                "case_id": case.id,
+                "source_id": "s1",
+                "timeline_id": timeline.id,
+                "event_id": "e1",
+                "enricher_key": "stub-block",
+                "fields": {"a:x": "v"},
+                "computed_at": datetime.now(UTC),
+                "enricher_config_hash": "hash1",
+            }
+        ]
+    )
+    user = User(id="u1", username="t", is_admin=True, is_active=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await run_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-block",
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=user,
+        )
+    assert excinfo.value.status_code == 409
+    assert "job1" in excinfo.value.detail
+    # Nothing was started and the staged work is untouched.
+    assert _jobs.get_active_enricher_run(timeline.id, "stub-block") is None
+    assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+
+    # force=True is not an escape hatch either — it would strand the same rows.
+    with pytest.raises(HTTPException) as excinfo:
+        await run_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-block",
+            background_tasks=BackgroundTasks(),
+            force=True,
+            case=case,
+            user=user,
+        )
+    assert excinfo.value.status_code == 409
+
+    # Once the marker clears, the run proceeds.
+    await store.finish_enrichment_job_run("job1")
+    res = await run_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-block",
+        background_tasks=BackgroundTasks(),
+        case=case,
+        user=user,
+    )
+    assert res["job_id"] is not None
+    _jobs.release_enricher_run(timeline.id, "stub-block", res["job_id"])
+    assert isinstance(JobStore(), JobStore)  # keep the import meaningful
+
+
+@pytest.mark.asyncio
+async def test_manual_run_409_takes_precedence_over_already_enriched_skip(store, monkeypatch):
+    """'Nothing to do' would be a lie while staged rows wait to be applied."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from vestigo.api.routers.cases import run_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import registry
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-prec")
+    config_hash = registry.get_enricher("stub-prec").config_hash()
+    await store.record_source_enrichment(
+        case_id=case.id,
+        source_id="s1",
+        timeline_id=timeline.id,
+        enricher_key="stub-prec",
+        enricher_config_hash=config_hash,
+        job_id="prior-job",
+        rows_applied=3,
+    )
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-prec"
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await run_timeline_enricher(
+            timeline_id=timeline.id,
+            enricher_key="stub-prec",
+            background_tasks=BackgroundTasks(),
+            case=case,
+            user=User(id="u1", username="t", is_admin=True, is_active=True),
+        )
+    assert excinfo.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_skips_when_unfinished_marker_exists(store, monkeypatch):
+    from vestigo.api.routers.cases import _trigger_automatic_enrichments
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-auto")
+    await store.upsert_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-auto",
+        mode="automatic",
+        enabled=True,
+        updated_by=None,
+    )
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-auto"
+    )
+    await _stage_one_row(store, job_id="job1")
+
+    job_store = JobStore()
+    # Must not raise: this runs inside the ingestion job, where an exception
+    # is swallowed with a misleading log.
+    await _trigger_automatic_enrichments(store, None, job_store, case.id, "s1")
+
+    assert job_store._jobs == {}
+    assert _jobs.get_active_enricher_run(timeline.id, "stub-auto") is None
+    assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_reports_a_live_run_as_running_not_resumable(store, monkeypatch, caplog):
+    """A marker held by its own live job is not something an analyst can resume.
+
+    Without excluding the run-slot holder, a healthy auto-run still going on a
+    sibling source is logged as "must be resumed first" and points the operator
+    at a resume that would only 409. Both paths skip either way — this is about
+    the log telling the truth, which is exactly what cost hours in session-56.
+    """
+    import logging
+
+    from vestigo.api.routers.cases import _trigger_automatic_enrichments
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import jobs as _jobs
+
+    case, timeline = await _stub_resume_case(store, monkeypatch, key="stub-auto-live")
+    await store.upsert_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-auto-live",
+        mode="automatic",
+        enabled=True,
+        updated_by=None,
+    )
+    await store.start_enrichment_job_run(
+        "job1", timeline_id=timeline.id, case_id=case.id, enricher_key="stub-auto-live"
+    )
+
+    job_store = JobStore()
+    _jobs.try_claim_enricher_run(timeline.id, "stub-auto-live", "job1")
+    try:
+        with caplog.at_level(logging.INFO, logger="vestigo.api.routers.cases"):
+            await _trigger_automatic_enrichments(store, None, job_store, case.id, "s1")
+    finally:
+        _jobs.release_enricher_run(timeline.id, "stub-auto-live", "job1")
+
+    assert job_store._jobs == {}
+    assert "already running" in caplog.text
+    assert "must be resumed" not in caplog.text

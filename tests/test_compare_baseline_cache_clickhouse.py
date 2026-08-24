@@ -51,11 +51,8 @@ def _event(i: int, ts: str, attrs: dict[str, str]) -> Event:
 
 @pytest.fixture(scope="module")
 def service():
-    try:
-        store = ClickHouseStore()
-        store.init_schema()
-    except Exception:
-        pytest.skip("ClickHouse not reachable — start the dev compose stack")
+    store = ClickHouseStore()
+    store.init_schema()
     events = [
         _event(
             i,

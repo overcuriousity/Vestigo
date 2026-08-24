@@ -1,13 +1,24 @@
-import { fetchBlob } from "./client";
+import { fetchBlob, type TransferOptions } from "./client";
 import type { ExportRequest, EventFilters } from "./types";
 import { serializeEventFilterFields } from "@/lib/queryParams";
 import { triggerDownload } from "@/lib/download";
 
+/**
+ * Download the filtered event set as CSV/JSONL.
+ *
+ * The server streams this and applies no row cap, so the response can be
+ * arbitrarily large — but the browser still has to hold the whole Blob before
+ * it can be saved. `opts` therefore matters here: the response is chunked with
+ * no `Content-Length`, so progress reports bytes received with a null total
+ * (an indeterminate bar), and the signal is the only way out of a download
+ * that turns out to be bigger than the analyst expected.
+ */
 export async function downloadExport(
   caseId: string,
   timelineId: string,
   format: "csv" | "jsonl",
   filters: EventFilters,
+  opts?: TransferOptions,
 ): Promise<void> {
   const body: ExportRequest = {
     format,
@@ -26,6 +37,7 @@ export async function downloadExport(
   const blob = await fetchBlob(
     `/cases/${caseId}/timelines/${timelineId}/export`,
     body,
+    opts,
   );
 
   triggerDownload(blob, `${caseId}-${timelineId}-events.${format}`);

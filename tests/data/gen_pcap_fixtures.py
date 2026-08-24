@@ -1,9 +1,12 @@
-"""One-off generator for tests/data/sample.pcap and sample.pcapng.
+"""Generator for the committed pcap fixtures, and the frame builders behind them.
 
-Not part of the test suite itself — run manually if the fixtures need
-regenerating:
+Run it to regenerate ``sample.pcap``, ``sample.pcapng`` and ``sample_http.pcap``:
 
     python3 tests/data/gen_pcap_fixtures.py
+
+Importing it writes nothing — ``test_pcap_converter.py`` imports the builders
+(``eth``/``ipv4``/``tcp``/``write_classic_pcap``) to assemble one-off captures
+for the reassembly tests rather than committing a fixture per edge case.
 """
 
 from __future__ import annotations
@@ -87,6 +90,71 @@ arp_frame = eth(b"\xff\xff\xff\xff\xff\xff", MAC1, 0x0806, arp_request(MAC1, IP1
 
 FRAMES = [tcp_frame, udp_frame, arp_frame]
 
+# ---------------------------------------------------------------------------
+# sample_http.pcap — one keep-alive HTTP/1.1 connection for --reassemble http.
+#
+# Deliberately awkward, because that is what the reassembler exists for:
+#   * the request line arrives in the *second* segment sent (out of order),
+#   * the first response body segment is retransmitted verbatim,
+#   * the response body is chunked,
+#   * a second, pipelined request/response follows on the same connection.
+# ---------------------------------------------------------------------------
+
+CLIENT_PORT = 40001
+SERVER_PORT = 80
+CLIENT_ISN = 1000
+SERVER_ISN = 5000
+
+FIN, SYN, RST, PSH, ACK = 0x01, 0x02, 0x04, 0x08, 0x10
+
+REQ1 = b"GET /index.html HTTP/1.1\r\nHost: example.test\r\nUser-Agent: fixture/1.0\r\n\r\n"
+RESP1_HEAD = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n"
+RESP1_BODY_A = b"5\r\nhello\r\n"
+RESP1_BODY_B = b"6\r\n world\r\n0\r\n\r\n"
+REQ2 = b"POST /submit HTTP/1.1\r\nHost: example.test\r\nContent-Length: 9\r\n\r\nkey=value"
+RESP2 = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nnah"
+
+
+def _c2s(seq_offset: int, flags: int, payload: bytes = b"") -> bytes:
+    """Client -> server frame at ``seq_offset`` bytes into the client stream."""
+    segment = tcp(CLIENT_PORT, SERVER_PORT, CLIENT_ISN + seq_offset, SERVER_ISN + 1, flags, payload)
+    return eth(MAC2, MAC1, 0x0800, ipv4(IP1, IP2, 6, segment))
+
+
+def _s2c(seq_offset: int, flags: int, payload: bytes = b"") -> bytes:
+    """Server -> client frame at ``seq_offset`` bytes into the server stream."""
+    segment = tcp(SERVER_PORT, CLIENT_PORT, SERVER_ISN + seq_offset, CLIENT_ISN + 1, flags, payload)
+    return eth(MAC1, MAC2, 0x0800, ipv4(IP2, IP1, 6, segment))
+
+
+def http_frames() -> list[bytes]:
+    split = 20  # mid-request-line, so neither segment alone parses
+    req1_a, req1_b = REQ1[:split], REQ1[split:]
+    req2_offset = 1 + len(REQ1)
+    resp1_body_b_offset = 1 + len(RESP1_HEAD) + len(RESP1_BODY_A)
+    resp2_offset = resp1_body_b_offset + len(RESP1_BODY_B)
+    return [
+        _c2s(0, SYN),
+        _s2c(0, SYN | ACK),
+        _c2s(1, ACK),
+        # Request, second half first.
+        _c2s(1 + split, PSH | ACK, req1_b),
+        _c2s(1, ACK, req1_a),
+        # Chunked response; first body segment sent twice.
+        _s2c(1, ACK, RESP1_HEAD),
+        _s2c(1 + len(RESP1_HEAD), ACK, RESP1_BODY_A),
+        _s2c(1 + len(RESP1_HEAD), ACK, RESP1_BODY_A),
+        _s2c(resp1_body_b_offset, PSH | ACK, RESP1_BODY_B),
+        # Second transaction on the same connection.
+        _c2s(req2_offset, PSH | ACK, REQ2),
+        _s2c(resp2_offset, PSH | ACK, RESP2),
+        _c2s(req2_offset + len(REQ2), FIN | ACK),
+        _s2c(resp2_offset + len(RESP2), FIN | ACK),
+    ]
+
+
+HTTP_FRAMES = http_frames()
+
 
 def write_classic_pcap(path: Path, frames: list[bytes]) -> None:
     global_header = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
@@ -132,6 +200,8 @@ def write_pcapng(path: Path, frames: list[bytes]) -> None:
         fh.write(packets)
 
 
-write_classic_pcap(HERE / "sample.pcap", FRAMES)
-write_pcapng(HERE / "sample.pcapng", FRAMES)
-print("wrote sample.pcap and sample.pcapng")
+if __name__ == "__main__":
+    write_classic_pcap(HERE / "sample.pcap", FRAMES)
+    write_pcapng(HERE / "sample.pcapng", FRAMES)
+    write_classic_pcap(HERE / "sample_http.pcap", HTTP_FRAMES)
+    print("wrote sample.pcap, sample.pcapng and sample_http.pcap")

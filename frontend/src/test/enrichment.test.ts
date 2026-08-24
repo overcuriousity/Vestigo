@@ -58,6 +58,38 @@ describe("getAttributeDecoration", () => {
       label: "GeoIP match",
     });
   });
+
+  it("merges the ASN operator into the geo label when both enrichers fired", () => {
+    expect(
+      getAttributeDecoration(
+        {
+          ...attributes,
+          "src_ip:asn_number": "15169",
+          "src_ip:asn_org": "Google LLC",
+        },
+        "src_ip",
+      ),
+    ).toEqual({
+      flag: "🇺🇸",
+      label: "Mountain View, United States — AS15169 Google LLC",
+    });
+  });
+
+  it("renders an AS marker with the operator label when only ASN output exists", () => {
+    expect(
+      getAttributeDecoration(
+        { "ip:asn_number": "64512", "ip:asn_org": "Example Hosting GmbH" },
+        "ip",
+      ),
+    ).toEqual({ flag: "AS", label: "AS64512 Example Hosting GmbH" });
+  });
+
+  it("labels by organization alone when the AS number is absent", () => {
+    expect(getAttributeDecoration({ "ip:asn_org": "Example Hosting GmbH" }, "ip")).toEqual({
+      flag: "AS",
+      label: "Example Hosting GmbH",
+    });
+  });
 });
 
 describe("splitDerivedKey", () => {

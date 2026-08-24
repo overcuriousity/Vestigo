@@ -15,6 +15,24 @@ export function fmtBytes(bytes: number | null | undefined): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
+/** Whole-percent progress, or null when there is no usable denominator —
+ * work whose size is not (yet) known, which the UI shows as an indeterminate
+ * bar rather than as 0%. */
+export function progressPct(
+  processed: number | null | undefined,
+  total: number | null | undefined,
+): number | null {
+  if (processed == null || total == null || total <= 0) return null;
+  return Math.round((processed / total) * 100);
+}
+
+/** Format a transfer rate. Decimal MB/s, matching how transfer speeds are
+ * quoted everywhere else — deliberately not `fmtBytes`'s binary MB. */
+export function fmtRate(bytesPerSecond: number | null | undefined): string | null {
+  if (bytesPerSecond == null || bytesPerSecond <= 0) return null;
+  return `${(bytesPerSecond / 1e6).toFixed(1)} MB/s`;
+}
+
 /** Format a number with thousands separators. */
 export function fmtNum(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -54,6 +72,18 @@ export function truncate(value: string, max = 120): string {
   return value.slice(0, max) + "…";
 }
 
+/**
+ * A long generated id, shortened to its distinguishing tail.
+ *
+ * `truncate` keeps the head, which is the wrong half for these: a source id
+ * reads `case_<case>_<sha>_<suffix>`, so the first 24 characters are the same
+ * for every source in the case. Two sources would render identically while a
+ * three-line id ate the row it was labelling.
+ */
+export function shortId(id: string, keep = 10): string {
+  return id.length <= keep + 1 ? id : `…${id.slice(-keep)}`;
+}
+
 /** Turn a parser name slug into a readable label. */
 export function fmtParserName(name: string | null | undefined): string {
   if (!name) return "—";
@@ -90,7 +120,7 @@ export function tagResultLabel(
 
 /** Friendly display label for an anomaly-detector field token (e.g.
  * "attr:user_agent" -> "user_agent", "parser_name" -> "Parser"). Shared
- * between AnomalyFieldPicker and ValueNoveltyView so the same token reads
+ * across every surface that names a field, so the same token reads
  * identically wherever it's shown. */
 export function anomalyFieldLabel(token: string): string {
   if (token.startsWith("attr:")) return token.slice(5);

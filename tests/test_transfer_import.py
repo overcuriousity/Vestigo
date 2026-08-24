@@ -15,7 +15,7 @@ import pyarrow as pa
 import pytest
 from sqlalchemy import delete, func, select
 
-from tests.transfer_fakes import FakeClickHouse, _add, _event_rows
+from tests.transfer_fakes import FakeClickHouse, ProgressRecorder, _add, _event_rows
 from vestigo.core.config import get_settings
 from vestigo.core.retention import retention_path
 from vestigo.db import postgres as pg
@@ -992,3 +992,180 @@ class TestBlobFiltering:
         assert not retention_path(sha).exists()
         assert any("no source references" in w for w in result.warnings)
         assert result.counts["blobs"] == 1  # the legitimate one still landed
+
+
+class TestProgress:
+    async def test_phases_reset_counters_and_complete(self, store, tmp_path, monkeypatch):
+        """Every phase entry must reset `processed`/`total` in the same write.
+
+        `JobStore.update` merges progress dicts, so a phase that published only
+        its name would inherit the previous phase's denominator and the UI
+        would render a percentage against the wrong total.
+        """
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            case = await _add(store, pg.Case, name="Progress", owner_id=alice.id)
+            rows = {}
+            for i in range(2):
+                file_hash = hashlib.sha256(f"blob{i}".encode()).hexdigest()
+                src = await _add(
+                    store, pg.Source, case_id=case.id, name=f"s{i}", file_hash=file_hash
+                )
+                rows[(case.id, src.id)] = _event_rows(case.id, src.id, n=1)
+                blob = retention_path(file_hash)
+                blob.parent.mkdir(parents=True, exist_ok=True)
+                blob.write_bytes(f"blob{i}".encode())
+            exported = await export_case(
+                store,
+                lambda: FakeClickHouse(rows),
+                case.id,
+                include_blobs=True,
+                exported_by="alice",
+                dest_dir=tmp_path / "out",
+            )
+            recorder = ProgressRecorder()
+
+            result = await import_case(
+                store,
+                lambda: FakeClickHouse(),
+                exported.path,
+                owner=alice,
+                progress=recorder,
+            )
+
+            assert result.counts["events"] == 2
+            assert recorder.phases == ["verify", "postgres", "events", "blobs", "stats"]
+            for write in recorder.writes:
+                if "phase" in write:
+                    assert write["processed"] == 0, write
+                    assert "total" in write, write
+            totals = {w["phase"]: w["total"] for w in recorder.writes if "phase" in w}
+            assert totals["events"] == 2
+            assert totals["blobs"] == 2
+            assert totals["stats"] == 2
+            # No accumulated snapshot overshoots its denominator — the check
+            # that a stale `total` from the previous phase would fail.
+            for snap in recorder.snapshots:
+                if snap.get("total"):
+                    assert snap["processed"] <= snap["total"], snap
+            for phase in ("events", "blobs", "stats"):
+                assert any(
+                    s.get("phase") == phase and s["processed"] == s["total"] > 0
+                    for s in recorder.snapshots
+                ), f"{phase} never reached its total"
+        finally:
+            get_settings.cache_clear()
+
+
+class TestConverterScripts:
+    async def test_roundtrip_carries_converter_scripts_and_raw_blob(
+        self, store, tmp_path, monkeypatch
+    ):
+        """Scripts travel with the case, ids remap, sources re-link, the raw file is restored."""
+        monkeypatch.setenv("VESTIGO_SOURCE_RETENTION_PATH", str(tmp_path / "retained"))
+        get_settings.cache_clear()
+        try:
+            alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+            bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+            case = await _add(store, pg.Case, name="Conv", owner_id=alice.id)
+            raw_bytes = b"raw log bytes"
+            raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+            parent = await store.create_converter_script(
+                case_id=case.id,
+                name="x2vestigo",
+                version=1,
+                raw_file_hash=raw_hash,
+                raw_filename="x.log",
+                model="m",
+                provider_endpoint="e",
+                prompt_hash="p",
+                sample_hash="s",
+                sample_excerpt="S",
+                hint=None,
+                created_by=alice.id,
+                status="failed",
+            )
+            child = await store.create_converter_script(
+                case_id=case.id,
+                name="x2vestigo",
+                version=2,
+                raw_file_hash=raw_hash,
+                raw_filename="x.log",
+                model="m",
+                provider_endpoint="e",
+                prompt_hash="p2",
+                sample_hash="s",
+                sample_excerpt="S",
+                hint="retry",
+                created_by=alice.id,
+                parent_id=parent.id,
+                status="working",
+            )
+            await store.update_converter_script(
+                child.id, source_code="print(2)\n", attempts=[{"n": 1, "phase": "sample"}]
+            )
+            src = await _add(
+                store,
+                pg.Source,
+                case_id=case.id,
+                name="s",
+                file_hash="ab" * 32,
+                converter_script_id=child.id,
+            )
+            blob = retention_path(raw_hash)
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(raw_bytes)
+            fake = FakeClickHouse({(case.id, src.id): _event_rows(case.id, src.id, n=1)})
+            exported = await export_case(
+                store,
+                lambda: fake,
+                case.id,
+                include_blobs=True,
+                exported_by="alice",
+                dest_dir=tmp_path / "out",
+            )
+            assert exported.counts["converter_scripts"] == 2
+            assert exported.counts["blobs"] == 1  # the raw input (source blob is absent on disk)
+            blob.unlink()
+
+            result = await import_case(store, lambda: FakeClickHouse(), exported.path, owner=bob)
+            assert result.counts["converter_scripts"] == 2
+            scripts = await store.list_converter_scripts(result.case_id)
+            by_version = {s.version: s for s in scripts}
+            assert set(by_version) == {1, 2}
+            new_child = await store.get_converter_script(result.case_id, by_version[2].id)
+            assert new_child is not None
+            assert new_child.id != child.id and new_child.parent_id == by_version[1].id
+            assert new_child.source_code == "print(2)\n"
+            assert new_child.attempts == [{"n": 1, "phase": "sample"}]
+            assert new_child.created_by == alice.id  # resolved by username like every created_by
+            new_src = (await store.list_sources(result.case_id))[0]
+            assert new_src.converter_script_id == new_child.id
+            assert retention_path(raw_hash).read_bytes() == raw_bytes
+        finally:
+            get_settings.cache_clear()
+
+    async def test_archive_without_converter_stem_imports(self, store, tmp_path):
+        """An archive from a version before generated converters has no such member."""
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _tl = await _rich_case(store, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        stripped = tmp_path / "old.vestigo"
+        with zipfile.ZipFile(archive) as zin, zipfile.ZipFile(stripped, "w") as zout:
+            manifest = json.loads(zin.read("manifest.json"))
+            manifest["members"] = [
+                m for m in manifest["members"] if m["path"] != "postgres/converter_scripts.ndjson"
+            ]
+            for item in zin.infolist():
+                if item.filename == "postgres/converter_scripts.ndjson":
+                    continue
+                if item.filename == "manifest.json":
+                    continue
+                zout.writestr(item, zin.read(item.filename))
+            zout.writestr("manifest.json", json.dumps(manifest))
+        result = await import_case(store, lambda: FakeClickHouse(), stripped, owner=bob)
+        assert result.counts.get("converter_scripts", 0) == 0
+        assert await store.list_converter_scripts(result.case_id) == []

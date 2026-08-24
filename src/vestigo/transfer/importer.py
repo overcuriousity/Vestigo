@@ -50,6 +50,7 @@ from vestigo.db.postgres import (
     Annotation,
     AuditLog,
     BaselineDefinition,
+    ConverterScript,
     DetectorRun,
     FindingDisposition,
     PostgresStore,
@@ -76,7 +77,16 @@ _USER_LOOKUP_BATCH = 1000
 
 # Insertion order = dependency order. Refs map column → remap kind.
 _IMPORT_SPECS: list[tuple[str, type, dict[str, str]]] = [
-    ("sources", Source, {"id": "source", "case_id": "case"}),
+    (
+        "converter_scripts",
+        ConverterScript,
+        {"id": "converter_script", "case_id": "case", "parent_id": "converter_script"},
+    ),
+    (
+        "sources",
+        Source,
+        {"id": "source", "case_id": "case", "converter_script_id": "converter_script"},
+    ),
     ("timelines", Timeline, {"id": "timeline", "case_id": "case"}),
     ("timeline_sources", TimelineSource, {"timeline_id": "timeline", "source_id": "source"}),
     (
@@ -278,6 +288,8 @@ def _prescan_ids(reader: ArchiveReader, idmap: _IdMap) -> None:
     pairs: list[tuple[str, str]] = []
     old_ids: set[str] = set()
     for stem, _model, refs in _IMPORT_SPECS:
+        if _stem_absent(reader, stem):
+            continue
         for row in reader.iter_ndjson(f"postgres/{stem}.ndjson"):
             for column, kind in refs.items():
                 value = row.get(column)
@@ -351,6 +363,19 @@ def _revive(model: type, row: dict[str, Any], idmap: _IdMap, refs: dict[str, str
     return model(**values)
 
 
+#: Stems added after the archive format shipped. An archive from an older
+#: version simply has no such member; that is not a malformed archive. Every
+#: other stem the exporter always writes, so its absence is a truncated or
+#: hand-edited archive and the import fails rather than restoring a case with,
+#: say, no annotations and reporting success (``tests/test_transfer_api.py``).
+_OPTIONAL_STEMS = frozenset({"converter_scripts"})
+
+
+def _stem_absent(reader: ArchiveReader, stem: str) -> bool:
+    """True when an *optional* stem's member is not in the (verified) archive."""
+    return stem in _OPTIONAL_STEMS and f"postgres/{stem}.ndjson" not in reader.verified_names
+
+
 def _source_ref(row: dict[str, Any]) -> tuple[str, str]:
     """``(id, file_hash)`` from an archived source row, type-checked.
 
@@ -420,9 +445,24 @@ async def import_case(
 ) -> ImportResult:
     """Restore an archive as a new case owned by `owner`. All-or-nothing."""
 
-    def _progress(phase: str) -> None:
+    def _progress(phase: str, total: int | None = None) -> None:
+        """Enter a phase, resetting the unit counters in the same write.
+
+        ``JobStore.update`` *merges* progress dicts, so a phase that only sets
+        ``phase`` inherits the previous phase's ``processed``/``total`` and the
+        UI shows a percentage from the wrong denominator. Always reset both
+        here, and let ``_advance`` move ``processed`` within the phase.
+
+        ``total=None`` means "this phase does not count items" (verifying the
+        archive's manifest is one operation, not N of them). The UI renders
+        that as an indeterminate bar rather than as a stuck 0%.
+        """
         if progress:
-            progress({"phase": phase})
+            progress({"phase": phase, "processed": 0, "total": total})
+
+    def _advance(processed: int) -> None:
+        if progress:
+            progress({"processed": processed})
 
     _progress("verify")
     reader = ArchiveReader(archive_path)  # raises ArchiveFormatError on bad manifest
@@ -505,12 +545,20 @@ async def import_case(
             # collected while this loop already has the stem open rather than
             # by re-parsing sources.ndjson a third time.
             source_refs: list[tuple[str, str]] = []
+            # Raw inputs of generated converters: blobs an archive may carry
+            # that no source row claims.
+            converter_raw_hashes: set[str] = set()
             for stem, model, refs in _IMPORT_SPECS:
                 rows_seen = 0
+                if _stem_absent(reader, stem):
+                    counts[stem] = 0
+                    continue
                 for row in reader.iter_ndjson(f"postgres/{stem}.ndjson"):
                     rows_seen += 1
                     if stem == "sources":
                         source_refs.append(_source_ref(row))
+                    elif stem == "converter_scripts" and row.get("raw_file_hash"):
+                        converter_raw_hashes.add(str(row["raw_file_hash"]))
                     obj = _revive(model, row, idmap, refs)
                     if isinstance(obj, Timeline):
                         if row.get("embedding_config_hash"):
@@ -552,7 +600,7 @@ async def import_case(
 
         event_members = [n for n in verified if n.startswith("events/") and n.endswith(".arrow")]
         if event_members:
-            _progress("events")
+            _progress("events", total=len(event_members))
             clickhouse = clickhouse_factory()
         for old_source_id, _file_hash in source_refs:
             new_source_id = idmap.remap("source", old_source_id)
@@ -565,24 +613,29 @@ async def import_case(
                     _insert_source_events, clickhouse, reader, arcname, new_case_id, new_source_id
                 )
                 counts["events"] += n
+                # Counts restored members, so it tracks the `event_members`
+                # denominator rather than the wider `source_refs` loop.
+                _advance(len(inserted_sources))
 
         # Sorted, because `verified` is a set: warning order in the job result
         # (and from there the audit detail) must not vary run to run.
         blob_members = sorted(n for n in verified if n.startswith("blobs/"))
         if blob_members:
-            _progress("blobs")
+            _progress("blobs", total=len(blob_members))
         # The retention dir is instance-global, so only blobs an archived
         # source actually claims may land in it. Content is verified against
         # the member name below, which stops an existing blob being poisoned;
         # this stops an archive planting unrelated files there at all.
-        referenced = {file_hash for _sid, file_hash in source_refs}
-        for arcname in blob_members:
+        referenced = {file_hash for _sid, file_hash in source_refs} | converter_raw_hashes
+        for done, arcname in enumerate(blob_members, start=1):
             sha = arcname.removeprefix("blobs/")
             if not _SHA256_RE.fullmatch(sha):
                 warnings.append(f"skipping suspicious blob member: {arcname}")
+                _advance(done)
                 continue
             if sha not in referenced:
                 warnings.append(f"ignoring blob no source references: {sha[:12]}…")
+                _advance(done)
                 continue
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
@@ -608,6 +661,7 @@ async def import_case(
                 counts["blobs"] += 1
             finally:
                 tmp_path.unlink(missing_ok=True)
+            _advance(done)
         blobbed = {n.removeprefix("blobs/") for n in blob_members}
         if blob_members:
             # Deduped by hash, not per source row: sources share blobs, and one
@@ -621,14 +675,15 @@ async def import_case(
                 )
 
         if clickhouse is not None and inserted_sources:
-            _progress("stats")
-            for new_source_id in inserted_sources:
+            _progress("stats", total=len(inserted_sources))
+            for done, new_source_id in enumerate(inserted_sources, start=1):
                 try:
                     await refresh_source_field_stats(store, clickhouse, new_case_id, new_source_id)
                 except Exception as exc:  # noqa: BLE001 — stats never fail an import
                     warnings.append(
                         f"field stats recompute failed for source {new_source_id}: {exc}"
                     )
+                _advance(done)
     except Exception:
         if clickhouse is not None:
             for new_source_id in inserted_sources:

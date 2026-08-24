@@ -68,17 +68,30 @@ export interface AttributeDecoration {
  * Per-enricher cell decorators, tried in order. Deliberately a plain internal
  * list rather than a plugin API — extend it here when a new enricher needs a
  * visual treatment in the Explorer.
+ *
+ * Note: only the *first* matching decorator runs, so enrichers that fire on
+ * the same attribute (GeoIP and ASN both match IPs) must share one decorator —
+ * a second one would never execute.
  */
 const DECORATORS: Array<(attributes: Attributes, attrKey: string) => AttributeDecoration | null> =
   [
-    // GeoIP: country flag + "city, country" tooltip from the geo_* siblings.
+    // GeoIP + ASN: country flag with a "city, country — AS12345 Operator"
+    // tooltip from the geo_* / asn_* siblings. With only ASN output (no GeoIP
+    // database uploaded, or no geo match) a plain "AS" marker carries the
+    // operator tooltip instead of a flag.
     (attributes, attrKey) => {
       const flag = countryFlagEmoji(attributes[derivedFieldKey(attrKey, "geo_country_code")]);
-      if (!flag) return null;
       const country = attributes[derivedFieldKey(attrKey, "geo_country")] || "";
       const city = attributes[derivedFieldKey(attrKey, "geo_city")] || "";
-      const label = [city, country].filter(Boolean).join(", ") || "GeoIP match";
-      return { flag, label };
+      const asnNumber = attributes[derivedFieldKey(attrKey, "asn_number")] || "";
+      const asnOrg = attributes[derivedFieldKey(attrKey, "asn_org")] || "";
+      const asnLabel =
+        [asnNumber ? `AS${asnNumber}` : "", asnOrg].filter(Boolean).join(" ") || null;
+      if (!flag) {
+        return asnLabel ? { flag: "AS", label: asnLabel } : null;
+      }
+      const geoLabel = [city, country].filter(Boolean).join(", ") || "GeoIP match";
+      return { flag, label: [geoLabel, asnLabel].filter(Boolean).join(" — ") };
     },
   ];
 

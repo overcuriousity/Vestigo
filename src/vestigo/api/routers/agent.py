@@ -32,9 +32,11 @@ from vestigo import __version__
 from vestigo.agent.availability import agent_available
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
 from vestigo.agent.fidelity import fidelity_config_warning, resolve_fidelity
+from vestigo.agent.resume import RESUME_NOTE
 from vestigo.agent.runtime import (
     LLM_TIMEOUT,
     SYSTEM_PROMPT,
+    TurnRecorder,
     dump_history,
     load_history,
     stream_turn,
@@ -57,6 +59,7 @@ from vestigo.db.postgres import (
     ANNOTATION_ORIGIN_AGENT,
     AgentConversation,
     Case,
+    ReferentGoneError,
     User,
     generate_id,
 )
@@ -128,12 +131,36 @@ class UpdateConversationRequest(BaseModel):
     _check_tools = field_validator("disabled_tools")(_validate_tool_names)
 
 
+# Serialized ceiling on a view_filters snapshot. The shape is deliberately not
+# pinned (the frontend's EventFilters keeps growing, and the stamp is a context
+# record, not something agent logic reads back), but it is persisted per user
+# message, so it needs a bound like `content` has one. A realistic Explorer view
+# is a few hundred bytes.
+_VIEW_FILTERS_MAX_CHARS = 16384
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=32768)
     # Snapshot of the analyst's current Explorer filters (frontend
     # EventFilters shape) — injected as context so the agent is aware of what
-    # the analyst is looking at.
+    # the analyst is looking at, and persisted on the user message row as the
+    # per-turn stamp (#205).
     view_filters: dict[str, Any] | None = None
+
+    @field_validator("view_filters")
+    @classmethod
+    def _bound_view_filters(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        try:
+            size = len(json.dumps(value, default=str))
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+            raise ValueError("view_filters must be JSON-serializable") from exc
+        if size > _VIEW_FILTERS_MAX_CHARS:
+            raise ValueError(
+                f"view_filters snapshot too large ({size} chars, max {_VIEW_FILTERS_MAX_CHARS})"
+            )
+        return value
 
 
 def _conversation_payload(conversation: AgentConversation) -> dict[str, Any]:
@@ -376,6 +403,17 @@ def _is_context_overflow(exc: ModelHTTPError) -> bool:
 _RETRY_SHRINK = 0.6
 _DERIVED_BUDGET_FACTOR = 0.8
 
+#: Minimum seconds between two mid-turn checkpoint writes (see
+#: `_persist_partial`). Each write is a full `dump_history` plus a whole-column
+#: JSON UPDATE of a blob that grows monotonically, on the event loop of a
+#: single-process deployment: a 125-tool-call turn writes a growing blob 125
+#: times, so the bytes are quadratic in turn length. The floor trades a few
+#: seconds of worst-case tool work for roughly an order of magnitude fewer
+#: writes on a busy turn. It never applies to a real interruption — every
+#: terminal exit forces the write. A module constant, not a `VESTIGO_` setting:
+#: it is an implementation trade, not something an operator should be tuning.
+_CHECKPOINT_MIN_INTERVAL = 3.0
+
 # Overflow bodies that name the model's actual window, per provider phrasing.
 # OpenAI / vLLM / LiteLLM passthrough: "This model's maximum context length is
 # 65536 tokens"; Anthropic: "prompt is too long: 123456 tokens > 64000 maximum";
@@ -519,7 +557,9 @@ async def _message_stream_inner(
     # streams so a stop can persist what ran and return normally — see the
     # `_cancelled` helper below.
     reservation = _active_turns.get(conversation_id)
-    await store.add_agent_message(conversation_id, "user", payload.content)
+    await store.add_agent_message(
+        conversation_id, "user", payload.content, view_filters=payload.view_filters
+    )
     if not conversation.title:
         await store.update_agent_conversation(conversation_id, title=payload.content[:_TITLE_MAX])
 
@@ -537,6 +577,11 @@ async def _message_stream_inner(
         fidelity=resolve_fidelity(config.tool_fidelity, config.context_window),
     )
     history = load_history(conversation.history)
+    # Set when `history` is a mid-turn checkpoint rather than a completed turn.
+    # Telling the model keeps it from re-running the orientation sweep it
+    # already paid for (observed in the 2026-07-26 export).
+    resume_note = RESUME_NOTE if conversation.history_partial_at is not None else None
+    recorder = TurnRecorder()
 
     if (
         warning := fidelity_config_warning(config.tool_fidelity, config.context_window)
@@ -658,9 +703,53 @@ async def _message_stream_inner(
         )
         return detail
 
+    # Revision of the last snapshot actually written, so the redundant writes
+    # are skipped rather than re-serialized, and when that write happened, so
+    # the periodic ones stay rate-limited (see `_persist_partial`).
+    persisted_revision = 0
+    persisted_at = 0.0
+
+    async def _persist_partial(*, force: bool = False) -> None:
+        """Store what the turn has produced so far, marked as mid-turn.
+
+        Called from every exit that is not a completed turn — a stop, a
+        provider error, the checkpoints in between. A hard kill runs none of
+        them, which is exactly why the checkpoints exist.
+
+        Two guards, for two different kinds of waste. The recorder's revision
+        skips a write whose snapshot is byte-identical to the last one, and
+        applies always. `_CHECKPOINT_MIN_INTERVAL` skips a write that is merely
+        *soon*, and applies only to the periodic checkpoints: `force` is set on
+        every terminal exit, because an interruption is the one moment the cost
+        of a write is worth paying unconditionally.
+        """
+        nonlocal persisted_revision, persisted_at
+        if not recorder.messages or recorder.revision == persisted_revision:
+            return
+        now = monotonic()
+        if not force and now - persisted_at < _CHECKPOINT_MIN_INTERVAL:
+            return
+        persisted_revision = recorder.revision
+        persisted_at = now
+        await store.update_agent_conversation(
+            conversation_id,
+            history=dump_history(history + recorder.messages),
+            history_partial_at=datetime.now(UTC),
+        )
+
     for attempt in range(2):
         text_parts = []
         window_stats = WindowStats()
+        # Attempt 1 re-runs the turn from the same `history` base, so the
+        # recorder must start empty — otherwise the persisted blob would carry
+        # the failed attempt's messages ahead of the re-run's and stop being a
+        # faithful record of what ran.
+        recorder.messages = []
+        recorder.revision = 0
+        persisted_revision = 0
+        # 0.0 rather than `monotonic()`: the re-run's first checkpoint must not
+        # be throttled by how recently attempt 0 wrote.
+        persisted_at = 0.0
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return
@@ -677,6 +766,8 @@ async def _message_stream_inner(
                 window_budget=window_budget,
                 window_stats=window_stats,
                 chars_per_token=chars_per_token,
+                recorder=recorder,
+                resume_note=resume_note,
             ):
                 # A stop lands here, between streamed events — so the partial
                 # turn is persisted the same way the interrupt paths below do
@@ -693,10 +784,18 @@ async def _message_stream_inner(
                         await store.add_agent_message(
                             conversation_id, "assistant", "".join(text_parts) + " [stopped]"
                         )
+                    # A stop is an interruption like any other: the analyst's
+                    # next message must be answered against this turn's work.
+                    await _persist_partial(force=True)
                     if (stats_detail := await _persist_window_stats(attempt)) is not None:
                         yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
                     yield _sse({"type": "cancelled"})
                     return
+                if event["type"] == "checkpoint":
+                    # Router-internal: persist the snapshot, never forward it.
+                    # Rate-limited — the terminal exits below are not.
+                    await _persist_partial()
+                    continue
                 if event["type"] == "result":
                     turn = event["turn"]
                     await store.add_agent_message(
@@ -707,7 +806,11 @@ async def _message_stream_inner(
                         completion_tokens=turn.completion_tokens,
                     )
                     await store.update_agent_conversation(
-                        conversation_id, history=dump_history(history + turn.new_messages)
+                        conversation_id,
+                        history=dump_history(history + turn.new_messages),
+                        # Completed: the stored history is a turn boundary
+                        # again, so the next turn needs no resume note.
+                        history_partial_at=None,
                     )
                     # One honest row per turn (the stats are the turn's
                     # maxima across its requests), not one per request.
@@ -880,6 +983,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            await _persist_partial(force=True)
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if overflow:
@@ -909,6 +1013,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            await _persist_partial(force=True)
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if isinstance(exc, UsageLimitExceeded):
@@ -930,6 +1035,7 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            await _persist_partial(force=True)
             if (stats_detail := await _persist_window_stats(attempt)) is not None:
                 yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             yield _sse({"type": "error", "detail": "Agent turn failed — see server logs."})
@@ -999,6 +1105,125 @@ async def list_proposals(
     return {"proposals": [p.to_dict() for p in rows]}
 
 
+async def _apply_story_block_proposal(
+    store, decided, case_id: str, conversation_id: str, user
+) -> dict[str, Any]:
+    """Apply a confirmed ``story_block`` proposal (W7 agent parity).
+
+    Confirm is the write: the block lands with ``origin: agent``. An inline
+    chart spec first becomes a SavedChart so the block references a persisted
+    object like every other embed. A story deleted since propose time still
+    decides the proposal (idempotency backbone untouched) but applies nothing,
+    reported honestly.
+    """
+    import uuid as _uuid
+
+    from vestigo.stories.refs import validate_block_scope
+    from vestigo.stories.schemas import validate_block_content
+
+    payload = decided.payload or {}
+    story = await store.get_story(case_id, payload.get("story_id"))
+    applied = False
+    block_dict = None
+    reason = None
+    if story is None:
+        reason = "story deleted since the proposal was made"
+    else:
+        block_kind = payload.get("block_kind")
+        content = dict(payload.get("content") or {})
+        # Everything that can fail on a *stored* payload is inside one try:
+        # a decided proposal must report an honest ``applied: false`` with a
+        # reason, never a 500. That includes the legacy chart conversion —
+        # a stored spec that no longer validates raises.
+        try:
+            if block_kind == "chart_ref" and "chart_spec" in content:
+                from pydantic import ValidationError
+
+                from vestigo.agent.tools import ChartSpec
+                from vestigo.stories.export import spec_to_stored_chart_config
+
+                # ``SavedChart.config`` is the frontend's versioned camelCase
+                # ChartConfig, not the agent's ChartSpec — storing the spec's
+                # dump produces a chart no consumer can draw (and no error
+                # until the analyst opens it). Proposals made before
+                # ``chart_config`` was carried in the payload are converted
+                # here instead.
+                chart_config = content.get("chart_config")
+                if not chart_config:
+                    try:
+                        spec = ChartSpec.model_validate(content["chart_spec"])
+                    except ValidationError as exc:
+                        raise ValueError(f"stored chart spec no longer validates: {exc}") from exc
+                    chart_config = spec_to_stored_chart_config(spec)
+                chart = await store.create_saved_chart(
+                    case_id,
+                    decided.timeline_id,
+                    _uuid.uuid4().hex,
+                    content.get("name") or "Agent chart",
+                    chart_config,
+                )
+                content = {"chart_id": chart.id, "timeline_id": decided.timeline_id}
+            content = validate_block_content(block_kind, content)
+            # Re-checked at confirm time, not only at propose time: the view,
+            # chart or source the block points at can be deleted in between.
+            await validate_block_scope(case_id, block_kind, content, store=store)
+            after_block_id = payload.get("after_block_id")
+            try:
+                block = await store.create_story_block(
+                    story.id,
+                    _uuid.uuid4().hex,
+                    block_kind,
+                    content,
+                    user=user.username,
+                    origin="agent",
+                    after_block_id=after_block_id,
+                )
+            except ReferentGoneError:
+                # The view this block points at was deleted between the scope
+                # check above and the insert. Re-placing it would only hit the
+                # same lock — report it like any other referent failure.
+                raise
+            except ValueError:
+                # The anchor block vanished since propose time — append instead
+                # of failing a decided proposal.
+                block = await store.create_story_block(
+                    story.id,
+                    _uuid.uuid4().hex,
+                    block_kind,
+                    content,
+                    user=user.username,
+                    origin="agent",
+                )
+            if block is None:
+                # The story was deleted between the lookup above and the
+                # insert; same honest report as the propose-time case.
+                reason = "story deleted since the proposal was made"
+            else:
+                applied = True
+                block_dict = block.to_dict()
+        except ValueError as exc:
+            reason = str(exc)
+    await store.record_audit(
+        action="agent.story_block_confirm",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_proposal",
+        target_id=decided.id,
+        detail={
+            "conversation_id": conversation_id,
+            "applied": applied,
+            "story_id": payload.get("story_id"),
+            "reason": reason,
+        },
+    )
+    return {
+        "proposal": decided.to_dict(),
+        "applied": applied,
+        "block": block_dict,
+        "reason": reason,
+    }
+
+
 @router.post("/{case_id}/agent/conversations/{conversation_id}/proposals/{proposal_id}/confirm")
 async def confirm_proposal(
     case_id: str,
@@ -1024,6 +1249,9 @@ async def confirm_proposal(
     )
     if decided is None:
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
+
+    if decided.kind == "story_block":
+        return await _apply_story_block_proposal(store, decided, case_id, conversation_id, user)
 
     scope = await build_scope(case_id, conversation.timeline_id, user)
     found, unknown = await _proposal_resolver()(scope, [e["event_id"] for e in decided.events])
@@ -1083,7 +1311,11 @@ async def reject_proposal(
     if decided is None:
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
     await store.record_audit(
-        action="agent.annotation_reject",
+        action=(
+            "agent.story_block_reject"
+            if decided.kind == "story_block"
+            else "agent.annotation_reject"
+        ),
         actor=user,
         case_id=case_id,
         target_type="agent_proposal",
