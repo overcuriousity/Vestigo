@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] — 2026-08-18
+
+### Fixed
+
+- **Every LLM wall clock is an operator setting.** Three model timeouts were hardcoded and
+  unreachable from the admin console: the converter generator's (a parameter default the only
+  call site never overrode), the agent turn's `LLM_TIMEOUT`, and the column advisor's. A local
+  endpoint too slow to answer within them failed every attempt with nothing an admin could
+  turn. They are now `converter_generation_timeout_seconds` (180),
+  `agent_request_timeout_seconds` (300) and `column_advisor_timeout_seconds` (45), each
+  editable in the settings console. `generate_script`'s `timeout_s` is a required keyword —
+  a default there is a ceiling nobody can reach — and the stranded-turn bound is computed per
+  call, so an edited timeout needs no restart.
+- **A failed converter attempt names its exception type.** A bare `TimeoutError` stringifies
+  to the empty string, so a stalled endpoint recorded `model call failed: ` on the attempt
+  trail and in the job error. An attempt trail that cannot tell "refused" from "stalled" is
+  not a forensic record.
+
 ## [1.13.0] — 2026-08-18
 
 ### Added

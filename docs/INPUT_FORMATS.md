@@ -532,7 +532,10 @@ year, and to say which in `timezone_assumption`.
 
 1. **Sample.** Binary files are refused up front (NUL bytes / mostly non-printable).
 2. **Generate.** One typed model call (`converters/generator.py`) returns `{name, artifact,
-   script}`. The system prompt is rendered from `ingestion/parquet_format.py`
+   script}`, under `converter_generation_timeout_seconds` (default 180) for the whole
+   round — availability probe, config resolution and the model request together. A model
+   too slow to finish inside it fails every attempt identically, so this is a setting, not
+   a constant: raise it for a large local model rather than cutting the attempt count. The system prompt is rendered from `ingestion/parquet_format.py`
    (`converters/prompt.py`), so it cannot drift from the contract, and it states what the
    harness enforces so the model optimises for the checks that actually run.
 3. **Static check.** `converters/runner.py::check_script` allow-lists imports — the

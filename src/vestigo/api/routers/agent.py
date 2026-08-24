@@ -34,7 +34,6 @@ from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
 from vestigo.agent.fidelity import fidelity_config_warning, resolve_fidelity
 from vestigo.agent.resume import RESUME_NOTE
 from vestigo.agent.runtime import (
-    LLM_TIMEOUT,
     SYSTEM_PROMPT,
     TurnRecorder,
     dump_history,
@@ -55,6 +54,7 @@ from vestigo.api.deps import (
     require_case_contribute,
     require_case_read,
 )
+from vestigo.core.config import get_settings
 from vestigo.db.postgres import (
     ANNOTATION_ORIGIN_AGENT,
     AgentConversation,
@@ -488,6 +488,7 @@ class _ActiveTurn:
 # In-memory on purpose — same single-process deployment premise as JobStore.
 _active_turns: dict[str, _ActiveTurn] = {}
 
+
 # Ceiling on how long a reservation is believed. `send_message` reserves before
 # returning the StreamingResponse, so if the ASGI task is cancelled before the
 # generator's first step the entry's release (the generator's `finally`) never
@@ -498,9 +499,12 @@ _active_turns: dict[str, _ActiveTurn] = {}
 # The tradeoff is deliberate: a turn that genuinely runs longer than this is
 # reported idle, and a concurrent turn then becomes possible (with the `history`
 # race that the reservation exists to prevent). The bound is the worst case a
-# turn can legitimately take — every model request timing out at `LLM_TIMEOUT`,
-# `max_turns` times over — so exceeding it means something is already wrong.
-_TURN_STALE_AFTER = LLM_TIMEOUT * DEFAULT_MAX_TURNS
+# turn can legitimately take — every model request timing out at the
+# configured request timeout, `max_turns` times over — so exceeding it means
+# something is already wrong. Computed per call rather than at import: both
+# factors are operator settings and a restart is not their contract.
+def _turn_stale_after() -> float:
+    return get_settings().agent_request_timeout_seconds * DEFAULT_MAX_TURNS
 
 
 def turn_is_active(conversation_id: str) -> bool:
@@ -513,11 +517,12 @@ def turn_is_active(conversation_id: str) -> bool:
     turn = _active_turns.get(conversation_id)
     if turn is None:
         return False
-    if monotonic() - turn.started > _TURN_STALE_AFTER:
+    stale_after = _turn_stale_after()
+    if monotonic() - turn.started > stale_after:
         logger.warning(
             "Dropping stranded turn reservation for conversation %s (age > %.0fs)",
             conversation_id,
-            _TURN_STALE_AFTER,
+            stale_after,
         )
         _active_turns.pop(conversation_id, None)
         return False

@@ -392,7 +392,9 @@ async def _generate_loop(
                     **_prompt_kwargs(inputs, sample, version, name),
                 )
             try:
-                gen = await generate_script(system, task)
+                gen = await generate_script(
+                    system, task, timeout_s=settings.converter_generation_timeout_seconds
+                )
             except GenerationUnavailable as exc:
                 # Raised by the availability probe, before anything is sent
                 # (``sent`` is deliberately left as it was). The endpoint is
@@ -406,7 +408,11 @@ async def _generate_loop(
                 break
             except Exception as exc:  # noqa: BLE001 — a model error is a failed attempt
                 sent = True
-                stderr_tail = f"model call failed: {exc}"
+                # Name the type: a timeout stringifies to "" (asyncio's
+                # TimeoutError and httpx's carry no message), and an attempt
+                # trail reading "model call failed: " tells an analyst nothing
+                # about whether the endpoint refused, stalled or went away.
+                stderr_tail = f"model call failed: {type(exc).__name__}: {exc}".rstrip(": ")
                 report = ValidationReport(ok=False, checks=[Check("model", False, stderr_tail)])
                 await trail.record("generate", report=report, error=stderr_tail)
                 continue

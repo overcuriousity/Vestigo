@@ -1,8 +1,8 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-20 (session 181 — ClickHouse strangled itself on a debug log).
+Last updated: 2026-08-20 (session 182 — ClickHouse strangled itself on a debug log).
 
-## Session 181 — 2026-08-20: ClickHouse strangled itself on a debug log
+## Session 182 — 2026-08-20: ClickHouse strangled itself on a debug log
 
 A production instance went fully unresponsive. The output was one stack trace repeating
 forever, nested inside itself:
@@ -54,7 +54,7 @@ Not fixed here, and it is the actual root cause: the quota lives on the hypervis
 the logs lowers how fast you reach the ceiling; it does not raise it.
 `docs/DEPLOYMENT.md` §"ClickHouse log growth" documents both halves.
 
-## Session 180 — 2026-08-20: haproxy2vestigo, and measuring a timezone instead of assuming it
+## Session 181 — 2026-08-20: haproxy2vestigo, and measuring a timezone instead of assuming it
 
 A 1.2 GB Docker `json-file` log of a HAProxy 2.6 frontend had no converter. Now it has one:
 `src/vestigo/assets/converters/haproxy2vestigo.py`, built on the `nginx2vestigo.py` template
@@ -84,6 +84,26 @@ is manifest-driven, so no frontend change. Verified end to end: 200k events thro
 `vestigo ingest` carry `parser_name=haproxy2vestigo`, and the column advisor picks
 `src_ip`/`http_path`/`client_real_ip` on its own.
 
+## Session 180 — 2026-08-18: every LLM wall clock is an operator setting
+
+A converter job on a slow local endpoint failed all four attempts with
+`model call failed: ` — an empty reason, because a bare `TimeoutError` (and httpx's)
+stringifies to `""` and `job.py` interpolated only `{exc}`. Behind it: three hardcoded
+model timeouts nobody could reach from the admin console.
+
+- **`converter_generation_timeout_seconds`** (default 180, was `generate_script`'s parameter
+  default that the single call site never overrode). `timeout_s` is now a required keyword —
+  a default there is a ceiling no operator can turn.
+- **`agent_request_timeout_seconds`** (default 300, was `runtime.LLM_TIMEOUT`). The
+  stranded-turn bound in `api/routers/agent.py` became `_turn_stale_after()`, computed per
+  call, so an edited timeout does not need a restart to be respected by the sweep.
+- **`column_advisor_timeout_seconds`** (default 45, was `ADVISOR_TIMEOUT_SECONDS`). The
+  constant stays as the no-settings fallback.
+- **Attempt errors name the exception type** (`model call failed: TimeoutError`). An
+  attempt trail that cannot distinguish "refused" from "stalled" is not a forensic record.
+
+`.env.example`, `docs/INPUT_FORMATS.md` §"Generated converters" step 2 and the settings
+registry follow; the console renders all three with no frontend change.
 
 ## Session 179 — 2026-08-18: fourth review pass, the dependabot batch, 1.13.0
 
@@ -282,7 +302,6 @@ answer either way, which on its own reads as "nothing happened" rather than "not
 
 Released as 1.12.2.
 
-
 ## Session 173 — 2026-08-14: review of PR #264, the two halves that did nothing
 
 A review of session 172's branch found the pin half broken in two places, both of which made a
@@ -316,7 +335,6 @@ on the mutation's `onSuccess`, so two chip clicks in quick succession both built
 pre-mutation state and the second PATCH — a full replace — dropped the first, including from
 the audit row's `previous`/`new` pair. Edits now build on what is in flight and the requests are
 chained so they cannot land out of order.
-
 
 ## Session 172 — 2026-08-14: per-timeline, per-method field overrides
 
@@ -412,7 +430,6 @@ filed the analyst's own decisions under machinery.
 
 `dispositionsApi.stats`, `bulkCreate` and `useTriageCoverage` remain uncalled; that is the
 `TriageBurndown` deletion, still open from the seventh review's notes.
-
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).

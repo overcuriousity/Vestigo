@@ -42,7 +42,7 @@ async def test_unavailable_when_agent_not_configured(monkeypatch, _clean):
     monkeypatch.delenv("VESTIGO_AGENT_MODEL", raising=False)
     get_settings.cache_clear()
     with pytest.raises(G.GenerationUnavailable):
-        await G.generate_script("s", "t")
+        await G.generate_script("s", "t", timeout_s=30.0)
 
 
 @pytest.mark.asyncio
@@ -59,15 +59,17 @@ async def test_generate_uses_completion_and_hashes_prompt(monkeypatch, _clean):
     seen = {}
 
     async def fake_complete(config: AgentConfig, system: str, task: str, timeout_s: float):
-        seen["system"], seen["task"] = system, task
+        seen["system"], seen["task"], seen["timeout_s"] = system, task, timeout_s
         return G.ScriptDraft(
             name="Web Server", artifact="nginx:access", script="```python\nprint(1)\n```\n"
         )
 
     monkeypatch.setattr(G, "_complete", fake_complete)
 
-    out = await G.generate_script("SYS", "TASK")
-    assert seen == {"system": "SYS", "task": "TASK"}
+    out = await G.generate_script("SYS", "TASK", timeout_s=42.0)
+    # The caller's budget is the wire call's budget too — not a default the
+    # operator cannot reach (regression: it used to be a hardcoded 180s).
+    assert seen == {"system": "SYS", "task": "TASK", "timeout_s": 42.0}
     assert out.name == "web_server2vestigo" and out.script == "print(1)\n"
     assert out.model == "test-model" and out.provider_endpoint == "http://localhost:9/v1"
     expected = hashlib.sha256(f"{SYSTEM_PROMPT_VERSION}\nSYS\nTASK".encode()).hexdigest()
