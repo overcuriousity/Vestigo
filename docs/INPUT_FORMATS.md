@@ -437,6 +437,48 @@ transaction fields into CSV/JSONL. It has no per-row provenance — no `*2timesk
 does; `--report` is that suite's provenance layer — and it keeps its globally time-sorted
 output by reading each capture file a second time to sort the derived rows before merging.
 
+### `haproxy2vestigo.py`: HAProxy, in whatever envelope it arrived
+
+`src/vestigo/assets/converters/haproxy2vestigo.py` handles the two things that make a
+HAProxy log awkward to normalize: the payload has four different shapes, and the log is
+usually wrapped in something else by the time an analyst receives it.
+
+Both layers are detected per line, without a flag:
+
+| Envelope | Recognized by | Contributes |
+|----------|---------------|-------------|
+| Docker `json-file` | a JSON object with `log` and `time` | `docker_stream`, and a UTC-anchored clock |
+| BSD syslog | `May 15 08:02:22 lb01 haproxy[1234]: …` | `syslog_host`, `syslog_program`, `syslog_pid` |
+| none | anything else | — |
+
+| Payload shape | `artifact` | Notable fields |
+|---------------|------------|----------------|
+| HTTP log | `haproxy:http` | five timers, `status_code`, `termination_state`, captured headers, request split into method/host/path |
+| TCP log | `haproxy:tcp` | three timers (`Tw/Tc/Tt`), no status code |
+| connection error | `haproxy:error` | `bind_id`, `error_message` (e.g. `SSL handshake failure`) |
+| startup / reload | `haproxy:admin` | `log_level`, `worker_pid` |
+
+A shape none of these match still becomes an event (`haproxy:message`) rather than being
+dropped — but only inside a file that already proved it is HAProxy: the converter sniffs the
+first 200 lines for a structured shape and refuses the file outright if it finds none.
+Without that gate the catch-all would happily "convert" any text file at all.
+
+**The timezone is measured, not assumed.** HAProxy's `accept_date` carries no UTC offset. A
+Docker envelope's `time` does, so it sets the timestamp and `accept_date` is preserved as the
+`haproxy_accept_date` attribute; every row records which clock it used in `timestamp_desc`
+("Log Write Time" vs "HTTP Request Time"). To show rather than assert that the two agree, the
+converter records the observed `envelope − accept_date` skew in `vestigo.parse_decisions`,
+and states the conclusion in `vestigo.timezone_assumption`.
+
+That skew is *session duration plus write latency* — HAProxy stamps `accept_date` when a
+session begins and logs it when it ends — so only its **minimum** is bounded by the clock
+offset. The median is not: a frontend that tarpits denied requests for ten seconds pushes the
+median ten seconds out while its clock is perfectly aligned, and a log where nearly every
+session is tarpitted leaves a low percentile nothing fast to land on either. The footer
+therefore reports `accept_date_skew_ms_min` (what the conclusion rests on) alongside
+`_p05` and `_median` (so a reader can judge whether that minimum is an isolated outlier).
+A whole-hour minimum is the tell that the host was logging local time.
+
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
 If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write a converter —

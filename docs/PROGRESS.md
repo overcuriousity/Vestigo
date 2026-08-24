@@ -1,6 +1,88 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-18 (session 180 — LLM timeouts became settings).
+Last updated: 2026-08-20 (session 182 — ClickHouse strangled itself on a debug log).
+
+## Session 182 — 2026-08-20: ClickHouse strangled itself on a debug log
+
+A production instance went fully unresponsive. The output was one stack trace repeating
+forever, nested inside itself:
+
+```
+Cannot log message in OwnAsyncSplitChannel channel: Cannot log message in ...
+Poco::Exception. Code: 1000, e.code() = 0, File access error: .../clickhouse-server.log
+0. Poco::RotateBySizeStrategy::mustRotate(Poco::LogFile*)
+```
+
+`df` inside the guest reported 390 GB free, the log directory was writable, and every file
+was present — so the three obvious causes were all wrong.
+
+- **`e.code() = 0` was the clue.** A real filesystem fault carries an errno and Poco throws
+  a specific subclass. A bare `FileException` with no errno comes from one place:
+  `LogFileImpl::sizeImpl()` when the `ofstream` flush fails. The handle was already dead,
+  not the filesystem. C++ streams latch their failbit, so it never recovered — and
+  ClickHouse stats the log before *every* message to decide about rotation, then tries to
+  log the failure, which needs the same stat. The logging thread span until the server
+  stopped answering. Nothing crashed; a restart cleared it in seconds.
+- **The trigger was `EDQUOT`, not `ENOSPC`.** `err.log` had it in plain text —
+  `Disk quota exceeded` on a rename, and `Cannot reserve 1.00 MiB` against the system log
+  tables. A quota enforced above the container, which `df` inside it cannot see. On ZFS
+  `quota` counts snapshots and `refquota` does not, and `df` shows the refquota view, so a
+  snapshot backlog exhausts the real ceiling while the guest looks healthy.
+- **Our compose file helped it along.** The stock image logs at `trace` with a 1000M x 10
+  rotation into the container's *writable layer* — we mount a volume for
+  `/var/lib/clickhouse` but none for `/var/log/clickhouse-server`. Measured on the dev box:
+  ~1.1 GB of log files, plus 1.32 GiB `trace_log` and 992 MiB `text_log` on the data volume.
+  ~11 GB of ceiling nobody reads.
+
+`scripts/clickhouse-log-recovery.sh` caps the logger (`information`, 100M x 3), disables the
+unbounded telemetry tables, puts a 14-day TTL on `query_log`/`part_log` — kept deliberately,
+they are what you want when an ingest misbehaves — and recreates the container, which is what
+reclaims the space: the writable layer goes, the named volume stays. It refuses outright if
+`/var/lib/clickhouse` is *not* on a volume, since a recreate would then delete every case.
+
+Airgap-safe by construction (`--pull never`, image verified present first — a stalled
+registry pull on an isolated host is its own outage), engine-agnostic across Docker and
+Podman, and it backs up and validates its `docker-compose.yml` edit before applying it.
+
+Verified rather than assumed: the drop-in was booted on a throwaway container running the
+same image, confirming `logger.level=information`, zero `<Trace>` lines, the telemetry tables
+absent and the TTLs applied. `tests/test_clickhouse_log_recovery.py` (16 cases) guards what
+can rot silently — the XML's meaning, and that the compose anchor the script splices against
+still exists.
+
+Not fixed here, and it is the actual root cause: the quota lives on the hypervisor. Capping
+the logs lowers how fast you reach the ceiling; it does not raise it.
+`docs/DEPLOYMENT.md` §"ClickHouse log growth" documents both halves.
+
+## Session 181 — 2026-08-20: haproxy2vestigo, and measuring a timezone instead of assuming it
+
+A 1.2 GB Docker `json-file` log of a HAProxy 2.6 frontend had no converter. Now it has one:
+`src/vestigo/assets/converters/haproxy2vestigo.py`, built on the `nginx2vestigo.py` template
+(same CLI, `.gz`, directory input, parallel chunking, `--split`, `--since/--until`).
+
+- **Two detected layers, no flags.** Envelope — Docker `json-file`, BSD syslog, or bare —
+  then payload: HTTP log, TCP log, connection error, startup/reload. On the real file:
+  4,207,331 events in 35 s, 0 skipped, 323 MB Parquet.
+- **A catch-all needs a gate.** An unmodelled shape still becomes an event
+  (`haproxy:message`) rather than being dropped, so the converter sniffs the first 200 lines
+  for a *structured* shape and refuses the file if it finds none. Without the gate it would
+  have "successfully" converted any text file at all.
+- **The timezone is measured.** `accept_date` carries no offset, so the Docker envelope's
+  RFC 3339 `time` sets the timestamp and each row records which clock it used in
+  `timestamp_desc`. The observed `envelope − accept_date` skew goes in the footer as evidence.
+- **The median was the wrong estimator, and the real file proved it.** First run reported a
+  9999 ms skew — not clock drift but HAProxy's 10 s **tarpit** on the `PT--` sessions that are
+  92% of that log. The difference is session duration plus write latency (accept stamped at
+  session start, logged at session end), so only its **minimum** is bounded by the clock
+  offset. A 5th percentile is not enough either — a log where every session is tarpitted
+  leaves it nothing fast to land on, which is what a fixture written for exactly that case
+  caught. The footer reports `_min` (the conclusion) beside `_p05`/`_median` (the context).
+
+`tests/test_haproxy_converter.py` (24 tests, synthetic fixtures only), a `manifest.json`
+entry, and `docs/INPUT_FORMATS.md` §"`haproxy2vestigo.py`" follow. The parser downloads panel
+is manifest-driven, so no frontend change. Verified end to end: 200k events through
+`vestigo ingest` carry `parser_name=haproxy2vestigo`, and the column advisor picks
+`src_ip`/`http_path`/`client_real_ip` on its own.
 
 ## Session 180 — 2026-08-18: every LLM wall clock is an operator setting
 
@@ -220,7 +302,6 @@ answer either way, which on its own reads as "nothing happened" rather than "not
 
 Released as 1.12.2.
 
-
 ## Session 173 — 2026-08-14: review of PR #264, the two halves that did nothing
 
 A review of session 172's branch found the pin half broken in two places, both of which made a
@@ -254,7 +335,6 @@ on the mutation's `onSuccess`, so two chip clicks in quick succession both built
 pre-mutation state and the second PATCH — a full replace — dropped the first, including from
 the audit row's `previous`/`new` pair. Edits now build on what is in flight and the requests are
 chained so they cannot land out of order.
-
 
 ## Session 172 — 2026-08-14: per-timeline, per-method field overrides
 
@@ -350,7 +430,6 @@ filed the analyst's own decisions under machinery.
 
 `dispositionsApi.stats`, `bulkCreate` and `useTriageCoverage` remain uncalled; that is the
 `TriageBurndown` deletion, still open from the seventh review's notes.
-
 
 Append-only session log, newest entry on top. Older sessions are archived:
 [1–70](./archive/PROGRESS_SESSIONS_01-70.md), [71–100](./archive/PROGRESS_SESSIONS_71-100.md).
