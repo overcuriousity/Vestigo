@@ -115,6 +115,21 @@
       "sha256": "41df26455f7cbdeb9dd7356bad8adebdaad2ba3291fdd50d2c4dfede84f154db"
     },
     {
+      "name": "haproxy2vestigo",
+      "filename": "haproxy2vestigo.py",
+      "description": "HAProxy HTTP/TCP logs, connection errors and startup lines (plain or .gz, file or directory) to a Vestigo Parquet file for direct upload. Auto-detects a Docker json-file, syslog, or bare envelope and measures the accept_date timezone rather than assuming it. Requires pyarrow.",
+      "inputs": [
+        "haproxy.log*",
+        "*-json.log (Docker json-file)"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 49993,
+      "sha256": "448b15c841e8551c61b968bfc600c14b2ca278dd2bdcab341eb44da5be395576"
+    },
+    {
       "name": "journal2timesketch",
       "filename": "journal2timesketch.py",
       "description": "systemd journal (via journalctl JSON export) to Timesketch timeline.",

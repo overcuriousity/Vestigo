@@ -1,0 +1,6 @@
+192.0.2.10:51514 [01/Jun/2026:10:15:30.100] fe_web~ be_app/app01 0/0/1/24/25 200 4711 - - ---- 12/12/3/1/0 0/0 {203.0.113.5} "GET https://shop.example.com/cart HTTP/2.0"
+192.0.2.11:33221 [01/Jun/2026:10:15:31.200] fe_web~ fe_web/<NOSRV> -1/-1/-1/-1/0 403 0 - - PT-- 13/13/0/0/0 0/0 {198.51.100.77} "GET https://shop.example.com/admin HTTP/1.1"
+192.0.2.13:44444 [01/Jun/2026:10:15:33.000] fe_smtp be_smtp/mx01 1/0/1050 342 -- 3/3/1/1/0 0/0
+192.0.2.14:52020 [01/Jun/2026:10:15:34.000] fe_web/2: SSL handshake failure
+[NOTICE]   (1) : New worker (8) forked
+Proxy fe_monit stopped (cumulated conns: FE: 0, BE: 0).

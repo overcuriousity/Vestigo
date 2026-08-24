@@ -1,0 +1,9 @@
+{"log": "192.0.2.10:51514 [01/Jun/2026:10:15:30.100] fe_web~ be_app/app01 0/0/1/24/25 200 4711 - - ---- 12/12/3/1/0 0/0 {203.0.113.5} \"GET https://shop.example.com/cart HTTP/2.0\"\n", "stream": "stdout", "time": "2026-06-01T10:15:30.102345678Z"}
+{"log": "192.0.2.11:33221 [01/Jun/2026:10:15:31.200] fe_web~ fe_web/<NOSRV> -1/-1/-1/-1/0 403 0 - - PT-- 13/13/0/0/0 0/0 {198.51.100.77} \"GET https://shop.example.com/admin HTTP/1.1\"\n", "stream": "stdout", "time": "2026-06-01T10:15:31.202000000Z"}
+{"log": "192.0.2.12:40001 [01/Jun/2026:10:15:32.000] fe_web~ be_app/app02 5/0/2/30/+37 200 +52000 - - --VN 14/14/2/1/+1 0/0 {198.51.100.9|Mozilla/5.0} {text/html} \"POST https://shop.example.com/api/v1/order HTTP/1.1\"\n", "stream": "stdout", "time": "2026-06-01T10:15:32.003000000Z"}
+{"log": "192.0.2.13:44444 [01/Jun/2026:10:15:33.000] fe_smtp be_smtp/mx01 1/0/1050 342 -- 3/3/1/1/0 0/0\n", "stream": "stdout", "time": "2026-06-01T10:15:33.005000000Z"}
+{"log": "truncated json
+{"log": "192.0.2.14:52020 [01/Jun/2026:10:15:34.000] fe_web/2: SSL handshake failure\n", "stream": "stdout", "time": "2026-06-01T10:15:34.001000000Z"}
+{"log": "[NOTICE]   (1) : New worker (8) forked\n", "stream": "stderr", "time": "2026-06-01T10:15:00.000000000Z"}
+{"log": "[WARNING]  (8) : Proxy fe_web stopped (cumulated conns: FE: 1492, BE: 0).\n", "stream": "stderr", "time": "2026-06-01T10:15:35.000000000Z"}
+{"log": "Proxy fe_monit stopped (cumulated conns: FE: 0, BE: 0).\n", "stream": "stderr", "time": "2026-06-01T10:15:35.100000000Z"}
