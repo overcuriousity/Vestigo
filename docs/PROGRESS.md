@@ -1,6 +1,49 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-20 (session 182 — ClickHouse strangled itself on a debug log).
+Last updated: 2026-08-24 (session 183 — upstream branch triage and 1.14.0).
+
+## Session 183 — 2026-08-24: upstream branch triage, and 1.14.0
+
+Forty remote branches, and the question was which of them still meant anything. Only
+sixteen were ahead of `main` at all; twenty-three were fully contained in it and had
+simply never been deleted. That left five branches carrying real work plus eleven
+dependabot bumps.
+
+Two checks in this triage were wrong the first time, both worth recording.
+
+The first: `git merge-tree` output was grepped for `CONFLICT`, but git on this machine
+reports in German — `KONFLIKT`. Every branch therefore read as merging cleanly. Redone
+by exit code, two did not: `docs/pr182-review-followups` conflicted in `ROADMAP.md`,
+and `feat/d11-entropy-bigram` conflicts in `anomaly_stats.py`. A locale-dependent
+predicate that fails open is worse than no predicate — it produces confident wrong
+answers. Match on exit status, not on translated prose.
+
+The second: the ten green dependabot PRs were green *individually*, against a `main`
+that predated the batch. `vitest` and `@vitest/ui` each failed alone with `ERESOLVE`
+because `@vitest/ui@4.1.10` peer-pins `vitest@4.1.10` exactly; neither bump is
+satisfiable without the other, and only merging them together resolves. `mcp` 2.0.0
+stays out for the same class of reason — every `pydantic-ai-slim[mcp]` release pins
+`mcp>=1.24.0,<2.0` — and that PR was closed rather than left to be re-triaged monthly.
+Two branches also had to be re-verified after the batch landed, because their green CI
+had run against ruff 0.16.2 while `main` moved to 0.16.3.
+
+`#293` looked like a merge and was not. Its backend job was failing on
+`test_manifest_hashes_match_committed_assets`: both nginx converters had been edited
+and neither `manifest.json` entry updated. That is not a test detail. The manifest is
+the integrity record an analyst checks a downloaded converter against, so a stale hash
+means the published checksum does not describe the script actually served. It then
+turned out to be unmergeable for a second reason — its original commit was unsigned and
+authored as `mstoeck3@hs-mittweida.de`, the global identity leaking past the repo-local
+config, exactly the PR #139 regression. Signed and re-authored; `BLOCKED` became
+`CLEAN`, which is the confirmation that the signature was the cause.
+
+Released as **1.14.0**, not 1.13.1. The version files already said 1.13.1 from the
+timeout branch, but by the time the release was cut it carried a new converter and a
+new `vhost` attribute — added functionality, and the changelog claims SemVer. A patch
+number would have had to file two `Added` items under `Fixed` to stay honest about
+itself. The unreleased 1.13.1 section was folded into 1.14.0 rather than left standing,
+since no tag was ever cut for it.
+
 
 ## Session 182 — 2026-08-20: ClickHouse strangled itself on a debug log
 
