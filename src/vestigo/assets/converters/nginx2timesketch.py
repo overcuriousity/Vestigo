@@ -1081,10 +1081,16 @@ from pathlib import Path
 from typing import Any
 
 
-# Combined log format used for access and redirect logs.
+# Combined log format used for access and redirect logs, with an optional
+# unquoted vhost field ($host) between the response size and the referer, as
+# produced by log_format variants that log the virtual host explicitly.
+# The vhost group must not start with a quote, otherwise it would greedily
+# swallow the quoted referer of the standard combined format.
+# Quoted fields accept \" escape sequences: some nginx builds escape quotes
+# inside request URIs / referers instead of dropping the character.
 _ACCESS_LOG_RE = re.compile(
-    r'(\S+) (\S*) (\S*) \[([^\]]+)\] "([^"]*)" (\d+) (\S+) "([^"]*)" "([^"]*)"'
-    r'(?:\s+"([^"]*)")?'
+    r'(\S+) (\S*) (\S*) \[([^\]]+)\] "((?:[^"\\]|\\.)*)" (\d+) (\S+)(?: ([^"\s]\S*))?'
+    r' "((?:[^"\\]|\\.)*)" "((?:[^"\\]|\\.)*)"(?:\s+"((?:[^"\\]|\\.)*)")?'
 )
 
 # Error log format: "2026/06/25 09:46:41 [error] 1234#1234: *1 message..."
@@ -1177,9 +1183,10 @@ def _parse_access_line(line: str, log_type: str, source_file: str) -> dict[str, 
     request = groups[4]
     status = groups[5]
     size = groups[6]
-    referer = groups[7] if groups[7] != "-" else None
-    user_agent = groups[8]
-    additional = groups[9] if len(groups) > 9 and groups[9] else None
+    vhost = groups[7]
+    referer = groups[8] if groups[8] != "-" else None
+    user_agent = groups[9]
+    additional = groups[10] if len(groups) > 10 and groups[10] else None
 
     request_parts = request.split(" ")
     method = request_parts[0] if len(request_parts) > 0 else None
@@ -1209,6 +1216,7 @@ def _parse_access_line(line: str, log_type: str, source_file: str) -> dict[str, 
         "http_request_full": request,
         "status_code": int(status),
         "response_size": int(size) if size.isdigit() else 0,
+        "vhost": vhost,
         "referer": referer,
         "user_agent": user_agent,
         "additional_field": additional,

@@ -1,0 +1,4 @@
+192.168.1.10 - - [25/Jun/2026:09:50:01 +0200] "GET /shop HTTP/1.1" 200 73875 www.example.com "https://example.com/" "Mozilla/5.0 (X11; Linux x86_64)" "-"
+203.0.113.7 - - [25/Jun/2026:09:50:02 +0200] "GET /film HTTP/1.1" 301 - www.example.com "-" "curl/8.5.0"
+198.51.100.9 - - [25/Jun/2026:09:50:03 +0200] "GET /index.php?lang=../../../../<?echo(md5(\"hi\"));?> HTTP/1.1" 200 85534 217.160.108.23:80 "-" "python-requests/2.31.0" "-"
+not a parseable line at all
