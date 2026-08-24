@@ -29,7 +29,7 @@
     "@radix-ui/react-tooltip": "1.2.16",
     "@tanstack/react-query": "5.101.4",
     "@tanstack/react-table": "9.1.2",
-    "@tanstack/react-virtual": "3.14.9",
+    "@tanstack/react-virtual": "3.14.10",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "d3-array": "^3.2.4",
@@ -38,14 +38,14 @@
     "d3-shape": "^3.2.0",
     "d3-time-format": "^4.1.0",
     "date-fns": "4.4.0",
-    "lucide-react": "1.31.0",
+    "lucide-react": "1.32.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.2",
     "remark-gfm": "^4.0.1",
     "tailwind-merge": "3.6.0",
-    "zustand": "5.0.14"
+    "zustand": "5.0.15"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.3",
@@ -60,12 +60,12 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
-    "@vitest/ui": "4.1.10",
+    "@vitest/ui": "4.1.11",
     "jsdom": "30.0.1",
-    "oxlint": "^1.77.0",
+    "oxlint": "^1.79.0",
     "tailwindcss": "4.3.3",
     "typescript": "~7.0.2",
     "vite": "^8.2.0",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
   }
 }

@@ -329,6 +329,20 @@ Skipped deliberately:
   full timeline scope; `logsource` is parsed, stored and displayed for manual selection
   only. Unscoped rules match log types they were never written for, so this is a
   precision defect, not polish.
+- [ ] **X1 residue — case export/import follow-ups.** Export/import shipped (PR #182,
+  see `docs/DEPLOYMENT.md` and
+  `docs/superpowers/specs/2026-07-24-case-export-import-design.md`). Open from the
+  review, full text in
+  [`docs/archive/PR182_REVIEW_FINDINGS.md`](./archive/PR182_REVIEW_FINDINGS.md): a
+  failed import records no audit row while a failed export does
+  (`api/routers/transfer.py` updates only the job store in its `except` branch);
+  `_insert_source_events` lets an untrusted Arrow stream size its own record batches,
+  bounded only by the 200 GiB total expansion cap and not per batch; the frontend
+  buffers a whole archive in memory to download it instead of navigating to the URL;
+  orphan `events/*.arrow` members are skipped silently while orphan blobs warn;
+  `ImportCaseDialog` doesn't reset state on reopen; and adding an `_IMPORT_SPECS` entity
+  breaks reading current-format archives without a `FORMAT_VERSION` bump — decide
+  missing-stem-as-empty vs. mandatory bump and write it on the list.
 - [ ] **W8 — Query-time field extraction (schema-on-read).** Define a virtual field as a
   regex capture over a raw attribute (usually `message`), then facet, histogram and run
   detectors on it without re-ingest — Splunk `rex` / ES runtime fields, but forensically
