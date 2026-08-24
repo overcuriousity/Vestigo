@@ -147,8 +147,8 @@
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 54137,
-      "sha256": "45940ec959528c54eb1d28ff107a9933016cbf14bf9fc5e2234dd9b19c0ee1e2"
+      "size_bytes": 54690,
+      "sha256": "f4c65cbc643af2b6b7f2dc9ca5e215deea4a099ac35ee29590d4612fb226fa99"
     },
     {
       "name": "nginx2vestigo",
@@ -162,8 +162,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 34145,
-      "sha256": "d322f3b3d314f40b8ba55a0cfc91367f3a4c73b0585ba3632fa0e071567331d8"
+      "size_bytes": 34702,
+      "sha256": "9862502607fbf2a9a655d0e8ca895985869eae6a6789edfe508ce68ae490cdf7"
     },
     {
       "name": "pcap2timesketch",

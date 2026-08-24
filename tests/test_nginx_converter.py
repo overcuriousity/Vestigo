@@ -85,6 +85,9 @@ class TestAccessLog:
         assert attrs["user_agent"] == "Mozilla/5.0 (X11; Linux x86_64)"
         # Empty/None attributes are dropped.
         assert "remote_ident" not in attrs
+        # Standard combined format has no vhost field; the optional regex
+        # group must not capture the quoted referer instead.
+        assert "vhost" not in attrs
 
         ipv6 = rows[2]
         assert dict(ipv6["attributes"])["src_ip"] == "2001:db8::42"
@@ -116,6 +119,42 @@ class TestAccessLog:
         for row in pf.read().to_pylist():
             assert row["file_hash"] == expected
             assert row["source_file"] == "nginx_access.log"
+
+
+class TestAccessLogVhostFormat:
+    """log_format variant with an unquoted vhost field after the response size.
+
+    Seen in the wild on multi-site nginx hosts (e.g. ``$host`` or
+    ``$http_host`` appended to the combined format); the previous regex
+    rejected every such line.
+    """
+
+    def test_golden_lines(self, converter, tmp_path):
+        pf = _convert(converter, DATA / "nginx_access_vhost.log", tmp_path / "out.parquet")
+        rows = pf.read().to_pylist()
+        assert len(rows) == 3  # malformed line skipped
+
+        attrs = dict(rows[0]["attributes"])
+        assert attrs["vhost"] == "www.example.com"
+        assert attrs["http_uri"] == "/shop"
+        assert attrs["referer"] == "https://example.com/"
+        assert attrs["user_agent"] == "Mozilla/5.0 (X11; Linux x86_64)"
+        assert attrs["additional_field"] == "-"
+
+        redirect = dict(rows[1]["attributes"])
+        assert redirect["vhost"] == "www.example.com"
+        assert redirect["status_code"] == "301"
+        assert redirect["response_size"] == "0"  # "-" size normalizes to 0
+        assert "referer" not in redirect
+
+    def test_escaped_quotes_in_request(self, converter, tmp_path):
+        # Some nginx builds emit \" inside quoted fields (typical for attack
+        # probes); the line must parse and keep the escapes verbatim.
+        pf = _convert(converter, DATA / "nginx_access_vhost.log", tmp_path / "out.parquet")
+        rows = pf.read().to_pylist()
+        probe = dict(rows[2]["attributes"])
+        assert probe["vhost"] == "217.160.108.23:80"
+        assert 'md5(\\"hi\\")' in probe["http_uri"]
 
 
 class TestErrorLog:
