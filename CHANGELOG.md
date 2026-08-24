@@ -5,10 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.13.1] — 2026-08-18
+## [1.14.0] — 2026-08-24
 
-### Fixed
+### Added
 
+- **`haproxy2vestigo` — HAProxy logs in whatever envelope they arrived.** HAProxy's HTTP and
+  TCP log formats, accepted plain, wrapped in syslog, or wrapped by Docker's log driver, so an
+  analyst does not have to strip the transport before converting. Listed in
+  `manifest.json`/`/api/converters` alongside the other converters; see
+  `docs/INPUT_FORMATS.md`.
+- **nginx access logs with a virtual-host field.** Multi-site hosts commonly extend the
+  combined `log_format` with `$host`/`$http_host` between the response size and the referer.
+  The combined-format regex expected the quoted referer directly after the size, so **every**
+  such line failed to match — on real evidence, a directory of 12 rotated logs (922,858 lines)
+  converted to zero events with every line reported unparseable. The vhost is now parsed into
+  a new `vhost` attribute, and quoted fields accept `\"` escapes, which recovers the attack
+  probes that carry quoted payloads. `nginx2vestigo`'s `CONVERTER_VERSION` is 1.4.0: parser
+  identity is embedded in the Parquet metadata, and the same input now yields additional rows
+  plus a new attribute. Standard combined-format parsing is unchanged.
 - **Every LLM wall clock is an operator setting.** Three model timeouts were hardcoded and
   unreachable from the admin console: the converter generator's (a parameter default the only
   call site never overrode), the agent turn's `LLM_TIMEOUT`, and the column advisor's. A local
@@ -18,10 +32,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   editable in the settings console. `generate_script`'s `timeout_s` is a required keyword —
   a default there is a ceiling nobody can reach — and the stranded-turn bound is computed per
   call, so an edited timeout needs no restart.
+- **A ClickHouse log-recovery script.** `scripts/clickhouse-log-recovery.sh` for a server that
+  has already wedged itself, plus the operator-facing guidance in `docs/DEPLOYMENT.md`.
+
+### Fixed
+
+- **ClickHouse could strangle itself on its own debug log.** A production instance went fully
+  unresponsive emitting one stack trace nested inside itself, while `df` reported free space
+  and the log directory was writable. Its own logging is now capped before it can take the
+  server down.
 - **A failed converter attempt names its exception type.** A bare `TimeoutError` stringifies
   to the empty string, so a stalled endpoint recorded `model call failed: ` on the attempt
   trail and in the job error. An attempt trail that cannot tell "refused" from "stalled" is
   not a forensic record.
+- **The nginx converter manifest matches the scripts it ships.** Both nginx converters were
+  edited without their `manifest.json` entries being updated, so the published SHA-256 an
+  analyst verifies a downloaded converter against did not match the script actually served.
+
+### Changed
+
+- **Dependency batch.** python-dotenv 1.2.3, clickhouse-connect 1.7.1, sentence-transformers
+  6.0.0, ruff 0.16.3, zustand 5.0.15, lucide-react 1.32.0, @tanstack/react-virtual 3.14.10,
+  oxlint 1.79.0, vitest and @vitest/ui 4.1.11. `mcp` stays on 1.x: every
+  `pydantic-ai-slim[mcp]` release pins `mcp>=1.24.0,<2.0`, so 2.0 would make the requirement
+  set unsatisfiable.
+
+### Documentation
+
+- The open PR #182 review findings for case export/import are recorded in
+  `docs/archive/PR182_REVIEW_FINDINGS.md`, with an X1 residue entry on the roadmap pointing
+  into them.
 
 ## [1.13.0] — 2026-08-18
 
