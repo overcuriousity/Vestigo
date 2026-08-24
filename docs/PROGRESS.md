@@ -1,6 +1,58 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-20 (session 180 — the HAProxy converter).
+Last updated: 2026-08-20 (session 181 — ClickHouse strangled itself on a debug log).
+
+## Session 181 — 2026-08-20: ClickHouse strangled itself on a debug log
+
+A production instance went fully unresponsive. The output was one stack trace repeating
+forever, nested inside itself:
+
+```
+Cannot log message in OwnAsyncSplitChannel channel: Cannot log message in ...
+Poco::Exception. Code: 1000, e.code() = 0, File access error: .../clickhouse-server.log
+0. Poco::RotateBySizeStrategy::mustRotate(Poco::LogFile*)
+```
+
+`df` inside the guest reported 390 GB free, the log directory was writable, and every file
+was present — so the three obvious causes were all wrong.
+
+- **`e.code() = 0` was the clue.** A real filesystem fault carries an errno and Poco throws
+  a specific subclass. A bare `FileException` with no errno comes from one place:
+  `LogFileImpl::sizeImpl()` when the `ofstream` flush fails. The handle was already dead,
+  not the filesystem. C++ streams latch their failbit, so it never recovered — and
+  ClickHouse stats the log before *every* message to decide about rotation, then tries to
+  log the failure, which needs the same stat. The logging thread span until the server
+  stopped answering. Nothing crashed; a restart cleared it in seconds.
+- **The trigger was `EDQUOT`, not `ENOSPC`.** `err.log` had it in plain text —
+  `Disk quota exceeded` on a rename, and `Cannot reserve 1.00 MiB` against the system log
+  tables. A quota enforced above the container, which `df` inside it cannot see. On ZFS
+  `quota` counts snapshots and `refquota` does not, and `df` shows the refquota view, so a
+  snapshot backlog exhausts the real ceiling while the guest looks healthy.
+- **Our compose file helped it along.** The stock image logs at `trace` with a 1000M x 10
+  rotation into the container's *writable layer* — we mount a volume for
+  `/var/lib/clickhouse` but none for `/var/log/clickhouse-server`. Measured on the dev box:
+  ~1.1 GB of log files, plus 1.32 GiB `trace_log` and 992 MiB `text_log` on the data volume.
+  ~11 GB of ceiling nobody reads.
+
+`scripts/clickhouse-log-recovery.sh` caps the logger (`information`, 100M x 3), disables the
+unbounded telemetry tables, puts a 14-day TTL on `query_log`/`part_log` — kept deliberately,
+they are what you want when an ingest misbehaves — and recreates the container, which is what
+reclaims the space: the writable layer goes, the named volume stays. It refuses outright if
+`/var/lib/clickhouse` is *not* on a volume, since a recreate would then delete every case.
+
+Airgap-safe by construction (`--pull never`, image verified present first — a stalled
+registry pull on an isolated host is its own outage), engine-agnostic across Docker and
+Podman, and it backs up and validates its `docker-compose.yml` edit before applying it.
+
+Verified rather than assumed: the drop-in was booted on a throwaway container running the
+same image, confirming `logger.level=information`, zero `<Trace>` lines, the telemetry tables
+absent and the TTLs applied. `tests/test_clickhouse_log_recovery.py` (16 cases) guards what
+can rot silently — the XML's meaning, and that the compose anchor the script splices against
+still exists.
+
+Not fixed here, and it is the actual root cause: the quota lives on the hypervisor. Capping
+the logs lowers how fast you reach the ceiling; it does not raise it.
+`docs/DEPLOYMENT.md` §"ClickHouse log growth" documents both halves.
 
 ## Session 180 — 2026-08-20: haproxy2vestigo, and measuring a timezone instead of assuming it
 

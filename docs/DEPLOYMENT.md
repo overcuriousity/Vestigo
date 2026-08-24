@@ -697,6 +697,70 @@ Operationally there are four things worth knowing:
   copies alone; upgrading an instance backfills every existing user at their
   next login, since their stamp is null.
 
+## ClickHouse log growth
+
+The stock ClickHouse image logs at `trace` with a `1000M` x `10` rotation policy, and the
+reference compose stack mounts a volume for `/var/lib/clickhouse` but not for
+`/var/log/clickhouse-server`. Debug logs therefore accumulate — up to ~11 GB — inside the
+container's **writable layer**, alongside several system telemetry tables (`trace_log`,
+`text_log`, `metric_log` and friends) that grow without bound on the data volume. Nothing
+in Vestigo reads any of it.
+
+On a host with room to spare this is only waste. On a host with a storage quota it is an
+outage, because ClickHouse does not degrade gracefully when a log write fails:
+
+- The write fails once — with `ENOSPC`, or with `EDQUOT` if a quota is enforced above the
+  container.
+- The `ofstream` behind the log latches its failbit. C++ streams do not recover on their
+  own.
+- ClickHouse checks the log file's size before every message to decide about rotation.
+  That check now throws `Poco::Exception. Code: 1000, e.code() = 0, File access error`.
+- It tries to log that failure, which requires the same check, which throws again. The
+  logging thread spins, and the server stops answering.
+
+The give-away in the output is the nesting: `Cannot log message in OwnAsyncSplitChannel
+channel: Cannot log message in OwnAsyncSplitChannel channel: ...`, repeating one identical
+stack trace through `RotateBySizeStrategy::mustRotate`. Nothing has crashed — the server
+has strangled itself on a debug log, and a restart clears it immediately.
+
+`scripts/clickhouse-log-recovery.sh` caps the logger (`information`, `100M` x `3`), turns
+off the unbounded telemetry tables, puts a 14-day TTL on `query_log` and `part_log` — which
+are worth keeping when an ingest misbehaves — and recreates the container. The recreate is
+what reclaims the space: it discards the writable layer where the logs live, while
+`/var/lib/clickhouse` is a named volume and survives. The script refuses to run if that is
+not true of your deployment.
+
+```bash
+./scripts/clickhouse-log-recovery.sh --dry-run              # report sizes, change nothing
+./scripts/clickhouse-log-recovery.sh                        # apply, ~1 minute of downtime
+./scripts/clickhouse-log-recovery.sh --truncate-system-logs # also drop rows already written
+```
+
+It works with Docker or Podman, never contacts a registry (`--pull never`, and the image is
+verified present first), backs up and validates its `docker-compose.yml` edit, and confirms
+the `vestigo` database is intact afterwards. Ingestion and embedding jobs are in-memory
+(§"Operational scale") and will not survive the restart — check the job tray is idle first.
+
+### When the limit is a quota, not the disk
+
+`Disk quota exceeded` (`EDQUOT`) is not `No space left on device` (`ENOSPC`), and the
+difference decides whether capping the logs is a fix or only a delay. A quota enforced
+outside the container is invisible to `df` inside it — most sharply on ZFS, where `quota`
+counts snapshots and `refquota` does not, so `df` reports the refquota view and a snapshot
+backlog can exhaust the real ceiling while the guest still shows hundreds of gigabytes
+free. Check from the storage layer (`zfs get quota,refquota,usedbysnapshots <dataset>`,
+`xfs_quota -x -c 'report -h'`, `repquota -s`, `lvs` for thin pools), not from the guest.
+
+One check does work from inside, because ClickHouse asks the filesystem the same way its
+writes do:
+
+```bash
+docker exec <clickhouse> clickhouse-client --query \
+  "SELECT name, formatReadableSize(free_space) FROM system.disks"
+```
+
+Monitor that rather than `df`, which will report healthy throughout this failure.
+
 ## On-disk state outside the databases
 
 Two directories hold case data on the app host itself, both `VESTIGO_*`-configurable
