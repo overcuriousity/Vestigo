@@ -1,6 +1,40 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-24 (session 183 — upstream branch triage and 1.14.0).
+Last updated: 2026-08-25 (session 184 — value inventory export).
+
+## Session 184 — 2026-08-25: the value inventory export (#295)
+
+An analyst wanted three columns out of a timeline — each distinct `attr:src_ip`, when it
+was first seen, when it was last seen — and the only way to get them was to export every
+event and aggregate the file elsewhere. `QueryService.field_terms` already grouped by the
+value; `min`/`max` over the timestamp were two more aggregates in the same scan.
+
+The aggregation is a *new* method rather than a flag on `field_terms`, for a reason worth
+recording: `field_terms` can afford its `sum() OVER ()` because it takes a top-N, and the
+inventory cannot — it is unbounded in group count, and window sorts are the one sort
+ClickHouse will not spill to disk (`db/_scan.py`). `iter_field_inventory` is therefore
+plain `GROUP BY`/`ORDER BY` under `HEAVY_SCAN_SETTINGS`, streamed to the client one block
+at a time through a new `_select_row_blocks` (the streaming sibling of `_select`), holding
+its scan-gate slot for the whole drain.
+
+Two details are the difference between a file an analyst can rely on and one they cannot.
+The no-timestamp storage sentinel is nulled out *inside* the aggregate, not filtered out
+of the scan — so a value seen only on undated events keeps its true count and reports no
+times, instead of claiming it was first seen in the year 2299. And the pre-flight
+`uniqExact` is the same construction as the events export's `count()`: the number the
+completeness trailer is proven against, and the last point at which a query failure can
+still pick a status code rather than truncate a 200.
+
+Columns and separator are the analyst's choice (issue thread). The one rule the server
+imposes: the column a file is *sorted by* is always written, even when unticked — a file
+ordered by a column it does not contain reads as shuffled. The UI says so rather than
+silently adding it.
+
+The dialog's field and order pickers are native `<select>`s, not the Radix one. A Radix
+Select inside a Radix Dialog puts two focus scopes in a loop under jsdom (the test hung on
+`Maximum call stack size exceeded` in `react-focus-scope`); `UploadDialog` already had the
+native precedent, and typing a prefix to jump is worth more than styling on a field list
+that runs to hundreds of entries.
 
 ## Session 183 — 2026-08-24: upstream branch triage, and 1.14.0
 

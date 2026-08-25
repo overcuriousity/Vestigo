@@ -1137,6 +1137,34 @@ class EventQueryService:
                 ) from exc
             raise
 
+    def _select_row_blocks(
+        self, sql: str, parameters: Mapping[str, Any] | None = None, **kwargs: Any
+    ) -> Iterator[Sequence[Sequence[Any]]]:
+        """Stream *sql*'s result to the caller one ClickHouse block at a time.
+
+        The streaming sibling of :py:meth:`_select` — same external-table
+        forwarding, same oversized-filter mapping — for results that must not
+        be materialised in the app at all (the value inventory of a
+        high-cardinality field is unbounded in row count). The HTTP response is
+        held open for as long as the caller keeps iterating, so callers holding
+        a scan-gate slot hold it for the whole drain.
+        """
+        external = getattr(parameters, "external", None)
+        if external is not None:
+            kwargs["external_data"] = external
+        try:
+            with self.store.client.query_row_block_stream(
+                sql, parameters=parameters, **kwargs
+            ) as stream:
+                yield from stream
+        except DatabaseError as exc:
+            message = str(exc)
+            if "code: 1000" in message and "Field value too long" in message:
+                raise QueryRequestTooLargeError(
+                    "the filter is too large for ClickHouse to accept in one request"
+                ) from exc
+            raise
+
     def _build_where(
         self, query: EventQuery, *, external_tables: _ExternalTables | None = None
     ) -> tuple[str, QueryParameters]:
@@ -2110,6 +2138,124 @@ class EventQueryService:
             "values": values,
             "other_count": max(0, other_count),
         }
+
+    # ── Field value inventory (#295) ─────────────────────────────────────────
+
+    #: Orderings the value-inventory stream accepts, mapped to their sort key.
+    #: A value with no known time (every occurrence on a no-timestamp event)
+    #: sorts last in *either* direction — ``NULLS LAST`` on the descending
+    #: orderings too, because "most recent first" putting the unknowns on top
+    #: is not what the analyst asked for.
+    INVENTORY_ORDERINGS: dict[str, str] = {
+        "count_desc": "c DESC",
+        "count_asc": "c ASC",
+        "value_asc": "val ASC",
+        "value_desc": "val DESC",
+        "first_seen_asc": "first_seen ASC NULLS LAST",
+        "first_seen_desc": "first_seen DESC NULLS LAST",
+        "last_seen_asc": "last_seen ASC NULLS LAST",
+        "last_seen_desc": "last_seen DESC NULLS LAST",
+    }
+
+    def _inventory_scope(self, query: EventQuery, field_token: str) -> tuple[str, Any, str]:
+        """Return ``(where, parameters, column_expr)`` for an inventory scan.
+
+        Shared by the streaming inventory and its pre-flight distinct count so
+        the two agree on the scope down to the character — the count is what
+        the export's completeness trailer is proven against, and a WHERE clause
+        that drifted between them would turn a correct export into a reported
+        shortfall.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        return f"{where} AND {col_expr} != ''", parameters, col_expr
+
+    def count_field_inventory(self, query: EventQuery, field_token: str) -> int:
+        """Number of distinct non-empty values of *field_token* under *query*.
+
+        Pre-flight for the value-inventory export, with the same two jobs the
+        events export's ``count()`` has: it is the row count the completeness
+        trailer proves against, and it is the last point at which a query-layer
+        failure can still become a status code rather than a truncated 200.
+        """
+        with HEAVY_SCAN_GATE:
+            where, parameters, col_expr = self._inventory_scope(query, field_token)
+            result = self._select(
+                f"SELECT uniqExact({col_expr}) FROM {self.store.database}.events "
+                f"WHERE {where} {HEAVY_SCAN_SETTINGS}",
+                parameters=parameters,
+            )
+        rows = result.result_rows
+        return int(rows[0][0]) if rows else 0
+
+    def iter_field_inventory(
+        self,
+        query: EventQuery,
+        field_token: str,
+        *,
+        order_by: str = "count_desc",
+        block_size: int = 10_000,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield one ``{value, count, first_seen, last_seen}`` row per distinct value.
+
+        The value inventory an analyst exports instead of every event (#295):
+        the same ``_build_where`` as every other aggregation here, so it always
+        describes the currently-filtered view, and offset-corrected times, so
+        it joins cleanly with an events export of the same timeline.
+
+        Three deliberate details:
+
+        - **No window functions.** ``field_terms`` can afford ``sum() OVER ()``
+          because it takes a top-N; this scan is unbounded in group count and
+          window sorts cannot spill to disk (see ``db/_scan.py``). Plain
+          ``GROUP BY``/``ORDER BY`` under ``HEAVY_SCAN_SETTINGS`` does.
+        - **Sentinel-safe times.** The no-timestamp storage sentinel is nulled
+          out *inside* the aggregate rather than filtered out of the scan, so a
+          value seen only on undated events still gets a row carrying its true
+          count, with empty times instead of a fabricated year-2299 one.
+        - **Streamed, not materialised.** A high-cardinality field can have
+          millions of distinct values; blocks are pulled from ClickHouse as the
+          consumer drains them. The scan gate is therefore held for the whole
+          stream — this is exactly the class of scan it exists to admit.
+
+        Every ordering breaks ties on the value, so re-running an export over
+        unchanged (immutable) sources reproduces the same file.
+        """
+        try:
+            order_sql = self.INVENTORY_ORDERINGS[order_by]
+        except KeyError:
+            raise ValueError(f"unknown inventory ordering {order_by!r}") from None
+
+        where, parameters, col_expr = self._inventory_scope(query, field_token)
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"if({VESTIGO_NOT_SENTINEL_SQL}, {eff}, NULL)"
+        tie_break = "" if order_sql.startswith("val ") else ", val ASC"
+        sql = (
+            f"SELECT {col_expr} AS val, count() AS c, "
+            f"min({dated}) AS first_seen, max({dated}) AS last_seen "
+            f"FROM {self.store.database}.events "
+            f"WHERE {where} "
+            f"GROUP BY val "
+            f"ORDER BY {order_sql}{tie_break} "
+            f"{HEAVY_SCAN_SETTINGS}, max_block_size = {int(block_size)}"
+        )
+
+        with HEAVY_SCAN_GATE:
+            for block in self._select_row_blocks(sql, parameters=parameters):
+                for value, count, first_seen, last_seen in block:
+                    yield {
+                        "value": value,
+                        "count": int(count),
+                        "first_seen": ensure_utc_iso(first_seen) if first_seen else None,
+                        "last_seen": ensure_utc_iso(last_seen) if last_seen else None,
+                    }
 
     # Quantiles reported for every numeric field — chosen to cover both the
     # box-plot five-number summary (0.25/0.5/0.75, whiskers approximated from

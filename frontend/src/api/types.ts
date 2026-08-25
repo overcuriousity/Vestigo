@@ -1533,30 +1533,63 @@ export interface SavedChart {
   updated_at: string | null;
 }
 
+/** The filter half of an export request — shared by both export surfaces, so a
+ * value inventory always covers the same scope as an events export of the same view. */
+export interface ExportFilterPayload {
+  q?: string;
+  q_regex?: boolean;
+  artifact?: string;
+  artifacts?: string;
+  source_id?: string;
+  tag?: string;
+  exclude_tag?: string;
+  tags_include?: string;
+  tags_exclude?: string;
+  ids?: string;
+  start?: string;
+  end?: string;
+  fields?: Record<string, string[]>;
+  exclude?: Record<string, string[]>;
+  field_modes?: Record<string, FieldMatchMode>;
+  exclude_modes?: Record<string, FieldMatchMode>;
+  annotated?: string;
+  annotation_tag_value?: string;
+  run_id?: string;
+}
+
 /** Body for export endpoint */
 export interface ExportRequest {
   format: "csv" | "jsonl";
-  filter: {
-    q?: string;
-    q_regex?: boolean;
-    artifact?: string;
-    artifacts?: string;
-    source_id?: string;
-    tag?: string;
-    exclude_tag?: string;
-    tags_include?: string;
-    tags_exclude?: string;
-    ids?: string;
-    start?: string;
-    end?: string;
-    fields?: Record<string, string[]>;
-    exclude?: Record<string, string[]>;
-    field_modes?: Record<string, FieldMatchMode>;
-    exclude_modes?: Record<string, FieldMatchMode>;
-    annotated?: string;
-    annotation_tag_value?: string;
-    run_id?: string;
-  };
+  filter: ExportFilterPayload;
+}
+
+/** Columns a value inventory can carry (#295). `value` is what the file is *of*,
+ * so it is always emitted; the column the file is sorted by is appended when the
+ * analyst has not ticked it. */
+export type FieldInventoryColumn = "value" | "count" | "first_seen" | "last_seen";
+
+/** Named separators rather than a free character — a delimited file is only useful
+ * if whatever opens it can parse it. */
+export type FieldInventorySeparator = "comma" | "semicolon" | "tab" | "pipe";
+
+export type FieldInventoryOrder =
+  | "count_desc"
+  | "count_asc"
+  | "value_asc"
+  | "value_desc"
+  | "first_seen_asc"
+  | "first_seen_desc"
+  | "last_seen_asc"
+  | "last_seen_desc";
+
+/** Body for the value-inventory export: one row per distinct value of `field`,
+ * within the same filters an events export would use. */
+export interface FieldInventoryRequest {
+  field: string;
+  columns: FieldInventoryColumn[];
+  separator: FieldInventorySeparator;
+  order_by: FieldInventoryOrder;
+  filter: ExportFilterPayload;
 }
 
 // ---------------------------------------------------------------------------

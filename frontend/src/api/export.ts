@@ -1,5 +1,13 @@
 import { fetchBlob, type TransferOptions } from "./client";
-import type { ExportRequest, EventFilters } from "./types";
+import type {
+  EventFilters,
+  ExportFilterPayload,
+  ExportRequest,
+  FieldInventoryColumn,
+  FieldInventoryOrder,
+  FieldInventoryRequest,
+  FieldInventorySeparator,
+} from "./types";
 import { serializeEventFilterFields } from "@/lib/queryParams";
 import { triggerDownload } from "@/lib/download";
 
@@ -20,19 +28,7 @@ export async function downloadExport(
   filters: EventFilters,
   opts?: TransferOptions,
 ): Promise<void> {
-  const body: ExportRequest = {
-    format,
-    filter: {
-      ...serializeEventFilterFields(filters),
-      // Sent as raw objects, not JSON strings — this is already a
-      // structured JSON POST body, unlike the query-param-shaped requests
-      // (list/histogram/bulk-annotate) that stringify these.
-      fields: filters.filters ?? {},
-      exclude: filters.exclusions ?? {},
-      field_modes: filters.filterModes ?? {},
-      exclude_modes: filters.exclusionModes ?? {},
-    },
-  };
+  const body: ExportRequest = { format, filter: exportFilterPayload(filters) };
 
   const blob = await fetchBlob(
     `/cases/${caseId}/timelines/${timelineId}/export`,
@@ -41,4 +37,65 @@ export async function downloadExport(
   );
 
   triggerDownload(blob, `${caseId}-${timelineId}-events.${format}`);
+}
+
+/**
+ * The filter half of an export body.
+ *
+ * Both export surfaces send it, so an inventory and an events export taken from
+ * the same view describe the same scope — an inventory computed over a wider one
+ * would be a forensic footgun.
+ */
+function exportFilterPayload(filters: EventFilters): ExportFilterPayload {
+  return {
+    ...serializeEventFilterFields(filters),
+    // Sent as raw objects, not JSON strings — this is already a
+    // structured JSON POST body, unlike the query-param-shaped requests
+    // (list/histogram/bulk-annotate) that stringify these.
+    fields: filters.filters ?? {},
+    exclude: filters.exclusions ?? {},
+    field_modes: filters.filterModes ?? {},
+    exclude_modes: filters.exclusionModes ?? {},
+  };
+}
+
+export interface FieldInventoryOptions {
+  field: string;
+  columns: FieldInventoryColumn[];
+  separator: FieldInventorySeparator;
+  orderBy: FieldInventoryOrder;
+}
+
+/**
+ * Download a value inventory of one field: one row per distinct value with its
+ * count and first/last seen, within the current filters (#295).
+ *
+ * Streamed and uncapped like the events export — a high-cardinality field can have
+ * millions of distinct values — so `opts` carries the same indeterminate progress
+ * and the same abort signal.
+ */
+export async function downloadFieldInventory(
+  caseId: string,
+  timelineId: string,
+  filters: EventFilters,
+  inventory: FieldInventoryOptions,
+  opts?: TransferOptions,
+): Promise<void> {
+  const body: FieldInventoryRequest = {
+    field: inventory.field,
+    columns: inventory.columns,
+    separator: inventory.separator,
+    order_by: inventory.orderBy,
+    filter: exportFilterPayload(filters),
+  };
+
+  const blob = await fetchBlob(
+    `/cases/${caseId}/timelines/${timelineId}/export/field-inventory`,
+    body,
+    opts,
+  );
+
+  const ext = inventory.separator === "tab" ? "tsv" : "csv";
+  const slug = inventory.field.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "field";
+  triggerDownload(blob, `${caseId}-${timelineId}-${slug}-inventory.${ext}`);
 }
