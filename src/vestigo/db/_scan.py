@@ -63,6 +63,7 @@ of admitted detector scans and OOM-killed a 32 GiB host mid-apply.
 """
 
 import os
+import re
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -173,9 +174,33 @@ _clickhouse_bounded: bool = False
 # both cgroup v1 (PAGE_COUNTER_MAX) and an unconfigured v2 surface that way.
 _UNLIMITED_CGROUP = 1 << 60
 
+_AUTO_THREADS = re.compile(r"^'?(?:auto\((\d+)\)|(\d+))'?$")
+
+
+def parse_resolved_max_threads(value: str | None) -> int | None:
+    """The core count ClickHouse resolved for itself, from `system.settings`.
+
+    ClickHouse 26.6 reports `max_threads` as ``'auto(N)'`` where N is the core
+    count it will actually use — cgroup-quota aware, which is the whole reason
+    to ask the server rather than count cores locally or count the per-core
+    ``OSUserTimeCPU*`` series (host cores, quota-blind). A server-side pin
+    reports a plain integer instead, which is equally the resolved value.
+
+    Returns ``None`` for anything that is not a positive integer, so a future
+    server that words this differently degrades to the fallback rather than to
+    a nonsense width.
+    """
+    if not value:
+        return None
+    match = _AUTO_THREADS.match(str(value).strip())
+    if not match:
+        return None
+    resolved = int(match.group(1) or match.group(2))
+    return resolved if resolved > 0 else None
+
 
 def resolve_clickhouse_ceiling(facts: Mapping[str, float]) -> tuple[int | None, bool]:
-    """Turn :py:meth:`ClickHouseStore.server_memory_facts` into ``(ceiling, bounded)``.
+    """Turn :py:meth:`ClickHouseStore.server_resource_facts` into ``(ceiling, bounded)``.
 
     Pure, so the interesting cases are testable without a server. *ceiling* is
     the bytes ClickHouse will actually allow itself; *bounded* says whether

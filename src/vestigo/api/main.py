@@ -432,7 +432,7 @@ async def _probe_scan_budget() -> None:
     )
     from vestigo.db.clickhouse import ClickHouseStore
 
-    facts = await asyncio.to_thread(ClickHouseStore().server_memory_facts)
+    facts = await asyncio.to_thread(ClickHouseStore().server_resource_facts)
     ceiling, bounded = resolve_clickhouse_ceiling(facts)
     configure_scan_budget(ceiling, bounded)
     report = scan_budget_report()

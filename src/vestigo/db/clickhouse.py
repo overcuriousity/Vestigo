@@ -688,27 +688,45 @@ class ClickHouseStore:
         row = result.result_rows[0]
         return {key for i, key in enumerate(keys) if int(row[i]) > 0}
 
-    def server_memory_facts(self) -> dict[str, float]:
-        """What ClickHouse reports about its own memory ceiling.
+    def server_resource_facts(self) -> dict[str, float]:
+        """What ClickHouse reports about its own ceiling, caches and core count.
 
-        Four numbers, straight from the server, because the app cannot infer
-        any of them: its own container's view of RAM says nothing about what
-        the ClickHouse container is allowed to use, and that gap is what
-        OOM-killed a production server (see ``db/_scan.py``).
+        The app cannot infer any of it: its own container's view of RAM says
+        nothing about what the ClickHouse container may use, and that gap is
+        what OOM-killed a production server (see ``db/_scan.py``).
 
-        Returns any of ``max_server_memory_usage``,
-        ``max_server_memory_usage_to_ram_ratio``, ``cgroup_memory_total`` and
-        ``os_memory_total`` the server would tell us about; interpretation is
-        :func:`vestigo.db._scan.resolve_clickhouse_ceiling`'s job. An empty
-        dict means the probe failed — an old server, or a user without rights
-        on the ``system`` tables — which is a reason to warn, never to refuse
-        to start.
+        Three groups, all optional — interpretation is
+        :func:`vestigo.db._scan.resolve_clickhouse_ceiling`,
+        :func:`vestigo.db._scan.resolve_cache_bytes` and
+        :func:`vestigo.db._scan.parse_resolved_max_threads`' job:
+
+        - the ceiling: ``max_server_memory_usage``,
+          ``max_server_memory_usage_to_ram_ratio``, ``cgroup_memory_total``,
+          ``os_memory_total``;
+        - the caches that live *under* that ceiling and are filled by a
+          MergeTree scan workload: ``mark_cache_size``,
+          ``uncompressed_cache_size``, ``index_mark_cache_size``,
+          ``index_uncompressed_cache_size``, ``primary_index_cache_size``.
+          The server ships many more (``text_index_*``, ``vector_similarity_*``,
+          ``parquet_metadata_*``, ``iceberg_*``, ``unique_key_*``) for engines
+          and index types Vestigo does not use; counting those would make the
+          budget permanently and wrongly read as `over_budget`;
+        - ``resolved_max_threads``: the core count the server resolved for
+          itself. ``system.asynchronous_metrics`` has no CPU-count metric on
+          26.6, so this comes from ``system.settings`` — see
+          :func:`vestigo.db._scan.parse_resolved_max_threads`.
+
+        An empty dict means the probe failed — an old server, or a user without
+        rights on the ``system`` tables — which is a reason to warn, never to
+        refuse to start.
         """
         facts: dict[str, float] = {}
         try:
             rows = self.client.query(
                 "SELECT name, value FROM system.server_settings WHERE name IN "
-                "('max_server_memory_usage', 'max_server_memory_usage_to_ram_ratio')"
+                "('max_server_memory_usage', 'max_server_memory_usage_to_ram_ratio', "
+                "'mark_cache_size', 'uncompressed_cache_size', 'index_mark_cache_size', "
+                "'index_uncompressed_cache_size', 'primary_index_cache_size')"
             ).result_rows
             for name, value in rows:
                 # Float throughout: the ratio is 0.9, and reading it as an int
@@ -727,8 +745,21 @@ class ClickHouseStore:
                         if metric == "CGroupMemoryTotal"
                         else "os_memory_total"
                     ] = float(value)
+            # Separate query, and separate failure: a server that renames this
+            # setting must still yield the memory facts above, which are the
+            # ones an OOM depends on.
+            with contextlib.suppress(Exception):
+                threads = self.client.query(
+                    "SELECT value FROM system.settings WHERE name = 'max_threads'"
+                ).result_rows
+                if threads:
+                    from vestigo.db._scan import parse_resolved_max_threads
+
+                    resolved = parse_resolved_max_threads(threads[0][0])
+                    if resolved:
+                        facts["resolved_max_threads"] = float(resolved)
         except Exception:  # noqa: BLE001 — a failed probe must not block startup
-            logger.warning("could not read ClickHouse memory limits", exc_info=True)
+            logger.warning("could not read ClickHouse resource limits", exc_info=True)
             return {}
         return facts
 
