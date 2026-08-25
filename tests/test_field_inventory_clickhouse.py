@@ -11,12 +11,14 @@ and the distinct-value pre-flight count matches what the stream yields.
 
 from __future__ import annotations
 
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from vestigo.db import queries
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.queries import EventQuery, EventQueryService
 from vestigo.models.event import Event
@@ -189,3 +191,118 @@ def test_inventory_streams_in_batches_smaller_than_the_result(service):
     rows = list(service.iter_field_inventory(_query(), "attr:src_ip", block_size=2))
 
     assert len(rows) == 4
+
+
+def test_inventory_decodes_fixed_string_hash_values(service):
+    """A hash field must inventory as hex, not as a `bytes` repr.
+
+    `content_hash`/`file_hash` are `FixedString(64)`, which clickhouse-connect
+    hands back as NUL-padded `bytes`. Every other read path runs them through
+    `decode_fixed_string_columns`; this one yields a bare cell, so it has to
+    decode it itself — otherwise the CSV writer stringifies the value as
+    `b'aaa…\\x00'` and the exported hash no longer equals the real SHA-256,
+    which is the whole point of storing it.
+    """
+    rows = list(service.iter_field_inventory(_query(), "file_hash"))
+
+    assert [row["value"] for row in rows] == ["a" * 64]
+    assert rows[0]["count"] == len(_ROWS)
+
+    content = {row["value"] for row in service.iter_field_inventory(_query(), "content_hash")}
+    assert all(isinstance(value, str) for value in content)
+    assert f"{0:064d}" in content
+
+
+def test_count_matches_the_stream_for_a_fixed_string_field(service):
+    """The pre-flight and the stream agree on a hash field too.
+
+    The count is aggregated through a `GROUP BY` subquery rather than
+    `uniqExact` (which cannot spill), so it is worth pinning that the swap did
+    not change the answer on a column whose type is not `String`.
+    """
+    expected = service.count_field_inventory(_query(), "content_hash")
+
+    assert expected == len(list(service.iter_field_inventory(_query(), "content_hash")))
+    assert expected == len(_ROWS)
+
+
+def _free(sem: threading.BoundedSemaphore) -> bool:
+    """Whether *sem* has a slot available right now (non-destructive)."""
+    if sem.acquire(blocking=False):
+        sem.release()
+        return True
+    return False
+
+
+@pytest.fixture
+def gates(service, monkeypatch):
+    """One-slot stand-ins for both scan gates, bound where `queries` reads them.
+
+    `db/_scan.py` is imported *by value* into `queries`, so patching the
+    module's own attributes would not reach the running code.
+    """
+    detector = threading.BoundedSemaphore(1)
+    export = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(queries, "HEAVY_SCAN_GATE", detector)
+    monkeypatch.setattr(queries, "EXPORT_SCAN_GATE", export)
+    return detector, export
+
+
+def test_detector_slot_is_handed_back_when_rows_start_flowing(service, gates, monkeypatch):
+    """The detector gate covers the aggregation, not the client-paced drain.
+
+    A sorted aggregate cannot emit its first row until every group exists, so
+    the first block proves the whole-corpus scan is over. Everything after it
+    is paced by the analyst's browser, and a backgrounded download that kept a
+    detector slot would starve every sweep on the box for as long as it sat
+    there.
+    """
+    detector, export = gates
+    observed: dict[str, bool] = {}
+    real_blocks = service._select_row_blocks
+
+    def spy(sql, parameters=None, **kwargs):
+        observed["held_during_scan"] = not _free(detector)
+        yield from real_blocks(sql, parameters=parameters, **kwargs)
+
+    monkeypatch.setattr(service, "_select_row_blocks", spy)
+
+    stream = service.iter_field_inventory(_query(), "attr:src_ip")
+    assert _free(detector) and _free(export), "nothing is taken before iteration starts"
+
+    next(stream)
+    assert observed["held_during_scan"], "the aggregation runs inside the detector gate"
+    assert _free(detector), "the detector slot is handed back at the first block"
+    assert not _free(export), "the export gate is held for the drain"
+
+    list(stream)
+    assert _free(detector) and _free(export)
+
+
+def test_abandoned_export_releases_both_gates(service, gates):
+    """A download the analyst cancels must not wedge a slot.
+
+    Closing the generator (what Starlette does when the client disconnects)
+    unwinds the `finally`, and the drain must not leave the export gate — the
+    one slot every other export queues behind — permanently taken.
+    """
+    detector, export = gates
+
+    stream = service.iter_field_inventory(_query(), "attr:src_ip")
+    next(stream)
+    stream.close()
+
+    assert _free(detector) and _free(export)
+
+
+def test_empty_inventory_releases_the_detector_gate(service, gates):
+    """A scan that yields no block at all still hands its slot back.
+
+    The release is driven by the first block, so the no-rows path is exactly
+    where a leak would hide — and `BoundedSemaphore` would then raise on the
+    *next* export's release rather than at the leak.
+    """
+    detector, export = gates
+
+    assert list(service.iter_field_inventory(_query(q="nothing-matches-this"), "attr:src_ip")) == []
+    assert _free(detector) and _free(export)

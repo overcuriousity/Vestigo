@@ -241,6 +241,15 @@ class Settings(BaseSettings):
     # deliberately under ClickHouse's own 256 MiB default — this path buys
     # headroom with throughput.
     enrichment_apply_insert_block_bytes: int = Field(default=67_108_864, ge=1_048_576)
+    # Seconds the enrichment apply keeps its scan-gate slot after the partition
+    # swap, waiting for the merges the swap queued to finish. Merge memory is
+    # the one consumer max_memory_usage cannot bound, so releasing the slot at
+    # the ALTER admits the next detector sweep straight into the merge burst.
+    # Bounded and non-fatal: the apply is already durably swapped in, so a slow
+    # merge must never fail it. 0 skips the wait — correct when ClickHouse has
+    # a max_server_memory_usage of its own, which bounds merges at the layer
+    # that can actually see them (docs/DEPLOYMENT.md "Resource sizing").
+    enrichment_apply_merge_wait_seconds: int = Field(default=300, ge=0)
     # Max entries in the process-local baseline-compare layer cache
     # (db/viz_cache.py, M24c) — memoizes the unfiltered baseline layer of
     # Visualize compare renders so it isn't a full-timeline re-scan on every

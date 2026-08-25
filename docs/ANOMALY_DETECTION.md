@@ -90,6 +90,15 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   the whole corpus must carry it. ClickHouse's own 90%-of-RAM server limit
   is no substitute — containerized servers misdetect total memory (observed
   503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
+- **The budget comes from ClickHouse, not from the app's host.** At startup the
+  app reads the ceiling ClickHouse runs under (`system.server_settings`, falling
+  back to `system.asynchronous_metrics`) and takes
+  `VESTIGO_STAT_SCAN_MEMORY_RATIO` of it, reserving the rest for merges and
+  caches. Measuring the app's *own* container instead is how a full-docker stack
+  authorized 25.6 GiB per query against a ClickHouse that shared the box with
+  three other services (`docs/DEPLOYMENT.md` §"How this went unnoticed"). The
+  clause is therefore built per query by `heavy_scan_settings()`, not frozen at
+  import — import is the one moment the app cannot ask ClickHouse anything.
 - **`HEAVY_SCAN_GATE` admission control on every `find_*` detector**: at most
   `VESTIGO_STAT_SCAN_CONCURRENCY` (2) heavy scans run against ClickHouse at once;
   surplus scans queue in the app. `max_memory_usage` is per *query* — without
@@ -98,6 +107,17 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   a correctly-pinned 8 GiB cap OOM-killed a 12 GiB host exactly this way.
   Nested helpers (`recommend_*`, `*_inventory`) are not gated — gated scans
   call them while holding the slot.
+- **`EXPORT_SCAN_GATE` for the one scan that streams to a browser**: the value
+  inventory export (`EventQueryService.iter_field_inventory`) is a whole-corpus
+  `GROUP BY` whose results are drained at the client's pace, which makes it the
+  only heavy scan whose duration is not bounded by ClickHouse. It holds
+  `HEAVY_SCAN_GATE` for the aggregation and hands that slot back at the first
+  block — a sorted aggregate cannot emit a row until every group exists, so the
+  first block proves the scan is over — then holds `EXPORT_SCAN_GATE` (one
+  slot, not configurable) for the drain. Without the handoff, one backgrounded
+  download starves every detector on the box for as long as it sits there; with
+  a second gate, two exports queue instead of stacking two live result streams
+  against the same memory budget.
   **The gate is not detector-only.** `ClickHouseStore.finalize_enrichment_apply`
   takes a slot for the whole enrichment partition rewrite (scratch build,
   `INSERT ... SELECT` over the source's partition, and the `REPLACE PARTITION`

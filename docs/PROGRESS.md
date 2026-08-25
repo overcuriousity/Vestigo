@@ -1,6 +1,116 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-25 (session 184 — value inventory export).
+Last updated: 2026-08-25 (session 186 — the ClickHouse OOM, root-caused).
+
+## Session 186 — 2026-08-25: nothing was bounding ClickHouse
+
+A production instance had been losing clickhouse-server to the kernel for months. The
+enrichment apply was blamed, twice, and gated twice (sessions 52 and 56). It was never
+the enrichers.
+
+**Three ceilings, all off.** The airgapped compose — the file that actually reaches
+production — carried no `mem_limit` on any service. The repository's own
+`docker-compose.yml` at least carried them commented out; the bundle template never had
+them. With no container limit, ClickHouse derived its own ceiling from
+`max_server_memory_usage_to_ram_ratio` (0.9) times detected RAM, which in an unlimited
+container is the whole 64 GiB host, so it never self-throttled. And
+`deploy/clickhouse/memory.xml` shipped as a `.example` nobody is told to copy.
+
+**The app made it worse, and reported success while doing it.**
+`detect_scan_memory_budget()` measured the memory of whatever host *the app* process
+sat on. Full-docker, no limits: 64 GiB detected, x 0.8 = 51.2 GiB total, / 2 slots =
+**25.6 GiB authorized for a single query** — while Postgres, Qdrant and the app shared
+the same RAM and ClickHouse's own ceiling sat at ~57.6 GiB. Every guardrail was
+honoured exactly. The sum simply did not fit, the kernel picked the largest RSS, and
+SIGKILL is not something a process gets to write a log line about. `restart:
+unless-stopped` then erased the outage: the only visible trace was `docker compose ps`
+showing ClickHouse up two hours against five days for everything else.
+
+**The fix is to stop having two numbers.** The budget is now derived from *ClickHouse's
+own reported ceiling* (`system.server_settings`, falling back to
+`system.asynchronous_metrics`), probed once at startup. An operator sets
+`max_server_memory_usage` and the app follows it. Local detection survives only as the
+pre-probe fallback, and landing there is now logged as a warning naming the
+misconfiguration.
+
+That required the SETTINGS clause to stop being a module constant. It was frozen at
+import — the one moment at which the app cannot ask ClickHouse anything, which is
+precisely why the budget could only ever be sized from the app's own host. It is now
+`heavy_scan_settings()`, called per query (69 call sites, mechanical). The side effect
+is worth as much as the fix: every `stat_scan_*` value except `concurrency` is now
+genuinely live, so four settings lost a `restart_required` badge that had been telling
+the truth about an implementation detail nobody wanted.
+
+`resolve_clickhouse_ceiling` distinguishes a ceiling an operator *set* from one
+ClickHouse *derived* from RAM it does not own. Both are usable for sizing; only the
+first is a limit. That distinction is the whole finding, so it is what `risk` reports:
+`ok` / `over_budget` / `unbounded`, served on `/api/health` because a startup warning is
+exactly what nobody reads.
+
+**The merge window.** `finalize_enrichment_apply` held its admission slot "across the
+INSERT *and* the REPLACE" on the stated grounds that the swap queues merges and merge
+memory is not covered by the per-query cap. Both halves of that sentence were right and
+the conclusion did not follow: `ALTER TABLE ... REPLACE PARTITION` returns as soon as
+the swap is done, with the merges still ahead of it. The slot was being released into
+the expensive part. It now waits on `system.merges`, bounded and non-fatal — the
+partition is durable by then, so a slow merge must never fail a completed apply.
+
+**Shipped, not documented.** Both compose files now set memory limits and mount
+`memory.xml`, overridable per service via `VESTIGO_*_MEM_LIMIT`. A guardrail that ships
+opt-in is a guardrail production runs without; that is the actual lesson and it is
+recorded in `DEPLOYMENT.md` §"How this went unnoticed" rather than left as folklore.
+
+Two test bugs surfaced on the way, both latent races rather than fallout.
+`_SeqFakeClient` keyed canned results to a FIFO under one marker while `compare_*` runs
+its two layers through `_run_parallel` — which layer got which counts was a thread race
+that happened to land right. Markers can now be tuples that must all match, so a test
+keys on what distinguishes the layers (`q=` compiles to `ILIKE`) instead of on arrival
+order. And `test_other_database_errors_are_not_swallowed` used `code: 241` as its
+example of an untranslated error; 241 is now deliberately translated, so it moved to
+`code: 62`.
+
+## Session 185 — 2026-08-25: what the review found in the value inventory (#299)
+
+Four findings against session 184's export, all correctness, and two of them changed a
+decision that session had recorded as deliberate.
+
+**The scan gate is not one gate.** Session 184 wrote that `iter_field_inventory` holds
+"its scan-gate slot for the whole drain" as though that followed from streaming. It does
+not. Every other holder of `HEAVY_SCAN_GATE` is bounded by ClickHouse; this one is bounded
+by the analyst's browser, and the gate has two slots, process-wide. Two people downloading
+a large inventory over a slow link — or one who backgrounds the download — hold both, and
+every detector on the box blocks behind them. The generator cannot even time itself out,
+because while it is suspended waiting on the consumer its own code is not running.
+
+The split that resolves it: the aggregation is what `HEAVY_SCAN_GATE` exists to admit, and
+a sorted aggregate cannot emit its first row until every group exists — so **the first
+block proves the heavy scan is over**. The detector slot is handed back there, and a new
+one-slot `EXPORT_SCAN_GATE` covers the drain. Exports queue behind each other rather than
+stacking two live result streams; detectors stop paying for a slow browser. No setting for
+the export gate: the supported answer to "I want more concurrent exports" is that you don't.
+
+**The pre-flight could not survive its own use case.** `uniqExact` builds the full distinct
+set in a hash table and does not spill — `HEAVY_SCAN_SETTINGS`' external-aggregation
+thresholds simply do not apply to it. So the count died at `max_memory_usage` on exactly
+the high-cardinality field the export was built for, and surfaced as a bare 500. This is
+the same trap session 184 avoided for the *stream* (window sorts cannot spill either) and
+then walked into for the count. It is now `count()` over a `GROUP BY` subquery: the same
+grouping the stream does, so exact for the same reason, through the spillable path. The
+grouping runs twice now. That is the price of the export working on the fields it exists
+for. A `QueryMemoryExceededError` maps any remaining `code: 241` to a 413 that says narrow
+the scope, alongside the older `QueryRequestTooLargeError` — the cap is ours, set so one
+scan dies instead of the server, which makes hitting it explainable rather than a 500.
+
+**Two smaller ones.** `iter_field_inventory` yielded ClickHouse cells straight through, so
+a `content_hash` or `file_hash` inventory — both legal field tokens, and reachable from the
+agent and the CLI even though the viz picker does not list them — wrote `b'3f2a…\x00'` into
+the CSV. `decode_fixed_string` is now factored out of `decode_fixed_string_columns` for the
+paths that yield a bare cell rather than a row. And in the export dialog only the mode
+toggle was frozen mid-download: flipping the separator to tab made the progress row read
+"Downloading .tsv" over an in-flight comma-separated request that would still save as
+`.csv`. Every control that shapes the request is frozen now, events-mode format included.
+
+Each of the four has a test that fails without its fix — checked by reverting each one.
 
 ## Session 184 — 2026-08-25: the value inventory export (#295)
 

@@ -2081,7 +2081,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     (external GROUP BY spill + per-query memory cap + thread cap) — a scan
     without it trusts the server-wide limit and can take the box down on a
     300M-row case."""
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
     class _RecordingClient(FakeClient):
         def __init__(self) -> None:
@@ -2113,7 +2113,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     ]
     assert scans
     for sql in scans:
-        assert HEAVY_SCAN_SETTINGS in sql, sql[:120]
+        assert heavy_scan_settings() in sql, sql[:120]
 
 
 # ---------------------------------------------------------------------------

@@ -134,6 +134,10 @@ SAVED="$(tar xOf "$BUNDLE/images/vestigo-stack.tar" manifest.json 2>/dev/null \
 cp deploy/airgap/docker-compose.airgap.yml "$BUNDLE/compose.airgap.yml"
 cp deploy/airgap/install.sh "$BUNDLE/install.sh"
 cp deploy/clickhouse/allow-default-network.xml "$BUNDLE/clickhouse/"
+# Ships enabled, not as an example to copy: the server-side memory ceiling is
+# what keeps ClickHouse failing one query instead of being OOM-killed, and an
+# opt-in guardrail is one that production runs without.
+cp deploy/clickhouse/memory.xml "$BUNDLE/clickhouse/"
 cp .env.example "$BUNDLE/.env.example"
 # Not optional: docs/DEPLOYMENT.md tells the operator this file is in the bundle,
 # and TLS is the last step of a first install.

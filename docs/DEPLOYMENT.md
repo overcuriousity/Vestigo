@@ -217,11 +217,17 @@ fails every Docker build. Keep the alias if you edit this.
 
 ## Resource sizing
 
-The reference stack ships **no memory limits**. That is fine for evaluation on a
-roomy box and wrong for anything real: four processes (app, ClickHouse, Postgres,
-Qdrant) share one host's RAM, none of them knows about the others, and the kernel
-resolves the shortfall by killing whichever is largest. That is almost always
-ClickHouse.
+Both compose files ship **with memory limits set**, sized for a 32 GiB host and
+overridable per service (`VESTIGO_CLICKHOUSE_MEM_LIMIT`, `VESTIGO_POSTGRES_MEM_LIMIT`,
+`VESTIGO_QDRANT_MEM_LIMIT`, `VESTIGO_APP_MEM_LIMIT`). Raise them to fit your box.
+**Do not remove them.** Four processes (app, ClickHouse, Postgres, Qdrant) share one
+host's RAM, none of them knows about the others, and with no limits the kernel
+resolves the shortfall by killing whichever is largest — almost always ClickHouse.
+
+They used to ship commented out, and the airgapped compose — the file that actually
+reaches production — did not carry them at all. A production instance therefore ran
+for months with nothing bounding any service. See §"How this went unnoticed" below;
+it is the reason none of these are opt-in any more.
 
 **Recognizing it.** A kernel/cgroup kill shows up as
 
@@ -235,53 +241,115 @@ had hit its own limit you would instead see a `MEMORY_LIMIT_EXCEEDED` query fail
 and the server would still be alive. Confirm with `dmesg -T | grep -i -A5 'killed
 process'`, which names the cgroup and the RSS at kill time.
 
+A subtler tell, and the one that is visible without reading any log: `docker compose
+ps` showing ClickHouse with an uptime far shorter than the rest of the stack.
+`restart: unless-stopped` brings it back silently, so a nightly kill looks like a
+healthy service.
+
 ### The three ceilings, and how they must relate
 
-1. **The container limit** (`mem_limit` in `docker-compose.yml`) — the hard stop.
-   Above it the kernel kills, without warning or a log line from the victim.
-2. **ClickHouse's own `max_server_memory_usage`** — must sit *below* the container
-   limit so the server refuses a query rather than being killed. By default it is
-   derived as 0.9 × detected RAM, and a containerized server can misdetect that
-   badly (503 GiB observed on a 128 GiB VM), in which case it never self-throttles.
-   Pin an absolute value: see `deploy/clickhouse/memory.xml.example`. Pinning does
-   not disable the ratio — the effective ceiling is the *lower* of the two, and
-   ClickHouse logs a "lowered to" line when it clamps the pinned value down, so
-   confirm the value it actually adopted in the server log.
+1. **The container limit** (`mem_limit`) — the hard stop. Above it the kernel kills,
+   without warning or a log line from the victim. It decides *who dies*, never
+   whether anyone throttles first.
+2. **ClickHouse's own `max_server_memory_usage`** (`deploy/clickhouse/memory.xml`,
+   mounted by both compose files) — must sit *below* the container limit so the
+   server refuses a query rather than being killed. By default it is derived as
+   0.9 × detected RAM, and a containerized server can misdetect that badly (503 GiB
+   observed on a 128 GiB VM) — and in a container with *no* memory limit "detected
+   RAM" is the whole host, which the server neither owns nor is alone on. Either way
+   it never self-throttles. Pinning does not disable the ratio: the effective ceiling
+   is the *lower* of the two, and ClickHouse logs a "lowered to" line when it clamps,
+   so confirm the adopted value in the server log.
+
+   This is also **the only ceiling that bounds background merges**, which no
+   per-query cap can reach — which makes it the layer that matters after an
+   enrichment partition rewrite.
 3. **Vestigo's scan budget** (`VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`) — a *total across
    concurrent heavy scans*; each query is granted budget ÷
    `VESTIGO_STAT_SCAN_CONCURRENCY` as its `max_memory_usage`. Must sit below (2).
 
-The trap is (3) when left at its `0` (auto) default. Detection runs **in the app
-process**, from its cgroup limit or, failing that, the host's `MemTotal`. In a
-full-docker stack with no limits set, the app reads the whole host and sizes a
-budget as though ClickHouse owned the machine. On a 32 GiB host that is 32 × 0.8 ÷ 2
-= 12.8 GiB granted to a single query, while Postgres, Qdrant and the app are also
-resident. Pin it explicitly whenever the app and ClickHouse are in separate
-containers — the automatic value is only correct when they genuinely share one
-memory limit.
+Left at its `0` (auto) default, (3) is now **derived from (2)**: at startup the app
+asks ClickHouse what ceiling it is running under (`system.server_settings`, falling
+back to `system.asynchronous_metrics`) and takes `VESTIGO_STAT_SCAN_MEMORY_RATIO` of
+it, reserving the remainder for merges and caches. One number to set, read from the
+service it protects.
+
+Only when that probe finds no ceiling does the app fall back to measuring its own
+container — and that fallback is exactly the trap: in a full-docker stack it reads
+the whole host and sizes a budget as though ClickHouse owned the machine. On a 64 GiB
+host that is 64 × 0.8 ÷ 2 = **25.6 GiB granted to a single query** while three other
+services are resident. The app now says so, loudly, at startup and in
+`/api/health`.
+
+### Checking what actually resolved
+
+`GET /api/health` (authenticated) carries a `scan_budget` block:
+
+```json
+{"risk": "ok", "per_query_bytes": 8589934592, "total_bytes": 17179869184,
+ "clickhouse_ceiling_bytes": 30064771072, "clickhouse_ceiling_is_explicit": true,
+ "source": "clickhouse", "concurrency": 2}
+```
+
+`risk` is what to act on:
+
+- `ok` — the total budget fits under ClickHouse's ceiling with headroom.
+- `over_budget` — scans alone are authorized more than ClickHouse may use in total.
+  Lower `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` or raise `max_server_memory_usage`.
+- `unbounded` — ClickHouse reports no ceiling an operator set. Nothing bounds its
+  merges, caches or allocator slack, and the kernel is the only backstop. Mount
+  `memory.xml` and set a container limit.
 
 Heavy scans are admission-controlled (`VESTIGO_STAT_SCAN_CONCURRENCY`, default 2),
 and the enrichment partition rewrite takes a slot too — so the worst case is
-`concurrency × per-query cap`, not one query's cap.
+`concurrency × per-query cap`, not one query's cap. That rewrite also holds its slot
+through the merges its `REPLACE PARTITION` queues
+(`VESTIGO_ENRICHMENT_APPLY_MERGE_WAIT_SECONDS`, default 300; set it to 0 when
+ClickHouse has a `max_server_memory_usage`, which bounds merges directly).
 
-### Worked example: 32 GiB host, full-docker
+### Worked example: 32 GiB host, full-docker (the shipped defaults)
 
 | Setting | Value | Where |
 | --- | --- | --- |
 | ClickHouse container limit | 12 GiB | `mem_limit: 12g` |
 | ClickHouse server limit | 10 GiB | `deploy/clickhouse/memory.xml` |
-| Vestigo scan budget (total) | 8 GiB | `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES=8000000000` |
+| Vestigo scan budget (total) | 8 GiB | auto: 0.8 × 10 GiB |
 | → per-query cap | 4 GiB | budget ÷ concurrency (2) |
 | Postgres | 4 GiB | `mem_limit: 4g` |
 | Qdrant | 4 GiB | `mem_limit: 4g` (only with embeddings) |
+| App | 4 GiB | `mem_limit: 4g` |
 
-That leaves roughly 12 GiB for the app process and the OS page cache. Scale the
-ClickHouse numbers first when you have more RAM; it is where query cost lives.
+That leaves roughly 8 GiB for the OS page cache. Do not spend it: ClickHouse reads
+compressed parts through it, and on a large timeline it is the difference between
+scanning from RAM and scanning from disk.
 
-Every `VESTIGO_STAT_SCAN_*` value is editable in the admin console, but all of them
-are **restart-required** — the SETTINGS clause is built once at import and the
-admission semaphore is shared by value across the scan modules, so a saved edit does
-nothing until the app restarts. The console labels them accordingly.
+### Worked example: 64 GiB host, one analyst, ~700M-event timelines
+
+| Setting | Value | Where |
+| --- | --- | --- |
+| ClickHouse container limit | 34 GiB | `VESTIGO_CLICKHOUSE_MEM_LIMIT=34g` |
+| ClickHouse server limit | 28 GiB | `max_server_memory_usage` in `memory.xml` |
+| Vestigo scan budget (total) | 16 GiB | `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES=17179869184` |
+| → per-query cap | 8 GiB | budget ÷ concurrency (2) |
+| Spill thresholds | 4 GB | `..._EXTERNAL_GROUP_BY_BYTES` / `..._EXTERNAL_SORT_BYTES` |
+| Threads per scan | 8 | `VESTIGO_STAT_SCAN_MAX_THREADS` (2 × 8 of 20 cores) |
+| Postgres / Qdrant / App | 4 / 6 / 8 GiB | `VESTIGO_*_MEM_LIMIT` |
+
+Sum: 52 GiB, leaving ~12 GiB for the OS and page cache. Keep concurrency at 2 even
+with a single analyst — opening the Investigate surface fires several detectors at
+once, and the gate is what makes them queue instead of stack. Raising it does not add
+throughput; it divides the same total into smaller, more spill-bound slices.
+
+### How this went unnoticed
+
+Every layer reported success. The container had no limit to exceed. ClickHouse had a
+ceiling in the sense that a number existed, derived from RAM it did not own. The app
+had a per-query cap, honoured exactly, sized from a host measurement that described
+the wrong machine. The kill left nothing in ClickHouse's log because SIGKILL is not
+something a process gets to write about, and `restart: unless-stopped` erased the
+outage from view. The lesson taken: a guardrail that ships opt-in is a guardrail
+production runs without, and a budget derived from a number nobody checked against
+the thing it protects is not a budget.
 
 ## Airgapped installation
 

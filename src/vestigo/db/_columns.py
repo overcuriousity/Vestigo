@@ -93,6 +93,19 @@ FIXED_STRING_COLUMNS: tuple[str, ...] = (
 )
 
 
+def decode_fixed_string(value: Any) -> Any:
+    """Decode one `FixedString(64)` cell to a plain hex string.
+
+    See :data:`FIXED_STRING_COLUMNS` for why. Non-`bytes` values are returned
+    unchanged, so this is idempotent and safe to apply to a cell whose type
+    depends on which column a field token resolved to — a value inventory over
+    `content_hash` yields `bytes`, over any other field a `str`.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace").rstrip("\x00")
+    return value
+
+
 def decode_fixed_string_columns(row: dict[str, Any]) -> dict[str, Any]:
     """Decode `FixedString(64)` columns in *row* to plain hex strings, in place.
 
@@ -102,7 +115,7 @@ def decode_fixed_string_columns(row: dict[str, Any]) -> dict[str, Any]:
     for key in FIXED_STRING_COLUMNS:
         value = row.get(key)
         if isinstance(value, bytes):
-            row[key] = value.decode("utf-8", "replace").rstrip("\x00")
+            row[key] = decode_fixed_string(value)
     return row
 
 

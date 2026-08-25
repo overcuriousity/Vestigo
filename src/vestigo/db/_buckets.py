@@ -50,7 +50,7 @@ def query_timestamp_range(
     property, never shifted).
 
     *settings* is an optional trailing SQL clause (pass
-    ``db/_scan.py::HEAVY_SCAN_SETTINGS`` to bound the scan's memory/threads);
+    ``db/_scan.py::heavy_scan_settings`` to bound the scan's memory/threads);
     empty by default so callers with their own settings discipline are
     unaffected.
     """

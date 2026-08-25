@@ -197,6 +197,33 @@ describe("ExportDialog — value inventory (#295)", () => {
     expect(screen.getByRole("button", { name: /Download \.tsv/ })).toBeTruthy();
   });
 
+  it("freezes every control that shapes the request while the file is arriving", async () => {
+    // The request captured its values at submit and the filename is computed
+    // from them there too, so a control that still moves mid-download makes
+    // the progress label and the button's extension describe a file other
+    // than the one actually arriving — flipping the separator to tab used to
+    // read "Downloading .tsv" over an in-flight comma-separated request.
+    downloadFieldInventoryMock.mockReturnValue(new Promise(() => {}));
+    await openInventory();
+    fireEvent.click(screen.getByRole("button", { name: /Download \.csv/ }));
+    expect(await screen.findByText("Downloading .csv")).toBeTruthy();
+
+    for (const control of [
+      screen.getByRole("button", { name: "tab" }),
+      screen.getByRole("combobox", { name: "Field" }),
+      screen.getByRole("combobox", { name: "Order" }),
+      screen.getByRole("checkbox", { name: "First seen" }),
+      screen.getByRole("button", { name: "Events" }),
+    ]) {
+      expect(control.hasAttribute("disabled") || control.getAttribute("aria-disabled") === "true")
+        .toBe(true);
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "tab" }));
+    expect(screen.getByText("Downloading .csv")).toBeTruthy();
+    expect(downloadFieldInventoryMock).toHaveBeenCalledTimes(1);
+  });
+
   it("shows how many rows the file will have before asking for it", async () => {
     await openInventory();
 

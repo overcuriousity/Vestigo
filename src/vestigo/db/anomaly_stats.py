@@ -214,7 +214,7 @@ from vestigo.db._dt import (
     to_clickhouse_utc,
 )
 from vestigo.db._offsets import active_offsets, bind_offset_params, effective_ts_sql
-from vestigo.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
+from vestigo.db._scan import HEAVY_SCAN_GATE, heavy_scan_settings
 from vestigo.db._template import template_normalize_expr
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import mapping_coalesce_expr, resolve_mapping
@@ -1734,7 +1734,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
-            f" {HEAVY_SCAN_SETTINGS}"
+            f" {heavy_scan_settings()}"
         )
         top_res = self.ch.client.query(top_sql, parameters=params)
         if top_res.result_rows:
@@ -1753,7 +1753,7 @@ class StatisticalAnomalyService:
         # ``uniq`` (approximate, ~1% error) replaces ``uniqExact`` — the
         # cardinality classification thresholds don't need exactness, and
         # exact per-key hash sets over near-unique values are the other
-        # memory blowup. HEAVY_SCAN_SETTINGS (external GROUP BY spill + a
+        # memory blowup. heavy_scan_settings() (external GROUP BY spill + a
         # query memory cap) bounds the worst case instead of trusting the
         # server-wide limit.
         attr_sql = f"""
@@ -1774,7 +1774,7 @@ class StatisticalAnomalyService:
             -- set is a coin flip is not reproducible.
             ORDER BY cov_count DESC, key ASC
             LIMIT {{max_keys:UInt32}}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         attr_res = self.ch.client.query(
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
@@ -1818,7 +1818,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
-            f" {HEAVY_SCAN_SETTINGS}"
+            f" {heavy_scan_settings()}"
         )
         m_res = self.ch.client.query(m_sql, parameters=m_params)
         out: list[tuple[str, int, int]] = []
@@ -2130,7 +2130,7 @@ class StatisticalAnomalyService:
                     HAVING cnt <= {{floor:UInt32}}
                     ORDER BY cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
-                    {HEAVY_SCAN_SETTINGS}
+                    {heavy_scan_settings()}
                 """
             else:
                 # Temporal: flag values absent from the baseline window but
@@ -2164,7 +2164,7 @@ class StatisticalAnomalyService:
                     HAVING baseline_cnt = 0 AND ({w_sum}) > 0
                     ORDER BY ({w_sum}) ASC
                     LIMIT {{lim:UInt32}}
-                    {HEAVY_SCAN_SETTINGS}
+                    {heavy_scan_settings()}
                 """
 
             rows = self.ch.client.query(sql, parameters=params).result_rows
@@ -2252,7 +2252,7 @@ class StatisticalAnomalyService:
                 HAVING cnt <= {{floor:UInt32}}
                 ORDER BY key ASC, cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}} BY key
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
         else:
             bp, sps = _window_preds(windows, params, source_offsets)
@@ -2282,7 +2282,7 @@ class StatisticalAnomalyService:
                 HAVING baseline_cnt = 0 AND ({w_sum}) > 0
                 ORDER BY key ASC, ({w_sum}) ASC
                 LIMIT {{lim:UInt32}} BY key
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
 
         rows_by_key: dict[str, list[tuple[Any, ...]]] = {}
@@ -2532,7 +2532,7 @@ class StatisticalAnomalyService:
                 HAVING cnt <= {{floor:UInt32}}
                 ORDER BY cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
         else:
             bp, sps = _window_preds(windows, params, source_offsets)
@@ -2560,7 +2560,7 @@ class StatisticalAnomalyService:
                 HAVING baseline_cnt = 0 AND ({w_sum}) > 0
                 ORDER BY ({w_sum}) ASC
                 LIMIT {{lim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
 
         rows = self.ch.client.query(sql, parameters=params).result_rows
@@ -2685,7 +2685,7 @@ class StatisticalAnomalyService:
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
             f"{window_pred}"
-            f" {HEAVY_SCAN_SETTINGS}"
+            f" {heavy_scan_settings()}"
         )
         rows = self.ch.client.query(probe_sql, parameters=params).result_rows
         if not rows:
@@ -2845,14 +2845,14 @@ class StatisticalAnomalyService:
             if windows is None:
                 stat_sql = (
                     f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
-                    f" FROM ({num_src}) WHERE num IS NOT NULL {HEAVY_SCAN_SETTINGS}"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL {heavy_scan_settings()}"
                 )
             else:
                 stat_bp, _ = _window_preds(windows, stat_params, source_offsets)
                 stat_sql = (
                     f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL AND {stat_bp}"
-                    f" {HEAVY_SCAN_SETTINGS}"
+                    f" {heavy_scan_settings()}"
                 )
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
             if not srows or srows[0][2] is None:
@@ -2917,7 +2917,7 @@ class StatisticalAnomalyService:
                 GROUP BY val{win_idx_group}
                 ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
@@ -3249,7 +3249,7 @@ class StatisticalAnomalyService:
                 )
                 ARRAY JOIN chars AS c
                 GROUP BY c
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             rows = self.ch.client.query(sql, parameters=params).result_rows
             counts = {str(c): int(nv) for c, nv, _ in rows}
@@ -3293,7 +3293,7 @@ class StatisticalAnomalyService:
                   AND ({" OR ".join(sps)})
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                 LIMIT {{glim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             rows = self.ch.client.query(sql, parameters=params).result_rows
             missing = {str(row[0]) for row in rows if str(row[0]) not in known}
@@ -3351,7 +3351,7 @@ class StatisticalAnomalyService:
                         )
                         ARRAY JOIN chars AS c
                         GROUP BY c
-                        {HEAVY_SCAN_SETTINGS}
+                        {heavy_scan_settings()}
                     """
                     cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
                     char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
@@ -3389,7 +3389,7 @@ class StatisticalAnomalyService:
                         )
                         ARRAY JOIN chars AS c
                         GROUP BY grp, c
-                        {HEAVY_SCAN_SETTINGS}
+                        {heavy_scan_settings()}
                     """
                     cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
                     by_grp: dict[str, dict[str, int]] = {}
@@ -3428,7 +3428,7 @@ class StatisticalAnomalyService:
                               AND {col} != ''
                               AND {bs_bp}
                         )
-                        {HEAVY_SCAN_SETTINGS}
+                        {heavy_scan_settings()}
                     """
                     bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
                     if not bs_rows:
@@ -3457,7 +3457,7 @@ class StatisticalAnomalyService:
                               AND {bs_bp}
                         )
                         GROUP BY grp
-                        {HEAVY_SCAN_SETTINGS}
+                        {heavy_scan_settings()}
                     """
                     bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
                     for grp, charset_arr, grp_n_vals in bs_rows:
@@ -3601,7 +3601,7 @@ class StatisticalAnomalyService:
                     WHERE length(novel) > 0
                     ORDER BY length(novel) DESC, cnt ASC
                     LIMIT {{plim:UInt32}}
-                    {HEAVY_SCAN_SETTINGS}
+                    {heavy_scan_settings()}
                 """
             else:
                 vgcol = _group_expr(group_field, viol_params, field_mappings)
@@ -3678,7 +3678,7 @@ class StatisticalAnomalyService:
                     ORDER BY length(novel) DESC, cnt ASC
                     LIMIT {{plim:UInt32}} BY grp
                     LIMIT {{tlim:UInt32}}
-                    {HEAVY_SCAN_SETTINGS}
+                    {heavy_scan_settings()}
                 """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
             if group_field is not None and len(vrows) >= _MAX_CHARSET_GROUPED_ROWS:
@@ -3986,7 +3986,7 @@ class StatisticalAnomalyService:
                           AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
                     )
                 )
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
             if not srows or srows[0][2] is None:
@@ -4045,7 +4045,7 @@ class StatisticalAnomalyService:
                 WHERE ent < {{lo:Float64}} OR ent > {{hi:Float64}}
                 ORDER BY greatest({{lo:Float64}} - ent, ent - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
@@ -4270,7 +4270,7 @@ class StatisticalAnomalyService:
                 HAVING baseline_cnt >= 1
                 ORDER BY (baseline_cnt + {w_sum}) DESC, val ASC
                 LIMIT {{cap:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             rows = self.ch.client.query(sql, parameters=params).result_rows
             if not rows:
@@ -4585,7 +4585,7 @@ class StatisticalAnomalyService:
                 HAVING w0_n >= 1
                 ORDER BY ({n_sum}) DESC, val ASC
                 LIMIT {{cap:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             rows = self.ch.client.query(sql, parameters=params).result_rows
             if not rows:
@@ -5010,7 +5010,7 @@ class StatisticalAnomalyService:
                       AND ({union_pred})
                 )
                 WHERE num IS NOT NULL
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             rows = self.ch.client.query(sql, parameters=params).result_rows
             if not rows:
@@ -5076,7 +5076,7 @@ class StatisticalAnomalyService:
                 GROUP BY val
                 ORDER BY baseline_cnt DESC, val ASC
                 LIMIT {{catcap:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             rows = self.ch.client.query(sql, parameters=params).result_rows
             rows = [r for r in rows if r[0]]
@@ -5395,7 +5395,7 @@ class StatisticalAnomalyService:
               AND {col} != ''
             GROUP BY bucket, series_val
             ORDER BY bucket
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         brows = self.ch.client.query(bucket_sql, parameters=params).result_rows
 
@@ -5561,7 +5561,7 @@ class StatisticalAnomalyService:
               AND {col} != ''
               AND ({union_pred})
             GROUP BY bucket, series_val
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         brows = self.ch.client.query(bucket_sql, parameters=params).result_rows
         if not brows:
@@ -5778,7 +5778,7 @@ class StatisticalAnomalyService:
               AND {col} IN {{vals:Array(String)}}
               AND {bucket_expr} IN {{buckets:Array(DateTime)}}
             GROUP BY bucket, series_val
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows
 
@@ -5914,7 +5914,7 @@ class StatisticalAnomalyService:
             FROM ({inner})
             WHERE guard IS NOT NULL
             GROUP BY w_idx
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         ngram_totals: dict[int, int] = {}
         for sid in source_ids:
@@ -5970,7 +5970,7 @@ class StatisticalAnomalyService:
             HAVING baseline_cnt = 0 AND ({w_sum}) > 0
             ORDER BY ({w_sum}) ASC, gram ASC
             LIMIT {{cap:UInt32}}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         # gram -> one [count, first_ts, first_eid] slot per suspect window,
         # merged across sources (counts summed, earliest occurrence wins).
@@ -6007,7 +6007,7 @@ class StatisticalAnomalyService:
                 FROM ({inner})
                 WHERE guard IS NOT NULL AND w_idx = -1
                   AND has({{cands:Array(Array(String))}}, gram)
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             cands = [list(g) for g in merged]
             for sid in source_ids:
@@ -6186,7 +6186,7 @@ class StatisticalAnomalyService:
             HAVING support >= {{msup:UInt32}}
             ORDER BY support DESC, gram ASC
             LIMIT {{cap:UInt32}}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         run_warnings: list[str] = []
         # gram -> [support, sources_count, first_occ, first_evt, last_occ]
@@ -6269,7 +6269,7 @@ class StatisticalAnomalyService:
             )
             WHERE delta IS NOT NULL
             GROUP BY gram
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         # gram -> {source_id: cadence block}
         cadence: dict[tuple[str, ...], dict[str, dict[str, Any]]] = defaultdict(dict)
@@ -6476,7 +6476,7 @@ class StatisticalAnomalyService:
             WHERE guard IS NOT NULL AND gram = {{g:Array(String)}}
             ORDER BY first_ts, member_eid
             LIMIT {{lim:UInt64}}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         written = 0
         warnings: list[str] = []
@@ -6597,7 +6597,7 @@ class StatisticalAnomalyService:
             WHERE {outer_pred}
             ORDER BY {order_col} {order_dir}
             LIMIT {{lim:UInt64}}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows
         total = int(rows[0][7]) if rows else 0
@@ -6698,7 +6698,7 @@ class StatisticalAnomalyService:
                     countIf(skew >= {{skew:Float64}}) AS n_viol,
                     maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
                 FROM ({_source_inner("")})
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             srows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
             if srows and int(srows[0][0]) > 0:
@@ -6734,7 +6734,7 @@ class StatisticalAnomalyService:
                 WHERE skew >= {{skew:Float64}}
                 ORDER BY skew DESC, byte_offset
                 LIMIT {{lim:UInt32}}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
             """
             for r in self.ch.client.query(detail_sql, parameters=detail_params).result_rows:
                 rows.append((sid, *r))

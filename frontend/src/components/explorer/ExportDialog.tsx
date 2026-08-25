@@ -124,6 +124,10 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
         </Button>
       </DialogTrigger>
       <DialogContent title="Export" description={description}>
+        {/* Every control that shapes the request is frozen while a download is
+            in flight: the request captured its values at submit, so a control
+            that still moves makes the progress label, the button's extension
+            and the saved filename disagree with the file actually arriving. */}
         <div className="space-y-4">
           <SegmentedControl<Mode>
             value={mode}
@@ -146,7 +150,8 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                     <button
                       key={f}
                       onClick={() => setFormat(f)}
-                      className={`flex-1 rounded border px-3 py-2 text-sm font-mono transition-base ${
+                      disabled={download.active}
+                      className={`flex-1 rounded border px-3 py-2 text-sm font-mono transition-base disabled:cursor-not-allowed disabled:opacity-50 ${
                         format === f
                           ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-accent)]"
                           : "border-[var(--color-border)] text-[var(--color-fg-muted)] hover:border-[var(--color-border-strong)]"
@@ -176,6 +181,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                 <select
                   aria-label="Field"
                   className={SELECT_CLASS}
+                  disabled={download.active}
                   value={field ?? ""}
                   onChange={(e) => setField(e.target.value || null)}
                 >
@@ -203,7 +209,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                       >
                         <Checkbox
                           checked={columns.includes(column)}
-                          disabled={forced}
+                          disabled={forced || download.active}
                           onCheckedChange={(checked) =>
                             setPicked((prev) =>
                               checked ? [...prev, column] : prev.filter((c) => c !== column),
@@ -230,6 +236,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                   <SegmentedControl<FieldInventorySeparator>
                     value={separator}
                     onChange={setSeparator}
+                    disabled={download.active}
                     options={SEPARATORS.map((s) => ({ id: s.id, label: s.label }))}
                   />
                 </div>
@@ -240,6 +247,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                   <select
                     aria-label="Order"
                     className={SELECT_CLASS}
+                    disabled={download.active}
                     value={orderBy}
                     onChange={(e) => setOrderBy(e.target.value as FieldInventoryOrder)}
                   >

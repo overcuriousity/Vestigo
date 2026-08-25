@@ -6,6 +6,7 @@ import functools
 import hashlib
 import logging
 import math
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -24,6 +25,7 @@ from vestigo.db._buckets import (
 from vestigo.db._columns import (
     EVENT_SELECT_COLUMNS,
     TOP_LEVEL_NON_STRING_COLUMNS,
+    decode_fixed_string,
     decode_fixed_string_columns,
     resolve_column_token,
 )
@@ -41,7 +43,7 @@ from vestigo.db._offsets import (
     effective_ts_sql,
     offset_raw_bounds,
 )
-from vestigo.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
+from vestigo.db._scan import EXPORT_SCAN_GATE, HEAVY_SCAN_GATE, heavy_scan_settings
 from vestigo.db._time_fields import TimeFieldSpec, resolve_time_field
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import (
@@ -111,6 +113,42 @@ class QueryRequestTooLargeError(Exception):
     message ("HTML Form Exception: Field value too long") tells an analyst
     nothing. The API turns this into a 413 with an actionable explanation.
     """
+
+
+class QueryMemoryExceededError(Exception):
+    """ClickHouse killed the query at its ``max_memory_usage`` cap.
+
+    Raised in place of the raw ``code: 241`` ``DatabaseError``, whose message
+    is a wall of internal allocator accounting. The cap is the one in
+    ``db/_scan.py`` — deliberately set so a runaway aggregation fails *one
+    query* instead of OOM-killing the server — so reaching it is a normal,
+    explainable outcome of asking for too broad a scan, not a bug. The API
+    turns it into a 413 telling the analyst to narrow the scope.
+    """
+
+
+def _mapped_database_error(exc: DatabaseError) -> Exception | None:
+    """Translate a ClickHouse error into an actionable one, or ``None``.
+
+    The single place the two server-side failures an analyst can actually do
+    something about are recognized, so :py:meth:`EventQueryService._select` and
+    its streaming sibling cannot drift on which of them they map.
+    """
+    message = str(exc)
+    if "code: 1000" in message and "Field value too long" in message:
+        return QueryRequestTooLargeError(
+            "the filter is too large for ClickHouse to accept in one request"
+        )
+    # Matched by name *and* by code: clickhouse-connect surfaces the server's
+    # "Code: 241. DB::Exception: Memory limit … exceeded" text in some paths
+    # and only the numeric code in others, and a mapping that catches one of
+    # the two regresses silently into the 500 it exists to prevent.
+    if "MEMORY_LIMIT_EXCEEDED" in message or re.search(r"code:\s*241\b", message, re.IGNORECASE):
+        return QueryMemoryExceededError(
+            "this query needs more memory than the event store is allowed to use — "
+            "narrow the time range or the filter and try again"
+        )
+    return None
 
 
 # Mirrors ClickHouse's TSV escape table exactly, so every sequence we emit
@@ -1130,11 +1168,9 @@ class EventQueryService:
         try:
             return self.store.client.query(sql, parameters=parameters, **kwargs)
         except DatabaseError as exc:
-            message = str(exc)
-            if "code: 1000" in message and "Field value too long" in message:
-                raise QueryRequestTooLargeError(
-                    "the filter is too large for ClickHouse to accept in one request"
-                ) from exc
+            mapped = _mapped_database_error(exc)
+            if mapped is not None:
+                raise mapped from exc
             raise
 
     def _select_row_blocks(
@@ -1158,11 +1194,9 @@ class EventQueryService:
             ) as stream:
                 yield from stream
         except DatabaseError as exc:
-            message = str(exc)
-            if "code: 1000" in message and "Field value too long" in message:
-                raise QueryRequestTooLargeError(
-                    "the filter is too large for ClickHouse to accept in one request"
-                ) from exc
+            mapped = _mapped_database_error(exc)
+            if mapped is not None:
+                raise mapped from exc
             raise
 
     def _build_where(
@@ -1813,7 +1847,7 @@ class EventQueryService:
             WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
             GROUP BY artifact
             ORDER BY n DESC
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=params,
         )
@@ -1840,7 +1874,7 @@ class EventQueryService:
                 )
             )
             WHERE _rn <= {{per:UInt32}}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=params,
         )
@@ -2009,7 +2043,7 @@ class EventQueryService:
                 WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
                 GROUP BY bucket
                 ORDER BY bucket
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -2052,7 +2086,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2114,7 +2148,7 @@ class EventQueryService:
             GROUP BY val
             ORDER BY c DESC, val ASC
             LIMIT {int(limit)}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2184,12 +2218,27 @@ class EventQueryService:
         events export's ``count()`` has: it is the row count the completeness
         trailer proves against, and it is the last point at which a query-layer
         failure can still become a status code rather than a truncated 200.
+
+        Counted as ``count()`` over a ``GROUP BY`` subquery rather than the
+        obvious ``uniqExact``, because ``uniqExact`` builds the full distinct
+        set in a hash table and **cannot spill** — ``heavy_scan_settings()``'
+        external-aggregation thresholds do not apply to it. It therefore dies
+        at ``max_memory_usage`` on precisely the high-cardinality field this
+        export exists for, which is the same reason
+        :py:meth:`iter_field_inventory` avoids window functions. The subquery
+        aggregates through the spillable path instead, and is exact for the
+        same reason the stream is: it is the very same grouping. The price is
+        that the grouping runs twice, once here and once to stream — worth it
+        to turn "the export refuses on the fields it was built for" into "the
+        export works".
         """
         with HEAVY_SCAN_GATE:
             where, parameters, col_expr = self._inventory_scope(query, field_token)
             result = self._select(
-                f"SELECT uniqExact({col_expr}) FROM {self.store.database}.events "
-                f"WHERE {where} {HEAVY_SCAN_SETTINGS}",
+                f"SELECT count() FROM ("
+                f"SELECT {col_expr} AS val FROM {self.store.database}.events "
+                f"WHERE {where} GROUP BY val"
+                f") {heavy_scan_settings()}",
                 parameters=parameters,
             )
         rows = result.result_rows
@@ -2215,15 +2264,25 @@ class EventQueryService:
         - **No window functions.** ``field_terms`` can afford ``sum() OVER ()``
           because it takes a top-N; this scan is unbounded in group count and
           window sorts cannot spill to disk (see ``db/_scan.py``). Plain
-          ``GROUP BY``/``ORDER BY`` under ``HEAVY_SCAN_SETTINGS`` does.
+          ``GROUP BY``/``ORDER BY`` under ``heavy_scan_settings()`` does.
         - **Sentinel-safe times.** The no-timestamp storage sentinel is nulled
           out *inside* the aggregate rather than filtered out of the scan, so a
           value seen only on undated events still gets a row carrying its true
           count, with empty times instead of a fabricated year-2299 one.
         - **Streamed, not materialised.** A high-cardinality field can have
           millions of distinct values; blocks are pulled from ClickHouse as the
-          consumer drains them. The scan gate is therefore held for the whole
-          stream — this is exactly the class of scan it exists to admit.
+          consumer drains them.
+
+        The two gates are a consequence of that last point. The aggregation is
+        the whole-corpus ``GROUP BY`` :data:`HEAVY_SCAN_GATE` exists to admit,
+        so it is held for that; but a sorted aggregate cannot emit its first
+        row until every group exists, so the **first block proves the heavy
+        scan is over**. What follows is paced by the analyst's browser, and
+        holding a detector slot at browser speed is how one backgrounded
+        download starves every sweep on the box. So the detector slot is handed
+        back at the first block and :data:`EXPORT_SCAN_GATE` — one slot — is
+        held for the drain, which queues a second export rather than stacking
+        two live result streams against the same memory budget.
 
         Every ordering breaks ties on the value, so re-running an export over
         unchanged (immutable) sources reproduces the same file.
@@ -2244,18 +2303,31 @@ class EventQueryService:
             f"WHERE {where} "
             f"GROUP BY val "
             f"ORDER BY {order_sql}{tie_break} "
-            f"{HEAVY_SCAN_SETTINGS}, max_block_size = {int(block_size)}"
+            f"{heavy_scan_settings()}, max_block_size = {int(block_size)}"
         )
 
-        with HEAVY_SCAN_GATE:
-            for block in self._select_row_blocks(sql, parameters=parameters):
-                for value, count, first_seen, last_seen in block:
-                    yield {
-                        "value": value,
-                        "count": int(count),
-                        "first_seen": ensure_utc_iso(first_seen) if first_seen else None,
-                        "last_seen": ensure_utc_iso(last_seen) if last_seen else None,
-                    }
+        with EXPORT_SCAN_GATE:
+            HEAVY_SCAN_GATE.acquire()
+            scanning = True
+            try:
+                for block in self._select_row_blocks(sql, parameters=parameters):
+                    if scanning:
+                        HEAVY_SCAN_GATE.release()
+                        scanning = False
+                    for value, count, first_seen, last_seen in block:
+                        yield {
+                            # `value` is `bytes` when the token resolved to a
+                            # FixedString(64) column (`content_hash`,
+                            # `file_hash`) — the CSV writer would stringify
+                            # that as `b'3f2a…\x00'`.
+                            "value": decode_fixed_string(value),
+                            "count": int(count),
+                            "first_seen": ensure_utc_iso(first_seen) if first_seen else None,
+                            "last_seen": ensure_utc_iso(last_seen) if last_seen else None,
+                        }
+            finally:
+                if scanning:
+                    HEAVY_SCAN_GATE.release()
 
     # Quantiles reported for every numeric field — chosen to cover both the
     # box-plot five-number summary (0.25/0.5/0.75, whiskers approximated from
@@ -2336,7 +2408,7 @@ class EventQueryService:
                    stddevPop(v) AS sd, skewPop(v) AS skew, {quantile_exprs}
             FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2393,7 +2465,7 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
@@ -2419,7 +2491,7 @@ class EventQueryService:
                 WHERE v IS NOT NULL
                 ORDER BY ord
                 LIMIT {int(points_limit)}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -2508,7 +2580,7 @@ class EventQueryService:
             f"""
             SELECT {", ".join(selects)}
             FROM ({values_subquery}) AS t
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2624,7 +2696,7 @@ class EventQueryService:
                 SELECT count(v), min(v), max(v), uniqExact(g)
                 FROM ({pairs_subquery}) AS t
                 WHERE {member_where}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=parameters,
             ),
@@ -2637,7 +2709,7 @@ class EventQueryService:
                 GROUP BY g
                 ORDER BY c DESC, g ASC
                 LIMIT {int(groups)}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=parameters,
             ),
@@ -2676,7 +2748,7 @@ class EventQueryService:
                 WHERE {member_where} AND g IN {{kept:Array(String)}}
                 GROUP BY g, bin_idx
                 ORDER BY g, bin_idx
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=_with_params(parameters, mn=mn, bw=bin_width, kept=kept_values),
             )
@@ -2696,7 +2768,7 @@ class EventQueryService:
                 WHERE {member_where} AND g IN {{kept:Array(String)}}
                 ORDER BY ord
                 LIMIT {int(points_limit)}
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=_with_params(parameters, kept=kept_values),
             )
@@ -2778,7 +2850,7 @@ class EventQueryService:
         keeps sentinel buckets out of the plotted series, matching the old
         bucket scan's ``VESTIGO_NOT_SENTINEL_SQL`` predicate. No window functions:
         those can't spill to disk (see ``_scan.py``), plain GROUP BY + ORDER
-        BY/LIMIT stay within ``HEAVY_SCAN_SETTINGS``' memory budget.
+        BY/LIMIT stay within ``heavy_scan_settings()``' memory budget.
 
         The timestamp-range scan (when no explicit window is set) stays a
         separate query on purpose: the bucket grid must cover *all* filtered
@@ -2806,7 +2878,7 @@ class EventQueryService:
                 where,
                 parameters,
                 ts_expr=eff,
-                settings=HEAVY_SCAN_SETTINGS,
+                settings=heavy_scan_settings(),
             )
 
         empty: dict[str, Any] = {
@@ -2845,7 +2917,7 @@ class EventQueryService:
             GROUP BY val
             ORDER BY total DESC, val ASC
             LIMIT {int(series_limit)}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2938,7 +3010,7 @@ class EventQueryService:
             where,
             parameters,
             ts_expr=effective_ts_sql(query.source_offsets),
-            settings=HEAVY_SCAN_SETTINGS,
+            settings=heavy_scan_settings(),
         )
 
     def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
@@ -2953,7 +3025,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3052,7 +3124,7 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_expr} != ''
             GROUP BY val
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3138,7 +3210,7 @@ class EventQueryService:
             SELECT count(v), min(v), max(v)
             FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3167,7 +3239,7 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
@@ -3283,7 +3355,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY dow, hod
             ORDER BY dow, hod
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3389,7 +3461,7 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_x} != '' AND {col_y} != ''
             GROUP BY xv, yv
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3475,7 +3547,7 @@ class EventQueryService:
                        simpleLinearRegression(assumeNotNull(vx), assumeNotNull(vy))
                 FROM ({pairs_subquery}) AS t
                 WHERE vx IS NOT NULL AND vy IS NOT NULL
-                {HEAVY_SCAN_SETTINGS}
+                {heavy_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -3531,7 +3603,7 @@ class EventQueryService:
             WHERE vx IS NOT NULL AND vy IS NOT NULL
             ORDER BY ord
             LIMIT {int(limit)}
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters=parameters,
         )

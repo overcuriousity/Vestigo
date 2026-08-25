@@ -75,7 +75,7 @@ def test_meminfo_beats_ballooned_sysinfo(monkeypatch):
 
 def test_heavy_scan_settings_carries_a_positive_budget():
     """The clause always renders a concrete positive max_memory_usage."""
-    clause = _scan.HEAVY_SCAN_SETTINGS
+    clause = _scan.heavy_scan_settings()
     value = int(clause.rsplit("max_memory_usage = ", 1)[1])
     assert value > 0
     assert "max_bytes_before_external_sort" in clause
@@ -84,7 +84,7 @@ def test_heavy_scan_settings_carries_a_positive_budget():
 def test_spill_thresholds_stay_below_the_per_query_cap():
     """Spill must engage before the cap kills the query — a threshold at or
     above max_memory_usage would never fire."""
-    clause = _scan.HEAVY_SCAN_SETTINGS
+    clause = _scan.heavy_scan_settings()
     cap = int(clause.rsplit("max_memory_usage = ", 1)[1])
     group_by = int(clause.split("max_bytes_before_external_group_by = ")[1].split(",")[0])
     sort = int(clause.split("max_bytes_before_external_sort = ")[1].split(",")[0])
@@ -171,10 +171,8 @@ def test_apply_insert_block_size_is_read_per_call():
     """An admin-console edit reaches the next apply without a restart.
 
     ``enrichment_apply_insert_block_bytes`` is declared ``restart_required=False``
-    in the settings registry, unlike every ``stat_scan_*`` setting — those are
-    frozen into the module-level ``HEAVY_SCAN_SETTINGS`` string at import, while
-    this one is interpolated from ``get_settings()`` when the apply runs. This
-    test is what makes that claim honest.
+    in the settings registry, and is interpolated from ``get_settings()`` when
+    the apply runs. This test is what makes that claim honest.
     """
     from vestigo.core.config import set_runtime_overrides
     from vestigo.db.clickhouse import ClickHouseStore
@@ -199,3 +197,218 @@ def test_apply_insert_block_size_is_read_per_call():
         set_runtime_overrides({})
 
     assert "min_insert_block_size_bytes = 8388608" in sql_seen[0]
+
+
+# ── Deriving the budget from ClickHouse rather than from our own host ───────
+#
+# The production failure this replaces (session-186): a full-docker stack on a
+# 64 GiB host, no container limits and no `max_server_memory_usage`. The app
+# detected 64 GiB *from inside its own container*, authorized 0.8 x 64 / 2 =
+# 25.6 GiB per query, and the kernel OOM-killed clickhouse-server with nothing
+# in ClickHouse's own log. Every guardrail read as satisfied throughout.
+
+
+def test_explicit_server_ceiling_is_taken_as_bounded():
+    """`max_server_memory_usage` set by an operator is the ceiling, full stop."""
+    ceiling, bounded = _scan.resolve_clickhouse_ceiling(
+        {"max_server_memory_usage": 10 << 30, "os_memory_total": 64 << 30}
+    )
+
+    assert (ceiling, bounded) == (10 << 30, True)
+
+
+def test_cgroup_limited_server_derives_a_bounded_ceiling():
+    """No explicit setting, but a real container limit: ratio x the cgroup."""
+    ceiling, bounded = _scan.resolve_clickhouse_ceiling(
+        {
+            "max_server_memory_usage": 0,
+            "max_server_memory_usage_to_ram_ratio": 0.9,
+            "cgroup_memory_total": 32 << 30,
+            "os_memory_total": 64 << 30,
+        }
+    )
+
+    assert ceiling == int((32 << 30) * 0.9)
+    assert bounded is True
+
+
+def test_unlimited_container_is_reported_unbounded():
+    """The session-186 configuration must not read as a limit.
+
+    ClickHouse always reports *a* ceiling — absent an explicit setting it is
+    0.9 x detected RAM. In a container with no memory limit that is the whole
+    host, which the server neither owns nor is alone on. Sizing against it
+    still beats guessing, so it is returned; calling it bounded would hide
+    exactly the misconfiguration this probe exists to surface.
+    """
+    ceiling, bounded = _scan.resolve_clickhouse_ceiling(
+        {
+            "max_server_memory_usage": 0,
+            "max_server_memory_usage_to_ram_ratio": 0.9,
+            "cgroup_memory_total": 0,
+            "os_memory_total": 64 << 30,
+        }
+    )
+
+    assert ceiling == int((64 << 30) * 0.9)
+    assert bounded is False
+
+
+def test_ratio_is_not_truncated_to_zero():
+    """Regression: reading the ratio as an int makes 0.9 become 0.
+
+    That would resolve every unpinned server to a zero ceiling — i.e. to
+    "ClickHouse may use nothing", inverting the conclusion.
+    """
+    ceiling, _ = _scan.resolve_clickhouse_ceiling(
+        {"max_server_memory_usage_to_ram_ratio": 0.9, "os_memory_total": 64 << 30}
+    )
+
+    assert ceiling and ceiling > 0
+
+
+def test_failed_probe_yields_no_ceiling():
+    """An old server, or a user without rights on system.server_settings."""
+    assert _scan.resolve_clickhouse_ceiling({}) == (None, False)
+
+
+def _report_with(monkeypatch, ceiling, bounded, per_query=None):
+    """A report against a chosen ceiling, and optionally a chosen budget.
+
+    The budget is injected by patching :func:`detect_scan_memory_budget` rather
+    than by setting ``stat_scan_max_memory_bytes``: a repository ``.env`` pins
+    that variable, and an environment value always beats the runtime-override
+    layer a test could set.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", ceiling)
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", bounded)
+    if per_query is not None:
+        monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: per_query)
+    return _scan.scan_budget_report()
+
+
+def test_report_flags_a_budget_over_the_server_ceiling(monkeypatch):
+    """Scans alone authorized more than ClickHouse may use in total."""
+    concurrency = _scan.get_settings().stat_scan_concurrency
+    report = _report_with(monkeypatch, 8 << 30, True, per_query=(16 << 30) // concurrency)
+
+    assert report["risk"] == "over_budget"
+    assert report["total_bytes"] > report["clickhouse_ceiling_bytes"]
+
+
+def test_report_flags_an_unbounded_server(monkeypatch):
+    """A derived ceiling over RAM the server does not own is not a limit."""
+    assert _report_with(monkeypatch, 57 << 30, False)["risk"] == "unbounded"
+
+
+def test_report_is_ok_when_the_budget_fits(monkeypatch):
+    concurrency = _scan.get_settings().stat_scan_concurrency
+    report = _report_with(monkeypatch, 28 << 30, True, per_query=(16 << 30) // concurrency)
+
+    assert report["risk"] == "ok"
+    assert report["clickhouse_ceiling_is_explicit"] is True
+
+
+def test_clause_follows_the_configured_ceiling(monkeypatch):
+    """The clause is built per query, so the probe reaches every scan.
+
+    Before this, the clause was a module constant built at import — the one
+    moment at which the app cannot ask ClickHouse anything, which is why the
+    budget could only ever be sized from the app's own host.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", None)
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", False)
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    before = _scan.heavy_scan_settings()
+
+    _scan.configure_scan_budget(8 << 30, bounded=True)
+    try:
+        after = _scan.heavy_scan_settings()
+    finally:
+        _scan.configure_scan_budget(None, bounded=False)
+
+    settings = _scan.get_settings()
+    expected = int((8 << 30) * settings.stat_scan_memory_ratio) // settings.stat_scan_concurrency
+    assert before != after
+    assert f"max_memory_usage = {expected}" in after
+
+
+# ── The merge window the admission gate used to miss ────────────────────────
+
+
+def _apply_store(merge_counts):
+    """A ClickHouseStore whose system.merges answers from *merge_counts*."""
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    seen: list[str] = []
+
+    class _Client:
+        def command(self, sql):
+            seen.append(sql)
+
+        def query(self, sql, parameters=None):
+            seen.append(sql)
+            if "system.merges" in sql:
+                value = merge_counts.pop(0) if merge_counts else 0
+
+                class _R:
+                    result_rows = [(value,)]
+
+                return _R()
+
+            class _Empty:
+                result_rows = []
+
+            return _Empty()
+
+    store = ClickHouseStore.__new__(ClickHouseStore)
+    store.client = _Client()
+    store.database = "testdb"
+    return store, seen
+
+
+def test_apply_holds_its_slot_until_merges_drain(monkeypatch):
+    """`REPLACE PARTITION` returns before the merges it queues are done.
+
+    Merge memory is the one consumer `max_memory_usage` cannot reach, so
+    releasing the admission slot at the ALTER admitted the next detector sweep
+    straight into the merge burst — which is how the gate could be held
+    "across the swap" and still not cover the expensive part.
+    """
+    monkeypatch.setattr("vestigo.db.clickhouse.time.sleep", lambda _s: None)
+    store, seen = _apply_store([2, 1, 0])
+
+    store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
+
+    merge_polls = [sql for sql in seen if "system.merges" in sql]
+    assert len(merge_polls) == 3, "polled until the merge count reached zero"
+    replace_at = next(i for i, sql in enumerate(seen) if "REPLACE PARTITION" in sql)
+    assert seen.index(merge_polls[0]) > replace_at, "waits after the swap, not before"
+
+
+def test_apply_gives_up_on_the_merge_wait_rather_than_failing(monkeypatch):
+    """A slow merge must never fail an apply that is already swapped in.
+
+    The wait is a courtesy to whatever runs next, not a correctness
+    requirement — the partition is durable by the time it starts.
+    """
+    monkeypatch.setattr("vestigo.db.clickhouse.time.sleep", lambda _s: None)
+    clock = iter([0.0, 0.0, 1.0, 2.0, 999.0])
+    monkeypatch.setattr("vestigo.db.clickhouse.time.monotonic", lambda: next(clock))
+    store, _seen = _apply_store([5, 5, 5, 5, 5])
+
+    store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
+
+
+def test_merge_wait_can_be_switched_off():
+    """0 skips it — right when ClickHouse bounds merges itself."""
+    from vestigo.core.config import set_runtime_overrides
+
+    store, seen = _apply_store([9, 9, 9])
+    try:
+        set_runtime_overrides({"enrichment_apply_merge_wait_seconds": 0})
+        store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
+    finally:
+        set_runtime_overrides({})
+
+    assert not [sql for sql in seen if "system.merges" in sql]

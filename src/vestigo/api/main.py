@@ -40,8 +40,9 @@ from vestigo.core.config import get_settings
 from vestigo.core.demo_case import cancel_pending_seeds
 from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.core.security import hash_password
+from vestigo.db._scan import scan_budget_report
 from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, User, generate_id
-from vestigo.db.queries import QueryRequestTooLargeError
+from vestigo.db.queries import QueryMemoryExceededError, QueryRequestTooLargeError
 
 logger = logging.getLogger(__name__)
 
@@ -408,6 +409,67 @@ async def _settle_orphaned_column_recommendations(store: PostgresStore) -> None:
         logger.exception("Could not settle orphaned column recommendations.")
 
 
+async def _probe_scan_budget() -> None:
+    """Size the heavy-scan budget from ClickHouse's ceiling, not the app's host.
+
+    Until this runs, ``db/_scan.py`` falls back to the memory *this process*
+    can see, which in a full-docker stack is the whole host — the app then
+    authorizes a per-query cap larger than the ClickHouse container is allowed
+    to use in total, every guardrail reads as satisfied, and the kernel does
+    the enforcing (session-186). Asking the server what it may use removes the
+    guess.
+
+    Runs here, in the background task, rather than in the lifespan proper: it
+    is the first thing that touches ClickHouse, and booting the HTTP server
+    must not depend on ClickHouse answering. A scan that beats this probe uses
+    the fallback budget, which is the same one every release before this used.
+    """
+    from vestigo.db._scan import (
+        configure_scan_budget,
+        resolve_clickhouse_ceiling,
+        scan_budget_report,
+    )
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    facts = await asyncio.to_thread(ClickHouseStore().server_memory_facts)
+    ceiling, bounded = resolve_clickhouse_ceiling(facts)
+    configure_scan_budget(ceiling, bounded)
+    report = scan_budget_report()
+    if report["risk"] == "unbounded":
+        logger.warning(
+            "ClickHouse reports no memory ceiling of its own (%s). Background merges and "
+            "caches are bounded by nothing but the kernel, which kills the server without "
+            "logging anything. Set max_server_memory_usage on the server (and a container "
+            "memory limit) — see docs/DEPLOYMENT.md 'Resource sizing'. Scan budget resolved "
+            "to %.1f GiB total across %d slot(s) from %s detection.",
+            "no max_server_memory_usage and no container limit"
+            if facts
+            else "the probe could not read system.server_settings",
+            report["total_bytes"] / (1 << 30),
+            report["concurrency"],
+            report["source"],
+        )
+    elif report["risk"] == "over_budget":
+        logger.error(
+            "Heavy-scan budget (%.1f GiB across %d slot(s)) exceeds what ClickHouse is "
+            "allowed to use in total (%.1f GiB). Admitting a full set of scans can only end "
+            "in a memory error or an OOM kill. Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES or "
+            "raise max_server_memory_usage.",
+            report["total_bytes"] / (1 << 30),
+            report["concurrency"],
+            report["clickhouse_ceiling_bytes"] / (1 << 30),
+        )
+    else:
+        logger.info(
+            "Heavy-scan budget: %.1f GiB total (%.1f GiB per query x %d) under ClickHouse's "
+            "%.1f GiB ceiling.",
+            report["total_bytes"] / (1 << 30),
+            report["per_query_bytes"] / (1 << 30),
+            report["concurrency"],
+            report["clickhouse_ceiling_bytes"] / (1 << 30),
+        )
+
+
 async def _startup_recovery(store: PostgresStore) -> None:
     """Best-effort recovery + housekeeping, run *after* the app is serving.
 
@@ -420,6 +482,12 @@ async def _startup_recovery(store: PostgresStore) -> None:
     restart if it fails, so running them in the background is safe.
     """
     try:
+        # First: every step below, and every request already being served, can
+        # start a heavy scan, and each one reads the budget this sets.
+        try:
+            await _probe_scan_budget()
+        except Exception:
+            logger.exception("Could not size the scan budget from ClickHouse; using detection.")
         await _sweep_stale_transfer_archives()
         await _reconcile_orphaned_ingests()
         enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
@@ -668,6 +736,27 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(QueryMemoryExceededError)
+    async def _query_out_of_memory(
+        _request: Request, exc: QueryMemoryExceededError
+    ) -> JSONResponse:
+        """Answer 413 instead of a 500 when a scan hits its memory cap.
+
+        The cap is ours, not ClickHouse's default: ``db/_scan.py`` pins
+        ``max_memory_usage`` per query precisely so a scan too broad for the
+        box fails alone rather than OOM-killing the server for everyone. That
+        makes hitting it an expected outcome with an obvious remedy — ask for
+        less — and a 500 tells the analyst none of that.
+
+        413 for the same reason as :func:`_query_too_large`: the request is
+        well-formed, it is the work it implies that does not fit. Streaming
+        exports reach this handler only via their pre-flight count, which is
+        why that pre-flight is aggregated through the spillable path
+        (``count_field_inventory``) — so the common high-cardinality case
+        succeeds rather than arriving here at all.
+        """
+        return JSONResponse(status_code=413, content={"detail": str(exc)})
+
     @app.get("/api/health", response_class=JSONResponse)
     async def health(user: User | None = Depends(resolve_user_optional)) -> dict:
         """Liveness, plus what this instance can actually do.
@@ -704,6 +793,14 @@ def create_app() -> FastAPI:
         body["embeddings_available"] = caps["embeddings"]
         body["agent_available"] = caps["agent"]
         body["mcp_enabled"] = caps["mcp"]
+        # How the heavy-scan memory budget resolved, and against what. A
+        # misconfiguration here has no symptom until ClickHouse is OOM-killed,
+        # and the kernel does that without writing anything to ClickHouse's own
+        # log — so the startup warning is the only signal, and a startup
+        # warning is exactly what nobody reads. Serving it makes the answer
+        # reachable at any time. Authenticated-only: it describes the host's
+        # memory layout.
+        body["scan_budget"] = scan_budget_report()
         return body
 
     app.include_router(auth.router)
