@@ -217,6 +217,11 @@ def _fake_bundle(tmp_path, images, *, scope="full", archive_images=None):
 
     shutil.copy(COMPOSE, bundle / "compose.airgap.yml")
     shutil.copy(REPO / "deploy/clickhouse/allow-default-network.xml", bundle / "clickhouse")
+    # The server-side memory ceiling. The real bundle carries it
+    # (scripts/airgap-bundle.sh) and install.sh now refuses to start without it,
+    # because a missing bind-mount source becomes an empty directory rather than
+    # an error and leaves ClickHouse with no ceiling at all.
+    shutil.copy(REPO / "deploy/clickhouse/memory.xml", bundle / "clickhouse")
     shutil.copy(INSTALL_SH, bundle / "install.sh")
     (bundle / "install.sh").chmod(0o755)
     (bundle / ".env.example").write_text("VESTIGO_ENVIRONMENT=production\n")
@@ -326,6 +331,31 @@ def test_install_starts_the_stack_when_every_image_is_present(tmp_path):
     # The install directory, not the bundle, is what the stack runs from.
     assert (install_dir / "docker-compose.yml").is_file()
     assert "VESTIGO_IMAGE_TAG=9.9.9-deadbee" in (install_dir / ".env").read_text()
+    # The mount source the compose file names. Its absence is silent — Docker
+    # makes an empty directory of it — so the installer placing it is the only
+    # thing between an airgap install and an unbounded ClickHouse.
+    assert (install_dir / "clickhouse/memory.xml").is_file()
+
+
+def test_install_refuses_to_start_without_the_memory_ceiling(tmp_path):
+    """A bundle missing memory.xml must fail loudly rather than start unbounded.
+
+    This is the production defect: install.sh never copied the file, the mount
+    source did not exist, Docker created an empty directory at the target, and
+    ClickHouse derived 0.9 x whatever RAM a limit-less container saw.
+    """
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    (bundle / "clickhouse/memory.xml").unlink()
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+
+    result = _run_install(bundle, bin_dir, tmp_path / "opt")
+
+    assert result.returncode != 0
+    assert "memory.xml" in result.stderr
+    # No log at all is the strongest form of "the stack was never started": the
+    # fake engine writes it on first invocation.
+    started = log.read_text() if log.exists() else ""
+    assert "compose up" not in started, "the stack must not have been started"
 
 
 def test_an_app_only_bundle_refuses_a_host_without_the_backing_services(tmp_path):

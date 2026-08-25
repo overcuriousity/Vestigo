@@ -11,6 +11,14 @@ issue numbers, and root-cause detail stays in the issue thread.
 umbrella and its sub-issues; D14 shipped on `release/1.8.6`, N1 in 1.10.0. Phase 3 is
 complete, so the queue is feature-shaped.
 
+## Open defects
+
+- **#300** — foreground histograms queue behind detector sweeps in the shared
+  `HEAVY_SCAN_GATE`, and the default (no explicit range) histogram scans the corpus
+  twice. Needs the gate split into two admission classes and a single-pass derived-range
+  histogram, with bucket boundaries unchanged. Root cause detail in the issue thread.
+  (#301, #302 and #303 shipped in session 188 — see `PROGRESS.md`.)
+
 **Priority order,** roughly by payoff-per-effort:
 
 1. **D11** entropy bigram variant — closes a capability gap the shipped docs

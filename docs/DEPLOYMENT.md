@@ -267,6 +267,23 @@ healthy service.
    This is also **the only ceiling that bounds background merges**, which no
    per-query cap can reach — which makes it the layer that matters after an
    enrichment partition rewrite.
+
+   **In an airgap install this file is at `./clickhouse/memory.xml`, relative to the
+   install directory — not `deploy/clickhouse/memory.xml`.** They are the same file
+   with two locations (`scripts/airgap-bundle.sh` copies one to the other), and only
+   the bundle-relative one is mounted. Editing the repo path on an airgap host has no
+   effect at all.
+
+   **The file on disk is not proof of the file in effect.** A missing bind-mount source
+   becomes an empty *directory*, which ClickHouse skips without complaint. Verify
+   server-side, never with `grep`:
+
+   ```sql
+   SELECT name, value FROM system.server_settings
+   WHERE name LIKE 'max_server_memory%' OR name LIKE '%cache_size';
+   ```
+
+   A `max_server_memory_usage` of 0 and a ratio of 0.9 mean nothing was merged.
 3. **Vestigo's scan budget** (`VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`) — a *total across
    concurrent heavy scans*; each query is granted budget ÷
    `VESTIGO_STAT_SCAN_CONCURRENCY` as its `max_memory_usage`. Must sit below (2).
@@ -289,23 +306,40 @@ services are resident. The app now says so, loudly, at startup and in
 `GET /api/health` (authenticated) carries a `scan_budget` block:
 
 ```json
-{"risk": "ok", "per_query_bytes": 8589934592, "total_bytes": 17179869184,
- "clickhouse_ceiling_bytes": 28991029248, "clickhouse_ceiling_is_explicit": true,
- "budget_ceiling_bytes": 28991029248, "local_detected_bytes": 68719476736,
- "source": "clickhouse", "concurrency": 2, "pending_concurrency": null}
+{"risk": "ok", "per_query_bytes": 2576980377, "total_bytes": 5153960754,
+ "cache_bytes": 3758096384, "cache_breakdown": {"mark_cache_size": 2147483648,
+ "index_mark_cache_size": 536870912, "primary_index_cache_size": 1073741824,
+ "uncompressed_cache_size": 0, "index_uncompressed_cache_size": 0},
+ "headroom_bytes": 1288490190, "clickhouse_ceiling_bytes": 10200547328,
+ "clickhouse_ceiling_is_explicit": true, "budget_ceiling_bytes": 10200547328,
+ "local_detected_bytes": 34359738368, "source": "clickhouse", "concurrency": 2,
+ "pending_concurrency": null, "max_threads": 6, "max_threads_source": "clickhouse",
+ "detected_cores": 12}
 ```
 
-`risk` is what to act on:
+`risk` is what to act on, and it is rendered on the admin **Settings** page above the
+"Scans" group as well as served here:
 
-- `ok` — the total budget fits under ClickHouse's ceiling with headroom.
-- `over_budget` — scans alone are authorized more than ClickHouse may use in total.
-  Lower `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` or raise `max_server_memory_usage`.
+- `ok` — scans *and* ClickHouse's own caches fit under its ceiling, with
+  `headroom_bytes` left for background merges.
+- `over_budget` — `total_bytes + cache_bytes` exceeds the ceiling. Lower
+  `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`, shrink the caches in `memory.xml`, or raise
+  `max_server_memory_usage`. The caches are counted because they are configured maxima
+  under the same ceiling: at 26.6 defaults `index_mark_cache_size` and
+  `primary_index_cache_size` are 5 GiB *each*, which alone exceeds the ceiling the
+  reference stack pins.
 - `unbounded` — ClickHouse reports no ceiling an operator set. Nothing bounds its
   merges, caches or allocator slack, and the kernel is the only backstop. Mount
   `memory.xml` and set a container limit. The budget still uses that derived ceiling,
   but capped by what the *app's* own container can see — two guesses, so the lower
   one — which is what `budget_ceiling_bytes` reports when it differs from
   `clickhouse_ceiling_bytes`.
+
+`max_threads` is per-scan thread width. At `VESTIGO_STAT_SCAN_MAX_THREADS=0` (the
+default) it is `detected_cores ÷ concurrency`, floor 2, where `detected_cores` is what
+ClickHouse resolves for itself — cgroup-CPU-quota aware, so a `--cpus=2` container
+reports 2. `max_threads_source` is `pinned`, `clickhouse`, or `fallback` (the probe
+failed; the width is the former constant 8).
 
 `concurrency` is the size the admission gate was built with at startup, which is also
 the number the budget is divided by. Change `VESTIGO_STAT_SCAN_CONCURRENCY` and
@@ -325,8 +359,10 @@ ClickHouse has a `max_server_memory_usage`, which bounds merges directly).
 | --- | --- | --- |
 | ClickHouse container limit | 12 GiB | `mem_limit: 12g` |
 | ClickHouse server limit | 9.5 GiB | `deploy/clickhouse/memory.xml` (under 0.8 × 12 GiB) |
-| Vestigo scan budget (total) | 7.6 GiB | auto: 0.8 × 9.5 GiB |
-| → per-query cap | 3.8 GiB | budget ÷ concurrency (2) |
+| ClickHouse caches (mark + index-mark + primary-index) | 3.5 GiB | `memory.xml` |
+| Vestigo scan budget (total) | 4.8 GiB | auto: 0.8 × (9.5 − 3.5) GiB |
+| → per-query cap | 2.4 GiB | budget ÷ concurrency (2) |
+| → merge headroom | 1.2 GiB | 9.5 − 4.8 − 3.5, reported as `headroom_bytes` |
 | Postgres | 4 GiB | `mem_limit: 4g` |
 | Qdrant | 4 GiB | `mem_limit: 4g` (only with embeddings) |
 | App | 4 GiB | `mem_limit: 4g` |
@@ -341,10 +377,15 @@ scanning from RAM and scanning from disk.
 | --- | --- | --- |
 | ClickHouse container limit | 34 GiB | `VESTIGO_CLICKHOUSE_MEM_LIMIT=34g` |
 | ClickHouse server limit | 27 GiB | `max_server_memory_usage` in `memory.xml` (under 0.8 × 34 GiB) |
+| ClickHouse caches | 3.5 GiB | `memory.xml`, unchanged from the shipped values |
 | Vestigo scan budget (total) | 16 GiB | `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES=17179869184` |
 | → per-query cap | 8 GiB | budget ÷ concurrency (2) |
 | Spill thresholds | 4 GB | `..._EXTERNAL_GROUP_BY_BYTES` / `..._EXTERNAL_SORT_BYTES` |
-| Threads per scan | 8 | `VESTIGO_STAT_SCAN_MAX_THREADS` (2 × 8 of 20 cores) |
+| Threads per scan | 10 | auto: 20 cores ÷ concurrency (2); was the constant 8 |
+
+A pinned `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` is honoured verbatim and bypasses the
+cache subtraction — it is a decision, not a derivation. Left on auto the budget here
+would be 0.8 × (27 − 3.5) = 18.8 GiB total, 9.4 GiB per query.
 | Postgres / Qdrant / App | 4 / 6 / 8 GiB | `VESTIGO_*_MEM_LIMIT` |
 
 Sum: 52 GiB, leaving ~12 GiB for the OS and page cache. Keep concurrency at 2 even

@@ -1,6 +1,36 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-25 (session 187 — PR #299 review fixes).
+Last updated: 2026-08-25 (session 188 — scan-budget truthfulness).
+
+## Session 188 — 2026-08-25: Scan-budget truthfulness (#301, #302, #303)
+
+`scan_budget.risk` reported `ok` for a configuration that does not fit, including the one
+we ship. Three defects, one probe.
+
+- **Caches were never counted** (#302). The ratio is now taken of
+  `ceiling − caches`, which is what `stat_scan_memory_ratio`'s own help text always
+  claimed, and `risk` compares `scans + caches` against the ceiling. The issue's own
+  table understated it: at 26.6 defaults `index_mark_cache_size` and
+  `primary_index_cache_size` are 5 GiB *each*, so the reference stack's caches (12 GiB)
+  exceeded its whole 9.5 GiB ceiling. `memory.xml` now pins both; caches total 3.5 GiB
+  and the stack fits, with 1.2 GiB of merge headroom, asserted by
+  `tests/test_reference_stack_budget.py`.
+- **Thread width was a constant** (#301). `stat_scan_max_threads` defaults to 0 = auto:
+  cores ÷ concurrency, floor 2. The issue proposed reading CPU counts from
+  `system.asynchronous_metrics`; 26.6 has none — no `CGroupMaxCPU`, no `OSNProcessors`.
+  The real source is `system.settings.max_threads`, which reports `auto(N)` and *is*
+  cgroup-quota aware (verified: `--cpus=2` → `auto(2)`).
+- **The airgap install never had a ceiling** (#303). `install.sh` copied
+  `allow-default-network.xml` and not `memory.xml`, so the compose bind-mount source did
+  not exist and Docker made an empty directory of it. Fixed, plus a `-f` pre-flight
+  assertion, `--check` coverage, and a parity test between the bundle script, the
+  installer and the compose mounts. `risk` is now rendered on the admin Settings page,
+  since a startup log line is what nobody reads.
+
+Design round: `docs/superpowers/specs/2026-08-25-scan-budget-truthfulness.md`.
+
+Issue #300 (foreground histograms queuing behind detector sweeps in the shared gate)
+stays open: it changes hot-path query behaviour and gets its own round.
 
 ## Session 187 — 2026-08-25: PR #299 review — the scan-budget half
 
