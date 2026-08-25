@@ -28,10 +28,17 @@ def _no_probed_ceiling():
     the memory they mocked. Ordering-dependent, which is the worst way to find
     out.
     """
-    ceiling, bounded = _scan._clickhouse_ceiling, _scan._clickhouse_bounded
+    saved = (
+        _scan._clickhouse_ceiling,
+        _scan._clickhouse_bounded,
+        _scan._clickhouse_cache_bytes,
+        _scan._clickhouse_cache_breakdown,
+    )
     _scan.configure_scan_budget(None, bounded=False)
     yield
-    _scan.configure_scan_budget(ceiling, bounded=bounded)
+    _scan.configure_scan_budget(
+        saved[0], bounded=saved[1], cache_bytes=saved[2], cache_breakdown=saved[3]
+    )
 
 
 def test_explicit_value_pins_the_budget():
@@ -561,3 +568,89 @@ def test_merge_wait_is_skipped_when_the_apply_wrote_no_parts():
     store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
 
     assert not [sql for sql in seen if "system.merges" in sql]
+
+
+# ── Caches share the ceiling the budget is taken from ───────────────────────
+
+_CACHE_FACTS = {
+    "mark_cache_size": 2 << 30,
+    "index_mark_cache_size": 512 << 20,
+    "primary_index_cache_size": 1 << 30,
+    "uncompressed_cache_size": 0,
+    "index_uncompressed_cache_size": 0,
+}
+
+
+def test_cache_bytes_sums_only_the_caches_a_mergetree_scan_fills():
+    """The server ships many cache settings; five of them are ours.
+
+    Summing text-index/vector/iceberg/parquet cache maxima would report
+    `over_budget` forever on a stack that never allocates any of them.
+    """
+    total, breakdown = _scan.resolve_cache_bytes(
+        {**_CACHE_FACTS, "text_index_postings_cache_size": 2 << 30, "os_memory_total": 64 << 30}
+    )
+
+    assert total == (2 << 30) + (512 << 20) + (1 << 30)
+    assert set(breakdown) == set(_CACHE_FACTS)
+    assert breakdown["mark_cache_size"] == 2 << 30
+
+
+def test_cache_bytes_is_zero_when_the_probe_said_nothing():
+    """No probe (the CLI, or a pre-probe scan) must behave exactly as before."""
+    assert _scan.resolve_cache_bytes({}) == (0, {})
+
+
+def test_budget_is_a_ratio_of_what_is_left_after_caches():
+    """`stat_scan_memory_ratio`'s help text has always claimed the remainder is
+    headroom for merges and caches. It was taken of the whole ceiling instead.
+    """
+    assert _scan._resolve_scan_memory_budget(0, 0.8, 10 << 30, concurrency=2, caches=2 << 30) == (
+        int((8 << 30) * 0.8) // 2
+    )
+    # An explicit pin is a decision and still bypasses the derivation entirely.
+    assert _scan._resolve_scan_memory_budget(
+        8 << 30, 0.8, 10 << 30, concurrency=2, caches=2 << 30
+    ) == (4 << 30)
+
+
+def test_caches_larger_than_the_ceiling_do_not_produce_a_negative_budget():
+    """26.6's own defaults are 12 GiB of cache maxima under a 9.5 GiB ceiling —
+    the exact condition the shipped memory.xml fix addresses, and one an operator
+    can recreate at any time. The budget floors at the conservative fallback
+    rather than going negative or to zero."""
+    assert (
+        _scan._resolve_scan_memory_budget(0, 0.8, 9 << 30, concurrency=2, caches=12 << 30)
+        == _FALLBACK_MAX_MEMORY_BYTES // 2
+    )
+
+
+def test_report_counts_caches_against_the_ceiling(monkeypatch):
+    """Scans that fit alone but not once the caches under the same ceiling are
+    counted. This is the shipped-defaults condition from issue #302."""
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", 10 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", True)
+    monkeypatch.setattr(_scan, "_clickhouse_cache_bytes", 5 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_cache_breakdown", {"mark_cache_size": 5 << 30})
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: (6 << 30) // 2)
+
+    report = _scan.scan_budget_report()
+
+    assert report["total_bytes"] < report["clickhouse_ceiling_bytes"], "scans alone fit"
+    assert report["risk"] == "over_budget", "scans plus caches do not"
+    assert report["cache_bytes"] == 5 << 30
+    assert report["cache_breakdown"] == {"mark_cache_size": 5 << 30}
+    assert report["headroom_bytes"] == (10 << 30) - (6 << 30) - (5 << 30)
+
+
+def test_report_is_ok_when_scans_and_caches_both_fit(monkeypatch):
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", 16 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", True)
+    monkeypatch.setattr(_scan, "_clickhouse_cache_bytes", 4 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_cache_breakdown", {"mark_cache_size": 4 << 30})
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: (8 << 30) // 2)
+
+    report = _scan.scan_budget_report()
+
+    assert report["risk"] == "ok"
+    assert report["headroom_bytes"] == (16 << 30) - (8 << 30) - (4 << 30)

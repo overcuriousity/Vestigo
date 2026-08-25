@@ -612,9 +612,11 @@ _SPECS: tuple[SettingSpec, ...] = (
         "stat_scan_memory_ratio",
         "scans",
         "Auto-budget memory ratio",
-        "Fraction of ClickHouse's own memory ceiling the automatic budget uses. The "
-        "remainder is headroom for what a per-query cap cannot bound: background merges, "
-        "the mark and uncompressed caches, and allocator slack.",
+        "Fraction of what is left of ClickHouse's memory ceiling *after* its own caches "
+        "(mark, index-mark, primary-index, uncompressed) that the automatic budget uses. "
+        "The remainder is headroom for the one thing no per-query cap can bound: background "
+        "merges, plus allocator slack. /api/health reports the cache figure that went into "
+        "the subtraction.",
     ),
     SettingSpec(
         "enrichment_apply_merge_wait_seconds",

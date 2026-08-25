@@ -215,7 +215,8 @@ class Settings(BaseSettings):
     # (size it to *that* host's RAM, leaving headroom for the server's own
     # caches/merges — ~70% of its RAM is a good start).
     stat_scan_max_memory_bytes: int = 0
-    # Fraction of detected memory the auto budget uses.
+    # Fraction of the ClickHouse ceiling *minus its own caches* that the auto
+    # budget uses; the remainder is merge and allocator-slack headroom.
     stat_scan_memory_ratio: float = Field(default=0.8, gt=0, le=1)
     # Max detector scans running against ClickHouse at once. Surplus scans
     # queue on a semaphore (db/_scan.py::HEAVY_SCAN_GATE). Without this, N

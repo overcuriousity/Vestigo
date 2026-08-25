@@ -427,6 +427,7 @@ async def _probe_scan_budget() -> None:
     """
     from vestigo.db._scan import (
         configure_scan_budget,
+        resolve_cache_bytes,
         resolve_clickhouse_ceiling,
         scan_budget_report,
     )
@@ -434,7 +435,8 @@ async def _probe_scan_budget() -> None:
 
     facts = await asyncio.to_thread(ClickHouseStore().server_resource_facts)
     ceiling, bounded = resolve_clickhouse_ceiling(facts)
-    configure_scan_budget(ceiling, bounded)
+    cache_bytes, cache_breakdown = resolve_cache_bytes(facts)
+    configure_scan_budget(ceiling, bounded, cache_bytes, cache_breakdown)
     report = scan_budget_report()
     if report["risk"] == "unbounded":
         logger.warning(
@@ -452,12 +454,14 @@ async def _probe_scan_budget() -> None:
         )
     elif report["risk"] == "over_budget":
         logger.error(
-            "Heavy-scan budget (%.1f GiB across %d slot(s)) exceeds what ClickHouse is "
-            "allowed to use in total (%.1f GiB). Admitting a full set of scans can only end "
-            "in a memory error or an OOM kill. Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES or "
-            "raise max_server_memory_usage.",
+            "Heavy-scan budget (%.1f GiB across %d slot(s)) plus ClickHouse's own caches "
+            "(%.1f GiB) exceeds what ClickHouse is allowed to use in total (%.1f GiB). "
+            "Admitting a full set of scans can only end in a memory error or an OOM kill. "
+            "Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES, shrink the caches in "
+            "deploy/clickhouse/memory.xml, or raise max_server_memory_usage.",
             report["total_bytes"] / (1 << 30),
             report["concurrency"],
+            report["cache_bytes"] / (1 << 30),
             report["clickhouse_ceiling_bytes"] / (1 << 30),
         )
     else:

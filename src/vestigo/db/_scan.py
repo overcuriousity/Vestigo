@@ -130,16 +130,29 @@ def _physical_memory_total() -> int | None:
 
 
 def _resolve_scan_memory_budget(
-    explicit: int, ratio: float, detected: int | None, concurrency: int = 1
+    explicit: int, ratio: float, detected: int | None, concurrency: int = 1, caches: int = 0
 ) -> int:
     """Pure resolution: explicit nonzero pins the *total* budget, else ratio of
-    detected, else fallback — then divided across the concurrency slots."""
+    what is left of *detected* after the caches that share it, else fallback —
+    then divided across the concurrency slots.
+
+    Subtracting the caches first is what makes ``stat_scan_memory_ratio``'s own
+    description true: it has always said the remainder is headroom for merges
+    and caches, while being taken of the whole ceiling with the caches counted
+    nowhere. Lowering the default ratio instead would silently shrink every
+    existing deployment's budget without saying why.
+    """
+    available = (detected or 0) - max(caches, 0)
     if explicit > 0:
         total = explicit
-    elif detected is None or detected <= 0:
+    elif available <= 0:
+        # Nothing detected, or caches alone at or over the ceiling. Nothing here
+        # can fix that configuration, so fall back to the conservative constant
+        # rather than to zero (which would fail every scan) or to a negative cap
+        # (which ClickHouse reads as "unlimited").
         total = _FALLBACK_MAX_MEMORY_BYTES
     else:
-        total = int(detected * ratio)
+        total = int(available * ratio)
     return total // max(concurrency, 1)
 
 
@@ -169,6 +182,43 @@ def detect_local_memory_total() -> int | None:
 #: ClickHouse derived from RAM it does not own. See
 #: :func:`resolve_clickhouse_ceiling`.
 _clickhouse_bounded: bool = False
+
+#: The MergeTree caches ClickHouse reported, which live *under* the ceiling
+#: above and are therefore not available to scans. Zero until the probe runs
+#: (and forever in the CLI), which makes the pre-probe budget exactly what
+#: every release before this computed.
+_clickhouse_cache_bytes: int = 0
+_clickhouse_cache_breakdown: dict[str, int] = {}
+
+#: The cache settings a MergeTree scan workload actually fills. ClickHouse 26.6
+#: ships a dozen more (``text_index_*``, ``vector_similarity_*``,
+#: ``parquet_metadata_*``, ``iceberg_*``, ``unique_key_*``); those belong to
+#: engines and index types Vestigo does not use, and counting their maxima would
+#: report ``over_budget`` on a stack that never allocates a byte of them.
+_COUNTED_CACHES = (
+    "mark_cache_size",
+    "uncompressed_cache_size",
+    "index_mark_cache_size",
+    "index_uncompressed_cache_size",
+    "primary_index_cache_size",
+)
+
+
+def resolve_cache_bytes(facts: Mapping[str, float]) -> tuple[int, dict[str, int]]:
+    """Cache maxima that share ClickHouse's ceiling with our scans.
+
+    Pure, so the interesting cases are testable without a server. Returns the
+    total and the per-setting breakdown, because a number an operator is asked
+    to act on should show its arithmetic — the same reason the report already
+    separates ``budget_ceiling_bytes`` from ``clickhouse_ceiling_bytes``.
+
+    These are configured *maxima*, not current residency: a cold server has
+    allocated none of it. That is the right figure for a guardrail, which has to
+    hold once the caches are warm.
+    """
+    breakdown = {name: int(facts.get(name, 0) or 0) for name in _COUNTED_CACHES if name in facts}
+    return sum(breakdown.values()), breakdown
+
 
 # A cgroup that reports a limit near or above the machine's RAM is not a limit;
 # both cgroup v1 (PAGE_COUNTER_MAX) and an unconfigured v2 surface that way.
@@ -239,17 +289,27 @@ def resolve_clickhouse_ceiling(facts: Mapping[str, float]) -> tuple[int | None, 
     return ratio_cap, cgroup_is_a_limit
 
 
-def configure_scan_budget(clickhouse_ceiling_bytes: int | None, bounded: bool = False) -> None:
-    """Record the ceiling ClickHouse reported for itself.
+def configure_scan_budget(
+    clickhouse_ceiling_bytes: int | None,
+    bounded: bool = False,
+    cache_bytes: int = 0,
+    cache_breakdown: Mapping[str, int] | None = None,
+) -> None:
+    """Record what ClickHouse reported about its own ceiling and caches.
 
     Called once from startup recovery, after the store answers. Passing
     ``None`` (the probe failed) leaves local detection in charge — and
     :func:`scan_budget_report` will say so, because "nobody has a limit" is the
-    configuration that OOM-kills the server.
+    configuration that OOM-kills the server. ``cache_bytes`` defaults to zero so
+    a caller that never probed (the CLI) resolves exactly the budget every
+    release before this one did.
     """
     global _clickhouse_ceiling, _clickhouse_bounded  # noqa: PLW0603
+    global _clickhouse_cache_bytes, _clickhouse_cache_breakdown  # noqa: PLW0603
     _clickhouse_ceiling = clickhouse_ceiling_bytes if clickhouse_ceiling_bytes else None
     _clickhouse_bounded = bool(bounded) and _clickhouse_ceiling is not None
+    _clickhouse_cache_bytes = max(int(cache_bytes or 0), 0)
+    _clickhouse_cache_breakdown = dict(cache_breakdown or {})
 
 
 def scan_memory_ceiling() -> int | None:
@@ -291,6 +351,7 @@ def detect_scan_memory_budget() -> int:
         # precisely the OOM the pair exists to prevent. `restart_required=True`
         # on the spec is what makes the frozen value honest, not enforcement.
         _GATE_CONCURRENCY,
+        _clickhouse_cache_bytes,
     )
 
 
@@ -303,9 +364,11 @@ def scan_budget_report() -> dict[str, Any]:
     - ``"unbounded"`` — ClickHouse reported no ceiling of its own. Nothing
       bounds its merges, caches or allocator slack, and the kernel is the only
       backstop. This is the session-186 production configuration.
-    - ``"over_budget"`` — our scans alone are authorized more than ClickHouse
-      is allowed to use in total, so admitting them can only end in its own
-      memory error or a kill.
+    - ``"over_budget"`` — our scans *plus the caches under the same ceiling* are
+      authorized more than ClickHouse is allowed to use in total, so admitting a
+      full set of scans can only end in its own memory error or a kill. The
+      caches are counted because they are configured maxima under that ceiling:
+      ``memory.xml``'s own comment says so, and the check did not.
     - ``"ok"`` — the total scan budget fits under ClickHouse's ceiling with
       headroom left for what the per-query cap cannot cover.
     """
@@ -313,9 +376,10 @@ def scan_budget_report() -> dict[str, Any]:
     per_query = detect_scan_memory_budget()
     total = per_query * _GATE_CONCURRENCY
     ceiling = scan_memory_ceiling()
+    committed = total + _clickhouse_cache_bytes
     if _clickhouse_ceiling is None or not _clickhouse_bounded:
         risk = "unbounded"
-    elif total > _clickhouse_ceiling:
+    elif committed > _clickhouse_ceiling:
         risk = "over_budget"
     else:
         risk = "ok"
@@ -323,6 +387,17 @@ def scan_budget_report() -> dict[str, Any]:
         "risk": risk,
         "per_query_bytes": per_query,
         "total_bytes": total,
+        # Cache maxima that sit under the same ceiling and are therefore not
+        # available to scans. Reported with their breakdown so the comparison
+        # is inspectable rather than implied: an operator told "over_budget"
+        # needs to see which number to move.
+        "cache_bytes": _clickhouse_cache_bytes,
+        "cache_breakdown": dict(_clickhouse_cache_breakdown),
+        # What is left under the ceiling once scans and caches are committed.
+        # This is the merge and allocator-slack headroom, which nothing else
+        # bounds — deliberately reported rather than reserved as a fraction,
+        # which would be a second guess stacked on the first.
+        "headroom_bytes": (_clickhouse_ceiling - committed) if _clickhouse_ceiling else None,
         "clickhouse_ceiling_bytes": _clickhouse_ceiling,
         "clickhouse_ceiling_is_explicit": _clickhouse_bounded,
         "local_detected_bytes": detect_local_memory_total(),
