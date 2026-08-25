@@ -5,6 +5,72 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] — 2026-08-25
+
+### Added
+
+- **Value inventory export (#295).** One row per distinct value of a field, with how often it
+  occurs and when it was first and last seen — the aggregate an analyst previously had to
+  rebuild by exporting every event and pivoting it themselves. Computed inside the *current*
+  Explorer filters and stamped with the same ISO-8601 UTC times as the events export, so the
+  two files join. Columns, separator and ordering are chosen in the export dialog; the column
+  an ordering sorts by is always written, since a file sorted by a column it does not contain
+  reads as shuffled. A value seen only on events with no timestamp gets empty time cells
+  rather than a fabricated one, and the file carries the same completeness trailer the events
+  export does — a stream shorter than the pre-flight count breaks the download instead of
+  handing over a silently short inventory.
+- **`VESTIGO_EXPORT_SCAN_QUEUE_WAIT_SECONDS`** (default 30) — how long a queued value-inventory
+  export waits for the single streamed-export slot before the request is refused with 503.
+  Editable in the settings console.
+
+### Fixed
+
+- **The scan budget is sized from ClickHouse's own ceiling, not the app's host.** A production
+  instance had been losing `clickhouse-server` to the kernel for months: with no container
+  limit and no `max_server_memory_usage`, ClickHouse derived its ceiling from 0.9 × the whole
+  64 GiB host, and the app — measuring the memory *its own* container could see — authorized
+  25.6 GiB for a single query. Every guardrail read as satisfied; SIGKILL writes no log line
+  and `restart: unless-stopped` erased the outage. The app now asks ClickHouse what ceiling it
+  runs under at startup and takes `VESTIGO_STAT_SCAN_MEMORY_RATIO` of that, `memory.xml` ships
+  mounted by default instead of as a `.example` nobody copies, and `/api/health` carries a
+  `scan_budget` block reporting what actually resolved and whether it is safe.
+- **A ceiling ClickHouse only derived no longer out-votes the app's own limit.** When the probe
+  reports a ceiling nobody set (0.9 × RAM a limit-less container does not own), it is now
+  capped by local detection — two guesses, take the lower. An app in a 4 GiB container against
+  an unlimited ClickHouse on a 64 GiB box was otherwise authorized ~23 GiB per query on the
+  strength of a number the code had just classified as unbounded.
+- **A pinned `max_server_memory_usage` is read as ClickHouse actually adopts it.** The server
+  clamps the absolute setting down to `max_server_memory_usage_to_ram_ratio` × detected RAM;
+  the probe reported the pinned value, so the budget and the `over_budget` check were
+  optimistic against a ceiling the server would not honour. The reference stack's own 10 GiB
+  against `mem_limit: 12g` was one such case, and now pins 9.5 GiB so the file states its
+  effective ceiling.
+- **The heavy-scan budget and the admission gate can no longer disagree.** The per-query
+  divisor followed the live `VESTIGO_STAT_SCAN_CONCURRENCY` while the semaphore stayed sized at
+  import, so lowering it in the admin console doubled every query's `max_memory_usage` while
+  the gate kept admitting the old count — twice the total budget ClickHouse was sized for.
+  Both halves now read one frozen value, and `/api/health` discloses an edit awaiting a
+  restart.
+- **A backgrounded inventory download can no longer stall every other export.** The single
+  streamed-export slot was taken with an unbounded blocking wait inside the response
+  generator, on a worker thread the rest of the app shares. It is now taken before the
+  response begins, bounded by the new setting above, so a busy server answers 503 rather than
+  parking queued requests indefinitely.
+- **The enrichment apply stops waiting out other people's merges.** The post-swap merge wait
+  polled `system.merges` for *any* merge on `events` while holding a scan slot, so an instance
+  with concurrent ingest burned the full 300-second timeout on every apply and stalled every
+  detector sweep behind it. It now polls only the partitions the apply staged.
+- **`/api/health` no longer re-detects host memory on the event loop** on every poll, and the
+  export dialog's field picker renders its loading and error states instead of appearing as an
+  empty list with a permanently disabled Download button.
+
+### Changed
+
+- **Coverage is no longer on by default for `pytest`.** It instrumented every local
+  invocation, including single-test runs, on a suite that drives real PostgreSQL and
+  ClickHouse. CI passes `--cov` explicitly, so the number is still measured on every push.
+- lucide-react 1.32.0 → 1.34.0.
+
 ## [1.14.0] — 2026-08-24
 
 ### Added
