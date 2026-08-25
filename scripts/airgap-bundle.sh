@@ -136,7 +136,10 @@ cp deploy/airgap/install.sh "$BUNDLE/install.sh"
 cp deploy/clickhouse/allow-default-network.xml "$BUNDLE/clickhouse/"
 # Ships enabled, not as an example to copy: the server-side memory ceiling is
 # what keeps ClickHouse failing one query instead of being OOM-killed, and an
-# opt-in guardrail is one that production runs without.
+# opt-in guardrail is one that production runs without. Staging it here is only
+# half of it — install.sh must copy it into the install directory too, which it
+# did not for several releases; tests/test_airgap_bundle_parity.py asserts the
+# two halves stay in step.
 cp deploy/clickhouse/memory.xml "$BUNDLE/clickhouse/"
 cp .env.example "$BUNDLE/.env.example"
 # Not optional: docs/DEPLOYMENT.md tells the operator this file is in the bundle,

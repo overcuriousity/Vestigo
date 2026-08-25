@@ -88,6 +88,11 @@ if [ "$CHECK_ONLY" = 1 ]; then
   else
     warn "no usable container engine found — install would fail here"
   fi
+  if [ -f clickhouse/memory.xml ]; then
+    say "clickhouse/memory.xml present ($(wc -c < clickhouse/memory.xml) bytes)"
+  else
+    warn "clickhouse/memory.xml missing from the bundle — install would leave ClickHouse with no memory ceiling"
+  fi
   say "bundle is complete and consistent — nothing changed (--check)"
   exit 0
 fi
@@ -205,6 +210,14 @@ mkdir -p "$INSTALL_DIR/clickhouse"
 # looks for, so the bundle directory has no runnable stack in it.
 cp compose.airgap.yml "$INSTALL_DIR/docker-compose.yml"
 cp clickhouse/allow-default-network.xml "$INSTALL_DIR/clickhouse/"
+# Not optional, and its absence is silent: the compose file bind-mounts
+# ./clickhouse/memory.xml, and a missing bind-mount source becomes an empty
+# *directory* rather than an error. ClickHouse then starts, merges no ceiling,
+# and derives 0.9 x whatever RAM a limit-less container sees — the unbounded
+# condition this file exists to prevent. This copy was missing from every
+# release that shipped memory.xml; tests/test_airgap_bundle_parity.py is what
+# stops the next drop-in repeating it.
+cp clickhouse/memory.xml "$INSTALL_DIR/clickhouse/"
 cp .env.example "$INSTALL_DIR/.env.example"
 cp bundle.env BUNDLE-INFO images.list "$INSTALL_DIR/"
 if [ -f nginx-tls.conf ]; then cp nginx-tls.conf "$INSTALL_DIR/"; fi
@@ -257,6 +270,16 @@ if ! "$ENGINE" volume inspect "${PROJECT}_postgres_data" >/dev/null 2>&1; then
 fi
 
 # ── start ───────────────────────────────────────────────────────────────────
+# The one mount whose absence does not fail. Checked with -f, not -e: the
+# failure shape is a *directory* Docker created at the target on a previous run
+# with a missing source, and -e would pass on exactly that.
+if [ ! -f clickhouse/memory.xml ]; then
+  if [ -d clickhouse/memory.xml ]; then
+    die "clickhouse/memory.xml is a directory — a previous run started the stack without it, and Docker created it as a mount target. Remove it (rm -rf clickhouse/memory.xml), then re-run this installer."
+  fi
+  die "clickhouse/memory.xml is missing. Without it ClickHouse runs with no memory ceiling and is eventually OOM-killed by the kernel with nothing in its own log. Re-copy the bundle and re-run."
+fi
+
 say "starting the stack"
 $COMPOSE up -d --no-build
 
