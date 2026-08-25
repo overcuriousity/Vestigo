@@ -217,6 +217,12 @@ fails every Docker build. Keep the alias if you edit this.
 
 ## Resource sizing
 
+**Start here:** the [sizing calculator](https://overcuriousity.github.io/Vestigo/sizing/) turns
+an expected dataset size, analyst count and deployment shape into the numbers this section
+explains. It computes them with the same arithmetic `db/_scan.py` uses, from constants generated
+out of the source — but it cannot see your host, so read `/api/health`'s `scan_budget` block
+(below) once the stack is up.
+
 Both compose files ship **with memory limits set**, sized for a 32 GiB host and
 overridable per service (`VESTIGO_CLICKHOUSE_MEM_LIMIT`, `VESTIGO_POSTGRES_MEM_LIMIT`,
 `VESTIGO_QDRANT_MEM_LIMIT`, `VESTIGO_APP_MEM_LIMIT`). Raise them to fit your box.

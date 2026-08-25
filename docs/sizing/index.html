@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vestigo sizing calculator</title>
+<meta name="description" content="Turn an expected dataset size and analyst count into recommended RAM, cores and VESTIGO_* values for a Vestigo deployment.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpolygon fill='%236d28d9' points='2,4 26,4 22,11 2,11'/%3E%3Cpolygon fill='%236d28d9' points='8,15 32,15 28,22 8,22'/%3E%3Cpolygon fill='%230891b2' points='22,26 46,26 42,33 22,33'/%3E%3Cpolygon fill='%236d28d9' points='20,37 44,37 40,44 20,44'/%3E%3C/svg%3E">
+<style>
+/* Tokens lifted from frontend/src/index.css so the page reads as Vestigo.
+   Light is the bare :root; dark redefines only what changes. */
+:root {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  --color-bg-base: #f8f6f1;
+  --color-bg-surface: #f2f0ea;
+  --color-bg-elevated: #ffffff;
+  --color-fg-primary: #2d2d2d;
+  --color-fg-secondary: #5a5a5a;
+  --color-fg-muted: #7a7a72;
+  --color-border: #ddd8cc;
+  --color-border-strong: #c9c3b4;
+  --color-accent: #3b6e91;
+  --color-accent-dim: rgba(59, 110, 145, 0.1);
+  --color-warning: #9a6a1a;
+  --color-warning-dim: rgba(154, 106, 26, 0.1);
+  --color-anomaly: #6d28d9;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg-base: #0e1015;
+    --color-bg-surface: #14171d;
+    --color-bg-elevated: #1b1e26;
+    --color-fg-primary: #e2e4ec;
+    --color-fg-secondary: #8b8fa8;
+    --color-fg-muted: #7d82a0;
+    --color-border: #232636;
+    --color-border-strong: #2e3244;
+    --color-accent: #5aa8b0;
+    --color-accent-dim: rgba(90, 168, 176, 0.15);
+    --color-warning: #e8a839;
+    --color-warning-dim: rgba(232, 168, 57, 0.15);
+    --color-anomaly: #a78bfa;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 2rem 1.25rem 4rem;
+  background: var(--color-bg-base);
+  color: var(--color-fg-primary);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+}
+main { max-width: 62rem; margin: 0 auto; }
+header { display: flex; align-items: center; gap: 0.85rem; margin-bottom: 0.25rem; }
+header svg { width: 34px; height: 34px; flex: none; }
+h1 { font-size: 1.35rem; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h2 {
+  font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--color-fg-muted); margin: 2rem 0 0.75rem; font-weight: 600;
+}
+.lede { color: var(--color-fg-secondary); margin: 0 0 0.5rem; max-width: 46rem; }
+.note {
+  border-left: 3px solid var(--color-accent); background: var(--color-accent-dim);
+  padding: 0.7rem 0.9rem; border-radius: 0 4px 4px 0; font-size: 0.85rem;
+  color: var(--color-fg-secondary); margin: 1rem 0 0;
+}
+.warn { border-left-color: var(--color-warning); background: var(--color-warning-dim); }
+
+.panel {
+  background: var(--color-bg-surface); border: 1px solid var(--color-border);
+  border-radius: 6px; padding: 1.1rem 1.25rem;
+}
+.controls { display: grid; gap: 1.15rem; }
+@media (min-width: 46rem) { .controls { grid-template-columns: 1fr 1fr; } }
+
+label { display: block; font-size: 0.82rem; font-weight: 600; margin-bottom: 0.3rem; }
+.value { font-family: var(--font-mono); color: var(--color-accent); font-weight: 500; }
+.hint { font-size: 0.76rem; color: var(--color-fg-muted); margin-top: 0.25rem; }
+input[type=range] { width: 100%; accent-color: var(--color-accent); margin: 0; }
+select {
+  width: 100%; padding: 0.35rem 0.5rem; border-radius: 4px; font: inherit; font-size: 0.85rem;
+  background: var(--color-bg-elevated); color: var(--color-fg-primary);
+  border: 1px solid var(--color-border-strong);
+}
+.checks { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 0.2rem; }
+.checks label { display: flex; align-items: center; gap: 0.4rem; font-weight: 500; margin: 0; }
+
+.headline { display: grid; gap: 0.75rem; margin-top: 0.9rem; }
+@media (min-width: 34rem) { .headline { grid-template-columns: 1fr 1fr; } }
+.stat {
+  background: var(--color-bg-elevated); border: 1px solid var(--color-border);
+  border-radius: 6px; padding: 0.85rem 1rem;
+}
+.stat .k { font-size: 0.75rem; color: var(--color-fg-muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.stat .v { font-size: 1.6rem; font-weight: 600; font-family: var(--font-mono); letter-spacing: -0.02em; }
+.stat .w { font-size: 0.78rem; color: var(--color-fg-secondary); }
+
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; min-width: 34rem; }
+th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--color-border); vertical-align: top; }
+th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-fg-muted); font-weight: 600; }
+td.n { font-family: var(--font-mono); white-space: nowrap; }
+td.why { color: var(--color-fg-secondary); font-size: 0.8rem; }
+code { font-family: var(--font-mono); font-size: 0.85em; }
+a { color: var(--color-accent); }
+footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <!-- Vestigo mark: a regular track of steps, one band out of cadence. -->
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" aria-hidden="true">
+    <polygon fill="var(--color-anomaly)" points="2,4 26,4 22,11 2,11"/>
+    <polygon fill="var(--color-anomaly)" points="8,15 32,15 28,22 8,22"/>
+    <polygon fill="var(--color-accent)" points="22,26 46,26 42,33 22,33"/>
+    <polygon fill="var(--color-anomaly)" points="20,37 44,37 40,44 20,44"/>
+  </svg>
+  <h1>Vestigo sizing calculator</h1>
+</header>
+
+<p class="lede">
+  What a Vestigo deployment needs, from what you expect to put in it. Everything below is
+  computed with the same arithmetic <code>src/vestigo/db/_scan.py</code> uses at runtime —
+  the constants are generated from the source, not transcribed.
+</p>
+
+<h2>What you expect</h2>
+<div class="panel controls">
+  <div>
+    <label for="events">Largest timeline <span class="value" id="events-v"></span></label>
+    <input type="range" id="events" min="0" max="100" value="45">
+    <p class="hint">Events in the biggest single timeline an analyst will scan. Detectors read the
+      whole thing, so this is what sizes ClickHouse — not your total across cases.</p>
+  </div>
+  <div>
+    <label for="analysts">Concurrent analysts <span class="value" id="analysts-v"></span></label>
+    <input type="range" id="analysts" min="1" max="12" value="2">
+    <p class="hint">People with the Investigate surface open at the same time. Each open timeline
+      fires several detector sweeps at once.</p>
+  </div>
+  <div>
+    <label for="shape">Deployment shape</label>
+    <select id="shape">
+      <option value="docker">Full Docker — app and all three services on one host</option>
+      <option value="native">App native, services containerized on the same host</option>
+      <option value="split">ClickHouse on its own host</option>
+    </select>
+    <p class="hint">Decides whether the app, Postgres and Qdrant are competing for the same RAM
+      as ClickHouse.</p>
+  </div>
+  <div>
+    <label>Optional subsystems</label>
+    <div class="checks">
+      <label><input type="checkbox" id="embeddings"> Embeddings (Qdrant)</label>
+      <label><input type="checkbox" id="enrichment" checked> Enrichment applies</label>
+    </div>
+    <p class="hint">Without embeddings, Qdrant needs no RAM at all. Enrichment rewrites a whole
+      partition and takes a scan slot, so it wants the per-query cap not to be tiny.</p>
+  </div>
+</div>
+
+<h2>What to provision</h2>
+<div class="headline">
+  <div class="stat">
+    <div class="k">Host RAM</div>
+    <div class="v" id="out-ram"></div>
+    <div class="w" id="out-ram-why"></div>
+  </div>
+  <div class="stat">
+    <div class="k">Host cores</div>
+    <div class="v" id="out-cores"></div>
+    <div class="w" id="out-cores-why"></div>
+  </div>
+</div>
+
+<div class="scroll" style="margin-top:1rem">
+  <table>
+    <thead><tr><th>Memory</th><th>Value</th><th>Why</th></tr></thead>
+    <tbody id="out-memory"></tbody>
+  </table>
+</div>
+
+<h2>Settings to set</h2>
+<div class="scroll">
+  <table>
+    <thead><tr><th>Key</th><th>Value</th><th>Why</th></tr></thead>
+    <tbody id="out-settings"></tbody>
+  </table>
+</div>
+
+<p class="note warn" id="caveat">
+  <strong>These are starting points.</strong> The only authority on what actually resolved is
+  <code>GET /api/health</code>'s <code>scan_budget</code> block on the machine you deploy to —
+  also rendered on the admin <strong>Settings</strong> page, above the Scans group. It reports the
+  ceiling ClickHouse really has, the caches counted against it, and a <code>risk</code> verdict.
+  Set the numbers below, start the stack, then read that.
+</p>
+
+<p class="note">
+  Full reasoning, the three ceilings and how they must relate, and worked examples:
+  <a href="https://github.com/overcuriousity/Vestigo/blob/main/docs/DEPLOYMENT.md#resource-sizing">docs/DEPLOYMENT.md §Resource sizing</a>.
+  Scan-cost machinery:
+  <a href="https://github.com/overcuriousity/Vestigo/blob/main/docs/ANOMALY_DETECTION.md">docs/ANOMALY_DETECTION.md</a>.
+</p>
+
+<footer>
+  Constants generated from <code>core/config.py</code>, <code>db/_scan.py</code> and
+  <code>deploy/clickhouse/memory.xml</code> by <code>scripts/gen_sizing_constants.py</code>;
+  <code>tests/test_sizing_constants.py</code> fails if this page drifts from them.
+</footer>
+
+</main>
+
+<script>
+const GIB = 1024 ** 3;
+let K = null;
+
+/** Slider position 0..100 → events, log-scaled across 1M..1B. */
+function eventsFor(pos) {
+  const decades = Math.log10(1000);           // 1M → 1B
+  const n = 1e6 * Math.pow(10, (pos / 100) * decades);
+  const mag = Math.pow(10, Math.floor(Math.log10(n)));
+  return Math.round(n / (mag / 10)) * (mag / 10);
+}
+
+function fmtEvents(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + "B events";
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e8 ? 0 : 0) + "M events";
+  return n.toLocaleString() + " events";
+}
+
+const gib = (b) => (b / GIB).toFixed(b < 10 * GIB ? 1 : 0) + " GiB";
+/** Round up to something an operator would actually type into mem_limit. */
+const roundGib = (b) => Math.max(1, Math.ceil(b / GIB));
+
+function row(tbody, key, value, why) {
+  const tr = document.createElement("tr");
+  const k = document.createElement("td");
+  k.innerHTML = key;
+  const v = document.createElement("td");
+  v.className = "n";
+  v.textContent = value;
+  const w = document.createElement("td");
+  w.className = "why";
+  w.textContent = why;
+  tr.append(k, v, w);
+  tbody.append(tr);
+}
+
+function compute() {
+  const events = eventsFor(+document.getElementById("events").value);
+  const analysts = +document.getElementById("analysts").value;
+  const shape = document.getElementById("shape").value;
+  const embeddings = document.getElementById("embeddings").checked;
+  const enrichment = document.getElementById("enrichment").checked;
+
+  document.getElementById("events-v").textContent = fmtEvents(events);
+  document.getElementById("analysts-v").textContent = analysts;
+
+  // Concurrency: the gate exists so several analysts' sweeps queue rather than
+  // stack. It grows well below linearly — more slots divide the same budget.
+  const concurrency = Math.min(6, Math.max(K.default_concurrency, Math.ceil(analysts / 2)));
+
+  // ClickHouse's working set: the scan state a whole-corpus GROUP BY holds,
+  // times the slots that may be live at once, plus the caches, plus merge
+  // headroom. Floored at the reference stack — below that, sizing down stops
+  // buying anything and just makes every scan spill.
+  const perScan = (events / 1e6) * K.scan_working_set_bytes_per_million_events;
+  const caches = Object.values(K.shipped_caches).reduce((a, b) => a + b, 0);
+  const wantedCeiling = Math.max(
+    K.reference.clickhouse_ceiling_bytes,
+    (perScan * concurrency) / K.memory_ratio + caches
+  );
+  // Enrichment rewrites a whole partition under one slot; a per-query cap of a
+  // couple of GiB is where that starts failing on a large source.
+  const minPerQuery = enrichment ? 2 * GIB : 1.5 * GIB;
+  const ceiling = Math.max(
+    wantedCeiling,
+    (minPerQuery * concurrency) / K.memory_ratio + caches
+  );
+
+  const scanTotal = Math.floor((ceiling - caches) * K.memory_ratio);
+  const perQuery = Math.floor(scanTotal / concurrency);
+  const headroom = ceiling - scanTotal - caches;
+  // memory.xml must sit under (ratio × container limit), and the container
+  // needs slack for allocator and thread stacks on top of what ClickHouse
+  // accounts for.
+  const chLimit = roundGib(ceiling / K.reference.ceiling_to_limit_ratio) * GIB;
+
+  const pgLimit = K.reference.postgres_mem_limit_bytes;
+  const qdLimit = embeddings ? K.reference.qdrant_mem_limit_bytes : 0;
+  const appLimit = K.reference.app_mem_limit_bytes;
+
+  // Page cache is not spare RAM: ClickHouse reads compressed parts through it.
+  const pageCache = Math.max(4 * GIB, Math.min(16 * GIB, events * K.bytes_per_event_on_disk * 0.05));
+  const onThisHost = shape === "split" ? chLimit + pageCache : chLimit + pgLimit + qdLimit + appLimit + pageCache;
+  const hostRam = roundGib(onThisHost * 1.1) * GIB;   // 10% for the OS itself
+
+  // Threads: the gate admits `concurrency` scans, so an even share is the width
+  // at which a full gate saturates the box instead of oversubscribing it.
+  const cores = Math.max(4, concurrency * 4);
+  const threads = Math.max(K.min_threads_per_scan, Math.floor(cores / concurrency));
+
+  document.getElementById("out-ram").textContent = gib(hostRam);
+  document.getElementById("out-ram-why").textContent =
+    shape === "split"
+      ? "ClickHouse host only — the app, Postgres and Qdrant sit elsewhere."
+      : "One host running the app and all three backing services.";
+  document.getElementById("out-cores").textContent = cores;
+  document.getElementById("out-cores-why").textContent =
+    `${concurrency} concurrent scans × ${threads} threads each, so a full gate saturates the box rather than oversubscribing it.`;
+
+  const mem = document.getElementById("out-memory");
+  mem.textContent = "";
+  row(mem, "ClickHouse container limit", gib(chLimit),
+    "mem_limit / VESTIGO_CLICKHOUSE_MEM_LIMIT. Decides who the kernel kills; it never makes anyone throttle first.");
+  row(mem, "ClickHouse <code>max_server_memory_usage</code>", gib(ceiling),
+    "memory.xml. The only ceiling that bounds background merges. Must sit under the container limit.");
+  row(mem, "→ its caches", gib(caches),
+    "mark, index-mark and primary-index caches live under that ceiling, so scans do not get them.");
+  row(mem, "→ Vestigo scan budget (total)", gib(scanTotal),
+    `Auto: ${K.memory_ratio} × (ceiling − caches), shared across ${concurrency} concurrent scans.`);
+  row(mem, "→ per-query cap", gib(perQuery),
+    "budget ÷ concurrency, as max_memory_usage on every heavy scan. One query fails instead of the server.");
+  row(mem, "→ merge headroom", gib(headroom),
+    "What is left under the ceiling. Nothing else bounds background merges.");
+  if (shape !== "split") {
+    row(mem, "PostgreSQL", gib(pgLimit), "Metadata only — cases, sources, annotations, audit. Does not grow with event count.");
+    row(mem, "Qdrant", qdLimit ? gib(qdLimit) : "not needed",
+      qdLimit ? "Vectors for embedding-based similarity." : "Embeddings are optional; without them Qdrant runs nothing.");
+    row(mem, "App", gib(appLimit), "Streams parses and drains query results; does not hold a corpus.");
+  }
+  row(mem, "OS page cache (leave free)", gib(pageCache),
+    "Not spare RAM. ClickHouse reads compressed parts through it — this is scanning from RAM versus from disk.");
+
+  const set = document.getElementById("out-settings");
+  set.textContent = "";
+  row(set, "<code>VESTIGO_STAT_SCAN_CONCURRENCY</code>", String(concurrency),
+    "Heavy scans admitted at once; the rest queue. Also the divisor on the memory budget, so it needs a restart.");
+  row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)",
+    `Auto resolves to ${threads} here — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
+  row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>",
+    shape === "split" ? String(scanTotal) : "0 (auto)",
+    shape === "split"
+      ? "ClickHouse is on another host, so the app cannot derive the budget — pin the total."
+      : "Auto: derived from the ceiling ClickHouse reports, minus its caches. Leave it alone.");
+  row(set, "<code>VESTIGO_STAT_SCAN_MEMORY_RATIO</code>", String(K.memory_ratio),
+    "Fraction of (ceiling − caches) the scan budget takes; the rest is merge headroom.");
+  row(set, "<code>max_server_memory_usage</code>", String(ceiling),
+    "In memory.xml. Keep it under (ratio × container limit) or ClickHouse silently clamps it.");
+  row(set, "<code>max_server_memory_usage_to_ram_ratio</code>", String(K.reference.ceiling_to_limit_ratio),
+    "Spelled out so clearing the absolute value cannot fall back to 0.9 of a possibly-misdetected total.");
+  for (const [name, value] of Object.entries(K.shipped_caches)) {
+    row(set, `<code>${name}</code>`, String(value),
+      "In memory.xml. Left at its ClickHouse default this can be 5 GiB, spending the ceiling on cache instead of queries.");
+  }
+  if (shape === "docker") {
+    row(set, "<code>VESTIGO_CLICKHOUSE_MEM_LIMIT</code>", roundGib(chLimit) + "g",
+      "Container limit. Recreate the container after changing it — a restart does not re-apply it.");
+  }
+}
+
+fetch("sizing-constants.json")
+  .then((r) => r.json())
+  .then((data) => {
+    K = data;
+    for (const id of ["events", "analysts", "shape", "embeddings", "enrichment"]) {
+      document.getElementById(id).addEventListener("input", compute);
+    }
+    compute();
+  })
+  .catch(() => {
+    document.getElementById("caveat").textContent =
+      "Could not load sizing-constants.json — this page must be served over HTTP, not opened as a file:// URL.";
+  });
+</script>
+</body>
+</html>

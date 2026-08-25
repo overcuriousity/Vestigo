@@ -29,6 +29,14 @@ we ship. Three defects, one probe.
 
 Design round: `docs/superpowers/specs/2026-08-25-scan-budget-truthfulness.md`.
 
+Alongside: a **sizing calculator** at `docs/sizing/` (GitHub Pages, linked from the README).
+It turns an expected dataset size, analyst count and deployment shape into recommended RAM,
+cores and `VESTIGO_*` values, using the same arithmetic `db/_scan.py` uses — its constants are
+*generated* from `core/config.py`, `db/_scan.py` and `memory.xml` by
+`scripts/gen_sizing_constants.py`, with a parity test, so a public sizing page cannot recommend
+values the app stopped using. Sizing numbers only, deliberately: an operator who pastes a
+generated config has skipped the file that explains what the numbers mean.
+
 Issue #300 (foreground histograms queuing behind detector sweeps in the shared gate)
 stays open: it changes hot-path query behaviour and gets its own round.
 
