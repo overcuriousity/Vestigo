@@ -2,7 +2,9 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Lock, RotateCcw } from "lucide-react";
 import { ApiError } from "@/api/client";
+import { useHealth } from "@/api/health";
 import { settingsApi, type InstanceSetting, type InstanceSettingsResponse } from "@/api/settings";
+import { ScanBudgetCard } from "@/components/admin/ScanBudgetCard";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -184,6 +186,7 @@ export function AdminSettingsPage() {
     queryKey: ["admin", "settings"],
     queryFn: settingsApi.get,
   });
+  const health = useHealth();
 
   const mutation = useMutation({
     mutationFn: (values: Record<string, unknown>) => settingsApi.update(values),
@@ -277,6 +280,10 @@ export function AdminSettingsPage() {
           <section key={group.key}>
             <h2 className="text-sm font-semibold text-[var(--color-fg-primary)]">{group.label}</h2>
             <p className="mb-2 text-xs text-[var(--color-fg-muted)]">{group.description}</p>
+            {/* The verdict belongs next to the knobs that move it: an operator
+                editing the scan budget is the person who needs to know it does
+                not currently fit. */}
+            {group.key === "scans" && <ScanBudgetCard budget={health.data?.scan_budget} />}
             <div className="rounded-lg border border-[var(--color-border)] px-4">
               {settings.map((s) => (
                 <SettingRow
