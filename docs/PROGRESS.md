@@ -30,6 +30,14 @@ imposes: the column a file is *sorted by* is always written, even when unticked 
 ordered by a column it does not contain reads as shuffled. The UI says so rather than
 silently adding it.
 
+`lucide-react` went 1.32.0 → 1.34.0 (upstream latest) in the same branch. It was not a
+planned bump: the installed copy in this checkout was missing its ESM entry and its type
+declarations, so thirty-odd untouched files failed `tsc` and `vite build` could not resolve
+the package at all — a broken install that reads exactly like a code error. Reinstalling
+fixed it; taking the current release rather than re-pinning the old one is the cheaper end
+state. Pinned exact, as every other frontend dependency here is, and the lockfile diff
+touches nothing else.
+
 The dialog's field and order pickers are native `<select>`s, not the Radix one. A Radix
 Select inside a Radix Dialog puts two focus scopes in a loop under jsdom (the test hung on
 `Maximum call stack size exceeded` in `react-focus-scope`); `UploadDialog` already had the
