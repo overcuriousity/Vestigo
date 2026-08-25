@@ -21,22 +21,32 @@
      Sizing: leave real headroom under the container limit. This setting bounds
      what ClickHouse *accounts for*; jemalloc slack, mmapped pages and thread
      stacks sit outside that accounting. The reference stack pairs
-     `mem_limit: 12g` with the 10 GiB below. Scale both together — the app's
+     `mem_limit: 12g` with the 9.5 GiB below. Scale both together — the app's
      scan budget is derived from whatever ClickHouse reports here, so raising
      one number is enough to move the whole stack, and `/api/health`'s
      `scan_budget` block reports what actually resolved.
 
+     Keep the pinned value under (ratio x mem_limit), which is 9.6 GiB here.
+     Above it ClickHouse clamps silently (see the ratio note below) and the
+     pinned number stops being the real ceiling — the app models that clamp
+     when it reads this file's values back off the server, so the two agree,
+     but a config whose stated limit is not its effective one is a trap for
+     whoever reads it next.
+
      See docs/DEPLOYMENT.md "Resource sizing" for a worked 64 GiB example. -->
 <clickhouse>
-  <!-- 10 GiB, paired with `mem_limit: 12g`. -->
-  <max_server_memory_usage>10737418240</max_server_memory_usage>
+  <!-- 9.5 GiB, paired with `mem_limit: 12g` — under the 9.6 GiB the ratio
+       below implies, so this value is adopted as written rather than clamped. -->
+  <max_server_memory_usage>10200547328</max_server_memory_usage>
 
   <!-- The effective ceiling is the *lower* of the absolute value above and
        (this ratio x detected RAM) — ClickHouse clamps the absolute value down
        and logs a "lowered to" line when it does. So on a box where the server
        under-detects RAM, or if this file is copied onto a smaller node, the
        real limit may be under what is pinned above; check the server log
-       before trusting the pinned number. Spelled out rather than left at the
+       before trusting the pinned number. Vestigo's own probe applies the same
+       clamp when it derives the scan budget, so `/api/health`'s `scan_budget`
+       reports the effective ceiling rather than the pinned one. Spelled out rather than left at the
        default so an operator who clears max_server_memory_usage doesn't
        silently fall back to 0.9 of a possibly-misdetected total. -->
   <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>

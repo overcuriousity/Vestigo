@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import logging
@@ -2251,6 +2252,7 @@ class EventQueryService:
         *,
         order_by: str = "count_desc",
         block_size: int = 10_000,
+        hold_export_slot: bool = True,
     ) -> Iterator[dict[str, Any]]:
         """Yield one ``{value, count, first_seen, last_seen}`` row per distinct value.
 
@@ -2284,6 +2286,13 @@ class EventQueryService:
         held for the drain, which queues a second export rather than stacking
         two live result streams against the same memory budget.
 
+        ``hold_export_slot=False`` says the caller already holds that slot and
+        will release it when the stream is done. The HTTP surface does exactly
+        that: the slot has to be taken *before* the response begins if a busy
+        server is to answer 503 rather than a truncated 200, and waiting for it
+        inside the generator would be waiting after the headers are already
+        gone (see ``api/routers/events.py::export_field_inventory``).
+
         Every ordering breaks ties on the value, so re-running an export over
         unchanged (immutable) sources reproduces the same file.
         """
@@ -2306,7 +2315,7 @@ class EventQueryService:
             f"{heavy_scan_settings()}, max_block_size = {int(block_size)}"
         )
 
-        with EXPORT_SCAN_GATE:
+        with EXPORT_SCAN_GATE if hold_export_slot else contextlib.nullcontext():
             HEAVY_SCAN_GATE.acquire()
             scanning = True
             try:

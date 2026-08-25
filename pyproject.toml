@@ -181,7 +181,12 @@ indent-style = "space"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "--cov=vestigo --cov-report=term-missing"
+# Coverage is deliberately *not* in addopts. It instruments every invocation,
+# including the single-test run that should take two seconds, and on this suite
+# — which drives real PostgreSQL and ClickHouse — that is the difference between
+# a run you take and one you skip. CI passes --cov explicitly (see
+# .github/workflows/ci.yml), so the number is still measured on every push;
+# locally, add `--cov=vestigo --cov-report=term-missing` when you want it.
 markers = [
     "clickhouse: requires a reachable ClickHouse (dev compose stack); skipped otherwise",
     "multiloop: drives work on more than one event loop (a second TestClient, the CLI); gives the test an unpooled store, since asyncpg binds a connection to the loop that opened it",

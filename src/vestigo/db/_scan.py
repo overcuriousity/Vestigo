@@ -40,8 +40,9 @@ reachable. It also means an admin console edit to a ``stat_scan_*`` value takes
 effect on the next query, with no restart.
 
 Local detection remains as the fallback for before the probe has run (and for
-the CLI, which never probes), but it is exactly the assumption that failed in
-production: a full-docker stack on a 64 GiB host detected 64 GiB *from the app
+the CLI, which never probes) — and as a *cap* on a ceiling ClickHouse could
+only derive rather than be given (:func:`scan_memory_ceiling`). On its own it is
+exactly the assumption that failed in production: a full-docker stack on a 64 GiB host detected 64 GiB *from the app
 container*, authorized 0.8 x 64 / 2 = 25.6 GiB per query, and ClickHouse — with
 no container limit and no ``max_server_memory_usage`` — was OOM-killed by the
 kernel with nothing in its own log (session-186). Asking ClickHouse what it is
@@ -49,8 +50,11 @@ allowed to use removes the guess.
 
 :data:`HEAVY_SCAN_GATE` is imported *by value* into every scan module, so
 rebinding it here would not reach those bindings — its size is therefore fixed
-at import and ``VESTIGO_STAT_SCAN_CONCURRENCY`` stays ``restart_required`` in
-``core/settings_registry.py``.
+at import (:data:`_GATE_CONCURRENCY`) and ``VESTIGO_STAT_SCAN_CONCURRENCY`` stays
+``restart_required`` in ``core/settings_registry.py``. The per-query divisor
+reads that frozen value too, not the live setting: the two halves are one
+budget seen from two sides, and a live edit that moved only the divisor would
+authorize N full-budget queries against a gate still admitting M of them.
 
 The gate is not detector-only: ``ClickHouseStore.finalize_enrichment_apply``
 takes a slot for the enrichment partition rewrite too. It is the same class of
@@ -188,19 +192,26 @@ def resolve_clickhouse_ceiling(facts: Mapping[str, float]) -> tuple[int | None, 
     against it still beats guessing — with ``bounded=False``, and
     :func:`scan_budget_report` reports that as ``"unbounded"``.
     """
-    explicit = int(facts.get("max_server_memory_usage", 0) or 0)
-    if explicit > 0:
-        return explicit, True
-
     cgroup = int(facts.get("cgroup_memory_total", 0) or 0)
     os_total = int(facts.get("os_memory_total", 0) or 0)
     cgroup_is_a_limit = 0 < cgroup < _UNLIMITED_CGROUP and (not os_total or cgroup < os_total)
     detected = cgroup if cgroup_is_a_limit else os_total
-    if detected <= 0:
-        return None, False
-
     ratio = float(facts.get("max_server_memory_usage_to_ram_ratio", 0.9) or 0.9)
-    return int(detected * ratio), cgroup_is_a_limit
+    ratio_cap = int(detected * ratio) if detected > 0 else 0
+
+    explicit = int(facts.get("max_server_memory_usage", 0) or 0)
+    if explicit > 0:
+        # ClickHouse clamps the absolute setting down to the ratio cap and logs
+        # a "lowered to" line when it does, so the pinned number is not always
+        # the effective one — the reference stack's own 10 GiB sits ~4% above
+        # the 0.8 x 12 GiB its container limit implies. Reporting the pinned
+        # value there would make the budget, and `over_budget`, optimistic
+        # against a ceiling the server will not actually honour.
+        return (min(explicit, ratio_cap) if ratio_cap else explicit), True
+
+    if ratio_cap <= 0:
+        return None, False
+    return ratio_cap, cgroup_is_a_limit
 
 
 def configure_scan_budget(clickhouse_ceiling_bytes: int | None, bounded: bool = False) -> None:
@@ -216,14 +227,45 @@ def configure_scan_budget(clickhouse_ceiling_bytes: int | None, bounded: bool = 
     _clickhouse_bounded = bool(bounded) and _clickhouse_ceiling is not None
 
 
+def scan_memory_ceiling() -> int | None:
+    """The ceiling the automatic budget takes its ratio of.
+
+    ClickHouse's own, when it reported one — that is the number describing the
+    machine the queries actually run on, and the whole point of the probe. With
+    one exception: an *unbounded* ceiling (``bounded=False``: 0.9 x whatever RAM
+    a limit-less container detected) is, in this module's own words, a ceiling
+    in name only, so it is capped by local detection rather than believed
+    outright. Otherwise an app in a 4 GiB container talking to an unlimited
+    ClickHouse on a 64 GiB box would authorize ~23 GiB per query on the strength
+    of a number :func:`resolve_clickhouse_ceiling` has just classified as
+    ``"unbounded"``. Two guesses, so take the lower one; an explicit
+    ``max_server_memory_usage`` is a decision, not a guess, and stands as-is.
+    """
+    local = detect_local_memory_total()
+    if not _clickhouse_ceiling:
+        return local
+    if _clickhouse_bounded or not local:
+        return _clickhouse_ceiling
+    return min(_clickhouse_ceiling, local)
+
+
 def detect_scan_memory_budget() -> int:
     """Resolve the per-query ``max_memory_usage`` for heavy scans (see module docstring)."""
     s = get_settings()
     return _resolve_scan_memory_budget(
         s.stat_scan_max_memory_bytes,
         s.stat_scan_memory_ratio,
-        _clickhouse_ceiling if _clickhouse_ceiling else detect_local_memory_total(),
-        s.stat_scan_concurrency,
+        scan_memory_ceiling(),
+        # Deliberately the gate's own size, not the live setting. The divisor
+        # and the semaphore describe one budget from two sides, and this is the
+        # only value both can agree on: :data:`HEAVY_SCAN_GATE` is sized at
+        # import and imported by value, while an admin-console edit to
+        # `stat_scan_concurrency` lands on the next `get_settings()`. Reading
+        # the live value here would let a 4 -> 2 edit double every query's cap
+        # while the gate still admitted four — 2x the total budget, which is
+        # precisely the OOM the pair exists to prevent. `restart_required=True`
+        # on the spec is what makes the frozen value honest, not enforcement.
+        _GATE_CONCURRENCY,
     )
 
 
@@ -244,7 +286,8 @@ def scan_budget_report() -> dict[str, Any]:
     """
     s = get_settings()
     per_query = detect_scan_memory_budget()
-    total = per_query * max(s.stat_scan_concurrency, 1)
+    total = per_query * _GATE_CONCURRENCY
+    ceiling = scan_memory_ceiling()
     if _clickhouse_ceiling is None or not _clickhouse_bounded:
         risk = "unbounded"
     elif total > _clickhouse_ceiling:
@@ -258,12 +301,25 @@ def scan_budget_report() -> dict[str, Any]:
         "clickhouse_ceiling_bytes": _clickhouse_ceiling,
         "clickhouse_ceiling_is_explicit": _clickhouse_bounded,
         "local_detected_bytes": detect_local_memory_total(),
+        # What the ratio was actually applied to — which is not
+        # `clickhouse_ceiling_bytes` when an unbounded ceiling was capped by
+        # local detection (see `scan_memory_ceiling`).
+        "budget_ceiling_bytes": ceiling,
         "source": (
             "pinned"
             if s.stat_scan_max_memory_bytes > 0
-            else ("clickhouse" if _clickhouse_ceiling else "local")
+            else (
+                "clickhouse" if _clickhouse_ceiling and ceiling == _clickhouse_ceiling else "local"
+            )
         ),
-        "concurrency": s.stat_scan_concurrency,
+        # The gate's size, i.e. the number the budget was actually divided by.
+        # A pending `stat_scan_concurrency` edit takes effect on restart, so
+        # reporting the live setting here would describe a budget nothing is
+        # using yet.
+        "concurrency": _GATE_CONCURRENCY,
+        "pending_concurrency": (
+            s.stat_scan_concurrency if s.stat_scan_concurrency != _GATE_CONCURRENCY else None
+        ),
     }
 
 
@@ -296,7 +352,10 @@ def heavy_scan_settings() -> str:
 # so blocking is fine). Every public find_* detector entry point in
 # db/anomaly_stats.py acquires this — nested helpers (recommend_*/inventory)
 # deliberately do not, so a gated scan can call them without deadlocking.
-HEAVY_SCAN_GATE = threading.BoundedSemaphore(get_settings().stat_scan_concurrency)
+# Frozen at import and shared with `detect_scan_memory_budget`, which divides
+# the total budget by exactly this number — see the comment at that call.
+_GATE_CONCURRENCY = max(get_settings().stat_scan_concurrency, 1)
+HEAVY_SCAN_GATE = threading.BoundedSemaphore(_GATE_CONCURRENCY)
 
 # Admission gate for *streamed* heavy scans (the value-inventory export).
 # Deliberately separate from HEAVY_SCAN_GATE and deliberately one slot.

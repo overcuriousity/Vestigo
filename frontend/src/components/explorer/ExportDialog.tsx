@@ -181,11 +181,21 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                 <select
                   aria-label="Field"
                   className={SELECT_CLASS}
-                  disabled={download.active}
+                  disabled={download.active || fieldsQuery.isPending || fieldsQuery.isError}
                   value={field ?? ""}
                   onChange={(e) => setField(e.target.value || null)}
                 >
-                  <option value="">Choose a field…</option>
+                  {/* The placeholder states which of the three the list is in.
+                      Without it a failed or in-flight `viz/fields` renders as
+                      an empty picker with the Download button permanently
+                      disabled and nothing saying why. */}
+                  <option value="">
+                    {fieldsQuery.isPending
+                      ? "Loading fields…"
+                      : fieldsQuery.isError
+                        ? "Could not load fields"
+                        : "Choose a field…"}
+                  </option>
                   {(fieldsQuery.data?.fields ?? []).map((f) => (
                     <option key={f.token} value={f.token}>
                       {f.token}
@@ -193,6 +203,21 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                     </option>
                   ))}
                 </select>
+                {fieldsQuery.isError ? (
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <p className="text-xs text-[var(--color-danger)]">
+                      The field list could not be loaded, so there is nothing to inventory yet.
+                    </p>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void fieldsQuery.refetch()}
+                      disabled={fieldsQuery.isFetching}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                ) : null}
               </div>
 
               <div>

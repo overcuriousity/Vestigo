@@ -88,7 +88,9 @@ jobs:
 
       - name: pytest
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: uv run pytest
+        # Coverage lives here rather than in pyproject's addopts, so a local
+        # run is not instrumented by default — see the note there.
+        run: uv run pytest --cov=vestigo --cov-report=term-missing
 
   container-smoke:
     # Build the reference image and boot it against real backing services —

@@ -627,6 +627,16 @@ _SPECS: tuple[SettingSpec, ...] = (
         "max_server_memory_usage of its own, which bounds merges directly.",
     ),
     SettingSpec(
+        "export_scan_queue_wait_seconds",
+        "scans",
+        "Export queue wait (seconds)",
+        "How long a value-inventory export waits for the single streamed-export slot before "
+        "the request is refused with 503. That slot is held for the whole download, which "
+        "the analyst's browser paces, so the wait is bounded rather than open-ended: an "
+        "unbounded one lets a single backgrounded download block every other export in the "
+        "process. 0 refuses immediately when an export is already running.",
+    ),
+    SettingSpec(
         "stat_scan_concurrency",
         "scans",
         "Concurrent heavy scans",

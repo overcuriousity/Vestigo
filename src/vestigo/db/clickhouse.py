@@ -892,14 +892,40 @@ class ClickHouseStore:
                     "owned_suffixes": owned_suffixes or [],
                 },
             )
+            # Read before the swap, off the scratch table: it holds exactly the
+            # parts about to be swapped in, under the same partition key, so
+            # its partition_id *is* the one whose merges we are about to queue.
+            # Deriving it this way avoids reconstructing ClickHouse's own
+            # formatting of a tuple partition key.
+            partition_ids = self._scratch_partition_ids(events_table)
             self.client.command(
                 f"ALTER TABLE {self.database}.events "
                 f"REPLACE PARTITION {partition_expr} FROM {events_table}"
             )
-            self._await_merges(get_settings().enrichment_apply_merge_wait_seconds)
+            self._await_merges(get_settings().enrichment_apply_merge_wait_seconds, partition_ids)
 
-    def _await_merges(self, timeout_seconds: int) -> None:
-        """Block until ClickHouse has no merges left on ``events``, or *timeout*.
+    def _scratch_partition_ids(self, events_table: str) -> list[str]:
+        """The partition ids of the parts staged in *events_table*.
+
+        Empty when the scratch table has no active parts (an apply over a
+        source with no matching rows) or when the query is not permitted —
+        both of which make the merge wait below a no-op rather than a
+        five-minute wait on merges that are not ours.
+        """
+        database, _, table = events_table.rpartition(".")
+        try:
+            rows = self.client.query(
+                "SELECT DISTINCT partition_id FROM system.parts "
+                "WHERE database = {db:String} AND table = {tbl:String} AND active",
+                parameters={"db": database, "tbl": table},
+            ).result_rows
+        except Exception:  # noqa: BLE001 — no rights on system.parts, say
+            logger.debug("could not read scratch partition ids", exc_info=True)
+            return []
+        return [str(row[0]) for row in rows if row[0]]
+
+    def _await_merges(self, timeout_seconds: int, partition_ids: list[str]) -> None:
+        """Block until *partition_ids* have no merges left on ``events``, or *timeout*.
 
         Called while still holding the admission slot, and that is the point.
         ``REPLACE PARTITION`` returns as soon as the swap is done; the merges it
@@ -916,16 +942,24 @@ class ClickHouseStore:
         ``VESTIGO_ENRICHMENT_APPLY_MERGE_WAIT_SECONDS`` to 0 to skip it, which
         is right when ClickHouse has a ``max_server_memory_usage`` of its own:
         that bounds merges directly, at the layer that can actually see them.
+
+        Scoped to the partitions this apply just wrote, not to ``events`` as a
+        whole. An instance with concurrent ingest into other sources has merges
+        in flight essentially always, so an unscoped poll waits out the full
+        timeout every time — and it does that holding the admission slot, which
+        stalls every detector sweep on the box for five minutes over merges the
+        apply did not cause.
         """
-        if timeout_seconds <= 0:
+        if timeout_seconds <= 0 or not partition_ids:
             return
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             try:
                 rows = self.client.query(
                     "SELECT count() FROM system.merges "
-                    "WHERE database = {db:String} AND table = 'events'",
-                    parameters={"db": self.database},
+                    "WHERE database = {db:String} AND table = 'events' "
+                    "AND partition_id IN {pids:Array(String)}",
+                    parameters={"db": self.database, "pids": partition_ids},
                 ).result_rows
             except Exception:  # noqa: BLE001 — no rights on system.merges, say
                 logger.debug("could not poll system.merges; not waiting", exc_info=True)
@@ -934,9 +968,10 @@ class ClickHouseStore:
                 return
             time.sleep(1.0)
         logger.info(
-            "enrichment apply: merges on %s.events still running after %ds; releasing the "
-            "scan slot anyway",
+            "enrichment apply: merges on %s.events partitions %s still running after %ds; "
+            "releasing the scan slot anyway",
             self.database,
+            partition_ids,
             timeout_seconds,
         )
 

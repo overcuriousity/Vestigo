@@ -250,6 +250,17 @@ class Settings(BaseSettings):
     # a max_server_memory_usage of its own, which bounds merges at the layer
     # that can actually see them (docs/DEPLOYMENT.md "Resource sizing").
     enrichment_apply_merge_wait_seconds: int = Field(default=300, ge=0)
+    # Seconds a value-inventory export waits for the single streamed-scan slot
+    # (db/_scan.py::EXPORT_SCAN_GATE) before the request is refused with 503.
+    # The slot is held for the whole client-paced drain, so an analyst who
+    # backgrounds or throttles a large download holds it for as long as they
+    # like; waiting on it without a bound made every other export in the
+    # process — every case, every user — block indefinitely, each one parked on
+    # an anyio worker thread that the rest of the app also needs. Bounded, the
+    # worst case is a queued export occupying a thread for this long and then
+    # telling the analyst to retry. 0 refuses immediately when the slot is
+    # taken.
+    export_scan_queue_wait_seconds: float = Field(default=30.0, ge=0)
     # Max entries in the process-local baseline-compare layer cache
     # (db/viz_cache.py, M24c) — memoizes the unfiltered baseline layer of
     # Visualize compare renders so it isn't a full-timeline re-scan on every

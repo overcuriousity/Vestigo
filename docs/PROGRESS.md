@@ -1,6 +1,64 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-25 (session 186 — the ClickHouse OOM, root-caused).
+Last updated: 2026-08-25 (session 187 — PR #299 review fixes).
+
+## Session 187 — 2026-08-25: PR #299 review — the scan-budget half
+
+The value-inventory export (#295) itself came through review clean. Everything below
+is the scan-budget refactor that shipped alongside it, plus one concurrency hole in
+the new export gate.
+
+**The budget and the gate had drifted apart.** Session 186 moved the per-query budget
+to query-build time so the ClickHouse probe could reach it. `HEAVY_SCAN_GATE` stayed
+sized at import — it has to be, it is imported by value — so the divisor followed the
+live setting while the semaphore did not. An admin lowering "Concurrent heavy scans"
+from 4 to 2 in the console would double every query's `max_memory_usage` while the
+gate kept admitting 4: twice the total budget, i.e. the exact OOM the pair exists to
+prevent. `restart_required=True` on the spec is advisory text, not enforcement. Both
+halves now read one frozen `_GATE_CONCURRENCY`, and `/api/health` discloses a pending
+value waiting for a restart.
+
+**An "unbounded" ceiling was still believed outright.** `resolve_clickhouse_ceiling`
+classifies a ceiling ClickHouse merely derived (0.9 x RAM a limit-less container does
+not own) as `bounded=False` — and the budget used it anyway. App in a 4 GiB container
+against an unlimited ClickHouse on a 64 GiB host went from 1.6 GiB per query to ~23,
+on the strength of a number the module had just called a guess. `scan_memory_ceiling()`
+now caps an unbounded ceiling by local detection: two guesses, take the lower. An
+explicit `max_server_memory_usage` is a decision and still stands as written — but it
+is now clamped by `max_server_memory_usage_to_ram_ratio` exactly as the server clamps
+it, which the reference stack needed: 10 GiB pinned against `mem_limit: 12g` and a 0.8
+ratio is really 9.6, and the probe reported the optimistic number. `memory.xml` now
+pins 9.5 GiB so the file says what it means.
+
+**The export gate could stall the app.** `EXPORT_SCAN_GATE` is one slot held for the
+whole client-paced drain, and it was acquired with an untimed blocking `acquire()`
+inside the generator — which Starlette runs on an anyio worker thread. One analyst
+backgrounding a large download blocked every other inventory export in the process,
+each queued one parked on a thread from the pool every `run_in_threadpool` query also
+needs. The slot is now taken by the endpoint *before* the response begins, bounded by
+`VESTIGO_EXPORT_SCAN_QUEUE_WAIT_SECONDS` (default 30), and a wait that runs out is a
+clean 503 rather than a truncated 200. Acquiring it after the headers are gone could
+never have been anything else. The start-of-export audit row moved below the
+acquisition while we were in there: a refused request produced no file, and a row
+saying an export ran is the kind of claim this trail exists not to make.
+
+**The merge wait was waiting on other people's merges.** `_await_merges` polled
+`system.merges` for *any* merge on `events`, holding the admission slot, for up to 300
+seconds. An instance with concurrent ingest always has one in flight, so it burned the
+full five minutes every apply and stalled every detector sweep behind it. It now polls
+the partition ids the apply actually staged, read off the scratch table before the
+swap — no parts staged, no wait.
+
+**One pre-existing test bug, found on the way.** `tests/test_scan_budget.py`'s
+local-detection tests read module state that startup recovery writes once, so any
+earlier test booting the app left the dev ClickHouse's real ceiling behind and three
+tests failed by *ordering* — on `main` too, not from this work. An autouse fixture now
+starts each of them from "the probe has not run".
+
+**Two small ones.** `/api/health` re-detected local memory on the event loop on every
+poll (three blocking reads); it runs in the threadpool now. And the export dialog's
+field picker rendered neither the loading nor the error state of `viz/fields`, so a
+failed request read as an empty list with a permanently disabled Download button.
 
 ## Session 186 — 2026-08-25: nothing was bounding ClickHouse
 

@@ -9,11 +9,29 @@ that many detector scans run at once.
 
 from __future__ import annotations
 
+import pytest
+
 from vestigo.db import _scan
 from vestigo.db._scan import (
     _FALLBACK_MAX_MEMORY_BYTES,
     _resolve_scan_memory_budget,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_probed_ceiling():
+    """Start every test from "the probe has not run".
+
+    The ceiling lives in module state that startup recovery writes once, so any
+    earlier test that boots the app leaves the *dev* ClickHouse's real ceiling
+    behind — and the local-detection tests below then measure that instead of
+    the memory they mocked. Ordering-dependent, which is the worst way to find
+    out.
+    """
+    ceiling, bounded = _scan._clickhouse_ceiling, _scan._clickhouse_bounded
+    _scan.configure_scan_budget(None, bounded=False)
+    yield
+    _scan.configure_scan_budget(ceiling, bounded=bounded)
 
 
 def test_explicit_value_pins_the_budget():
@@ -145,6 +163,12 @@ def test_enrichment_partition_rewrite_takes_a_gate_slot():
 
         def query(self, sql, parameters=None):
             assert seen == ["acquired"], "rewrite ran outside the gate"
+            if "system." in sql:
+
+                class _Empty:
+                    result_rows = []
+
+                return _Empty()
             assert "min_insert_block_size_bytes" in sql
             # Left at ClickHouse's default (0 = single-threaded INSERT SELECT):
             # every insert thread carries its own squashing buffer, so raising
@@ -185,6 +209,11 @@ def test_apply_insert_block_size_is_read_per_call():
 
         def query(self, sql, parameters=None):
             sql_seen.append(sql)
+
+            class _Empty:
+                result_rows = []
+
+            return _Empty()
 
     store = ClickHouseStore.__new__(ClickHouseStore)
     store.client = _Client()
@@ -349,12 +378,23 @@ def _apply_store(merge_counts):
         def query(self, sql, parameters=None):
             seen.append(sql)
             if "system.merges" in sql:
+                # The poll must name the partitions the apply just wrote, not
+                # the whole table — an unscoped one waits out merges caused by
+                # unrelated ingest, holding the admission slot the whole time.
+                assert "partition_id IN" in sql
+                assert parameters["pids"] == ["pid-1"]
                 value = merge_counts.pop(0) if merge_counts else 0
 
                 class _R:
                     result_rows = [(value,)]
 
                 return _R()
+            if "system.parts" in sql:
+
+                class _P:
+                    result_rows = [("pid-1",)]
+
+                return _P()
 
             class _Empty:
                 result_rows = []
@@ -410,5 +450,114 @@ def test_merge_wait_can_be_switched_off():
         store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
     finally:
         set_runtime_overrides({})
+
+    assert not [sql for sql in seen if "system.merges" in sql]
+
+
+# ── The two halves of one budget, and one ceiling that is not a decision ────
+
+
+def test_explicit_server_ceiling_is_clamped_by_the_ratio():
+    """`max_server_memory_usage` above (ratio x RAM) is not what the server adopts.
+
+    ClickHouse takes the *lower* of the two and logs a "lowered to" line. The
+    reference stack pins 10 GiB against a 12 GiB container limit and a 0.8
+    ratio, so reporting the pinned number would size the budget — and the
+    `over_budget` check — against a ceiling ~4% above the real one.
+    """
+    ceiling, bounded = _scan.resolve_clickhouse_ceiling(
+        {
+            "max_server_memory_usage": 10 << 30,
+            "max_server_memory_usage_to_ram_ratio": 0.8,
+            "cgroup_memory_total": 12 << 30,
+            "os_memory_total": 64 << 30,
+        }
+    )
+
+    assert ceiling == int((12 << 30) * 0.8)
+    assert bounded is True, "an operator still set it; it is a decision, not a guess"
+
+
+def test_unbounded_server_ceiling_is_capped_by_local_detection(monkeypatch):
+    """A ceiling ClickHouse only derived must not out-vote the app's own limit.
+
+    App in a 4 GiB container, ClickHouse unlimited on a 64 GiB host: the probe
+    reports 0.9 x 64 GiB, which `resolve_clickhouse_ceiling` has already
+    classified as "unbounded". Believing it authorizes ~23 GiB to a single
+    query. Two guesses, so the lower one wins.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", int((64 << 30) * 0.9))
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", False)
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 4 << 30)
+
+    assert _scan.scan_memory_ceiling() == 4 << 30
+
+
+def test_bounded_server_ceiling_beats_local_detection(monkeypatch):
+    """A ceiling an operator set describes the machine the queries run on.
+
+    It is used even when it is *larger* than what the app's own container sees
+    — that is the whole point of asking ClickHouse instead of guessing.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", 28 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", True)
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 4 << 30)
+
+    assert _scan.scan_memory_ceiling() == 28 << 30
+
+
+def test_budget_divides_by_the_gate_size_not_the_live_setting():
+    """A live `stat_scan_concurrency` edit must not move the divisor alone.
+
+    `HEAVY_SCAN_GATE` is sized at import and imported by value, so an admin
+    console edit cannot resize it — but it *does* reach `get_settings()`
+    immediately. Dividing by the live value would let a 2 -> 4 edit halve every
+    query's cap while the gate still admitted 2, and a 4 -> 2 edit double it
+    while the gate still admitted 4: twice the total budget ClickHouse was
+    sized for, which is the OOM this pair exists to prevent.
+    """
+    before = _scan.detect_scan_memory_budget()
+    pending = _scan._GATE_CONCURRENCY + 2
+    # Patched rather than set through `set_runtime_overrides`: a repository
+    # `.env` pins this variable, and an environment value always beats the
+    # runtime-override layer — which is the same reason `_report_with` injects
+    # its budget directly.
+    edited = _scan.get_settings().model_copy(update={"stat_scan_concurrency": pending})
+    original = _scan.get_settings
+    _scan.get_settings = lambda: edited
+    try:
+        assert _scan.get_settings().stat_scan_concurrency == pending, "the edit did land"
+        assert _scan.detect_scan_memory_budget() == before
+        report = _scan.scan_budget_report()
+    finally:
+        _scan.get_settings = original
+
+    assert report["concurrency"] == _scan._GATE_CONCURRENCY
+    assert report["pending_concurrency"] == pending, "the waiting value is disclosed"
+    assert report["total_bytes"] == before * _scan._GATE_CONCURRENCY
+
+
+def test_merge_wait_is_skipped_when_the_apply_wrote_no_parts():
+    """No staged parts means no merges of ours to wait for.
+
+    The scratch table's partition ids are how the wait is scoped; an empty
+    answer must skip the wait rather than fall back to polling the whole table,
+    which is the unscoped behaviour this replaces.
+    """
+    store, seen = _apply_store([9, 9, 9])
+
+    class _NoParts:
+        result_rows = []
+
+    original = store.client.query
+
+    def query(sql, parameters=None):
+        if "system.parts" in sql:
+            seen.append(sql)
+            return _NoParts()
+        return original(sql, parameters=parameters)
+
+    store.client.query = query
+    store.finalize_enrichment_apply("c1", "s1", "job1", ["geo_country"])
 
     assert not [sql for sql in seen if "system.merges" in sql]

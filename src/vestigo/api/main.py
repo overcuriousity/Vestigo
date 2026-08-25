@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -800,7 +801,10 @@ def create_app() -> FastAPI:
         # warning is exactly what nobody reads. Serving it makes the answer
         # reachable at any time. Authenticated-only: it describes the host's
         # memory layout.
-        body["scan_budget"] = scan_budget_report()
+        # Off the event loop: the report re-detects local memory, which is
+        # three blocking reads (`/sys/fs/cgroup/memory.max`, `/proc/meminfo`,
+        # `os.sysconf`), and this is the app's most frequently polled route.
+        body["scan_budget"] = await run_in_threadpool(scan_budget_report)
         return body
 
     app.include_router(auth.router)

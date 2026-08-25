@@ -30,6 +30,7 @@ from vestigo.api.deps import (
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
+from vestigo.db._scan import EXPORT_SCAN_GATE
 from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS
 from vestigo.db.anomaly_stats import (
     AnalysisWindows,
@@ -1714,6 +1715,47 @@ def _resolve_inventory_columns(columns: list[str], order_by: str) -> list[str]:
     return list(columns)
 
 
+def _acquire_export_slot(wait: float) -> bool:
+    """Take the single streamed-export slot, waiting at most *wait* seconds."""
+    if wait <= 0:
+        return EXPORT_SCAN_GATE.acquire(blocking=False)
+    return EXPORT_SCAN_GATE.acquire(timeout=wait)
+
+
+async def _audit_inventory_export(
+    store,
+    user: User,
+    case_id: str,
+    timeline_id: str,
+    body: FieldInventoryRequest,
+    columns: list[str],
+    expected: int,
+    source_offsets: dict[str, int] | None,
+) -> None:
+    """Record that this export started, with everything that shaped the file.
+
+    Written after the streamed-export slot is taken, not before: a request
+    refused with 503 produced no file, and an audit row saying an export ran is
+    exactly the kind of claim this trail exists not to make.
+    """
+    await store.record_audit(
+        action="events.export.field_inventory",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "field": body.field,
+            "columns": columns,
+            "separator": body.separator,
+            "order_by": body.order_by,
+            "expected": expected,
+            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            **({"applied_time_offsets": source_offsets} if source_offsets else {}),
+        },
+    )
+
+
 def _stream_field_inventory(
     query: EventQuery,
     field_token: str,
@@ -1733,34 +1775,47 @@ def _stream_field_inventory(
     distinct value the pre-flight counted. A value seen only on undated events
     writes empty time cells rather than the storage sentinel.
     """
-    buf = io.StringIO()
-    if applied_offsets:
-        yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
-    writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
-    writer.writerow(columns)
-    yield buf.getvalue()
-
-    written = 0
-    for row in _get_query_service().iter_field_inventory(query, field_token, order_by=order_by):
-        buf.seek(0)
-        buf.truncate()
-        writer.writerow(["" if row.get(c) is None else row[c] for c in columns])
+    try:
+        buf = io.StringIO()
+        if applied_offsets:
+            yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
+        writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
+        writer.writerow(columns)
         yield buf.getvalue()
-        written += 1
 
-    complete = written == expected
-    tally["written"] = written
-    tally["complete"] = complete
-    yield f"# vestigo_export complete={str(complete).lower()} rows={written} expected={expected}\n"
-    if not complete:
-        _logger.error(
-            "field inventory export incomplete: expected=%s written=%s case=%s field=%s",
-            expected,
-            written,
-            query.case_id,
-            field_token,
+        written = 0
+        rows = _get_query_service().iter_field_inventory(
+            query, field_token, order_by=order_by, hold_export_slot=False
         )
-        raise ExportIncompleteError(f"export wrote {written} of {expected} distinct values")
+        for row in rows:
+            buf.seek(0)
+            buf.truncate()
+            writer.writerow(["" if row.get(c) is None else row[c] for c in columns])
+            yield buf.getvalue()
+            written += 1
+
+        complete = written == expected
+        tally["written"] = written
+        tally["complete"] = complete
+        yield (
+            f"# vestigo_export complete={str(complete).lower()} "
+            f"rows={written} expected={expected}\n"
+        )
+        if not complete:
+            _logger.error(
+                "field inventory export incomplete: expected=%s written=%s case=%s field=%s",
+                expected,
+                written,
+                query.case_id,
+                field_token,
+            )
+            raise ExportIncompleteError(f"export wrote {written} of {expected} distinct values")
+    finally:
+        # The slot was taken by the endpoint, before a byte was sent, so a busy
+        # server could still answer 503 (see `export_field_inventory`). This is
+        # the matching release, and it must run on every exit — including the
+        # `close()` Starlette calls when the analyst cancels the download.
+        EXPORT_SCAN_GATE.release()
 
 
 @router.post("/{case_id}/timelines/{timeline_id}/export/field-inventory")
@@ -1800,23 +1855,31 @@ async def export_field_inventory(
     delimiter = _INVENTORY_SEPARATORS[body.separator]
     ext = "tsv" if body.separator == "tab" else "csv"
 
+    # The one streamed-export slot is taken *here*, not inside the generator,
+    # and that placement is the whole point: it is held for the entire drain,
+    # which the analyst's browser paces, so a queued export can wait on it for
+    # as long as someone leaves a download backgrounded. Once the generator has
+    # started, the status code is already sent and the only way to report a
+    # busy server is a truncated 200. Taken before the response instead, a wait
+    # that runs out is a clean 503 — and the wait is bounded, because the
+    # generator runs on an anyio worker thread the rest of the app shares.
+    wait = get_settings().export_scan_queue_wait_seconds
+    if not await run_in_threadpool(_acquire_export_slot, wait):
+        raise HTTPException(
+            status_code=503,
+            detail="another value-inventory export is still streaming; try again shortly",
+            headers={"Retry-After": str(max(int(wait), 1))},
+        )
+
     store = get_store()
-    await store.record_audit(
-        action="events.export.field_inventory",
-        actor=user,
-        case_id=case_id,
-        target_type="timeline",
-        target_id=timeline_id,
-        detail={
-            "field": body.field,
-            "columns": columns,
-            "separator": body.separator,
-            "order_by": body.order_by,
-            "expected": expected,
-            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
-            **({"applied_time_offsets": source_offsets} if source_offsets else {}),
-        },
-    )
+    try:
+        await _audit_inventory_export(
+            store, user, case_id, timeline_id, body, columns, expected, source_offsets
+        )
+    except BaseException:
+        # Nothing will drain the stream, so nothing will release the slot.
+        EXPORT_SCAN_GATE.release()
+        raise
 
     async def _audit_completeness() -> None:
         await store.record_audit(

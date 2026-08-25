@@ -99,12 +99,24 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   three other services (`docs/DEPLOYMENT.md` §"How this went unnoticed"). The
   clause is therefore built per query by `heavy_scan_settings()`, not frozen at
   import — import is the one moment the app cannot ask ClickHouse anything.
+  Two qualifications keep that derivation honest. A ceiling ClickHouse only
+  *derived* (no `max_server_memory_usage`, no container limit — 0.9 x a host it
+  does not own) is capped by the app's own local detection: two guesses, take
+  the lower. And an explicit `max_server_memory_usage` is clamped by
+  `max_server_memory_usage_to_ram_ratio` exactly as the server clamps it, so a
+  pinned value the server silently lowered cannot make the budget optimistic.
 - **`HEAVY_SCAN_GATE` admission control on every `find_*` detector**: at most
   `VESTIGO_STAT_SCAN_CONCURRENCY` (2) heavy scans run against ClickHouse at once;
   surplus scans queue in the app. `max_memory_usage` is per *query* — without
   the gate, N parallel detector requests (one anomaly-panel load fires
   several) each carry a full cap and stack past the ClickHouse host's RAM;
   a correctly-pinned 8 GiB cap OOM-killed a 12 GiB host exactly this way.
+  The gate's size and the per-query divisor are the same frozen number
+  (`db/_scan.py::_GATE_CONCURRENCY`), read at import: the semaphore is imported
+  by value and cannot be resized live, so a divisor that followed the live
+  setting would let one console edit authorize twice the total budget the gate
+  admits. `/api/health` reports the value in force and any edit awaiting a
+  restart.
   Nested helpers (`recommend_*`, `*_inventory`) are not gated — gated scans
   call them while holding the slot.
 - **`EXPORT_SCAN_GATE` for the one scan that streams to a browser**: the value
@@ -114,15 +126,22 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   `HEAVY_SCAN_GATE` for the aggregation and hands that slot back at the first
   block — a sorted aggregate cannot emit a row until every group exists, so the
   first block proves the scan is over — then holds `EXPORT_SCAN_GATE` (one
-  slot, not configurable) for the drain. Without the handoff, one backgrounded
-  download starves every detector on the box for as long as it sits there; with
-  a second gate, two exports queue instead of stacking two live result streams
-  against the same memory budget.
+  slot; the count is not configurable) for the drain. Without the handoff, one
+  backgrounded download starves every detector on the box for as long as it sits
+  there; with a second gate, two exports queue instead of stacking two live
+  result streams against the same memory budget. The *wait* for that slot is
+  bounded (`VESTIGO_EXPORT_SCAN_QUEUE_WAIT_SECONDS`, default 30) and taken by
+  the endpoint before a byte is sent, so a queued export is refused with 503
+  rather than parked on a shared worker thread for as long as someone leaves a
+  download backgrounded.
   **The gate is not detector-only.** `ClickHouseStore.finalize_enrichment_apply`
   takes a slot for the whole enrichment partition rewrite (scratch build,
   `INSERT ... SELECT` over the source's partition, and the `REPLACE PARTITION`
   swap — the swap included, because it queues merges on freshly written parts
-  and merge memory was never covered by the per-query cap). Ungated, that
+  and merge memory was never covered by the per-query cap; that wait is scoped
+  to the partition ids the apply staged, since an instance with concurrent
+  ingest always has *some* merge in flight and an unscoped poll would hold the
+  slot for the full timeout every time). Ungated, that
   rewrite stacked on top of a full set of admitted detector scans and
   OOM-killed clickhouse-server on a 32 GiB full-docker host mid-apply. Its
   write side is bounded separately by `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`,

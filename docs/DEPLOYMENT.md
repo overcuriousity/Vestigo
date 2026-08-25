@@ -259,7 +259,10 @@ healthy service.
    RAM" is the whole host, which the server neither owns nor is alone on. Either way
    it never self-throttles. Pinning does not disable the ratio: the effective ceiling
    is the *lower* of the two, and ClickHouse logs a "lowered to" line when it clamps,
-   so confirm the adopted value in the server log.
+   so confirm the adopted value in the server log. Vestigo applies that same clamp
+   when it reads the server's settings back, so `scan_budget` below reports the
+   effective ceiling rather than the pinned one — but keep the pinned value under
+   (ratio × `mem_limit`) anyway, so the file says what it means.
 
    This is also **the only ceiling that bounds background merges**, which no
    per-query cap can reach — which makes it the layer that matters after an
@@ -287,8 +290,9 @@ services are resident. The app now says so, loudly, at startup and in
 
 ```json
 {"risk": "ok", "per_query_bytes": 8589934592, "total_bytes": 17179869184,
- "clickhouse_ceiling_bytes": 30064771072, "clickhouse_ceiling_is_explicit": true,
- "source": "clickhouse", "concurrency": 2}
+ "clickhouse_ceiling_bytes": 28991029248, "clickhouse_ceiling_is_explicit": true,
+ "budget_ceiling_bytes": 28991029248, "local_detected_bytes": 68719476736,
+ "source": "clickhouse", "concurrency": 2, "pending_concurrency": null}
 ```
 
 `risk` is what to act on:
@@ -298,7 +302,15 @@ services are resident. The app now says so, loudly, at startup and in
   Lower `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` or raise `max_server_memory_usage`.
 - `unbounded` — ClickHouse reports no ceiling an operator set. Nothing bounds its
   merges, caches or allocator slack, and the kernel is the only backstop. Mount
-  `memory.xml` and set a container limit.
+  `memory.xml` and set a container limit. The budget still uses that derived ceiling,
+  but capped by what the *app's* own container can see — two guesses, so the lower
+  one — which is what `budget_ceiling_bytes` reports when it differs from
+  `clickhouse_ceiling_bytes`.
+
+`concurrency` is the size the admission gate was built with at startup, which is also
+the number the budget is divided by. Change `VESTIGO_STAT_SCAN_CONCURRENCY` and
+`pending_concurrency` names the value waiting for a restart; until then both halves
+keep using the old one, so the total budget never exceeds what the gate admits.
 
 Heavy scans are admission-controlled (`VESTIGO_STAT_SCAN_CONCURRENCY`, default 2),
 and the enrichment partition rewrite takes a slot too — so the worst case is
@@ -312,9 +324,9 @@ ClickHouse has a `max_server_memory_usage`, which bounds merges directly).
 | Setting | Value | Where |
 | --- | --- | --- |
 | ClickHouse container limit | 12 GiB | `mem_limit: 12g` |
-| ClickHouse server limit | 10 GiB | `deploy/clickhouse/memory.xml` |
-| Vestigo scan budget (total) | 8 GiB | auto: 0.8 × 10 GiB |
-| → per-query cap | 4 GiB | budget ÷ concurrency (2) |
+| ClickHouse server limit | 9.5 GiB | `deploy/clickhouse/memory.xml` (under 0.8 × 12 GiB) |
+| Vestigo scan budget (total) | 7.6 GiB | auto: 0.8 × 9.5 GiB |
+| → per-query cap | 3.8 GiB | budget ÷ concurrency (2) |
 | Postgres | 4 GiB | `mem_limit: 4g` |
 | Qdrant | 4 GiB | `mem_limit: 4g` (only with embeddings) |
 | App | 4 GiB | `mem_limit: 4g` |
@@ -328,7 +340,7 @@ scanning from RAM and scanning from disk.
 | Setting | Value | Where |
 | --- | --- | --- |
 | ClickHouse container limit | 34 GiB | `VESTIGO_CLICKHOUSE_MEM_LIMIT=34g` |
-| ClickHouse server limit | 28 GiB | `max_server_memory_usage` in `memory.xml` |
+| ClickHouse server limit | 27 GiB | `max_server_memory_usage` in `memory.xml` (under 0.8 × 34 GiB) |
 | Vestigo scan budget (total) | 16 GiB | `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES=17179869184` |
 | → per-query cap | 8 GiB | budget ÷ concurrency (2) |
 | Spill thresholds | 4 GB | `..._EXTERNAL_GROUP_BY_BYTES` / `..._EXTERNAL_SORT_BYTES` |

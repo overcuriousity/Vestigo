@@ -10,6 +10,8 @@ download rather than hand over a silently short inventory.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
@@ -259,3 +261,109 @@ async def test_export_is_audited(patched_store, monkeypatch):
     actions = [a.action for a in await patched_store.query_audit(case_id="c1")]
     assert "events.export.field_inventory" in actions
     assert "events.export.field_inventory.result" in actions
+
+
+# ── The single streamed-export slot ─────────────────────────────────────────
+
+
+@pytest.fixture()
+def export_gate(monkeypatch):
+    """A one-slot stand-in bound where the endpoint reads it.
+
+    `db/_scan.py` is imported by value into the router, so patching the
+    module's own attribute would not reach the running code.
+    """
+    gate = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(events, "EXPORT_SCAN_GATE", gate)
+    return gate
+
+
+def _free(gate) -> bool:
+    if not gate.acquire(blocking=False):
+        return False
+    gate.release()
+    return True
+
+
+@pytest.mark.asyncio
+async def test_a_completed_export_hands_the_slot_back(patched_store, monkeypatch, export_gate):
+    await _export(patched_store, monkeypatch, _FakeInventoryService(2), _request())
+
+    assert _free(export_gate)
+
+
+@pytest.mark.asyncio
+async def test_a_busy_slot_is_refused_before_a_byte_is_sent(
+    patched_store, monkeypatch, export_gate
+):
+    """A queued export must fail as a status code, not as a truncated file.
+
+    The slot is held for the whole client-paced drain, so an analyst who
+    backgrounds a large download holds it for as long as they like. Waiting on
+    it inside the generator would mean waiting after the headers are already
+    gone; taken up front, a wait that runs out is a clean 503 — and bounded,
+    because the drain occupies an anyio worker thread the rest of the app
+    shares.
+    """
+    from vestigo.core.config import set_runtime_overrides
+
+    await _seed_export_timeline(patched_store)
+    monkeypatch.setattr(events, "_get_query_service", lambda: _FakeInventoryService(2))
+    assert export_gate.acquire(blocking=False), "somebody else is exporting"
+
+    try:
+        set_runtime_overrides({"export_scan_queue_wait_seconds": 0})
+        with pytest.raises(HTTPException) as excinfo:
+            await events.export_field_inventory(
+                "c1", "t1", _request(), case=Case(id="c1"), user=_fake_user()
+            )
+    finally:
+        set_runtime_overrides({})
+        export_gate.release()
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.headers["Retry-After"]
+    assert _free(export_gate), "a refusal must not consume the slot it could not take"
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_export_hands_the_slot_back(patched_store, monkeypatch, export_gate):
+    """Starlette closes the generator when the analyst cancels the download.
+
+    That unwinds the `finally`, and it has to, or the one slot every other
+    export queues behind stays taken for the life of the process.
+    """
+    await _seed_export_timeline(patched_store)
+    monkeypatch.setattr(events, "_get_query_service", lambda: _FakeInventoryService(2))
+    resp = await events.export_field_inventory(
+        "c1", "t1", _request(), case=Case(id="c1"), user=_fake_user()
+    )
+    assert not _free(export_gate), "held for the drain"
+
+    await resp.body_iterator.__anext__()
+    await resp.body_iterator.aclose()
+
+    assert _free(export_gate)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_export_records_no_audit_row(patched_store, monkeypatch, export_gate):
+    """A 503 produced no file, so the trail must not say an export ran."""
+    from vestigo.core.config import set_runtime_overrides
+
+    await _seed_export_timeline(patched_store)
+    monkeypatch.setattr(events, "_get_query_service", lambda: _FakeInventoryService(2))
+    assert export_gate.acquire(blocking=False)
+
+    try:
+        set_runtime_overrides({"export_scan_queue_wait_seconds": 0})
+        with pytest.raises(HTTPException):
+            await events.export_field_inventory(
+                "c1", "t1", _request(), case=Case(id="c1"), user=_fake_user()
+            )
+    finally:
+        set_runtime_overrides({})
+        export_gate.release()
+
+    rows = await patched_store.query_audit(case_id="c1")
+    assert not [r for r in rows if r.action.startswith("events.export.field_inventory")]
