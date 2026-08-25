@@ -427,6 +427,7 @@ async def _probe_scan_budget() -> None:
     """
     from vestigo.db._scan import (
         configure_scan_budget,
+        configure_scan_threads,
         resolve_cache_bytes,
         resolve_clickhouse_ceiling,
         scan_budget_report,
@@ -437,6 +438,7 @@ async def _probe_scan_budget() -> None:
     ceiling, bounded = resolve_clickhouse_ceiling(facts)
     cache_bytes, cache_breakdown = resolve_cache_bytes(facts)
     configure_scan_budget(ceiling, bounded, cache_bytes, cache_breakdown)
+    configure_scan_threads(int(facts.get("resolved_max_threads", 0) or 0) or None)
     report = scan_budget_report()
     if report["risk"] == "unbounded":
         logger.warning(
@@ -467,11 +469,14 @@ async def _probe_scan_budget() -> None:
     else:
         logger.info(
             "Heavy-scan budget: %.1f GiB total (%.1f GiB per query x %d) under ClickHouse's "
-            "%.1f GiB ceiling.",
+            "%.1f GiB ceiling, with %.1f GiB of server caches counted; %d threads per scan (%s).",
             report["total_bytes"] / (1 << 30),
             report["per_query_bytes"] / (1 << 30),
             report["concurrency"],
             report["clickhouse_ceiling_bytes"] / (1 << 30),
+            report["cache_bytes"] / (1 << 30),
+            report["max_threads"],
+            report["max_threads_source"],
         )
 
 

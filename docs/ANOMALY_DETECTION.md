@@ -79,7 +79,11 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   ranking are hydrated afterwards in one batched `get_events_by_ids` call
   (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
   event vanished mid-flight keeps a minimal `_stub_event` shape.
-- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
+- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads` auto-derived as
+  cores ÷ `VESTIGO_STAT_SCAN_CONCURRENCY` from the core count ClickHouse reports for
+  itself — `system.settings.max_threads`, which resolves `auto(N)` cgroup-quota-aware;
+  pin it with `VESTIGO_STAT_SCAN_MAX_THREADS`, and detection failure falls back to the
+  former constant 8,
   spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
   per-query cap), `max_memory_usage` = total budget / concurrency — the
   budget auto-sizes to `VESTIGO_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,

@@ -4,7 +4,9 @@ Single home for the SETTINGS clause every whole-corpus scan (GROUP BY over up
 to hundreds of millions of rows) must carry: spill large aggregation states to
 disk instead of ballooning RAM, cap the query's memory hard (fail one query,
 not the server), and bound thread fan-out so several concurrent scans don't
-oversubscribe the box. The limits are ``VESTIGO_*`` tunables (see
+oversubscribe the box (``VESTIGO_STAT_SCAN_MAX_THREADS`` at its 0 default derives
+that width from the cores ClickHouse reports for itself, divided by the gate's
+size — see :func:`detect_scan_max_threads`). The limits are ``VESTIGO_*`` tunables (see
 ``core/config.py``).
 
 The memory budget is a **total across concurrent scans**, resolved from
@@ -74,6 +76,11 @@ from vestigo.core.config import get_settings
 # Used when detection is explicitly disabled nowhere but fails (exotic
 # platforms) — the pre-auto-detection default from the session-27 incident.
 _FALLBACK_MAX_MEMORY_BYTES = 12_000_000_000
+
+# What `stat_scan_max_threads` was before it became auto-sized. Kept as the
+# detection fallback for the same reason the memory fallback exists: an exotic
+# platform, or a server that will not answer, must still start.
+_FALLBACK_MAX_THREADS = 8
 
 
 def _cgroup_memory_limit() -> int | None:
@@ -202,6 +209,39 @@ _COUNTED_CACHES = (
     "index_uncompressed_cache_size",
     "primary_index_cache_size",
 )
+
+
+#: Cores ClickHouse resolved for itself (``system.settings.max_threads``,
+#: cgroup-quota aware), or ``None`` until the probe runs.
+_clickhouse_cores: int | None = None
+
+
+def configure_scan_threads(resolved_cores: int | None) -> None:
+    """Record the core count ClickHouse reported, for the auto thread width."""
+    global _clickhouse_cores  # noqa: PLW0603
+    _clickhouse_cores = int(resolved_cores) if resolved_cores and resolved_cores > 0 else None
+
+
+def detect_scan_max_threads() -> int:
+    """``max_threads`` for heavy scans: explicit, else an even share of the cores.
+
+    ``VESTIGO_STAT_SCAN_MAX_THREADS`` at 0 means auto, spelled the same way
+    ``VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`` already spells it. Auto is
+    ``cores // _GATE_CONCURRENCY``: the gate admits that many scans at once, so
+    an even share is the width at which a *full* gate exactly saturates the box.
+    The old constant 8 was wrong in both directions — 40% of a 20-core host, and
+    4x oversubscription on a 4-core one (issue #301).
+
+    Floored at 2, because a whole-corpus GROUP BY running single-threaded is not
+    a fallback anybody wants to land on silently, and capped at the core count
+    for the degenerate case of a gate wider than the machine.
+    """
+    explicit = get_settings().stat_scan_max_threads
+    if explicit > 0:
+        return explicit
+    if not _clickhouse_cores:
+        return _FALLBACK_MAX_THREADS
+    return max(2, min(_clickhouse_cores, _clickhouse_cores // max(_GATE_CONCURRENCY, 1)))
 
 
 def resolve_cache_bytes(facts: Mapping[str, float]) -> tuple[int, dict[str, int]]:
@@ -420,6 +460,16 @@ def scan_budget_report() -> dict[str, Any]:
         "pending_concurrency": (
             s.stat_scan_concurrency if s.stat_scan_concurrency != _GATE_CONCURRENCY else None
         ),
+        # Thread width and its provenance. A wrong width has no symptom except
+        # "everything is slow", which is the same reason the memory resolution
+        # is reported here rather than left to be inferred from a failure.
+        "max_threads": detect_scan_max_threads(),
+        "max_threads_source": (
+            "pinned"
+            if s.stat_scan_max_threads > 0
+            else ("clickhouse" if _clickhouse_cores else "fallback")
+        ),
+        "detected_cores": _clickhouse_cores,
     }
 
 
@@ -437,7 +487,7 @@ def heavy_scan_settings() -> str:
     group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
     sort_spill = min(s.stat_scan_external_sort_bytes, budget // 2)
     return (
-        f"SETTINGS max_threads = {s.stat_scan_max_threads}, "
+        f"SETTINGS max_threads = {detect_scan_max_threads()}, "
         f"max_bytes_before_external_group_by = {group_by_spill}, "
         # Plain ORDER BY sorts spill at this threshold. Window-function sorts
         # cannot spill at all (see docs/ANOMALY_DETECTION.md) — bound those

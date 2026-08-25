@@ -201,7 +201,12 @@ class Settings(BaseSettings):
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.
-    stat_scan_max_threads: int = 8
+    # 0 = auto: an even share of the cores ClickHouse reports for itself
+    # (cores / concurrency, floor 2), read from the server at startup. A
+    # nonzero value pins it, exactly as stat_scan_max_memory_bytes pins the
+    # budget. It was the constant 8, which is 40% of a 20-core host and 4x
+    # oversubscription of a 4-core one.
+    stat_scan_max_threads: int = 0
     stat_scan_external_group_by_bytes: int = 4_000_000_000
     # Spill threshold for plain ORDER BY sorts. Window-function sorts cannot
     # spill (ClickHouse limitation, docs/ANOMALY_DETECTION.md) — those scans

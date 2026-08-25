@@ -654,3 +654,68 @@ def test_report_is_ok_when_scans_and_caches_both_fit(monkeypatch):
 
     assert report["risk"] == "ok"
     assert report["headroom_bytes"] == (16 << 30) - (8 << 30) - (4 << 30)
+
+
+# ── Thread width follows the cores ClickHouse actually has ──────────────────
+
+
+def _settings_with(monkeypatch, **overrides):
+    """`get_settings()` patched for one test.
+
+    Patched rather than set through `set_runtime_overrides`, for the same reason
+    `_report_with` injects its budget directly: a repository `.env` pins these
+    variables, and an environment value always beats the runtime-override layer.
+    """
+    edited = _scan.get_settings().model_copy(update=overrides)
+    monkeypatch.setattr(_scan, "get_settings", lambda: edited)
+
+
+def test_auto_thread_width_is_an_even_share_of_the_cores(monkeypatch):
+    """The gate admits `_GATE_CONCURRENCY` scans at once, so an even share is
+    the width at which a full gate saturates the box instead of oversubscribing
+    it. 8 was a constant: 40% of a 20-core host, and 4x oversubscription on 4.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 2)
+    _settings_with(monkeypatch, stat_scan_max_threads=0)
+
+    assert _scan.detect_scan_max_threads() == 10
+
+
+def test_auto_thread_width_never_drops_below_two(monkeypatch):
+    """A single-threaded whole-corpus scan is not a useful floor to land on."""
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 2)
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 4)
+    _settings_with(monkeypatch, stat_scan_max_threads=0)
+
+    assert _scan.detect_scan_max_threads() == 2
+
+
+def test_explicit_thread_width_still_wins(monkeypatch):
+    """VESTIGO_STAT_SCAN_MAX_THREADS is a decision, exactly like a pinned budget."""
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    _settings_with(monkeypatch, stat_scan_max_threads=6)
+
+    assert _scan.detect_scan_max_threads() == 6
+    assert "max_threads = 6" in _scan.heavy_scan_settings()
+
+
+def test_thread_detection_failure_falls_back_to_the_old_constant(monkeypatch):
+    """Same posture as the memory probe: warn and carry on, never refuse."""
+    monkeypatch.setattr(_scan, "_clickhouse_cores", None)
+    _settings_with(monkeypatch, stat_scan_max_threads=0)
+
+    assert _scan.detect_scan_max_threads() == _scan._FALLBACK_MAX_THREADS == 8
+
+
+def test_report_discloses_the_thread_width_and_where_it_came_from(monkeypatch):
+    """A wrong thread width has no symptom except 'everything is slow', which is
+    the same reason the memory resolution is reported."""
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    _settings_with(monkeypatch, stat_scan_max_threads=0)
+
+    report = _scan.scan_budget_report()
+
+    assert report["detected_cores"] == 20
+    assert report["max_threads"] == _scan.detect_scan_max_threads()
+    assert report["max_threads_source"] == "clickhouse"

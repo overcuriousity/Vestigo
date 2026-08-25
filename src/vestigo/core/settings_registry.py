@@ -583,7 +583,11 @@ _SPECS: tuple[SettingSpec, ...] = (
         "stat_scan_max_threads",
         "scans",
         "Max threads per scan",
-        "ClickHouse max_threads for heavy detector/inventory scans.",
+        "ClickHouse max_threads for heavy detector/inventory scans. 0 = auto: an even share "
+        "of the cores ClickHouse reports for itself (cores / concurrent-scans, floor 2), so "
+        "a full admission gate saturates the box rather than oversubscribing it. Pin a value "
+        "only to override that. /api/health reports what resolved and whether it was "
+        "detected or pinned.",
     ),
     SettingSpec(
         "stat_scan_external_group_by_bytes",
