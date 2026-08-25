@@ -335,7 +335,11 @@ def test_form_overflow_is_translated_to_a_domain_error(service: EventQueryServic
 
 def test_other_database_errors_are_not_swallowed(service: EventQueryService) -> None:
     def boom(*args: Any, **kwargs: Any) -> Any:
-        raise DatabaseError("code: 241, memory limit exceeded")
+        # Deliberately neither of the two translated failures: `code: 241`
+        # (memory) becomes QueryMemoryExceededError and `code: 1000` /
+        # "Field value too long" becomes QueryRequestTooLargeError, both so the
+        # API can answer 413. Everything else must reach the caller unchanged.
+        raise DatabaseError("code: 62, syntax error")
 
     service.store.client.query = boom  # type: ignore[method-assign]
     with pytest.raises(DatabaseError):
@@ -2219,12 +2223,21 @@ def test_field_value_timeseries_no_values_returns_empty_series_without_bucket_qu
 class _SeqFakeClient:
     """Like _VizFakeClient, but each marker maps to a FIFO of results.
 
-    The compare_* methods run the *same query shape once per layer* (primary
-    then comparison), so a single canned result per marker cannot tell the
-    layers apart — a FIFO can.
+    A marker is a substring, or a tuple of substrings that must *all* appear.
+    The tuple form is what tells two layers of a compare_* call apart: those
+    run the same query shape once per layer, but through ``_run_parallel``, so
+    which one reaches this fake first is a thread race. Keying on a predicate
+    only the primary carries (its ``q=`` search compiles to ``ILIKE``) is
+    order-independent; a plain FIFO under one shared marker is not, and was
+    silently deciding which layer got which counts.
+
+    Order matters between entries, not within them: the first marker that
+    matches wins, so list the more specific one first.
     """
 
-    def __init__(self, responses: list[tuple[str, list[FakeQueryResult]]]) -> None:
+    def __init__(
+        self, responses: list[tuple[str | tuple[str, ...], list[FakeQueryResult]]]
+    ) -> None:
         self._responses = responses
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
 
@@ -2232,13 +2245,16 @@ class _SeqFakeClient:
         self, query: str, parameters: dict[str, Any] | None = None, **_kwargs: Any
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
-        for substr, queue in self._responses:
-            if substr in query and queue:
+        for marker, queue in self._responses:
+            needles = (marker,) if isinstance(marker, str) else marker
+            if all(needle in query for needle in needles) and queue:
                 return queue.pop(0)
         raise AssertionError(f"No fake response left for query:\n{query}")
 
 
-def _seq_service(responses: list[tuple[str, list[FakeQueryResult]]]) -> EventQueryService:
+def _seq_service(
+    responses: list[tuple[str | tuple[str, ...], list[FakeQueryResult]]],
+) -> EventQueryService:
     store = FakeClickHouseStore()
     store.client = _SeqFakeClient(responses)  # type: ignore[assignment]
     return EventQueryService(store=store)
@@ -2251,15 +2267,15 @@ def test_compare_time_histogram_shared_grid_zero_fill_and_no_range_query() -> No
     max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
     b0 = min_ts
     b1 = min_ts + timedelta(hours=1)
+    # Keyed on what makes the two layers *different*, not on which arrives
+    # first: `compare_time_histogram` runs them through `_run_parallel`, so a
+    # FIFO under one marker is decided by a thread race. Only the primary
+    # carries `q="dos"`, hence the ILIKE predicate — and it is listed first
+    # because the comparison's marker matches both queries.
     svc = _seq_service(
         [
-            (
-                "toStartOfInterval",
-                [
-                    FakeQueryResult(result_rows=[[b0, 5]]),  # primary
-                    FakeQueryResult(result_rows=[[b0, 50], [b1, 40]]),  # comparison
-                ],
-            ),
+            ("ILIKE", [FakeQueryResult(result_rows=[[b0, 5]])]),  # primary
+            ("toStartOfInterval", [FakeQueryResult(result_rows=[[b0, 50], [b1, 40]])]),
         ]
     )
     primary = EventQuery(case_id="c1", source_ids=["s1"], q="dos", start=min_ts, end=max_ts)
@@ -2383,22 +2399,18 @@ def test_compare_field_terms_empty_primary_skips_comparison_query() -> None:
 def test_compare_field_numeric_shared_edges_from_union_min_max() -> None:
     """Bin edges come from the union min/max of both layers, and both layers
     are bucketed on those identical edges."""
+    # Two query shapes x two layers. Only the primary carries `q="dos"`, which
+    # compiles to an ILIKE predicate — matching on it pins each result to its
+    # layer instead of to whichever thread got there first.
     svc = _seq_service(
         [
             (
-                "count(v), min(v), max(v)",
-                [
-                    FakeQueryResult(result_rows=[[10, 20.0, 60.0]]),  # primary
-                    FakeQueryResult(result_rows=[[100, 0.0, 100.0]]),  # comparison
-                ],
+                ("count(v), min(v), max(v)", "ILIKE"),
+                [FakeQueryResult(result_rows=[[10, 20.0, 60.0]])],
             ),
-            (
-                "greatest(0, least(",
-                [
-                    FakeQueryResult(result_rows=[[0, 4], [1, 6]]),  # primary
-                    FakeQueryResult(result_rows=[[0, 50], [1, 50]]),  # comparison
-                ],
-            ),
+            ("count(v), min(v), max(v)", [FakeQueryResult(result_rows=[[100, 0.0, 100.0]])]),
+            (("greatest(0, least(", "ILIKE"), [FakeQueryResult(result_rows=[[0, 4], [1, 6]])]),
+            ("greatest(0, least(", [FakeQueryResult(result_rows=[[0, 50], [1, 50]])]),
         ]
     )
     result = svc.compare_field_numeric(
@@ -2472,14 +2484,14 @@ def test_embedding_wizard_scans_carry_memory_settings(service):
     """Both wizard scans (artifact inventory reading the attributes map, and
     the randomized sample) are whole-corpus queries and must carry the shared
     heavy-scan SETTINGS clause (see db/_scan.py)."""
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
     service.list_fields_by_artifact("case", ["s1"], encode=None)
     queries = [q for q, _ in service.store.client.queries]
     scans = [q for q in queries if "GROUP BY artifact" in q or "_rn" in q]
     assert len(scans) == 2
     for q in scans:
-        assert HEAVY_SCAN_SETTINGS in q
+        assert heavy_scan_settings() in q
 
 
 # ── heavy-scan guardrails + clock-skew on viz aggregations ──────────────────
@@ -2490,7 +2502,7 @@ def test_viz_aggregations_carry_memory_settings() -> None:
     clause (db/_scan.py) — a chart over a high-cardinality field is a
     whole-corpus GROUP BY exactly like a detector scan, and without the
     per-query memory cap N concurrent charts can stack unbounded scans."""
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
@@ -2532,11 +2544,11 @@ def test_viz_aggregations_carry_memory_settings() -> None:
         queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
         assert queries, name
         for sql in queries:
-            assert HEAVY_SCAN_SETTINGS in sql, f"{name} scan missing settings:\n{sql}"
+            assert heavy_scan_settings() in sql, f"{name} scan missing settings:\n{sql}"
 
 
 def test_viz_compare_aggregations_carry_memory_settings() -> None:
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
@@ -2582,7 +2594,7 @@ def test_viz_compare_aggregations_carry_memory_settings() -> None:
         queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
         assert queries, name
         for sql in queries:
-            assert HEAVY_SCAN_SETTINGS in sql, f"compare {name} scan missing settings:\n{sql}"
+            assert heavy_scan_settings() in sql, f"compare {name} scan missing settings:\n{sql}"
 
 
 class _CountingGate:
@@ -2730,9 +2742,9 @@ def test_time_punchcard_returns_sparse_cells_and_totals() -> None:
     assert "toDayOfWeek(timestamp, 0, 'UTC')" in sql
     assert "toHour(timestamp, 'UTC')" in sql
     assert VESTIGO_NOT_SENTINEL_SQL in sql
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
-    assert HEAVY_SCAN_SETTINGS in sql
+    assert heavy_scan_settings() in sql
 
 
 def test_time_punchcard_honors_source_offsets() -> None:
@@ -2781,9 +2793,9 @@ def test_field_pivot_builds_matrix_with_other_rollup() -> None:
     assert matrix_params.get("field_key_y") == "status"
     assert matrix_params.get("pivot_x_values") == ["auth"]
     assert matrix_params.get("pivot_y_values") == ["200"]
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
-    assert HEAVY_SCAN_SETTINGS in matrix_sql
+    assert heavy_scan_settings() in matrix_sql
 
 
 def test_field_pivot_empty_axis_skips_matrix_scan() -> None:
@@ -2870,9 +2882,9 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
         if "ORDER BY ord" in sql
     )
     assert "LIMIT 2" in sample_sql
-    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import heavy_scan_settings
 
-    assert HEAVY_SCAN_SETTINGS in sample_sql
+    assert heavy_scan_settings() in sample_sql
     assert "toFloat64OrNull(toString(" in sample_sql
     # Reproducibility: the sample is drawn in a stable hash order, never rand().
     assert "cityHash64(event_id)" in sample_sql

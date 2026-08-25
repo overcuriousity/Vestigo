@@ -78,7 +78,9 @@ jobs:
         run: uv run ruff check .
 
       - name: pytest
-        run: uv run pytest
+        # Coverage lives here rather than in pyproject's addopts — see the
+        # note there.
+        run: uv run pytest --cov=vestigo --cov-report=term-missing
 
   frontend:
     name: Frontend (typecheck + lint + test)

@@ -575,46 +575,66 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Memoized baseline layers for compare renders. 0 disables the cache.",
     ),
     # ── Scan guardrails ──────────────────────────────────────────────────
-    # All restart_required: the SETTINGS clause is a module-level string built
-    # once at import and the admission semaphore is imported by value into
-    # every scan module, so neither reacts to a runtime edit (db/_scan.py).
+    # The SETTINGS clause is built per query (db/_scan.py::heavy_scan_settings),
+    # so an edit to any value it interpolates lands on the next scan. Only
+    # `stat_scan_concurrency` still needs a restart: it sizes the admission
+    # semaphore, which every scan module imports by value.
     SettingSpec(
         "stat_scan_max_threads",
         "scans",
         "Max threads per scan",
         "ClickHouse max_threads for heavy detector/inventory scans.",
-        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_external_group_by_bytes",
         "scans",
         "GROUP BY spill threshold (bytes)",
         "Bytes after which a heavy GROUP BY spills to disk.",
-        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_external_sort_bytes",
         "scans",
         "ORDER BY spill threshold (bytes)",
         "Bytes after which a plain sort spills to disk (window sorts cannot spill).",
-        restart_required=True,
     ),
     SettingSpec(
         "stat_scan_max_memory_bytes",
         "scans",
         "Scan memory budget (bytes)",
-        "Total budget shared across concurrent scans. 0 = auto-derive from detected RAM. "
-        "Pin it when ClickHouse runs on another host — size it to that host. In a "
-        "full-docker stack the automatic value is detected from the *app* container and "
-        "assumes ClickHouse owns the box, so pin it there too.",
-        restart_required=True,
+        "Total budget shared across concurrent scans. 0 = auto: a fraction (below) of the "
+        "ceiling ClickHouse reports for itself, which the app reads from the server at "
+        "startup. Pin a byte value only to override that. If ClickHouse reports no ceiling "
+        "the app falls back to its own container's view of RAM, which in a full-docker "
+        "stack is the whole host and assumes ClickHouse owns it — set "
+        "max_server_memory_usage on the server instead of pinning around it.",
     ),
     SettingSpec(
         "stat_scan_memory_ratio",
         "scans",
         "Auto-budget memory ratio",
-        "Fraction of detected RAM the automatic budget uses.",
-        restart_required=True,
+        "Fraction of ClickHouse's own memory ceiling the automatic budget uses. The "
+        "remainder is headroom for what a per-query cap cannot bound: background merges, "
+        "the mark and uncompressed caches, and allocator slack.",
+    ),
+    SettingSpec(
+        "enrichment_apply_merge_wait_seconds",
+        "scans",
+        "Merge wait after an enrichment apply (seconds)",
+        "How long the enrichment partition rewrite keeps its scan slot after the swap, "
+        "waiting out the merges the swap queued. Merges are the one memory consumer a "
+        "per-query cap cannot bound, so releasing the slot at the swap admits the next "
+        "sweep straight into them. 0 skips the wait — right when ClickHouse has a "
+        "max_server_memory_usage of its own, which bounds merges directly.",
+    ),
+    SettingSpec(
+        "export_scan_queue_wait_seconds",
+        "scans",
+        "Export queue wait (seconds)",
+        "How long a value-inventory export waits for the single streamed-export slot before "
+        "the request is refused with 503. That slot is held for the whole download, which "
+        "the analyst's browser paces, so the wait is bounded rather than open-ended: an "
+        "unbounded one lets a single backgrounded download block every other export in the "
+        "process. 0 refuses immediately when an export is already running.",
     ),
     SettingSpec(
         "stat_scan_concurrency",

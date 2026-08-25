@@ -36,7 +36,7 @@ from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
-from vestigo.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
+from vestigo.db._scan import HEAVY_SCAN_GATE, heavy_scan_settings
 from vestigo.db._template import template_hash_expr
 from vestigo.models.event import Event
 
@@ -688,6 +688,50 @@ class ClickHouseStore:
         row = result.result_rows[0]
         return {key for i, key in enumerate(keys) if int(row[i]) > 0}
 
+    def server_memory_facts(self) -> dict[str, float]:
+        """What ClickHouse reports about its own memory ceiling.
+
+        Four numbers, straight from the server, because the app cannot infer
+        any of them: its own container's view of RAM says nothing about what
+        the ClickHouse container is allowed to use, and that gap is what
+        OOM-killed a production server (see ``db/_scan.py``).
+
+        Returns any of ``max_server_memory_usage``,
+        ``max_server_memory_usage_to_ram_ratio``, ``cgroup_memory_total`` and
+        ``os_memory_total`` the server would tell us about; interpretation is
+        :func:`vestigo.db._scan.resolve_clickhouse_ceiling`'s job. An empty
+        dict means the probe failed — an old server, or a user without rights
+        on the ``system`` tables — which is a reason to warn, never to refuse
+        to start.
+        """
+        facts: dict[str, float] = {}
+        try:
+            rows = self.client.query(
+                "SELECT name, value FROM system.server_settings WHERE name IN "
+                "('max_server_memory_usage', 'max_server_memory_usage_to_ram_ratio')"
+            ).result_rows
+            for name, value in rows:
+                # Float throughout: the ratio is 0.9, and reading it as an int
+                # truncates it to 0 — which would read as "no limit at all" and
+                # invert the very conclusion this probe exists to draw.
+                with contextlib.suppress(TypeError, ValueError):
+                    facts[name] = float(value)
+            metrics = self.client.query(
+                "SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN "
+                "('CGroupMemoryTotal', 'OSMemoryTotal')"
+            ).result_rows
+            for metric, value in metrics:
+                with contextlib.suppress(TypeError, ValueError):
+                    facts[
+                        "cgroup_memory_total"
+                        if metric == "CGroupMemoryTotal"
+                        else "os_memory_total"
+                    ] = float(value)
+        except Exception:  # noqa: BLE001 — a failed probe must not block startup
+            logger.warning("could not read ClickHouse memory limits", exc_info=True)
+            return {}
+        return facts
+
     def _enrichment_scratch_tables(self, scratch_suffix: str) -> tuple[str, str]:
         # Suffix comes from the in-process job id (uuid4 hex); defensive
         # strip anyway since it lands in DDL identifiers.
@@ -763,7 +807,7 @@ class ClickHouseStore:
         concurrent REPLACEs would silently discard one side's keys.
 
         The rewrite carries the same memory guardrails as the detector scans
-        (``HEAVY_SCAN_SETTINGS``: hard per-query cap + external spill +
+        (``heavy_scan_settings()``: hard per-query cap + external spill +
         bounded threads) plus ``grace_hash`` so the staged-rows join spills
         to disk instead of holding its hash table in RAM — an unguarded
         whole-partition JOIN + GROUP BY is exactly the query shape that can
@@ -839,7 +883,7 @@ class ClickHouseStore:
                     GROUP BY event_id
                 ) AS m ON e.event_id = m.event_id
                 WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
-                {HEAVY_SCAN_SETTINGS}, join_use_nulls = 0, join_algorithm = 'grace_hash',
+                {heavy_scan_settings()}, join_use_nulls = 0, join_algorithm = 'grace_hash',
                 min_insert_block_size_bytes = {settings.enrichment_apply_insert_block_bytes}
                 """,
                 parameters={
@@ -848,10 +892,88 @@ class ClickHouseStore:
                     "owned_suffixes": owned_suffixes or [],
                 },
             )
+            # Read before the swap, off the scratch table: it holds exactly the
+            # parts about to be swapped in, under the same partition key, so
+            # its partition_id *is* the one whose merges we are about to queue.
+            # Deriving it this way avoids reconstructing ClickHouse's own
+            # formatting of a tuple partition key.
+            partition_ids = self._scratch_partition_ids(events_table)
             self.client.command(
                 f"ALTER TABLE {self.database}.events "
                 f"REPLACE PARTITION {partition_expr} FROM {events_table}"
             )
+            self._await_merges(get_settings().enrichment_apply_merge_wait_seconds, partition_ids)
+
+    def _scratch_partition_ids(self, events_table: str) -> list[str]:
+        """The partition ids of the parts staged in *events_table*.
+
+        Empty when the scratch table has no active parts (an apply over a
+        source with no matching rows) or when the query is not permitted —
+        both of which make the merge wait below a no-op rather than a
+        five-minute wait on merges that are not ours.
+        """
+        database, _, table = events_table.rpartition(".")
+        try:
+            rows = self.client.query(
+                "SELECT DISTINCT partition_id FROM system.parts "
+                "WHERE database = {db:String} AND table = {tbl:String} AND active",
+                parameters={"db": database, "tbl": table},
+            ).result_rows
+        except Exception:  # noqa: BLE001 — no rights on system.parts, say
+            logger.debug("could not read scratch partition ids", exc_info=True)
+            return []
+        return [str(row[0]) for row in rows if row[0]]
+
+    def _await_merges(self, timeout_seconds: int, partition_ids: list[str]) -> None:
+        """Block until *partition_ids* have no merges left on ``events``, or *timeout*.
+
+        Called while still holding the admission slot, and that is the point.
+        ``REPLACE PARTITION`` returns as soon as the swap is done; the merges it
+        queues on the freshly written parts run *afterwards*, and merge memory
+        is the one consumer no ``max_memory_usage`` reaches. Holding the slot
+        across the ALTER alone — which is what this method used to do — released
+        it while the expensive part was still ahead, so a detector sweep could
+        be admitted straight into the merge burst.
+
+        Bounded, and non-fatal on timeout: the apply itself is already durably
+        swapped in by this point, and merges are ClickHouse's business, not
+        ours. The wait is a courtesy to whatever runs next, not a correctness
+        requirement — so a slow merge must not fail a completed apply. Set
+        ``VESTIGO_ENRICHMENT_APPLY_MERGE_WAIT_SECONDS`` to 0 to skip it, which
+        is right when ClickHouse has a ``max_server_memory_usage`` of its own:
+        that bounds merges directly, at the layer that can actually see them.
+
+        Scoped to the partitions this apply just wrote, not to ``events`` as a
+        whole. An instance with concurrent ingest into other sources has merges
+        in flight essentially always, so an unscoped poll waits out the full
+        timeout every time — and it does that holding the admission slot, which
+        stalls every detector sweep on the box for five minutes over merges the
+        apply did not cause.
+        """
+        if timeout_seconds <= 0 or not partition_ids:
+            return
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                rows = self.client.query(
+                    "SELECT count() FROM system.merges "
+                    "WHERE database = {db:String} AND table = 'events' "
+                    "AND partition_id IN {pids:Array(String)}",
+                    parameters={"db": self.database, "pids": partition_ids},
+                ).result_rows
+            except Exception:  # noqa: BLE001 — no rights on system.merges, say
+                logger.debug("could not poll system.merges; not waiting", exc_info=True)
+                return
+            if not rows or not rows[0][0]:
+                return
+            time.sleep(1.0)
+        logger.info(
+            "enrichment apply: merges on %s.events partitions %s still running after %ds; "
+            "releasing the scan slot anyway",
+            self.database,
+            partition_ids,
+            timeout_seconds,
+        )
 
     def drop_enrichment_scratch(self, scratch_suffix: str) -> None:
         """Drop both scratch tables for ``scratch_suffix``, ignoring errors."""

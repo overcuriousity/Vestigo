@@ -1,6 +1,216 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-24 (session 183 — upstream branch triage and 1.14.0).
+Last updated: 2026-08-25 (session 187 — PR #299 review fixes).
+
+## Session 187 — 2026-08-25: PR #299 review — the scan-budget half
+
+The value-inventory export (#295) itself came through review clean. Everything below
+is the scan-budget refactor that shipped alongside it, plus one concurrency hole in
+the new export gate.
+
+**The budget and the gate had drifted apart.** Session 186 moved the per-query budget
+to query-build time so the ClickHouse probe could reach it. `HEAVY_SCAN_GATE` stayed
+sized at import — it has to be, it is imported by value — so the divisor followed the
+live setting while the semaphore did not. An admin lowering "Concurrent heavy scans"
+from 4 to 2 in the console would double every query's `max_memory_usage` while the
+gate kept admitting 4: twice the total budget, i.e. the exact OOM the pair exists to
+prevent. `restart_required=True` on the spec is advisory text, not enforcement. Both
+halves now read one frozen `_GATE_CONCURRENCY`, and `/api/health` discloses a pending
+value waiting for a restart.
+
+**An "unbounded" ceiling was still believed outright.** `resolve_clickhouse_ceiling`
+classifies a ceiling ClickHouse merely derived (0.9 x RAM a limit-less container does
+not own) as `bounded=False` — and the budget used it anyway. App in a 4 GiB container
+against an unlimited ClickHouse on a 64 GiB host went from 1.6 GiB per query to ~23,
+on the strength of a number the module had just called a guess. `scan_memory_ceiling()`
+now caps an unbounded ceiling by local detection: two guesses, take the lower. An
+explicit `max_server_memory_usage` is a decision and still stands as written — but it
+is now clamped by `max_server_memory_usage_to_ram_ratio` exactly as the server clamps
+it, which the reference stack needed: 10 GiB pinned against `mem_limit: 12g` and a 0.8
+ratio is really 9.6, and the probe reported the optimistic number. `memory.xml` now
+pins 9.5 GiB so the file says what it means.
+
+**The export gate could stall the app.** `EXPORT_SCAN_GATE` is one slot held for the
+whole client-paced drain, and it was acquired with an untimed blocking `acquire()`
+inside the generator — which Starlette runs on an anyio worker thread. One analyst
+backgrounding a large download blocked every other inventory export in the process,
+each queued one parked on a thread from the pool every `run_in_threadpool` query also
+needs. The slot is now taken by the endpoint *before* the response begins, bounded by
+`VESTIGO_EXPORT_SCAN_QUEUE_WAIT_SECONDS` (default 30), and a wait that runs out is a
+clean 503 rather than a truncated 200. Acquiring it after the headers are gone could
+never have been anything else. The start-of-export audit row moved below the
+acquisition while we were in there: a refused request produced no file, and a row
+saying an export ran is the kind of claim this trail exists not to make.
+
+**The merge wait was waiting on other people's merges.** `_await_merges` polled
+`system.merges` for *any* merge on `events`, holding the admission slot, for up to 300
+seconds. An instance with concurrent ingest always has one in flight, so it burned the
+full five minutes every apply and stalled every detector sweep behind it. It now polls
+the partition ids the apply actually staged, read off the scratch table before the
+swap — no parts staged, no wait.
+
+**One pre-existing test bug, found on the way.** `tests/test_scan_budget.py`'s
+local-detection tests read module state that startup recovery writes once, so any
+earlier test booting the app left the dev ClickHouse's real ceiling behind and three
+tests failed by *ordering* — on `main` too, not from this work. An autouse fixture now
+starts each of them from "the probe has not run".
+
+**Two small ones.** `/api/health` re-detected local memory on the event loop on every
+poll (three blocking reads); it runs in the threadpool now. And the export dialog's
+field picker rendered neither the loading nor the error state of `viz/fields`, so a
+failed request read as an empty list with a permanently disabled Download button.
+
+## Session 186 — 2026-08-25: nothing was bounding ClickHouse
+
+A production instance had been losing clickhouse-server to the kernel for months. The
+enrichment apply was blamed, twice, and gated twice (sessions 52 and 56). It was never
+the enrichers.
+
+**Three ceilings, all off.** The airgapped compose — the file that actually reaches
+production — carried no `mem_limit` on any service. The repository's own
+`docker-compose.yml` at least carried them commented out; the bundle template never had
+them. With no container limit, ClickHouse derived its own ceiling from
+`max_server_memory_usage_to_ram_ratio` (0.9) times detected RAM, which in an unlimited
+container is the whole 64 GiB host, so it never self-throttled. And
+`deploy/clickhouse/memory.xml` shipped as a `.example` nobody is told to copy.
+
+**The app made it worse, and reported success while doing it.**
+`detect_scan_memory_budget()` measured the memory of whatever host *the app* process
+sat on. Full-docker, no limits: 64 GiB detected, x 0.8 = 51.2 GiB total, / 2 slots =
+**25.6 GiB authorized for a single query** — while Postgres, Qdrant and the app shared
+the same RAM and ClickHouse's own ceiling sat at ~57.6 GiB. Every guardrail was
+honoured exactly. The sum simply did not fit, the kernel picked the largest RSS, and
+SIGKILL is not something a process gets to write a log line about. `restart:
+unless-stopped` then erased the outage: the only visible trace was `docker compose ps`
+showing ClickHouse up two hours against five days for everything else.
+
+**The fix is to stop having two numbers.** The budget is now derived from *ClickHouse's
+own reported ceiling* (`system.server_settings`, falling back to
+`system.asynchronous_metrics`), probed once at startup. An operator sets
+`max_server_memory_usage` and the app follows it. Local detection survives only as the
+pre-probe fallback, and landing there is now logged as a warning naming the
+misconfiguration.
+
+That required the SETTINGS clause to stop being a module constant. It was frozen at
+import — the one moment at which the app cannot ask ClickHouse anything, which is
+precisely why the budget could only ever be sized from the app's own host. It is now
+`heavy_scan_settings()`, called per query (69 call sites, mechanical). The side effect
+is worth as much as the fix: every `stat_scan_*` value except `concurrency` is now
+genuinely live, so four settings lost a `restart_required` badge that had been telling
+the truth about an implementation detail nobody wanted.
+
+`resolve_clickhouse_ceiling` distinguishes a ceiling an operator *set* from one
+ClickHouse *derived* from RAM it does not own. Both are usable for sizing; only the
+first is a limit. That distinction is the whole finding, so it is what `risk` reports:
+`ok` / `over_budget` / `unbounded`, served on `/api/health` because a startup warning is
+exactly what nobody reads.
+
+**The merge window.** `finalize_enrichment_apply` held its admission slot "across the
+INSERT *and* the REPLACE" on the stated grounds that the swap queues merges and merge
+memory is not covered by the per-query cap. Both halves of that sentence were right and
+the conclusion did not follow: `ALTER TABLE ... REPLACE PARTITION` returns as soon as
+the swap is done, with the merges still ahead of it. The slot was being released into
+the expensive part. It now waits on `system.merges`, bounded and non-fatal — the
+partition is durable by then, so a slow merge must never fail a completed apply.
+
+**Shipped, not documented.** Both compose files now set memory limits and mount
+`memory.xml`, overridable per service via `VESTIGO_*_MEM_LIMIT`. A guardrail that ships
+opt-in is a guardrail production runs without; that is the actual lesson and it is
+recorded in `DEPLOYMENT.md` §"How this went unnoticed" rather than left as folklore.
+
+Two test bugs surfaced on the way, both latent races rather than fallout.
+`_SeqFakeClient` keyed canned results to a FIFO under one marker while `compare_*` runs
+its two layers through `_run_parallel` — which layer got which counts was a thread race
+that happened to land right. Markers can now be tuples that must all match, so a test
+keys on what distinguishes the layers (`q=` compiles to `ILIKE`) instead of on arrival
+order. And `test_other_database_errors_are_not_swallowed` used `code: 241` as its
+example of an untranslated error; 241 is now deliberately translated, so it moved to
+`code: 62`.
+
+## Session 185 — 2026-08-25: what the review found in the value inventory (#299)
+
+Four findings against session 184's export, all correctness, and two of them changed a
+decision that session had recorded as deliberate.
+
+**The scan gate is not one gate.** Session 184 wrote that `iter_field_inventory` holds
+"its scan-gate slot for the whole drain" as though that followed from streaming. It does
+not. Every other holder of `HEAVY_SCAN_GATE` is bounded by ClickHouse; this one is bounded
+by the analyst's browser, and the gate has two slots, process-wide. Two people downloading
+a large inventory over a slow link — or one who backgrounds the download — hold both, and
+every detector on the box blocks behind them. The generator cannot even time itself out,
+because while it is suspended waiting on the consumer its own code is not running.
+
+The split that resolves it: the aggregation is what `HEAVY_SCAN_GATE` exists to admit, and
+a sorted aggregate cannot emit its first row until every group exists — so **the first
+block proves the heavy scan is over**. The detector slot is handed back there, and a new
+one-slot `EXPORT_SCAN_GATE` covers the drain. Exports queue behind each other rather than
+stacking two live result streams; detectors stop paying for a slow browser. No setting for
+the export gate: the supported answer to "I want more concurrent exports" is that you don't.
+
+**The pre-flight could not survive its own use case.** `uniqExact` builds the full distinct
+set in a hash table and does not spill — `HEAVY_SCAN_SETTINGS`' external-aggregation
+thresholds simply do not apply to it. So the count died at `max_memory_usage` on exactly
+the high-cardinality field the export was built for, and surfaced as a bare 500. This is
+the same trap session 184 avoided for the *stream* (window sorts cannot spill either) and
+then walked into for the count. It is now `count()` over a `GROUP BY` subquery: the same
+grouping the stream does, so exact for the same reason, through the spillable path. The
+grouping runs twice now. That is the price of the export working on the fields it exists
+for. A `QueryMemoryExceededError` maps any remaining `code: 241` to a 413 that says narrow
+the scope, alongside the older `QueryRequestTooLargeError` — the cap is ours, set so one
+scan dies instead of the server, which makes hitting it explainable rather than a 500.
+
+**Two smaller ones.** `iter_field_inventory` yielded ClickHouse cells straight through, so
+a `content_hash` or `file_hash` inventory — both legal field tokens, and reachable from the
+agent and the CLI even though the viz picker does not list them — wrote `b'3f2a…\x00'` into
+the CSV. `decode_fixed_string` is now factored out of `decode_fixed_string_columns` for the
+paths that yield a bare cell rather than a row. And in the export dialog only the mode
+toggle was frozen mid-download: flipping the separator to tab made the progress row read
+"Downloading .tsv" over an in-flight comma-separated request that would still save as
+`.csv`. Every control that shapes the request is frozen now, events-mode format included.
+
+Each of the four has a test that fails without its fix — checked by reverting each one.
+
+## Session 184 — 2026-08-25: the value inventory export (#295)
+
+An analyst wanted three columns out of a timeline — each distinct `attr:src_ip`, when it
+was first seen, when it was last seen — and the only way to get them was to export every
+event and aggregate the file elsewhere. `QueryService.field_terms` already grouped by the
+value; `min`/`max` over the timestamp were two more aggregates in the same scan.
+
+The aggregation is a *new* method rather than a flag on `field_terms`, for a reason worth
+recording: `field_terms` can afford its `sum() OVER ()` because it takes a top-N, and the
+inventory cannot — it is unbounded in group count, and window sorts are the one sort
+ClickHouse will not spill to disk (`db/_scan.py`). `iter_field_inventory` is therefore
+plain `GROUP BY`/`ORDER BY` under `HEAVY_SCAN_SETTINGS`, streamed to the client one block
+at a time through a new `_select_row_blocks` (the streaming sibling of `_select`), holding
+its scan-gate slot for the whole drain.
+
+Two details are the difference between a file an analyst can rely on and one they cannot.
+The no-timestamp storage sentinel is nulled out *inside* the aggregate, not filtered out
+of the scan — so a value seen only on undated events keeps its true count and reports no
+times, instead of claiming it was first seen in the year 2299. And the pre-flight
+`uniqExact` is the same construction as the events export's `count()`: the number the
+completeness trailer is proven against, and the last point at which a query failure can
+still pick a status code rather than truncate a 200.
+
+Columns and separator are the analyst's choice (issue thread). The one rule the server
+imposes: the column a file is *sorted by* is always written, even when unticked — a file
+ordered by a column it does not contain reads as shuffled. The UI says so rather than
+silently adding it.
+
+`lucide-react` went 1.32.0 → 1.34.0 (upstream latest) in the same branch. It was not a
+planned bump: the installed copy in this checkout was missing its ESM entry and its type
+declarations, so thirty-odd untouched files failed `tsc` and `vite build` could not resolve
+the package at all — a broken install that reads exactly like a code error. Reinstalling
+fixed it; taking the current release rather than re-pinning the old one is the cheaper end
+state. Pinned exact, as every other frontend dependency here is, and the lockfile diff
+touches nothing else.
+
+The dialog's field and order pickers are native `<select>`s, not the Radix one. A Radix
+Select inside a Radix Dialog puts two focus scopes in a loop under jsdom (the test hung on
+`Maximum call stack size exceeded` in `react-focus-scope`); `UploadDialog` already had the
+native precedent, and typing a prefix to jump is worth more than styling on a field list
+that runs to hundreds of entries.
 
 ## Session 183 — 2026-08-24: upstream branch triage, and 1.14.0
 

@@ -63,7 +63,7 @@ uv sync                          # install deps
 uv run vestigo-web                    # start API + serve built frontend on :8080
 uv run vestigo ingest <path> -c <case> -s <source>   # CLI ingestion (no embeddings)
 uv run vestigo embed -c <case> -s <source>           # CLI embedding job
-uv run pytest                    # full test suite (coverage on by default, see pyproject.toml)
+uv run pytest                    # full test suite (no coverage; CI adds --cov, see pyproject.toml)
 uv run pytest tests/test_pipeline.py            # single file
 uv run pytest tests/test_pipeline.py::test_name # single test
 uv run ruff check .              # lint

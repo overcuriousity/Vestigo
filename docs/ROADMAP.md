@@ -60,13 +60,19 @@ model migrates once, not twice.**
 
 ## Milestone 3 — polish
 
-- [ ] **Make the scan guardrails live instead of restart-required.** Every
-  `VESTIGO_STAT_SCAN_*` setting is declared `restart_required` because `HEAVY_SCAN_SETTINGS` is a module-level string built once at
-  import and `HEAVY_SCAN_GATE` is imported *by value* into `db/queries.py`,
-  `db/anomaly_stats.py`, `sigma/runner.py` and `db/clickhouse.py` — rebinding the `_scan`
-  globals would not reach those bindings. An operator tuning the budget in response to an
-  OOM incident (session 159) has to restart to apply it. Needs the clause resolved at call
-  time and the semaphore behind an accessor, not a rebind.
+- [ ] **Make `VESTIGO_STAT_SCAN_CONCURRENCY` live too.** The clause is now resolved
+  per query (`heavy_scan_settings()`, session 186), so every other `stat_scan_*` value
+  applies without a restart. Concurrency is the last one that does not: it sizes
+  `HEAVY_SCAN_GATE`, a `BoundedSemaphore` imported *by value* into `db/queries.py`,
+  `db/anomaly_stats.py`, `sigma/runner.py` and `db/clickhouse.py`, so rebinding the
+  `_scan` global would not reach those bindings. Needs the gate behind an accessor, or a
+  resizable wrapper — and a decision about what resizing means for slots already held.
+- [ ] **Surface the scan-budget risk in the admin console.** `/api/health` carries
+  `scan_budget` with `risk: ok | over_budget | unbounded` (session 186), but nothing
+  renders it. The whole point of that field is that the startup warning it duplicates is
+  the thing nobody reads; leaving it API-only repeats the mistake one layer up. Belongs
+  next to the Scan guardrails group on Admin → Settings, as a banner when `risk` is not
+  `ok`, naming the remedy (`max_server_memory_usage`, or a lower budget).
 - [ ] **Per-source progress on a resumed enrichment run.** `run_resume_job` reports
   status only, so the analyst sees a spinner for the duration of a whole-partition
   rewrite. `_apply_staged_rows` has no progress hook and its signature is shared with

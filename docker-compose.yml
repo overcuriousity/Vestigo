@@ -8,13 +8,22 @@
 # set real credentials (e.g. the commented QDRANT__SERVICE__API_KEY below, a real
 # POSTGRES_PASSWORD, and a ClickHouse user/password).
 #
-# MEMORY LIMITS: none are set here, so every service can grow into all of the host's
-# RAM and the kernel picks the victim when they collectively don't fit — usually
-# ClickHouse, which then dies as `exited with code 137` (SIGKILL) rather than as a
-# clean ClickHouse memory error. Each service below carries commented `mem_limit`
-# values sized for a 32 GiB host; uncomment and adjust to your box before running
-# anything real. See docs/DEPLOYMENT.md "Resource sizing" for how the numbers relate
-# to the app's own VESTIGO_STAT_SCAN_* budget (editable in the admin console).
+# MEMORY LIMITS are set, sized for a 32 GiB host, and overridable per service via the
+# VESTIGO_*_MEM_LIMIT variables below. They used to ship commented out, which is how a
+# production instance ran for months with nothing bounding ClickHouse at all: with no
+# container limit it derived its own ceiling from 0.9 x the RAM it *detected* — the whole
+# host — grew past what was actually free, and was SIGKILLed (`exited with code 137`)
+# with no ClickHouse-side memory error anywhere in its log. A guardrail nobody enables is
+# not a guardrail. Raise them to fit your box; do not remove them.
+#
+# The container limit is only half of it: it decides who the kernel kills, not whether
+# ClickHouse throttles itself first. `deploy/clickhouse/memory.xml` (mounted below) is
+# what does that, and it is also the only layer that bounds background merges — which no
+# per-query cap can reach. Keep the two in step: server ceiling below container limit.
+#
+# The app derives its own VESTIGO_STAT_SCAN_* budget from whatever ClickHouse reports,
+# so these numbers move the whole stack. `/api/health` reports what actually resolved.
+# See docs/DEPLOYMENT.md "Resource sizing".
 
 services:
   postgres:
@@ -25,8 +34,8 @@ services:
       POSTGRES_DB: vestigo
     ports:
       - "127.0.0.1:5432:5432"
-    # Metadata only — never holds events. 4g is generous on a 32 GiB host.
-    # mem_limit: 4g
+    # Metadata only — never holds events.
+    mem_limit: ${VESTIGO_POSTGRES_MEM_LIMIT:-4g}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -46,19 +55,23 @@ services:
       - "127.0.0.1:9000:9000"
     # Where query cost actually lives, and the service the kernel kills first.
     # 12g suits a 32 GiB host running the whole stack. A cgroup limit alone is
-    # not enough — pair it with the memory.xml drop-in below, because a
+    # not enough — it is paired with the memory.xml drop-in below, because a
     # containerized ClickHouse can misdetect total RAM when deriving its own
     # 90%-of-RAM server limit, and would then never self-throttle.
-    # mem_limit: 12g
+    # memswap_limit pins swap off: a swapping ClickHouse is worse than a
+    # failing one.
+    mem_limit: ${VESTIGO_CLICKHOUSE_MEM_LIMIT:-12g}
+    memswap_limit: ${VESTIGO_CLICKHOUSE_MEM_LIMIT:-12g}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       # >= 25.x images restrict the `default` user to localhost — see the
       # comment in the mounted file.
       # (`z` = SELinux relabel for rootless podman on Fedora; harmless on Docker)
       - ./deploy/clickhouse/allow-default-network.xml:/etc/clickhouse-server/users.d/zz-allow-default-network.xml:ro,z
-      # Server-side memory ceiling. Copy memory.xml.example to memory.xml,
-      # set the value to match mem_limit above, then uncomment this line.
-      # - ./deploy/clickhouse/memory.xml:/etc/clickhouse-server/config.d/zz-memory.xml:ro,z
+      # Server-side memory ceiling — the layer that makes ClickHouse fail one
+      # query instead of being killed, and the only one that bounds merges.
+      # Sized to sit under mem_limit above; edit both together.
+      - ./deploy/clickhouse/memory.xml:/etc/clickhouse-server/config.d/zz-memory.xml:ro,z
     healthcheck:
       # clickhouse-client is bundled in the image and always present, unlike
       # wget/curl which vary across the alpine base and gave false negatives.
@@ -73,7 +86,7 @@ services:
     ports:
       - "127.0.0.1:6333:6333"
     # Only used when embeddings are enabled; memory scales with vector count.
-    # mem_limit: 4g
+    mem_limit: ${VESTIGO_QDRANT_MEM_LIMIT:-4g}
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
@@ -96,6 +109,10 @@ services:
 #        INSTALL_EMBEDDINGS: "1"
 #    ports:
 #      - "8080:8080"
+#    # Ingestion batches, export buffering and any converter subprocess live
+#    # here. A converter that outgrows this is killed inside the container
+#    # rather than taking the host down, which is the intended trade.
+#    mem_limit: ${VESTIGO_APP_MEM_LIMIT:-4g}
 #    environment:
 #      VESTIGO_ENVIRONMENT: production
 #      VESTIGO_LOG_LEVEL: INFO

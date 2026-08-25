@@ -30,6 +30,7 @@ from vestigo.api.deps import (
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
+from vestigo.db._scan import EXPORT_SCAN_GATE
 from vestigo.db.analysis_plan import FIELD_OVERRIDE_METHOD_IDS
 from vestigo.db.anomaly_stats import (
     AnalysisWindows,
@@ -1494,6 +1495,67 @@ def _stream_csv(
         raise ExportIncompleteError(f"export wrote {written} of {expected} matching events")
 
 
+async def _build_export_query(
+    case_id: str, timeline_id: str, spec: ExportFilter
+) -> tuple[EventQuery, dict[str, int] | None]:
+    """Validate *spec* and resolve it to the ``EventQuery`` an export streams.
+
+    Shared by both export surfaces (events, value inventory) so a filter means
+    the same thing in each — an inventory computed over a wider scope than the
+    events file it is meant to accompany would be a forensic footgun. The
+    resolved per-source clock-skew offsets come back alongside because the
+    streamers document them in their own header.
+    """
+    _validate_regex(spec.q, spec.q_regex)
+    for modes in (spec.field_modes, spec.exclude_modes):
+        for k, v in modes.items():
+            if v not in _VALID_FILTER_MODES:
+                raise HTTPException(
+                    status_code=400, detail=f"invalid match mode {v!r} for field {k!r}"
+                )
+    _validate_field_modes(spec.fields, spec.field_modes)
+    _validate_field_modes(spec.exclude, spec.exclude_modes)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
+    event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
+        case_id,
+        source_ids,
+        annotated=spec.annotated,
+        annotation_tag_value=spec.annotation_tag_value,
+        run_id=spec.run_id,
+        tags_include=spec.tags_include,
+        tags_exclude=spec.tags_exclude,
+        ids=spec.ids,
+    )
+    routine_scope = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, spec.collapse_routine
+    )
+    eq = EventQuery(
+        case_id=case_id,
+        source_ids=source_ids,
+        q=spec.q,
+        q_regex=spec.q_regex,
+        artifact=spec.artifact,
+        artifacts=_parse_str_list(spec.artifacts),
+        source_id=spec.source_id,
+        tag=spec.tag,
+        exclude_tag=spec.exclude_tag,
+        start=spec.start,
+        end=spec.end,
+        field_filters=spec.fields,
+        field_exclusions=spec.exclude,
+        filter_modes=spec.field_modes,
+        exclusion_modes=spec.exclude_modes,
+        event_ids=event_ids,
+        tags_include=tags_include_filter,
+        tags_exclude=tags_exclude_filter,
+        field_mappings=field_mappings,
+        source_offsets=source_offsets,
+        exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+        exclude_template_hashes=routine_scope.template_hashes,
+    )
+    return eq, source_offsets
+
+
 # ── Export endpoint ───────────────────────────────────────────────────────────
 
 
@@ -1511,59 +1573,11 @@ async def export_events(
     persisted anomaly findings) so the export is a self-contained record —
     tagging a finding is what makes it show up here.
     """
-    _validate_regex(body.filter.q, body.filter.q_regex)
-    for modes in (body.filter.field_modes, body.filter.exclude_modes):
-        for k, v in modes.items():
-            if v not in _VALID_FILTER_MODES:
-                raise HTTPException(
-                    status_code=400, detail=f"invalid match mode {v!r} for field {k!r}"
-                )
-    _validate_field_modes(body.filter.fields, body.filter.field_modes)
-    _validate_field_modes(body.filter.exclude, body.filter.exclude_modes)
-    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
-    event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
-        case_id,
-        source_ids,
-        annotated=body.filter.annotated,
-        annotation_tag_value=body.filter.annotation_tag_value,
-        run_id=body.filter.run_id,
-        tags_include=body.filter.tags_include,
-        tags_exclude=body.filter.tags_exclude,
-        ids=body.filter.ids,
-    )
-
-    routine_scope = await _resolve_routine_collapse(
-        case_id, timeline_id, source_ids, body.filter.collapse_routine
-    )
+    eq, source_offsets = await _build_export_query(case_id, timeline_id, body.filter)
 
     store = get_store()
     annotations_by_event = _index_annotations_by_event(
-        await store.list_source_annotations(case_id, source_ids)
-    )
-
-    eq = EventQuery(
-        case_id=case_id,
-        source_ids=source_ids,
-        q=body.filter.q,
-        q_regex=body.filter.q_regex,
-        artifact=body.filter.artifact,
-        artifacts=_parse_str_list(body.filter.artifacts),
-        source_id=body.filter.source_id,
-        tag=body.filter.tag,
-        exclude_tag=body.filter.exclude_tag,
-        start=body.filter.start,
-        end=body.filter.end,
-        field_filters=body.filter.fields,
-        field_exclusions=body.filter.exclude,
-        filter_modes=body.filter.field_modes,
-        exclusion_modes=body.filter.exclude_modes,
-        event_ids=event_ids,
-        tags_include=tags_include_filter,
-        tags_exclude=tags_exclude_filter,
-        field_mappings=field_mappings,
-        source_offsets=source_offsets,
-        exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
-        exclude_template_hashes=routine_scope.template_hashes,
+        await store.list_source_annotations(case_id, eq.source_ids or [])
     )
 
     if _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes):
@@ -1649,6 +1663,253 @@ async def export_events(
     return StreamingResponse(
         content,
         media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        background=BackgroundTask(_audit_completeness),
+    )
+
+
+# ── Value inventory export (#295) ─────────────────────────────────────────────
+
+#: The four columns a value inventory can carry. `value` is what the file is
+#: *of*, so it is always present; the rest are the analyst's choice, and the
+#: order they ask for is the order they get.
+_INVENTORY_COLUMNS = ("value", "count", "first_seen", "last_seen")
+
+#: Named separators rather than a free-text character: a delimited file is
+#: only useful if whatever opens it can parse it, and these four cover the
+#: cases that come up (Excel in a comma-decimal locale wants `;`, a joinable
+#: sidecar wants a tab).
+_INVENTORY_SEPARATORS = {"comma": ",", "semicolon": ";", "tab": "\t", "pipe": "|"}
+
+
+class FieldInventoryRequest(BaseModel):
+    """Request body for the value-inventory export."""
+
+    field: str = Field(min_length=1, description="Field token, e.g. 'attr:src_ip'")
+    columns: list[str] = Field(default_factory=lambda: ["value", "first_seen", "last_seen"])
+    separator: Literal["comma", "semicolon", "tab", "pipe"] = "comma"
+    order_by: str = "count_desc"
+    filter: ExportFilter = Field(default_factory=ExportFilter)
+
+
+def _resolve_inventory_columns(columns: list[str], order_by: str) -> list[str]:
+    """Validate the requested columns, appending the one the file is sorted by.
+
+    A file ordered by a column it does not contain cannot be read as ordered —
+    the rows would look shuffled — so the sort key is always emitted, even when
+    the analyst did not tick it. Nothing else is added, and the requested order
+    is preserved.
+    """
+    if not columns:
+        raise HTTPException(status_code=400, detail="select at least one column")
+    unknown = [c for c in columns if c not in _INVENTORY_COLUMNS]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"unknown column {unknown[0]!r}")
+    if len(set(columns)) != len(columns):
+        raise HTTPException(status_code=400, detail="duplicate column in selection")
+    if "value" not in columns:
+        raise HTTPException(status_code=400, detail="the 'value' column is required")
+    sort_column = order_by.rsplit("_", 1)[0]
+    if sort_column in _INVENTORY_COLUMNS and sort_column not in columns:
+        return [*columns, sort_column]
+    return list(columns)
+
+
+def _acquire_export_slot(wait: float) -> bool:
+    """Take the single streamed-export slot, waiting at most *wait* seconds."""
+    if wait <= 0:
+        return EXPORT_SCAN_GATE.acquire(blocking=False)
+    return EXPORT_SCAN_GATE.acquire(timeout=wait)
+
+
+async def _audit_inventory_export(
+    store,
+    user: User,
+    case_id: str,
+    timeline_id: str,
+    body: FieldInventoryRequest,
+    columns: list[str],
+    expected: int,
+    source_offsets: dict[str, int] | None,
+) -> None:
+    """Record that this export started, with everything that shaped the file.
+
+    Written after the streamed-export slot is taken, not before: a request
+    refused with 503 produced no file, and an audit row saying an export ran is
+    exactly the kind of claim this trail exists not to make.
+    """
+    await store.record_audit(
+        action="events.export.field_inventory",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "field": body.field,
+            "columns": columns,
+            "separator": body.separator,
+            "order_by": body.order_by,
+            "expected": expected,
+            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            **({"applied_time_offsets": source_offsets} if source_offsets else {}),
+        },
+    )
+
+
+def _stream_field_inventory(
+    query: EventQuery,
+    field_token: str,
+    *,
+    columns: list[str],
+    delimiter: str,
+    order_by: str,
+    applied_offsets: dict[str, int] | None,
+    expected: int,
+    tally: dict[str, Any],
+) -> Generator[str]:
+    """Yield the delimited value inventory for *field_token* (header first).
+
+    Same self-describing envelope as the events export — a leading
+    ``# applied_time_offsets=…`` comment when a clock-skew offset is active,
+    and a trailing ``# vestigo_export …`` line proving the file holds every
+    distinct value the pre-flight counted. A value seen only on undated events
+    writes empty time cells rather than the storage sentinel.
+    """
+    try:
+        buf = io.StringIO()
+        if applied_offsets:
+            yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
+        writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
+        writer.writerow(columns)
+        yield buf.getvalue()
+
+        written = 0
+        rows = _get_query_service().iter_field_inventory(
+            query, field_token, order_by=order_by, hold_export_slot=False
+        )
+        for row in rows:
+            buf.seek(0)
+            buf.truncate()
+            writer.writerow(["" if row.get(c) is None else row[c] for c in columns])
+            yield buf.getvalue()
+            written += 1
+
+        complete = written == expected
+        tally["written"] = written
+        tally["complete"] = complete
+        yield (
+            f"# vestigo_export complete={str(complete).lower()} "
+            f"rows={written} expected={expected}\n"
+        )
+        if not complete:
+            _logger.error(
+                "field inventory export incomplete: expected=%s written=%s case=%s field=%s",
+                expected,
+                written,
+                query.case_id,
+                field_token,
+            )
+            raise ExportIncompleteError(f"export wrote {written} of {expected} distinct values")
+    finally:
+        # The slot was taken by the endpoint, before a byte was sent, so a busy
+        # server could still answer 503 (see `export_field_inventory`). This is
+        # the matching release, and it must run on every exit — including the
+        # `close()` Starlette calls when the analyst cancels the download.
+        EXPORT_SCAN_GATE.release()
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/export/field-inventory")
+async def export_field_inventory(
+    case_id: str,
+    timeline_id: str,
+    body: FieldInventoryRequest,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Stream a delimited inventory of one field's distinct values (#295).
+
+    One row per distinct value with its count and the first and last time it
+    was seen — the aggregate an analyst would otherwise have had to rebuild
+    from a full events export. Computed inside the *current* filters, exactly
+    like the events export, and stamped with the same ISO-8601 UTC times, so
+    the two files join.
+    """
+    if body.order_by not in EventQueryService.INVENTORY_ORDERINGS:
+        raise HTTPException(status_code=400, detail=f"unknown ordering {body.order_by!r}")
+    columns = _resolve_inventory_columns(body.columns, body.order_by)
+    eq, source_offsets = await _build_export_query(case_id, timeline_id, body.filter)
+
+    # Pre-flight the distinct-value count over the *same* query — the number
+    # the completeness trailer is proven against, and (load-bearing, exactly as
+    # in `export_events`) the last point at which a query-layer failure can
+    # still become a status code rather than a truncated 200. Don't move it
+    # below the StreamingResponse construction.
+    expected = await _run_regex_guarded(
+        _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes),
+        _get_query_service().count_field_inventory,
+        eq,
+        body.field,
+    )
+
+    tally: dict[str, Any] = {"written": None, "complete": None}
+    delimiter = _INVENTORY_SEPARATORS[body.separator]
+    ext = "tsv" if body.separator == "tab" else "csv"
+
+    # The one streamed-export slot is taken *here*, not inside the generator,
+    # and that placement is the whole point: it is held for the entire drain,
+    # which the analyst's browser paces, so a queued export can wait on it for
+    # as long as someone leaves a download backgrounded. Once the generator has
+    # started, the status code is already sent and the only way to report a
+    # busy server is a truncated 200. Taken before the response instead, a wait
+    # that runs out is a clean 503 — and the wait is bounded, because the
+    # generator runs on an anyio worker thread the rest of the app shares.
+    wait = get_settings().export_scan_queue_wait_seconds
+    if not await run_in_threadpool(_acquire_export_slot, wait):
+        raise HTTPException(
+            status_code=503,
+            detail="another value-inventory export is still streaming; try again shortly",
+            headers={"Retry-After": str(max(int(wait), 1))},
+        )
+
+    store = get_store()
+    try:
+        await _audit_inventory_export(
+            store, user, case_id, timeline_id, body, columns, expected, source_offsets
+        )
+    except BaseException:
+        # Nothing will drain the stream, so nothing will release the slot.
+        EXPORT_SCAN_GATE.release()
+        raise
+
+    async def _audit_completeness() -> None:
+        await store.record_audit(
+            action="events.export.field_inventory.result",
+            actor=user,
+            case_id=case_id,
+            target_type="timeline",
+            target_id=timeline_id,
+            detail={
+                "field": body.field,
+                "expected": expected,
+                "written": tally["written"],
+                "complete": tally["complete"],
+            },
+        )
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", body.field).strip("_") or "field"
+    filename = f"{case_id}-{timeline_id}-{slug}-inventory.{ext}"
+    return StreamingResponse(
+        _stream_field_inventory(
+            eq,
+            body.field,
+            columns=columns,
+            delimiter=delimiter,
+            order_by=body.order_by,
+            applied_offsets=source_offsets,
+            expected=expected,
+            tally=tally,
+        ),
+        media_type="text/tab-separated-values" if ext == "tsv" else "text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         background=BackgroundTask(_audit_completeness),
     )

@@ -87,6 +87,9 @@ The current vocabulary is defined and implemented in
 - Saved views per case.
 - Multi-select events and add tags/comments.
 - Export filtered results or full annotated timeline as CSV/JSONL.
+- Export a value inventory of any field — each distinct value with its count and the
+  first and last time it was seen — over the same filtered view, with the columns and
+  separator the analyst picks.
 - Time histogram and per-source color stripes in the Explorer.
 - Chart-based visualization of any aggregation (`docs/ROADMAP.md` tracks the remaining
   chart families).

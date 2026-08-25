@@ -16,11 +16,24 @@
 # a new project name from it and bring up an empty stack next to the old data.
 # Set COMPOSE_PROJECT_NAME in .env to adopt an install that used another name.
 
+# MEMORY LIMITS are set below, sized for a 32 GiB host and overridable per service
+# via the VESTIGO_*_MEM_LIMIT variables in .env. They were missing entirely from this
+# file until 1.15 — the repository's own docker-compose.yml at least carried them
+# commented out, but *this* is the file that reaches production, and it shipped with
+# nothing bounding any service. With no container limit ClickHouse derives its own
+# ceiling from 0.9 x the RAM it detects, which in an unlimited container is the whole
+# host, shared with three other services; it grows past what is free and the kernel
+# SIGKILLs it (`exited with code 137`) leaving no memory error in ClickHouse's log,
+# and `restart: unless-stopped` brings it straight back. Raise these to fit your box;
+# do not remove them. See docs/DEPLOYMENT.md "Resource sizing".
+
 name: vestigo
 
 services:
   postgres:
     image: docker.io/library/postgres:17-alpine
+    # Metadata only — never holds events.
+    mem_limit: ${VESTIGO_POSTGRES_MEM_LIMIT:-4g}
     environment:
       POSTGRES_USER: vestigo
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vestigo}
@@ -36,9 +49,19 @@ services:
 
   clickhouse:
     image: docker.io/clickhouse/clickhouse-server:26.6.1.1193-alpine
+    # The service that holds every event, and the one the kernel kills first.
+    # memswap_limit pins swap off: a swapping ClickHouse is worse than a
+    # failing one.
+    mem_limit: ${VESTIGO_CLICKHOUSE_MEM_LIMIT:-12g}
+    memswap_limit: ${VESTIGO_CLICKHOUSE_MEM_LIMIT:-12g}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse/allow-default-network.xml:/etc/clickhouse-server/users.d/zz-allow-default-network.xml:ro,z
+      # Server-side ceiling. The cgroup limit above only decides who the kernel
+      # kills; this decides whether ClickHouse throttles itself first, and it is
+      # the only layer that bounds background merges — which no per-query cap
+      # reaches. Keep it under mem_limit and edit the two together.
+      - ./clickhouse/memory.xml:/etc/clickhouse-server/config.d/zz-memory.xml:ro,z
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 5s
@@ -49,6 +72,8 @@ services:
 
   qdrant:
     image: docker.io/qdrant/qdrant:v1.18.2
+    # Only carries weight when embeddings are enabled; scales with vector count.
+    mem_limit: ${VESTIGO_QDRANT_MEM_LIMIT:-4g}
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
@@ -73,6 +98,12 @@ services:
     # `localhost/`, which is why only docker hosts saw it. Writing the name fully
     # qualified makes both engines agree, and nothing ever pulls it.
     image: localhost/vestigo-app:${VESTIGO_IMAGE_TAG:?set VESTIGO_IMAGE_TAG in .env}
+    # Ingestion batches, export buffering and any converter subprocess live
+    # here. A converter that outgrows this is killed inside the container
+    # rather than taking the host down, which is the intended trade — keep
+    # VESTIGO_CONVERTER_RUN_MEMORY_MB under it so the guarded runner reports
+    # the failure itself instead.
+    mem_limit: ${VESTIGO_APP_MEM_LIMIT:-4g}
     ports:
       - "${VESTIGO_BIND:-0.0.0.0}:${VESTIGO_PORT:-8080}:8080"
     env_file:

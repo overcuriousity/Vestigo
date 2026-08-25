@@ -36,7 +36,7 @@ import asyncio
 import zlib
 from typing import TYPE_CHECKING, Any
 
-from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+from vestigo.db._scan import heavy_scan_settings
 
 # Top-level categorical columns tracked in the payload — single-sourced from
 # the anomaly recommender, whose inventory this cache replaces.
@@ -161,7 +161,7 @@ def compute_source_field_stats(
         for col in _NOVELTY_CANDIDATE_TOP_LEVEL
     ]
     top_res = clickhouse.client.query(
-        f"SELECT {', '.join(agg_parts)} FROM {db}.events WHERE {where} {HEAVY_SCAN_SETTINGS}",
+        f"SELECT {', '.join(agg_parts)} FROM {db}.events WHERE {where} {heavy_scan_settings()}",
         parameters=params,
     )
     if top_res.result_rows:
@@ -185,7 +185,7 @@ def compute_source_field_stats(
         GROUP BY k
         ORDER BY cov DESC
         LIMIT {{max_keys:UInt32}}
-        {HEAVY_SCAN_SETTINGS}
+        {heavy_scan_settings()}
         """,
         parameters={**params, "max_keys": _MAX_ATTR_KEYS_PER_SOURCE},
     )
@@ -210,7 +210,7 @@ def compute_source_field_stats(
         GROUP BY k, v
         ORDER BY k, c DESC, v ASC
         LIMIT {{n_vals:UInt32}} BY k
-        {HEAVY_SCAN_SETTINGS}
+        {heavy_scan_settings()}
         """,
         parameters={**params, "n_vals": _TOP_VALUES_PER_FIELD},
     )
@@ -230,7 +230,7 @@ def compute_source_field_stats(
             GROUP BY k, v
             ORDER BY k, c DESC, v ASC
             LIMIT {{n_vals:UInt32}} BY k
-            {HEAVY_SCAN_SETTINGS}
+            {heavy_scan_settings()}
             """,
             parameters={**params, "vkeys": value_keys, "n_vals": _TOP_VALUES_PER_FIELD},
         )
