@@ -15,7 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vestigo import __version__
+from vestigo.api import scan_exec
 from vestigo.api.deps import get_store, resolve_user_optional
+from vestigo.api.request_context import RequestContextMiddleware
 from vestigo.api.routers import (
     admin,
     agent,
@@ -710,6 +712,11 @@ def create_app() -> FastAPI:
     # and 401 responses, instead of AuthAuditMiddleware short-circuiting
     # them first with a bare, header-less 401.
     app.add_middleware(AuthAuditMiddleware)
+    # Binds the Request into a contextvar for every HTTP request so
+    # scan_exec.run_scan can watch it for a disconnect. Order relative to the
+    # auth gate is immaterial — it sets a variable and passes through.
+    app.add_middleware(RequestContextMiddleware)
+    scan_exec.install(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://localhost:8080"],
