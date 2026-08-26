@@ -438,7 +438,12 @@ async def _probe_scan_budget() -> None:
     ceiling, bounded = resolve_clickhouse_ceiling(facts)
     cache_bytes, cache_breakdown = resolve_cache_bytes(facts)
     configure_scan_budget(ceiling, bounded, cache_bytes, cache_breakdown)
-    configure_scan_threads(int(facts.get("resolved_max_threads", 0) or 0) or None)
+    configure_scan_threads(
+        int(facts.get("resolved_max_threads", 0) or 0) or None,
+        # A server that answered but did not say which kind of value it gave is
+        # treated as auto, which is what every unpinned ClickHouse reports.
+        is_auto=bool(facts.get("max_threads_is_auto", 1)),
+    )
     report = scan_budget_report()
     if report["risk"] == "unbounded":
         logger.warning(

@@ -314,8 +314,7 @@ services are resident. The app now says so, loudly, at startup and in
 ```json
 {"risk": "ok", "per_query_bytes": 2576980377, "total_bytes": 5153960754,
  "cache_bytes": 3758096384, "cache_breakdown": {"mark_cache_size": 2147483648,
- "index_mark_cache_size": 536870912, "primary_index_cache_size": 1073741824,
- "uncompressed_cache_size": 0, "index_uncompressed_cache_size": 0},
+ "index_mark_cache_size": 536870912, "primary_index_cache_size": 1073741824},
  "headroom_bytes": 1288490190, "clickhouse_ceiling_bytes": 10200547328,
  "clickhouse_ceiling_is_explicit": true, "budget_ceiling_bytes": 10200547328,
  "local_detected_bytes": 34359738368, "source": "clickhouse", "concurrency": 2,
@@ -344,7 +343,10 @@ services are resident. The app now says so, loudly, at startup and in
 `max_threads` is per-scan thread width. At `VESTIGO_STAT_SCAN_MAX_THREADS=0` (the
 default) it is `detected_cores ÷ concurrency`, floor 2, where `detected_cores` is what
 ClickHouse resolves for itself — cgroup-CPU-quota aware, so a `--cpus=2` container
-reports 2. `max_threads_source` is `pinned`, `clickhouse`, or `fallback` (the probe
+reports 2. `max_threads_source` is `pinned` (`VESTIGO_STAT_SCAN_MAX_THREADS`),
+`clickhouse_pinned` (an operator pinned `max_threads` in a ClickHouse profile — that
+is a thread limit, not a core count, so it is honoured as written and *not* divided by
+`concurrency`, and `detected_cores` is `null`), `clickhouse`, or `fallback` (the probe
 failed; the width is the former constant 8).
 
 `concurrency` is the size the admission gate was built with at startup, which is also

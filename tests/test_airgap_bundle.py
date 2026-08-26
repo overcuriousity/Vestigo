@@ -346,14 +346,49 @@ def test_install_refuses_to_start_without_the_memory_ceiling(tmp_path):
     """
     bundle = _fake_bundle(tmp_path, ALL_IMAGES)
     (bundle / "clickhouse/memory.xml").unlink()
+    # And out of the manifest, so the installer's own guard is what refuses.
+    # Leaving it listed makes the checksum step fail first — which is a correct
+    # refusal for a *damaged* bundle, but it is not this one, and it is what
+    # made this test pass while the guard it names was unreachable.
+    manifest = bundle / "MANIFEST.sha256"
+    manifest.write_text(
+        "".join(line for line in manifest.read_text().splitlines(True) if "memory.xml" not in line)
+    )
     bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
 
     result = _run_install(bundle, bin_dir, tmp_path / "opt")
 
     assert result.returncode != 0
-    assert "memory.xml" in result.stderr
+    # The installer's own message, not `cp: cannot stat`. Under `set -e` the
+    # copy aborts first unless the guard runs ahead of it, and a bare `cp` error
+    # names neither the cause nor the remedy — while still satisfying a test
+    # that only looked for the filename.
+    assert "no clickhouse/memory.xml" in result.stderr
+    assert "memory ceiling" in result.stderr
+    assert "cannot stat" not in result.stderr
     # No log at all is the strongest form of "the stack was never started": the
     # fake engine writes it on first invocation.
+    started = log.read_text() if log.exists() else ""
+    assert "compose up" not in started, "the stack must not have been started"
+
+
+def test_install_refuses_when_a_previous_run_left_a_mount_target_directory(tmp_path):
+    """The second failure shape: Docker materialised the missing bind source as
+    an empty *directory* at the target, so the file is there in name only. The
+    copy over it fails with `cannot overwrite directory`, which tells an
+    operator nothing about what to remove.
+    """
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+    install_dir = tmp_path / "opt"
+    (install_dir / "clickhouse" / "memory.xml").mkdir(parents=True)
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode != 0
+    assert "is a directory" in result.stderr
+    assert "rm -rf" in result.stderr
+    assert "cannot overwrite" not in result.stderr
     started = log.read_text() if log.exists() else ""
     assert "compose up" not in started, "the stack must not have been started"
 

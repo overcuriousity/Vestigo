@@ -98,8 +98,9 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   app reads the ceiling ClickHouse runs under (`system.server_settings`, falling
   back to `system.asynchronous_metrics`) **and the cache maxima that live under
   that ceiling** (`mark_cache_size`, `index_mark_cache_size`,
-  `primary_index_cache_size`, `uncompressed_cache_size`,
-  `index_uncompressed_cache_size`), subtracts the caches, and takes
+  `primary_index_cache_size` — the two `uncompressed` caches are excluded
+  because `use_uncompressed_cache` is off by default, so their maxima are never
+  allocated), subtracts the caches, and takes
   `VESTIGO_STAT_SCAN_MEMORY_RATIO` of what remains — leaving the rest as headroom
   for background merges, which no per-query cap reaches. Counting the caches is
   not optional bookkeeping: at 26.6 defaults `index_mark_cache_size` and

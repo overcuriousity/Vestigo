@@ -34,11 +34,14 @@ def _no_probed_ceiling():
         _scan._clickhouse_cache_bytes,
         _scan._clickhouse_cache_breakdown,
     )
+    threads = (_scan._clickhouse_cores, _scan._clickhouse_pinned_max_threads)
     _scan.configure_scan_budget(None, bounded=False)
+    _scan.configure_scan_threads(None)
     yield
     _scan.configure_scan_budget(
         saved[0], bounded=saved[1], cache_bytes=saved[2], cache_breakdown=saved[3]
     )
+    _scan._clickhouse_cores, _scan._clickhouse_pinned_max_threads = threads
 
 
 def test_explicit_value_pins_the_budget():
@@ -572,17 +575,27 @@ def test_merge_wait_is_skipped_when_the_apply_wrote_no_parts():
 
 # ── Caches share the ceiling the budget is taken from ───────────────────────
 
+
+def _settings_with(monkeypatch, **overrides):
+    """`get_settings()` patched for one test.
+
+    Patched rather than set through `set_runtime_overrides`, for the same reason
+    `_report_with` injects its budget directly: a repository `.env` pins these
+    variables, and an environment value always beats the runtime-override layer.
+    """
+    edited = _scan.get_settings().model_copy(update=overrides)
+    monkeypatch.setattr(_scan, "get_settings", lambda: edited)
+
+
 _CACHE_FACTS = {
     "mark_cache_size": 2 << 30,
     "index_mark_cache_size": 512 << 20,
     "primary_index_cache_size": 1 << 30,
-    "uncompressed_cache_size": 0,
-    "index_uncompressed_cache_size": 0,
 }
 
 
 def test_cache_bytes_sums_only_the_caches_a_mergetree_scan_fills():
-    """The server ships many cache settings; five of them are ours.
+    """The server ships many cache settings; three of them are ours.
 
     Summing text-index/vector/iceberg/parquet cache maxima would report
     `over_budget` forever on a stack that never allocates any of them.
@@ -594,6 +607,26 @@ def test_cache_bytes_sums_only_the_caches_a_mergetree_scan_fills():
     assert total == (2 << 30) + (512 << 20) + (1 << 30)
     assert set(breakdown) == set(_CACHE_FACTS)
     assert breakdown["mark_cache_size"] == 2 << 30
+
+
+def test_the_uncompressed_caches_are_not_counted():
+    """They are gated on `use_uncompressed_cache`, which is off by default, so a
+    stock server reports an 8 GiB maximum it never allocates a byte of. Counting
+    it took 8 GiB off the budget of every ClickHouse not mounting our memory.xml
+    — which is every externally managed one — and could invent an
+    `over_budget`.
+    """
+    total, breakdown = _scan.resolve_cache_bytes(
+        {
+            **_CACHE_FACTS,
+            "uncompressed_cache_size": 8 << 30,
+            "index_uncompressed_cache_size": 5 << 30,
+        }
+    )
+
+    assert total == (2 << 30) + (512 << 20) + (1 << 30)
+    assert "uncompressed_cache_size" not in breakdown
+    assert "index_uncompressed_cache_size" not in breakdown
 
 
 def test_cache_bytes_is_zero_when_the_probe_said_nothing():
@@ -617,12 +650,64 @@ def test_budget_is_a_ratio_of_what_is_left_after_caches():
 def test_caches_larger_than_the_ceiling_do_not_produce_a_negative_budget():
     """26.6's own defaults are 12 GiB of cache maxima under a 9.5 GiB ceiling —
     the exact condition the shipped memory.xml fix addresses, and one an operator
-    can recreate at any time. The budget floors at the conservative fallback
-    rather than going negative or to zero."""
-    assert (
-        _scan._resolve_scan_memory_budget(0, 0.8, 9 << 30, concurrency=2, caches=12 << 30)
-        == _FALLBACK_MAX_MEMORY_BYTES // 2
+    can recreate at any time. The budget floors rather than going negative or to
+    zero (which ClickHouse reads as *unlimited*)."""
+    budget = _scan._resolve_scan_memory_budget(0, 0.8, 64 << 30, concurrency=2, caches=96 << 30)
+
+    assert budget == _FALLBACK_MAX_MEMORY_BYTES // 2
+
+
+def test_over_committed_caches_never_raise_the_budget():
+    """The failure the fallback introduced: on a ceiling smaller than the
+    fallback constant, "the caches alone exceed the ceiling" *increased* the
+    authorized memory — an 8 GiB app container went from 6.4 GB to 12 GB
+    precisely because its configuration was found to be over-committed.
+    Subtracting the caches may only ever lower the budget.
+    """
+    ceiling = 8 << 30
+    without_caches = _scan._resolve_scan_memory_budget(0, 0.8, ceiling, concurrency=1)
+    over_committed = _scan._resolve_scan_memory_budget(
+        0, 0.8, ceiling, concurrency=1, caches=23 << 30
     )
+
+    assert over_committed <= without_caches
+    assert over_committed == int(ceiling * 0.8)
+
+
+def test_the_budget_is_never_zero():
+    """`max_memory_usage = 0` is *unlimited* in ClickHouse, so a degenerate
+    ceiling has to fail queries rather than remove the cap."""
+    assert _scan._resolve_scan_memory_budget(0, 0.8, 1, concurrency=2, caches=64 << 30) == 1
+
+
+def test_clickhouse_caches_are_not_subtracted_from_the_apps_own_memory(monkeypatch):
+    """`scan_memory_ceiling` falls back to local detection — the *app*
+    container's RAM — whenever the probe never ran or an unbounded ClickHouse
+    ceiling was capped by it. ClickHouse's cache maxima do not live under that
+    number, and subtracting them from it once sent a 4 GiB app container past
+    zero and into a 12 GB fallback: 3.75x the budget it had before the caches
+    were counted at all.
+    """
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 4 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", None)
+    monkeypatch.setattr(_scan, "_clickhouse_cache_bytes", 23 << 30)
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 1)
+    _settings_with(monkeypatch, stat_scan_max_memory_bytes=0, stat_scan_memory_ratio=0.8)
+
+    assert _scan.detect_scan_memory_budget() == int((4 << 30) * 0.8)
+
+
+def test_clickhouse_caches_are_subtracted_from_clickhouses_own_ceiling(monkeypatch):
+    """The case the subtraction exists for: the ceiling being sized against is
+    the one the caches actually sit under."""
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_ceiling", 10 << 30)
+    monkeypatch.setattr(_scan, "_clickhouse_bounded", True)
+    monkeypatch.setattr(_scan, "_clickhouse_cache_bytes", 2 << 30)
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 1)
+    _settings_with(monkeypatch, stat_scan_max_memory_bytes=0, stat_scan_memory_ratio=0.8)
+
+    assert _scan.detect_scan_memory_budget() == int((8 << 30) * 0.8)
 
 
 def test_report_counts_caches_against_the_ceiling(monkeypatch):
@@ -657,17 +742,6 @@ def test_report_is_ok_when_scans_and_caches_both_fit(monkeypatch):
 
 
 # ── Thread width follows the cores ClickHouse actually has ──────────────────
-
-
-def _settings_with(monkeypatch, **overrides):
-    """`get_settings()` patched for one test.
-
-    Patched rather than set through `set_runtime_overrides`, for the same reason
-    `_report_with` injects its budget directly: a repository `.env` pins these
-    variables, and an environment value always beats the runtime-override layer.
-    """
-    edited = _scan.get_settings().model_copy(update=overrides)
-    monkeypatch.setattr(_scan, "get_settings", lambda: edited)
 
 
 def test_auto_thread_width_is_an_even_share_of_the_cores(monkeypatch):
@@ -719,3 +793,37 @@ def test_report_discloses_the_thread_width_and_where_it_came_from(monkeypatch):
     assert report["detected_cores"] == 20
     assert report["max_threads"] == _scan.detect_scan_max_threads()
     assert report["max_threads_source"] == "clickhouse"
+
+
+def test_a_server_side_pin_is_a_thread_limit_not_a_core_count(monkeypatch):
+    """`system.settings.max_threads` reports `auto(N)` — a core count — unless an
+    operator pinned it in a profile, in which case it is already the width they
+    asked for. Dividing it by the gate again ran scans at a quarter of the
+    configured width on a 32-core host and reported the 8 as `detected_cores`.
+    """
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 2)
+    _settings_with(monkeypatch, stat_scan_max_threads=0)
+    _scan.configure_scan_threads(8, is_auto=False)
+
+    assert _scan.detect_scan_max_threads() == 8
+
+    report = _scan.scan_budget_report()
+    assert report["max_threads_source"] == "clickhouse_pinned"
+    assert report["detected_cores"] is None, "a thread limit is not a core count"
+
+
+def test_an_auto_value_is_still_divided_across_the_gate(monkeypatch):
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 2)
+    _settings_with(monkeypatch, stat_scan_max_threads=0)
+    _scan.configure_scan_threads(8, is_auto=True)
+
+    assert _scan.detect_scan_max_threads() == 4
+    assert _scan.scan_budget_report()["detected_cores"] == 8
+
+
+def test_our_own_pin_still_beats_a_server_side_one(monkeypatch):
+    _settings_with(monkeypatch, stat_scan_max_threads=6)
+    _scan.configure_scan_threads(8, is_auto=False)
+
+    assert _scan.detect_scan_max_threads() == 6
+    assert _scan.scan_budget_report()["max_threads_source"] == "pinned"

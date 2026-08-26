@@ -11,17 +11,19 @@ from __future__ import annotations
 
 import pytest
 
-from vestigo.db._scan import parse_resolved_max_threads
+from vestigo.db._scan import _COUNTED_CACHES, parse_max_threads_setting, resolve_cache_bytes
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("'auto(12)'", 12),  # what the HTTP interface returns, quotes included
-        ("auto(12)", 12),  # what the native client returns
-        ("auto(2)", 2),  # verified under `--cpus=2`
-        ("16", 16),  # an operator pinned it server-side
-        ("'16'", 16),
+        ("'auto(12)'", (12, True)),  # what the HTTP interface returns, quotes included
+        ("auto(12)", (12, True)),  # what the native client returns
+        ("auto(2)", (2, True)),  # verified under `--cpus=2`
+        # An operator pinned it server-side: a thread limit, not a core count,
+        # which is why `is_auto` is reported rather than the two collapsed.
+        ("16", (16, False)),
+        ("'16'", (16, False)),
         ("auto(0)", None),  # nonsense N is not a core count
         ("0", None),
         ("auto()", None),
@@ -30,8 +32,8 @@ from vestigo.db._scan import parse_resolved_max_threads
         ("auto(abc)", None),
     ],
 )
-def test_parse_resolved_max_threads(raw, expected):
-    assert parse_resolved_max_threads(raw) == expected
+def test_parse_max_threads_setting(raw, expected):
+    assert parse_max_threads_setting(raw) == expected
 
 
 def test_probe_reads_caches_and_core_count_from_a_real_server():
@@ -46,7 +48,18 @@ def test_probe_reads_caches_and_core_count_from_a_real_server():
     facts = ClickHouseStore().server_resource_facts()
 
     assert facts, "the probe answered at all"
-    assert "mark_cache_size" in facts
-    assert "index_mark_cache_size" in facts
-    assert "primary_index_cache_size" in facts
+    for name in _COUNTED_CACHES:
+        assert name in facts, f"{name} is not a setting this server has"
     assert facts.get("resolved_max_threads", 0) >= 1
+    assert "max_threads_is_auto" in facts
+
+
+def test_the_probe_does_not_read_caches_it_does_not_count():
+    """Every name in the query has to end up in the breakdown an operator acts
+    on. A fact nobody counts is one the next reader has to work out is inert."""
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    facts = ClickHouseStore().server_resource_facts()
+    _, breakdown = resolve_cache_bytes(facts)
+
+    assert set(breakdown) == set(_COUNTED_CACHES)

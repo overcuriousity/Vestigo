@@ -47,6 +47,24 @@ describe("ScanBudgetCard", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(/kernel/i);
   });
 
+  it("distinguishes a ClickHouse-side thread pin from a resolved core count", () => {
+    // A pinned `max_threads` is a thread limit, so it is honoured as written
+    // and there is no core count to attribute it to.
+    render(
+      <ScanBudgetCard
+        budget={{
+          ...base,
+          max_threads: 8,
+          max_threads_source: "clickhouse_pinned",
+          detected_cores: null,
+        }}
+      />,
+    );
+    expect(screen.getByText(/8 threads per scan/i)).toBeInTheDocument();
+    expect(screen.getByText(/ClickHouse's own profile/i)).toBeInTheDocument();
+    expect(screen.queryByText(/cores ClickHouse reports/i)).not.toBeInTheDocument();
+  });
+
   it("discloses a concurrency edit waiting for a restart", () => {
     render(<ScanBudgetCard budget={{ ...base, pending_concurrency: 4 }} />);
     expect(screen.getByText(/restart/i)).toBeInTheDocument();

@@ -68,9 +68,11 @@ export function ScanBudgetCard({ budget }: { budget: ScanBudget | undefined }) {
           {budget.max_threads} threads per scan (
           {budget.max_threads_source === "pinned"
             ? "pinned"
-            : budget.max_threads_source === "clickhouse"
-              ? `from ${budget.detected_cores} cores ClickHouse reports`
-              : "detection failed — fallback"}
+            : budget.max_threads_source === "clickhouse_pinned"
+              ? "pinned in ClickHouse's own profile"
+              : budget.max_threads_source === "clickhouse"
+                ? `from ${budget.detected_cores} cores ClickHouse reports`
+                : "detection failed — fallback"}
           ), budget from {budget.source} detection.
         </p>
         {budget.pending_concurrency !== null && (

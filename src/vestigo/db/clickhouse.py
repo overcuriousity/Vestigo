@@ -705,16 +705,19 @@ class ClickHouseStore:
           ``os_memory_total``;
         - the caches that live *under* that ceiling and are filled by a
           MergeTree scan workload: ``mark_cache_size``,
-          ``uncompressed_cache_size``, ``index_mark_cache_size``,
-          ``index_uncompressed_cache_size``, ``primary_index_cache_size``.
-          The server ships many more (``text_index_*``, ``vector_similarity_*``,
+          ``index_mark_cache_size``, ``primary_index_cache_size``. The server
+          ships many more (``text_index_*``, ``vector_similarity_*``,
           ``parquet_metadata_*``, ``iceberg_*``, ``unique_key_*``) for engines
-          and index types Vestigo does not use; counting those would make the
-          budget permanently and wrongly read as `over_budget`;
-        - ``resolved_max_threads``: the core count the server resolved for
-          itself. ``system.asynchronous_metrics`` has no CPU-count metric on
-          26.6, so this comes from ``system.settings`` — see
-          :func:`vestigo.db._scan.parse_resolved_max_threads`.
+          and index types Vestigo does not use, and the two ``uncompressed``
+          caches are gated on a query setting that is off by default; counting
+          any of those would make the budget wrongly read as `over_budget` on a
+          server that never allocates a byte of them;
+        - ``resolved_max_threads`` and ``max_threads_is_auto``: what the server
+          resolved ``max_threads`` to, and whether it derived that from its own
+          core count or an operator pinned it. ``system.asynchronous_metrics``
+          has no CPU-count metric on 26.6, so this comes from
+          ``system.settings`` — see
+          :func:`vestigo.db._scan.parse_max_threads_setting`.
 
         An empty dict means the probe failed — an old server, or a user without
         rights on the ``system`` tables — which is a reason to warn, never to
@@ -725,8 +728,7 @@ class ClickHouseStore:
             rows = self.client.query(
                 "SELECT name, value FROM system.server_settings WHERE name IN "
                 "('max_server_memory_usage', 'max_server_memory_usage_to_ram_ratio', "
-                "'mark_cache_size', 'uncompressed_cache_size', 'index_mark_cache_size', "
-                "'index_uncompressed_cache_size', 'primary_index_cache_size')"
+                "'mark_cache_size', 'index_mark_cache_size', 'primary_index_cache_size')"
             ).result_rows
             for name, value in rows:
                 # Float throughout: the ratio is 0.9, and reading it as an int
@@ -753,11 +755,13 @@ class ClickHouseStore:
                     "SELECT value FROM system.settings WHERE name = 'max_threads'"
                 ).result_rows
                 if threads:
-                    from vestigo.db._scan import parse_resolved_max_threads
+                    from vestigo.db._scan import parse_max_threads_setting
 
-                    resolved = parse_resolved_max_threads(threads[0][0])
-                    if resolved:
+                    parsed = parse_max_threads_setting(threads[0][0])
+                    if parsed:
+                        resolved, is_auto = parsed
                         facts["resolved_max_threads"] = float(resolved)
+                        facts["max_threads_is_auto"] = float(is_auto)
         except Exception:  # noqa: BLE001 — a failed probe must not block startup
             logger.warning("could not read ClickHouse resource limits", exc_info=True)
             return {}

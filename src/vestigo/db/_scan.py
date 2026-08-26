@@ -6,7 +6,8 @@ disk instead of ballooning RAM, cap the query's memory hard (fail one query,
 not the server), and bound thread fan-out so several concurrent scans don't
 oversubscribe the box (``VESTIGO_STAT_SCAN_MAX_THREADS`` at its 0 default derives
 that width from the cores ClickHouse reports for itself, divided by the gate's
-size — see :func:`detect_scan_max_threads`). The limits are ``VESTIGO_*`` tunables (see
+size — unless an operator pinned ``max_threads`` in a ClickHouse profile, which
+is that width already; see :func:`detect_scan_max_threads`). The limits are ``VESTIGO_*`` tunables (see
 ``core/config.py``).
 
 The memory budget is a **total across concurrent scans**, resolved from
@@ -158,9 +159,19 @@ def _resolve_scan_memory_budget(
         # rather than to zero (which would fail every scan) or to a negative cap
         # (which ClickHouse reads as "unlimited").
         total = _FALLBACK_MAX_MEMORY_BYTES
+        if detected and detected > 0:
+            # ...but never *above* what the ceiling alone would have allowed.
+            # The fallback constant is unrelated to the ceiling we have just
+            # found too small, so on a small one it is the larger number: an
+            # 8 GiB app container would go from 6.4 GB to 12 GB precisely
+            # because its caches were found to be over-committed. Subtracting
+            # the caches may only ever lower the budget.
+            total = min(total, int(detected * ratio))
     else:
         total = int(available * ratio)
-    return total // max(concurrency, 1)
+    # Never 0: ClickHouse reads `max_memory_usage = 0` as *unlimited*, so a
+    # degenerate ceiling must fail queries loudly rather than remove the cap.
+    return max(total // max(concurrency, 1), 1)
 
 
 #: What ClickHouse reported it is allowed to use, in bytes — set once by
@@ -202,24 +213,48 @@ _clickhouse_cache_breakdown: dict[str, int] = {}
 #: ``parquet_metadata_*``, ``iceberg_*``, ``unique_key_*``); those belong to
 #: engines and index types Vestigo does not use, and counting their maxima would
 #: report ``over_budget`` on a stack that never allocates a byte of them.
+#:
+#: ``uncompressed_cache_size`` and ``index_uncompressed_cache_size`` are left
+#: out for exactly the same reason, even though a scan workload *would* fill
+#: them if they were live: they are gated on the ``use_uncompressed_cache``
+#: query setting, which is off by default. A stock server therefore reports an
+#: 8 GiB ``uncompressed_cache_size`` it will never allocate a byte of, and
+#: counting it took 8 GiB off the scan budget of every deployment that does not
+#: mount our ``memory.xml`` — i.e. every externally managed ClickHouse — and
+#: could push it into a false ``over_budget``. The shipped ``memory.xml`` pins
+#: both to 0 so this premise cannot be turned over by an upgrade.
 _COUNTED_CACHES = (
     "mark_cache_size",
-    "uncompressed_cache_size",
     "index_mark_cache_size",
-    "index_uncompressed_cache_size",
     "primary_index_cache_size",
 )
 
 
-#: Cores ClickHouse resolved for itself (``system.settings.max_threads``,
-#: cgroup-quota aware), or ``None`` until the probe runs.
+#: Cores ClickHouse resolved for itself (``system.settings.max_threads``
+#: reported as ``auto(N)``, cgroup-quota aware), or ``None`` until the probe
+#: runs. Only ever a *core count* — a server-side pin lands in
+#: :data:`_clickhouse_pinned_max_threads` instead, because it is not one.
 _clickhouse_cores: int | None = None
 
+#: A ``max_threads`` an operator pinned in a ClickHouse profile: a thread limit,
+#: already the width they asked scans to run at. ``None`` unless the server
+#: reported a plain integer.
+_clickhouse_pinned_max_threads: int | None = None
 
-def configure_scan_threads(resolved_cores: int | None) -> None:
-    """Record the core count ClickHouse reported, for the auto thread width."""
-    global _clickhouse_cores  # noqa: PLW0603
-    _clickhouse_cores = int(resolved_cores) if resolved_cores and resolved_cores > 0 else None
+
+def configure_scan_threads(resolved: int | None, is_auto: bool = True) -> None:
+    """Record what the server said about ``max_threads``.
+
+    *is_auto* is what keeps the two apart: ``auto(N)`` is the core count
+    ClickHouse resolved for itself, from which the auto width is derived; a
+    plain integer is an operator's own thread limit, which is that width
+    already. Defaults to True so a caller that has only a core count (and no
+    reason to think otherwise) reads as before.
+    """
+    global _clickhouse_cores, _clickhouse_pinned_max_threads  # noqa: PLW0603
+    value = int(resolved) if resolved and resolved > 0 else None
+    _clickhouse_cores = value if is_auto else None
+    _clickhouse_pinned_max_threads = None if is_auto else value
 
 
 def detect_scan_max_threads() -> int:
@@ -232,6 +267,11 @@ def detect_scan_max_threads() -> int:
     The old constant 8 was wrong in both directions — 40% of a 20-core host, and
     4x oversubscription on a 4-core one (issue #301).
 
+    A ``max_threads`` pinned server-side is honoured as written and *not* divided
+    again: it is a thread limit, not a core count, so an operator who pinned 8 on
+    a 32-core host would otherwise get scans four threads wide — the opposite of
+    what they configured — while the report called 8 a core count.
+
     Floored at 2, because a whole-corpus GROUP BY running single-threaded is not
     a fallback anybody wants to land on silently, and capped at the core count
     for the degenerate case of a gate wider than the machine.
@@ -239,6 +279,8 @@ def detect_scan_max_threads() -> int:
     explicit = get_settings().stat_scan_max_threads
     if explicit > 0:
         return explicit
+    if _clickhouse_pinned_max_threads:
+        return _clickhouse_pinned_max_threads
     if not _clickhouse_cores:
         return _FALLBACK_MAX_THREADS
     return max(2, min(_clickhouse_cores, _clickhouse_cores // max(_GATE_CONCURRENCY, 1)))
@@ -267,14 +309,17 @@ _UNLIMITED_CGROUP = 1 << 60
 _AUTO_THREADS = re.compile(r"^'?(?:auto\((\d+)\)|(\d+))'?$")
 
 
-def parse_resolved_max_threads(value: str | None) -> int | None:
-    """The core count ClickHouse resolved for itself, from `system.settings`.
+def parse_max_threads_setting(value: str | None) -> tuple[int, bool] | None:
+    """``system.settings.max_threads`` as ``(value, is_auto)``.
 
-    ClickHouse 26.6 reports `max_threads` as ``'auto(N)'`` where N is the core
-    count it will actually use — cgroup-quota aware, which is the whole reason
-    to ask the server rather than count cores locally or count the per-core
+    ClickHouse 26.6 reports it as ``'auto(N)'`` where N is the core count it
+    will actually use — cgroup-quota aware, which is the whole reason to ask the
+    server rather than count cores locally or count the per-core
     ``OSUserTimeCPU*`` series (host cores, quota-blind). A server-side pin
-    reports a plain integer instead, which is equally the resolved value.
+    reports a plain integer instead, and that is a *thread limit*, not a core
+    count: the two are returned distinguishable rather than collapsed, because
+    the auto width divides one of them by the gate size and must not divide the
+    other (see :func:`detect_scan_max_threads`).
 
     Returns ``None`` for anything that is not a positive integer, so a future
     server that words this differently degrades to the fallback rather than to
@@ -285,8 +330,9 @@ def parse_resolved_max_threads(value: str | None) -> int | None:
     match = _AUTO_THREADS.match(str(value).strip())
     if not match:
         return None
-    resolved = int(match.group(1) or match.group(2))
-    return resolved if resolved > 0 else None
+    auto = match.group(1)
+    resolved = int(auto or match.group(2))
+    return (resolved, auto is not None) if resolved > 0 else None
 
 
 def resolve_clickhouse_ceiling(facts: Mapping[str, float]) -> tuple[int | None, bool]:
@@ -374,13 +420,30 @@ def scan_memory_ceiling() -> int | None:
     return min(_clickhouse_ceiling, local)
 
 
+def _cache_bytes_under(ceiling: int | None) -> int:
+    """The cache maxima that share *ceiling*, which is only ever ClickHouse's own.
+
+    :func:`scan_memory_ceiling` can return local detection instead — the *app*
+    process's cgroup limit or the machine's RAM — either because the probe never
+    ran or because an unbounded ClickHouse ceiling was capped by it. Subtracting
+    ClickHouse's cache maxima from the app container's memory total mixes two
+    unrelated quantities: an app in a 4 GiB container beside a default-configured
+    ClickHouse would go straight past zero into the fallback and end up with
+    *more* budget than before the caches were counted at all.
+    """
+    if _clickhouse_ceiling and ceiling == _clickhouse_ceiling:
+        return _clickhouse_cache_bytes
+    return 0
+
+
 def detect_scan_memory_budget() -> int:
     """Resolve the per-query ``max_memory_usage`` for heavy scans (see module docstring)."""
     s = get_settings()
+    ceiling = scan_memory_ceiling()
     return _resolve_scan_memory_budget(
         s.stat_scan_max_memory_bytes,
         s.stat_scan_memory_ratio,
-        scan_memory_ceiling(),
+        ceiling,
         # Deliberately the gate's own size, not the live setting. The divisor
         # and the semaphore describe one budget from two sides, and this is the
         # only value both can agree on: :data:`HEAVY_SCAN_GATE` is sized at
@@ -391,7 +454,7 @@ def detect_scan_memory_budget() -> int:
         # precisely the OOM the pair exists to prevent. `restart_required=True`
         # on the spec is what makes the frozen value honest, not enforcement.
         _GATE_CONCURRENCY,
-        _clickhouse_cache_bytes,
+        _cache_bytes_under(ceiling),
     )
 
 
@@ -467,8 +530,16 @@ def scan_budget_report() -> dict[str, Any]:
         "max_threads_source": (
             "pinned"
             if s.stat_scan_max_threads > 0
-            else ("clickhouse" if _clickhouse_cores else "fallback")
+            else (
+                "clickhouse_pinned"
+                if _clickhouse_pinned_max_threads
+                else ("clickhouse" if _clickhouse_cores else "fallback")
+            )
         ),
+        # Cores, and only ever cores. A `max_threads` pinned in a ClickHouse
+        # profile is reported as `clickhouse_pinned` above rather than here,
+        # because calling a thread limit a core count is how the width came to
+        # be divided by the gate twice.
         "detected_cores": _clickhouse_cores,
     }
 

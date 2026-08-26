@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from vestigo.db._scan import (
+    _COUNTED_CACHES,
     _resolve_scan_memory_budget,
     resolve_cache_bytes,
     resolve_clickhouse_ceiling,
@@ -54,13 +55,17 @@ def _shipped_facts() -> dict[str, float]:
 def test_shipped_memory_xml_pins_every_cache_we_count():
     """A cache left at its default is 5 GiB under a 9.5 GiB ceiling."""
     pinned = set(_pinned())
-    for name in (
-        "mark_cache_size",
-        "uncompressed_cache_size",
-        "index_mark_cache_size",
-        "primary_index_cache_size",
-    ):
+    for name in _COUNTED_CACHES:
         assert name in pinned, f"memory.xml leaves {name} at its ClickHouse default"
+
+
+def test_shipped_memory_xml_keeps_the_uncompressed_caches_off():
+    """They are *not* counted against the ceiling, because `use_uncompressed_cache`
+    is off by default and they are never populated. Pinning them to 0 is what
+    keeps that premise true here across a ClickHouse upgrade."""
+    pinned = _pinned()
+    for name in ("uncompressed_cache_size", "index_uncompressed_cache_size"):
+        assert pinned.get(name) == 0, f"{name} is not counted, so it must be off"
 
 
 def test_shipped_defaults_fit_under_their_own_ceiling():

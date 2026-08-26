@@ -60,8 +60,12 @@
        leaving one at its default visibly shrinks the scan budget instead of
        silently overcommitting the server.
 
-       The uncompressed caches are off. Stated rather than left at the default
-       so an upgrade cannot turn them on underneath this budget. -->
+       The uncompressed caches are off. They are the one pair Vestigo does not
+       count against the ceiling — they are gated on the `use_uncompressed_cache`
+       query setting, which is off by default, so a stock server reports an
+       8 GiB maximum it never allocates a byte of. Pinning them to 0 here is
+       what keeps that true: stated rather than left at the default so an
+       upgrade cannot turn them on underneath this budget. -->
   <mark_cache_size>2147483648</mark_cache_size>
   <uncompressed_cache_size>0</uncompressed_cache_size>
   <!-- 512 MiB / 1 GiB against 5 GiB each by default. Vestigo's scans are

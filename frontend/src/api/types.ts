@@ -1092,7 +1092,7 @@ export interface ScanBudget {
   concurrency: number;
   pending_concurrency: number | null;
   max_threads: number;
-  max_threads_source: "pinned" | "clickhouse" | "fallback";
+  max_threads_source: "pinned" | "clickhouse_pinned" | "clickhouse" | "fallback";
   detected_cores: number | null;
 }
 

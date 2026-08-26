@@ -2,9 +2,7 @@
   "bytes_per_event_on_disk": 220,
   "counted_caches": [
     "mark_cache_size",
-    "uncompressed_cache_size",
     "index_mark_cache_size",
-    "index_uncompressed_cache_size",
     "primary_index_cache_size"
   ],
   "default_concurrency": 2,
@@ -22,9 +20,7 @@
   "scan_working_set_bytes_per_million_events": 12582912,
   "shipped_caches": {
     "index_mark_cache_size": 536870912,
-    "index_uncompressed_cache_size": 0,
     "mark_cache_size": 2147483648,
-    "primary_index_cache_size": 1073741824,
-    "uncompressed_cache_size": 0
+    "primary_index_cache_size": 1073741824
   }
 }
