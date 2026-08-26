@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1] — 2026-08-26
+
+### Added
+
+- **The scan budget counts ClickHouse's own caches (#302).** `mark_cache_size`,
+  `index_mark_cache_size` and `primary_index_cache_size` are configured maxima under the same
+  ceiling the scan budget is taken of, and they were counted nowhere — so
+  `VESTIGO_STAT_SCAN_MEMORY_RATIO`'s promise that the remainder is headroom for merges and
+  caches was not true. The ratio is now taken of `ceiling − caches`, and `risk` compares
+  scans *plus* caches against the ceiling. At 26.6 defaults `index_mark_cache_size` and
+  `primary_index_cache_size` are 5 GiB **each**, so the stack we ship had 12 GiB of cache
+  maxima under a 9.5 GiB ceiling while `/api/health` reported `risk: "ok"`. The shipped
+  `memory.xml` now pins them; the reference stack fits, with merge headroom left, and
+  `tests/test_reference_stack_budget.py` keeps it that way. The two `uncompressed` caches are
+  deliberately *not* counted — they are gated on `use_uncompressed_cache`, which is off by
+  default, so their maxima are never allocated.
+- **Scan thread width follows the cores ClickHouse actually has (#301).**
+  `VESTIGO_STAT_SCAN_MAX_THREADS` defaults to 0 = auto: the cores ClickHouse resolves for
+  itself, divided by the admission gate's size, floor 2. The old constant 8 was wrong in both
+  directions — 40% of a 20-core host, and 4× oversubscription on a 4-core one. The count comes
+  from `system.settings.max_threads`, which is cgroup-CPU-quota aware (a `--cpus=2` container
+  reports `auto(2)`); a `max_threads` an operator pinned in a ClickHouse profile is a thread
+  limit rather than a core count, so it is honoured as written and not divided again.
+- **The scan-budget verdict is rendered where the settings are.** `risk` has been served on
+  `/api/health` and written to the startup log since 1.15, which is to say nobody saw it. It
+  now sits above the "Scans" group on the admin Settings page with the numbers behind it —
+  scans, caches, ceiling, headroom, thread width and where each came from.
+- **A sizing calculator** at `docs/sizing/` (GitHub Pages): corpus size and host shape in,
+  container limits, `memory.xml` values and scan settings out. Its constants are generated
+  from the app's own defaults and the shipped `memory.xml`, so a public sizing page cannot
+  recommend values the app stopped using.
+
+### Fixed
+
+- **The airgapped install ran with no ClickHouse ceiling (#303).** `install.sh` copied
+  `allow-default-network.xml` and silently not `memory.xml`, so the compose file's
+  `./clickhouse/memory.xml` bind-mount source did not exist — and Docker materialises a
+  missing bind source as an empty *directory* rather than failing. ClickHouse started, merged
+  no ceiling, and derived 0.9 × whatever RAM a limit-less container saw: the exact unbounded
+  condition 1.15 shipped to prevent, on the deployment that actually reaches production. The
+  installer now copies it, refuses to start without it (naming the remedy for both failure
+  shapes, before it touches anything), and a parity test holds the bundle script, the
+  installer and the compose mounts to each other.
+- **Counting the caches can only lower the budget.** With caches at or over the ceiling the
+  resolution fell back to a 12 GB constant, which is *larger* than the ratio gives on any
+  ceiling under 15 GB — so an 8 GiB deployment was authorized more memory precisely because
+  its configuration was found to be over-committed. The fallback is clamped to the ceiling it
+  is standing in for, and the result can never be 0, which ClickHouse reads as *unlimited*.
+- **ClickHouse's caches are no longer subtracted from the app's own memory.** The budget falls
+  back to local detection whenever the probe never ran or an unbounded ceiling was capped by
+  it; that number is the app container's RAM, which ClickHouse's caches do not live under.
+
+### Changed
+
+- CI and the release workflow run ClickHouse `26.6.1.1193`, the version `docker-compose.yml`
+  pins, instead of `24`.
+
 ## [1.15.0] — 2026-08-25
 
 ### Added

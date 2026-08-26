@@ -583,7 +583,11 @@ _SPECS: tuple[SettingSpec, ...] = (
         "stat_scan_max_threads",
         "scans",
         "Max threads per scan",
-        "ClickHouse max_threads for heavy detector/inventory scans.",
+        "ClickHouse max_threads for heavy detector/inventory scans. 0 = auto: an even share "
+        "of the cores ClickHouse reports for itself (cores / concurrent-scans, floor 2), so "
+        "a full admission gate saturates the box rather than oversubscribing it. Pin a value "
+        "only to override that. /api/health reports what resolved and whether it was "
+        "detected or pinned.",
     ),
     SettingSpec(
         "stat_scan_external_group_by_bytes",
@@ -612,9 +616,11 @@ _SPECS: tuple[SettingSpec, ...] = (
         "stat_scan_memory_ratio",
         "scans",
         "Auto-budget memory ratio",
-        "Fraction of ClickHouse's own memory ceiling the automatic budget uses. The "
-        "remainder is headroom for what a per-query cap cannot bound: background merges, "
-        "the mark and uncompressed caches, and allocator slack.",
+        "Fraction of what is left of ClickHouse's memory ceiling *after* its own caches "
+        "(mark, index-mark, primary-index, uncompressed) that the automatic budget uses. "
+        "The remainder is headroom for the one thing no per-query cap can bound: background "
+        "merges, plus allocator slack. /api/health reports the cache figure that went into "
+        "the subtraction.",
     ),
     SettingSpec(
         "enrichment_apply_merge_wait_seconds",

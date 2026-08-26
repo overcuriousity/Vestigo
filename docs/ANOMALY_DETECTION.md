@@ -79,7 +79,11 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   ranking are hydrated afterwards in one batched `get_events_by_ids` call
   (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
   event vanished mid-flight keeps a minimal `_stub_event` shape.
-- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
+- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads` auto-derived as
+  cores ÷ `VESTIGO_STAT_SCAN_CONCURRENCY` from the core count ClickHouse reports for
+  itself — `system.settings.max_threads`, which resolves `auto(N)` cgroup-quota-aware;
+  pin it with `VESTIGO_STAT_SCAN_MAX_THREADS`, and detection failure falls back to the
+  former constant 8,
   spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
   per-query cap), `max_memory_usage` = total budget / concurrency — the
   budget auto-sizes to `VESTIGO_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,
@@ -92,9 +96,17 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
 - **The budget comes from ClickHouse, not from the app's host.** At startup the
   app reads the ceiling ClickHouse runs under (`system.server_settings`, falling
-  back to `system.asynchronous_metrics`) and takes
-  `VESTIGO_STAT_SCAN_MEMORY_RATIO` of it, reserving the rest for merges and
-  caches. Measuring the app's *own* container instead is how a full-docker stack
+  back to `system.asynchronous_metrics`) **and the cache maxima that live under
+  that ceiling** (`mark_cache_size`, `index_mark_cache_size`,
+  `primary_index_cache_size` — the two `uncompressed` caches are excluded
+  because `use_uncompressed_cache` is off by default, so their maxima are never
+  allocated), subtracts the caches, and takes
+  `VESTIGO_STAT_SCAN_MEMORY_RATIO` of what remains — leaving the rest as headroom
+  for background merges, which no per-query cap reaches. Counting the caches is
+  not optional bookkeeping: at 26.6 defaults `index_mark_cache_size` and
+  `primary_index_cache_size` are 5 GiB *each*, so the reference stack's own
+  caches exceeded its whole 9.5 GiB ceiling while `/api/health` reported
+  `risk: "ok"`. Measuring the app's *own* container instead is how a full-docker stack
   authorized 25.6 GiB per query against a ClickHouse that shared the box with
   three other services (`docs/DEPLOYMENT.md` §"How this went unnoticed"). The
   clause is therefore built per query by `heavy_scan_settings()`, not frozen at

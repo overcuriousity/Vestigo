@@ -1,6 +1,81 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-25 (session 187 — PR #299 review fixes).
+Last updated: 2026-08-26 (session 189 — PR #304 review fixes).
+
+## Session 189 — 2026-08-26: PR #304 review fixes (scan-budget accounting)
+
+Five findings from the review of the session-188 branch, four of them in the new cache
+accounting itself.
+
+- **The fallback could raise the budget.** With the caches at or over the ceiling,
+  `_resolve_scan_memory_budget` fell back to the 12 GB constant — larger than the ratio
+  would have given on any ceiling under 15 GB. An 8 GiB app container went from 6.4 GB
+  to 12 GB *because* its configuration was found to be over-committed. The fallback is
+  now clamped to `ratio × detected`, so subtracting the caches can only ever lower the
+  budget, and the result can never be 0 (which ClickHouse reads as unlimited).
+- **The caches were subtracted from the wrong ceiling.** `scan_memory_ceiling()` returns
+  local detection — the *app* container's RAM — whenever the probe never ran or an
+  unbounded ClickHouse ceiling was capped by it. ClickHouse's cache maxima do not live
+  under that number; `_cache_bytes_under` now applies them only to ClickHouse's own.
+- **`uncompressed_cache_size` is never allocated.** It is gated on
+  `use_uncompressed_cache`, which is off by default, so a stock server reports an 8 GiB
+  maximum it never touches. Counting it took 8 GiB off the budget of every externally
+  managed ClickHouse and could invent an `over_budget`. Both uncompressed caches are out
+  of `_COUNTED_CACHES` and out of the probe query; `memory.xml` still pins them to 0 so
+  the premise survives an upgrade.
+- **A server-pinned `max_threads` is not a core count.** `auto(N)` is; a plain integer is
+  an operator's thread limit, and dividing it by the gate ran scans at a quarter of the
+  configured width while reporting it as `detected_cores`. `parse_max_threads_setting`
+  now returns `(value, is_auto)`, a pin is honoured verbatim, and the report says
+  `clickhouse_pinned` with `detected_cores: null`.
+- **The airgap `memory.xml` guard was unreachable.** Under `set -e` the `cp` aborted
+  first, on both failure shapes, with a `cp:` line naming no cause. The guard now runs
+  ahead of the copy (bundle side and mount-target side). Its test passed anyway — twice
+  over: it asserted only `returncode != 0` and the string `memory.xml`, and the bundle it
+  built failed the manifest check before ever reaching the installer.
+
+CI and the release workflow now run ClickHouse `26.6.1.1193` (the glibc build of the tag
+`docker-compose.yml` pins) instead of `24`, which is what surfaced this: `24` has no
+`primary_index_cache_size`, so the probe test asserted a name the server under test did
+not have.
+
+## Session 188 — 2026-08-25: Scan-budget truthfulness (#301, #302, #303)
+
+`scan_budget.risk` reported `ok` for a configuration that does not fit, including the one
+we ship. Three defects, one probe.
+
+- **Caches were never counted** (#302). The ratio is now taken of
+  `ceiling − caches`, which is what `stat_scan_memory_ratio`'s own help text always
+  claimed, and `risk` compares `scans + caches` against the ceiling. The issue's own
+  table understated it: at 26.6 defaults `index_mark_cache_size` and
+  `primary_index_cache_size` are 5 GiB *each*, so the reference stack's caches (12 GiB)
+  exceeded its whole 9.5 GiB ceiling. `memory.xml` now pins both; caches total 3.5 GiB
+  and the stack fits, with 1.2 GiB of merge headroom, asserted by
+  `tests/test_reference_stack_budget.py`.
+- **Thread width was a constant** (#301). `stat_scan_max_threads` defaults to 0 = auto:
+  cores ÷ concurrency, floor 2. The issue proposed reading CPU counts from
+  `system.asynchronous_metrics`; 26.6 has none — no `CGroupMaxCPU`, no `OSNProcessors`.
+  The real source is `system.settings.max_threads`, which reports `auto(N)` and *is*
+  cgroup-quota aware (verified: `--cpus=2` → `auto(2)`).
+- **The airgap install never had a ceiling** (#303). `install.sh` copied
+  `allow-default-network.xml` and not `memory.xml`, so the compose bind-mount source did
+  not exist and Docker made an empty directory of it. Fixed, plus a `-f` pre-flight
+  assertion, `--check` coverage, and a parity test between the bundle script, the
+  installer and the compose mounts. `risk` is now rendered on the admin Settings page,
+  since a startup log line is what nobody reads.
+
+Design round: `docs/superpowers/specs/2026-08-25-scan-budget-truthfulness.md`.
+
+Alongside: a **sizing calculator** at `docs/sizing/` (GitHub Pages, linked from the README).
+It turns an expected dataset size, analyst count and deployment shape into recommended RAM,
+cores and `VESTIGO_*` values, using the same arithmetic `db/_scan.py` uses — its constants are
+*generated* from `core/config.py`, `db/_scan.py` and `memory.xml` by
+`scripts/gen_sizing_constants.py`, with a parity test, so a public sizing page cannot recommend
+values the app stopped using. Sizing numbers only, deliberately: an operator who pastes a
+generated config has skipped the file that explains what the numbers mean.
+
+Issue #300 (foreground histograms queuing behind detector sweeps in the shared gate)
+stays open: it changes hot-path query behaviour and gets its own round.
 
 ## Session 187 — 2026-08-25: PR #299 review — the scan-budget half
 

@@ -55,6 +55,11 @@ and everything else works normally.
 For production hardening, containerized deployment, airgapped installation, TLS and upgrade
 guarantees, see [Deployment](docs/DEPLOYMENT.md).
 
+**Sizing a box first?** The [sizing calculator](https://overcuriousity.github.io/Vestigo/sizing/)
+turns an expected dataset size and analyst count into recommended RAM, cores and `VESTIGO_*`
+values. It is a starting point — `/api/health`'s `scan_budget` block reports what actually
+resolved on the machine you deploy to.
+
 ## Capabilities
 
 - **Ingestion at scale** — streaming parsers for Plaso and generic CSV/JSONL take tens of
@@ -132,6 +137,7 @@ The full comparison, including what we hold narrower on purpose, is in
 
 - [Concept](docs/CONCEPT.md) — vision, target user, data model summary
 - [Deployment](docs/DEPLOYMENT.md) — compose stack, airgapped install, TLS, upgrades
+- [Sizing calculator](https://overcuriousity.github.io/Vestigo/sizing/) — hardware and `VESTIGO_*` values from your expected dataset size
 - [Input Formats](docs/INPUT_FORMATS.md) — CSV/JSONL/Parquet field-level normalization spec
 - [Anomaly Detection](docs/ANOMALY_DETECTION.md) — every detector explained, plain language
 - [Stories](docs/STORIES.md) — the living report: blocks, collaboration, hashed export

@@ -33,7 +33,7 @@ jobs:
       clickhouse:
         # glibc tag, not -alpine — see ci.yml's comment (musl startup path
         # trips the Actions seccomp profile and never boots).
-        image: docker.io/clickhouse/clickhouse-server:24
+        image: docker.io/clickhouse/clickhouse-server:26.6.1.1193
         ports:
           - 8123:8123
           - 9000:9000

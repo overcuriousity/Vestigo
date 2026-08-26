@@ -88,6 +88,11 @@ if [ "$CHECK_ONLY" = 1 ]; then
   else
     warn "no usable container engine found — install would fail here"
   fi
+  if [ -f clickhouse/memory.xml ]; then
+    say "clickhouse/memory.xml present ($(wc -c < clickhouse/memory.xml) bytes)"
+  else
+    warn "clickhouse/memory.xml missing from the bundle — install would leave ClickHouse with no memory ceiling"
+  fi
   say "bundle is complete and consistent — nothing changed (--check)"
   exit 0
 fi
@@ -193,6 +198,19 @@ fi
 
 # Bundle-owned files: refreshed on every run, because they are what carries the
 # new version. The operator's .env is the one thing that is not.
+# Both memory.xml failure shapes have to be caught *before* the copy below,
+# not at `up`: under `set -e` the `cp` itself aborts on either one, with a
+# `cp: cannot stat` / `cannot overwrite directory` line that names no cause and
+# offers no remedy. Checked with -f, not -e, because the second shape is a
+# *directory* Docker created at the mount target on a previous run with a
+# missing source, and -e passes on exactly that.
+if [ ! -f clickhouse/memory.xml ]; then
+  die "this bundle has no clickhouse/memory.xml. Without it ClickHouse runs with no memory ceiling and is eventually OOM-killed by the kernel with nothing in its own log. Re-copy the bundle and re-run; nothing was changed or started."
+fi
+if [ -d "$INSTALL_DIR/clickhouse/memory.xml" ]; then
+  die "$INSTALL_DIR/clickhouse/memory.xml is a directory — a previous run started the stack without it, and Docker created it as a mount target. Remove it (rm -rf $INSTALL_DIR/clickhouse/memory.xml), then re-run this installer; nothing was changed or started."
+fi
+
 say "copying bundle payload into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/clickhouse"
 # Named `compose.airgap.yml` in the bundle and `docker-compose.yml` only in the
@@ -205,6 +223,14 @@ mkdir -p "$INSTALL_DIR/clickhouse"
 # looks for, so the bundle directory has no runnable stack in it.
 cp compose.airgap.yml "$INSTALL_DIR/docker-compose.yml"
 cp clickhouse/allow-default-network.xml "$INSTALL_DIR/clickhouse/"
+# Not optional, and its absence is silent: the compose file bind-mounts
+# ./clickhouse/memory.xml, and a missing bind-mount source becomes an empty
+# *directory* rather than an error. ClickHouse then starts, merges no ceiling,
+# and derives 0.9 x whatever RAM a limit-less container sees — the unbounded
+# condition this file exists to prevent. This copy was missing from every
+# release that shipped memory.xml; tests/test_airgap_bundle_parity.py is what
+# stops the next drop-in repeating it.
+cp clickhouse/memory.xml "$INSTALL_DIR/clickhouse/"
 cp .env.example "$INSTALL_DIR/.env.example"
 cp bundle.env BUNDLE-INFO images.list "$INSTALL_DIR/"
 if [ -f nginx-tls.conf ]; then cp nginx-tls.conf "$INSTALL_DIR/"; fi
@@ -257,6 +283,15 @@ if ! "$ENGINE" volume inspect "${PROJECT}_postgres_data" >/dev/null 2>&1; then
 fi
 
 # ── start ───────────────────────────────────────────────────────────────────
+# The one mount whose absence does not fail: Docker materialises a missing bind
+# source as an empty directory rather than erroring, and ClickHouse then starts
+# with no ceiling at all. The copy above is guarded, so reaching here with the
+# file missing means something removed it in between — still worth refusing,
+# because this is the last point before `up` at which that is visible.
+if [ ! -f clickhouse/memory.xml ]; then
+  die "clickhouse/memory.xml is missing from $INSTALL_DIR. Without it ClickHouse runs with no memory ceiling and is eventually OOM-killed by the kernel with nothing in its own log. Re-run this installer from the bundle."
+fi
+
 say "starting the stack"
 $COMPOSE up -d --no-build
 

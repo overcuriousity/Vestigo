@@ -217,6 +217,11 @@ def _fake_bundle(tmp_path, images, *, scope="full", archive_images=None):
 
     shutil.copy(COMPOSE, bundle / "compose.airgap.yml")
     shutil.copy(REPO / "deploy/clickhouse/allow-default-network.xml", bundle / "clickhouse")
+    # The server-side memory ceiling. The real bundle carries it
+    # (scripts/airgap-bundle.sh) and install.sh now refuses to start without it,
+    # because a missing bind-mount source becomes an empty directory rather than
+    # an error and leaves ClickHouse with no ceiling at all.
+    shutil.copy(REPO / "deploy/clickhouse/memory.xml", bundle / "clickhouse")
     shutil.copy(INSTALL_SH, bundle / "install.sh")
     (bundle / "install.sh").chmod(0o755)
     (bundle / ".env.example").write_text("VESTIGO_ENVIRONMENT=production\n")
@@ -326,6 +331,66 @@ def test_install_starts_the_stack_when_every_image_is_present(tmp_path):
     # The install directory, not the bundle, is what the stack runs from.
     assert (install_dir / "docker-compose.yml").is_file()
     assert "VESTIGO_IMAGE_TAG=9.9.9-deadbee" in (install_dir / ".env").read_text()
+    # The mount source the compose file names. Its absence is silent — Docker
+    # makes an empty directory of it — so the installer placing it is the only
+    # thing between an airgap install and an unbounded ClickHouse.
+    assert (install_dir / "clickhouse/memory.xml").is_file()
+
+
+def test_install_refuses_to_start_without_the_memory_ceiling(tmp_path):
+    """A bundle missing memory.xml must fail loudly rather than start unbounded.
+
+    This is the production defect: install.sh never copied the file, the mount
+    source did not exist, Docker created an empty directory at the target, and
+    ClickHouse derived 0.9 x whatever RAM a limit-less container saw.
+    """
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    (bundle / "clickhouse/memory.xml").unlink()
+    # And out of the manifest, so the installer's own guard is what refuses.
+    # Leaving it listed makes the checksum step fail first — which is a correct
+    # refusal for a *damaged* bundle, but it is not this one, and it is what
+    # made this test pass while the guard it names was unreachable.
+    manifest = bundle / "MANIFEST.sha256"
+    manifest.write_text(
+        "".join(line for line in manifest.read_text().splitlines(True) if "memory.xml" not in line)
+    )
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+
+    result = _run_install(bundle, bin_dir, tmp_path / "opt")
+
+    assert result.returncode != 0
+    # The installer's own message, not `cp: cannot stat`. Under `set -e` the
+    # copy aborts first unless the guard runs ahead of it, and a bare `cp` error
+    # names neither the cause nor the remedy — while still satisfying a test
+    # that only looked for the filename.
+    assert "no clickhouse/memory.xml" in result.stderr
+    assert "memory ceiling" in result.stderr
+    assert "cannot stat" not in result.stderr
+    # No log at all is the strongest form of "the stack was never started": the
+    # fake engine writes it on first invocation.
+    started = log.read_text() if log.exists() else ""
+    assert "compose up" not in started, "the stack must not have been started"
+
+
+def test_install_refuses_when_a_previous_run_left_a_mount_target_directory(tmp_path):
+    """The second failure shape: Docker materialised the missing bind source as
+    an empty *directory* at the target, so the file is there in name only. The
+    copy over it fails with `cannot overwrite directory`, which tells an
+    operator nothing about what to remove.
+    """
+    bundle = _fake_bundle(tmp_path, ALL_IMAGES)
+    bin_dir, log = _fake_engine(tmp_path, ALL_IMAGES)
+    install_dir = tmp_path / "opt"
+    (install_dir / "clickhouse" / "memory.xml").mkdir(parents=True)
+
+    result = _run_install(bundle, bin_dir, install_dir)
+
+    assert result.returncode != 0
+    assert "is a directory" in result.stderr
+    assert "rm -rf" in result.stderr
+    assert "cannot overwrite" not in result.stderr
+    started = log.read_text() if log.exists() else ""
+    assert "compose up" not in started, "the stack must not have been started"
 
 
 def test_an_app_only_bundle_refuses_a_host_without_the_backing_services(tmp_path):

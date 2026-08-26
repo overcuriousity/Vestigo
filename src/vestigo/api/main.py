@@ -427,14 +427,23 @@ async def _probe_scan_budget() -> None:
     """
     from vestigo.db._scan import (
         configure_scan_budget,
+        configure_scan_threads,
+        resolve_cache_bytes,
         resolve_clickhouse_ceiling,
         scan_budget_report,
     )
     from vestigo.db.clickhouse import ClickHouseStore
 
-    facts = await asyncio.to_thread(ClickHouseStore().server_memory_facts)
+    facts = await asyncio.to_thread(ClickHouseStore().server_resource_facts)
     ceiling, bounded = resolve_clickhouse_ceiling(facts)
-    configure_scan_budget(ceiling, bounded)
+    cache_bytes, cache_breakdown = resolve_cache_bytes(facts)
+    configure_scan_budget(ceiling, bounded, cache_bytes, cache_breakdown)
+    configure_scan_threads(
+        int(facts.get("resolved_max_threads", 0) or 0) or None,
+        # A server that answered but did not say which kind of value it gave is
+        # treated as auto, which is what every unpinned ClickHouse reports.
+        is_auto=bool(facts.get("max_threads_is_auto", 1)),
+    )
     report = scan_budget_report()
     if report["risk"] == "unbounded":
         logger.warning(
@@ -452,22 +461,27 @@ async def _probe_scan_budget() -> None:
         )
     elif report["risk"] == "over_budget":
         logger.error(
-            "Heavy-scan budget (%.1f GiB across %d slot(s)) exceeds what ClickHouse is "
-            "allowed to use in total (%.1f GiB). Admitting a full set of scans can only end "
-            "in a memory error or an OOM kill. Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES or "
-            "raise max_server_memory_usage.",
+            "Heavy-scan budget (%.1f GiB across %d slot(s)) plus ClickHouse's own caches "
+            "(%.1f GiB) exceeds what ClickHouse is allowed to use in total (%.1f GiB). "
+            "Admitting a full set of scans can only end in a memory error or an OOM kill. "
+            "Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES, shrink the caches in "
+            "deploy/clickhouse/memory.xml, or raise max_server_memory_usage.",
             report["total_bytes"] / (1 << 30),
             report["concurrency"],
+            report["cache_bytes"] / (1 << 30),
             report["clickhouse_ceiling_bytes"] / (1 << 30),
         )
     else:
         logger.info(
             "Heavy-scan budget: %.1f GiB total (%.1f GiB per query x %d) under ClickHouse's "
-            "%.1f GiB ceiling.",
+            "%.1f GiB ceiling, with %.1f GiB of server caches counted; %d threads per scan (%s).",
             report["total_bytes"] / (1 << 30),
             report["per_query_bytes"] / (1 << 30),
             report["concurrency"],
             report["clickhouse_ceiling_bytes"] / (1 << 30),
+            report["cache_bytes"] / (1 << 30),
+            report["max_threads"],
+            report["max_threads_source"],
         )
 
 

@@ -1070,6 +1070,33 @@ export interface Capabilities {
 }
 
 /**
+ * `/api/health`'s `scan_budget` block: how the heavy-scan memory budget
+ * resolved and against what. `risk` is the field an operator acts on — a
+ * misconfiguration here has no symptom until ClickHouse is OOM-killed, and the
+ * kernel does that without writing anything to ClickHouse's own log.
+ */
+export interface ScanBudget {
+  risk: "ok" | "over_budget" | "unbounded";
+  per_query_bytes: number;
+  total_bytes: number;
+  /** Cache maxima under the same ClickHouse ceiling, unavailable to scans. */
+  cache_bytes: number;
+  cache_breakdown: Record<string, number>;
+  /** What is left under the ceiling for merges and allocator slack. */
+  headroom_bytes: number | null;
+  clickhouse_ceiling_bytes: number | null;
+  clickhouse_ceiling_is_explicit: boolean;
+  budget_ceiling_bytes: number | null;
+  local_detected_bytes: number | null;
+  source: "pinned" | "clickhouse" | "local";
+  concurrency: number;
+  pending_concurrency: number | null;
+  max_threads: number;
+  max_threads_source: "pinned" | "clickhouse_pinned" | "clickhouse" | "fallback";
+  detected_cores: number | null;
+}
+
+/**
  * `/api/health`. Everything below `oidc_enabled` requires a session: which
  * optional subsystems an instance runs is an inventory of its attack surface,
  * while the login page legitimately needs to know the app is up and whether to
@@ -1100,6 +1127,9 @@ export interface HealthResponse {
    * matching without raising anything.
    */
   annotated_tag?: string;
+  /** How the heavy-scan budget resolved. Authenticated responses only — it
+   * describes the host's memory layout. */
+  scan_budget?: ScanBudget;
 }
 
 /**
