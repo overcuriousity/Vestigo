@@ -2588,3 +2588,35 @@ async def test_run_stat_detector_passes_max_gap_seconds(patched_store, monkeypat
     )
     assert fake_svc.sequence_calls[1]["max_gap_seconds"] is None
     assert res3["sequence_max_gap_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# Scans run through scan_exec.run_scan (#300)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_regex_guard_runs_scans_through_run_scan(monkeypatch):
+    """Every chart/detector endpoint must be cancellable and busy-aware (#300)."""
+    calls = []
+
+    async def fake_run_scan(fn, *args, **kwargs):
+        calls.append(fn)
+        return "ran"
+
+    monkeypatch.setattr(events, "run_scan", fake_run_scan)
+    assert await events._run_regex_guarded(False, lambda: None) == "ran"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_busy_scan_surfaces_as_503_not_500(monkeypatch):
+    from vestigo.api import scan_exec
+    from vestigo.db._scan import ScanBusy
+
+    def busy():
+        raise ScanBusy(ahead=4, wait=30.0)
+
+    monkeypatch.setattr(scan_exec, "current_request", lambda: None)
+    with pytest.raises(scan_exec.ScanBusyResponse):
+        await events._run_regex_guarded(False, busy)

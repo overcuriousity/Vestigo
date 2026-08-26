@@ -29,6 +29,7 @@ from vestigo.agent.chart_meta import (
     metric_available,
     requires_field,
 )
+from vestigo.db._scan import ScanBusy
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 
 if TYPE_CHECKING:
@@ -100,6 +101,14 @@ ANALYST_CHART_LIMITS = ChartLimits(
 )
 
 
+async def _scan(fn: Any, *args: Any) -> Any:
+    """Run a chart aggregation; a busy foreground lane is a tool error, not a crash."""
+    try:
+        return await run_in_threadpool(fn, *args)
+    except ScanBusy as exc:
+        raise ValueError(f"{exc}. Tell the analyst the chart lane is busy and try again.") from exc
+
+
 async def execute_chart_spec(
     scope: AgentScope,
     spec: ChartSpec,
@@ -151,7 +160,7 @@ async def execute_chart_spec(
             if resolve_time_field(token) is not None:
                 return
             if vocabulary is None:
-                listed = await run_in_threadpool(
+                listed = await _scan(
                     service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
                 )
                 attrs = listed.get("attributes") or []
@@ -302,7 +311,7 @@ async def execute_chart_spec(
     if data_kind == "terms":
         applied["top_n"] = _capped(opts.top_n, limits.terms_top_n, "top_n")
         if comparison_query is not None:
-            result = await run_in_threadpool(
+            result = await _scan(
                 service.compare_field_terms,
                 primary_query,
                 comparison_query,
@@ -315,9 +324,7 @@ async def execute_chart_spec(
                 "distinct": result["distinct"],
             }
         else:
-            result = await run_in_threadpool(
-                service.field_terms, primary_query, spec.field, applied["top_n"]
-            )
+            result = await _scan(service.field_terms, primary_query, spec.field, applied["top_n"])
             summary = {
                 "total": result["total"],
                 "distinct": result["distinct"],
@@ -331,7 +338,7 @@ async def execute_chart_spec(
         # Grouped box/violin: numeric response × categorical grouping field.
         applied["groups"] = _capped(opts.groups, limits.groups, "groups", floor=2)
         applied["bins"] = _capped(opts.bins, limits.bins, "bins")
-        result = await run_in_threadpool(
+        result = await _scan(
             service.field_numeric_grouped,
             primary_query,
             spec.field,
@@ -381,7 +388,7 @@ async def execute_chart_spec(
             # edges are negotiated between the two layers), so an omitted
             # bins falls back to the manual default.
             applied["bins"] = _capped(opts.bins, limits.bins, "bins")
-            result = await run_in_threadpool(
+            result = await _scan(
                 service.compare_field_numeric,
                 primary_query,
                 comparison_query,
@@ -396,9 +403,7 @@ async def execute_chart_spec(
             # bins omitted → the service picks Freedman–Diaconis; echo the
             # resolved count so the model knows what will be drawn.
             bins_arg = _capped(opts.bins, limits.bins, "bins") if opts.bins is not None else None
-            result = await run_in_threadpool(
-                service.field_numeric_stats, primary_query, spec.field, bins_arg
-            )
+            result = await _scan(service.field_numeric_stats, primary_query, spec.field, bins_arg)
             applied["bins"] = len(result["bins"]) or None
             applied["bin_rule"] = result.get("bin_rule", "manual")
             if not result["count"]:
@@ -417,7 +422,7 @@ async def execute_chart_spec(
     elif data_kind == "timeseries":
         applied["buckets"] = _capped(opts.buckets, limits.series_buckets, "buckets", floor=4)
         applied["top_n"] = _capped(opts.top_n, limits.series_top_n, "top_n")
-        result = await run_in_threadpool(
+        result = await _scan(
             service.field_value_timeseries,
             primary_query,
             spec.field,
@@ -431,7 +436,7 @@ async def execute_chart_spec(
     elif data_kind == "time":
         applied["buckets"] = _capped(opts.buckets, limits.time_buckets, "buckets", floor=4)
         if comparison_query is not None:
-            result = await run_in_threadpool(
+            result = await _scan(
                 service.compare_time_histogram,
                 primary_query,
                 comparison_query,
@@ -442,18 +447,18 @@ async def execute_chart_spec(
                 "comparison_total": result["comparison_total"],
             }
         else:
-            result = await run_in_threadpool(service.histogram, primary_query, applied["buckets"])
+            result = await _scan(service.histogram, primary_query, applied["buckets"])
             summary = {
                 "buckets": len(result["buckets"]),
                 "interval_seconds": result["interval_seconds"],
             }
     elif data_kind == "punchcard":
-        result = await run_in_threadpool(service.time_punchcard, primary_query)
+        result = await _scan(service.time_punchcard, primary_query)
         summary = {"total": result["total"], "max_count": result["max_count"]}
     elif data_kind == "pivot":
         applied["limit_x"] = _capped(opts.limit_x, limits.pivot_limit, "limit_x")
         applied["limit_y"] = _capped(opts.limit_y, limits.pivot_limit, "limit_y")
-        result = await run_in_threadpool(
+        result = await _scan(
             service.field_pivot,
             primary_query,
             spec.field,
@@ -496,7 +501,7 @@ async def execute_chart_spec(
         # `fields` is already validated (2–limits.corr_max_fields, distinct)
         # by the multi_field guard above, so no capping happens here.
         fields = spec.fields or []
-        result = await run_in_threadpool(service.field_correlation, primary_query, fields)
+        result = await _scan(service.field_correlation, primary_query, fields)
         dropped = [d["field"] for d in result["dropped_fields"]]
         if dropped:
             warnings.append(
@@ -519,7 +524,7 @@ async def execute_chart_spec(
         }
     else:  # scatter
         applied["sample_limit"] = _capped(opts.sample_limit, limits.scatter_sample, "sample_limit")
-        result = await run_in_threadpool(
+        result = await _scan(
             service.field_scatter,
             primary_query,
             spec.field,

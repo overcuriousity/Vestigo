@@ -35,6 +35,7 @@ from vestigo.api.routers.events import (
     _run_stat_detector,
     _serialize_stat_result,
 )
+from vestigo.api.scan_exec import run_scan
 from vestigo.core.config import get_settings
 from vestigo.db._buckets import query_timestamp_range
 from vestigo.db._dt import ensure_utc
@@ -449,7 +450,7 @@ async def _run_log_templates(
             )
         baseline_end = ensure_utc(definition.baseline_end)
 
-    result = await run_in_threadpool(
+    result = await run_scan(
         svc.list_log_templates,
         case_id=case_id,
         source_ids=source_ids,

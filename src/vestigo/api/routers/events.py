@@ -27,6 +27,7 @@ from vestigo.api.deps import (
     require_case_read,
     require_password_current,
 )
+from vestigo.api.scan_exec import run_scan
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
@@ -163,9 +164,12 @@ async def _run_regex_guarded(q_regex: bool, fn: Any, /, *args: Any, **kwargs: An
     RE2 rejects some patterns Python's ``re`` accepts, so a pattern can pass
     :func:`_validate_regex` and still fail to compile inside ClickHouse —
     without this, that surfaces as a 500 instead of a client error.
+
+    Runs through ``scan_exec.run_scan`` so the scan is cancelled when the
+    client disconnects and a full foreground lane answers 503 (#300).
     """
     try:
-        return await run_in_threadpool(fn, *args, **kwargs)
+        return await run_scan(fn, *args, **kwargs)
     except DatabaseError as exc:
         message = str(exc)
         if q_regex and re.search(r"re2|regex", message, re.IGNORECASE):
@@ -2138,7 +2142,7 @@ async def _run_stat_detector(
     if detector == "timestamp_order":
         # Mode-less: no windows, and per-event (not value-level) so it keeps the
         # legacy event-level `normal` suppression only.
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_order_violations,
             case_id=case_id,
             source_ids=source_ids,
@@ -2152,7 +2156,7 @@ async def _run_stat_detector(
         return result, resolution
 
     if detector == "frequency":
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_frequency_anomalies,
             case_id=case_id,
             source_ids=source_ids,
@@ -2178,7 +2182,7 @@ async def _run_stat_detector(
         # D14: None = no gap bound (pre-1.8.6 behavior).
         resolution["sequence_max_gap_seconds"] = max_gap_seconds
         try:
-            result = await run_in_threadpool(
+            result = await run_scan(
                 svc.find_sequence_novelty,
                 case_id=case_id,
                 source_ids=source_ids,
@@ -2212,7 +2216,7 @@ async def _run_stat_detector(
         # on what a sequence is.
         resolution["motif_max_gap_seconds"] = max_gap_seconds
         try:
-            result = await run_in_threadpool(
+            result = await run_scan(
                 svc.find_sequence_motifs,
                 case_id=case_id,
                 source_ids=source_ids,
@@ -2237,7 +2241,7 @@ async def _run_stat_detector(
     parsed_fields = _parse_novelty_fields(fields)
 
     if detector == "numeric_range":
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_range_violations,
             case_id=case_id,
             source_ids=source_ids,
@@ -2265,7 +2269,7 @@ async def _run_stat_detector(
                 detail="value_combo supports at most four fields.",
             )
         try:
-            result = await run_in_threadpool(
+            result = await run_scan(
                 svc.find_value_combos,
                 case_id=case_id,
                 source_ids=source_ids,
@@ -2300,7 +2304,7 @@ async def _run_stat_detector(
         # (None = one merged alphabet per field, the pre-1.8.6 behavior).
         resolution["charset_group_field"] = group_field
         try:
-            result = await run_in_threadpool(
+            result = await run_scan(
                 svc.find_charset_novelty,
                 case_id=case_id,
                 source_ids=source_ids,
@@ -2325,7 +2329,7 @@ async def _run_stat_detector(
         return result, resolution
 
     if detector == "entropy":
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_entropy_outliers,
             case_id=case_id,
             source_ids=source_ids,
@@ -2350,7 +2354,7 @@ async def _run_stat_detector(
         resolution["shift_min_ratio"] = (
             min_ratio if min_ratio is not None else cfg.stat_shift_min_ratio
         )
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_proportion_shifts,
             case_id=case_id,
             source_ids=source_ids,
@@ -2378,7 +2382,7 @@ async def _run_stat_detector(
         resolution["interval_min_rate_ratio"] = (
             min_ratio if min_ratio is not None else cfg.stat_interval_min_rate_ratio
         )
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_interval_periodicity,
             case_id=case_id,
             source_ids=source_ids,
@@ -2410,7 +2414,7 @@ async def _run_stat_detector(
         # units the generic min_ratio param can't express, so they stay
         # server config.
         resolution["drift_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_drift_fdr_q
-        result = await run_in_threadpool(
+        result = await run_scan(
             svc.find_distribution_drift,
             case_id=case_id,
             source_ids=source_ids,
@@ -2431,7 +2435,7 @@ async def _run_stat_detector(
         )
         return result, resolution
 
-    result = await run_in_threadpool(
+    result = await run_scan(
         svc.find_value_novelty,
         case_id=case_id,
         source_ids=source_ids,
