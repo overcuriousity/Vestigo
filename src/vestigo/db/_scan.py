@@ -14,8 +14,9 @@ The memory budget is a **total across concurrent scans**, resolved from
 ``VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`` when nonzero, else auto-sized to
 ``VESTIGO_STAT_SCAN_MEMORY_RATIO`` (0.8) of the detected memory — the cgroup limit
 when the process runs in a memory-limited container, the machine's physical
-RAM otherwise. Each query's ``max_memory_usage`` is budget /
-``VESTIGO_STAT_SCAN_CONCURRENCY``, and :data:`HEAVY_SCAN_GATE` (acquired by every
+RAM otherwise. Each heavy query's ``max_memory_usage`` is budget /
+(``VESTIGO_STAT_SCAN_CONCURRENCY`` + 1) — the extra slot is the foreground
+class, see :data:`FOREGROUND_SCAN_GATE` — and :data:`HEAVY_SCAN_GATE` (acquired by every
 detector entry point in ``db/anomaly_stats.py``) holds surplus scans so no
 more than that many run at once — ``max_memory_usage`` alone is per *query*,
 and N parallel detector requests stacking N full-budget queries is exactly
@@ -444,18 +445,32 @@ def detect_scan_memory_budget() -> int:
         s.stat_scan_max_memory_bytes,
         s.stat_scan_memory_ratio,
         ceiling,
-        # Deliberately the gate's own size, not the live setting. The divisor
-        # and the semaphore describe one budget from two sides, and this is the
-        # only value both can agree on: :data:`HEAVY_SCAN_GATE` is sized at
-        # import and imported by value, while an admin-console edit to
-        # `stat_scan_concurrency` lands on the next `get_settings()`. Reading
-        # the live value here would let a 4 -> 2 edit double every query's cap
-        # while the gate still admitted four — 2x the total budget, which is
-        # precisely the OOM the pair exists to prevent. `restart_required=True`
-        # on the spec is what makes the frozen value honest, not enforcement.
-        _GATE_CONCURRENCY,
+        # Deliberately the gate's own size *plus one*, not the live setting.
+        # The extra slot is the foreground class's share (see
+        # :data:`FOREGROUND_SCAN_GATE`): N heavy scans plus four foreground
+        # charts at a quarter-slot each is exactly the total, so both gates
+        # fully admitted still fit. The divisor and the semaphore describe one
+        # budget from two sides, and this is the only value both can agree on:
+        # :data:`HEAVY_SCAN_GATE` is sized at import and imported by value,
+        # while an admin-console edit to `stat_scan_concurrency` lands on the
+        # next `get_settings()`. Reading the live value here would let a
+        # 4 -> 2 edit double every query's cap while the gate still admitted
+        # four — 2x the total budget, which is precisely the OOM the pair
+        # exists to prevent. `restart_required=True` on the spec is what makes
+        # the frozen value honest, not enforcement.
+        _GATE_CONCURRENCY + 1,
         _cache_bytes_under(ceiling),
     )
+
+
+def detect_foreground_memory_budget() -> int:
+    """Per-query ``max_memory_usage`` for a foreground (chart) scan.
+
+    One heavy slot's worth, divided across the foreground gate — so charts
+    have their own lane without adding to the total the heavy class already
+    accounts for. Never 0, for the same reason as the heavy cap.
+    """
+    return max(detect_scan_memory_budget() // _FOREGROUND_CONCURRENCY, 1)
 
 
 def scan_budget_report() -> dict[str, Any]:
@@ -477,7 +492,10 @@ def scan_budget_report() -> dict[str, Any]:
     """
     s = get_settings()
     per_query = detect_scan_memory_budget()
-    total = per_query * _GATE_CONCURRENCY
+    foreground = detect_foreground_memory_budget()
+    # Both classes fully admitted: N heavy slots plus the one slot the
+    # foreground gate shares.
+    total = per_query * (_GATE_CONCURRENCY + 1)
     ceiling = scan_memory_ceiling()
     committed = total + _clickhouse_cache_bytes
     if _clickhouse_ceiling is None or not _clickhouse_bounded:
@@ -523,6 +541,10 @@ def scan_budget_report() -> dict[str, Any]:
         "pending_concurrency": (
             s.stat_scan_concurrency if s.stat_scan_concurrency != _GATE_CONCURRENCY else None
         ),
+        # The foreground class (charts): its own gate, fed by the slot the
+        # heavy divisor reserves. Disclosed so "why is my chart capped at X"
+        # has an answer on the same page as the heavy cap.
+        "foreground": {"concurrency": _FOREGROUND_CONCURRENCY, "per_query_bytes": foreground},
         # Thread width and its provenance. A wrong width has no symptom except
         # "everything is slow", which is the same reason the memory resolution
         # is reported here rather than left to be inferred from a failure.
@@ -544,15 +566,8 @@ def scan_budget_report() -> dict[str, Any]:
     }
 
 
-def heavy_scan_settings() -> str:
-    """The SETTINGS clause every whole-corpus scan must carry.
-
-    Built per call rather than frozen at import — see the module docstring.
-    Cheap: a few f-string formats over cached inputs, against a query that is
-    about to read the whole corpus.
-    """
+def _scan_settings_clause(budget: int) -> str:
     s = get_settings()
-    budget = detect_scan_memory_budget()
     # Spill must engage well before the cap kills the query — a configured
     # threshold at or above the per-query cap would never fire.
     group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
@@ -568,6 +583,26 @@ def heavy_scan_settings() -> str:
     )
 
 
+def heavy_scan_settings() -> str:
+    """The SETTINGS clause every whole-corpus scan must carry.
+
+    Built per call rather than frozen at import — see the module docstring.
+    Cheap: a few f-string formats over cached inputs, against a query that is
+    about to read the whole corpus.
+    """
+    return _scan_settings_clause(detect_scan_memory_budget())
+
+
+def foreground_scan_settings() -> str:
+    """The SETTINGS clause for an interactive chart aggregation.
+
+    Same shape as :func:`heavy_scan_settings` with the foreground cap. Thread
+    width is the heavy width on purpose: a chart is short and latency-bound,
+    and the foreground gate's size, not the thread width, bounds its CPU.
+    """
+    return _scan_settings_clause(detect_foreground_memory_budget())
+
+
 # Admission gate for heavy detector scans: at most VESTIGO_STAT_SCAN_CONCURRENCY
 # run against ClickHouse at once; surplus callers block (threadpool threads,
 # so blocking is fine). Every public find_* detector entry point in
@@ -577,6 +612,16 @@ def heavy_scan_settings() -> str:
 # the total budget by exactly this number — see the comment at that call.
 _GATE_CONCURRENCY = max(get_settings().stat_scan_concurrency, 1)
 HEAVY_SCAN_GATE = threading.BoundedSemaphore(_GATE_CONCURRENCY)
+
+# Admission gate for *foreground* scans: the chart aggregations an analyst is
+# looking at while they wait (histogram, top terms, numeric stats, …). Its own
+# lane so a 60-bucket GROUP BY never queues behind a whole-corpus detector
+# sweep (issue #300). Sized as one heavy slot split four ways — see
+# detect_foreground_memory_budget — so it adds nothing to the total. A
+# constant rather than a setting: how finely the reserved slot is sliced is
+# not a number an operator needs to reason about.
+_FOREGROUND_CONCURRENCY = 4
+FOREGROUND_SCAN_GATE = threading.BoundedSemaphore(_FOREGROUND_CONCURRENCY)
 
 # Admission gate for *streamed* heavy scans (the value-inventory export).
 # Deliberately separate from HEAVY_SCAN_GATE and deliberately one slot.
