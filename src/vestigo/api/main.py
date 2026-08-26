@@ -463,7 +463,7 @@ async def _probe_scan_budget() -> None:
         )
     elif report["risk"] == "over_budget":
         logger.error(
-            "Heavy-scan budget (%.1f GiB across %d slot(s)) plus ClickHouse's own caches "
+            "Scan budget (%.1f GiB across %d heavy slot(s) plus the chart lane) plus ClickHouse's own caches "
             "(%.1f GiB) exceeds what ClickHouse is allowed to use in total (%.1f GiB). "
             "Admitting a full set of scans can only end in a memory error or an OOM kill. "
             "Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES, shrink the caches in "
@@ -475,11 +475,14 @@ async def _probe_scan_budget() -> None:
         )
     else:
         logger.info(
-            "Heavy-scan budget: %.1f GiB total (%.1f GiB per query x %d) under ClickHouse's "
-            "%.1f GiB ceiling, with %.1f GiB of server caches counted; %d threads per scan (%s).",
+            "Scan budget: %.1f GiB total (%.1f GiB per heavy query x %d, plus %d chart queries "
+            "at %.1f GiB) under ClickHouse's %.1f GiB ceiling, with %.1f GiB of server caches "
+            "counted; %d threads per scan (%s).",
             report["total_bytes"] / (1 << 30),
             report["per_query_bytes"] / (1 << 30),
             report["concurrency"],
+            report["foreground"]["concurrency"],
+            report["foreground"]["per_query_bytes"] / (1 << 30),
             report["clickhouse_ceiling_bytes"] / (1 << 30),
             report["cache_bytes"] / (1 << 30),
             report["max_threads"],
